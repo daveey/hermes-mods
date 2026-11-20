@@ -1,0 +1,166 @@
+From 5d9e537979b46a579ccdfcdf347f7fde95ace5e3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 13:52:26 +0000
+Subject: [PATCH] [daveey] Reuse duplicate lifecycle substitution token
+ readings
+
+Deduplicate identical preprocessed readings per nesting level and memoize repeated substitution bodies per traversal and depth budget. Preserve distinct ANSI-C evidence, occurrence order, fresh mutable results and depth-limit refusal.
+
+Proof: 54 lifecycle suites / 9665 tests pass; full heredoc corpus 30852 cases, violations=0 false_refusals=0. Two new regressions fail on baseline; all six pass with fix. scripts/check --base origin/main passes. Five-sample full-scan medians before/after: 800 lines 1.855/1.478s; one-liner 4.012/3.549ms; 50x20 deep 4.830/2.140s.
+---
+ cron/lifecycle_guard_tokens.py                | 36 ++++++---
+ .../cron/test_lifecycle_guard_token_dedupe.py | 78 +++++++++++++++++++
+ 2 files changed, 105 insertions(+), 9 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_token_dedupe.py
+
+diff --git a/cron/lifecycle_guard_tokens.py b/cron/lifecycle_guard_tokens.py
+index 990d306e4c83691e4e9003cea7ef209ea5670d16..8b6673cb22ce9c113d98ae61fc07c13190801868 100644
+--- a/cron/lifecycle_guard_tokens.py
++++ b/cron/lifecycle_guard_tokens.py
+@@ -27,32 +27,50 @@ def _iter_command_token_lists(command: str, *, _nesting: int = 0) -> Iterator[li
+     """Yield the shell tokens of each logical line; a line shlex rejects (unbalanced quotes) falls
+     back to per-physical-line tokenization. An unquoted ``<``/``>`` glued to a word starts a word
+     of its own (``python3 -<f.py``), as in the shell."""
+-    if _nesting >= MAX_SUBSTITUTION_DEPTH:
++    yield from _iter_memoized_token_lists(command, _nesting, {})
++
++
++def _iter_memoized_token_lists(
++    command: str, nesting: int, bodies_cache: dict[tuple[str, int], tuple[tuple[str, ...], ...]],
++) -> Iterator[list[str]]:
++    if nesting >= MAX_SUBSTITUTION_DEPTH:
+         raise SubstitutionNestingLimit('substitution nesting limit reached')
+     # Separate nested quote frames before any flat comment/quote preprocessing.
+     # A quoted hash inside $(...) is data even inside an outer double quote.
+     outer, bodies = separate_substitutions(command)
+     for body in bodies:
+-        yield from _iter_command_token_lists(body, _nesting=_nesting + 1)
++        # The same body at a deeper level has less budget: text alone is not
++        # a safe cache key. Replay fresh lists to preserve occurrence order and
++        # prevent a consumer's mutation from corrupting later occurrences.
++        key = (body, nesting + 1)
++        if key not in bodies_cache:
++            bodies_cache[key] = tuple(tuple(tokens) for tokens in
++                                      _iter_memoized_token_lists(body, nesting + 1, bodies_cache))
++        for tokens in bodies_cache[key]:
++            yield list(tokens)
+     # Keep both present-word and absent-word readings, plus the original evidence.
++    seen_readings: set[str] = set()
+     if outer != command:
+-        yield from _iter_plain_token_lists(command)
++        yield from _iter_plain_token_lists(command, seen_readings)
+         empty_outer, _ = separate_substitutions(command, empty_unquoted=True)
+         if empty_outer != outer:
+-            yield from _iter_plain_token_lists(empty_outer)
+-    yield from _iter_plain_token_lists(outer)
++            yield from _iter_plain_token_lists(empty_outer, seen_readings)
++    yield from _iter_plain_token_lists(outer, seen_readings)
+ 
+ 
+-def _iter_plain_token_lists(command: str) -> Iterator[list[str]]:
++def _iter_plain_token_lists(command: str, seen: set[str] | None = None) -> Iterator[list[str]]:
+     """Tokenize without evaluating or separating any expansion."""
+     command = strip_shell_comments(command).replace("\\\n", "")
+     normalized = normalize_ansi_c_quotes(command)
+     # Normalization helps shlex with Bash quoting, but must not erase evidence
+     # recovered by the original physical-line fallback (the line splitter has
+     # different backslash-in-single-quote rules). Walk both only when different.
+-    if normalized != command:
+-        yield from _iter_raw_token_lists(command)
+-    yield from _iter_raw_token_lists(normalized)
++    if seen is None:
++        seen = set()
++    for reading in (command, normalized):
++        if reading not in seen:
++            seen.add(reading)
++            yield from _iter_raw_token_lists(reading)
+ 
+ 
+ def _iter_raw_token_lists(command: str) -> Iterator[list[str]]:
+diff --git a/tests/cron/test_lifecycle_guard_token_dedupe.py b/tests/cron/test_lifecycle_guard_token_dedupe.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7f703466a09e75bee157dc6b9bbfc37b030026d0
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_token_dedupe.py
+@@ -0,0 +1,78 @@
++"""Parser work is reused only within one traversal and one nesting budget."""
++from collections import Counter
++
++import pytest
++
++from cron import lifecycle_guard_tokens as tokens
++from cron.lifecycle_guard_substitutions import MAX_SUBSTITUTION_DEPTH, SubstitutionNestingLimit
++
++
++def test_repeated_bodies_are_walked_once(monkeypatch):
++    calls = Counter()
++    original = tokens.separate_substitutions
++
++    def counted(command, **kwargs):
++        if not kwargs:
++            calls[command] += 1
++        return original(command, **kwargs)
++
++    monkeypatch.setattr(tokens, 'separate_substitutions', counted)
++    command = 'echo $(echo $(bash ./r.sh)) $(echo $(bash ./r.sh))'
++    result = list(tokens._iter_command_token_lists(command))
++    assert ['bash', './r.sh'] in result
++    assert calls['echo $(bash ./r.sh)'] == 1
++    assert calls['bash ./r.sh'] == 1
++    list(tokens._iter_command_token_lists(command))
++    assert calls['bash ./r.sh'] == 2  # no process-wide cache
++
++
++def test_convergent_readings_are_tokenized_once(monkeypatch):
++    calls = Counter()
++    original = tokens._iter_raw_token_lists
++
++    def counted(command):
++        calls[command] += 1
++        yield from original(command)
++
++    # Original, empty and placeholder readings differ before preprocessing,
++    # but comments / continuation removal make all three identical.
++    monkeypatch.setattr(tokens, 'separate_substitutions', lambda command, **kw:
++                        ('echo ok # empty' if kw else 'echo ok # outer', []))
++    monkeypatch.setattr(tokens, '_iter_raw_token_lists', counted)
++    assert list(tokens._iter_command_token_lists('echo ok # original')) == [['echo', 'ok']]
++    assert sum(calls.values()) == 1
++
++
++def test_distinct_readings_and_ansi_normalization_survive(monkeypatch):
++    monkeypatch.setattr(tokens, 'separate_substitutions', lambda command, **kw:
++                        ("echo $'empty'" if kw else "echo $'outer'", []))
++    result = list(tokens._iter_command_token_lists("echo $'original'"))
++    assert {tuple(row) for row in result} == {
++        ('echo', '$original'), ('echo', 'original'),
++        ('echo', '$empty'), ('echo', 'empty'),
++        ('echo', '$outer'), ('echo', 'outer'),
++    }
++
++
++def test_cached_occurrences_preserve_order_and_list_isolation():
++    rows = tokens._iter_command_token_lists('echo $(true) $(false) $(true)')
++    first = next(rows)
++    assert first == ['true']
++    first.append('mutated')
++    assert next(rows) == ['false']
++    assert next(rows) == ['true']
++
++
++def test_plain_readings_default_keeps_distinct_ansi_evidence():
++    assert list(tokens._iter_plain_token_lists("echo $'ok'")) == [
++        ['echo', '$ok'], ['echo', 'ok'],
++    ]
++
++
++def test_repeated_body_at_deeper_budget_still_hits_limit():
++    body = 'echo $(true)'
++    deep = body
++    for _ in range(MAX_SUBSTITUTION_DEPTH - 2):
++        deep = 'echo $(' + deep + ')'
++    with pytest.raises(SubstitutionNestingLimit):
++        list(tokens._iter_command_token_lists('echo $(' + body + ') $(' + deep + ')'))
+-- 
+2.43.0
+

@@ -1,0 +1,207 @@
+From 138d88bba3ac11c7e226d44aa82aa581cd8b1cb0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 20:26:07 +0000
+Subject: [PATCH] [daveey] kanban pacing: read-only views describe a paced pool
+ as a hold only with pace_starts
+
+Review of 262b95542d: paced_pools still returned a paced pool under the
+default, so the priority-raise guard refused "held by llm_pacing" and the
+chat-wait / parent-unclaimed notices named a pacing hold that no dispatcher
+makes. It now counts paced only with pace_starts (held always).
+
+The notice and priority-guard test files describe the opt-in mode and say
+so (an autouse fixture); test_kanban_pacing_default_reads.py covers each
+consumer on the default config. kanban.md says the token throttle is a
+separate component and what a paced pool does without it.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_llm_pacing_dispatch.py      | 11 ++-
+ .../test_kanban_edit_priority_paced.py        |  3 +-
+ .../test_kanban_notice_pacing_admission.py    | 10 +++
+ .../test_kanban_pacing_default_reads.py       | 82 +++++++++++++++++++
+ website/docs/user-guide/features/kanban.md    |  2 +-
+ 5 files changed, 102 insertions(+), 6 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_pacing_default_reads.py
+
+diff --git a/hermes_cli/kanban_llm_pacing_dispatch.py b/hermes_cli/kanban_llm_pacing_dispatch.py
+index cdd2f3684850c2dc4fa7c7e92ef46a345ebc7256..b3c47cb5bebeddbcd64583d966d0997bf5e8385a 100644
+--- a/hermes_cli/kanban_llm_pacing_dispatch.py
++++ b/hermes_cli/kanban_llm_pacing_dispatch.py
+@@ -389,23 +389,26 @@ def _stored_pace(entry: Any, now: float, cfg: lp.PacingConfig) -> Optional[lp.Po
+ 
+ def paced_pools(conn: sqlite3.Connection, task_id: str) -> Optional[list[lp.PoolPace]]:
+     """The pools holding ready card ``task_id``, for a stall notice: one :class:`~kanban_llm_pacing.PoolPace` per
+-    candidate provider when EVERY candidate is stored as ``paced`` or ``held``; else None (no positive read).
++    candidate provider when EVERY candidate is stored in a state that holds starts (``held``; also ``paced`` with
++    ``pace_starts``); else None (no positive read).
+ 
+     A notice describes the hold, it never makes one: this reads the pace the dispatchers of this home stored
+     (``llm_pacing.json``; pool workers draw the same accounts from the hub's relay), makes no usage read and writes
+     nothing. It judges the card as :func:`hold` does (:func:`_governed`) and, like :func:`_verdicts`, finds no hold as
+     soon as one candidate is open, unknown or unread: the card may start there. The pool's state, not this host's slot
+-    math: the hosts that would run the card keep their own concurrency, so a held pool admits nothing anywhere and a
+-    paced pool limits every host. Faults propagate; the caller fails open."""
++    math: the hosts that would run the card keep their own concurrency, so a held pool admits nothing anywhere and,
++    with ``pace_starts``, a paced pool limits every host. Without it (the default) a paced pool holds nothing, so
++    it is no hold to describe. Faults propagate; the caller fails open."""
+     cfg = load_config()
+     judged = _governed(conn, task_id, "ready", cfg) if cfg.enabled else None
+     if judged is None:
+         return None
+     stored, now = _load_state(state_path()), time.time()
++    holding = (lp.PACED, lp.HELD) if cfg.pace_starts else (lp.HELD,)  # what admit_limit can limit on
+     paces: list[lp.PoolPace] = []
+     for provider in judged[1]:
+         pace = _stored_pace(stored.get(provider), now, cfg)
+-        if pace is None or pace.state not in (lp.PACED, lp.HELD):
++        if pace is None or pace.state not in holding:
+             return None
+         paces.append(pace)
+     return paces
+diff --git a/tests/hermes_cli/test_kanban_edit_priority_paced.py b/tests/hermes_cli/test_kanban_edit_priority_paced.py
+index 4fd078f68d4f7090d347918f56c4b320bbe6dd66..2b233aa4780f11900ed1b37dba40cacca705bc8d 100644
+--- a/tests/hermes_cli/test_kanban_edit_priority_paced.py
++++ b/tests/hermes_cli/test_kanban_edit_priority_paced.py
+@@ -21,7 +21,8 @@ from hermes_cli import kanban_llm_pacing as lp
+ from hermes_cli import kanban_llm_pacing_dispatch as pd
+ from hermes_cli.kanban_parser import build_parser
+ from tests.hermes_cli import test_kanban_model_tier as model_tier
+-from tests.hermes_cli.test_kanban_notice_pacing_admission import OPUS, _store
++from tests.hermes_cli.test_kanban_notice_pacing_admission import (  # _pace_starts_mode: the autouse opt-in
++    OPUS, _pace_starts_mode, _store)
+ 
+ board = model_tier.board  # one unsynced gateway: every card is its own to lease
+ 
+diff --git a/tests/hermes_cli/test_kanban_notice_pacing_admission.py b/tests/hermes_cli/test_kanban_notice_pacing_admission.py
+index ab5144481f9bed7f5a71bac1e059e85ab34133f1..38d5964675042895cac7d904ad23ac406895ecf2 100644
+--- a/tests/hermes_cli/test_kanban_notice_pacing_admission.py
++++ b/tests/hermes_cli/test_kanban_notice_pacing_admission.py
+@@ -13,6 +13,7 @@ unreadable, failing or OPEN read leaves today's payload and words, "admission re
+ from __future__ import annotations
+ 
+ import copy
++import dataclasses
+ import json
+ import time
+ 
+@@ -33,6 +34,15 @@ from tests.hermes_cli import test_kanban_model_tier as model_tier
+ 
+ hub = pool_wait.hub  # a hub that cannot lease ``pool:worker`` cards: the Board registry names two pool workers
+ board = model_tier.board  # one unsynced gateway: every card is its own to lease
++
++
++@pytest.fixture(autouse=True)
++def _pace_starts_mode(monkeypatch):
++    """This file describes the opt-in mode (``kanban.llm_pacing.pace_starts: true``), where a paced pool holds
++    starts. The default, where it holds nothing and is no hold to describe, is in
++    ``test_kanban_pacing_default_reads.py``."""
++    real = lp.config_from
++    monkeypatch.setattr(lp, "config_from", lambda section: dataclasses.replace(real(section), pace_starts=True))
+ LABELS = pool_wait.LABELS
+ OPUS = "claude-opus-5-5"
+ DAY = 86400
+diff --git a/tests/hermes_cli/test_kanban_pacing_default_reads.py b/tests/hermes_cli/test_kanban_pacing_default_reads.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9d46747d76aa19fae4ed18e8f69e9c277978d7a0
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pacing_default_reads.py
+@@ -0,0 +1,82 @@
++"""Default ``kanban.llm_pacing`` (``pace_starts: false``): a paced pool holds no start, so the read-only views that
++describe pacing holds must not describe one. ``paced_pools`` feeds the priority-raise guard
++(``kanban_db_edit.paced_raise_refusal``) and the chat-wait / parent-unclaimed notices
++(``kanban_parent_unclaimed._pacing_admission``); each is exercised here on the default config. The opt-in mode is
++covered by ``test_kanban_notice_pacing_admission.py`` and ``test_kanban_edit_priority_paced.py``. [daveey]"""
++from __future__ import annotations
++
++import time
++
++import pytest
++
++from hermes_cli import kanban_chat_wait as cw
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_llm_pacing as lp
++from hermes_cli import kanban_llm_pacing_dispatch as pd
++from tests.hermes_cli import test_kanban_edit_priority_paced as edit_paced
++from tests.hermes_cli import test_kanban_notice_pacing_admission as notices
++
++hub = notices.hub
++board = notices.board
++
++
++@pytest.fixture(autouse=True)
++def _default_config(monkeypatch):
++    monkeypatch.setattr(pd, "_CACHE", {})
++    assert pd.load_config().pace_starts is False  # this file runs on the shipped default
++
++
++def _anthropic_card(conn, priority=900):
++    return kb.create_task(conn, title="paced pool card", assignee="default", priority=priority,
++                          model_override=notices.OPUS, provider_override="anthropic")
++
++
++def test_a_paced_pool_is_no_hold_to_describe_and_a_held_one_still_is(board):
++    with kbc.connect_closing() as conn:
++        tid = _anthropic_card(conn)
++        notices._store(("anthropic", lp.PACED))
++        assert pd.paced_pools(conn, tid) is None
++        until = time.time() + 3600
++        notices._store(("anthropic", lp.HELD, until))
++        assert [(p.provider, p.state) for p in pd.paced_pools(conn, tid)] == [("anthropic", lp.HELD)]
++
++
++def test_raising_priority_on_a_paced_pool_card_is_not_refused(board, capsys):
++    with kbc.connect_closing() as conn:
++        tid = _anthropic_card(conn)
++    notices._store(("anthropic", lp.PACED))
++    assert edit_paced._main(["edit", tid, "--priority", "1000"]) == 0, capsys.readouterr().err
++    assert edit_paced._state(tid)[0] == 1000
++
++
++def test_raising_priority_on_a_held_pool_card_is_still_refused_without_a_reason(board, capsys):
++    with kbc.connect_closing() as conn:
++        tid = _anthropic_card(conn)
++    notices._store(("anthropic", lp.HELD, time.time() + 3600))
++    assert edit_paced._main(["edit", tid, "--priority", "1000"]) == 1
++    assert "llm_pacing" in capsys.readouterr().err and edit_paced._state(tid)[0] == 900
++
++
++def test_chat_wait_notice_for_a_paced_pool_card_keeps_its_ordinary_words(hub):
++    notices._store(("anthropic", lp.PACED))
++    tid = notices._hub_card(hub.conn)
++    payload, text = notices._chat_wait(hub.conn, tid)
++    assert (payload.get("admission") or {}).get("reason") != "llm_pacing", payload
++    assert "llm_pacing" not in text and "back on pace" not in text, text
++
++
++def test_parent_unclaimed_notice_for_a_paced_pool_card_keeps_its_ordinary_words(hub):
++    notices._store(("anthropic", lp.PACED))
++    tid = notices._hub_card(hub.conn)
++    payload, text = notices._parent_unclaimed(hub.conn, tid)
++    assert (payload.get("admission") or {}).get("reason") != "llm_pacing", payload
++    assert "llm_pacing" not in text and "back on pace" not in text, text
++
++
++def test_held_pool_notice_is_unchanged_by_default(hub):
++    notices._store(("anthropic", lp.HELD, time.time() + 3600))
++    tid = notices._hub_card(hub.conn)
++    payload, text = notices._chat_wait(hub.conn, tid)
++    assert payload["admission"]["reason"] == "llm_pacing", payload
++    assert cw.NOTICE_KIND and "llm_pacing" in text, text
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index d71d62c0c0d78055e2abcd3b508ad22ca5ecec21..af47ddb43a7b9a0b0d73c37d73105cd4e33339e6 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -1560,7 +1560,7 @@ To see why a ready card is not spawning, run `hermes kanban dispatch --dry-run`
+ Before claiming a ready or review card, the dispatcher checks the OAuth pool of the provider the card's next run would use (for a `class:*` selector, every provider the class may route to; the card waits only when all of them hold it). It reads each account's account-wide usage windows (`five_hour` and `seven_day` from `/api/oauth/usage`; Codex `Session`/`Weekly`) at most every `read_interval_seconds`, measures each window's burn rate from its recent samples, and compares the pool's burn with the rate that would bring every account with headroom to `target_percent` exactly at its window's reset. An account whose window has not started yet (the endpoint reports `null` for an idle `five_hour`) counts as a fresh full window; an account read successfully with both windows `null` (idle or brand-new) counts as two. A failed usage read adds no headroom.
+ 
+ - **open**: the pool is on or behind pace, so claims proceed (with `pace_starts: true`, just behind pace this host may grow only to its recent concurrency × the pace factor, at least one run).
+-- **paced**: the pool is ahead of pace. By default this holds nothing: how many cards run is decided by worker slots, and the token rate by a token throttle, so the verdict is only stored and shown. With `pace_starts: true` this host keeps its recent average concurrency on that provider × the pace factor. Review-lane, negative-priority and continuation-woken cards get only `deferrable_share` of that limit. The final limit has a one-run floor, including deferrable work: paced pools still have headroom, and an idle host must be able to restart rather than remain at zero forever. That floor is shared with running work on the provider, not an extra slot per card; it can exceed the proportional rate at low concurrency. Known quota walls are resolved before this check, and a rerouted card is governed by its destination provider's limit.
++- **paced**: the pool is ahead of pace. By default this holds nothing: how many cards run is decided by worker slots, and the token rate by a token throttle, so the verdict is only stored and shown. That token throttle is a separate component (the hermes-mods throughput plugin), not part of core: on a host without it, a paced pool runs at full slot count until every account passes its reserve and the pool becomes held, and a pool leaving a hold refills to the slot count at once. With `pace_starts: true` this host keeps its recent average concurrency on that provider × the pace factor. Review-lane, negative-priority and continuation-woken cards get only `deferrable_share` of that limit. The final limit has a one-run floor, including deferrable work: paced pools still have headroom, and an idle host must be able to restart rather than remain at zero forever. That floor is shared with running work on the provider, not an extra slot per card; it can exceed the proportional rate at low concurrency. Known quota walls are resolved before this check, and a rerouted card is governed by its destination provider's limit.
+ - **held**: every readable account is past its reserve (`reserve_five_hour_percent` / `reserve_seven_day_percent`), so no Kanban claim starts until the earliest reset frees one; the remaining headroom is left to chats, cron and notices.
+ 
+ A held card stays `ready` and unclaimed. The dispatcher records an `llm_paced` event (providers, state, limit, running) and a `dispatch_skipped` row with reason `llm_paced`. Queue position, the chat-wait and parent-unclaimed notices, and `hermes kanban diagnostics` (`held_in_ready`) name the hold instead of "skip reason unrecorded". Raising the card's priority does not lift it. If no account can be read, the governor fails open, and mandatory model pins and ungoverned providers always start. Only Kanban dispatch consults it.
+-- 
+2.43.0
+

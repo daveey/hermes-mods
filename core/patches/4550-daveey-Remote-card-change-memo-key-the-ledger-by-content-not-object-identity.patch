@@ -1,0 +1,167 @@
+From 756d682b3a83224a45a6626ca0cacd37d07f4c2d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 03:58:08 +0000
+Subject: [PATCH] [daveey] Remote card-change memo: key the ledger by content,
+ not object identity
+
+The unloaded host pass (INTERVAL_S 30 s) keyed `_remote_change_pass`'s skip memo on the
+`_remote_links(stale_ok=True)` card dicts by identity. A warm stale_ok read refreshes in the
+background, and that refresh republishes a NEW projection whenever the entry is older than
+`_LINKS_MAX_AGE_S` (15 s). So every steady-state pass saw new dicts for an unchanged ledger and the
+memo never hit in production replica mode (fail-safe: a miss runs the full pass, but the claimed
+skip never happened).
+
+Fix: `_ledger_content_key` digests (blake2b, sorted rows) the ledger-card fields
+`replica_cards` reads (owner labels, profile-board cards, cold-start fallback) and the pass keeps:
+key, board, id, gateway, profile, session, origin_session, origin_gateway, origin_profile, status,
+unfinished, released, ownership_state. The memo is compared by equality; no objects are held.
+
+Why it shipped: the PR's tests monkeypatched `_remote_inputs_key` itself, so nothing exercised the
+real `_remote_links` across >15 s gaps.
+
+Tests (tests/tui_gateway/test_remote_card_outcomes.py): the real `_remote_inputs_key` over the real
+`_remote_links`, clock +30 s per pass, refresh run inline, projector returning new dicts each call.
+- unchanged content: projections republish, remote reads stay flat (memo hits) - RED on base
+- key/status/session/origin_session/profile/gateway/released change: the pass runs
+- mutant dropping "profile" from the key fields is caught.
+
+Follow-up from review of #3349 (t_c0dda0fd22abf9d8); card t_bbea93e8bb9553ba.
+---
+ .../tui_gateway/test_remote_card_outcomes.py  | 56 +++++++++++++++++++
+ tui_gateway/notice_fanout.py                  | 28 +++++++---
+ 2 files changed, 76 insertions(+), 8 deletions(-)
+
+diff --git a/tests/tui_gateway/test_remote_card_outcomes.py b/tests/tui_gateway/test_remote_card_outcomes.py
+index e60b85690d3222b6d408e91ca8e38ce1c55aedf0..d292380cb2187096c7b1b72248ca4d68daaeb849 100644
+--- a/tests/tui_gateway/test_remote_card_outcomes.py
++++ b/tests/tui_gateway/test_remote_card_outcomes.py
+@@ -233,3 +233,59 @@ def test_a_failed_refresh_is_retried_not_memoised(db, remote, gated, monkeypatch
+     n = len(reads)
+     assert len(run(db)) == 1  # same inputs, but the chat was never acknowledged: the pass runs again
+     assert len(reads) > n
++
++
++# --- the real key over the real ``_remote_links`` at the 30 s host-pass cadence (t_bbea93e8bb9553ba) ---------------
++
++@pytest.fixture
++def real_key(db, remote, monkeypatch):
++    """The real ``_remote_inputs_key`` over the real ``_remote_links`` (warm ``stale_ok`` entry, refresh run inline),
++    a clock that moves 30 s per pass, and a projector that builds NEW dicts of ``ledger`` content on every call."""
++    import time as _time
++    from types import SimpleNamespace
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_client as ksc
++
++    clock, ledger, projections, reads = [1000.0], [], [], []
++    monkeypatch.setattr(sync, "sync_config", lambda: {"links_reader": "replica"})
++    monkeypatch.setattr(ksc, "load_identity", lambda: SimpleNamespace(gateway="gw"))
++    monkeypatch.setattr(ksc, "board_paths", list)
++    monkeypatch.setattr(ksa, "time", SimpleNamespace(**{**vars(_time), "monotonic": lambda: clock[0]}))
++    monkeypatch.setattr(ksa, "_links_cache", {})
++    monkeypatch.setattr(ksa, "_project_remote_links", lambda: projections.append(1) or [dict(c) for c in ledger])
++    monkeypatch.setattr(ksa, "_refresh_links_in_background", ksa._refresh_links_scope)
++    monkeypatch.setattr(ksa, "_remote_cards", lambda ids, statuses, stale_ok: reads.append(1) or list(remote))
++
++    def tick():
++        clock[0] += 30.0  # INTERVAL_S: past _LINKS_MAX_AGE_S, so every warm read republishes
++        return run(db)
++    return ledger, projections, reads, tick
++
++
++def test_unchanged_ledger_content_skips_across_republished_projections(db, remote, real_key):
++    ledger, projections, reads, tick = real_key
++    ledger.append({**card(), "profile": "default", "ownership_state": "qualified"})
++    tick()  # seeds
++    tick()  # reads and memoises
++    n, p = len(reads), len(projections)
++    for _ in range(3):
++        assert tick() == []
++    assert len(projections) > p  # new card objects every pass ...
++    assert len(reads) == n  # ... and the pass never re-read the remote cards
++
++
++@pytest.mark.parametrize("change", [{"key": "worker/default/t_other"}, {"status": "blocked"},
++                                    {"session": "other-chat"}, {"origin_session": "origin-chat"},
++                                    {"profile": "bb-tuner"}, {"gateway": "worker-2"}, {"released": True}])
++def test_a_ledger_content_change_runs_the_pass(db, remote, real_key, change):
++    ledger, _projections, reads, tick = real_key
++    ledger.append({**card(), "profile": "default", "ownership_state": "qualified"})
++    tick()
++    tick()
++    tick()  # the projection republished before this pass: settled on the memo
++    n = len(reads)
++    assert tick() == [] and len(reads) == n
++    ledger[0] = {**ledger[0], **change}
++    tick()  # warm read returns the old projection and refreshes inline; the next pass sees the change
++    tick()
++    assert len(reads) > n
+diff --git a/tui_gateway/notice_fanout.py b/tui_gateway/notice_fanout.py
+index dce3114fc513fbc04c9fe2b4094fde2dc914d0b3..e12f9470554d8dcc8ed174d29267173c8fa4762c 100644
+--- a/tui_gateway/notice_fanout.py
++++ b/tui_gateway/notice_fanout.py
+@@ -25,6 +25,7 @@ Session-outcome contract, "Fan-out" and "Stale notices":
+ from __future__ import annotations
+ 
+ import contextlib
++import hashlib
+ import json
+ import logging
+ import re
+@@ -245,17 +246,30 @@ def _fan_out_changes(conn: sqlite3.Connection, _kb: Any, session_db: Callable, s
+     return out
+ 
+ 
+-# The input key of the last remote pass that left every chat acknowledged, with the ledger cards it was computed over
+-# (held, so an object identity in the key cannot be reused). A pass over the same inputs reads the same snapshot.
++# The input key of the last remote pass that left every chat acknowledged. A pass over the same inputs reads the same
++# snapshot.
+ _remote_memo: Optional[tuple] = None
+ 
++# The ledger-card fields ``kanban_chat_links.replica_cards`` reads (owner labels, profile-board cards, cold-start
++# fallback) and the pass keeps (key, status, chat, origin chat, unfinished).
++_LEDGER_KEY_FIELDS = ("key", "board", "id", "gateway", "profile", "session", "origin_session", "origin_gateway",
++                      "origin_profile", "status", "unfinished", "released", "ownership_state")
++
++
++def _ledger_content_key(cards: list[dict]) -> str:
++    """A digest of what the pass can see of the origin-ledger projection. By content, not object identity: a warm
++    ``stale_ok`` read re-projects in the background once its entry is older than ``_LINKS_MAX_AGE_S`` (15 s), so
++    every 30 s pass would see new dicts for an unchanged ledger (t_bbea93e8bb9553ba)."""
++    rows = sorted(repr(tuple(c.get(f) for f in _LEDGER_KEY_FIELDS)) for c in cards)
++    return hashlib.blake2b("\n".join(rows).encode(), digest_size=16).hexdigest()
++
+ 
+ def _remote_inputs_key() -> Optional[tuple]:
+     """Everything ``activity._remote_cards`` reads for the replica projection that ``_remote_change_pass`` keeps
+     (card key, status, chat, origin chat), or None when any of it cannot be vouched for. That is each synced board's
+     replica content revision (trigger-backed only: a stat fallback never vouches), the origin-ledger projection's
+-    card objects (``_remote_links`` returns the same dicts until it re-projects), this gateway and profile, and
+-    the reader mode. A pull that moves only ``pulled_at`` changes none of them (t_48c41072e7cba68d)."""
++    content (``_ledger_content_key``), this gateway and profile, and the reader mode. A pull that moves only
++    ``pulled_at`` changes none of them (t_48c41072e7cba68d)."""
+     from hermes_cli import kanban_db_sync as sync
+     from hermes_cli import kanban_session_activity as activity
+     from hermes_cli import kanban_sync_client as ksc
+@@ -277,7 +291,7 @@ def _remote_inputs_key() -> Optional[tuple]:
+         if not is_revision(content):
+             return None
+         boards.append((slug, str(path), content))
+-    ledger = activity._remote_links(stale_ok=True)
++    ledger = _ledger_content_key(activity._remote_links(stale_ok=True))
+     return (gateway, get_active_profile_name(), tuple(boards)), ledger
+ 
+ 
+@@ -289,9 +303,7 @@ def _remote_change_pass(session_db: Callable) -> list[dict]:
+     except Exception:  # health: allow BLE001 -- an unreadable input is unknown: run the pass
+         logger.debug("remote card-change inputs unavailable", exc_info=True)
+         inputs = None
+-    memo = _remote_memo
+-    if inputs is not None and memo is not None and memo[0] == inputs[0] and len(memo[1]) == len(inputs[1]) \
+-            and all(a is b for a, b in zip(memo[1], inputs[1])):
++    if inputs is not None and inputs == _remote_memo:
+         return []
+     _remote_memo = None
+     from hermes_cli import kanban_session_activity as activity
+-- 
+2.43.0
+

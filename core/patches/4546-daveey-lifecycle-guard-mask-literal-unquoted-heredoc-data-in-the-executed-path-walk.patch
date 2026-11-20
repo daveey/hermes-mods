@@ -1,0 +1,201 @@
+From b466cfa846be5692af82b18a7c2c32937ddaa1fc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 21:10:42 +0000
+Subject: [PATCH] [daveey] lifecycle guard: mask literal unquoted heredoc data
+ in the executed-path walk
+
+`bash -l close.sh` refused with "kanban.db is a SQLite database open in this
+gateway process" when the script held an UNQUOTED heredoc whose body had call
+syntax on the db path (`python3 - <<EOF\nsqlite3.connect("DB")\nEOF`,
+`cat <<EOF\nf(DB)\nEOF`). In a startup-file shell's walk alias names are
+unknown (76e3ffa400), the unquoted body stayed visible, and `NAME ( x )` read
+as an alias-led subshell executing the db.
+
+Rule: in the executed-path walk only (nested=True), an unquoted heredoc body
+with no `$`, backtick or backslash is masked exactly like its quoted twin,
+behind the same consumer/shadow/output-sink fences. Such a body is
+byte-identical to the `<<'EOF'` form, which 76e3ffa400 already masks under
+unknown aliases, so this reopens nothing that rule closed. Expansion- or
+escape-bearing bodies stay visible (backslash-newline can even move the
+delimiter). Text scans are unchanged: `cat <<EOF\nhermes gateway restart\nEOF`
+under `bash -l` still refuses, and a script path named in a masked body is
+still read.
+
+Tests (tests/cron/test_lifecycle_guard_login_heredoc_data.py):
+- both data shapes allowed under bash -l / bash / sh / source, quoted and not;
+- still refused under bash -l: `alias cat=bash` (with and without
+  `shopt -s expand_aliases`) + unquoted body holding `hermes gateway restart`
+  or `bash danger.sh`; $(...)/backtick bodies; `| bash`; body written to a
+  later-run file; 80 real-bash oracle cases.
+- test_lifecycle_guard_heredoc_walk: the "expansion-capable body" test now
+  carries a real expansion (`$HOME`); its literal twin is pinned equal to the
+  quoted form.
+
+RED on main 5d9e537979b: 4 failures (both bash -l data shapes, the literal
+mask boundary, the quoted-twin equality). GREEN: tests/cron 282 files /
+11992 passed; tests/tools self_repo + heredoc_background guards 168 passed.
+
+The historical close_1235.sh on laptop-1 (read via hub) uses QUOTED
+heredocs; its refusal is a separate shape, not claimed fixed here.
+Card: t_8e9378b380c66089.
+---
+ .../cron/test_lifecycle_guard_heredoc_walk.py | 10 +-
+ ...test_lifecycle_guard_login_heredoc_data.py | 93 +++++++++++++++++++
+ tools/shell_heredoc.py                        | 13 ++-
+ 3 files changed, 113 insertions(+), 3 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_login_heredoc_data.py
+
+diff --git a/tests/cron/test_lifecycle_guard_heredoc_walk.py b/tests/cron/test_lifecycle_guard_heredoc_walk.py
+index ee6466114d526a704da1561f48538ec2233e4b75..03e67b2df7ec592fd1f1ecc16014dd27d2d92ae1 100644
+--- a/tests/cron/test_lifecycle_guard_heredoc_walk.py
++++ b/tests/cron/test_lifecycle_guard_heredoc_walk.py
+@@ -45,7 +45,15 @@ def test_allowlisted_name_function_heredoc_stays_visible(tmp_path):
+ def test_unquoted_heredoc_body_path_still_walked(tmp_path):
+     """An expansion-capable body is not provably inert: the walk still sees it and fails closed."""
+     big = _big_file(tmp_path)
+-    assert guard(f"cat > /tmp/x <<EOF\n{big}\nEOF", cwd=str(tmp_path)) is True
++    assert guard(f"cat > /tmp/x <<EOF\n{big} $HOME\nEOF", cwd=str(tmp_path)) is True
++
++
++def test_literal_unquoted_heredoc_body_matches_quoted_twin(tmp_path):
++    """Without ``$``, backtick or backslash an unquoted body is byte-identical to its quoted
++    twin, so the executed-path walk masks both alike."""
++    big = _big_file(tmp_path)
++    for delimiter in ("EOF", "'EOF'"):
++        assert guard(f"cat > /tmp/x <<{delimiter}\n{big}\nEOF", cwd=str(tmp_path)) is False
+ 
+ 
+ def test_inert_heredoc_body_script_path_still_read(tmp_path):
+diff --git a/tests/cron/test_lifecycle_guard_login_heredoc_data.py b/tests/cron/test_lifecycle_guard_login_heredoc_data.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d0ee1648414a296fa657c6bd3fbca205a97b4b38
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_login_heredoc_data.py
+@@ -0,0 +1,93 @@
++"""Literal unquoted heredoc data is not a startup shell's alias subshell."""
++
++import itertools
++import os
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from tools.shell_heredoc import strip_inert_heredoc_bodies
++
++
++@pytest.mark.parametrize("body", [
++    'python3 - <<EOF\nimport sqlite3\nc = sqlite3.connect("DB")\nEOF\n',
++    'cat <<EOF\nf(DB)\nEOF\n',
++])
++@pytest.mark.parametrize("launcher", ["bash -l", "bash", "sh", "source"])
++@pytest.mark.parametrize("delimiter", ["EOF", "'EOF'"])
++def test_login_script_literal_heredoc_data(tmp_path, body, launcher, delimiter):
++    db = tmp_path / "kanban.db"
++    db.write_bytes(b"x" * 2100000)
++    script = tmp_path / "close.sh"
++    script.write_text(body.replace("DB", str(db)).replace("<<EOF", f"<<{delimiter}"))
++    assert scan_gateway_lifecycle(f"{launcher} {script}", cwd=str(tmp_path)) == (False, None)
++
++
++@pytest.mark.parametrize("prefix,opener,body,suffix", [
++    ("shopt -s expand_aliases\nalias cat=bash\n", "cat <<EOF", 'hermes gateway restart', ""),
++    ("alias cat=bash\n", "cat <<EOF", 'hermes gateway restart', ""),
++    ("alias cat=bash\n", "cat <<EOF", 'bash DANGER', ""),
++    ("", "cat <<EOF", '$(hermes gateway restart)', ""),
++    ("", "cat <<EOF", '`hermes gateway restart`', ""),
++    ("", "cat <<EOF | bash", 'hermes gateway "restart"', ""),
++    ("", "cat <<EOF > later.sh", 'hermes gateway "restart"', "bash later.sh\n"),
++    ("", "cat <<EOF > later.sh", 'bash DANGER', "bash later.sh\n"),
++])
++def test_login_heredoc_execution_stays_refused(tmp_path, prefix, opener, body, suffix):
++    danger = tmp_path / "danger.sh"
++    danger.write_text('hermes gateway "restart"\n')
++    script = tmp_path / "close.sh"
++    script.write_text(f"{prefix}{opener}\n{body}\nEOF\n{suffix}".replace("DANGER", str(danger)))
++    assert scan_gateway_lifecycle(f"bash -l {script}", cwd=str(tmp_path))[0]
++
++
++@pytest.mark.parametrize("body", ["$VALUE", "`printf RUN`", "line\\\ncontinued", "literal"])
++@pytest.mark.parametrize("nested", [False, True])
++def test_literal_mask_boundary(body, nested):
++    text = f"cat <<EOF\n{body}\nEOF\n"
++    masked = strip_inert_heredoc_bodies(text, nested=nested)
++    assert (masked != text) is (nested and body == "literal")
++
++
++def test_every_body_must_be_literal():
++    text = "cat <<EOF 3<<SECOND\nliteral\nEOF\n$VALUE\nSECOND\n"
++    assert strip_inert_heredoc_bodies(text, nested=True) == text
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("shell,consumer,shape", itertools.product(
++    ["bash -l", "bash --login", "env bash -l", "timeout 5 bash -l", "bash -O expand_aliases -l"],
++    ["cat", "command cat", "env cat", "timeout 5 cat"],
++    ["substitution", "backtick", "pipe", "file"],
++))
++def test_generated_real_bash_execution_is_refused(tmp_path, shell, consumer, shape):
++    """Real harmless execution oracle; the fake hermes never touches a gateway."""
++    fake = tmp_path / "hermes"
++    fake.write_text('#!/bin/sh\nprintf RUN\\n\n')
++    fake.chmod(0o755)
++    danger = tmp_path / "danger.sh"
++    danger.write_text('hermes gateway "restart"\n')
++    payload = f"bash {danger}"
++    opener, suffix = f"{consumer} <<EOF", ""
++    if shape == "substitution":
++        payload = f"$({payload})"
++    elif shape == "backtick":
++        payload = f"`{payload}`"
++    elif shape == "pipe":
++        opener += " | bash"
++    else:
++        opener += f" > {tmp_path / 'later.sh'}"
++        suffix = f"bash {tmp_path / 'later.sh'}\n"
++    script = tmp_path / "close.sh"
++    script.write_text(f"{opener}\n{payload}\nEOF\n{suffix}")
++    unsafe_before_execution = scan_gateway_lifecycle(f"{shell} {script}", cwd=str(tmp_path))[0]
++    # Outer startup files are not needed for the marker; execute the same script
++    # under isolated bash while testing each login invocation through the guard.
++    result = subprocess.run(
++        ["/bin/bash", "--noprofile", "--norc", str(script)],
++        env={"PATH": f"{tmp_path}{os.pathsep}{os.defpath}", "HOME": str(tmp_path)}, cwd=tmp_path,
++        capture_output=True, text=True, encoding="utf-8", timeout=10, check=True,
++    )
++    assert "RUN" in result.stdout
++    assert unsafe_before_execution
+diff --git a/tools/shell_heredoc.py b/tools/shell_heredoc.py
+index 18c5d2dd5df848586e0e1f0c76ff7b0e0a5ba6a6..c47b4f5e3f7fea159f3657a8fe0832039c75fcdd 100644
+--- a/tools/shell_heredoc.py
++++ b/tools/shell_heredoc.py
+@@ -643,7 +643,8 @@ def heredoc_body_spans(command: str) -> list[tuple[int, int, int]]:
+ def strip_inert_heredoc_bodies(command: str, *, nested: bool = False, _depth: int = 0) -> str:
+     """Mask heredoc bodies that are provably inert data (see module docstring).
+ 
+-    ``nested=True`` (the lifecycle guard's executed-path walk only) also masks data-consumer
++    ``nested=True`` (the lifecycle guard's executed-path walk only) also masks literal
++    unquoted data bodies with no expansion or escape characters, and data-consumer
+     heredocs nested in the single quoted body of an outer heredoc a shell reads verbatim (``ssh h
+     'bash -s' <<'R'``); the outer body's own lines stay visible. Text scanners keep the default:
+     a nested body's literal text stays visible to them, whatever the outer body does with it."""
+@@ -686,7 +687,15 @@ def strip_inert_heredoc_bodies(command: str, *, nested: bool = False, _depth: in
+         body_cursor = bodies[-1][2]
+         quoted = [spec_quoted for _delimiter, _strip_tabs, spec_quoted in specs]
+         consumer = None
+-        if all(quoted) and not post_heredoc_list_operator:
++        # The executed-path walk need not interpret literal unquoted data as shell
++        # syntax (notably Python calls under a login shell's unknown aliases).
++        # Keep every expansion/escape uncertain; backslash-newline can even change
++        # where an unquoted delimiter ends. Text scanners retain their old view.
++        literal_data = nested and all(
++            not any(char in command[start:terminator] for char in "$`\\")
++            for start, terminator, _end in bodies
++        )
++        if (all(quoted) or literal_data) and not post_heredoc_list_operator:
+             consumer = _owner_runs_inert_consumer(command, command_start, command_end, owner_start)
+         prefix_intact = stdin.before_heredoc(command, command_start, owner_start)
+         if _depth and not prefix_intact:
+-- 
+2.43.0
+

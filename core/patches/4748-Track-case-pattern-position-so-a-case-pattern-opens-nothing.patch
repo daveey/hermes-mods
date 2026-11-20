@@ -1,0 +1,148 @@
+From 14827168000b9f4b76a3ff83a9b14012bba4bce5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 14:42:35 +0000
+Subject: [PATCH] Track case pattern position so a `case` pattern opens nothing
+
+In a `$(...)` frame, `case` spelled as a pattern (after `(`, `|`, `;;`,
+`;&`, `;;&` or a newline in pattern position) pushed a phantom case that
+never popped, so the real `)` closing `$(` read as a pattern end and a
+double-quoted frame hid the following command
+(`echo "${x:-$(case x in (case) true;; esac)}"; bash ./r.sh`).
+
+_command_span now tracks each open case's phase (subject, in, pattern,
+pattern-word, body). In a pattern list only a leading `esac` is reserved,
+matching bash: `(esac)` and `a|esac)` are patterns, and `;;`/`;&`/`;;&`
+return a clause to pattern position.
+
+Tests: 15 case-pattern RUN rows with clean twins (11 red at b73814a23a,
+all green after); lifecycle-guard suites 29 files / 2230 passed; a
+13056-row case-pattern sweep against real bash shows 0 fail-open and 0
+over-refusals.
+---
+ cron/lifecycle_guard_lines.py                 | 46 ++++++++++++++-----
+ .../test_lifecycle_guard_nested_comments.py   | 32 +++++++++++++
+ 2 files changed, 66 insertions(+), 12 deletions(-)
+
+diff --git a/cron/lifecycle_guard_lines.py b/cron/lifecycle_guard_lines.py
+index 7d4e5f190f19e59ebeb4870db1e5fef92118acfd..b8c8094db1f62cae6b1f55171df39241c5579934 100644
+--- a/cron/lifecycle_guard_lines.py
++++ b/cron/lifecycle_guard_lines.py
+@@ -61,11 +61,13 @@ def _command_span(text: str, start: int, *, shlex_quotes: bool,
+     depth = 1
+     word_start = True
+     parts = ["$("]
+-    # Depths at which an open `case` waits for its `esac`: there a bare `)` ends a pattern,
+-    # not the substitution (`$(case x in x) true;; esac)`).
+-    case_depths: list[int] = []
++    # Open `case` statements as [depth, phase]. In a pattern list a bare `)` ends the pattern,
++    # not the substitution (`$(case x in x) true;; esac)`), and no word but a leading `esac`
++    # is reserved there (`(case)` is a pattern, not a nested `case`). Phases: "subject" and
++    # "in" before the clauses, "pattern" at a clause start, "pattern-word" inside a pattern
++    # list (after `(`, `|` or a word), "body" in a clause's command list.
++    cases: list[list] = []
+     at_command = True
+-    last_word = ""
+     while pos < len(text):
+         char = text[pos]
+         if char == "#" and word_start:
+@@ -80,13 +82,22 @@ def _command_span(text: str, start: int, *, shlex_quotes: bool,
+             continue
+         if word_start and char not in _WORD_BREAKS:
+             word = _plain_word(text, pos)
+-            if word == "case" and at_command:
+-                case_depths.append(depth)
+-            elif (word == "esac" and case_depths and case_depths[-1] == depth
+-                  and (at_command or last_word == "in")):
+-                case_depths.pop()
+-            at_command = word in _COMMAND_PREFIX_WORDS
+-            last_word = word
++            top = cases[-1] if cases and cases[-1][0] == depth else [depth, ""]
++            phase = top[1]
++            if phase == "subject":
++                top[1] = "in"
++            elif phase == "in":
++                if word == "in":
++                    top[1] = "pattern"
++            elif phase == "pattern" and word == "esac":
++                cases.pop()
++            elif phase in ("pattern", "pattern-word"):
++                top[1] = "pattern-word"
++            elif word == "case" and at_command:
++                cases.append([depth, "subject"])
++            elif word == "esac" and phase == "body" and at_command:
++                cases.pop()
++            at_command = phase in ("", "body") and word in _COMMAND_PREFIX_WORDS
+         if char == "\\":
+             if text[pos + 1:pos + 2] != "\n":
+                 word_start = False
+@@ -111,12 +122,23 @@ def _command_span(text: str, start: int, *, shlex_quotes: bool,
+             pos = copied = end
+             word_start = False
+             continue
++        top = cases[-1] if cases and cases[-1][0] == depth else [depth, ""]
++        phase = top[1]
++        if char == ";" and phase == "body" and text[pos + 1:pos + 2] in (";", "&"):
++            # `;;`, `;&` or `;;&` ends a clause: a pattern list (or `esac`) follows.
++            pos += 3 if text.startswith(";;&", pos) else 2
++            top[1] = "pattern"
++            at_command = word_start = True
++            continue
+         if char == "\n" and breaks is not None:
+             breaks.append(_out_len(parts) + pos - copied)
++        elif char == "(" and phase == "pattern":
++            top[1] = "pattern-word"  # a pattern list's optional leading parenthesis
+         elif char == "(":
+             depth += 1
+         elif char == ")":
+-            if case_depths and case_depths[-1] == depth:
++            if phase in ("pattern", "pattern-word"):
++                top[1] = "body"
+                 at_command = True  # a case pattern ends; its command list follows
+             else:
+                 depth -= 1
+diff --git a/tests/cron/test_lifecycle_guard_nested_comments.py b/tests/cron/test_lifecycle_guard_nested_comments.py
+index 0054751f3f69e1a0763d338a8ea79e490f65f847..b4394365cc71a18c8cf3c13aabd1a7091193866b 100644
+--- a/tests/cron/test_lifecycle_guard_nested_comments.py
++++ b/tests/cron/test_lifecycle_guard_nested_comments.py
+@@ -107,6 +107,38 @@ def test_newline_in_nested_substitution_separates_commands(tmp_path, frame, dang
+     assert refused is dangerous, reason
+ 
+ 
++# In a case pattern list only a leading `esac` is reserved: a pattern spelled `case` (or `in`,
++# `esac` after `(`/`|`) opens nothing, so the real `)` still closes the substitution and the
++# command after a double-quoted frame stays visible.
++CASE_PATTERN_FRAMES = [
++    'echo "${x:-$(case x in (case) true;; esac)}"; {cmd}',
++    'echo "${x:-$(case x in case) true;; esac)}"; {cmd}',
++    'echo "${x:-$(case x in a|case) true;; esac)}"; {cmd}',
++    'echo "${x:-$(case x in x) true;; case) true;; esac)}"; {cmd}',
++    'echo "${x:-$(case x in x) true;& case) true;; esac)}"; {cmd}',
++    'echo "${x:-$(case x in x) true;;& case) true;; esac)}"; {cmd}',
++    'echo "${x:-$(case x in\ncase) true;; esac)}"; {cmd}',
++    'echo "${x:-$(case x in (esac) true;; esac)}"; {cmd}',
++    'echo "${x:-$(case x in a|esac) true;; esac)}"; {cmd}',
++    'echo "${x:-$(case x in (in) true;; esac)}"; {cmd}',
++    'echo "${x:-$(case case in (case) true;; esac)}"; {cmd}',
++    'echo ${x:-"$(case x in (case) true;; esac)"}; {cmd}',
++    'x="${y:-$(case x in (case) true;; esac)}"; {cmd}',
++    'echo "${x:-$(case x in (case) true;; esac)}" && {cmd}',
++    'echo "${x:-$(case x in x) case y in (case) true;; esac;; esac)}"; {cmd}',
++]
++
++
++@pytest.mark.parametrize("frame", CASE_PATTERN_FRAMES)
++@pytest.mark.parametrize("dangerous", [True, False], ids=["RUN", "clean"])
++def test_case_word_as_pattern_does_not_hide_following_command(tmp_path, frame, dangerous):
++    helpers._tree(tmp_path)
++    command = frame.replace("{cmd}", "bash ./r.sh" if dangerous else "python3 ./clean.py")
++    assert helpers._bash_runs(tmp_path, command) is dangerous
++    refused, reason = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert refused is dangerous, reason
++
++
+ @pytest.mark.parametrize("escape", [r"\0", r"\x00"])
+ @pytest.mark.parametrize("dangerous", [True, False], ids=["RUN", "clean"])
+ def test_ansi_nul_truncates_only_quoted_span(tmp_path, escape, dangerous):
+-- 
+2.43.0
+

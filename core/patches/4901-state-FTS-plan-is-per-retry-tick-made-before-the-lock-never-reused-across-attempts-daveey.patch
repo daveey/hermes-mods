@@ -1,0 +1,226 @@
+From 1e0cccaac99b6acd4694e8e072389b5b975e0a97 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 17:41:27 -0800
+Subject: [PATCH] state: FTS plan is per retry tick, made before the lock,
+ never reused across attempts [daveey]
+
+Review round 4: (1) on #106393's holder-changed branch the backoff had not elapsed, so the tick
+skipped its pre-lock check and the gate planned under self._lock (the hub's case: the
+supervised holder stops); (2) the pre-lock check also ran while a holder was present, where the
+one-shot just defers; (3) a cached plan (5 min) outlived a successful one-shot, so a fresh
+failure could be judged on a pre-damage check and the DROP free a shared page twice.
+
+- No plan cache. The retry tick makes its plan just before taking self._lock, on every path
+  that reaches the one-shot, and only when no foreign holder is present; the gate and the
+  online path of that tick use it; it is discarded in `finally`.
+- Inside a retry tick the gate never plans under the lock: with no tick plan (a holder left
+  between the two checks) it skips the DROP and the next tick plans first.
+- With a holder present, the online path plans for itself after the lock is released.
+- The 6 h refusal memo stays.
+
+Tests: holder leaving mid-backoff plans once, outside the lock, and the tick plan is discarded;
+the gate never plans under the lock inside a tick.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_state_fts_online.py                    | 38 ++++++-------
+ hermes_state_schema.py                        | 18 ++++--
+ .../hermes_state/test_fts_online_recovery.py  | 57 ++++++++++++++++++-
+ 3 files changed, 84 insertions(+), 29 deletions(-)
+
+diff --git a/hermes_state_fts_online.py b/hermes_state_fts_online.py
+index 389d6ccb47e8bd64a96c676d6daf96a80c36065a..965752a2c69be378e0d9f334961b835e0ab117d0 100644
+--- a/hermes_state_fts_online.py
++++ b/hermes_state_fts_online.py
+@@ -168,38 +168,35 @@ def online_recovery_script(*, unlink_tables, trash, trash_tables, trigram: bool,
+     return "\n".join(p for p in parts if p)
+ 
+ 
+-# A plan computed by the retry tick (outside ``self._lock``) is reused by the one-shot gate and the online path of the
+-# same tick instead of a second whole-file check.
+-_PLAN_REUSE_S = 300.0
+-
+-
+ class SessionFtsOnlineRecoveryMixin:
+     """See the module docstring. Mixed into ``SessionDB``."""
+ 
++    def _fts_plan_outcome(self):
++        """``("ok", plan)`` or ``("refused", reason)`` from a fresh whole-file check, honouring the refusal memo."""
++        try:
++            return ("ok", self._fts_plan())
++        except OnlineRecoveryRefused as exc:
++            return ("refused", str(exc))
++
+     def _fts_plan(self, *, force: bool = False) -> dict:
+-        """The current whole-file plan: a fresh cached one, else a new check. Raises OnlineRecoveryRefused, also
+-        for a refusal remembered within ``ONLINE_REFUSAL_MEMO_S`` (unless *force*). Callers should not hold
+-        ``self._lock`` when it may run a check (``prepare_fts_plan`` does that ahead of time)."""
++        """The plan for the current recovery attempt: the retry tick's own (``_fts_tick_plan``, made before it took
++        ``self._lock`` and discarded at the end of the tick), else a fresh whole-file check. Never a plan from an
++        earlier attempt: damage can appear between attempts. Raises OnlineRecoveryRefused, also for a refusal
++        remembered within ``ONLINE_REFUSAL_MEMO_S`` (unless *force*)."""
++        tick = getattr(self, "_fts_tick_plan", None)
++        if tick is not None and not force:
++            if tick[0] == "refused":
++                raise OnlineRecoveryRefused(tick[1])
++            return tick[1]
+         now = time.monotonic()
+         if not force and now < getattr(self, "_fts_online_refused_until", 0.0):
+             raise OnlineRecoveryRefused(getattr(self, "_fts_online_refused_reason", "a recent plan refused"))
+-        cached = getattr(self, "_fts_cached_plan", None)
+-        if cached is not None and now - cached[0] < _PLAN_REUSE_S:
+-            return cached[1]
+         try:
+-            plan = plan_online_recovery(self.db_path)
++            return plan_online_recovery(self.db_path)
+         except OnlineRecoveryRefused as exc:
+             self._fts_online_refused_until = now + ONLINE_REFUSAL_MEMO_S
+             self._fts_online_refused_reason = str(exc)
+             raise
+-        self._fts_cached_plan = (now, plan)
+-        return plan
+-
+-    def prepare_fts_plan(self) -> None:
+-        """Run the whole-file check now, without holding ``self._lock`` (the retry tick calls this first, so the
+-        check never stalls this process's writes). Never raises."""
+-        with contextlib.suppress(OnlineRecoveryRefused, Exception):
+-            self._fts_plan()
+ 
+     def recover_stale_fts_online(self, *, reason: str, force: bool = False) -> bool:
+         """Steps 1-2. True when done (or already done by a peer). Never raises; False leaves everything as it was.
+@@ -264,7 +261,6 @@ class SessionFtsOnlineRecoveryMixin:
+                     self._fts_deferred_holder_pids = None
+                     self._fts_stale_retry_interval = 0.0
+                     self._fts_chunk_rows = self._FTS_REBUILD_CHUNK_ROWS
+-                    self._fts_cached_plan = None
+                     high_water = cursor.execute(
+                         "SELECT value FROM state_meta WHERE key = 'fts_rebuild_high_water'").fetchone()
+             logger.warning(
+diff --git a/hermes_state_schema.py b/hermes_state_schema.py
+index 1fee862e7a1b11409f660c92b3513e018e2bb3e6..ed1d1b20509c9169a16af1677d73cd1ce6bf8061 100644
+--- a/hermes_state_schema.py
++++ b/hermes_state_schema.py
+@@ -581,6 +581,10 @@ class SessionSchemaMixin:
+         the plan before taking ``self._lock`` and this reuses it."""
+         from hermes_state_fts_online import OnlineRecoveryRefused
+ 
++        if getattr(self, "_fts_in_retry_tick", False) and getattr(self, "_fts_tick_plan", None) is None:
++            # A holder left between the tick's check and the one-shot's: no plan made outside the lock. Never plan
++            # under it in a running process; the next tick plans first.
++            return False
+         try:
+             plan = self._fts_plan()
+         except OnlineRecoveryRefused as exc:
+@@ -656,11 +660,6 @@ class SessionSchemaMixin:
+         except sqlite3.Error:
+             pass
+         now = time.monotonic()
+-        if now >= getattr(self, "_fts_stale_retry_after", 0.0):
+-            # The whole-file check behind the DROP gate and the online plan runs here, before self._lock: on a large
+-            # store it takes minutes, and every write of this process waits on that lock.
+-            self.prepare_fts_plan()
+-            now = time.monotonic()
+         deferred_pids = getattr(self, "_fts_deferred_holder_pids", None)
+         if now < getattr(self, "_fts_stale_retry_after", 0.0):
+             # The backoff was earned by a specific holder set; once that set changes (the other
+@@ -678,6 +677,12 @@ class SessionSchemaMixin:
+             max(interval, _FTS_STALE_RETRY_SECONDS, 1.0) * 2.0, _FTS_STALE_RETRY_MAX_SECONDS,
+         )
+         try:
++            # The one-shot DROP gate needs a whole-file plan, and on a large store that check takes minutes; every
++            # write of this process waits on self._lock, so it runs here, before the lock, and only when the
++            # one-shot can run at all (no foreign holder: with one, the one-shot defers before the gate, and the
++            # online path below plans for itself, also outside the lock). Used for this tick only.
++            self._fts_tick_plan = self._fts_plan_outcome() if not self._foreign_state_db_holders() else None
++            self._fts_in_retry_tick = True
+             with self._lock:
+                 if self._conn is None or not self._fts_stale:
+                     return False
+@@ -704,6 +709,9 @@ class SessionSchemaMixin:
+                 "In-process retry of the deferred stale state.db FTS rebuild failed; will retry later.", exc_info=True,
+             )
+             return False
++        finally:
++            self._fts_tick_plan = None
++            self._fts_in_retry_tick = False
+ 
+     def _recover_stale_fts_locked(self, cursor: sqlite3.Cursor, *, legacy: bool) -> bool:
+         """Body of :meth:`_recover_stale_fts`; caller holds rebuild authority. One write
+diff --git a/tests/hermes_state/test_fts_online_recovery.py b/tests/hermes_state/test_fts_online_recovery.py
+index b1d44f1f453186739045438f158f15d0df62585c..fa08830624c218c7ea563cc8efe7db7f09d86df8 100644
+--- a/tests/hermes_state/test_fts_online_recovery.py
++++ b/tests/hermes_state/test_fts_online_recovery.py
+@@ -582,7 +582,6 @@ def test_a_refused_plan_is_remembered_by_the_one_shot_gate(tmp_path, monkeypatch
+             raise hermes_state_fts_online.OnlineRecoveryRefused("damage outside the index (test)")
+ 
+         monkeypatch.setattr(hermes_state_fts_online, "plan_online_recovery", refuse)
+-        db._fts_cached_plan = None
+         assert db._oneshot_drop_is_safe(legacy=False) is False
+         assert db._oneshot_drop_is_safe(legacy=False) is False
+         assert db.recover_stale_fts_online(reason="test") is False
+@@ -606,8 +605,60 @@ def test_retry_tick_plans_before_taking_the_session_lock(damaged, monkeypatch):
+             return real(db_path)
+ 
+         monkeypatch.setattr(hermes_state_fts_online, "plan_online_recovery", plan)
+-        db._fts_cached_plan = None
+         assert db.retry_deferred_fts_recovery() is True
+-        assert held == [False]  # one check, outside the lock, shared by the gate and the online path
++        assert held == [False]  # one check, outside the lock (holders present: the online path plans for itself)
+     finally:
+         db.close()
++
++
++def test_holder_leaving_mid_backoff_plans_outside_the_lock_and_never_reuses_an_old_plan(tmp_path, monkeypatch):
++    """#106393's branch: the backoff has not elapsed but the holder set changed. The one-shot then runs; its gate gets a
++    plan made this tick, outside the lock, never one from an earlier attempt."""
++    import hermes_state_fts_online
++
++    path = tmp_path / "state.db"
++    _seed(path)
++    before = _canonical(path)
++    _break_trigram_btree(path)
++    holders = [[(424242, str(path))]]
++    monkeypatch.setattr(SessionDB, "_foreign_state_db_holders", lambda self: holders[0])
++    db = SessionDB(db_path=path)
++    try:
++        assert db._fts_stale is True
++        db._fts_stale_retry_after = time.monotonic() + 600
++        db._fts_deferred_holder_pids = [424242]
++        real = hermes_state_fts_online.plan_online_recovery
++        held = []
++
++        def plan(db_path):
++            held.append(db._lock.locked())
++            return real(db_path)
++
++        monkeypatch.setattr(hermes_state_fts_online, "plan_online_recovery", plan)
++        holders[0] = []  # the supervised holder stops
++        # The gate refuses the DROP (named family), and the same tick recovers online with that plan.
++        assert db.retry_deferred_fts_recovery() is True
++        assert held == [False]
++        assert db._fts_tick_plan is None  # discarded at the end of the tick
++        _drain(db)
++    finally:
++        db.close()
++    assert _canonical(path)[:len(before)] == before
++
++
++def test_gate_never_plans_under_the_lock_inside_a_retry_tick(tmp_path, monkeypatch):
++    import hermes_state_fts_online
++
++    path = tmp_path / "state.db"
++    _seed(path, sessions=1, per=10)
++    db = SessionDB(db_path=path)
++    try:
++        monkeypatch.setattr(hermes_state_fts_online, "plan_online_recovery",
++                            lambda p: pytest.fail("no whole-file check under the lock in a running process"))
++        db._fts_in_retry_tick, db._fts_tick_plan = True, None
++        with db._lock:
++            assert db._oneshot_drop_is_safe(legacy=False) is False
++    finally:
++        db._fts_in_retry_tick = False
++        db.close()
++
+-- 
+2.43.0
+

@@ -1,0 +1,148 @@
+From 5a537c1a395e264417f50122a931644f260e924a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 14:06:02 +0000
+Subject: [PATCH] [daveey] Keep case-pattern closers inside arithmetic
+ substitution frames
+
+The arithmetic sink scanner popped a command-substitution frame at a case-pattern closing parenthesis. Nested quotes then poisoned its parent state, classifying ordinary stderr output as executed code and falsely rejecting /dev/null. Use the existing case-aware substitution boundary parser and scan each body with preserved date policy and bounded depth. Keep malformed and exhausted frames conservative; remove the scoped xfail.
+
+Proof: baseline new regression tests 70 passed/6 failed; fixed focused suite 80 passed. Five focused mutants killed (body traversal, malformed closer, boundary budget, depth and date policy). 64 importer files: 10314 passed. Full real-Bash shape corpus: 30852 cases, zero violations and false refusals. scripts/check --base origin/main passed.
+---
+ tests/cron/test_lifecycle_guard_case_sink.py  | 62 +++++++++++++++++++
+ ...t_lifecycle_guard_substitution_comments.py |  7 +--
+ tools/shell_arith_sink.py                     | 18 +++++-
+ 3 files changed, 78 insertions(+), 9 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_case_sink.py
+
+diff --git a/tests/cron/test_lifecycle_guard_case_sink.py b/tests/cron/test_lifecycle_guard_case_sink.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f1108918f6bc2cc78bc021ced7914b138f19cb0e
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_case_sink.py
+@@ -0,0 +1,62 @@
++"""Case pattern closers must not turn substitution data into executed scripts."""
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from tools.shell_arith_sink import substitution_in_arithmetic
++from tools.shell_heredoc import output_reaches_shell
++
++
++@pytest.mark.parametrize('body', [
++    'case x in x) echo " # ";; esac; echo ok',
++    'case x in (x) echo " # ";; esac; echo ok',
++    'case x in x) case y in y) echo " # ";; esac;; esac',
++])
++@pytest.mark.parametrize('levels', [1, 2, 3])
++def test_case_substitution_output_is_data(body, levels):
++    for _ in range(levels):
++        body = 'echo "$(' + body + ')"'
++    assert not substitution_in_arithmetic(body, date_exempt=True)
++    assert not output_reaches_shell(body)
++
++
++@pytest.mark.parametrize('payload', [
++    'echo "$(( $(echo 1) + 1 ))"',
++    'let "a[$(echo 1)]=1"',
++    'declare -i value; value=$(echo 1)',
++])
++def test_case_body_retains_real_arithmetic_sink(payload):
++    command = 'echo "$(echo "$(case x in x) ' + payload + ';; esac)")"'
++    assert substitution_in_arithmetic(command, date_exempt=True)
++    assert output_reaches_shell(command)
++
++
++@pytest.mark.parametrize('command', ['echo "$(echo x', 'echo $(case x in x) echo x;; esac'])
++def test_incomplete_substitution_stays_conservative(command):
++    assert substitution_in_arithmetic(command, date_exempt=True)
++
++
++def test_substitution_boundary_budget_stays_conservative(monkeypatch):
++    from cron import lifecycle_guard_substitutions as substitutions
++
++    def exhausted(*args):
++        raise substitutions.SubstitutionNestingLimit('test boundary budget')
++
++    monkeypatch.setattr(substitutions, '_paren_end', exhausted)
++    assert substitution_in_arithmetic('echo $(echo ok)', date_exempt=True)
++
++
++@pytest.mark.parametrize('date_exempt', [True, False])
++def test_nested_body_preserves_date_policy(date_exempt):
++    command = 'echo "$(echo "$(( $(date +%s) + 1 ))")"'
++    assert substitution_in_arithmetic(command, date_exempt=date_exempt) is not date_exempt
++
++
++def test_nested_body_charges_recursion_depth():
++    assert substitution_in_arithmetic('echo $(echo ok)', date_exempt=True, _depth=31)
++
++
++def test_case_body_executed_device_still_fails_closed():
++    command = 'echo "$(echo "$(case x in x) echo " # ";; esac; bash /dev/null)")"'
++    unsafe, reason = scan_gateway_lifecycle(command)
++    assert unsafe
++    assert 'not a regular file' in reason
+diff --git a/tests/cron/test_lifecycle_guard_substitution_comments.py b/tests/cron/test_lifecycle_guard_substitution_comments.py
+index efbfa76cfe8b074caac5974dc6244d304e54905b..1c65bb0cb72d85f037697ba393ebc724ed830297 100644
+--- a/tests/cron/test_lifecycle_guard_substitution_comments.py
++++ b/tests/cron/test_lifecycle_guard_substitution_comments.py
+@@ -15,12 +15,7 @@ from tests.cron.test_lifecycle_guard_fd_redirections import _bash_runs, _tree
+ @pytest.mark.parametrize('wrapper', ['echo "$(BODY)"', 'echo "$(echo "$(BODY)")"'])
+ @pytest.mark.parametrize('script', ['bash ./r.sh', 'bash 2>$(echo /dev/null) < ./r.sh'])
+ @pytest.mark.parametrize('dangerous', [True, False])
+-def test_nested_quote_comment_boundary(tmp_path, body, wrapper, script, dangerous, request):
+-    # Existing quoted-output walker false positive, independent of tokenization.
+-    if (not dangerous and body.startswith('case ') and wrapper.count('$(') == 2
+-            and '2>' in script):
+-        request.node.add_marker(pytest.mark.xfail(
+-            strict=True, reason='t_b7ab5fa6d6edc46d: stderr output scanned as a script'))
++def test_nested_quote_comment_boundary(tmp_path, body, wrapper, script, dangerous):
+     _tree(tmp_path)
+     if not dangerous:
+         script = script.replace('bash', 'python3').replace('./r.sh', './clean.py')
+diff --git a/tools/shell_arith_sink.py b/tools/shell_arith_sink.py
+index 5ec04ccd04d5350e6fc8a215557e94a0f4281ba4..e7fa58a454a2cb835648c685f6a87c03fe291a6a 100644
+--- a/tools/shell_arith_sink.py
++++ b/tools/shell_arith_sink.py
+@@ -91,7 +91,7 @@ def substitution_in_arithmetic(command: str, *, date_exempt: bool, _depth: int =
+         top = stack[-1]
+         kind, quoted = top[0], top[3]
+         if token in ("`", "$(", "$((", "$[", "${"):
+-            pos, sink = _expansion_token(command, token, pos, stack, date_exempt)
++            pos, sink = _expansion_token(command, token, pos, stack, date_exempt, _depth)
+             if sink:
+                 return True
+             backtick_open ^= token == "`"
+@@ -342,7 +342,7 @@ def _parameter_token(token, start, pos, stack) -> int:
+     return pos
+ 
+ 
+-def _expansion_token(command, token, pos, stack, date_exempt) -> tuple[int, bool]:
++def _expansion_token(command, token, pos, stack, date_exempt, depth=0) -> tuple[int, bool]:
+     """Open an expansion frame, or flag a producer whose output is arithmetic."""
+     if token == "`":
+         if stack[-1][0] in (_ARITH, _PARAM_ARITH):
+@@ -356,7 +356,19 @@ def _expansion_token(command, token, pos, stack, date_exempt) -> tuple[int, bool
+         if stack[-1][0] in (_ARITH, _PARAM_ARITH) and not (
+                 date_exempt and _DATE_PRODUCER_RE.match(command, pos)):
+             return pos, True
+-        stack.append([_CMD, ")", 0, False, pos, None])
++        # A case-pattern ')' is not this substitution's closer. Match the whole
++        # command frame before inspecting its arithmetic; otherwise its quotes
++        # can corrupt the parent and promote ordinary redirection output to code.
++        from cron.lifecycle_guard_substitutions import _paren_end, SubstitutionNestingLimit
++
++        try:
++            end = _paren_end(command, pos - 2, depth)
++        except SubstitutionNestingLimit:
++            return pos, True
++        if not command[pos:end].endswith(')'):
++            return end, True
++        return end, substitution_in_arithmetic(
++            command[pos:end - 1], date_exempt=date_exempt, _depth=depth + 1)
+     elif token == "${":
+         pos = _open_parameter(command, pos, stack)
+     else:  # $(( or $[
+-- 
+2.43.0
+

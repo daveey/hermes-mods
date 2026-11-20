@@ -1,0 +1,380 @@
+From 1b608e08ebd0e87e339595e84562785a1b1ca5ed Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 12:43:15 +0000
+Subject: [PATCH] perf(auth): scope read-only pool parsing to picker builds
+ [daveey]
+
+Keep every read-modify-write loader fresh. Revalidate the active auth file on every scoped pool read, deep-copy returned slices, and discard scope data on exit. Bind parsing to the sampled path; copied contexts cannot reuse snapshots on another thread or after exit.
+
+Proof so far: initial parse-count test RED (2 loads instead of 1), sampled-path race RED then fixed; 123 focused consumer tests GREEN, then 13 expanded scope tests GREEN; scripts/check all 20 gates GREEN. Intermediate review found sampled-path race, fixed with deterministic regression. Hub diagnostic A/B measured ~5-7ms reduction of ~69ms warm model.options with zero auth-write attempts; async usage payload changes still need controlled parity proof. Not yet final acceptance, reviewed for landing, or deployed.
+---
+ hermes_cli/auth.py                            |  22 +-
+ hermes_cli/auth_pool_read_scope.py            |  90 ++++++++
+ hermes_cli/model_switch_providers.py          |   4 +-
+ .../hermes_cli/test_picker_auth_read_scope.py | 207 ++++++++++++++++++
+ 4 files changed, 302 insertions(+), 21 deletions(-)
+ create mode 100644 hermes_cli/auth_pool_read_scope.py
+ create mode 100644 tests/hermes_cli/test_picker_auth_read_scope.py
+
+diff --git a/hermes_cli/auth.py b/hermes_cli/auth.py
+index e4ebe9bcee9dd806c91bae67949ebb589fcbf24e..cf0ac57ba4c48225bb7c715b229a294bed36adea 100644
+--- a/hermes_cli/auth.py
++++ b/hermes_cli/auth.py
+@@ -941,26 +941,8 @@ def read_credential_pool(provider_id: Optional[str] = None) -> dict[str, Any]:
+ 
+     In profile mode the global-root ``auth.json`` is a read-only fallback applied per provider ONLY
+     when the profile has zero entries for it (``hermes auth add`` in the profile shadows global)."""
+-    pool = _load_auth_store().get("credential_pool")
+-    pool = pool if isinstance(pool, dict) else {}
+-    global_pool = _load_global_auth_store().get("credential_pool")
+-    global_pool = global_pool if isinstance(global_pool, dict) else {}
+-
+-    if provider_id is None:
+-        merged = dict(pool)
+-        for gp_key, gp_entries in global_pool.items():
+-            existing = merged.get(gp_key)
+-            if not (isinstance(gp_entries, list) and gp_entries):
+-                continue
+-            if not (isinstance(existing, list) and existing):  # profile wins when it has ANY entries
+-                merged[gp_key] = list(gp_entries)
+-        return merged
+-
+-    provider_entries = pool.get(provider_id)
+-    if isinstance(provider_entries, list) and provider_entries:
+-        return list(provider_entries)
+-    global_entries = global_pool.get(provider_id)
+-    return list(global_entries) if isinstance(global_entries, list) else []
++    from hermes_cli.auth_pool_read_scope import read_credential_pool as read_pool
++    return read_pool(provider_id)
+ 
+ 
+ _POOL_TOKEN_GENERATION_FIELDS = (
+diff --git a/hermes_cli/auth_pool_read_scope.py b/hermes_cli/auth_pool_read_scope.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9b0c73c0117dfecd4010ed22c2eb29a71ca4221b
+--- /dev/null
++++ b/hermes_cli/auth_pool_read_scope.py
+@@ -0,0 +1,90 @@
++"""Read-only credential-pool snapshots for one synchronous picker build.
++
++Writers always use auth._load_auth_store directly. No parsed object leaves this
++module: callers get independent provider slices, never a shared working copy.
++"""
++from contextlib import contextmanager
++from contextvars import ContextVar
++from copy import deepcopy
++from dataclasses import dataclass, field
++from threading import current_thread
++from typing import Any
++
++from utils import file_cache_version
++
++
++@dataclass
++class _ReadScope:
++    owner: object = field(default_factory=current_thread)
++    active: bool = True
++    version: object = None
++    store: dict[str, Any] | None = None
++
++
++_SCOPE: ContextVar[_ReadScope | None] = ContextVar("picker_auth_pool_reads", default=None)
++
++
++def _current_scope():
++    scope = _SCOPE.get()
++    # A copied context must not extend the pass or share its mutable snapshot
++    # with a background catalog-refresh thread.
++    return scope if scope is not None and scope.active and scope.owner is current_thread() else None
++
++
++@contextmanager
++def auth_pool_read_scope():
++    """Nested reads share a snapshot; independent builds never retain one."""
++    if _current_scope() is not None:
++        yield
++        return
++    scope = _ReadScope()
++    token = _SCOPE.set(scope)
++    try:
++        yield
++    finally:
++        scope.active = False
++        scope.store = None
++        _SCOPE.reset(token)
++
++
++def _read_store():
++    from hermes_cli import auth
++
++    scope = _current_scope()
++    if scope is None:
++        return auth._load_auth_store()
++    path = auth._auth_file_path()
++    try:
++        version = (str(path), file_cache_version(path))
++    except OSError:
++        scope.store = None
++        return auth._load_auth_store()
++    if scope.store is not None and scope.version == version:
++        return scope.store
++    store = auth._load_auth_store(path)
++    # Capture before reading: a concurrent replacement must not label an old
++    # parse with a newer version. The next read checks the path again.
++    scope.version = version
++    scope.store = store if isinstance(store.get("credential_pool"), dict) else None
++    return store
++
++
++def read_credential_pool(provider_id=None):
++    """Preserve per-provider profile shadowing; copy only the requested slice."""
++    from hermes_cli import auth
++
++    pool = _read_store().get("credential_pool")
++    pool = pool if isinstance(pool, dict) else {}
++    global_pool = auth._load_global_auth_store().get("credential_pool")
++    global_pool = global_pool if isinstance(global_pool, dict) else {}
++    if provider_id is None:
++        merged = dict(pool)
++        for key, rows in global_pool.items():
++            existing = merged.get(key)
++            if isinstance(rows, list) and rows and not (isinstance(existing, list) and existing):
++                merged[key] = rows
++        return deepcopy(merged)
++    rows = pool.get(provider_id)
++    if not (isinstance(rows, list) and rows):
++        rows = global_pool.get(provider_id)
++    return deepcopy(rows) if isinstance(rows, list) else []
+diff --git a/hermes_cli/model_switch_providers.py b/hermes_cli/model_switch_providers.py
+index 85a0ddee742cae321ff245b2b8d2a569d3ba8ef3..6395af6b3c4415285e74da3ce1892970b7420b38 100644
+--- a/hermes_cli/model_switch_providers.py
++++ b/hermes_cli/model_switch_providers.py
+@@ -212,9 +212,11 @@ def picker_build_scope():
+     if _POOL_STATE_MEMO.get() is not None:
+         yield
+         return
++    from hermes_cli.auth_pool_read_scope import auth_pool_read_scope
+     token = _POOL_STATE_MEMO.set({})
+     try:
+-        yield
++        with auth_pool_read_scope():
++            yield
+     finally:
+         _POOL_STATE_MEMO.reset(token)
+ 
+diff --git a/tests/hermes_cli/test_picker_auth_read_scope.py b/tests/hermes_cli/test_picker_auth_read_scope.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..edc9c926e087f520c4e4faa1553f72acd6d7ac53
+--- /dev/null
++++ b/tests/hermes_cli/test_picker_auth_read_scope.py
+@@ -0,0 +1,207 @@
++"""Picker-only auth parsing reuse must never supply a writer's working copy."""
++import json
++import os
++from concurrent.futures import ThreadPoolExecutor
++from contextvars import copy_context
++from threading import Barrier
++
++import pytest
++
++from hermes_cli import auth
++from hermes_cli.model_switch_providers import picker_build_scope
++
++
++@pytest.fixture
++def store(tmp_path, monkeypatch):
++    path = tmp_path / "auth.json"
++    monkeypatch.setattr(auth, "_auth_file_path", lambda: path)
++    monkeypatch.setattr(auth, "_load_global_auth_store", dict)
++    path.write_text(json.dumps({"providers": {}, "credential_pool": {
++        "alpha": [{"id": "one", "access_token": "fixture-old", "nested": {"value": 1}}],
++        "beta": [{"id": "two"}]}}))
++    return path
++
++
++def count_loads(monkeypatch):
++    calls = []
++    original = auth._load_auth_store
++
++    def load(*args, **kwargs):
++        calls.append(1)
++        return original(*args, **kwargs)
++
++    monkeypatch.setattr(auth, "_load_auth_store", load)
++    return calls
++
++
++def test_distinct_provider_reads_share_parse_only_inside_picker(store, monkeypatch):
++    calls = count_loads(monkeypatch)
++    with picker_build_scope():
++        assert auth.read_credential_pool("alpha")[0]["id"] == "one"
++        with picker_build_scope():
++            assert auth.read_credential_pool("beta")[0]["id"] == "two"
++        assert len(calls) == 1
++    auth.read_credential_pool("alpha")
++    auth.read_credential_pool("beta")
++    assert len(calls) == 3
++    with picker_build_scope():
++        auth.read_credential_pool("alpha")
++    assert len(calls) == 4
++
++
++def test_returned_nested_payload_is_not_the_snapshot(store):
++    with picker_build_scope():
++        rows = auth.read_credential_pool("alpha")
++        rows[0]["nested"]["value"] = 9
++        rows.clear()
++        all_rows = auth.read_credential_pool()
++        assert all_rows["alpha"][0]["nested"]["value"] == 1
++        all_rows["alpha"][0]["nested"]["value"] = 7
++        assert auth.read_credential_pool("alpha")[0]["nested"]["value"] == 1
++
++
++@pytest.mark.parametrize("replacement", [False, True])
++def test_same_size_mtime_write_visible_during_and_after_pass(store, replacement):
++    with picker_build_scope():
++        assert auth.read_credential_pool("alpha")[0]["access_token"] == "fixture-old"
++        before = store.stat()
++        changed = store.read_text().replace("fixture-old", "fixture-new")
++        target = store.with_suffix(".new") if replacement else store
++        target.write_text(changed)
++        os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
++        if replacement:
++            target.replace(store)
++        assert auth.read_credential_pool("alpha")[0]["access_token"] == "fixture-new"
++    with picker_build_scope():
++        assert auth.read_credential_pool("alpha")[0]["access_token"] == "fixture-new"
++
++
++def test_writer_always_gets_fresh_independent_store(store, monkeypatch):
++    calls = count_loads(monkeypatch)
++    with picker_build_scope():
++        auth.read_credential_pool("alpha")
++        first = auth._load_auth_store()
++        second = auth._load_auth_store()
++        assert len(calls) == 3
++        first["credential_pool"]["alpha"][0]["nested"]["value"] = 42
++        assert second["credential_pool"]["alpha"][0]["nested"]["value"] == 1
++        assert auth.read_credential_pool("alpha")[0]["nested"]["value"] == 1
++
++
++def test_concurrent_passes_and_writer(store, monkeypatch):
++    calls = count_loads(monkeypatch)
++    barrier = Barrier(3)
++
++    def reader():
++        with picker_build_scope():
++            old = auth.read_credential_pool("alpha")
++            barrier.wait(timeout=10)
++            barrier.wait(timeout=10)
++            new = auth.read_credential_pool("alpha")
++            return old[0]["access_token"], new[0]["access_token"]
++
++    with ThreadPoolExecutor(max_workers=2) as executor:
++        futures = [executor.submit(reader) for _ in range(2)]
++        barrier.wait(timeout=10)
++        assert len(calls) == 2
++        value = auth._load_auth_store()
++        value["credential_pool"]["alpha"][0]["access_token"] = "fixture-new"
++        # Atomic publication, like _save_auth_store, without its unrelated home permission setup.
++        replacement = store.with_suffix(".new")
++        replacement.write_text(json.dumps(value))
++        replacement.replace(store)
++        barrier.wait(timeout=10)
++        assert [f.result(timeout=10) for f in futures] == [("fixture-old", "fixture-new")] * 2
++    assert len(calls) == 5
++
++
++def test_missing_then_created_and_read_errors_are_not_memoized(store, monkeypatch):
++    store.unlink()
++    with picker_build_scope():
++        assert auth.read_credential_pool("alpha") == []
++        store.write_text('{"credential_pool":{"alpha":[{"id":"new"}]}}')
++        assert auth.read_credential_pool("alpha")[0]["id"] == "new"
++        store.unlink()
++        def denied(*args, **kwargs):
++            raise PermissionError("fixture")
++        monkeypatch.setattr(auth, "_load_auth_store", denied)
++        with pytest.raises(PermissionError):
++            auth.read_credential_pool("alpha")
++
++
++def test_copied_context_cannot_extend_or_cross_thread_scope(store, monkeypatch):
++    calls = count_loads(monkeypatch)
++    with picker_build_scope():
++        auth.read_credential_pool("alpha")
++        context = copy_context()
++        with ThreadPoolExecutor(max_workers=1) as executor:
++            executor.submit(context.run, auth.read_credential_pool, "beta").result(timeout=10)
++        assert len(calls) == 2
++        auth.read_credential_pool("beta")
++        assert len(calls) == 2
++    context.run(auth.read_credential_pool, "alpha")
++    context.run(auth.read_credential_pool, "beta")
++    assert len(calls) == 4
++
++
++def test_corruption_keeps_loader_behavior(store, monkeypatch):
++    store.write_text("not-json")
++    calls = count_loads(monkeypatch)
++    with picker_build_scope():
++        assert auth.read_credential_pool("alpha") == []
++        assert auth.read_credential_pool("beta") == []
++    assert len(calls) == 2
++    assert store.with_suffix(".json.corrupt").read_text() == "not-json"
++
++
++def test_real_writer_preserves_other_provider_and_invalidates_snapshot(store):
++    with picker_build_scope():
++        auth.read_credential_pool("alpha")
++        auth.write_credential_pool("beta", [{"id": "three", "source": "manual", "access_token": "fixture"}],
++                                   removed_ids=["two"])
++        assert auth.read_credential_pool("alpha")[0]["id"] == "one"
++        assert [row["id"] for row in auth.read_credential_pool("beta")] == ["three"]
++
++
++def test_warm_stat_failure_does_not_serve_cached_credentials(store, monkeypatch):
++    from hermes_cli import auth_pool_read_scope as scope_module
++    with picker_build_scope():
++        auth.read_credential_pool("alpha")
++        def denied(*args, **kwargs):
++            raise PermissionError("fixture")
++        monkeypatch.setattr(scope_module, "file_cache_version", denied)
++        monkeypatch.setattr(auth, "_load_auth_store", denied)
++        with pytest.raises(PermissionError):
++            auth.read_credential_pool("alpha")
++
++
++def test_sampled_path_is_the_path_parsed(store, monkeypatch):
++    from hermes_cli import auth_pool_read_scope as scope_module
++    other = store.with_suffix(".other")
++    other.write_text(store.read_text().replace("fixture-old", "fixture-new"))
++    selected = [store]
++    monkeypatch.setattr(auth, "_auth_file_path", lambda: selected[0])
++    real_version = scope_module.file_cache_version
++
++    def switch_after_stat(path):
++        version = real_version(path)
++        selected[0] = other
++        return version
++
++    monkeypatch.setattr(scope_module, "file_cache_version", switch_after_stat)
++    with picker_build_scope():
++        assert auth.read_credential_pool("alpha")[0]["access_token"] == "fixture-old"
++        selected[0] = store
++        assert auth.read_credential_pool("alpha")[0]["access_token"] == "fixture-old"
++
++
++def test_global_fallback_and_nested_copy(store, monkeypatch):
++    global_rows = {"alpha": [{"id": "shadowed"}], "gamma": [{"id": "root", "nested": [1]}]}
++    monkeypatch.setattr(auth, "_load_global_auth_store", lambda: {"credential_pool": global_rows})
++    with picker_build_scope():
++        assert auth.read_credential_pool("alpha")[0]["id"] == "one"
++        rows = auth.read_credential_pool("gamma")
++        rows[0]["nested"].append(2)
++        assert auth.read_credential_pool()["gamma"][0]["nested"] == [1]
++        assert auth.read_credential_pool("missing") == []
++
+-- 
+2.43.0
+

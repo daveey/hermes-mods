@@ -1,0 +1,107 @@
+From 9efcae991b98bef9259da99917039143a8aad4ac Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 12:32:35 +0000
+Subject: [PATCH] [daveey] kanban pacing: a class card is judged on its
+ governed pools, not exempted by an ungoverned one
+
+A class route (class:deep/auto on the strong tier) whose class also holds an ungoverned subscription pool
+(xai-oauth: Grok on the X Ultra subscription) was exempt from the pace governor: _governed() returned None as
+soon as one candidate provider was ungoverned. Once the pool workers' registry adds Grok to deep/standard
+(t_d943a79dd2b3889f), every strong-tier card would start ungoverned while Claude and Codex are paced, and the
+class allocator could hand it to a paced pool.
+
+_governed() now judges a card on the governed subset of its candidates (None only when that subset is empty).
+When every governed pool holds it, the pace alternate from the previous commit moves it to the ungoverned pool
+if that pool serves on this host; with no Grok credential it keeps the hold. A class card with one governed pool
+still open starts unmoved, as before.
+
+Proof: three new tests in tests/hermes_cli/test_kanban_pace_reroute.py (strong pattern card -> grok-4.7 with
+tier_reason pattern:security+paced:anthropic,openai-codex; open Claude pool -> starts class:deep/auto unmoved;
+no Grok credential -> held). The first and third are RED without this change (card started class:deep/auto
+ungoverned), GREEN with it.
+---
+ hermes_cli/kanban_llm_pacing_dispatch.py     | 11 ++++--
+ tests/hermes_cli/test_kanban_pace_reroute.py | 41 ++++++++++++++++++++
+ 2 files changed, 49 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_llm_pacing_dispatch.py b/hermes_cli/kanban_llm_pacing_dispatch.py
+index b6f50feb2d2501b3ef72cd3ada085d94a2c0dcf6..420ddb216f2fd66fe8d7a50fbf2cc766d8c3545b 100644
+--- a/hermes_cli/kanban_llm_pacing_dispatch.py
++++ b/hermes_cli/kanban_llm_pacing_dispatch.py
+@@ -294,13 +294,18 @@ def _record(conn: sqlite3.Connection, task_id: str, verdicts: list[dict], result
+ 
+ def _governed(conn: sqlite3.Connection, task_id: str, lane: str, cfg: lp.PacingConfig) -> Optional[tuple[Any, list[str]]]:
+     """``(task, providers)`` for a card the governor judges on ``lane``; None when it starts regardless: no such card,
+-    a mandatory pin, an unknown route or a provider the governor does not govern."""
++    a mandatory pin, an unknown route or no provider the governor governs.
++
++    A class route judges only its governed pools: an ungoverned pool in the same class (xai-oauth: Grok on the X Ultra
++    subscription) no longer exempts the card, which would start it ungoverned and let the class allocator hand it to
++    a paced Claude/Codex pool. When every governed pool holds it, :func:`_pace_alternate` moves it to the ungoverned
++    pool if that one serves here. [daveey] (t_d943a79dd2b3889f)"""
+     from hermes_cli import kanban_db as kb
+     task = kb.get_task(conn, task_id)
+     if task is None or int(getattr(task, "model_pin_mandatory", 0) or 0):
+         return None
+-    providers = candidate_providers(conn, task, lane)
+-    if not providers or any(p not in cfg.providers for p in providers):
++    providers = [p for p in candidate_providers(conn, task, lane) if p in cfg.providers]
++    if not providers:
+         return None
+     return task, providers
+ 
+diff --git a/tests/hermes_cli/test_kanban_pace_reroute.py b/tests/hermes_cli/test_kanban_pace_reroute.py
+index 41914aac0ded18d92ec3d401565102d5cc6bdec7..4c5412b047bc49f1d41230d8d7a07f0a273c051c 100644
+--- a/tests/hermes_cli/test_kanban_pace_reroute.py
++++ b/tests/hermes_cli/test_kanban_pace_reroute.py
+@@ -96,6 +96,47 @@ def test_default_card_on_paced_codex_takes_the_open_claude_pool_first(pool, monk
+     assert receipt["tier_reason"] == "default+paced:openai-codex"
+ 
+ 
++@pytest.fixture
++def strong_pattern(pool, monkeypatch):
++    """Cards titled ``security ...`` take the strong tier: ``class:deep``/``auto`` (reason ``pattern:security``)."""
++    config, _ = pool
++    monkeypatch.setattr(tier, "load_tier_config", lambda: {**POOL_CFG, "default_model_keep_patterns": ["security"]})
++    monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective", lambda *_a, **_k: config)
++
++
++def test_strong_class_card_moves_to_grok_not_a_paced_pool(pool, strong_pattern, monkeypatch):
++    """A class card whose class also holds an ungoverned subscription pool (xai-oauth) is still judged on its governed
++    pools: otherwise it starts ungoverned and the class allocator may hand it to a paced Claude/Codex pool."""
++    _pools(monkeypatch, {"anthropic": 99, "openai-codex": 99})
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="security work", assignee="a")
++        seen, result = _dispatch(conn)
++        receipt = _route_receipt(conn, tid)
++    assert seen == [(tid, *GROK)]
++    assert tid not in result.clock_held
++    assert receipt["provider"] == "xai-oauth" and receipt["model"] == "grok-4.7"
++    assert receipt["tier_reason"] == "pattern:security+paced:anthropic,openai-codex"
++
++
++def test_strong_class_card_with_an_open_governed_pool_starts_unmoved(pool, strong_pattern, monkeypatch):
++    _pools(monkeypatch, {"anthropic": 5, "openai-codex": 99})
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="security work", assignee="a")
++        seen, result = _dispatch(conn)
++        assert _paced_events(conn, tid) == []
++    assert seen == [(tid, "class:deep", "auto")] and tid not in result.clock_held
++
++
++def test_strong_class_card_without_grok_credential_waits(pool, strong_pattern, monkeypatch):
++    _, serving = pool
++    serving.discard("xai-oauth")
++    _pools(monkeypatch, {"anthropic": 99, "openai-codex": 99})
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="security work", assignee="a")
++        seen, result = _dispatch(conn)
++    assert seen == [] and result.clock_held[tid][0] == lp.GUARD_REASON
++
++
+ def test_no_grok_credential_on_this_host_keeps_the_hold(pool, monkeypatch):
+     _, serving = pool
+     serving.discard("xai-oauth")
+-- 
+2.43.0
+

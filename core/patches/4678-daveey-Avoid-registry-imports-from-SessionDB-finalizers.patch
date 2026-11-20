@@ -1,0 +1,155 @@
+From 5a72af25254ea82b9288325fa9e93b846674abf7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 19:52:38 +0000
+Subject: [PATCH] [daveey] Avoid registry imports from SessionDB finalizers
+
+Main CI44048784637 passed the derived-session tests then hung for 600s. Persistent stacks locate __del__ -> close -> registry import -> global import lock. A retained shared DB is finalized after sys.modules clears; a suspended daemon can retain that lock. The CI lock holder is unknown, but controlled real-interpreter shutdown reproduces the exact stuck stack.
+
+Bind release when acquire grants registry ownership; close calls that operation without re-importing. Preserve nonshared close, WAL retirement and refcount teardown. Detection gap: quiet exit and ordinary cleanup tests did not exercise imports after module teardown.
+
+Proof: canonical new regression on base: locked daemon fails with exact incident stack, unlocked control passes. After fix focused 23 tests pass including original derived-session file and registry lifecycle. Added no-import refcount/final-close control passes. Broad suite partial (transport timeout), full verification follows before publication.
+---
+ hermes_state.py                               |  9 +-
+ hermes_state_registry.py                      |  4 +
+ .../test_registry_finalization.py             | 87 +++++++++++++++++++
+ 3 files changed, 95 insertions(+), 5 deletions(-)
+ create mode 100644 tests/hermes_state/test_registry_finalization.py
+
+diff --git a/hermes_state.py b/hermes_state.py
+index 5b933cc83aea6fd45f494a44254779d4ba403ff8..771b054cf9fbc71547fa99ee83b7f09ebcb970c3 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -690,9 +690,9 @@ class SessionDB(
+         self._token_writer_thread: Optional[threading.Thread] = None
+         self._token_writer_stop = self._token_writer_busy = False
+         self._token_atexit_hook: Optional[Callable[[], None]] = None
+-        # Opened via hermes_state_registry.acquire(): close() releases a refcount instead.
+-        # Set True when this instance is opened via hermes_state_registry.acquire(). Makes close() a no-op so the
+-        # registry (not individual callers) controls the connection lifecycle (#90837).
++        # acquire() binds the release callback before enabling shared ownership.
++        # close() releases a refcount; the registry controls physical teardown.
++        self._shared_registry_release: Callable[[SessionDB], bool]
+         self._shared_registry_owned = False
+         initialization_complete = False
+         try:
+@@ -1715,8 +1715,7 @@ class SessionDB(
+         sites return their reference instead of leaking it.
+         """
+         if self._shared_registry_owned:
+-            from hermes_state_registry import release
+-            release(self)
++            self._shared_registry_release(self)
+             return
+         self._stop_token_writer()
+         hook, self._token_atexit_hook = self._token_atexit_hook, None
+diff --git a/hermes_state_registry.py b/hermes_state_registry.py
+index 1b6471db583471f1c1a6b055dde4fdfa8f2bc0df..3eebf6a146a64fe2fadf75b53f103069c027d669 100644
+--- a/hermes_state_registry.py
++++ b/hermes_state_registry.py
+@@ -244,6 +244,10 @@ def acquire(db_path: Optional[Path] = None) -> SessionDB:
+         try:
+             with lifecycle_lock:
+                 db = _open_session_db(path)
++                # close() also runs from __del__ after sys.modules is cleared.
++                # Retain the release operation: a late import can deadlock on
++                # an import lock still held by a suspended daemon at shutdown.
++                db._shared_registry_release = release
+                 db._shared_registry_owned = True
+                 identity = _stat_db_file_identity(path)
+         except BaseException:
+diff --git a/tests/hermes_state/test_registry_finalization.py b/tests/hermes_state/test_registry_finalization.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1cfeb46c771e03b14f7afa17b625226e5a2109b8
+--- /dev/null
++++ b/tests/hermes_state/test_registry_finalization.py
+@@ -0,0 +1,87 @@
++"""A shared SessionDB finalizer must not import during interpreter shutdown.
++
++The derived-session CI hang ended in __del__ -> close -> _get_module_lock.
++Hold that real import lock in an owned daemon to make the shutdown boundary
++repeatable, without relying on the CI thread's unidentified scheduling.
++"""
++
++import builtins
++import subprocess
++import sys
++import textwrap
++from pathlib import Path
++
++import pytest
++
++
++_EXIT_PROBE = """
++import _imp
++import faulthandler
++import os
++import sys
++import threading
++from pathlib import Path
++import hermes_state
++import hermes_state_registry as registry
++
++original_del = hermes_state.SessionDB.__del__
++def observe_del(self, original=original_del, write=os.write, finalizing=sys.is_finalizing):
++    if finalizing():
++        write(2, b'finalizing-db-enter\\n')
++    original(self)
++    write(2, b'finalizing-db-return\\n')
++hermes_state.SessionDB.__del__ = observe_del
++
++db = registry.acquire(Path(sys.argv[1]) / 'state.db')
++del db  # Only the registry owns it: clearing that module triggers __del__.
++faulthandler.dump_traceback_later(15, exit=True)
++# A __main__ target retains its globals (including registry) and can suppress
++# the finalizer entirely. Give the daemon its own minimal global namespace.
++namespace = {}
++exec('import _imp, threading\\ndef park(ready, lock):\\n'
++     '    if lock: _imp.acquire_lock()\\n'
++     '    ready.set()\\n'
++     '    threading.Event().wait()\\n', namespace)
++ready = threading.Event()
++threading.Thread(target=namespace['park'], args=(ready, sys.argv[2] == 'locked'), daemon=True).start()
++assert ready.wait(10), 'daemon never reached the controlled boundary'
++del namespace
++print('main-returning', flush=True)
++"""
++
++
++@pytest.mark.parametrize("lock_state", ["unlocked", "locked"])
++def test_shared_db_finalizer_exits_without_import_lock(tmp_path, lock_state):
++    result = subprocess.run(
++        [sys.executable, "-c", textwrap.dedent(_EXIT_PROBE), str(tmp_path), lock_state],
++        cwd=Path(__file__).resolve().parents[2],
++        capture_output=True, text=True, encoding="utf-8", timeout=45, check=False,
++    )
++    assert "main-returning" in result.stdout, result.stderr
++    assert "finalizing-db-enter" in result.stderr, result.stderr
++    assert result.returncode == 0, result.stderr
++    assert "finalizing-db-return" in result.stderr, result.stderr
++
++
++def test_close_releases_shared_refs_without_importing_registry(tmp_path, monkeypatch):
++    import hermes_state_registry as registry
++
++    first = registry.acquire(tmp_path / "state.db")
++    second = registry.acquire(tmp_path / "state.db")
++    assert first is second
++    original_import = builtins.__import__
++
++    def refuse_registry_import(name, *args, **kwargs):
++        assert name != "hermes_state_registry", "close must use its already-bound owner"
++        return original_import(name, *args, **kwargs)
++
++    try:
++        with monkeypatch.context() as patcher:
++            patcher.delitem(sys.modules, "hermes_state_registry")
++            patcher.setattr(builtins, "__import__", refuse_registry_import)
++            first.close()
++            assert second._conn is not None, "first release must preserve the other holder"
++            second.close()
++            assert second._conn is None, "final release must physically close"
++    finally:
++        registry.close_all()
+-- 
+2.43.0
+

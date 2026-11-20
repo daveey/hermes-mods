@@ -1,0 +1,206 @@
+From 1c7868c3bf13ace81f479e3dd8fc65d1938d9bdf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 06:45:11 +0000
+Subject: [PATCH] [daveey] Quiet closed CLI stdout pipes at write and shutdown
+
+Four coach incidents were kanban show piped to head or grep -m1, not a
+terminal transport failure. A downstream consumer closed stdout while
+Python continued printing, then interpreter shutdown retried its buffer.
+The sample exit 4 was a subsequent gh auth failure, not the pipe status.
+
+Guard non-TTY CLI text stdout at its write/flush boundary, including the
+pre-import version path. Exit nonzero (1), redirect the failed descriptor
+to devnull to prevent a second shutdown diagnostic, and restore stdout.
+Do not alter SIGPIPE or swallow internal transport BrokenPipeError.
+TTY behavior and non-output exceptions retain their existing contracts.
+No plugin surface wraps these pre-discovery CLI output boundaries.
+
+Detection gap: buffered exit and early consumer closure were not covered.
+Regression tests run actual help/version/kanban-show subprocesses with a
+closed reader and isolated home/DB, buffered and unbuffered. Normal-output
+prechecks prevent a missing fixture from masquerading as pipe handling.
+Unchanged main: 6 failures, 5 controls pass. Patched: 11 pass.
+Existing fixes PR2252/2048 address different broken-pipe boundaries.
+---
+ hermes_cli/main.py                       |  6 +-
+ hermes_cli/stdio_pipe.py                 | 52 ++++++++++++++++
+ tests/hermes_cli/test_cli_broken_pipe.py | 76 ++++++++++++++++++++++++
+ 3 files changed, 131 insertions(+), 3 deletions(-)
+ create mode 100644 hermes_cli/stdio_pipe.py
+ create mode 100644 tests/hermes_cli/test_cli_broken_pipe.py
+
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 14ead6540a04cb71f8fca8dc8ba82b46d7079f23..fde897bc2d4f9b4d8b2648355e72d34fc1a4b4f1 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -248,9 +248,9 @@ _suppress_mouse_residue_early()
+ 
+ 
+ _startup_fast.ensure_project_root_on_path()
+-
++from hermes_cli.stdio_pipe import quiet_stdout_pipe
+ # ``hermes --version`` is answered before config/logging imports.
+-if _startup_fast.try_fast_version():
++if quiet_stdout_pipe(_startup_fast.try_fast_version)():
+     raise SystemExit(0)
+ 
+ import argparse
+@@ -3281,6 +3281,7 @@ def _default_to_chat(args) -> None:
+     cmd_chat(args)
+ 
+ 
++@quiet_stdout_pipe
+ def main():
+     """Main entry point for hermes CLI."""
+     # A Desktop/serve/dashboard/gateway launched from inside a kanban worker must not inherit
+@@ -3294,7 +3295,6 @@ def main():
+     _warn_if_unsupervised_pid1()
+     _advertise_agent_env()
+ 
+-    # Force UTF-8 stdio on Windows before anything prints.  No-op elsewhere.
+     try:
+         from hermes_cli.stdio import configure_windows_stdio
+         configure_windows_stdio()
+diff --git a/hermes_cli/stdio_pipe.py b/hermes_cli/stdio_pipe.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c81468da3744fdcc9f50ebddf29eb251c0952a2a
+--- /dev/null
++++ b/hermes_cli/stdio_pipe.py
+@@ -0,0 +1,52 @@
++"""Quiet CLI stdout cancellation without changing process-wide SIGPIPE behavior."""
++from functools import wraps
++import os
++import sys
++
++
++class _PipeOutput:
++    """Only stdout writes/flushes are cancellation; internal EPIPE still propagates."""
++
++    def __init__(self, stream):
++        self.stream = stream
++
++    def __getattr__(self, name):
++        return getattr(self.stream, name)
++
++    def _call(self, method, *args):
++        try:
++            return getattr(self.stream, method)(*args)
++        except BrokenPipeError:
++            # Python flushes the original stream again at shutdown. Redirect its
++            # descriptor, rather than closing it or changing inherited SIGPIPE.
++            with open(os.devnull, "wb") as sink:
++                os.dup2(sink.fileno(), self.stream.fileno())
++            raise SystemExit(1) from None
++
++    def write(self, text):
++        return self._call("write", text)
++
++    def flush(self):
++        return self._call("flush")
++
++
++def quiet_stdout_pipe(function):
++    """Guard text output, including buffered output on normal/argparse exit."""
++    @wraps(function)
++    def run(*args, **kwargs):
++        original = sys.stdout
++        if original is None or original.isatty():
++            return function(*args, **kwargs)
++        output = _PipeOutput(original)
++        sys.stdout = output
++        try:
++            try:
++                result = function(*args, **kwargs)
++            except SystemExit:
++                output.flush()
++                raise
++            output.flush()
++            return result
++        finally:
++            sys.stdout = original
++    return run
+diff --git a/tests/hermes_cli/test_cli_broken_pipe.py b/tests/hermes_cli/test_cli_broken_pipe.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ea2a3a5640aa8268fcc595dcb892b71476be80d1
+--- /dev/null
++++ b/tests/hermes_cli/test_cli_broken_pipe.py
+@@ -0,0 +1,76 @@
++"""A closed output consumer must not produce a CLI traceback at write or exit."""
++import os
++from pathlib import Path
++import subprocess
++import sys
++
++import pytest
++
++ROOT = Path(__file__).resolve().parents[2]
++
++
++@pytest.mark.parametrize("argument", ["--version", "--help", "kanban-show"])
++@pytest.mark.parametrize("unbuffered", [False, True])
++def test_cli_to_closed_pipe_is_quiet(tmp_path, unbuffered, argument):
++    env = dict(os.environ, HERMES_HOME=str(tmp_path), HERMES_RUNTIME_DIR=str(tmp_path / "runtime"))
++    argv = [argument]
++    if argument == "kanban-show":
++        from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++        path = tmp_path / "fixture.db"
++        with kbc.connect_closing(path) as conn:
++            task_id = kb.create_task(conn, title="pipe fixture", body="body\n" * 20000)
++        env["HERMES_KANBAN_DB"] = str(path)
++        argv = ["kanban", "show", task_id]
++    command = [sys.executable, *(["-u"] if unbuffered else []), "-m", "hermes_cli.main", *argv]
++    complete = subprocess.run(command, cwd=ROOT, env=env, capture_output=True,
++                              text=True, timeout=60, check=False)
++    assert complete.returncode == 0, complete.stderr
++    assert complete.stdout
++    if argument == "kanban-show":
++        assert "pipe fixture" in complete.stdout
++        assert "body\n" in complete.stdout
++    # The read end is gone before startup: deterministic EPIPE, no head timing race.
++    reader, writer = os.pipe()
++    os.close(reader)
++    try:
++        result = subprocess.run(
++            [sys.executable, *(["-u"] if unbuffered else []), "-m", "hermes_cli.main", *argv],
++            cwd=ROOT, env=env, stdout=writer, stderr=subprocess.PIPE, text=True, timeout=60, check=False,
++        )
++    finally:
++        os.close(writer)
++    assert result.returncode == 1
++    assert "BrokenPipeError" not in result.stderr
++    assert "Traceback" not in result.stderr
++    assert "Exception ignored" not in result.stderr
++
++
++@pytest.mark.parametrize("error", [BrokenPipeError(32, "internal transport"), OSError(28, "disk full"), ValueError("bad input"), SystemExit(7)])
++def test_non_stdout_failures_propagate(error):
++    from hermes_cli.stdio_pipe import quiet_stdout_pipe
++
++    original = sys.stdout
++
++    @quiet_stdout_pipe
++    def command():
++        raise error
++
++    with pytest.raises(type(error)) as caught:
++        command()
++    assert caught.value is error
++    assert sys.stdout is original
++
++
++def test_normal_output_and_return_are_preserved(capsys):
++    from hermes_cli.stdio_pipe import quiet_stdout_pipe
++
++    original = sys.stdout
++
++    @quiet_stdout_pipe
++    def command():
++        print("complete")
++        return 7
++
++    assert command() == 7
++    assert sys.stdout is original
++    assert capsys.readouterr().out == "complete\n"
+-- 
+2.43.0
+

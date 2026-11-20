@@ -1,0 +1,322 @@
+From 70607520f63936857008d1d7ee959002095ecd45 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 03:21:58 +0000
+Subject: [PATCH] perf(kanban-unloaded): gate remote_notices on terminal-row
+ prints, reuse swept cards, ignore settled open-chat links
+
+Third cut of t_48c41072e7cba68d. On the hub P1 of #3513 remote_notices ran 21/21 with 0 skips (0.62% of a core):
+- the replica token moved on every rewrite of a terminal row (owner bookkeeping) -> now keyed on a per-row notice print
+- a ledger commit (the sweep's own observation rows) re-armed the key every run -> not a key component; every probe
+  re-judges cards against the ledger
+- one settled link in a chat held open by the gateway kept the pass hot -> settled links in open chats are quiet
+- cold snapshot (~1.7 s CPU) is cached per replica token so a ledger/live change re-judges without re-reading the replica
+---
+ tests/tui_gateway/test_h2_gate_mutations.py   |   2 +-
+ .../tui_gateway/test_kanban_unloaded_gates.py |  54 +++++++-
+ tui_gateway/kanban_unloaded_gates.py          | 122 ++++++++++++++----
+ 3 files changed, 149 insertions(+), 29 deletions(-)
+
+diff --git a/tests/tui_gateway/test_h2_gate_mutations.py b/tests/tui_gateway/test_h2_gate_mutations.py
+index dd02cf4e54b4b7b811ffb3b6782fec3d9f4c8804..347ac38261b2a221f24aa689c772e5a7a7891a0e 100644
+--- a/tests/tui_gateway/test_h2_gate_mutations.py
++++ b/tests/tui_gateway/test_h2_gate_mutations.py
+@@ -418,7 +418,7 @@ def test_remote_each_key_component_moves_the_key_independently(monkeypatch, tmp_
+         conn.execute('INSERT INTO notices(delivered) VALUES (1)')
+         conn.commit()
+     after = gates.probe('remote_notices')
+-    assert not after.pending and after.key != base.key
++    assert not after.pending and after.key == base.key  # a settled ledger row is judged each probe, not keyed
+     state['ledger'] = tmp_path / 'absent.db'
+     missing = gates.probe('remote_notices')
+     assert not missing.pending and missing.key != after.key
+diff --git a/tests/tui_gateway/test_kanban_unloaded_gates.py b/tests/tui_gateway/test_kanban_unloaded_gates.py
+index 84c02ecb4f54f8c0b1b0c28706ca1b22987fe161..c4735827ef44c60b8ccc83ce1b1648bf0bd88791 100644
+--- a/tests/tui_gateway/test_kanban_unloaded_gates.py
++++ b/tests/tui_gateway/test_kanban_unloaded_gates.py
+@@ -427,7 +427,9 @@ def test_remote_probe_key_changes_with_the_card_state_and_the_ledger(remote_host
+     settle()
+     first = gates._remote()
+     settle(session='chat-b')
+-    assert gates._remote().key != first.key
++    # A settled ledger row changes nothing the sweep does: every probe re-judges the cards against the ledger, so the
++    # ledger's commit counter is not a key component (the sweep's own rows re-armed the pass every run).
++    assert gates._remote().key == first.key
+     cards[0] = (*cards[0][:2], {'id': 't_1', 'status': 'blocked', 'blocked_at': 200.0}, cards[0][3])
+     stamp[1][0] = (1, 2, 2)  # the owner's write of that state
+     stamp[2][:] = [('macbook', 'default/t_1', cards[0][2])]
+@@ -512,7 +514,8 @@ def test_remote_probe_open_chat_in_flight_claim_and_woken_stay_hot(remote_host):
+     gates, _, _, settle = remote_host
+     settle()
+     assert not gates._remote().pending
+-    assert gates._remote(frozenset({'chat-a'})).pending
++    # A settled notice in a chat this process holds: ``_deliver_link`` only logs, so an open chat is not work.
++    assert not gates._remote(frozenset({'chat-a'})).pending
+     settle(session='chat-b', delivered=0, holder=12345)
+     assert gates._remote().pending
+     settle(session='chat-b', delivered=remote.DELIVERED)
+@@ -701,3 +704,50 @@ def test_remote_replica_commit_during_the_cold_read_still_publishes_the_proof(re
+     monkeypatch.setattr(remote, '_sweep_snapshot', racing)
+     assert not gates._remote().pending
+     assert 'inputs' in gates._remote_memo
++
++
++# --- the hub's always-hot shapes (t_48c41072e7cba68d, third cut) --------------------------------------------------
++
++def test_remote_probe_ignores_a_rewrite_of_a_terminal_row_whose_notice_inputs_did_not_change(remote_host):
++    """The hub rewrites terminal rows it already holds (owner bookkeeping); only a changed state/chat/withdrawal can
++    change what the sweep does, so a same-print rewrite must not move the token and re-read the 1300-card replica."""
++    gates, _, stamp, settle = remote_host
++    settle()
++    row = ('macbook', 'default/t_1', {'id': 't_1', 'status': 'done', 'completed_at': 100.0, 'lease': 1})
++    gates._remote()  # initialises the watch
++    stamp[1][0] = (1, 2, 2)
++    stamp[2][:] = [row]
++    first = gates._remote()  # first sight of the row's print: judged, moves the token once
++    for n in range(3, 8):
++        stamp[1][0] = (1, n, n)
++        stamp[2][:] = [('macbook', 'default/t_1', {**row[2], 'lease': n})]
++        assert gates._remote() == first
++    stamp[1][0] = (1, 9, 9)
++    stamp[2][:] = [('macbook', 'default/t_1', {'id': 't_1', 'status': 'done', 'completed_at': 250.0})]
++    assert gates._remote().key != first.key  # a new completion time is a new notice state
++
++
++def test_remote_probe_reuses_the_swept_cards_while_the_replica_token_stands(remote_host, monkeypatch):
++    """A ledger commit re-judges the cards against the ledger; it must not re-read the replica."""
++    from tui_gateway import kanban_remote_notices as remote
++    gates, cards, _, settle = remote_host
++    settle()
++    reads = []
++    monkeypatch.setattr(remote, '_sweep_snapshot', lambda path, me: (reads.append(1), (list(cards), {}))[1])
++    gates._remote_memo.clear()
++    gates._remote()
++    settle(session='chat-b')  # a ledger commit: the memo key moves, the replica did not
++    assert not gates._remote().pending
++    assert len(reads) == 1
++
++
++def test_remote_probe_open_chat_with_every_notice_settled_is_quiet(remote_host):
++    """One link in a chat this gateway holds open kept the whole pass hot on the hub: its sweep only logs."""
++    gates, _, _, settle = remote_host
++    settle()
++    assert not gates._remote(frozenset({'chat-a'})).pending
++
++
++def test_remote_probe_open_chat_with_an_unsettled_notice_stays_hot(remote_host):
++    gates, _, _, _ = remote_host
++    assert gates._remote(frozenset({'chat-a'})).pending
+diff --git a/tui_gateway/kanban_unloaded_gates.py b/tui_gateway/kanban_unloaded_gates.py
+index ea6a957d8cdabdfd74fd10eb2b1a00a54086f2f4..2d4b0764c2239c6fb8f175c85958295fda213aa9 100644
+--- a/tui_gateway/kanban_unloaded_gates.py
++++ b/tui_gateway/kanban_unloaded_gates.py
+@@ -55,6 +55,7 @@ def reset_for_tests() -> None:
+     _killed_empty_keys.clear()
+     _replica_watch.clear()
+     _remote_memo.clear()
++    _row_prints.clear()
+ 
+ 
+ def _killed_empty(conn) -> bool:
+@@ -297,6 +298,18 @@ _replica_watch: dict = {}
+ _remote_memo: dict = {}
+ 
+ 
++# The notice-relevant print of every terminal/withdrawn/swept replica task row this host last examined, keyed
++# ``(replica path, gw, key)``. A terminal row is rewritten all the time on the hub (owner-side bookkeeping: a lease, a
++# heartbeat's mirror, a re-sync of an unchanged card); only a CHANGED print can change what ``observe`` or the sweep do.
++_row_prints: dict = {}
++_ROW_PRINTS_MAX = 20000
++
++
++def _drop_row_prints(path: str) -> None:
++    for ident in [i for i in _row_prints if i[0] == path]:
++        del _row_prints[ident]
++
++
+ def _remote(live: frozenset = frozenset()) -> Inputs:
+     from hermes_cli.kanban_origin import _hub_db, gateway_names
+     from hermes_cli.kanban_reader_retention import reader
+@@ -316,11 +329,14 @@ def _remote(live: frozenset = frozenset()) -> Inputs:
+                 getattr(stamp, 'signature', None))
+     if _remote_memo.get('identity') != identity:
+         _replica_watch.pop(str(path), None)
++        _drop_row_prints(str(path))
+         _remote_memo.pop('inputs', None)
++        _remote_memo.pop('cards', None)
+         _remote_memo['identity'] = identity
+     now = time.time()
+     if now < _remote_memo.get('clock', now):
+         _remote_memo.pop('inputs', None)
++        _remote_memo.pop('cards', None)
+         _remote_memo['clock_epoch'] = _remote_memo.get('clock_epoch', 0) + 1
+     _remote_memo['clock'] = now
+     epoch = (identity, _remote_memo.get('clock_epoch', 0))
+@@ -348,7 +364,7 @@ def _remote(live: frozenset = frozenset()) -> Inputs:
+     # ``observe`` records this host's first sighting of EVERY terminal state, linked or not, and a later link must
+     # not resurrect a notice that expired unseen: so a task row that is terminal, withdrawn or swept is never
+     # skipped. Unreadable = unknown = hot.
+-    token = _replica_token(path)
++    token = _replica_token(path, me)
+     if token is None:
+         return Inputs()
+     memo_key = (str(path), me, token, str(ledger), ledger_stamp, live, epoch, frozenset(held))
+@@ -359,7 +375,24 @@ def _remote(live: frozenset = frozenset()) -> Inputs:
+             return hit[1]
+         return Inputs()
+     _remote_memo.pop('inputs', None)
+-    cards, _states = remote._sweep_snapshot(path, me)
++    # The sweep's cards are a function of the replica rows the token certifies: a ledger commit (the sweep's own
++    # observations, a poller's claim) or a live-set change re-judges them below, it does not re-read the replica.
++    cards_key = (str(path), me, token, epoch)
++    cached = _remote_memo.get('cards')
++    if cached is not None and cached[0] == cards_key:
++        cards = cached[1]
++    else:
++        _remote_memo.pop('cards', None)
++        cards, _states = remote._sweep_snapshot(path, me)
++        # Never trust a snapshot across a replacement or a write the sweep could act on. The hub's replica commits
++        # several rows a second, almost none of them a card this host owes anything for: comparing the raw commit
++        # stamp made the cold read (about 2 s of CPU) lose that race every time, so the proof was never published
++        # and every pass paid it again (t_48c41072e7cba68d). The semantic token is what the proof is keyed on.
++        after = fingerprint(path)
++        if after is None or (getattr(after, 'ident', None), getattr(after, 'generation', None),
++                             getattr(after, 'signature', None)) != identity or _replica_token(path, me) != token:
++            return Inputs()
++        _remote_memo['cards'] = (cards_key, cards)
+     watch = _replica_watch.get(str(path))
+     if watch is not None:  # a later non-terminal write to one of these (a reopened card) must not be skipped
+         _replica_watch[str(path)] = (*watch[:2], frozenset(f'{owner}/{key}' for owner, key, _t, _l in cards))
+@@ -377,16 +410,11 @@ def _remote(live: frozenset = frozenset()) -> Inputs:
+     for owner, key, task, links in cards:
+         digest.update(repr((owner, key, remote._notice_state(task),
+                             tuple((link.get('profile'), link.get('session')) for link in links))).encode())
+-    result = Inputs((str(path), me, digest.hexdigest(), str(ledger), ledger_stamp, frozenset(held),
+-                     frozenset(parked)), pending=False)
+-    # Never publish a quiet proof across a replacement or a write the sweep could act on. The hub's replica commits
+-    # several rows a second, almost none of them a card this host owes anything for: comparing the raw commit stamp
+-    # made the cold read (about 2 s of CPU) lose that race every time, so the proof was never published and every
+-    # pass paid it again (t_48c41072e7cba68d). The semantic token is what the proof is keyed on.
+-    after = fingerprint(path)
+-    if after is None or (getattr(after, 'ident', None), getattr(after, 'generation', None),
+-                         getattr(after, 'signature', None)) != identity or _replica_token(path) != token:
+-        return Inputs()
++    # The ledger's commit counter is not part of the key: ``_cards_settled`` above judges every owed link against the
++    # ledger on EVERY probe, so a ledger write that un-settles anything makes the probe pending, and one that does not
++    # leaves the pass nothing to do. The sweep's own observation rows used to re-arm it once per pass it ran.
++    result = Inputs((str(path), me, digest.hexdigest(), str(ledger), frozenset(held), frozenset(parked)),
++                    pending=False)
+     _remote_memo['inputs'] = (memo_key, result, frozenset(parked))
+     return result
+ 
+@@ -424,16 +452,50 @@ def _replica_rows_after(path, seq):
+     return out
+ 
+ 
+-def _substantive(gw, key, task, swept) -> bool:
++def _row_print(task, me):
++    """What ``observe`` and the sweep read of a terminal/withdrawn task row, or None when it cannot be told: the
++    notice state (status and its time), the freshness time, whether the owner published a completion notice, the
++    chats of this gateway it links and its withdrawal. A rewrite that changes none of these changes nothing either
++    reads (the delivery text is only built for a notice that is not settled, which keeps the probe pending)."""
++    from hermes_cli.kanban_withdrawal_notice import envelope
++    from tui_gateway import kanban_remote_notices as remote
++    if not me or not isinstance(task, dict):
++        return None
++    try:
++        notice = task.get('completion_notice')
++        withdrawal = envelope(task)
++        return (task.get('status'), remote._notice_state(task), remote._fresh_at(task),
++                isinstance(notice, dict) and 'event_id' in notice,
++                tuple(remote._linked_chats(task, me)), repr(withdrawal) if withdrawal is not None else None)
++    except Exception:  # health: allow BLE001 -- a row that cannot be read is unknown: it moves the token
++        return None
++
++
++def _substantive(gw, key, task, swept, path=None, me=None) -> bool:
+     """A replica task row whose write the remote sweep (or ``observe``) may act on."""
+     from hermes_cli.kanban_withdrawal_notice import envelope
+     from tui_gateway.kanban_remote_notices import _TERMINAL
+-    if task is None or f'{gw}/{key}' in swept or envelope(task) is not None:
++    if task is None:
++        return True
++    ident = (str(path), gw, key)
++    if me is not None and gw == me:
++        return False  # ``observe`` and the sweep read every gateway's rows but this one's own
++    terminal = task.get('status') in _TERMINAL or not task.get('status')
++    if not (f'{gw}/{key}' in swept or envelope(task) is not None or terminal):
++        _row_prints.pop(ident, None)  # left the terminal set: its next terminal write is a new state
++        return False
++    print_ = _row_print(task, me)
++    if print_ is None or path is None:
+         return True
+-    return task.get('status') in _TERMINAL or not task.get('status')
++    if _row_prints.get(ident) == print_:
++        return False
++    if len(_row_prints) >= _ROW_PRINTS_MAX:
++        _row_prints.clear()
++    _row_prints[ident] = print_
++    return True
+ 
+ 
+-def _moved_since(path, old, sig, swept):
++def _moved_since(path, old, sig, swept, me=None):
+     """True when a task row written between signatures ``old`` and ``sig`` may matter; None when unreadable."""
+     if any(v is None for v in (*old, *sig)) or sig[1] < old[1] or sig[0] < old[0]:
+         return True  # an empty table, a vanished row or a sequence that went backwards: no basis to skip
+@@ -441,10 +503,12 @@ def _moved_since(path, old, sig, swept):
+         rows = _replica_rows_after(path, old[1])
+     except Exception:  # health: allow BLE001 -- unreadable rows are unknown: hot
+         return None
+-    return sig[0] - old[0] > len(rows) or any(_substantive(gw, key, task, swept) for gw, key, task in rows)
++    # Judge EVERY row (no short-circuit): each one updates its remembered print.
++    moved = [_substantive(gw, key, task, swept, path, me) for gw, key, task in rows]
++    return sig[0] - old[0] > len(rows) or any(moved)
+ 
+ 
+-def _replica_token(path):
++def _replica_token(path, me=None):
+     """A counter that moves only when a replica task row changes in a way ``observe``/the sweep can act on, else
+     None (unknown). The first sight is 0: the first pass runs anyway."""
+     sig = _replica_tasks_signature(path)
+@@ -456,7 +520,7 @@ def _replica_token(path):
+         return 0
+     old, token, swept = prev
+     if sig != old:
+-        moved = _moved_since(path, old, sig, swept)
++        moved = _moved_since(path, old, sig, swept, me)
+         if moved is None:
+             return None
+         token += bool(moved)
+@@ -494,16 +558,22 @@ def _cards_settled(conn, cards, live, source: str = '', now: float | None = None
+             profile, sid = link.get('profile'), link.get('session')
+             if not profile or not sid or is_placeholder_session(sid):
+                 continue
+-            if sid in live:
+-                return False
+             if (sid, ref, state) in held:
+                 continue  # a live foreign holder owns it: the sweep skips it (see ``_remote``)
+-            if not remote._ledger_settled(conn, (sid,), ref, state) and not _expired_unobserved(
++            if remote._ledger_settled(conn, (sid,), ref, state) or _expired_unobserved(
+                     conn, source, task, ref, state, now):
+-                if parked is not None and _chat_inert(profile, sid):
+-                    parked.add((str(profile), str(sid)))  # re-read by every probe, memo hit or not
+-                    continue
+-                return False
++                # Nothing for the sweep to do, and an open chat changes none of it: ``_deliver_link`` ends at
++                # ``_note_open_chat`` (a log line) for a chat this process holds, with no claim and no write. The
++                # hub's owner chats are open in its gateway and own hundreds of settled cards each, so ONE such
++                # link kept the whole pass hot and cold every 30 s (t_48c41072e7cba68d). The live set is part of the
++                # memo key, so a chat unloading re-judges this.
++                continue
++            if sid in live:
++                return False  # unsettled in an open chat: its poller claims it within seconds
++            if parked is not None and _chat_inert(profile, sid):
++                parked.add((str(profile), str(sid)))  # re-read by every probe, memo hit or not
++                continue
++            return False
+     return True
+ 
+ 
+-- 
+2.43.0
+

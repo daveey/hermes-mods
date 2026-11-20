@@ -1,0 +1,259 @@
+From df3e7705141bf7f4629c116eda5e01eec4024814 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:49:07 -0800
+Subject: [PATCH] fix(state): futile FTS deferral keys on holder presence, not
+ an identical PID set
+
+The hub's stale index deferred 2,213 times over two days with foreign
+holders present at every deferral, yet the record never turned futile:
+the observed PID set changed every few deferrals (short-lived CLI holders,
+and each process records its own view, which excludes itself), and any
+change restarted the futility window. So the automatic online recovery
+never ran and the index had to be repaired by hand.
+
+The window now measures continuous presence of any foreign holder. It
+restarts only when the record shows no deferral for longer than twice the
+retry backoff cap (a new episode) or when the last deferral saw no holder.
+Log and doctor text name the current holders instead of claiming the
+same ones.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/doctor_state.py                    |   5 +-
+ hermes_state_fts_online.py                    |   4 +-
+ hermes_state_schema.py                        |  26 ++--
+ .../test_fts_futile_holder_churn.py           | 129 ++++++++++++++++++
+ 4 files changed, 149 insertions(+), 15 deletions(-)
+ create mode 100644 tests/hermes_state/test_fts_futile_holder_churn.py
+
+diff --git a/hermes_cli/doctor_state.py b/hermes_cli/doctor_state.py
+index c38474841d90528b3699f0bb128bad7b4f81b036..bcf53e509757d67aef2ea6408451e3998f145108 100644
+--- a/hermes_cli/doctor_state.py
++++ b/hermes_cli/doctor_state.py
+@@ -84,8 +84,9 @@ def _render_state_db_stats(stats: dict, holders=None, host_note: str = "") -> li
+     if isinstance(deferral, dict):
+         pids = deferral.get("holder_pids") or "unknown"
+         if deferral.get("futile"):
+-            lines.append(("warn", f"state.db FTS repair is blocked by the same holder(s) PID(s) {pids} for "
+-                          f"{deferral.get('holders_attempts') or '?'} consecutive deferral(s); waiting is futile",
++            lines.append(("warn", f"state.db FTS repair has been blocked by foreign holder(s) (now PID(s) "
++                          f"{pids}) for {deferral.get('holders_attempts') or '?'} consecutive deferral(s); "
++                          "waiting is futile",
+                           "(the host gateway's next retry rebuilds online with every holder running, or run "
+                           "'hermes sessions repair-search' now; alternatively stop ONLY the listed process(es) and "
+                           "the gateway's own retry rebuilds within a minute of the holder leaving)"))
+diff --git a/hermes_state_fts_online.py b/hermes_state_fts_online.py
+index 9d8c6565efef40a567f343690e5be306bef91398..ed367bec2191aa977cf4264b1a34749395ef9df0 100644
+--- a/hermes_state_fts_online.py
++++ b/hermes_state_fts_online.py
+@@ -31,8 +31,8 @@ names as damaged leaves unreachable pages, and those stores already failed every
+ recovery. Unlinking rather than renaming a damaged index is deliberate: a damaged index kept under any name can
+ later be dropped or drained, and that frees pages that live data may already reuse (the double references).
+ 
+-Used automatically by :meth:`retry_deferred_fts_recovery` once the one-shot rebuild is futile (same holders for
+-``_FTS_HOLDER_FUTILE_SECONDS``) or failed with a corrupt-image error, and by ``hermes sessions repair-search``.
++Used automatically by :meth:`retry_deferred_fts_recovery` once the one-shot rebuild is futile (foreign holders at every
++deferral for ``_FTS_HOLDER_FUTILE_SECONDS``) or failed with a corrupt-image error, and by ``hermes sessions repair-search``.
+ Never on a read-only or quarantined handle, nor on the legacy inline (pre-v23) layout.
+ """
+ 
+diff --git a/hermes_state_schema.py b/hermes_state_schema.py
+index 1d31ec7888156e25d67e9de744b2ac9cad4fef5b..9c9520dfe52e768d1abd1b3c8e3c937a880eb28d 100644
+--- a/hermes_state_schema.py
++++ b/hermes_state_schema.py
+@@ -42,8 +42,10 @@ logger = logging.getLogger("hermes_state")
+ 
+ _FTS_HOLDER_ESCALATE_ATTEMPTS = 3
+ _FTS_HOLDER_ESCALATE_SECONDS = 60.0
+-# The same holder PID set blocking this many deferrals over this long is a structurally resident
+-# peer (a supervised service on the same HERMES_HOME), not a transient one worth waiting out (#106393).
++# Foreign holders present at every deferral, this many over this long, mean the file is never free: a resident
++# peer (a supervised service on the same HERMES_HOME), not a transient one worth waiting out (#106393). Presence,
++# not identity: the hub's set never stayed equal (short-lived CLI holders come and go, and every process records
++# its own view, which leaves itself out), so a same-set window never closed in two days of deferrals.
+ _FTS_HOLDER_FUTILE_ATTEMPTS = 10
+ _FTS_HOLDER_FUTILE_SECONDS = 1800.0
+ # retry_deferred_fts_recovery cadence: startup paid the full admission wait once; later
+@@ -510,11 +512,12 @@ class SessionSchemaMixin:
+         (holders remain). After ``_FTS_HOLDER_ESCALATE_ATTEMPTS`` deferrals spanning
+         ``_FTS_HOLDER_ESCALATE_SECONDS``, provably inactive orphan Desktop backends are
+         reaped and the holders re-checked. The orphan reap is the only exit, so a supervised
+-        peer (never an orphan) blocks forever: once the SAME PID set has blocked
+-        ``_FTS_HOLDER_FUTILE_ATTEMPTS`` deferrals over ``_FTS_HOLDER_FUTILE_SECONDS`` the
+-        record is marked ``futile`` and the escalation names the holders and the remedy that
+-        works from inside a gateway session (stop only the other holder; this process's own
+-        retry tick admits the rebuild). A changed holder set restarts that window."""
++        peer (never an orphan) blocks forever: once foreign holders have blocked
++        ``_FTS_HOLDER_FUTILE_ATTEMPTS`` consecutive deferrals over ``_FTS_HOLDER_FUTILE_SECONDS``
++        (whichever PIDs they were) the record is marked ``futile`` and the escalation names the
++        holders and the remedy that works from inside a gateway session (stop only the other
++        holder; this process's own retry tick admits the rebuild). The window restarts only
++        when no deferral was recorded for longer than the retry backoff cap (a new episode)."""
+         now = time.time()
+         try:
+             row = cursor.execute(
+@@ -529,12 +532,13 @@ class SessionSchemaMixin:
+             attempts = int(record.get("attempts", 0)) + 1
+             holders_since = float(record.get("holders_since", now))
+             holders_attempts = int(record.get("holders_attempts", 0)) + 1
++            last_seen = float(record.get("last_seen", now))
+         except (TypeError, ValueError):
+-            first_seen, attempts, holders_since, holders_attempts = now, 1, now, 1
++            first_seen, attempts, holders_since, holders_attempts, last_seen = now, 1, now, 1, now
+         if first_seen > now or first_seen < 0:
+             first_seen = now
+         holder_pids = sorted({pid for pid, _path in foreign_holders if pid > 0})
+-        if holder_pids != record.get("holder_pids"):
++        if not record.get("holder_pids") or not 0 <= now - last_seen <= _FTS_STALE_RETRY_MAX_SECONDS * 2:
+             holders_since, holders_attempts = now, 1
+         if attempts >= _FTS_HOLDER_ESCALATE_ATTEMPTS and now - first_seen >= _FTS_HOLDER_ESCALATE_SECONDS:
+             reaped = self._reap_inactive_orphan_desktop_holders(
+@@ -564,8 +568,8 @@ class SessionSchemaMixin:
+         self._fts_deferred_holder_pids = holder_pids
+         if futile:
+             logger.error(
+-                "state.db FTS repair has been blocked by the same holder(s) for %d deferrals over %.0f min "
+-                "(%s); waiting is futile. Stop ONLY the other holder(s) — this process keeps running and its "
++                "state.db FTS repair has been blocked by foreign holder(s) at every one of %d deferrals over %.0f "
++                "min (now %s); waiting is futile. Stop ONLY the other holder(s) — this process keeps running and its "
+                 "own retry admits the rebuild within %.0fs of the holder leaving. Meanwhile its retry runs the "
+                 "online recovery, which needs no holder to stop (`hermes sessions repair-search` runs it now). "
+                 "`hermes doctor` shows this.",
+diff --git a/tests/hermes_state/test_fts_futile_holder_churn.py b/tests/hermes_state/test_fts_futile_holder_churn.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9be21cf85a02289f3d3067bca033ed5e46d26bc2
+--- /dev/null
++++ b/tests/hermes_state/test_fts_futile_holder_churn.py
+@@ -0,0 +1,129 @@
++"""Futile-deferral detection under a churning holder set.
++
++Regression for the hub's 2026-11-18/19 stale index: foreign holders were present at every one of 2,213 deferrals
++over two days, but the observed PID set changed every few deferrals (short-lived CLI holders, and each process
++records its own view, which leaves itself out). The futility window keyed on an identical set, so it never closed
++and the automatic online recovery never ran. Futility is continuous presence of any foreign holder.
++"""
++
++import json
++import sqlite3
++
++import pytest
++
++import hermes_state_schema
++from hermes_state import SessionDB
++from hermes_state_common import FTS_REBUILD_DEFERRAL_KEY
++
++
++def _meta_value(db_path, key):
++    raw = sqlite3.connect(str(db_path))
++    try:
++        row = raw.execute(
++            "SELECT value FROM state_meta WHERE key = ?", (key,)
++        ).fetchone()
++    finally:
++        raw.close()
++    return None if row is None else row[0]
++
++
++@pytest.fixture
++def stale_store(tmp_path, monkeypatch):
++    """A stale store reopened while foreign holders change on every scan; yields (db, db_path, clock)."""
++    db_path = tmp_path / "state.db"
++    db = SessionDB(db_path=db_path)
++    if not db._fts_enabled:
++        db.close()
++        pytest.skip("FTS5 unavailable in this build")
++    db.create_session("s1", source="test")
++    db.append_message("s1", "user", "seed")
++    raw = sqlite3.connect(str(db_path))
++    raw.execute(
++        "UPDATE messages_fts_data SET block = X'DEADBEEFDEADBEEFDEADBEEFDEADBEEF'"
++    )
++    raw.commit()
++    raw.close()
++    monkeypatch.setattr(
++        db,
++        "rebuild_fts",
++        lambda: (_ for _ in ()).throw(sqlite3.DatabaseError("still corrupt")),
++    )
++    db.append_message("s1", "user", "before restart")
++    db.close()
++
++    # Two processes each seeing the other (never itself), plus a transient CLI holder now and then.
++    scans = [0]
++
++    def holders(self):
++        scans[0] += 1
++        pid = 4242 if scans[0] % 2 else 5151
++        found = [(pid, str(db_path) + "-wal")]
++        if scans[0] % 3 == 0:
++            found.append((9000 + scans[0], str(db_path)))
++        return found
++
++    monkeypatch.setattr(SessionDB, "_foreign_state_db_holders", holders)
++    monkeypatch.setattr(
++        SessionDB,
++        "_reap_inactive_orphan_desktop_holders",
++        lambda self, h, *, min_age_seconds: [],
++    )
++    clock = [1000.0]
++    monkeypatch.setattr(hermes_state_schema.time, "time", lambda: clock[0])
++    reopened = SessionDB(db_path=db_path)
++    try:
++        assert reopened._fts_stale is True
++        yield reopened, db_path, clock
++    finally:
++        reopened.close()
++
++
++def _defer(db, clock, step):
++    clock[0] += step
++    cursor = db._conn.cursor()
++    assert db._recover_stale_fts(cursor, legacy=False, timeout_seconds=0.0) is False
++    db._conn.commit()
++    return json.loads(_meta_value(db.db_path, FTS_REBUILD_DEFERRAL_KEY))
++
++
++def test_holders_present_at_every_deferral_turn_futile_even_when_the_pids_change(
++    stale_store, caplog
++):
++    db, _db_path, clock = stale_store
++    attempts = hermes_state_schema._FTS_HOLDER_FUTILE_ATTEMPTS
++    step = hermes_state_schema._FTS_HOLDER_FUTILE_SECONDS / (attempts - 1)
++    seen = set()
++    record = {}
++    for _ in range(
++        attempts
++    ):  # the open deferred once already, so the window ends inside this loop
++        caplog.clear()
++        record = _defer(db, clock, step)
++        seen.add(tuple(record["holder_pids"]))
++        if record.get("futile"):
++            break
++    assert len(seen) > 1, (
++        "the holder set must actually churn for this test to mean anything"
++    )
++    assert record.get("futile") is True and record["holders_attempts"] == attempts, (
++        record
++    )
++    assert SessionDB._fts_deferral_futile(db._conn.cursor()) is True
++    futile_lines = [
++        r.getMessage() for r in caplog.records if "waiting is futile" in r.getMessage()
++    ]
++    assert futile_lines and "Stop ONLY the other holder" in futile_lines[-1]
++
++
++def test_a_quiet_gap_longer_than_the_retry_cap_starts_a_new_window(stale_store):
++    db, _db_path, clock = stale_store
++    attempts = hermes_state_schema._FTS_HOLDER_FUTILE_ATTEMPTS
++    step = hermes_state_schema._FTS_HOLDER_FUTILE_SECONDS / (attempts - 1)
++    for _ in range(attempts - 2):  # plus the open's deferral: one short of the window
++        record = _defer(db, clock, step)
++    assert record["holders_attempts"] == attempts - 1 and not record.get("futile"), (
++        record
++    )
++    # No deferral recorded for longer than any retry backoff: an old episode, not continuous presence.
++    record = _defer(db, clock, hermes_state_schema._FTS_STALE_RETRY_MAX_SECONDS * 2 + 1)
++    assert record["holders_attempts"] == 1 and not record.get("futile")
+-- 
+2.43.0
+

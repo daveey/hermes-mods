@@ -1,0 +1,406 @@
+From e74ba102f7e8d409cef700d2f7f7e7db77b85fbb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 20:57:25 +0000
+Subject: [PATCH] fix(kanban): a land-turn owner ranks ahead of aged work at
+ the priority cap [daveey]
+
+Problem (t_e1e58febfc0fae2d): state PR #3207 was approved at its exact head with 13/13 checks green from
+15:12Z on 2026-11-15, and its owner card t_37acb422ca465f9e held the state land turn until 16:30Z. The
+card re-entered ready at 15:12:26Z (condition_met on its CI wake) and was next claimed at 16:36:46Z
+(worker-4), 6 min after the turn expired. That run found an overlapping turn and 27 drifted base commits:
+another refresh, CI round and delta review (t_ae47e8c79ed22d88). Same pattern at 12:54->13:44->14:59Z and
+16:54->20:34Z; four review cards were spent on a patch whose verbatim patch-id never changed.
+
+Why 1: the owner waited 84 min in ready. Hub events 15:46:16Z chat_wait_unclaimed admission
+  {reason: llm_pacing, provider openai-codex paced}; dispatch_skipped llm_paced limit 1 running 1.
+  Each worker runs one codex card; the next freed slot goes to the best-ranked codex card.
+Why 2: the owner was not best-ranked. kanban_admission_score.rank orders by
+  min(1000, priority) + 25 * ready_minutes; the owner and the cards ahead of it were at the 1000 cap
+  (all 9 of the ready hub cards above 900 at 20:47Z are at 1000), so age decided,
+  and a card just back from a park restarts its ready clock (_ready_since: latest condition_met /
+  promoted). The body's 16:55Z reading: score 1025, 21st of ~28.
+Why 3: the existing turn-holder mechanism could not lift it. The turn-urgency observation
+  (kanban_turn_urgency.read_owners) feeds _apply_turn_floor, which sets max(priority, 900): a no-op for
+  a card already at 1000 (test_kanban_turn_score asserted the floor value, never the resulting order).
+Why 4 (detection): the floor was tested as "effective priority becomes 900", not "the owner is
+  dispatched before others"; no test put an owner behind aged cards at the cap. Separately, the
+  observer itself has published nothing since ~06:06Z (hub: "gh output too large", owned by
+  t_12e8775bde14262e), so even a working lift had no input.
+
+Root (happened): turn-holder urgency was expressed as a priority floor inside a score where priority
+  saturates at the cap and age dominates, so holding a turn bought no queue position.
+Root (not caught): tests checked the floor's number, not the dispatch order it was meant to produce.
+Recurrence: t_ce15faa434176d77 fixed paced cards hiding runnable ones in the pickup window; it did not
+  change order among runnable codex cards, so it could not prevent this.
+
+Fix: rank() puts cards the observation names as land-turn/lane owners ahead of every non-owner (owners
+keep score order among themselves; score values unchanged; ScoreBreakdown.turn_owner, explain/summary
+note it). kanban_board_share.Candidate carries the same tier, so a cross-board host slot also goes to the
+owner. A stale, invalid or missing observation names no owners and leaves the order exactly as before.
+Entry paths covered, each RED before / GREEN after:
+- worker pickup of a hub-homed owner (kanban_worker_node._evaluate): 12 codex cards ready 90 min, owner
+  just back from its CI park, codex paced; when one slot frees, pickup(budget=1) offers the owner, not the
+  oldest aged card (tests/hermes_cli/test_kanban_turn_owner_pickup.py);
+- home-gateway dispatch (kanban_db_dispatch.dispatch_once, max_spawn=1): the owner is claimed;
+- cross-board shared slot (gateway dispatcher tick, board_share): the owner's board takes the slot;
+- rank() with local and replica rows, two owners in score order, explain text.
+Not covered: the board-share starvation guard (2 h) still gives a starved board's head the first pick.
+---
+ hermes_cli/kanban_admission_score.py          |  46 +++++---
+ hermes_cli/kanban_board_share.py              |   8 +-
+ .../gateway/test_kanban_cross_board_slots.py  |  15 +++
+ .../test_kanban_turn_owner_pickup.py          | 108 ++++++++++++++++++
+ tests/hermes_cli/test_kanban_turn_score.py    |  30 +++++
+ 5 files changed, 190 insertions(+), 17 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_turn_owner_pickup.py
+
+diff --git a/hermes_cli/kanban_admission_score.py b/hermes_cli/kanban_admission_score.py
+index 57b6100198da480897836a10b6d823e76e695ef4..a22aa456894cd5dcb4bf533a698561ac45ec8488 100644
+--- a/hermes_cli/kanban_admission_score.py
++++ b/hermes_cli/kanban_admission_score.py
+@@ -8,6 +8,13 @@ Effective priority and open descendants come from the same graph as
+ edge set overriding it. Readiness age is the current ready/review interval (the stranded-ready diagnostic's floor:
+ latest ready-entry event, latest run end, else creation), not card age. One call is one snapshot: nothing is cached
+ or written (stored priority included), so completion, unlink or archive take effect on the next call.
++
++Turn owners rank first. A card the local turn-urgency observation (:mod:`kanban_turn_urgency`) names as holding the
++core land lane or a state land turn sorts ahead of every other card; owners keep score order among themselves. The
++score itself is unchanged (the 900 inherited floor still applies for donation). The floor alone could not do this:
++at the 1000 cap the age term (25 points per ready minute) decides, so an owner just back in ready from a CI or
++review park ranked behind every older card while its turn ran out (PR #3207, t_e1e58febfc0fae2d). A stale, invalid
++or missing observation names no owners, and the order is the score alone.
+ """
+ from __future__ import annotations
+ 
+@@ -34,11 +41,13 @@ class ScoreBreakdown:
+     total: float
+     ready_since: int
+     weights: tuple = tuple(sorted(DEFAULT_WEIGHTS.items()))
++    turn_owner: bool = False  # holds a land turn/lane per the turn-urgency observation: ranks ahead of any score
+ 
+     def as_dict(self) -> dict:
+         return {"effective_priority": self.effective_priority, "class_rank": self.class_rank,
+                 "descendants": self.descendants, "age_buckets": self.age_buckets, "failures": self.failures,
+-                "total": self.total, "ready_since": self.ready_since, "weights": dict(self.weights)}
++                "total": self.total, "ready_since": self.ready_since, "weights": dict(self.weights),
++                "turn_owner": self.turn_owner}
+ 
+ 
+ def _n(value) -> str:
+@@ -50,7 +59,7 @@ def explain(parts: dict) -> str:
+     w = parts["weights"]
+     return (f"score {_n(parts['total'])} = priority {parts['effective_priority']} + class {_n(w['class'])}*"
+             f"{parts['class_rank']} + unblock {_n(w['unblock'])}*{parts['descendants']} + age {_n(w['age'])}*"
+-            f"{parts['age_buckets']} - failures {_n(w['failure'])}*{parts['failures']}")
++            f"{parts['age_buckets']} - failures {_n(w['failure'])}*{parts['failures']}{_owner_note(parts)}")
+ 
+ 
+ def summary(parts: dict) -> str:
+@@ -58,7 +67,12 @@ def summary(parts: dict) -> str:
+     w = parts["weights"]
+     return (f"score {_n(parts['total'])} (priority {parts['effective_priority']} + class "
+             f"{_n(w['class'] * parts['class_rank'])} + unblock {_n(w['unblock'] * parts['descendants'])} + age "
+-            f"{_n(w['age'] * parts['age_buckets'])} - failures {_n(w['failure'] * parts['failures'])})")
++            f"{_n(w['age'] * parts['age_buckets'])} - failures {_n(w['failure'] * parts['failures'])})"
++            f"{_owner_note(parts)}")
++
++
++def _owner_note(parts: dict) -> str:
++    return "; turn owner: ranks ahead of non-owners" if parts.get("turn_owner") else ""
+ 
+ 
+ def validate_weights(raw) -> dict:
+@@ -112,7 +126,7 @@ def _graph(conn: sqlite3.Connection, candidate_ids, *, now_s=None):
+     local_ids = {r[0] for r in local}
+     tasks = {r[0]: (r[1] or 0, r[2]) for r in remote}
+     tasks.update((r[0], (r[1] or 0, r[2])) for r in local)
+-    _apply_turn_floor(conn, tasks, now_s=now_s)
++    owners = _apply_turn_floor(conn, tasks, now_s=now_s)
+     edges = [(p, c) for p, c in edges if c not in local_ids]
+     edges.extend(tuple(r) for r in local_edges)
+     children = defaultdict(set)
+@@ -121,11 +135,11 @@ def _graph(conn: sqlite3.Connection, candidate_ids, *, now_s=None):
+             children[parent].add(child)
+     metadata.update(local_metadata)
+     since.update(local_since)
+-    return tasks, children, metadata, since
++    return tasks, children, metadata, since, owners
+ 
+ 
+-def _apply_turn_floor(conn, tasks, *, now_s=None):
+-    """Apply advisory owners only to existing open rows on this connection's board."""
++def _apply_turn_floor(conn, tasks, *, now_s=None) -> frozenset:
++    """Apply advisory owners only to existing open rows on this connection's board; return those owners."""
+     import time
+ 
+     from hermes_cli.kanban_host_counts import board_of
+@@ -133,12 +147,15 @@ def _apply_turn_floor(conn, tasks, *, now_s=None):
+ 
+     board = board_of(conn)
+     if board is None:
+-        return
++        return frozenset()
+     owners = read_owners(board=board, now_s=time.time() if now_s is None else now_s)
++    applied = set()
+     for tid in owners & tasks.keys():
+         priority, status = tasks[tid]
+         if status not in ("done", "archived"):
+             tasks[tid] = (max(priority, 900), status)
++            applied.add(tid)
++    return frozenset(applied)
+ 
+ 
+ def _alarm_key(key) -> bool:
+@@ -222,7 +239,7 @@ def effective_priorities(conn: sqlite3.Connection, task_ids: list[str]) -> dict[
+ 
+     Return only extant task identities. Stored values are never changed.
+     """
+-    tasks, children, _metadata, _since = _graph(conn, [])
++    tasks, children, _metadata, _since, _owners = _graph(conn, [])
+     return {tid: min(PRIORITY_CAP, max([tasks[tid][0], *(tasks[c][0] for c in _descendants(tid, children))]))
+             for tid in task_ids if tid in tasks}
+ 
+@@ -230,8 +247,9 @@ def effective_priorities(conn: sqlite3.Connection, task_ids: list[str]) -> dict[
+ def rank(conn: sqlite3.Connection, rows, *, now_ms: Optional[int] = None, weights: Optional[dict] = None):
+     """``rows`` (local task rows with ``id``) in admission order, each with its :class:`ScoreBreakdown`.
+ 
+-    Pure and read-only. Ties break on ready-interval start, source creation time,
+-    then task id. Creation retains subsecond precision and local custody wins."""
++    Pure and read-only. Turn owners come first (module docstring), then the score; ties break on
++    ready-interval start, source creation time, then task id. Creation retains subsecond precision and local
++    custody wins."""
+     import time
+ 
+     rows = list(rows)
+@@ -240,7 +258,7 @@ def rank(conn: sqlite3.Connection, rows, *, now_ms: Optional[int] = None, weight
+     weights = configured_weights() if weights is None else validate_weights(weights)
+     now_s = (time.time() * 1000 if now_ms is None else now_ms) / 1000
+     ids = [row["id"] for row in rows]
+-    tasks, children, metadata, since = _graph(conn, ids, now_s=now_s)
++    tasks, children, metadata, since, owners = _graph(conn, ids, now_s=now_s)
+     scored = []
+     for row in rows:
+         tid = row["id"]
+@@ -257,7 +275,7 @@ def rank(conn: sqlite3.Connection, rows, *, now_ms: Optional[int] = None, weight
+         total = (effective + weights["class"] * class_rank + weights["unblock"] * descendants
+                  + weights["age"] * buckets - weights["failure"] * failures)
+         scored.append((row, ScoreBreakdown(effective, class_rank, descendants, buckets, failures, total, start,
+-                                           tuple(sorted(weights.items())))))
+-    scored.sort(key=lambda item: (-item[1].total, item[1].ready_since,
++                                           tuple(sorted(weights.items())), tid in owners)))
++    scored.sort(key=lambda item: (not item[1].turn_owner, -item[1].total, item[1].ready_since,
+                                  metadata.get(item[0]["id"], ("normal", 0, 0))[2], item[0]["id"]))
+     return scored
+diff --git a/hermes_cli/kanban_board_share.py b/hermes_cli/kanban_board_share.py
+index 9ea0db5244fbabc9fd7e84fa92424ae58031f2f1..56f33d776f8176c97c8d8e1e53bfb34a8308e2f1 100644
+--- a/hermes_cli/kanban_board_share.py
++++ b/hermes_cli/kanban_board_share.py
+@@ -54,11 +54,12 @@ class Candidate(NamedTuple):
+     ready_since: float  # the starvation clock, set on a board's head only (:func:`_starve_clock`)
+     score: Optional[float] = None  # cross-board aged admission score; None: raw effective priority (fallback)
+     since: float = 0.0  # the score's age clock: its first tie-break, as in ``kanban_admission_score.rank``
++    turn_owner: bool = False  # holds a land turn/lane: ahead of every non-owner (``kanban_admission_score.rank``)
+ 
+     def rank(self) -> tuple:
+         if self.score is None:
+-            return (-self.priority, self.since, not self.waited_on, self.created_at, self.task_id)
+-        return (-self.score, self.since, False, self.created_at, self.task_id)
++            return (True, -self.priority, self.since, not self.waited_on, self.created_at, self.task_id)
++        return (not self.turn_owner, -self.score, self.since, False, self.created_at, self.task_id)
+ 
+ 
+ def candidates(conn, limit: int, *, now: Optional[float] = None) -> list[Candidate]:
+@@ -102,7 +103,8 @@ def _scored(conn, rows: list, now: float) -> list[Candidate]:
+         since = max(parts.ready_since, served)
+         age = dict(parts.weights)["age"]
+         score = parts.total - age * (parts.age_buckets - max(0, int(now - since)) // AGE_BUCKET_S)
+-        out.append(by_id[row["id"]]._replace(priority=parts.effective_priority, score=score, since=float(since)))
++        out.append(by_id[row["id"]]._replace(priority=parts.effective_priority, score=score, since=float(since),
++                                             turn_owner=parts.turn_owner))
+     return out
+ 
+ 
+diff --git a/tests/gateway/test_kanban_cross_board_slots.py b/tests/gateway/test_kanban_cross_board_slots.py
+index fbb5810b691039d773effaa514c97d5b04ff8fb6..b7c308997036f33e4616a31b3b1257259b89f91d 100644
+--- a/tests/gateway/test_kanban_cross_board_slots.py
++++ b/tests/gateway/test_kanban_cross_board_slots.py
+@@ -80,6 +80,21 @@ def test_one_shared_slot_goes_to_the_higher_priority_card_on_the_other_board(hom
+     assert hermes.at_capacity == "max_in_progress=1/1"  # ticked after default spent the slot
+ 
+ 
++def test_a_turn_owner_on_another_board_takes_the_shared_slot_from_aged_work(home, monkeypatch):
++    """t_e1e58febfc0fae2d: a card holding a land turn wins the host slot across boards too, not only on its own."""
++    from tests.hermes_cli.test_kanban_turn_owner_pickup import observe
++    old = time.time() - 90 * 60
++    aged = _card("default", "default p1000, ready 90 min", 1000, ready_since=old)
++    owner = _card("hermes", "hermes p1000 turn owner, just back in ready", 1000)
++    observe(home, "hermes", owner)
++    spawned = []
++    dispatcher = _dispatcher(monkeypatch, spawned, start_board="default")
++
++    dispatcher.tick_once()
++
++    assert spawned == [("hermes", owner)], (spawned, aged)
++
++
+ def test_zero_quota_refuses_spawns_and_says_why(home):
+     with kbc.connect_closing(board="hermes") as conn:
+         res = kbd.DispatchResult()
+diff --git a/tests/hermes_cli/test_kanban_turn_owner_pickup.py b/tests/hermes_cli/test_kanban_turn_owner_pickup.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..147bb43dc23b6ae1ae5c7b98b1bff9c2aed49f5f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_turn_owner_pickup.py
+@@ -0,0 +1,108 @@
++"""A card that holds a land turn is picked up ahead of aged work, on every dispatch path. [daveey]
++
++Regression (2026-11-15, t_e1e58febfc0fae2d): state PR #3207's owner card t_37acb422ca465f9e held the state land
++turn until 16:30Z with an approved, 13/13-green head from 15:12Z. Codex was paced to one run per worker and every
++ready card sat at priority 1000 (the cap), so the order came from the age term (25 points per ready minute). The
++owner had just re-entered ready from its CI park, so it ranked behind every card that had waited longer, and the
++next claim came at 16:36Z, after the turn expired and ``state`` drifted: another refresh, CI round and review.
++The turn-urgency observation names exactly these owners, but it only raised them to a priority FLOOR of 900, a
++no-op for a card already at 1000.
++"""
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_llm_pacing as lp
++from hermes_cli import kanban_llm_pacing_dispatch as pd
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli import test_kanban_worker_node as support
++
++svc = support.svc
++gws = support.gws
++AGED_S = 90 * 60  # the aged codex queue: ready 90 min, like the 21 cards ahead of #3207's owner at 16:55Z
++TURN_LEFT_S = 70 * 60
++
++
++def observe(home, board, owner, *, now=None, source="state-turn"):
++    """The cache the turn-urgency observer (or its hub snapshot import) writes on this host."""
++    now = time.time() if now is None else now
++    path = home / "cache" / ("kanban-turn-urgency.json" if board == "default"
++                             else f"kanban-turn-urgency-{board}.json")
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(json.dumps({
++        "version": 1, "board": board, "source_revision": "lane=x;turns=y", "observed_at": now - 1,
++        "valid_until": now + 100, "owners": [{"task_id": owner, "source": source,
++                                              "ref": "refs/land-turn/pr-3207", "head": "c831bb9a98",
++                                              "expires_at": now + TURN_LEFT_S}]}))
++    return path
++
++
++@pytest.fixture
++def pools(monkeypatch):
++    """codex follows ``state['codex']`` (HELD = at its limit, OPEN = a slot freed)."""
++    state = {"codex": lp.HELD}
++
++    def pace_for(conn, provider, cfg, now):
++        if provider == "openai-codex":
++            return lp.PoolPace(provider, state["codex"], 0.0 if state["codex"] == lp.HELD else 1.0)
++        return lp.PoolPace(provider, lp.OPEN, 1.0)
++    monkeypatch.setattr(pd, "pace_for", pace_for)
++    return state
++
++
++def _codex(conn, title, *, aged):
++    tid = kb.create_task(conn, title=title, assignee="default", priority=1000, runs_on=["linux"],
++                         model_override="gpt-5.5", provider_override="openai-codex")
++    if aged:
++        old = int(time.time()) - AGED_S
++        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (old, tid))
++        conn.execute("UPDATE task_events SET created_at = ? WHERE task_id = ?", (old, tid))
++        conn.commit()
++    return tid
++
++
++def _hub_queue(hub, n):
++    """``n`` aged codex cards at the cap, then the owner, just back in ready from its CI park."""
++    hub.enter()
++    aged = [_codex(hub.conn, f"aged codex {i}", aged=True) for i in range(n)]
++    owner = _codex(hub.conn, "land state PR #3207 (holds the turn)", aged=False)
++    hub.round()
++    return aged, owner
++
++
++def test_worker_pickup_offers_the_turn_owner_first_when_a_paced_slot_frees(gws, pools):
++    """Hub-homed owner, picked up by a pool worker (``kanban_worker_node._evaluate``)."""
++    hub, worker = gws
++    _aged, owner = _hub_queue(hub, 12)
++    worker.round()
++    worker.enter()
++    observe(worker.home, "default", owner)
++    assert wn.pickup(worker.conn, budget=1) == []  # codex at its limit: nothing offered, nothing hidden
++    pools["codex"] = lp.OPEN  # one codex run on this worker ends
++    assert wn.pickup(worker.conn, budget=1) == [owner]  # RED before: the oldest aged codex card
++
++
++def test_without_a_valid_observation_the_aged_order_stands(gws, pools):
++    hub, worker = gws
++    aged, owner = _hub_queue(hub, 3)
++    worker.round()
++    worker.enter()
++    observe(worker.home, "default", owner, now=time.time() - 600)  # expired generation: no urgency at all
++    pools["codex"] = lp.OPEN
++    picked = wn.pickup(worker.conn, budget=1)
++    assert picked and picked[0] in aged
++
++
++def test_home_dispatch_claims_the_turn_owner_before_aged_work(gws, pools):
++    """Owner homed on the dispatching gateway (``kanban_db_dispatch.dispatch_once``), one slot."""
++    hub, _worker = gws
++    hub.enter()
++    pools["codex"] = lp.OPEN
++    aged = [_codex(hub.conn, f"aged codex {i}", aged=True) for i in range(5)]
++    owner = _codex(hub.conn, "land state PR (holds the turn)", aged=False)
++    observe(hub.home, "default", owner)
++    hub.tick(max_spawn=1)
++    claimed = [r["id"] for r in hub.conn.execute("SELECT id FROM tasks WHERE status = 'running'")]
++    assert claimed == [owner], (claimed, aged)
+diff --git a/tests/hermes_cli/test_kanban_turn_score.py b/tests/hermes_cli/test_kanban_turn_score.py
+index d830d77a0ddfbefea3e7212890875469254d1ec2..b34bcdfe207175dd5f36ef73770ca842d69a29e4 100644
+--- a/tests/hermes_cli/test_kanban_turn_score.py
++++ b/tests/hermes_cli/test_kanban_turn_score.py
+@@ -40,6 +40,36 @@ def test_owner_floor_ranking_inheritance_and_no_write(sources, observation, remo
+     assert source.execute("SELECT priority FROM tasks WHERE id='owner'").fetchone()[0] == 0
+ 
+ 
++@pytest.mark.parametrize('remote', [False, True])
++def test_owner_ranks_ahead_of_aged_cards_at_the_cap(sources, observation, remote):
++    """t_e1e58febfc0fae2d: a floor of 900 does nothing for an owner already at 1000; the turn ranks it first."""
++    local, replica = sources
++    source = replica if remote else local
++    aged = [helpers.add(source, f'aged-{i}', 1 + i, 1000) for i in range(5)]  # ready ~16 min: +400 points
++    owner = helpers.add(source, 'owner', 999, 1000)
++    source.execute("INSERT INTO task_events VALUES ('owner', 'promoted', '{}', 999)")  # just back from a park
++    ranked = score.rank(local, [*aged, owner], now_ms=1000000)
++    assert ranked[0][0]['id'] == 'owner'
++    parts = dict((row['id'], p) for row, p in ranked)
++    assert parts['owner'].turn_owner and not parts['aged-0'].turn_owner
++    assert parts['owner'].total < parts['aged-0'].total  # the score itself is unchanged: the turn is a tier
++    assert 'turn owner' in score.explain(parts['owner'].as_dict())
++    assert 'turn owner' not in score.explain(parts['aged-0'].as_dict())
++
++
++def test_two_owners_keep_score_order_between_them(sources, observation):
++    local, _ = sources
++    path, value = observation
++    value['owners'].append({'task_id': 'owner-2', 'source': 'state-turn', 'ref': 'turn', 'head': 'h',
++                            'expires_at': 1120})
++    path.write_text(json.dumps(value))
++    first = helpers.add(local, 'owner', 999, 1000)
++    second = helpers.add(local, 'owner-2', 100, 1000)  # waited longer
++    other = helpers.add(local, 'aged', 1, 1000)
++    ranked = score.rank(local, [first, other, second], now_ms=1000000)
++    assert [row['id'] for row, _ in ranked] == ['owner-2', 'owner', 'aged']
++
++
+ @pytest.mark.parametrize('change', ['stale', 'future', 'foreign', 'unknown_board'])
+ def test_invalid_observation_never_promotes(sources, observation, monkeypatch, change):
+     local, _ = sources
+-- 
+2.43.0
+

@@ -1,0 +1,429 @@
+From 5ae35051e23b0023339e9bc6c743e02e6475104b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 10:41:21 +0000
+Subject: [PATCH] [daveey] kanban pacing: start a paced card on a class route
+ with room instead of holding it
+
+Pool workers 2026-11-15 10:09Z: the quota pace governor held Anthropic and openai-codex to one running card each
+(llm_paced), so ready cards queued for hours, although each worker's routing registry can hold a subscription
+route in the same class on a pool with room: Grok on xai-oauth (X Ultra subscription; entitlement checked: hub
+xai-oauth pool row -> POST api.x.ai/v1/responses grok-4.7 -> HTTP 200, served grok-4.7), or a governed pool
+still behind pace. The governor only knew "start on this route" or "hold"; it never asked whether the card's
+class had another route (t_d943a79dd2b3889f).
+
+Five whys: cards queue -> hold() returns True -> every candidate pool of the card's route is ahead of pace ->
+a default card's route is one concrete provider (gpt-6-astra/openai-codex, or claude-opus after a wall move)
+-> the governor never consulted the class alternates the quota-wall path already uses (alternate_route).
+
+Change:
+- kanban_llm_pacing_dispatch._pace_alternate: when every candidate pool holds the card, probe the same
+  non-allocating alternate_route the quota-episode/wall path uses, with the holding pools as extra walls.
+  Eligibility is the worker's own (billing/capability, subscription-only, funding_verified), unpinned default
+  or strong-class routes only; mandatory pins, model/provider overrides and require_model cards still wait.
+  A governed target is pace-judged only when the probe names it (no extra usage reads), a target that does not
+  serve on this host's live pool (no credential) or shows a quota wall is excluded and the probe retried
+  (bounded). Any fault keeps today's hold.
+- hold(): with an alternate, the card is not held; the move is offered to the route applier.
+  pickup_hold(): a card the local claim would start on an alternate is not held from pickup.
+- New kanban_pace_reroute: process-local offer/take handoff (120 s TTL, taken once, bound to the judged
+  route) so the governor stays the only reader of pace state (test_only_kanban_dispatch_consults_the_governor
+  unchanged). apply_model_tier takes the offer after its own resolution and records the move on run_route:
+  tier_reason "<reason>+paced:<paced providers>", provider/model = the alternate.
+
+xai-oauth stays ungoverned: there is no usage endpoint for it (account_usage has no xai branch), so its pool is
+never paced; a real rate limit there walls through the existing quota-episode path.
+
+Proof: tests/hermes_cli/test_kanban_pace_reroute.py (10): RED on main for the three move cases (default card
+-> grok when anthropic+codex paced, default codex card -> open anthropic sonnet, pickup), GREEN here; holds kept
+for no Grok credential, ineligible/unfunded Grok route, override and require_model pins, probe fault; offer
+binding and TTL. All 29 test files importing kanban_llm_pacing_dispatch/kanban_model_tier (756 tests) pass;
+scripts/check --base origin/main: 20 checks ok.
+
+Deployment: inert until a host's model_routing registry lists an eligible, funding-verified Grok route and the
+host holds an xai-oauth credential (state PRs: relay accepts xai-oauth #3298, then mint + worker routes).
+---
+ hermes_cli/kanban_llm_pacing_dispatch.py     |  81 ++++++++-
+ hermes_cli/kanban_model_tier.py              |   8 +
+ hermes_cli/kanban_pace_reroute.py            |  49 ++++++
+ tests/hermes_cli/test_kanban_pace_reroute.py | 176 +++++++++++++++++++
+ 4 files changed, 310 insertions(+), 4 deletions(-)
+ create mode 100644 hermes_cli/kanban_pace_reroute.py
+ create mode 100644 tests/hermes_cli/test_kanban_pace_reroute.py
+
+diff --git a/hermes_cli/kanban_llm_pacing_dispatch.py b/hermes_cli/kanban_llm_pacing_dispatch.py
+index ef3bbc0513416ddef8fdba4f7e0e0fcde28cc048..b6f50feb2d2501b3ef72cd3ada085d94a2c0dcf6 100644
+--- a/hermes_cli/kanban_llm_pacing_dispatch.py
++++ b/hermes_cli/kanban_llm_pacing_dispatch.py
+@@ -144,15 +144,21 @@ def _route_providers(model: Optional[str], provider: Optional[str]) -> list[str]
+     return [name] if name else []
+ 
+ 
+-def candidate_providers(conn: sqlite3.Connection, task: Any, lane: str) -> list[str]:
+-    """Providers the card's next run may land on; ``[]`` = unknown (the card starts)."""
++def candidate_route(conn: sqlite3.Connection, task: Any, lane: str) -> tuple[tuple, list[str]]:
++    """``((model, provider, reason), providers)``: the card's next-run route and the providers it may land on
++    (``[]`` = unknown, the card starts)."""
+     from hermes_cli.kanban_model_tier import profile_route, resolve_dispatch_tier
+-    model, provider, _ = resolve_dispatch_tier(conn, task, lane=lane)
++    model, provider, reason = resolve_dispatch_tier(conn, task, lane=lane)
+     if not model:
+         model, provider = getattr(task, "model_override", None), getattr(task, "provider_override", None)
+     if not model:
+         model, provider = profile_route(getattr(task, "assignee", None))
+-    return _route_providers(model, provider)
++    return (model, provider, reason), _route_providers(model, provider)
++
++
++def candidate_providers(conn: sqlite3.Connection, task: Any, lane: str) -> list[str]:
++    """Providers the card's next run may land on; ``[]`` = unknown (the card starts)."""
++    return candidate_route(conn, task, lane)[1]
+ 
+ 
+ def local_running(conn: sqlite3.Connection, provider: str) -> int:
+@@ -299,6 +305,62 @@ def _governed(conn: sqlite3.Connection, task_id: str, lane: str, cfg: lp.PacingC
+     return task, providers
+ 
+ 
++def _pace_alternate(conn: sqlite3.Connection, task: Any, lane: str, cfg: lp.PacingConfig,
++                    host: sqlite3.Connection, verdicts: list[dict]) -> Optional[tuple[str, str, str, tuple]]:
++    """``(model, provider, paced, judged)``: a route of the card's own class on a pool that is NOT ahead of pace, for a
++    card whose every candidate pool holds it (``verdicts``); ``judged`` is the ``(model, provider)`` route it moves
++    from. None keeps the hold. [daveey]
++
++    The move uses the quota-episode probe (``alternate_route``: unpinned default or strong-class routes only, the
++    worker's own billing/capability eligibility, never a mandatory or ``require_model`` card, never a walled provider)
++    with the holding pools as extra walls, so an ungoverned subscription pool (xai-oauth: Grok on the X Ultra
++    subscription) or a governed one still behind pace takes the card. A governed target is judged by this governor
++    first and only when the probe names it, so no pool is read that the card could not move to. The target must serve
++    on this host's live pool and show no quota wall: never a second wall, never a provider this host holds no
++    credential for. ``paced`` names the governed pools that would hold the card (``,``-joined). Pool workers
++    2026-11-15: Anthropic and Codex paced to one running card each while ready cards queued for hours
++    (t_d943a79dd2b3889f). Any fault keeps the hold (warned)."""
++    try:
++        route = candidate_route(conn, task, lane)[0]
++        return _pace_alternate_route(conn, task, route, lane, cfg, host, verdicts)
++    except Exception as exc:  # health: allow BLE001 -- a failed probe keeps today's hold, never starts a paced card
++        _warn("alternate", "kanban pacing: pace alternate probe failed (%s: %s); holding", type(exc).__name__, exc)
++        return None
++
++
++def _pace_alternate_route(conn, task, route, lane, cfg, host, verdicts):
++    from hermes_cli import kanban_provider_walls as pw
++    from hermes_cli.kanban_quota_episode import alternate_route
++    if pw.requires_model(task):
++        return None
++    now = time.time()
++    paced = {v["provider"]: float(v.get("until") or now + cfg.read_interval) for v in verdicts}
++    unusable: dict[str, float] = {}
++    model, provider, reason = route
++    # A default route already moved off a wall or by its episode is still the unpinned default card.
++    reason = str(reason or "")
++    base = (model, provider, reason.split("+", 1)[0] if reason.startswith("default+") else reason)
++    deferrable = is_deferrable(conn, task, lane)
++    for _ in range(len(cfg.providers) + 4):  # every probe excludes one more provider: bounded
++        moved = alternate_route(conn, task, {**unusable, **paced}, base, now)
++        if not moved:
++            return None
++        target = pw._norm(moved[1])
++        if target in paced or target in unusable:
++            return None  # the probe ignored its walls: never trust it
++        if not pw.live_pool_serving(target, moved[0]) or pw.live_quota_wall(target, moved[0]):
++            unusable[target] = now
++            continue
++        if target in cfg.providers:
++            pace = pace_for(host, target, cfg, now)
++            limit = lp.admit_limit(pace, avg_running(target, now, cfg), deferrable=deferrable, cfg=cfg)
++            if limit is not None and local_running(host, target) >= limit:
++                paced[target] = float(pace.until or now + cfg.read_interval)
++                continue
++        return moved[0], target, ",".join(sorted(paced)), (model, provider)
++    return None
++
++
+ def _stored_pace(entry: Any, now: float, cfg: lp.PacingConfig) -> Optional[lp.PoolPace]:
+     """The pace a dispatcher on this home stored for one provider; None when it is absent, malformed, stamped in the
+     future or older than :data:`STALE_READ_INTERVALS` read intervals."""
+@@ -385,6 +447,15 @@ def hold(conn: sqlite3.Connection, row: Any, lane: str, result: Any, *, dry_run:
+         verdicts = _verdicts(conn, task, providers, lane, cfg)
+         if verdicts is None:
+             return False
++        moved = _pace_alternate(conn, task, lane, cfg, conn, verdicts)
++        if moved is not None:
++            # Start it on a pool with room instead of holding it; the applier moves the route after the claim.
++            from hermes_cli.kanban_pace_reroute import offer
++            if not dry_run:
++                offer(task.id, moved[3], moved[:3])
++            logger.info("kanban pacing: %s pools %s ahead of pace; starting on %s/%s", task.id, moved[2], moved[1],
++                        moved[0])
++            return False
+         _record(conn, task.id, verdicts, result, dry_run=dry_run, cfg=cfg)
+         return True
+     except Exception as exc:  # health: allow BLE001 -- the governor fails open; a fault never holds a card
+@@ -405,6 +476,8 @@ def pickup_hold(local: sqlite3.Connection, replica: sqlite3.Connection, card: An
+         if judged is None:
+             return None
+         verdicts = _verdicts(replica, judged[0], judged[1], card["status"], cfg, host=local)
++        if verdicts is not None and _pace_alternate(replica, judged[0], card["status"], cfg, local, verdicts):
++            return None  # the local claim starts it on a pool with room (hold)
+         return None if verdicts is None else ", ".join(f"{v['provider']} {v['state']}" for v in verdicts)
+     except Exception as exc:  # health: allow BLE001 -- a hold prediction must never stop a pickup
+         _warn("pickup", "kanban pacing: pickup hold check failed (%s: %s); copying ungoverned", type(exc).__name__, exc)
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index f9afc20627bc0a18c079d892f7f37b0535786569..7e646d2a2da0f99c94856f994687a6d742435e09 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -296,6 +296,14 @@ def apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Opt
+     plus the run's resolved ``run_route`` receipt (every spawn, tier off included).
+     Returns the reason. Review resolution/receipt failures refuse admission rather than reusing an author pin."""
+     reason = _apply_model_tier(conn, task, lane=lane, cfg=cfg)
++    # The claim-time quota governor started this card on a pool with room instead of holding it on a paced one
++    # (kanban_pace_reroute): move the run there, only when this resolution landed on the route it judged. [daveey]
++    from hermes_cli.kanban_pace_reroute import REASON as _PACED, take as _take_pace_move
++    moved = _take_pace_move(getattr(task, "id", ""), (getattr(task, "model_override", None),
++                                                      getattr(task, "provider_override", None)))
++    if moved:
++        task.model_override, task.provider_override = moved[0], moved[1]
++        reason = f"{reason}+{_PACED}:{moved[2]}"
+     record_run_route(conn, task, lane=lane, reason=reason)
+     return reason
+ 
+diff --git a/hermes_cli/kanban_pace_reroute.py b/hermes_cli/kanban_pace_reroute.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..cd85e486a6c052205e89bbac25d8aa2044ef6041
+--- /dev/null
++++ b/hermes_cli/kanban_pace_reroute.py
+@@ -0,0 +1,49 @@
++"""Claim-time handoff of a pace reroute from the Kanban quota governor to the route applier. [daveey]
++
++The governor (the dispatcher's pace hold) judges a ready card before its claim; when every pool the card would run on
++is ahead of pace but another subscription route of the same class has room, it starts the card on that route
++instead of holding it. The route itself is applied after the claim (``kanban_model_tier.apply_model_tier``), so the
++governor :func:`offer`\\ s the move here and the applier :func:`take`\\ s it for the same card in the same tick.
++
++An offer binds to the route the governor judged: the applier moves the card only when its own resolution lands on
++that same route (else the card's route changed between the two reads and the move no longer applies). Offers live
++:data:`TTL_SECONDS` and are taken once. Process-local by design: the hold and the claim run in one dispatcher tick.
++"""
++from __future__ import annotations
++
++import threading
++import time
++from typing import Optional
++
++TTL_SECONDS = 120.0
++REASON = "paced"  # ``run_route.tier_reason`` suffix: ``<reason>+paced:<paced providers>``
++_LOCK = threading.Lock()
++_OFFERS: dict[str, tuple[float, tuple[str, str], tuple[str, str, str]]] = {}
++
++
++def _norm(route: tuple) -> tuple[str, str]:
++    model, provider = route[0], route[1]
++    return str(model or "").strip(), str(provider or "").strip().lower()
++
++
++def offer(task_id: str, judged: tuple, moved: tuple[str, str, str]) -> None:
++    """Record that ``task_id``'s judged ``(model, provider)`` route moves to ``moved`` = ``(model, provider, paced)``."""
++    now = time.monotonic()
++    with _LOCK:
++        for key in [k for k, v in _OFFERS.items() if now - v[0] >= TTL_SECONDS]:
++            _OFFERS.pop(key, None)
++        _OFFERS[task_id] = (now, _norm(judged), moved)
++
++
++def take(task_id: str, resolved: tuple) -> Optional[tuple[str, str, str]]:
++    """The move offered for ``task_id`` when it is fresh and was judged on the ``resolved`` route; consumed either way."""
++    with _LOCK:
++        found = _OFFERS.pop(task_id, None)
++    if found is None or time.monotonic() - found[0] >= TTL_SECONDS or found[1] != _norm(resolved):
++        return None
++    return found[2]
++
++
++def clear() -> None:
++    with _LOCK:
++        _OFFERS.clear()
+diff --git a/tests/hermes_cli/test_kanban_pace_reroute.py b/tests/hermes_cli/test_kanban_pace_reroute.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..41914aac0ded18d92ec3d401565102d5cc6bdec7
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pace_reroute.py
+@@ -0,0 +1,176 @@
++"""The quota pace governor starts a card on a pool with room instead of holding it (t_d943a79dd2b3889f). [daveey]
++
++Pool workers 2026-11-15: every governed pool (Anthropic, Codex) paced to one running card while ready cards queued for
++hours, though the routing registry held a subscription Grok route (xai-oauth, X Ultra) in the same classes.
++"""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_llm_pacing as lp
++from hermes_cli import kanban_llm_pacing_dispatch as pd
++from hermes_cli import kanban_model_tier as tier
++from hermes_cli import kanban_pace_reroute as reroute
++from hermes_cli import kanban_provider_walls as walls
++from tests.hermes_cli.test_kanban_quota_episode import board as board, routing  # noqa: PLC0414
++
++HOUR = 3600.0
++GROK = ("grok-4.7", "xai-oauth")
++POOL_CFG = {"default_model": "gpt-6-astra", "default_provider": "openai-codex",
++            "strong_model": "class:deep", "strong_provider": "auto"}
++
++
++def _route(provider, model):
++    return dict(provider=provider, model=model, billing="subscription", weight=1, eligible=True,
++                funding_verified=True, capabilities={"tools": True, "streaming": True})
++
++
++@pytest.fixture
++def pool(board, monkeypatch, all_assignees_spawnable):
++    """A pool worker's registry: Grok in standard and deep next to Codex and Claude; no walls anywhere."""
++    config, _ = routing(monkeypatch)
++    config["model_routing"]["routes"] = {
++        "standard": [_route("openai-codex", "gpt-6-astra"), _route("anthropic", "claude-sonnet-5-5"), _route(*GROK[::-1])],
++        "deep": [_route("anthropic", "claude-opus-5-5"), _route("openai-codex", "gpt-6.1-sol"), _route(*GROK[::-1])]}
++    monkeypatch.setattr(tier, "load_tier_config", lambda: dict(POOL_CFG))
++    monkeypatch.setattr(walls, "active_walls", lambda **_k: {})
++    monkeypatch.setattr(walls, "live_quota_wall", lambda *_a, **_k: None)
++    serving = {"xai-oauth", "anthropic", "openai-codex"}
++    monkeypatch.setattr(walls, "live_pool_serving", lambda provider, model=None: provider in serving)
++    monkeypatch.setattr(pd, "_CACHE", {})
++    monkeypatch.setattr(pd, "_WARNED", {})
++    monkeypatch.setattr(pd, "state_path", lambda: board / "llm_pacing.json")
++    reroute.clear()
++    yield config, serving
++    reroute.clear()
++
++
++def _pools(monkeypatch, used):
++    """``used``: provider -> seven-day percent; 99 holds the pool (past reserve), 5 leaves it open."""
++    def read(provider, now):
++        return [lp.Reading(now, f"{provider}-1", lp.SEVEN_DAY, used[provider], now + 9 * HOUR)]
++    monkeypatch.setattr(pd, "read_pool", read)
++
++
++def _dispatch(conn):
++    seen = []
++    result = kbd.dispatch_once(conn, dry_run=False, spawn_fn=lambda task, ws: seen.append(
++        (task.id, task.model_override, task.provider_override)))
++    return seen, result
++
++
++def _route_receipt(conn, tid):
++    row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='run_route' ORDER BY id DESC LIMIT 1",
++                       (tid,)).fetchone()
++    return kb._json_dict(row[0]) if row else None
++
++
++def _paced_events(conn, tid):
++    return [e for e in kb.list_events(conn, tid) if e.kind == pd.EVENT_KIND]
++
++
++def test_default_card_starts_on_grok_when_codex_and_claude_are_paced(pool, monkeypatch):
++    _pools(monkeypatch, {"anthropic": 99, "openai-codex": 99})
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="routine work", assignee="a")
++        seen, result = _dispatch(conn)
++        receipt = _route_receipt(conn, tid)
++        assert _paced_events(conn, tid) == []
++    assert seen == [(tid, *GROK)]
++    assert tid not in result.clock_held
++    assert receipt["provider"] == "xai-oauth" and receipt["model"] == "grok-4.7"
++    assert receipt["tier_reason"] == "default+paced:anthropic,openai-codex"
++
++
++def test_default_card_on_paced_codex_takes_the_open_claude_pool_first(pool, monkeypatch):
++    """The paced pools are the walls; a governed pool still behind pace is a valid alternate (class order)."""
++    _pools(monkeypatch, {"anthropic": 5, "openai-codex": 99})
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="routine work", assignee="a")
++        seen, _ = _dispatch(conn)
++        receipt = _route_receipt(conn, tid)
++    assert seen == [(tid, "claude-sonnet-5-5", "anthropic")]
++    assert receipt["tier_reason"] == "default+paced:openai-codex"
++
++
++def test_no_grok_credential_on_this_host_keeps_the_hold(pool, monkeypatch):
++    _, serving = pool
++    serving.discard("xai-oauth")
++    _pools(monkeypatch, {"anthropic": 99, "openai-codex": 99})
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="routine work", assignee="a")
++        seen, result = _dispatch(conn)
++        assert len(_paced_events(conn, tid)) == 1
++    assert seen == [] and result.clock_held[tid][0] == lp.GUARD_REASON
++
++
++def test_ineligible_grok_route_keeps_the_hold(pool, monkeypatch):
++    config, _ = pool
++    for routes in config["model_routing"]["routes"].values():
++        for route in routes:
++            if route["provider"] == "xai-oauth":
++                route["funding_verified"] = False
++    _pools(monkeypatch, {"anthropic": 99, "openai-codex": 99})
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="routine work", assignee="a")
++        seen, result = _dispatch(conn)
++    assert seen == [] and result.clock_held[tid][0] == lp.GUARD_REASON
++
++
++@pytest.mark.parametrize("pin", ["override", "require_model"])
++def test_pinned_cards_still_wait_for_their_pool(pool, monkeypatch, pin):
++    _pools(monkeypatch, {"anthropic": 99, "openai-codex": 99})
++    with kbc.connect() as conn:
++        if pin == "override":
++            tid = kb.create_task(conn, title="needs opus", assignee="a", model_override="claude-opus-5-5",
++                                 provider_override="anthropic")
++        else:
++            tid = kb.create_task(conn, title="needs astra", assignee="a", body=walls.REQUIRE_MODEL_MARKER)
++        seen, result = _dispatch(conn)
++    assert seen == [] and result.clock_held[tid][0] == lp.GUARD_REASON
++
++
++def test_pickup_takes_a_card_the_claim_would_start_on_grok(pool, monkeypatch):
++    _pools(monkeypatch, {"anthropic": 99, "openai-codex": 99})
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="routine work", assignee="a")
++        card = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
++        assert pd.pickup_hold(conn, conn, card) is None
++    _, serving = pool
++    serving.discard("xai-oauth")
++    monkeypatch.setattr(pd, "_CACHE", {})
++    with kbc.connect() as conn:
++        assert pd.pickup_hold(conn, conn, card) == "openai-codex held"
++
++
++def test_alternate_probe_fault_keeps_the_hold(pool, monkeypatch):
++    _pools(monkeypatch, {"anthropic": 99, "openai-codex": 99})
++
++    def boom(*_a, **_k):
++        raise RuntimeError("probe down")
++    monkeypatch.setattr("hermes_cli.kanban_quota_episode.alternate_route", boom)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="routine work", assignee="a")
++        seen, result = _dispatch(conn)
++    assert seen == [] and result.clock_held[tid][0] == lp.GUARD_REASON
++
++
++def test_offer_applies_only_to_the_route_it_judged():
++    reroute.clear()
++    reroute.offer("t1", ("gpt-6-astra", "openai-codex"), ("grok-4.7", "xai-oauth", "openai-codex"))
++    assert reroute.take("t1", ("claude-opus-5-5", "anthropic")) is None  # the route moved since: no move
++    assert reroute.take("t1", ("gpt-6-astra", "openai-codex")) is None  # consumed by the first take
++    reroute.offer("t1", ("gpt-6-astra", "OpenAI-Codex"), ("grok-4.7", "xai-oauth", "openai-codex"))
++    assert reroute.take("t1", ("gpt-6-astra", "openai-codex")) == ("grok-4.7", "xai-oauth", "openai-codex")
++
++
++def test_stale_offer_is_ignored(monkeypatch):
++    reroute.clear()
++    now = [1000.0]
++    monkeypatch.setattr(reroute.time, "monotonic", lambda: now[0])
++    reroute.offer("t1", ("gpt-6-astra", "openai-codex"), ("grok-4.7", "xai-oauth", "openai-codex"))
++    now[0] += reroute.TTL_SECONDS
++    assert reroute.take("t1", ("gpt-6-astra", "openai-codex")) is None
+-- 
+2.43.0
+

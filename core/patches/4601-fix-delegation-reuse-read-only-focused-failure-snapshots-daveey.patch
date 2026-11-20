@@ -1,0 +1,328 @@
+From 08167653cbc20d52ab31a372bb8bd6bcc6040ab8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 15:17:36 +0000
+Subject: [PATCH] fix(delegation): reuse read-only focused failure snapshots
+ [daveey]
+
+Focused subagent.list polls opened the async ledger writer on every call.
+Even after schema-once reconciliation, writer setup applied durability
+barriers and cloned configuration plus chmod on every read. A real-store
+209-call cProfile replay attributed 1.306s cumulative wall to that setup.
+Existing failure-surface tests checked output, not writer/bootstrap work.
+
+Use bounded thread-local read-only handles and commit-keyed scoped SQL
+snapshots. Evaluate the 24h cutoff each call, retaining its inclusive
+boundary and clock rollback behavior. Never memoize RPC authorization,
+live children, progress or process observations. Errors discard handles;
+missing/schema-unready stores are not created or migrated by polling.
+
+RED: no-writer and missing-store tests failed on base; no-rescan due-time
+test failed on uncached read-only intermediate. GREEN: targeted consumers
+and focused tests; complete consumer suite follows on this commit.
+Real-dispatch fixture replay (2 owners, 2000 foreign rows, 209 calls,
+21 unrelated commits, one relevant update): before 0.368490 CPU seconds,
+after 0.030386 seconds (1.763111 vs 0.145389 ms/call). Fixture evidence is
+not live whole-rpc acceptance; parent J retains the <=1% core gate.
+---
+ .../test_async_delegation_focused_reads.py    | 147 ++++++++++++++++++
+ .../test_subagent_list_focused_reads.py       |  29 ++++
+ tools/async_delegation.py                     |  14 +-
+ tools/async_delegation_focused_reads.py       |  71 +++++++++
+ 4 files changed, 254 insertions(+), 7 deletions(-)
+ create mode 100644 tests/tools/test_async_delegation_focused_reads.py
+ create mode 100644 tests/tui_gateway/test_subagent_list_focused_reads.py
+ create mode 100644 tools/async_delegation_focused_reads.py
+
+diff --git a/tests/tools/test_async_delegation_focused_reads.py b/tests/tools/test_async_delegation_focused_reads.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e31dfd8d70dd9dfb20e076ebf3c8fb7e37e265bc
+--- /dev/null
++++ b/tests/tools/test_async_delegation_focused_reads.py
+@@ -0,0 +1,147 @@
++"""Focused list reads must not reopen the ledger's writer/bootstrap path."""
++import sqlite3
++
++import pytest
++
++from tools import async_delegation as ad
++from tests.tools.test_async_delegation_failed_surface import home as _home_fixture, _delegation
++
++home = _home_fixture
++
++
++def test_focused_read_never_opens_writer_after_dispatch(monkeypatch):
++    _delegation('failed', status='error', result={'status': 'error'}, completed_at=1000)
++    def forbidden():
++        raise AssertionError('focused list reopened writer/bootstrap')
++    monkeypatch.setattr(ad, '_connect', forbidden)
++    assert ad.failed_delegations_for_session('ui-1', now=1001)[0]['delegation_id'] == 'failed'
++
++
++def test_unchanged_reads_and_due_time_do_not_rescan(home, monkeypatch):
++    from tools import async_delegation_focused_reads as reads
++    _delegation('failed', status='error', result={'status': 'error'}, completed_at=1000)
++    statements = []
++    connect = reads.sqlite3.connect
++    def traced(*args, **kwargs):
++        conn = connect(*args, **kwargs)
++        conn.set_trace_callback(statements.append)
++        return conn
++    monkeypatch.setattr(reads.sqlite3, 'connect', traced)
++    deadline = 1000 + ad._FAILURE_SURFACE_WINDOW_S
++    for now in (1001, deadline):
++        assert ad.failed_delegations_for_session('ui-1', now=now)
++    assert ad.failed_delegations_for_session('ui-1', now=deadline + 0.25) == []
++    # Wall-clock rollback restores the still-valid row, without a database commit.
++    assert ad.failed_delegations_for_session('ui-1', now=1001)
++    assert len([s for s in statements if s.startswith('SELECT delegation_id')]) == 1
++
++
++def test_missing_store_is_not_created(home):
++    assert ad.failed_delegations_for_session('ui-1') == []
++    assert not (home / 'state.db').exists()
++
++
++def test_external_commits_refresh_only_requested_scope(home):
++    _delegation('failed', status='error', result={'status': 'error'}, completed_at=1000)
++    assert ad.failed_delegations_for_session('ui-1', now=1001)[0]['status'] == 'error'
++    assert ad.failed_delegations_for_session('other', 'other', now=1001) == []
++    # Separate real writer, not a same-handle total_changes approximation.
++    with sqlite3.connect(home / 'state.db') as writer:
++        writer.execute("UPDATE async_delegations SET result_json=? WHERE delegation_id='failed'",
++                       ('{"status":"timeout","error":"new error"}',))
++    row = ad.failed_delegations_for_session('ui-1', now=1001)[0]
++    assert (row['status'], row['error']) == ('timeout', 'new error')
++    with sqlite3.connect(home / 'state.db') as writer:
++        writer.execute("UPDATE async_delegations SET origin_ui_session_id='other', parent_session_id='other'")
++    assert ad.failed_delegations_for_session('ui-1', 'agent-1', now=1001) == []
++    assert ad.failed_delegations_for_session('other', 'other', now=1001)[0]['delegation_id'] == 'failed'
++    with sqlite3.connect(home / 'state.db') as writer:
++        writer.execute('DELETE FROM async_delegations')
++    assert ad.failed_delegations_for_session('other', now=1001) == []
++
++
++def test_failed_row_appears_after_empty_snapshot():
++    ad._persist_dispatch({'delegation_id': 'later', 'origin_ui_session_id': 'ui-1', 'session_key': '', 'dispatched_at': 900})
++    assert ad.failed_delegations_for_session('ui-1', now=1001) == []
++    ad._persist_completion({'delegation_id': 'later', 'status': 'error', 'completed_at': 1000}, {'status': 'error'})
++    assert ad.failed_delegations_for_session('ui-1', now=1001)[0]['delegation_id'] == 'later'
++
++
++def test_profiles_and_limits_are_separate(home):
++    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
++    _delegation('one', status='error', result={'status': 'error'}, completed_at=1000)
++    _delegation('two', status='error', result={'status': 'error'}, completed_at=1001)
++    assert len(ad.failed_delegations_for_session('ui-1', now=1002, limit=1)) == 1
++    assert len(ad.failed_delegations_for_session('ui-1', now=1002, limit=2)) == 2
++    token = set_hermes_home_override(str(home / 'other'))
++    try:
++        assert ad.failed_delegations_for_session('ui-1', now=1002) == []
++        _delegation('other-home', status='error', result={'status': 'error'}, completed_at=1000)
++        assert ad.failed_delegations_for_session('ui-1', now=1002)[0]['delegation_id'] == 'other-home'
++    finally:
++        reset_hermes_home_override(token)
++    assert ad.failed_delegations_for_session('ui-1', now=1002)[0]['delegation_id'] == 'two'
++
++
++@pytest.mark.parametrize('during_query', [False, True])
++def test_atomic_replacement_never_reuses_old_rows(home, monkeypatch, during_query):
++    from tools import async_delegation_focused_reads as reads
++    _delegation('old', status='error', result={'status': 'error'}, completed_at=1000)
++    path = home / 'state.db'
++    # Independent standalone copy; backup includes any WAL pages.
++    replacement = home / 'replacement.db'
++    with sqlite3.connect(path) as source, sqlite3.connect(replacement) as target:
++        source.backup(target)
++        target.execute("UPDATE async_delegations SET delegation_id='replacement'")
++    assert ad.failed_delegations_for_session('ui-1', now=1001)[0]['delegation_id'] == 'old'
++    if during_query:
++        query = reads._query
++        def replacing(*args):
++            rows = query(*args)
++            replacement.replace(path)
++            return rows
++        monkeypatch.setattr(reads, '_query', replacing)
++        # New scope forces a query while the old handle remains open.
++        assert ad.failed_delegations_for_session('ui-1', 'agent-1', now=1001) == []
++        monkeypatch.setattr(reads, '_query', query)
++    else:
++        replacement.replace(path)
++    assert ad.failed_delegations_for_session('ui-1', now=1001)[0]['delegation_id'] == 'replacement'
++
++
++def test_removed_store_and_schema_unready_recover(home):
++    _delegation('old', status='error', result={'status': 'error'}, completed_at=1000)
++    assert ad.failed_delegations_for_session('ui-1', now=1001)
++    (home / 'state.db').rename(home / 'removed.db')
++    assert ad.failed_delegations_for_session('ui-1', now=1001) == []
++    with sqlite3.connect(home / 'state.db') as writer:
++        writer.execute('CREATE TABLE unrelated (id INTEGER)')
++    assert ad.failed_delegations_for_session('ui-1', now=1001) == []
++    _delegation('new', status='error', result={'status': 'error'}, completed_at=1000)
++    assert ad.failed_delegations_for_session('ui-1', now=1001)[0]['delegation_id'] == 'new'
++
++
++def test_commit_during_query_is_not_certified_as_current(home, monkeypatch):
++    from tools import async_delegation_focused_reads as reads
++    _delegation('old', status='error', result={'status': 'error'}, completed_at=1000)
++    query = reads._query
++    def racing(*args):
++        rows = query(*args)
++        with sqlite3.connect(home / 'state.db') as writer:
++            writer.execute("UPDATE async_delegations SET result_json=?", ('{"status":"timeout"}',))
++        return rows
++    monkeypatch.setattr(reads, '_query', racing)
++    assert ad.failed_delegations_for_session('ui-1', now=1001)[0]['status'] == 'error'
++    monkeypatch.setattr(reads, '_query', query)
++    assert ad.failed_delegations_for_session('ui-1', now=1001)[0]['status'] == 'timeout'
++
++
++def test_reader_is_readonly_and_scope_cache_is_bounded(home):
++    from tools import async_delegation_focused_reads as reads
++    _delegation('one', status='error', result={'status': 'error'}, completed_at=1000)
++    for i in range(reads._MAX_SCOPES + 1):
++        ad.failed_delegations_for_session(f'ui-{i}', now=1001)
++    _, conn, scopes = reads._readers.entries[str((home / 'state.db').absolute())]
++    assert len(scopes) == reads._MAX_SCOPES
++    with pytest.raises(sqlite3.OperationalError, match='readonly'):
++        conn.execute('DELETE FROM async_delegations')
+diff --git a/tests/tui_gateway/test_subagent_list_focused_reads.py b/tests/tui_gateway/test_subagent_list_focused_reads.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9f6e81cb37486559c887a133d75ed7f5e373e14a
+--- /dev/null
++++ b/tests/tui_gateway/test_subagent_list_focused_reads.py
+@@ -0,0 +1,29 @@
++"""Focused failure memo must never cache runtime authority or live child rows."""
++from types import SimpleNamespace
++
++from tests.tui_gateway.test_subagent_snapshot import runtime as _runtime_fixture
++from tests.tools.test_async_delegation_failed_surface import home as _home_fixture, _delegation
++
++runtime = _runtime_fixture
++home = _home_fixture
++
++
++def test_failure_memo_keeps_authority_and_child_progress_live(runtime, home, monkeypatch):
++    import time
++    from tools import delegate_tool_registry as reg
++    server, owner, transport, call = runtime
++    _delegation('failed', status='error', ui='ui-owner', result={'status': 'error'}, completed_at=time.time())
++    assert call('subagent.list')['result']['delegations'][0]['delegation_id'] == 'failed'
++    reg._active_subagents['child'] = {
++        'subagent_id': 'child', 'owner_session_id': 'ui-owner', 'owner_transport': transport,
++        'owner_session_record': owner, 'tool_count': 1, 'status': 'running', 'started_at': 999,
++        'agent': SimpleNamespace(session_id='child-session')}
++    first = call('subagent.list')['result']['subagents'][0]
++    assert first['tool_count'] == 1
++    reg._active_subagents['child']['tool_count'] = 2
++    assert call('subagent.list')['result']['subagents'][0]['tool_count'] == 2
++    reg._active_subagents.clear()
++    assert call('subagent.list')['result']['subagents'] == []
++    assert 'error' in call('subagent.list', via=SimpleNamespace(write=lambda frame: True))
++    server._sessions.clear()
++    assert 'error' in call('subagent.list')
+diff --git a/tools/async_delegation.py b/tools/async_delegation.py
+index 2ba32ba4fd9632cd0d06b961ea994182748f2c4d..8610706eca58047d8255b2c3f5c44a40e9a8c9c0 100644
+--- a/tools/async_delegation.py
++++ b/tools/async_delegation.py
+@@ -1020,13 +1020,13 @@ def failed_delegations_for_session(
+     if not selectors:
+         return []
+     cutoff = (now if now is not None else time.time()) - _FAILURE_SURFACE_WINDOW_S
+-    owner_sql = " OR ".join(f"{col}=?" for col, _ in selectors)
+-    with _DB_LOCK, _transaction() as conn:
+-        rows = conn.execute(
+-            f"""SELECT delegation_id, state, dispatched_at, completed_at, task_json, result_json FROM async_delegations
+-                WHERE ({owner_sql}) AND state NOT IN ('running','finalizing') AND completed_at >= ?
+-                ORDER BY completed_at DESC LIMIT ?""",
+-            (*(val for _, val in selectors), cutoff, limit)).fetchall()
++    from agent.runtime_session_store import WorkerPersistenceError, is_worker_process
++    from tools.async_delegation_focused_reads import failure_rows
++
++    if is_worker_process():
++        raise WorkerPersistenceError('worker_delegation_ledger_unavailable')
++    rows = failure_rows(_db_path(), selectors, limit)
++    rows = [row for row in rows if row[3] >= cutoff]
+     failed: list[dict[str, Any]] = []
+     for delegation_id, state, dispatched_at, completed_at, task_json, result_json in rows:
+         task, result = _json_object(task_json), redact_child_result(_json_object(result_json))
+diff --git a/tools/async_delegation_focused_reads.py b/tools/async_delegation_focused_reads.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3812faf83a89df8e435451e9b07c947849147904
+--- /dev/null
++++ b/tools/async_delegation_focused_reads.py
+@@ -0,0 +1,71 @@
++"""Commit-keyed, read-only durable failure rows for focused session polling.
++
++Only immutable SQL rows are retained, never owner authority or live observations.
++The caller evaluates its time window on every read (including clock rollback).
++"""
++import sqlite3
++import threading
++from collections import OrderedDict
++
++_readers = threading.local()
++_MAX_HOMES = 8
++_MAX_SCOPES = 32
++
++
++def _identity(path):
++    stat = path.stat()
++    return stat.st_dev, stat.st_ino
++
++
++def _query(conn, selectors, limit):
++    owner_sql = ' OR '.join(f'{col}=?' for col, _ in selectors)
++    return tuple(conn.execute(
++        "SELECT delegation_id, state, dispatched_at, completed_at, task_json, result_json "
++        f"FROM async_delegations WHERE ({owner_sql}) AND state NOT IN ('running','finalizing') "
++        "AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT ?",
++        (*(val for _, val in selectors), limit)).fetchall())
++
++
++def failure_rows(path, selectors, limit):
++    """No writer/bootstrap on polls; errors drop the reader and retry next call.
++
++    data_version belongs to this retained connection, not another handle. Read it
++    BEFORE querying so a concurrent commit cannot certify older rows as current.
++    Bound both connections and scope entries; expiry never relies on a cache TTL.
++    """
++    readers = getattr(_readers, 'entries', None)
++    if readers is None:
++        readers = _readers.entries = OrderedDict()
++    key = str(path.absolute())
++    try:
++        identity = _identity(path)
++        entry = readers.get(key)
++        if entry is not None and entry[0] != identity:
++            readers.pop(key)[1].close()
++            entry = None
++        if entry is None:
++            conn = sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True, timeout=0.1)
++            entry = (identity, conn, OrderedDict())
++            readers[key] = entry
++            if _identity(path) != identity:
++                raise OSError('ledger replaced during open')
++            while len(readers) > _MAX_HOMES:
++                readers.popitem(last=False)[1][1].close()
++        readers.move_to_end(key)
++        conn, scopes = entry[1:]
++        revision = conn.execute('PRAGMA data_version').fetchone()[0]
++        scope = (tuple(selectors), limit)
++        cached = scopes.get(scope)
++        if cached is None or cached[0] != revision:
++            rows = _query(conn, selectors, limit)
++            if _identity(path) != identity:
++                raise OSError('ledger replaced during read')
++            scopes[scope] = (revision, rows)
++        scopes.move_to_end(scope)
++        while len(scopes) > _MAX_SCOPES:
++            scopes.popitem(last=False)
++        return scopes[scope][1]
++    except (OSError, sqlite3.Error):
++        if entry := readers.pop(key, None):
++            entry[1].close()
++        return ()
+-- 
+2.43.0
+

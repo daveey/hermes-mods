@@ -1,0 +1,192 @@
+From 91ec92fcf841b23999f7b2a2e7d835b59f7ee8d5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 14:05:28 -0800
+Subject: [PATCH] Read a picked-up review card's source links from the board
+ replica
+
+Pickup copies a card's parent edges only, and the feed keeps a link only when
+its child is local, so a review card picked up on a worker lost its links to the
+source cards: no implementer evidence, review refused. Review evidence now lists
+a card's linked children from the live file and, on a synced board, the replica
+(source_reader.children), which also covers links added after pickup.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_review_model.py             |  3 +-
+ hermes_cli/kanban_review_sources.py           | 39 ++++++++---
+ .../test_kanban_review_source_replica.py      | 70 +++++++++++++++++--
+ 3 files changed, 95 insertions(+), 17 deletions(-)
+
+diff --git a/hermes_cli/kanban_review_model.py b/hermes_cli/kanban_review_model.py
+index 45bf7c457bb45e8ecc5a0a75b6860e8209e34d6a..8444e516b278fcf031e9a49ae36e1af1b10eb6b3 100644
+--- a/hermes_cli/kanban_review_model.py
++++ b/hermes_cli/kanban_review_model.py
+@@ -107,8 +107,7 @@ def implementer_models(conn, task) -> set[str]:
+             created = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='created' "
+                                    "ORDER BY id LIMIT 1", (card.id,)).fetchone()
+             creator = _payload(created[0] if created else None).get("creator_task_id")
+-            sources = [row[0] for row in conn.execute(
+-                "SELECT child_id FROM task_links WHERE parent_id=?", (card.id,)).fetchall()]
++            sources = lookup.children(card.id)
+             if isinstance(creator, str) and creator:
+                 sources.append(creator)
+             for source in sources:
+diff --git a/hermes_cli/kanban_review_sources.py b/hermes_cli/kanban_review_sources.py
+index 89856dfc18c40bf0fb8e2c7da8b5d69d4dcb8502..181da4f38dc9f4b722ad0faef1ccdcee91ae896f 100644
+--- a/hermes_cli/kanban_review_sources.py
++++ b/hermes_cli/kanban_review_sources.py
+@@ -11,6 +11,10 @@ def source_reader(conn):
+     not import creators for routing: eviction would remove them again, and a
+     runnable source must not gain execution custody merely by being read.
+     Runs and their events always use the same connection (integer IDs are local).
++
++    ``lookup.children(task_id)`` lists a card's linked child ids from the live file and, on a synced board, the
++    replica: pickup copies only a card's parent edges, and the feed keeps only links whose child is local, so a
++    picked-up review card's links to its sources live only in the replica (worker refusals 2026-11-19). [daveey]
+     """
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_db_sync as sync
+@@ -18,24 +22,37 @@ def source_reader(conn):
+     from hermes_cli.kanban_review_model import ReviewModelUnavailable
+ 
+     replica = None
++    opened = False
++
++    def board_replica():
++        nonlocal replica, opened
++        if not opened and (sync.sync_state(conn) or {}).get('mode') == 'primary':
++            opened = True
++            replica = wn.open_replica(conn)
++            if replica is not None:
++                replica.execute('BEGIN')
++        return replica
+ 
+     def lookup(task_id):
+-        nonlocal replica
+         local = kb.get_task(conn, task_id)
+         if local is not None:
+             return conn, local
+-        state = sync.sync_state(conn) or {}
+-        if state.get('mode') == 'primary':
+-            if replica is None:
+-                replica = wn.open_replica(conn)
+-                if replica is not None:
+-                    replica.execute('BEGIN')
+-            if replica is not None:
+-                remote = kb.get_task(replica, task_id)
+-                if remote is not None:
+-                    return replica, remote
++        remote_board = board_replica()
++        if remote_board is not None:
++            remote = kb.get_task(remote_board, task_id)
++            if remote is not None:
++                return remote_board, remote
+         raise ReviewModelUnavailable(f'Review implementer evidence is unavailable for source {task_id}')
+ 
++    def children(task_id):
++        query = 'SELECT child_id FROM task_links WHERE parent_id=? ORDER BY child_id'
++        found = [row[0] for row in conn.execute(query, (task_id,)).fetchall()]
++        remote_board = board_replica()
++        if remote_board is not None:
++            found += [row[0] for row in remote_board.execute(query, (task_id,)).fetchall() if row[0] not in found]
++        return found
++
++    lookup.children = children
+     try:
+         yield lookup
+     except (sqlite3.Error, OSError) as exc:
+diff --git a/tests/hermes_cli/test_kanban_review_source_replica.py b/tests/hermes_cli/test_kanban_review_source_replica.py
+index ac61937879835a039a2966ae9b1534d05d11cabe..fbf5bad0f762c1e5dfb45e38da9c2b279a0ec932 100644
+--- a/tests/hermes_cli/test_kanban_review_source_replica.py
++++ b/tests/hermes_cli/test_kanban_review_source_replica.py
+@@ -101,7 +101,7 @@ def test_replica_author_pin_is_refused_without_rewriting_pin(gws, monkeypatch):
+     assert kb.get_task(worker.conn, down).model_override == AUTHOR
+ 
+ 
+-def test_local_source_wins_and_no_replica_is_opened(gws, monkeypatch):
++def test_local_source_wins_over_the_replica_copy(gws, monkeypatch):
+     pool._attest(monkeypatch)
+     source, down, _ = _carried(gws)
+     _, worker = gws
+@@ -113,9 +113,12 @@ def test_local_source_wins_and_no_replica_is_opened(gws, monkeypatch):
+         replica.close()
+     worker.conn.execute('UPDATE tasks SET model_override=? WHERE id=?', ('gpt-6-astra', source))
+     worker.conn.commit()
+-    def unexpected(conn):
+-        pytest.fail('local source must not open replica')
+-    monkeypatch.setattr(wn, 'open_replica', unexpected)
++    # The replica copy still has no override: only the local copy can name gpt-6-astra.
++    replica = wn.open_replica(worker.conn)
++    try:
++        assert kb.get_task(replica, source).model_override in (None, '')
++    finally:
++        replica.close()
+     assert review.implementer_models(worker.conn, kb.get_task(worker.conn, down)) == {AUTHOR, 'gpt-6-astra'}
+ 
+ 
+@@ -193,3 +196,62 @@ def test_unsynced_board_never_reads_a_replica(gws, monkeypatch):
+     monkeypatch.setattr(wn, 'open_replica', unexpected)
+     with pytest.raises(review.ReviewModelUnavailable):
+         review.implementer_models(worker.conn, kb.get_task(worker.conn, down))
++
++
++def _linked(gws, *, link_after_pickup=False):
++    """A review card whose only implementer evidence is its link to the source (no creator, no declaration)."""
++    hub, worker = gws
++    hub.enter()
++    source = kb.create_task(hub.conn, title='Implement cache', assignee='default')
++    hub.round()
++    claim = kb.claim_task(hub.conn, source, claimer=kb._claimer_id())
++    assert claim
++    kb._append_event(hub.conn, source, 'worker_result', {'route_model': AUTHOR}, run_id=claim.current_run_id)
++    assert kb.complete_task(hub.conn, source, result='implemented', expected_run_id=claim.current_run_id)
++    down = kb.create_task(hub.conn, title='Independent review: cache', assignee='default')
++    if not link_after_pickup:
++        kb.link_tasks(hub.conn, down, source)
++    hub.conn.commit()
++    hub.round()
++    worker.round()
++    worker.enter()
++    replica = wn.open_replica(worker.conn)
++    assert replica is not None
++    try:
++        assert wn.import_cards(worker.conn, replica, [down]) == [down]
++    finally:
++        replica.close()
++    if link_after_pickup:
++        hub.enter()
++        kb.link_tasks(hub.conn, down, source)
++        hub.conn.commit()
++        hub.round()
++        worker.round()
++        worker.enter()
++    assert kb.get_task(worker.conn, source) is None
++    return source, down
++
++
++@pytest.mark.parametrize('link_after_pickup', [False, True])
++def test_picked_up_review_reads_its_source_links_from_the_replica(gws, monkeypatch, link_after_pickup):
++    """Worker refusals 2026-11-19: pickup copied the review card but not its links to the source, so the worker
++    found no implementer and refused the review. A link the Board adds after pickup never reaches the live file
++    either (the feed keeps a link only when its child is local)."""
++    pool._attest(monkeypatch)
++    source, down = _linked(gws, link_after_pickup=link_after_pickup)
++    _, worker = gws
++    assert not worker.conn.execute('SELECT 1 FROM task_links WHERE parent_id=?', (down,)).fetchone()
++    before = worker.conn.total_changes
++    assert review.implementer_models(worker.conn, kb.get_task(worker.conn, down)) == {AUTHOR}
++    assert worker.conn.total_changes == before
++    assert kb.get_task(worker.conn, source) is None
++
++
++def test_linked_review_without_a_replica_stays_fail_closed(gws, monkeypatch):
++    pool._attest(monkeypatch)
++    _, down = _linked(gws)
++    _, worker = gws
++    monkeypatch.setattr(wn, 'open_replica', lambda conn: None)
++    assert review.implementer_models(worker.conn, kb.get_task(worker.conn, down)) == set()
++    with pytest.raises(review.ReviewModelUnavailable, match='Downstream review implementer evidence'):
++        review.resolve_review_model(worker.conn, kb.get_task(worker.conn, down), {'strong_model': pool.PIN['model']})
+-- 
+2.43.0
+

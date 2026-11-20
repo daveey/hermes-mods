@@ -1,0 +1,422 @@
+From c7d243db1f8c978199a7bf69b94c56f5fefcbc9a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 02:00:58 +0000
+Subject: [PATCH] [daveey] Detect quote-removed builtin name subscript sinks
+
+Normalize literal builtin name operands before arithmetic evaluation, preserve conditional escape semantics and data-only builtin options, and expose escaped names to the reference walk. Cache expansion boundaries across frames to retain linear scans. Proof: Bash 5.2.21 marker tests reproduce all 14 reported misses on main; original suite RED 24 failures/10 passes, expanded focused GREEN 167 tests. Existing quoted DATA lists unchanged.
+---
+ tests/tools/test_shell_builtin_names.py | 108 +++++++++++++
+ tools/shell_arith_sink.py               |  18 +++
+ tools/shell_builtin_names.py            | 200 ++++++++++++++++++++++++
+ tools/shell_prefix_expansions.py        |  11 +-
+ 4 files changed, 334 insertions(+), 3 deletions(-)
+ create mode 100644 tests/tools/test_shell_builtin_names.py
+ create mode 100644 tools/shell_builtin_names.py
+
+diff --git a/tests/tools/test_shell_builtin_names.py b/tests/tools/test_shell_builtin_names.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6f1aa780145f5886a40fa3d2d72d98daa97dee80
+--- /dev/null
++++ b/tests/tools/test_shell_builtin_names.py
+@@ -0,0 +1,108 @@
++"""Real Bash proof for quote-removed builtin name operands."""
++import subprocess
++
++import pytest
++
++from tools.shell_arith_sink import substitution_in_arithmetic
++
++SINKS = [
++    "a=(1); unset 'a[$(P)]'",
++    "a=(1); unset $'a[$(P)]'",
++    "a=(1); unset a'[$(P)]'",
++    r"a=(1); unset 'a['\$'(P)]'",
++    r"a=(1); unset a[\$\(P\)]",
++    "printf -v 'a[$(P)]' x",
++    r"printf -v a[\$\(P\)] x",
++    "a=(1); [[ -v 'a[$(P)]' ]]",
++    "a=(1); test -v 'a[$(P)]'",
++    "declare 'a[$(P)]=1'",
++    r"declare a\[\$\(P\)\]=1",
++    "typeset 'a[$(P)]=1'",
++    "f() { local 'a[$(P)]=1'; }; f",
++    "read 'a[$(P)]' <<< x",
++    "read -d -p 'a[$(P)]' <<< x",
++    "a=(1); A=1 \\\n unset 'a[$(P)]'",
++    "a=(1); $\"unset\" 'a[$(P)]'",
++    "a=(1); unset 2>&1 'a[$(P)]'",
++    "printf -v'a[$(P)]' x",
++    "a=(1); unset -- 'a[$(P)]'",
++    r"a=(1); unset $'a[\x24(P)]'",
++]
++DATA = [
++    "export 'a[$(P)]=1'",
++    "readonly 'a[$(P)]=1'",
++    "mapfile -t 'a[$(P)]' <<< x",
++    r"[[ -v a[\$\(P\)] ]]",
++    "unset -f 'a[$(P)]'",
++    "declare -p 'a[$(P)]'",
++    "declare -f 'a[$(P)]'",
++    "read -a 'a[$(P)]' <<< x",
++    "printf '%s ' -v 'a[$(P)]'",
++    "declare 'a[0]=foo[$(P)]'",
++]
++
++
++@pytest.mark.platforms("linux")
++@pytest.mark.parametrize("shape, expected", [(s, True) for s in SINKS] + [(s, False) for s in DATA])
++def test_literal_builtin_name_marker(tmp_path, shape, expected):
++    payload = tmp_path / "payload"
++    payload.write_text("#!/bin/sh\nprintf ran > marker\nprintf 0\n", encoding="utf-8")
++    payload.chmod(0o700)
++    command = shape.replace("P", "./payload")
++    result = subprocess.run(
++        ["/bin/bash", "--noprofile", "--norc", "-c", command],
++        cwd=tmp_path, env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
++        capture_output=True, text=True, encoding="utf-8", timeout=10, check=False,
++    )
++    assert (tmp_path / "marker").exists() is expected, result.stderr
++    assert substitution_in_arithmetic(command, date_exempt=True) is expected
++
++
++@pytest.mark.parametrize("command", [
++    "echo 'a[$(value)]'",
++    "printf -v x %s 'a[$(value)]'",
++    "unset x > 'a[$(value)]'",
++    "declare 'a=literal[$(value)]'",
++    "read -p 'a[$(value)]' x",
++    "command -v unset 'a[$(value)]'",
++])
++def test_literal_name_data(command):
++    assert not substitution_in_arithmetic(command, date_exempt=True)
++
++
++@pytest.mark.parametrize("shape", [s for s in SINKS if "\\" not in s])
++def test_literal_name_numeric_date(shape):
++    command = shape.replace("P", "date +%s")
++    assert not substitution_in_arithmetic(command, date_exempt=True)
++    assert substitution_in_arithmetic(command, date_exempt=False)
++
++
++@pytest.mark.parametrize("shape", SINKS)
++def test_literal_name_reaches_lifecycle_refusal(tmp_path, shape):
++    from cron.lifecycle_guard import scan_gateway_lifecycle
++    from tests.cron.test_lifecycle_guard_arith_sink import _big_log
++
++    payload = _big_log(tmp_path)
++    command = shape.replace("P", "bash " + str(payload))
++    # Escaped ordinary words must preserve the producer's space through quote removal.
++    if r"\(" in shape:
++        command = command.replace("bash ", r"bash\ ")
++    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert unsafe and refusal and "larger than the scan cap" in refusal
++
++
++def test_nested_expansions_share_linear_boundary_scan(monkeypatch):
++    from tools import shell_prefix_expansions as expansions
++
++    original = expansions._opener
++    calls = 0
++
++    def counted(*args):
++        nonlocal calls
++        calls += 1
++        return original(*args)
++
++    monkeypatch.setattr(expansions, "_opener", counted)
++    command = "echo $(" * 200 + "echo 'x'" + ")" * 200
++    assert not substitution_in_arithmetic(command, date_exempt=True)
++    assert calls < len(command) * 3
+diff --git a/tools/shell_arith_sink.py b/tools/shell_arith_sink.py
+index e7fa58a454a2cb835648c685f6a87c03fe291a6a..82c2c5ed5e8c089f8720c270ca47a470da019784 100644
+--- a/tools/shell_arith_sink.py
++++ b/tools/shell_arith_sink.py
+@@ -73,6 +73,7 @@ def substitution_in_arithmetic(command: str, *, date_exempt: bool, _depth: int =
+     closes = [m.start() for m in re.finditer(r"\]\]", command)]
+     operators = [m.start() for m in _INT_OPERATOR_RE.finditer(command)]
+     pending = []
++    literal_cache = {}
+     backtick_open = False
+     stack: list[list] = [[_CMD, None, 0, False, 0, None]]
+     pos, end = 0, len(command)
+@@ -90,6 +91,8 @@ def substitution_in_arithmetic(command: str, *, date_exempt: bool, _depth: int =
+         pos = match.end()
+         top = stack[-1]
+         kind, quoted = top[0], top[3]
++        if kind == _CMD and not quoted and _literal_name_sink(command, start, top, date_exempt, literal_cache):
++            return True
+         if token in ("`", "$(", "$((", "$[", "${"):
+             pos, sink = _expansion_token(command, token, pos, stack, date_exempt, _depth)
+             if sink:
+@@ -123,6 +126,21 @@ def substitution_in_arithmetic(command: str, *, date_exempt: bool, _depth: int =
+     return backtick_open or any(frame[3] for frame in stack)
+ 
+ 
++def _literal_name_sink(command: str, start: int, top: list, date_exempt: bool, cache: dict) -> bool:
++    from tools.shell_builtin_names import LiteralNameScanner
++
++    if top[1] == "array":
++        return False
++    if len(top) < 7:
++        top.append(None)
++    if top[6] is None or top[6].base != top[4]:
++        top[6] = LiteralNameScanner(top[4], cache)
++    try:
++        return top[6].check(command, start, date_exempt=date_exempt)
++    except (ValueError, RecursionError):
++        return False  # Original scanner handles uncertain quoting and real expansions.
++
++
+ def _quoted_subscript_sink(command: str, start: int, top: list) -> bool:
+     """Whether the double-quoted ``[`` at *start* opens a builtin's array subscript.
+ 
+diff --git a/tools/shell_builtin_names.py b/tools/shell_builtin_names.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e4c17f8c283295b46a07de74dc9f3c261f14f4af
+--- /dev/null
++++ b/tools/shell_builtin_names.py
+@@ -0,0 +1,200 @@
++"""Quote removal for literal builtin name operands (not general data flow)."""
++from __future__ import annotations
++
++import re
++
++from tools.shell_command_position import _REDIRECTION_RE, _builtin_index
++from tools.shell_prefix_expansions import _expansion_end, _opener
++
++_BREAKS = frozenset(" \t\r\n;&|()<>")
++_ANSI_ESCAPE = re.compile(r"\\(?:x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|[0-7]{1,3}|c.|.)", re.DOTALL)
++_ESCAPES = dict(zip("abefnrtv\\'\"?", "\a\b\x1b\f\n\r\t\v\\'\"?"))
++
++
++def _ansi_escape(match: re.Match) -> str:
++    value = match.group()[1:]
++    if value[0] in "xuU":
++        number = int(value[1:], 16)
++        return chr(number) if number <= 0x10ffff else "\ufffd"
++    if value[0] in "01234567":
++        return chr(int(value, 8) % 256)
++    if value[0] == "c" and len(value) == 2:
++        return chr(ord(value[1].upper()) ^ 64)
++    return _ESCAPES.get(value, "\\" + value)
++
++
++def _word(text: str, pos: int, conditional: bool, cache: dict) -> tuple[str, int]:
++    """Remove lexical quotes, leaving real expansions opaque to name classification."""
++    pieces = []
++    while pos < len(text) and text[pos] not in _BREAKS:
++        char = text[pos]
++        if char == "\\":
++            pair = text[pos:pos + 2]
++            pieces.append("" if pair == "\\\n" else pair if conditional else pair[1:])
++            pos += len(pair)
++        elif char == "'" or text.startswith("$'", pos):
++            ansi = char == "$"
++            start = pos + (2 if ansi else 1)
++            pos = start
++            while pos < len(text) and text[pos] != "'":
++                pos += 2 if ansi and text[pos] == "\\" else 1
++            if pos >= len(text):
++                raise ValueError("unterminated literal")
++            span = text[start:pos]
++            pieces.append(_ANSI_ESCAPE.sub(_ansi_escape, span).split("\0", 1)[0] if ansi else span)
++            pos += 1
++        elif char == '"' or text.startswith('$"', pos):
++            span, pos = _double_word(text, pos + (2 if char == "$" else 1), cache)
++            pieces.append(span)
++        else:
++            opening = _opener(text, pos, "")
++            if opening is not None:
++                width, closer = opening
++                pos = _expansion_end(text, pos + width, closer, cache)
++                pieces.append("__expansion__")
++            else:
++                pieces.append(char)
++                pos += 1
++    return "".join(pieces), pos
++
++
++def _double_word(text: str, pos: int, cache: dict) -> tuple[str, int]:
++    pieces = []
++    while pos < len(text):
++        char = text[pos]
++        if char == '"':
++            return "".join(pieces), pos + 1
++        if char == "\\" and text[pos + 1:pos + 2] in ('$', '`', '"', '\\', '\n'):
++            pieces.append("" if text[pos + 1] == "\n" else text[pos + 1])
++            pos += 2
++            continue
++        opening = _opener(text, pos, '"')
++        if opening is not None:
++            width, closer = opening
++            pos = _expansion_end(text, pos + width, closer, cache)
++            pieces.append("__expansion__")
++        else:
++            pieces.append(char)
++            pos += 1
++    raise ValueError("unterminated double quote")
++
++
++class _Operands:
++    """Builtin option values must not be confused with variable destinations."""
++
++    def __init__(self, name: str):
++        self.name = name
++        self.options = True
++        self.pending = ""
++        self.disabled = False
++        self.previous = ""
++
++    def take(self, word: str) -> str | None:
++        name = self.name
++        if name in ("test", "[", "[["):
++            previous, self.previous = self.previous, word
++            return word if previous == "-v" else None
++        if self.pending:
++            pending, self.pending = self.pending, ""
++            return word if pending == "v" else None
++        if self.options and word == "--":
++            self.options = False
++            return None
++        if self.options and len(word) > 1 and word[0] in "-+":
++            return self._option(word)
++        self.options = False
++        if name == "printf":
++            self.disabled = True
++        return word if not self.disabled and name in ("declare", "typeset", "local", "unset", "read") else None
++
++    def _option(self, word: str) -> str | None:
++        name = self.name
++        if name == "printf":
++            if word.startswith("-v"):
++                if len(word) > 2:
++                    return word[2:]
++                self.pending = "v"
++            return None
++        if word.startswith("-") and (
++            (name == "unset" and "f" in word[1:])
++            or (name in ("declare", "typeset", "local") and any(c in word[1:] for c in "pfF"))
++        ):
++            self.disabled = True
++        if name == "read":
++            for index, flag in enumerate(word[1:], 1):
++                if flag in "adnNptui":
++                    if index + 1 == len(word):
++                        self.pending = flag
++                    break
++        return None
++
++
++def _subscript(operand: str) -> str | None:
++    match = re.match(r"[A-Za-z_]\w*\[", operand)
++    if match is None:
++        return None
++    depth = 1
++    for index in range(match.end(), len(operand)):
++        char = operand[index]
++        depth += (char == "[") - (char == "]")
++        if depth == 0:
++            return operand[match.end():index]
++    return None
++
++
++class LiteralNameScanner:
++    """Walk each simple command once, caching the verdict of its current word."""
++
++    def __init__(self, base: int, cache: dict):
++        self.base = base
++        self.cache = cache
++        self.pos = base
++        self.words: list[str] = []
++        self.operands: _Operands | None = None
++        self.sink = False
++        self.redirect = False
++
++    def check(self, text: str, start: int, *, date_exempt: bool) -> bool:
++        from tools.shell_arith_sink import substitution_in_arithmetic
++
++        while self.pos <= start:
++            char = text[self.pos]
++            if text.startswith("\\\n", self.pos):
++                self.pos += 2
++                continue
++            if char.isspace():
++                self.pos += 1
++                continue
++            redirect = _REDIRECTION_RE.match(text, self.pos)
++            if redirect is not None:
++                self.redirect = True
++                self.pos = redirect.end()
++                continue
++            if char in ";&|()":
++                self.words.clear()
++                self.operands = None
++                self.redirect = False
++                self.pos += 1
++                continue
++            if char == "#":
++                self.pos = text.find("\n", self.pos)
++                if self.pos < 0:
++                    self.pos = len(text)
++                continue
++            conditional = self.operands is not None and self.operands.name == "[["
++            word, self.pos = _word(text, self.pos, conditional, self.cache)
++            self.sink = False
++            if self.redirect:
++                self.redirect = False
++                continue
++            if self.operands is None:
++                self.words.append(word)
++                index = _builtin_index(self.words[:64])
++                if 0 <= index < len(self.words):
++                    self.operands = _Operands(self.words[index])
++                continue
++            operand = self.operands.take(word)
++            subscript = _subscript(operand) if operand is not None else None
++            if subscript is not None:
++                self.sink = substitution_in_arithmetic("$((" + subscript + "))", date_exempt=date_exempt)
++        return self.sink
+diff --git a/tools/shell_prefix_expansions.py b/tools/shell_prefix_expansions.py
+index 41460539c69a7965e9f31a2b245197b028125ad6..fc893ab63c6c966e8de15b95218eaef4ee5b68ab 100644
+--- a/tools/shell_prefix_expansions.py
++++ b/tools/shell_prefix_expansions.py
+@@ -20,8 +20,11 @@ def _comment_end(text: str, pos: int, quoted: str) -> int | None:
+     return len(text) if newline < 0 else newline
+ 
+ 
+-def _expansion_end(text: str, start: int, closer: str) -> int:
++def _expansion_end(text: str, start: int, closer: str, cache: dict | None = None) -> int:
+     """Return just past an expansion, respecting nested frames and quote scopes."""
++    key = (start, closer)
++    if cache is not None and key in cache:
++        return cache[key]
+     pos, quote = start, ""
+     while pos < len(text):
+         char = text[pos]
+@@ -34,6 +37,8 @@ def _expansion_end(text: str, start: int, closer: str) -> int:
+             pos += 1
+             continue
+         if char == closer and not quote:
++            if cache is not None:
++                cache[key] = pos + 1
+             return pos + 1
+         if not quote and _CASE_WORD.match(text, pos):
+             # A case-pattern ')' is not a frame closer; fail closed on grammar
+@@ -46,12 +51,12 @@ def _expansion_end(text: str, start: int, closer: str) -> int:
+         nested = _opener(text, pos, quote)
+         if nested is not None:
+             width, end = nested
+-            pos = _expansion_end(text, pos + width, end)
++            pos = _expansion_end(text, pos + width, end, cache)
+             continue
+         if char in "\"'" and (not quote or char == quote):
+             quote = "" if quote else char
+         elif not quote and char == "(" and closer == ")":
+-            pos = _expansion_end(text, pos + 1, ")")
++            pos = _expansion_end(text, pos + 1, ")", cache)
+             continue
+         pos += 1
+     raise ValueError("unterminated expansion")
+-- 
+2.43.0
+

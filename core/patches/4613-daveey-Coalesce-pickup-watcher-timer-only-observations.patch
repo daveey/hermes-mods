@@ -1,0 +1,121 @@
+From 252491ac38e89c52eb3a960d7d415183c77965c3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 15:13:43 +0000
+Subject: [PATCH] [daveey] Coalesce pickup watcher timer-only observations
+
+Compare the latest delivered watcher observation transactionally after removing rendered elapsed minutes, skip observation time/pass counters and registry read time. Preserve material target/reason/count/registry changes and closed-new behavior. Why: byte-identical dedupe made every dispatcher tick a new comment. RED: both real file_repairs 20-tick proofs produced 19 comments. GREEN: both retain one repeat comment; changed target and changed/reverted reason append. All 19 pickup suites pass (325 tests); scripts/check passes.
+---
+ hermes_cli/kanban_pickup_observation.py       | 29 +++++++++++++++
+ hermes_cli/kanban_pickup_stall.py             |  7 +---
+ .../hermes_cli/test_pickup_incident_append.py | 37 +++++++++++++++++++
+ 3 files changed, 68 insertions(+), 5 deletions(-)
+ create mode 100644 hermes_cli/kanban_pickup_observation.py
+
+diff --git a/hermes_cli/kanban_pickup_observation.py b/hermes_cli/kanban_pickup_observation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..303643fe9250db730267bca19a26c68b45b2bac7
+--- /dev/null
++++ b/hermes_cli/kanban_pickup_observation.py
+@@ -0,0 +1,29 @@
++"""Material pickup evidence, excluding the detector's changing observation clocks."""
++from __future__ import annotations
++
++import re
++
++_STAMP = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z"
++
++
++def evidence(body: str) -> str:
++    """Keep reasons, targets, counts and registry state; discard only rendered tick fields."""
++    body = re.sub(r"(, ready )\d+( min,)", r"\1<elapsed>\2", body)
++    body = re.sub(r"(pinned to machine:[^,\n]+, for )\d+( min \(threshold )", r"\1<elapsed>\2", body)
++    body = re.sub(r", last " + _STAMP + r", \d+ pass\(es\)", ", last <tick>, <ticks> pass(es)", body)
++    body = re.sub(r"(Registry entry for [^\n]+? at )" + _STAMP, r"\1<tick>", body)
++    return body
++
++
++def append_observation(conn, task_id: str, author: str, body: str) -> None:
++    """Call under the incident write transaction; compare the last delivered observation, not all history."""
++    from hermes_cli.kanban_db_comment_ids import add_comment
++
++    note = f"Watcher firing:\n\n{body}"
++    prior = conn.execute(
++        "SELECT body FROM task_comments WHERE task_id=? AND author=? "
++        "AND instr(body, ?) = 1 ORDER BY id DESC LIMIT 1",
++        (task_id, author, "Watcher firing:\n\n"),
++    ).fetchone()
++    if prior is None or evidence(prior[0]) != evidence(note):
++        add_comment(conn, task_id, author, note)
+diff --git a/hermes_cli/kanban_pickup_stall.py b/hermes_cli/kanban_pickup_stall.py
+index 0c39f5434c963ec6c000e2fc38ee88a2f74c7a4a..e643476ff8dca8abd1b36f133516c772de8e0dec 100644
+--- a/hermes_cli/kanban_pickup_stall.py
++++ b/hermes_cli/kanban_pickup_stall.py
+@@ -364,15 +364,12 @@ def _create(conn, *, key: str, title: str, body: str, tenant: Optional[str], own
+     machines = None if reg is None else (reg.get("machines") or {})
+     assignee = _supervisor_profile()
+     runs_on, why = alarm_placement(own, machines, assignee=assignee, now_ms=now_ms)
+-    from hermes_cli.kanban_db_comment_ids import add_comment
++    from hermes_cli.kanban_pickup_observation import append_observation
+     from uuid import uuid4
+     with kb.write_txn(conn):
+         existing = _covering_repair(conn, key, now_ms)
+         if existing:
+-            note = f"Watcher firing:\n\n{body}"
+-            if not conn.execute("SELECT 1 FROM task_comments WHERE task_id=? AND author=? AND body=? LIMIT 1",
+-                                (existing, DETECTOR, note)).fetchone():
+-                add_comment(conn, existing, DETECTOR, note)
++            append_observation(conn, existing, DETECTOR, body)
+         else:
+             # Positive decimal suffix preserves the authenticated Board alarm identity contract.
+             return kb.create_task(conn, title=title, body=body + f"\n\nPlaced with runs_on {runs_on}: {why}."
+diff --git a/tests/hermes_cli/test_pickup_incident_append.py b/tests/hermes_cli/test_pickup_incident_append.py
+index f0d402cfbf66a525e0b3a6f57502d67ae1b7e675..ea30910e3300312122acc70b8d9473b2c3c4967f 100644
+--- a/tests/hermes_cli/test_pickup_incident_append.py
++++ b/tests/hermes_cli/test_pickup_incident_append.py
+@@ -52,6 +52,43 @@ def test_registry_evidence_changes_only_when_fields_change(monkeypatch, entry):
+     assert "hold=True" in after and "active_card_runs=2" in after
+ 
+ 
++def test_ticks_ignore_elapsed_but_keep_material_changes(gws):
++    _, worker = gws
++    worker.enter()
++    card = {"id": "t_da066fc02a25c3b2", "title": "Pending task", "tenant": None,
++            "since_ms": 1000, "skip": {"reason": "other", "detail": "not eligible",
++                                      "first_at": 1000, "last_at": 1000, "passes": 1}}
++    first = pickup.file_repairs(worker.conn, support.WORKER, [card], now=1200)[0]
++    for tick in range(1, 20):
++        card["skip"].update(last_at=(1200 + tick * 60) * 1000, passes=tick + 1)
++        assert pickup.file_repairs(worker.conn, support.WORKER, [card], now=1200 + tick * 60) == [first]
++    assert len(kb.list_comments(worker.conn, first)) == 1
++    card["skip"]["detail"] = "capability changed"
++    pickup.file_repairs(worker.conn, support.WORKER, [card], now=2500)
++    assert len(kb.list_comments(worker.conn, first)) == 2
++    card["skip"]["detail"] = "not eligible"
++    pickup.file_repairs(worker.conn, support.WORKER, [card], now=2560)
++    assert len(kb.list_comments(worker.conn, first)) == 3
++
++
++def test_host_ticks_ignore_registry_clock_and_report_new_targets(gws, monkeypatch):
++    _, worker = gws
++    worker.enter()
++    card = {"id": "t_da066fc02a25c3b2", "title": "Pending task", "tenant": None,
++            "since_ms": 1000, "skip": {"reason": "budget_exhausted", "detail": "no slot",
++                                      "first_at": 1000, "last_at": 1000, "passes": 1}}
++    first = pickup.file_repairs(worker.conn, support.WORKER, [card], now=1200)[0]
++    for tick in range(1, 20):
++        monkeypatch.setattr(pickup, "_now_ms", lambda now=None, tick=tick: (1200 + tick * 60) * 1000)
++        card["skip"].update(last_at=(1200 + tick * 60) * 1000, passes=tick + 1)
++        assert pickup.file_repairs(worker.conn, support.WORKER, [card], now=1200 + tick * 60) == [first]
++    assert len(kb.list_comments(worker.conn, first)) == 1
++    changed = {**card, "id": "t_fedcba9876543210"}
++    pickup.file_repairs(worker.conn, support.WORKER, [changed], now=2500)
++    assert len(kb.list_comments(worker.conn, first)) == 2
++    assert "t_fedcba9876543210" in kb.list_comments(worker.conn, first)[-1].body
++
++
+ def test_distinct_subjects_have_distinct_incidents(gws):
+     _, worker = gws
+     assert fire(worker) != fire(worker, "hold")
+-- 
+2.43.0
+

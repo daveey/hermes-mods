@@ -1,0 +1,240 @@
+From 7a55262269019150db7fac2a499f84ac55052f25 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 08:30:59 +0000
+Subject: [PATCH] [daveey] Align upgrade CI release tags and busy handoff
+ scenarios
+
+Fetch both stable upstream tag eras even when calver already resolves. The handoff fixture waited for an update drain that idle-only pre-swap correctly refuses; assert refusal, finish the worker, then retry idle. Preserve the >180s worker drain regression in an explicit real socket drain with a 300s fixture cap rather than the incompatible 120s cap.
+
+Proof: tag routing regression RED on old workflow; focused resolver/routing/verdict suites GREEN (36 tests); full scripts/check passes. Real namespace handoff proof requires dispatch CI; shared-worker userns policy left untouched.
+---
+ .github/workflows/tests.yml                   | 15 +++---
+ tests/ci/test_fast_runner_routing.py          |  7 ++-
+ tests/e2e/core/upgrade/handoff/_handoff.py    |  6 +--
+ tests/e2e/core/upgrade/handoff/_scenario.py   | 34 ++++++++++---
+ .../upgrade/handoff/test_kanban_long_drain.py | 51 +++++++++++++++++++
+ .../handoff/test_restart_wait_verdict.py      | 11 ++++
+ 6 files changed, 103 insertions(+), 21 deletions(-)
+ create mode 100644 tests/e2e/core/upgrade/handoff/test_kanban_long_drain.py
+
+diff --git a/.github/workflows/tests.yml b/.github/workflows/tests.yml
+index a66f560d638f5a13ac83f4dab84343360eb9928b..3f870b19065de7ee0278ed4863831ad72b87431b 100644
+--- a/.github/workflows/tests.yml
++++ b/.github/workflows/tests.yml
+@@ -479,17 +479,14 @@ jobs:
+           fetch-tags: true
+ 
+       - name: Fetch upstream release tags
+-        # [daveey] The fork carries no v20* release tags, so N-1 (`git describe` below) found
+-        # nothing and every N-1 test failed "No names found" (run 40658892506, git shard).
+-        # main = upstream + fork commits, so upstream's release tags are ancestors of HEAD~1.
+-        # Fetched only when origin's own tags can't resolve N-1; the last line fails the step
+-        # if they still can't.
++        # [daveey] Fetch both upstream release eras, even when a calver tag already resolves:
++        # the generation-specific suites also need the newer v0.x by-path updater.
++        # Origin's +canary tags are not stable release starting points.
+         run: |
+           set -euo pipefail
+-          if ! git describe --tags --abbrev=0 --match 'v20[0-9][0-9].*' HEAD~1 >/dev/null 2>&1; then
+-            git fetch --no-tags --quiet https://github.com/NousResearch/hermes-agent.git '+refs/tags/v20*:refs/tags/v20*'
+-          fi
+-          git describe --tags --abbrev=0 --match 'v20[0-9][0-9].*' HEAD~1
++          git fetch --no-tags --quiet https://github.com/NousResearch/hermes-agent.git \
++            '+refs/tags/v20*:refs/tags/v20*' '+refs/tags/v0.*:refs/tags/v0.*'
++          git describe --tags --abbrev=0 --match 'v20[0-9][0-9].*' --match 'v0.*' --exclude '*+*' HEAD~1
+ 
+       - name: Set up locked Node and ripgrep
+         # `hermes update` builds the web UI / TUI workspaces.
+diff --git a/tests/ci/test_fast_runner_routing.py b/tests/ci/test_fast_runner_routing.py
+index d142bd6078047df57aa794f68256dd5f5e46688a..d247d5cefda7a3cc52f9b62f412ef42342e406a1 100644
+--- a/tests/ci/test_fast_runner_routing.py
++++ b/tests/ci/test_fast_runner_routing.py
+@@ -315,8 +315,11 @@ def test_e2e_upgrade_has_release_tags_for_n_minus_1():
+     assert names.index("Fetch upstream release tags") < names.index("Run upgrade e2e tests (${{ matrix.shard }})")
+     assert "https://github.com/NousResearch/hermes-agent.git" in fetch["run"]
+     assert "refs/tags/v20*:refs/tags/v20*" in fetch["run"]
+-    # The step proves N-1 resolves instead of letting every N-1 test fail on its own.
+-    assert fetch["run"].rstrip().endswith("git describe --tags --abbrev=0 --match 'v20[0-9][0-9].*' HEAD~1")
++    assert "refs/tags/v0.*:refs/tags/v0.*" in fetch["run"]
++    # A reachable calver release must not suppress fetching the newer by-path line.
++    assert "if ! git describe" not in fetch["run"]
++    assert "--match 'v0.*'" in fetch["run"]
++    assert "--exclude '*+*'" in fetch["run"]
+ 
+ 
+ def test_termux_assembly_permissions_run_with_docker_and_fail_on_skip():
+diff --git a/tests/e2e/core/upgrade/handoff/_handoff.py b/tests/e2e/core/upgrade/handoff/_handoff.py
+index 15119ee1da2049cd25e175ac0a8fa139567cc2ab..41161779ba569ccff19911dfbedbfeb26613ca35 100644
+--- a/tests/e2e/core/upgrade/handoff/_handoff.py
++++ b/tests/e2e/core/upgrade/handoff/_handoff.py
+@@ -437,7 +437,7 @@ def _log_time(stamp: str) -> dt.datetime:
+     return dt.datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S,%f")
+ 
+ 
+-def restart_wait_verdict(inst: Install, slack_s: float = 15.0) -> str:
++def restart_wait_verdict(inst: Install, slack_s: float = 15.0, *, cap_s: float = RESTART_WAIT_CAP_S) -> str:
+     """'' when every restart wait the gateway logged closed within ``RESTART_WAIT_CAP_S``; otherwise
+     how long the first failing wait held and the work units the gateway last named while it held."""
+     log = inst.hermes_home / "logs" / "gateway.log"
+@@ -448,9 +448,9 @@ def restart_wait_verdict(inst: Install, slack_s: float = 15.0) -> str:
+         opened = _log_time(_WAIT_OPENED.match(wait).group(1))
+         close = _WAIT_CLOSED.search(wait)
+         held = ((_log_time(close.group(1)) if close else dt.datetime.now()) - opened).total_seconds()
+-        if close is None or held > RESTART_WAIT_CAP_S + slack_s:
++        if close is None or held > cap_s + slack_s:
+             holders = _WAIT_HOLDERS.findall(wait[:close.start()] if close else wait)
+-            return (f"the gateway's restart wait held {held:.0f}s against its {RESTART_WAIT_CAP_S}s cap "
++            return (f"the gateway's restart wait held {held:.0f}s against its {cap_s}s cap "
+                     f"({'never closed' if close is None else 'closed late'}); last named holders: "
+                     f"{holders[-1] if holders else 'none'}")
+     return ""
+diff --git a/tests/e2e/core/upgrade/handoff/_scenario.py b/tests/e2e/core/upgrade/handoff/_scenario.py
+index 2ffe6c46b72428a8b42c340a6eb5b2c7237a4ad8..d35c5dc4e1be6b990c0abc7487a4469948d85934 100644
+--- a/tests/e2e/core/upgrade/handoff/_scenario.py
++++ b/tests/e2e/core/upgrade/handoff/_scenario.py
+@@ -27,6 +27,7 @@ from types import SimpleNamespace
+ 
+ import pytest
+ 
++from gateway.control_socket import query_gateway_control
+ from tests.e2e.core._pending_fixes import known_failure, known_gate
+ from tests.e2e.core.upgrade import _helpers as H
+ from tests.e2e.core.upgrade.handoff import _handoff as X
+@@ -316,6 +317,23 @@ def run(column: str, root: Path) -> SimpleNamespace:
+ 
+             o.boots = len(X.gateway_starts(inst))
+             o.target = X.publish_target(inst)
++            if column == "head":
++                # The fork's pre-swap contract is idle-only: never wait for a drain
++                # that a busy update correctly refuses to start. Long drain coverage
++                # lives in test_kanban_long_drain, using the explicit control verb.
++                refused = inst.update()
++                out = refused.stdout + refused.stderr
++                assert "Update deferred" in out and "busy or cannot acknowledge an idle pause" in out, (
++                    f"a busy update did not defer safely\n{inst.diagnostics(refused)}")
++                assert inst.sha() == X.refs().head, "a busy update moved the checkout"
++                ident = X.identify(inst.hermes_home)
++                assert ident and ident["pid"] == o.old_pid, "a busy update stopped the gateway"
++                assert card_status(inst, o.card1) == "running", "the held worker was interrupted"
++                model.release.set()
++                X.wait_for(lambda: card_status(inst, o.card1) == "done", timeout=120,
++                           what="the held worker to finish before the idle update")
++                X.wait_for(lambda: (query_gateway_control(inst.hermes_home, "active-work") or {}).get(
++                    "active_agents") == 0, timeout=120, what="the completed worker's turn to retire")
+             due = dt.datetime.now(dt.UTC).replace(microsecond=0) + dt.timedelta(seconds=CRON_DUE_S + 5)
+             cp = inst.cli("cron", "create", due.isoformat(), f"Reply with the word done. {model.cron_marker}",
+                           "--name", model.cron_marker)
+@@ -325,12 +343,15 @@ def run(column: str, root: Path) -> SimpleNamespace:
+             o.job_id = job["id"]
+             assert not model.cron_calls, "premise: the job ran before it was due"
+ 
+-            # The held turn ends inside the update's drain, past the old 180 s worker give-up: the
+-            # drain waits for it and the worker outlasts it (it used to give up at 180 s and the
+-            # update's drain "completed" on a dead turn). The update returning releases it too.
++            # Older upstream releases still drain during update. HEAD now proves the
++            # busy refusal above, then retries idle; its long drain has a separate cell.
+             releaser = threading.Thread(target=_release_inside_the_drain, args=(inst, model), daemon=True)
+             releaser.start()
+-            o.up = inst.update()
++            try:
++                o.up = inst.update()
++            finally:
++                model.release.set()
++                releaser.join(timeout=5)
+             o.sha_after = inst.sha()
+             o.layout_after = {rel: (inst.checkout / rel).is_file() for rel in X.NEXT_MOVE}
+ 
+@@ -505,9 +526,8 @@ class HandoffProperties:
+         assert len(o.runs[o.card1]) <= 2, f"the in-flight card ran {len(o.runs[o.card1])} times\n{o.diag}"
+         assert len(o.runs[o.card2]) == 1, f"the new card ran {len(o.runs[o.card2])} times\n{o.diag}"
+         if o.column == "head":
+-            # The updater under test drains its own restart: the in-flight turn outlives the old
+-            # 180 s give-up and finishes in its one run, never booked a crash. (n1's worker is the
+-            # previous release's and still gives up at 180 s.) [daveey]
++            # The busy update refused without interrupting or rerunning this worker.
++            # test_kanban_long_drain separately proves survival beyond the old 180s cap.
+             outcomes = [r["outcome"] for r in o.runs[o.card1]]
+             assert outcomes == ["completed"], f"the drain lost the in-flight run: {outcomes}\n{o.diag}"
+ 
+diff --git a/tests/e2e/core/upgrade/handoff/test_kanban_long_drain.py b/tests/e2e/core/upgrade/handoff/test_kanban_long_drain.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b737e820fe9e79fe0dc8191d29d0ddf516880816
+--- /dev/null
++++ b/tests/e2e/core/upgrade/handoff/test_kanban_long_drain.py
+@@ -0,0 +1,51 @@
++"""A direct restart drain, unlike an idle-only update, waits for the held Kanban turn.
++
++Keep the >180s worker-owner regression separate from the default updater's safe
++busy refusal. The fixture cap must exceed the hold; production budgets are unchanged.
++"""
++from __future__ import annotations
++
++import threading
++import time
++
++from gateway.control_socket import pause_gateway_for_update
++from tests.e2e.core.upgrade.handoff import _handoff as X
++from tests.e2e.core.upgrade.handoff import _scenario as S
++from tests.fakes.fake_llm_provider import FakeLLMServer
++
++
++DRAIN_CAP_S = 300
++
++
++def test_kanban_worker_outlasts_180_seconds_of_real_gateway_drain(root):
++    model = S.Model("long-drain-no-cron")
++    with FakeLLMServer(model) as srv, X.cell(
++        "head", root, srv.base_url,
++        extra={"agent": {"restart_after_turn_timeout": DRAIN_CAP_S},
++               "kanban": {"dispatch_interval_seconds": 3}},
++    ) as inst:
++        before = X.start_gateway(inst)
++        card = S.create_card(inst, "finish once across a long gateway drain")
++        assert model.holding.wait(timeout=240) and model.hold == card, inst.diagnostics()
++        releaser = threading.Thread(target=S._release_inside_the_drain, args=(inst, model), daemon=True)
++        with S.WorkerSampler(inst) as sampler:
++            releaser.start()
++            started = time.monotonic()
++            try:
++                ack = pause_gateway_for_update(inst.hermes_home)
++                assert ack and ack.get("pausing") and ack.get("pid") == before["pid"], ack
++                X.wait_for(lambda: S.card_status(inst, card) == "done", timeout=DRAIN_CAP_S,
++                           what="the held worker to complete during the drain")
++                assert time.monotonic() - started >= S.HOLD_INTO_DRAIN_S, "the held turn ended before 210s"
++                X.wait_for(lambda: not X.gateway_pids(inst), timeout=90, what="the drained gateway to exit")
++            finally:
++                model.release.set()
++                releaser.join(timeout=5)
++        log = (inst.hermes_home / "logs" / "gateway.log").read_text(encoding="utf-8")
++        assert "Restart deferred wait complete" in log, inst.diagnostics()
++        assert "Restart after-turn wait timed out" not in log, inst.diagnostics()
++        assert not X.restart_wait_verdict(inst, cap_s=DRAIN_CAP_S), inst.diagnostics()
++        runs = S._kanban(inst, "SELECT outcome FROM task_runs WHERE task_id = ? ORDER BY id", (card,))
++        assert [r["outcome"] for r in runs] == ["completed"], (runs, S.worker_logs(inst))
++        assert model.completes[card] == 1
++        assert sampler.peak[card] == 1, sampler.evidence
+diff --git a/tests/e2e/core/upgrade/handoff/test_restart_wait_verdict.py b/tests/e2e/core/upgrade/handoff/test_restart_wait_verdict.py
+index 07bc2d446715c6bcd139c594cac03c41a430d4d6..8818dfeade4c64c6a46e6a10bbccc1e8a12c6ef3 100644
+--- a/tests/e2e/core/upgrade/handoff/test_restart_wait_verdict.py
++++ b/tests/e2e/core/upgrade/handoff/test_restart_wait_verdict.py
+@@ -43,6 +43,17 @@ def test_a_wait_that_never_closes_fails(tmp_path):
+     assert "never closed" in _verdict(tmp_path, OPENED, HOLDING)
+ 
+ 
++def test_a_larger_explicit_cell_cap_is_used(tmp_path):
++    logs = tmp_path / "logs"
++    logs.mkdir()
++    (logs / "gateway.log").write_text(
++        f"{OPENED}\n{HOLDING}\n2026-11-06 23:34:50,808 {CLOSES['drained']}\n", encoding="utf-8")
++    inst = SimpleNamespace(hermes_home=tmp_path)
++    assert "closed late" in X.restart_wait_verdict(inst)
++    assert X.restart_wait_verdict(inst, cap_s=300) == ""
++    assert "closed late" in X.restart_wait_verdict(inst, cap_s=180)
++
++
+ def test_a_later_wait_neither_closes_nor_names_the_holders_of_an_earlier_one(tmp_path):
+     later_open = OPENED.replace("23:31:20,808", "23:32:00,000")
+     later_holding = HOLDING.replace("23:31:20,810", "23:32:00,001").replace("local-1", "local-2")
+-- 
+2.43.0
+

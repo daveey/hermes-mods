@@ -1,0 +1,853 @@
+From 385dd5aa1079009b88ae5e33b2219161a241a27f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 20:07:57 +0000
+Subject: [PATCH] Bind managed interactive origin custody to adopted RPC store
+
+Managed (RPC-store) turns lack a local state.db, so interactive native origin
+capture refused them. Mint a private capability only at the post-adoption
+execute seam (task custody takes precedence), pinned to agent/store/scope
+credentials and pid/home/profile/gateway, and authorize each capture with a
+fresh owner-fenced worker.nativeOrigin observation: exact-holder lease expiry,
+normalized creation source agreeing between execution root and current
+session, and owner-published compression lineage. Environment, launch labels
+and replayed receipts grant nothing.
+---
+ agent/managed_worker.py                       |   3 +
+ agent/origin_managed_custody.py               |  82 ++++++++
+ agent/origin_turn_custody.py                  |   4 +
+ agent/runtime_session_store.py                |   6 +
+ apps/shared/src/gateway-contract.generated.ts |  19 ++
+ apps/shared/src/gateway-contract.openrpc.json | 113 ++++++++++
+ gateway/session_controls.py                   |   5 +
+ gateway/session_worker.py                     |   6 +-
+ hermes_state_runtime.py                       |  32 ++-
+ tests/agent/test_origin_managed_custody.py    | 196 ++++++++++++++++++
+ .../test_worker_native_origin_query.py        |  88 ++++++++
+ tests/gateway/test_worker_turn_lease_query.py |  30 +--
+ tui_gateway/contracts/canonical.py            |  13 ++
+ 13 files changed, 580 insertions(+), 17 deletions(-)
+ create mode 100644 agent/origin_managed_custody.py
+ create mode 100644 tests/agent/test_origin_managed_custody.py
+ create mode 100644 tests/gateway/test_worker_native_origin_query.py
+
+diff --git a/agent/managed_worker.py b/agent/managed_worker.py
+index 99f8083abe2c67a9628bfe7b71de1392388144ac..d677e22dcc716f2e841ab77488d1a36a1724c3fa 100644
+--- a/agent/managed_worker.py
++++ b/agent/managed_worker.py
+@@ -400,6 +400,9 @@ def execute(frame, channel):
+                 tool_complete_callback=lambda call_id, name, args, result: channel.send('tool.complete',
+                                                                                          **tool_frame(call_id, name, args, result)))
+             controls.agent = agent
++            if origin_custody is None:
++                from agent.origin_managed_custody import bind_adopted_agent
++                bind_adopted_agent(agent, store, home=frame['home'], scope=scope)
+             if origin_custody is not None:
+                 origin_custody.bind_agent(agent)
+             if controls.stopped.is_set():
+diff --git a/agent/origin_managed_custody.py b/agent/origin_managed_custody.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0cf86ad81ad7080b92dc39694eaa412edee12ec2
+--- /dev/null
++++ b/agent/origin_managed_custody.py
+@@ -0,0 +1,82 @@
++"""Private post-adoption interactive capability, intersected with the actual facade lease.
++
++Environment strings, launch source labels and persistence replay receipts grant no authority.
++"""
++from dataclasses import dataclass
++import os
++from pathlib import Path
++
++
++def _credentials(scope):
++    return tuple(sorted((key, value) for key, value in scope.items() if key != 'session_id'))
++
++
++@dataclass(frozen=True, eq=False)
++class _ManagedCustody:
++    agent: object
++    store: object
++    credentials: tuple
++    session_id: str
++    home: Path
++    profile: str
++    gateway: str
++    pid: int
++
++    def origin(self, custody):
++        from agent.origin_worker_custody import _unexpired
++        from agent.runtime_session_store import WorkerPersistenceError
++        from hermes_cli.kanban_session_provenance import _INTERACTIVE_SOURCES
++        lease, pid, home, profile, gateway = custody
++        agent, store = self.agent, self.store
++
++        def matches(sid):
++            return (lease.agent is agent and lease.db is store
++                and getattr(agent, '_native_origin_managed_custody', None) is self
++                and getattr(agent, '_session_db', None) is store
++                and (pid, home, profile, gateway) == (self.pid, self.home, self.profile, self.gateway)
++                and self.pid == os.getpid() and _credentials(store.scope) == self.credentials
++                and getattr(agent, 'session_id', None) == sid == store.scope['session_id']
++                and not getattr(agent, '_persist_disabled', False)
++                and lease.is_turn_active() and not lease.stop.is_set() and not lease.interrupt_message
++                and getattr(agent, '_active_session_turn_lease_holder', None) == lease.holder)
++
++        def authorized(observation, sid):
++            lineage = observation['assignment_lineage']
++            return (_unexpired(observation['expires_at']) and observation['source'] in _INTERACTIVE_SOURCES
++                and lineage[0] == self.session_id and lineage[-1] == sid
++                and lease.session_id in lineage)
++
++        try:
++            with store.lock:
++                sid = store.scope['session_id']
++                if not matches(sid):
++                    return None
++                first = store.native_origin_observation(sid, lease.holder)
++                if not authorized(first, sid):
++                    return None
++                # Blocking owner reads can race local revocation or another assignment.
++                final = store.native_origin_observation(sid, lease.holder)
++                if not authorized(final, sid) or not matches(sid):
++                    return None
++                return {'gateway': self.gateway, 'profile': self.profile, 'session': sid}
++        except (OSError, ValueError, AttributeError, TypeError, KeyError, IndexError, WorkerPersistenceError):
++            return None
++
++
++def bind_adopted_agent(agent, store, *, home, scope):
++    """Private execute seam, called only after successful owner adoption and construction."""
++    from agent.runtime_session_store import RuntimeSessionStore
++    from hermes_cli.profiles import get_active_profile_name
++    from hermes_cli.kanban_origin import gateway_names
++    from hermes_constants import get_hermes_home
++    # Minimal construction shims do not participate; never synthesize a store or lease.
++    # (A shim lacking the scoped RPC surface gets no capability, so it can never authorize.)
++    if (not isinstance(store, RuntimeSessionStore) or not isinstance(getattr(store, 'scope', None), dict)
++            or getattr(agent, '_session_db', None) is not store):
++        return
++    if (dict(store.scope) != scope or Path(home).resolve() != Path(get_hermes_home()).resolve()
++            or agent.session_id != scope['session_id']
++            or getattr(agent, '_native_origin_managed_custody', None) is not None):
++        raise ValueError('invalid_managed_origin_agent')
++    agent._native_origin_managed_custody = _ManagedCustody(agent, store, _credentials(scope),
++        scope['session_id'], Path(home).resolve(), get_active_profile_name(), gateway_names()[0], os.getpid())
+diff --git a/agent/origin_turn_custody.py b/agent/origin_turn_custody.py
+index e2631746d81c7235de3f94f1b59cea5b9944257c..f76ee8763e1045a4c913456a1a256a36ab963269 100644
+--- a/agent/origin_turn_custody.py
++++ b/agent/origin_turn_custody.py
+@@ -48,6 +48,10 @@ def origin():
+             or getattr(agent, "_active_session_turn_lease_holder", None) != lease.holder
+             or getattr(agent, "_persist_disabled", False)):
+         return None
++    from agent.origin_managed_custody import _ManagedCustody
++    capability = getattr(agent, '_native_origin_managed_custody', None)
++    if type(capability) is _ManagedCustody:
++        return capability.origin(value)
+     sid = getattr(agent, "session_id", None)
+     try:
+         if Path(db.db_path).resolve() != home / "state.db":
+diff --git a/agent/runtime_session_store.py b/agent/runtime_session_store.py
+index 65ef82c0b3830844ccaf07607a4f350cc6819c2e..f9e948d168c9e2dd6f5648a5b9e367e13822d186 100644
+--- a/agent/runtime_session_store.py
++++ b/agent/runtime_session_store.py
+@@ -604,6 +604,12 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
+         self._session(session_id)
+         return self._apply('turn.renew', {'holder': holder, 'ttl_seconds': ttl_seconds})['value']
+ 
++    def native_origin_observation(self, session_id, holder):
++        """Fresh owner-classified source and publication lineage, never the write journal."""
++        with self.lock:
++            self._session(session_id)
++            return self.rpc('worker.nativeOrigin', **self.scope, holder=holder)
++
+     def session_turn_lease_expires_at(self, session_id, holder):
+         """Observe current owner authority, never replay a journaled lease receipt."""
+         with self.lock:
+diff --git a/apps/shared/src/gateway-contract.generated.ts b/apps/shared/src/gateway-contract.generated.ts
+index 0495eca05f9b507531d611425f9dbbbadf3c5664..7645cf00f49a1c4e16b3707d33aaf393df393f35 100644
+--- a/apps/shared/src/gateway-contract.generated.ts
++++ b/apps/shared/src/gateway-contract.generated.ts
+@@ -5234,6 +5234,22 @@ export interface WorkerTurnLeaseParams {
+ export interface WorkerTurnLeaseResult {
+   expires_at: number | null
+ }
++export interface WorkerNativeOriginParams {
++  profile_id: string
++  session_id: string
++  execution_id: string
++  generation: number
++  pid: number
++  birth: number
++  secret: string
++  epoch: number
++  holder: string
++}
++export interface WorkerNativeOriginResult {
++  expires_at: number | null
++  source: string | null
++  assignment_lineage: string[]
++}
+ export interface WorkerPersistParams {
+   profile_id: string
+   session_id: string
+@@ -7364,6 +7380,8 @@ export interface CanonicalRpcMethods {
+   'shell.exec': { params: CanonicalShellExecParams; result: ShellExecResult }
+   /** Adopt a registered execution after verifying the live producer claim. */
+   'worker.adopt': { params: WorkerScopeParams; result: WorkerExecution }
++  /** Fresh owner-fenced lease, consistent creation source and execution publication lineage. */
++  'worker.nativeOrigin': { params: WorkerNativeOriginParams; result: WorkerNativeOriginResult }
+   /** Sequence-fenced typed persistence write from an adopted worker. */
+   'worker.persist': { params: WorkerPersistParams; result: WorkerPersistResult }
+   /** Register a compute worker execution on an idle session. */
+@@ -7424,6 +7442,7 @@ export const CANONICAL_RPC_METHODS = [
+   'session.transcript',
+   'shell.exec',
+   'worker.adopt',
++  'worker.nativeOrigin',
+   'worker.persist',
+   'worker.register',
+   'worker.turnLease'
+diff --git a/apps/shared/src/gateway-contract.openrpc.json b/apps/shared/src/gateway-contract.openrpc.json
+index b92ea11c4710d1aa3e7f53825283bde891660df7..10ffbad4e4685f4c8e4981b5609db53ae3a4bf5b 100644
+--- a/apps/shared/src/gateway-contract.openrpc.json
++++ b/apps/shared/src/gateway-contract.openrpc.json
+@@ -50937,6 +50937,101 @@
+         "title": "WorkerExecution",
+         "type": "object"
+       },
++      "WorkerNativeOriginParams": {
++        "additionalProperties": false,
++        "properties": {
++          "profile_id": {
++            "title": "Profile Id",
++            "type": "string"
++          },
++          "session_id": {
++            "title": "Session Id",
++            "type": "string"
++          },
++          "execution_id": {
++            "title": "Execution Id",
++            "type": "string"
++          },
++          "generation": {
++            "title": "Generation",
++            "type": "integer"
++          },
++          "pid": {
++            "title": "Pid",
++            "type": "integer"
++          },
++          "birth": {
++            "title": "Birth",
++            "type": "number"
++          },
++          "secret": {
++            "title": "Secret",
++            "type": "string"
++          },
++          "epoch": {
++            "title": "Epoch",
++            "type": "integer"
++          },
++          "holder": {
++            "title": "Holder",
++            "type": "string"
++          }
++        },
++        "required": [
++          "profile_id",
++          "session_id",
++          "execution_id",
++          "generation",
++          "pid",
++          "birth",
++          "secret",
++          "epoch",
++          "holder"
++        ],
++        "title": "WorkerNativeOriginParams",
++        "type": "object"
++      },
++      "WorkerNativeOriginResult": {
++        "additionalProperties": false,
++        "properties": {
++          "expires_at": {
++            "anyOf": [
++              {
++                "type": "number"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Expires At"
++          },
++          "source": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Source"
++          },
++          "assignment_lineage": {
++            "items": {
++              "type": "string"
++            },
++            "title": "Assignment Lineage",
++            "type": "array"
++          }
++        },
++        "required": [
++          "expires_at",
++          "source",
++          "assignment_lineage"
++        ],
++        "title": "WorkerNativeOriginResult",
++        "type": "object"
++      },
+       "WorkerPersistParams": {
+         "additionalProperties": false,
+         "properties": {
+@@ -52148,6 +52243,24 @@
+         }
+       }
+     },
++    {
++      "name": "worker.nativeOrigin",
++      "summary": "Fresh owner-fenced lease, consistent creation source and execution publication lineage.",
++      "params": [
++        {
++          "name": "params",
++          "schema": {
++            "$ref": "#/components/schemas/WorkerNativeOriginParams"
++          }
++        }
++      ],
++      "result": {
++        "name": "result",
++        "schema": {
++          "$ref": "#/components/schemas/WorkerNativeOriginResult"
++        }
++      }
++    },
+     {
+       "name": "worker.persist",
+       "summary": "Sequence-fenced typed persistence write from an adopted worker.",
+diff --git a/gateway/session_controls.py b/gateway/session_controls.py
+index 7516e14984f47ebea2bcc2850d8158bb3488b82b..4a4b5fcec32e29e4cc26ef777fa7c9e695a2b7cb 100644
+--- a/gateway/session_controls.py
++++ b/gateway/session_controls.py
+@@ -247,6 +247,7 @@ class AuthorityConnection:
+                     'cron.cancel': self.cron_cancel, 'cron.recover': self.cron_recover,
+                     'worker.register': self.worker_register, 'worker.adopt': self.worker_adopt,
+                     'worker.persist': self.worker_persist, 'worker.turnLease': self.worker_turn_lease,
++                    'worker.nativeOrigin': self.worker_native_origin,
+                     'setup.status': self.setup_status, 'setup.runtime_check': self.setup_runtime_check,
+                     'session.resume': self.resume, 'session.detach': self.detach,
+                     'prompt.submit': self.submit,
+@@ -479,6 +480,10 @@ class AuthorityConnection:
+         from gateway.session_worker import worker_request
+         return await worker_request(self, ref, params, operation='turnLease')
+ 
++    async def worker_native_origin(self, ref, params):
++        from gateway.session_worker import worker_request
++        return await worker_request(self, ref, params, operation='nativeOrigin')
++
+     async def slash_exec(self, ref, params):
+         from gateway.session_commands import execute_command
+         return await execute_command(self, ref, params)
+diff --git a/gateway/session_worker.py b/gateway/session_worker.py
+index 7a705b07a9cfca57001674eeca81a503e1e026fb..cf32fabc77d9286a50b78a7281ad76237e2dc306 100644
+--- a/gateway/session_worker.py
++++ b/gateway/session_worker.py
+@@ -122,7 +122,7 @@ async def _worker_request(connection, ref, params, *, operation):
+         from gateway.session_worker_child import worker_child_request
+         return await worker_child_request(connection, ref, params)
+     extra = {'register': {'kind'}, 'adopt': set(), 'persist': {'epoch', 'sequence', 'operation', 'payload'},
+-             'turnLease': {'epoch', 'holder'}}[operation]
++             'turnLease': {'epoch', 'holder'}, 'nativeOrigin': {'epoch', 'holder'}}[operation]
+     if set(params) != _SCOPE | extra:
+         raise RuntimeStoreError('invalid_params')
+     claim = _claim(connection, ref, params)
+@@ -141,12 +141,12 @@ async def _worker_request(connection, ref, params, *, operation):
+     if 'worker:adopt' not in connection.actor.capabilities:
+         raise RuntimeStoreError('permission_denied')
+     _verify(connection, ref, params, claim)
+-    if operation == 'turnLease':
++    if operation in ('turnLease', 'nativeOrigin'):
+         from hermes_state_runtime import worker_turn_lease
+         if type(params['epoch']) is not int or params['epoch'] != authority.epoch:
+             raise RuntimeStoreError('stale_epoch')
+         return await asyncio.to_thread(worker_turn_lease, authority.db, epoch=authority.epoch,
+-                                       **scope, holder=params['holder'])
++                                       **scope, holder=params['holder'], native_origin=operation == 'nativeOrigin')
+     if operation == 'adopt':
+         return await asyncio.to_thread(adopt_worker_execution, authority.db, epoch=authority.epoch,
+                                        **scope, adoption_secret=claim)
+diff --git a/hermes_state_runtime.py b/hermes_state_runtime.py
+index b7ced71478095e2d0f35757923c90e762ea08907..3429f49ada6003a4e1b8c02178ac54568e8ba781 100644
+--- a/hermes_state_runtime.py
++++ b/hermes_state_runtime.py
+@@ -789,7 +789,27 @@ def _worker_assignment(conn, execution_id, session_id, generation):
+     return row
+ 
+ 
+-def worker_turn_lease(db, *, epoch, execution_id, session_id, generation, holder):
++def _worker_publication_lineage(conn, execution_id, session_id):
++    """Only this execution's committed owner publications authorize physical rotation."""
++    rows = conn.execute("SELECT result_json FROM worker_receipts WHERE execution_id=? "
++        "AND json_extract(result_json,'$.worker_assignment.parent') IS NOT NULL "
++        "ORDER BY sequence LIMIT 257", (execution_id,)).fetchall()
++    if len(rows) > 256:
++        raise RuntimeStoreError('permission_denied')
++    lineage = []
++    for row in rows:
++        assignment = json.loads(row[0])['worker_assignment']
++        if not lineage:
++            lineage.append(assignment['parent'])
++        if assignment['parent'] != lineage[-1] or assignment['session_id'] in lineage:
++            raise RuntimeStoreError('permission_denied')
++        lineage.append(assignment['session_id'])
++    if lineage and lineage[-1] != session_id:
++        raise RuntimeStoreError('permission_denied')
++    return lineage or [session_id]
++
++
++def worker_turn_lease(db, *, epoch, execution_id, session_id, generation, holder, native_origin=False):
+     """Fresh assignment and exact-holder lease in one read transaction; no replay receipts."""
+     _text(holder)
+     with db._read_ctx() as conn:
+@@ -806,7 +826,15 @@ def worker_turn_lease(db, *, epoch, execution_id, session_id, generation, holder
+             lease = conn.execute(
+                 'SELECT expires_at FROM session_turn_leases WHERE conversation_id=? AND holder=?',
+                 (db._session_turn_lease_key_on_conn(conn, session_id), holder)).fetchone()
+-            return {'expires_at': float(lease[0]) if lease else None}
++            result: dict = {'expires_at': float(lease[0]) if lease else None}
++            if native_origin:
++                from hermes_cli.kanban_session_provenance import session_creation_source
++                lineage = _worker_publication_lineage(conn, execution_id, session_id)
++                root_source = session_creation_source(dict(_session(conn, lineage[0])))
++                current_source = session_creation_source(dict(_session(conn, session_id)))
++                result.update(source=current_source if current_source == root_source else None,
++                              assignment_lineage=lineage)
++            return result
+         finally:
+             if began and conn.in_transaction:
+                 conn.execute('ROLLBACK')
+diff --git a/tests/agent/test_origin_managed_custody.py b/tests/agent/test_origin_managed_custody.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8e2a51f6dd7ae5350298f9c4077725cab0a5f1f2
+--- /dev/null
++++ b/tests/agent/test_origin_managed_custody.py
+@@ -0,0 +1,196 @@
++"""Managed interactive attribution uses adopted custody, not process environment."""
++from pathlib import Path
++
++import pytest
++
++from tests.gateway import test_worker_turn_lease_query as lease_tests
++from tests.gateway.test_worker_native_origin_query import _compress
++
++worker = lease_tests.worker
++OWNED = {'origin': {'gateway': 'here', 'profile': 'default', 'session': 'owned'}}
++
++
++@pytest.fixture
++def managed(worker, monkeypatch):
++    from hermes_cli import kanban_origin
++    monkeypatch.setattr(kanban_origin, 'gateway_names', lambda: ('here', []))
++    monkeypatch.setattr('agent.turn_liveness.resolve_turn_liveness_settings', lambda cfg: (None, 1.0))
++    monkeypatch.setattr('agent.relay_cwd.resolve_relay_scope_cwds', lambda *a: ('', ''))
++    return worker
++
++
++def _agent(store, *, bind=True):
++    from agent.origin_managed_custody import bind_adopted_agent
++    from hermes_constants import get_hermes_home
++    from tests.agent.test_cross_process_turn_lease import _agent_with_db
++    agent = _agent_with_db(store, session_id=store.scope['session_id'], platform='tui')
++    if bind:
++        bind_adopted_agent(agent, store, home=get_hermes_home(), scope=dict(store.scope))
++    return agent
++
++
++def _turn(agent, monkeypatch, inside):
++    """Run the actual facade; ``inside`` executes during the live leased turn."""
++    seen = []
++
++    def loop(*args, **kwargs):
++        seen.append(inside())
++        return dict(final_response='ok', messages=[], failed=False)
++
++    monkeypatch.setattr('agent.conversation_loop.run_conversation', loop)
++    agent.run_conversation('capture')
++    assert len(seen) == 1
++    return seen[0]
++
++
++def _capture():
++    from hermes_cli import kanban_origin_native as native
++    value = native.capture(None)
++    return value, (value.validated() if value is not None else None)
++
++
++def test_managed_interactive_facade_capture(managed, monkeypatch):
++    from agent import origin_turn_custody
++    store = managed.store
++    agent = _agent(store)
++
++    def inside():
++        assert origin_turn_custody._current.get()[0].db is store
++        return _capture()
++
++    value, validated = _turn(agent, monkeypatch, inside)
++    assert validated == OWNED
++    assert value.validated() is None        # revoked with the lease after the turn
++
++
++def test_unbound_managed_agent_has_no_authority(managed, monkeypatch):
++    """Without the private post-adoption capability the RPC store grants nothing."""
++    assert _turn(_agent(managed.store, bind=False), monkeypatch, _capture) == (None, None)
++
++
++@pytest.mark.parametrize(('source', 'created'), [
++    ('cron', None), ('local', 'kanban'), ('local', None), ('cli', 'subagent'), ('telegram', None),
++])
++def test_noninteractive_creation_source_refused(managed, monkeypatch, source, created):
++    managed.db._write_sql('UPDATE sessions SET source=?,created_source=? WHERE id=?', (source, created, 'owned'))
++    assert _turn(_agent(managed.store), monkeypatch, _capture) == (None, None)
++
++
++def test_normalized_local_desktop_session_is_interactive(managed, monkeypatch):
++    managed.db._write_sql("UPDATE sessions SET source='local',created_source='desktop' WHERE id='owned'")
++    assert _turn(_agent(managed.store), monkeypatch, _capture)[1] == OWNED
++
++
++def test_owner_published_compression_keeps_current_session(managed, monkeypatch):
++    store = managed.store
++    agent = _agent(store)
++
++    def inside():
++        _compress(store, 'owned', 'child')
++        assert store.scope['session_id'] == 'child'
++        agent.session_id = 'child'
++        return _capture()
++
++    assert _turn(agent, monkeypatch, inside)[1] == {'origin': dict(OWNED['origin'], session='child')}
++
++
++def test_agent_naming_retired_compression_target_refused(managed, monkeypatch):
++    store = managed.store
++
++    def inside():
++        _compress(store, 'owned', 'child')
++        return _capture()        # agent still names the retired target
++
++    assert _turn(_agent(store), monkeypatch, inside) == (None, None)
++
++
++def _bump_pid(managed, agent, store):
++    cap = agent._native_origin_managed_custody
++    object.__setattr__(cap, 'pid', cap.pid + 1)
++
++
++def _replace_epoch(managed, agent, store):
++    from hermes_state_runtime import begin_runtime_epoch
++    begin_runtime_epoch(managed.db, instance_id='replacement')
++
++
++_MUTATIONS = {
++    'generation': lambda managed, agent, store: store.scope.update(generation=store.scope['generation'] + 1),
++    'execution': lambda managed, agent, store: store.scope.update(execution_id='other'),
++    'foreign_store': lambda managed, agent, store: setattr(agent, '_session_db', object()),
++    'pid': _bump_pid,
++    'persist_disabled': lambda managed, agent, store: setattr(agent, '_persist_disabled', True),
++    'expired': lambda managed, agent, store: managed.db._write_sql('UPDATE session_turn_leases SET expires_at=1'),
++    'stale_epoch': _replace_epoch,
++    'holder': lambda managed, agent, store: managed.db._write_sql(
++        "UPDATE session_turn_leases SET holder='intruder'"),
++}
++
++
++@pytest.mark.parametrize('mutate', sorted(_MUTATIONS))
++def test_custody_predicates_fail_closed(managed, monkeypatch, mutate):
++    store = managed.store
++    agent = _agent(store)
++    saved = dict(store.scope)
++
++    def inside():
++        _MUTATIONS[mutate](managed, agent, store)
++        result = _capture()
++        store.scope.clear()
++        store.scope.update(saved)
++        agent._session_db = store
++        return result
++
++    assert _turn(agent, monkeypatch, inside) == (None, None)
++
++
++def test_bind_refuses_mismatch_and_double_binding(managed, tmp_path):
++    from agent.origin_managed_custody import bind_adopted_agent
++    from hermes_constants import get_hermes_home
++    store = managed.store
++    agent = _agent(store, bind=False)
++    with pytest.raises(ValueError, match='invalid_managed_origin_agent'):
++        bind_adopted_agent(agent, store, home=tmp_path / 'elsewhere', scope=dict(store.scope))
++    with pytest.raises(ValueError, match='invalid_managed_origin_agent'):
++        bind_adopted_agent(agent, store, home=get_hermes_home(), scope=dict(store.scope, generation=9))
++    bind_adopted_agent(agent, store, home=get_hermes_home(), scope=dict(store.scope))
++    with pytest.raises(ValueError, match='invalid_managed_origin_agent'):
++        bind_adopted_agent(agent, store, home=get_hermes_home(), scope=dict(store.scope))
++    # A non-RPC store (local SessionDB or a shim) never receives managed custody.
++    other = _agent(store, bind=False)
++    other._session_db = managed.db
++    bind_adopted_agent(other, managed.db, home=Path(get_hermes_home()), scope=dict(store.scope))
++    assert getattr(other, '_native_origin_managed_custody', None) is None
++
++
++@pytest.mark.parametrize('kanban', [False, True])
++def test_adopted_execute_binds_managed_custody_only_without_task_custody(tmp_path, monkeypatch, kanban):
++    """Wiring proof for the private execute seam: adoption first, task custody wins."""
++    from types import SimpleNamespace
++    from agent import origin_managed_custody
++    from agent.runtime_session_store import RuntimeSessionStore
++    from gateway import session_kanban
++    from tests.gateway.test_managed_worker_route_key import _execute
++    from tests.gateway.test_managed_turn_contract import assignment
++    frame, _ = assignment(tmp_path, monkeypatch)
++    calls, task_bound = [], []
++    capability = SimpleNamespace(bind_agent=task_bound.append) if kanban else None
++    monkeypatch.setattr(session_kanban, 'bind_worker_context', lambda frame: capability)
++    monkeypatch.setattr(origin_managed_custody, 'bind_adopted_agent',
++                        lambda agent, store, **kw: calls.append((agent, store, kw)))
++
++    def turns(agent, frame, history):
++        if kanban:
++            assert task_bound == [agent] and calls == []
++        else:
++            [(bound, store, kw)] = calls
++            # The harness substitutes its store class; the seam must pass the one the agent was built on.
++            assert bound is agent and store is built['session_db']
++            assert type(store).__name__ == 'Store' or isinstance(store, RuntimeSessionStore)
++            assert kw == {'home': frame['home'], 'scope': dict(frame['scope'])}
++        return dict(final_response='ok', completed=True)
++
++    monkeypatch.setattr(session_kanban, 'run_worker_turns', turns)
++    built = {}
++    _execute(frame, monkeypatch, built=built)
++    assert len(calls) == (0 if kanban else 1)
+diff --git a/tests/gateway/test_worker_native_origin_query.py b/tests/gateway/test_worker_native_origin_query.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8b527d2c7249c57680002c3c31f5499859b3fbae
+--- /dev/null
++++ b/tests/gateway/test_worker_native_origin_query.py
+@@ -0,0 +1,88 @@
++"""Native-origin enrichment is opt-in, owner-authenticated and fail-closed."""
++import asyncio
++import copy
++import json
++
++import pytest
++
++from tests.gateway import test_worker_turn_lease_query as lease_tests
++
++worker = lease_tests.worker
++
++
++def _compress(store, parent, child):
++    assert store.try_acquire_compression_lock(parent, 'compressor')
++    store.publish_compression_child(parent_session_id=parent, child_session_id=child, source='cli',
++        messages=[{'role': 'assistant', 'content': 'summary'}], compression_lock_holder='compressor')
++
++
++def test_native_origin_real_dispatch_and_store_transport(worker):
++    store, db = worker.store, worker.db
++    assert store.try_acquire_session_turn_lease('owned', 'holder')
++    journal, disk = copy.deepcopy(store.journal), store.path.read_bytes()
++    sequence = db._read_one('SELECT last_sequence FROM worker_executions')[0]
++    params = dict(store.scope, holder='holder')
++    request = {'jsonrpc': '2.0', 'id': 'native-query', 'method': 'worker.nativeOrigin', 'params': params}
++    expected = {'expires_at': db.session_turn_lease_expires_at('owned', 'holder'),
++                'source': 'cli', 'assignment_lineage': ['owned']}
++    assert asyncio.run(worker.connection.dispatch(request)) == {
++        'jsonrpc': '2.0', 'id': 'native-query', 'result': expected}
++    assert store.native_origin_observation('owned', 'holder') == expected
++    refused = asyncio.run(worker.connection.dispatch(dict(request, params=dict(params, sequence=1))))
++    assert refused['error']['data']['reason'] == 'invalid_params'
++    assert store.native_origin_observation('owned', 'foreign-holder') == dict(expected, expires_at=None)
++    assert store.journal == journal and store.path.read_bytes() == disk
++    assert db._read_one('SELECT last_sequence FROM worker_executions')[0] == sequence
++
++
++def test_ordinary_query_never_calls_lineage_validation(worker, monkeypatch):
++    import hermes_state_runtime as runtime
++    assert worker.store.try_acquire_session_turn_lease('owned', 'holder')
++
++    def refuse(*args):
++        raise runtime.RuntimeStoreError('permission_denied')
++
++    monkeypatch.setattr(runtime, '_worker_publication_lineage', refuse)
++    expected = {'expires_at': worker.db.session_turn_lease_expires_at('owned', 'holder')}
++    assert worker.rpc('worker.turnLease', **worker.store.scope, holder='holder') == expected
++    with pytest.raises(runtime.RuntimeStoreError, match='^permission_denied$'):
++        worker.store.native_origin_observation('owned', 'holder')
++
++
++def test_broken_publication_chain_does_not_break_ordinary_lease(worker):
++    from hermes_state_runtime import RuntimeStoreError
++    store, db = worker.store, worker.db
++    assert store.try_acquire_session_turn_lease('owned', 'holder')
++    expiry = store.session_turn_lease_expires_at('owned', 'holder')
++    _compress(store, 'owned', 'child')
++    _compress(store, 'child', 'tip')
++    assert store.native_origin_observation('tip', 'holder')['assignment_lineage'] == ['owned', 'child', 'tip']
++    rows = db._read_all("SELECT sequence,result_json FROM worker_receipts "
++                        "WHERE json_extract(result_json,'$.worker_assignment.parent') IS NOT NULL ORDER BY sequence")
++    receipt = json.loads(rows[-1]['result_json'])
++    receipt['worker_assignment']['parent'] = 'unrelated'
++    db._write_sql('UPDATE worker_receipts SET result_json=? WHERE sequence=?',
++                  (json.dumps(receipt), rows[-1]['sequence']))
++    with pytest.raises(RuntimeStoreError, match='^permission_denied$'):
++        store.native_origin_observation('tip', 'holder')
++    assert worker.rpc('worker.turnLease', **store.scope, holder='holder') == {'expires_at': expiry}
++
++
++@pytest.mark.parametrize(('root', 'current', 'expected'), [
++    (('cli', None), ('cli', None), 'cli'),
++    (('local', 'desktop'), ('desktop', None), 'desktop'),
++    (('local', 'kanban'), ('cli', None), None),
++    (('cli', None), ('local', 'cron'), None),
++    (('cli', 'kanban'), ('cli', 'kanban'), 'kanban'),
++    (('desktop', None), ('cli', None), None),
++])
++def test_root_and_current_creation_classification_must_agree(worker, root, current, expected):
++    store, db = worker.store, worker.db
++    assert store.try_acquire_session_turn_lease('owned', 'holder')
++    expiry = store.session_turn_lease_expires_at('owned', 'holder')
++    _compress(store, 'owned', 'child')
++    db._write_sql('UPDATE sessions SET source=?,created_source=? WHERE id=?', (*root, 'owned'))
++    db._write_sql('UPDATE sessions SET source=?,created_source=? WHERE id=?', (*current, 'child'))
++    assert store.native_origin_observation('child', 'holder') == {
++        'expires_at': expiry, 'source': expected, 'assignment_lineage': ['owned', 'child']}
++    assert store.session_turn_lease_expires_at('child', 'holder') == expiry
+diff --git a/tests/gateway/test_worker_turn_lease_query.py b/tests/gateway/test_worker_turn_lease_query.py
+index 8ddc0ac11c25ab4f276afccfb2c4e73fd5352e19..ca5973153cd184005bc5bc261553c4c03d261b30 100644
+--- a/tests/gateway/test_worker_turn_lease_query.py
++++ b/tests/gateway/test_worker_turn_lease_query.py
+@@ -89,10 +89,11 @@ def test_fresh_query_observes_refresh_release_and_expiry_without_receipts(worker
+     ({'holder': None}, 'invalid_params'),
+     ({'sequence': 1}, 'invalid_params'),
+ ])
+-def test_query_rejects_invalid_scope(worker, changes, reason):
++@pytest.mark.parametrize('method', ['worker.turnLease', 'worker.nativeOrigin'])
++def test_query_rejects_invalid_scope(worker, changes, reason, method):
+     from hermes_state_runtime import RuntimeStoreError
+     with pytest.raises(RuntimeStoreError, match=f'^{reason}$'):
+-        worker.rpc('worker.turnLease', **(dict(worker.store.scope, holder='holder') | changes))
++        worker.rpc(method, **(dict(worker.store.scope, holder='holder') | changes))
+ 
+ 
+ @pytest.mark.parametrize(('sql', 'reason'), [
+@@ -101,47 +102,51 @@ def test_query_rejects_invalid_scope(worker, changes, reason):
+     ("UPDATE worker_executions SET status='unknown'", 'stale_generation'),
+     ("UPDATE worker_executions SET status='terminal'", 'stale_generation'),
+ ])
+-def test_query_refuses_freshly_invalidated_execution(worker, sql, reason):
++@pytest.mark.parametrize('method', ['worker.turnLease', 'worker.nativeOrigin'])
++def test_query_refuses_freshly_invalidated_execution(worker, sql, reason, method):
+     from hermes_state_runtime import RuntimeStoreError
+     assert worker.store.try_acquire_session_turn_lease('owned', 'holder')
+     assert worker.store.session_turn_lease_expires_at('owned', 'holder') is not None
+     worker.db._write_sql(sql)
+     with pytest.raises(RuntimeStoreError, match=f'^{reason}$'):
+-        worker.store.session_turn_lease_expires_at('owned', 'holder')
++        worker.rpc(method, **worker.store.scope, holder='holder')
+ 
+ 
+-def test_query_refuses_new_owner_epoch(worker):
++@pytest.mark.parametrize('method', ['worker.turnLease', 'worker.nativeOrigin'])
++def test_query_refuses_new_owner_epoch(worker, method):
+     from hermes_state_runtime import RuntimeStoreError
+     assert worker.store.try_acquire_session_turn_lease('owned', 'holder')
+     begin_runtime_epoch(worker.db, instance_id='replacement')
+     with pytest.raises(RuntimeStoreError, match='^stale_epoch$'):
+-        worker.store.session_turn_lease_expires_at('owned', 'holder')
++        worker.rpc(method, **worker.store.scope, holder='holder')
+ 
+ 
+-def test_query_refuses_superseded_serving_connection(worker):
++@pytest.mark.parametrize('method', ['worker.turnLease', 'worker.nativeOrigin'])
++def test_query_refuses_superseded_serving_connection(worker, method):
+     from hermes_state_runtime import RuntimeStoreError
+     assert worker.store.try_acquire_session_turn_lease('owned', 'holder')
+     # Caller and DB agree, but this not-yet-retired connection belongs to the old owner.
+     worker.authority.epoch -= 1
+     with pytest.raises(RuntimeStoreError, match='^stale_epoch$'):
+-        worker.store.session_turn_lease_expires_at('owned', 'holder')
++        worker.rpc(method, **worker.store.scope, holder='holder')
+ 
+ 
+-def test_query_requires_live_producer_and_capability(worker):
++@pytest.mark.parametrize('method', ['worker.turnLease', 'worker.nativeOrigin'])
++def test_query_requires_live_producer_and_capability(worker, method):
+     from dataclasses import replace
+     from hermes_state_runtime import RuntimeStoreError
+     actor = worker.connection.actor
+     worker.connection.actor = replace(actor, capabilities=frozenset({'session:control'}))
+     with pytest.raises(RuntimeStoreError, match='^permission_denied$'):
+-        worker.store.session_turn_lease_expires_at('owned', 'holder')
++        worker.rpc(method, **worker.store.scope, holder='holder')
+     worker.connection.actor = replace(actor, subject='other-principal')
+     with pytest.raises(RuntimeStoreError, match='^permission_denied$'):
+-        worker.store.session_turn_lease_expires_at('owned', 'holder')
++        worker.rpc(method, **worker.store.scope, holder='holder')
+     worker.connection.actor = actor
+     worker.child.terminate()
+     worker.child.wait(timeout=5)
+     with pytest.raises(RuntimeStoreError, match='^worker_not_live$'):
+-        worker.store.session_turn_lease_expires_at('owned', 'holder')
++        worker.rpc(method, **worker.store.scope, holder='holder')
+ 
+ 
+ def test_query_does_not_touch_pending_or_failure_and_propagates_unavailable(worker):
+@@ -237,6 +242,7 @@ def test_query_sql_has_no_writes_and_does_not_change_revision(worker, monkeypatc
+     assert statements
+     assert all(sql.lstrip().split()[0].upper() in {'SELECT', 'ROLLBACK'} for sql in statements)
+     assert statements[-1] == 'ROLLBACK'
++    assert not any('worker_receipts' in sql.lower() for sql in statements)
+     assert db.get_session('owned')['runtime_revision'] == revision
+ 
+ 
+diff --git a/tui_gateway/contracts/canonical.py b/tui_gateway/contracts/canonical.py
+index b927c03bc0b8b44f86d2e37aba5b01a1e477c068..cbdbffdba083f55f80f1613c5df61e3cd3cbe0f6 100644
+--- a/tui_gateway/contracts/canonical.py
++++ b/tui_gateway/contracts/canonical.py
+@@ -544,6 +544,19 @@ canonical_method("worker.turnLease", params=WorkerTurnLeaseParams, result=Worker
+                  doc="Fresh owner-fenced exact-holder turn lease expiry; never a persistence receipt.")
+ 
+ 
++class WorkerNativeOriginParams(WorkerTurnLeaseParams):
++    pass
++
++
++class WorkerNativeOriginResult(WorkerTurnLeaseResult):
++    source: str | None
++    assignment_lineage: list[str]
++
++
++canonical_method("worker.nativeOrigin", params=WorkerNativeOriginParams, result=WorkerNativeOriginResult,
++                 doc="Fresh owner-fenced lease, consistent creation source and execution publication lineage.")
++
++
+ class WorkerPersistParams(WorkerScopeParams):
+     epoch: int
+     sequence: int
+-- 
+2.43.0
+

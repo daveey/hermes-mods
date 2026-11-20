@@ -1,0 +1,253 @@
+From 4e084ff8992342df9937865f0f73b3f388e885a0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 07:03:41 +0000
+Subject: [PATCH] [daveey] kanban chat waits: the owner turns an undeliverable
+ synced ask into a visible one
+
+Review and adversarial pass of the previous head (reviewer APPROVE with this
+as its Medium): a pool worker's chat wait skips the subscriber check (the
+owner holds the subscriptions), so when the owner has no chat that can take
+it the ask was recorded, synced and read by nobody.
+
+- Sync apply records an imported decision_requested for a card this gateway
+  owns (ApplyResult.decision_asks). After the commit, owner_fallback checks
+  has_chat_subscriber; with none, the still-parked card leaves the park
+  (scheduled -> triage, probe cleared, decision_unanswerable event, as the
+  spend-budget hold does) and is blocked needs_input with a human_request
+  carrying the question. If that block is refused it stays visible in triage.
+- --skip-system also ignores the older kernel writers without the kanban-
+  prefix (dispatcher, placement, worker-placement, triage-sweep, respawn-guard,
+  quota/oom/dup detectors, gateway).
+
+Tests: an imported ask on an owned card with no wakeable chat blocks it with
+the question; with a wakeable chat it stays parked; dispatcher and placement
+notes do not fire the probe. 3 of 49 fail on the previous head; 35 neighbour
+files (638 tests) and 75 sync files (1837 tests) pass.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_comment_origin.py          | 15 +++++--
+ hermes_cli/kanban_db_sync.py                 | 13 ++++++
+ hermes_cli/kanban_decision_ask.py            | 40 +++++++++++++++++
+ hermes_cli/kanban_parser.py                  |  4 +-
+ tests/hermes_cli/test_kanban_decision_ask.py | 46 ++++++++++++++++++++
+ 5 files changed, 113 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban_comment_origin.py b/hermes_cli/kanban_comment_origin.py
+index 31eff8ab6483531d6c0edeb29cc1e719a118b123..11574ccc857424e5c7dc7cf5886ace0e9551aff2 100644
+--- a/hermes_cli/kanban_comment_origin.py
++++ b/hermes_cli/kanban_comment_origin.py
+@@ -137,6 +137,14 @@ def _writer_tasks(conn: sqlite3.Connection, task_id: str) -> dict:
+ 
+ 
+ SYSTEM_AUTHOR_PREFIX = "kanban-"  # kernel writers: kanban-park, kanban-dispatcher, kanban-supervisor, ...
++# Kernel writers that predate the prefix (kanban_host_reboot, placement, sweeps, detectors).
++SYSTEM_AUTHORS = frozenset({"dispatcher", "placement", "worker-placement", "triage-sweep", "respawn-guard",
++                            "quota-detector", "oom-detector", "dup-detector", "gateway"})
++
++
++def is_system_author(author: Optional[str]) -> bool:
++    name = (author or "").strip().lower()
++    return name.startswith(SYSTEM_AUTHOR_PREFIX) or name in SYSTEM_AUTHORS
+ 
+ 
+ def find_comment(conn: sqlite3.Connection, task_id: str, *, after_id: int = 0, from_gateway: Optional[str] = None,
+@@ -159,7 +167,7 @@ def find_comment(conn: sqlite3.Connection, task_id: str, *, after_id: int = 0, f
+             writer = writers.get(str(row[4])) if row[4] else writers.get(("id", int(row[0])))
+             if writer != card and not _from_card(row[1], card):
+                 continue
+-            if skip_system and (row[1] or "").lower().startswith(SYSTEM_AUTHOR_PREFIX):
++            if skip_system and is_system_author(row[1]):
+                 continue
+             if gw and gw != (row[2] or "").lower() and gw not in (row[1] or "").lower():
+                 continue
+@@ -172,8 +180,9 @@ def find_comment(conn: sqlite3.Connection, task_id: str, *, after_id: int = 0, f
+     sql = "SELECT id, author, origin_gateway, body FROM task_comments WHERE task_id = ? AND id > ?"
+     params: list[Any] = [task_id, int(after_id or 0)]
+     if skip_system:
+-        sql += " AND substr(lower(author), 1, ?) != ?"
+-        params += [len(SYSTEM_AUTHOR_PREFIX), SYSTEM_AUTHOR_PREFIX]
++        sql += (" AND substr(lower(trim(author)), 1, ?) != ? AND lower(trim(author)) NOT IN ("
++                + ",".join("?" * len(SYSTEM_AUTHORS)) + ")")
++        params += [len(SYSTEM_AUTHOR_PREFIX), SYSTEM_AUTHOR_PREFIX, *sorted(SYSTEM_AUTHORS)]
+     if from_gateway:
+         gw = from_gateway.strip().lower()
+         sql += " AND (lower(coalesce(origin_gateway, '')) = ? OR instr(lower(author), ?) > 0)"
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index e61832ab30ed532f907468e67760e393ed6a5e5e..07b75e34d05fc1ed59b8e96a53987b3731f34e62 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -1258,6 +1258,8 @@ class ApplyResult:
+     changed_fields: dict[str, set[str]] = field(default_factory=dict)
+     wake_dispatcher: bool = False
+     blobs_to_fetch: list[str] = field(default_factory=list)
++    # [daveey] Cards this gateway owns that received a worker's ``decision_requested`` (kanban_decision_ask).
++    decision_asks: set[str] = field(default_factory=set)
+     # [daveey] A feed pull or snapshot: task fields with an unanswered local edit keep the local value
+     # (``_without_unacked_fields``), checked inside the apply transaction.
+     local_pending_wins: bool = False
+@@ -1528,6 +1530,10 @@ def _upsert_row(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: Ap
+         from hermes_cli.kanban_terminal_guard import is_reopen
+         if is_reopen({"kind": cols.get("kind"), "payload": cols.get("payload")}):
+             result.reopened.add(str(task_id))
++    if table == "task_events" and task_id and cols.get("kind") == "decision_requested":
++        row = conn.execute("SELECT created_on FROM tasks WHERE id = ?", (task_id,)).fetchone()
++        if row is not None and (not row[0] or row[0] == own):
++            result.decision_asks.add(str(task_id))  # the owner checks it can deliver, after the commit
+     if table == "task_events" and ch.fields.get("kind") in ("archive_requested", "capability_owner_archive_requested"):
+         result.wake_dispatcher = True  # a stop request (kanban_remote_stop) or forwarded owner archive to apply
+     if table == "task_chat_links":
+@@ -1617,6 +1623,13 @@ def _after_commit(conn: sqlite3.Connection, result: ApplyResult, board: Optional
+             _kb._fire_kanban_lifecycle_hook(
+                 "on_kanban_task_updated", task_id, board=board, changed_fields=sorted(fields), remote=True,
+             )
++    if result.decision_asks:
++        from hermes_cli import kanban_decision_ask
++        for task_id in sorted(result.decision_asks):
++            try:
++                kanban_decision_ask.owner_fallback(conn, task_id)
++            except (sqlite3.Error, ValueError) as exc:  # one card's fallback never stops the rest of the apply
++                _log.warning("kanban sync: decision ask fallback for %s failed: %s", task_id, exc, exc_info=True)
+     if result.wake_dispatcher:
+         wake_dispatcher()
+ 
+diff --git a/hermes_cli/kanban_decision_ask.py b/hermes_cli/kanban_decision_ask.py
+index c9ae46493cbacd4e20bffddce136efb694aca08b..b05d004397d6345b7e7d9d757674adc274afd362 100644
+--- a/hermes_cli/kanban_decision_ask.py
++++ b/hermes_cli/kanban_decision_ask.py
+@@ -11,12 +11,17 @@ its orchestrator never saw (2026-11-18).
+ the card. After the park, :func:`post_notice` appends ``decision_requested`` in the same transaction.
+ That kind is a gateway wake kind and a ``tui`` notify kind, so a live chat gets it in its queue, a
+ Mac ``notify+wake`` row starts a turn, and the unloaded sweeper wakes a dormant ``tui`` chat.
++
++The subscriber check runs only where the card is owned (subscriptions are machine-local). When a pool
++worker's ask reaches the owner by sync and the owner has no chat that can take it, :func:`owner_fallback`
++turns it into a visible ask for David (``needs_input`` with ``human_request``) instead of a silent park.
+ """
+ from __future__ import annotations
+ 
+ from typing import Any
+ 
+ NOTICE_KIND = "decision_requested"
++UNANSWERED_KIND = "decision_unanswerable"  # the owner had no chat to take the ask; it became David's
+ 
+ 
+ def is_chat_wait(awaiting: Any) -> bool:
+@@ -40,3 +45,38 @@ def post_notice(conn, task_id: str, *, reason: str | None, awaiting: Any, run_id
+     from hermes_cli import kanban_db as kb
+     payload = {"reason": reason, "why": awaiting.get("why"), "ref": awaiting.get("ref")}
+     kb._append_event(conn, task_id, NOTICE_KIND, {k: v for k, v in payload.items() if v}, run_id=run_id)
++
++
++def owner_fallback(conn, task_id: str) -> bool:
++    """On the owning gateway, after an imported ``decision_requested``: no wakeable subscriber means nobody gets
++    the ask, so block the still-parked card ``needs_input`` with the question. True when it blocked."""
++    from hermes_cli import kanban_awaiting as kaw
++    from hermes_cli import kanban_db as kb
++    task = kb.get_task(conn, task_id)
++    if task is None or task.status != "scheduled" or kaw.has_chat_subscriber(conn, task_id):
++        return False
++    ask = [e for e in kb.list_events(conn, task_id) if e.kind == NOTICE_KIND]
++    question = str((ask[-1].payload or {}).get("why") or (ask[-1].payload or {}).get("reason") or "") if ask else ""
++    question = question.strip()[:1500] or "the decision named in the card's latest comment"
++    from hermes_cli import kanban_wake_check as kwc
++    own = kwc.own_gateway(conn)
++    # A parked card cannot be blocked directly (block_task takes running/ready/triage): leave the park first, as the
++    # spend-budget hold does. If the block below is refused, the card still sits visibly in triage.
++    with kb.write_txn(conn):
++        if conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ? AND status = 'scheduled'",
++                        (task_id,)).rowcount != 1:
++            return False
++        kwc.set_check(conn, task_id, None, None)
++        kb._append_event(conn, task_id, UNANSWERED_KIND, {"why": question, "gateway": own})
++    return bool(kb.block_task(
++        conn, task_id, kind="needs_input",
++        reason=("This card's worker parked waiting on its orchestrator's decision, but no chat subscribed to the "
++                "card can be woken here. 1) Answer the question below with a comment on the card. 2) Then unblock "
++                "it.\n" + question),
++        human_request={
++            "action": "Answer the card's question: " + question[:400],
++            "why_human": "its worker asked its orchestrator, and no subscribed chat on the owning gateway can take it",
++            "interaction": "reply",
++            "scope": f"card {task_id}: {str(task.title or '')[:120]}",
++            "evidence": f"decision_requested on {task_id}; no wakeable notify subscription on {own or 'this gateway'}",
++        }))
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 91ba633ec7f4d7627a9d0b97694847184b42ac1f..686d0776112c00a6cf7cfd30774894263d668656 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -505,8 +505,8 @@ _SPECS = [
+                   "authored it <gateway>/<task id>). Use it to wait for another card's answer instead of a phrase "
+                   "the other card has to reproduce"),
+         _arg("--skip-system", action="store_true", default=False,
+-             help="Ignore comments by kernel writers (authors 'kanban-*': the park's own progress note, dispatcher, "
+-                  "supervisor and spend-budget notes), so only an answer from an agent or a person fires"),
++             help="Ignore comments by kernel writers (authors 'kanban-*' and the older dispatcher, placement, sweep "
++                  "and detector notes), so only an answer from an agent or a person fires"),
+     ], help="Wake-probe primitive for a reply: exit 0 a matching comment exists, 1 not yet, 2 cannot tell. "
+             "Use it instead of matching task_comments.author (the park guard refuses that: author_probe)"),
+     _cmd("attach", [
+diff --git a/tests/hermes_cli/test_kanban_decision_ask.py b/tests/hermes_cli/test_kanban_decision_ask.py
+index 2314723abe8ff704a98db2df2f7385519fcaeb98..b5be0ac278abeb07a1a15de5d02791c41a86de70 100644
+--- a/tests/hermes_cli/test_kanban_decision_ask.py
++++ b/tests/hermes_cli/test_kanban_decision_ask.py
+@@ -393,6 +393,8 @@ def test_park_progress_note_does_not_fire_the_chat_probe(kanban_home, monkeypatc
+     assert kcli.kanban_command(parser.parse_args(argv)) != 0
+     with kbc.connect_closing() as conn:
+         kb.add_comment(conn, tid, "kanban-dispatcher", "Woken: probe stale", system=True)
++        kb.add_comment(conn, tid, "dispatcher", "Host rebooted; card requeued", system=True)
++        kb.add_comment(conn, tid, "placement", "Placed on worker-1", system=True)
+     assert kcli.kanban_command(parser.parse_args(argv)) != 0
+     with kbc.connect_closing() as conn:
+         kb.add_comment(conn, tid, "default", "Decisions: B, authorize, Phase A alone.")
+@@ -426,3 +428,47 @@ def test_owned_card_still_needs_a_subscriber(kanban_home, monkeypatch) -> None:
+         _as_worker(monkeypatch, conn, tid)
+         out = _tool("schedule", {"reason": LIVE_REASON, "clock_only": True, "awaiting": LIVE_AWAITING})
+         assert kaw.NO_CHAT_SUBSCRIBER in (out.get("code") or "") + out.get("error", ""), out
++
++
++def _imported_ask(tid) -> None:
++    """A pool worker's park reaching the owner by sync: its decision_requested event."""
++    from hermes_cli import kanban_db_sync as sync
++    payload = {"why": "premise A, B or C for the replay?", "reason": LIVE_REASON}
++    change = sync.RemoteChange(1, "task_events", "remote-ask-1", "upsert",
++                               {"task_id": tid, "kind": "decision_requested", "created_at": int(time.time()),
++                                "payload": json.dumps(payload)}, 1, "", "worker-a1")
++    with kbc.connect_closing() as conn:
++        assert sync.apply_remote_changes(conn, [change], new_cursor=1, observers=True).applied == 1
++
++
++def _owned_parked(subscribed: bool) -> str:
++    from tests.hermes_cli.test_kanban_release_imported_comments import enable_sync
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        if subscribed:
++            _subscribe(conn, tid)
++    enable_sync(tid)  # this gateway ("owner") owns the card
++    with kbc.connect_closing() as conn:
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status = 'scheduled' WHERE id = ?", (tid,))
++    return tid
++
++
++def test_owner_with_no_wakeable_chat_turns_an_imported_ask_into_a_visible_one(kanban_home) -> None:
++    """Adversarial review of #3647: a foreign-card park skips the subscriber check, so the owner must act."""
++    tid = _owned_parked(subscribed=False)
++    _imported_ask(tid)
++    with kbc.connect_closing() as conn:
++        task = kb.get_task(conn, tid)
++        assert task.status == "blocked", task.status
++        assert kwc.get_state(conn, tid) is None
++        assert [e.kind for e in kb.list_events(conn, tid) if e.kind == "decision_unanswerable"]
++        request = json.loads(task.human_request) if isinstance(task.human_request, str) else task.human_request
++        assert request["interaction"] == "reply" and "premise A, B or C" in request["action"]
++
++
++def test_owner_with_a_wakeable_chat_leaves_the_card_parked(kanban_home) -> None:
++    tid = _owned_parked(subscribed=True)
++    _imported_ask(tid)
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, tid).status == "scheduled"
+-- 
+2.43.0
+

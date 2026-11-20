@@ -1,0 +1,242 @@
+From 945ea5ad0dba300699e8b550f4b7b735b9a569c2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 17:47:31 +0000
+Subject: [PATCH] fix(kanban): attach this host's core-update hold only to
+ cards it leases [daveey]
+
+Ready-card chat notices (chat_wait_unclaimed) blamed the hub's own core-update
+swap for pool cards the hub never leases: 41 such notices on pool-placed cards
+in the Board replica, 11-11 21:47Z to 11-15 16:40Z (task t_fc957aa5f46a6e47).
+
+Example: 2026-11-15 16:40:48Z, t_826b414bdb02d4ef (runs_on capability:core-ship,
+pool:worker) was told "claims are held for a pending Hermes update" during the
+hub's 185 s swap. Pool workers claimed cards the whole time (claimed events
+16:36-16:43Z from worker-1..6 and -8). The card was really waiting on the
+openai-codex pacing hold and queue order. Notices post once per ready episode,
+so the true reason was never sent.
+
+Five whys:
+1. Why the wrong sentence? The payload carried core_update_hold, which
+   notice_text prints before the queue/pacing sentence, and post_notice
+   recorded admission core_update_hold.
+2. Why did the payload carry it? kanban_chat_wait.sweep() reads this host's
+   update_hold() once and merges it into every due card's extra.
+3. Why every card? c7eb57bb4e2 ("Explain active update drains in ready-card
+   notices") assumed the host's hold stops every ready card's claims.
+4. Why is that false? The hold (agent.core_update_drain.active_hold) only
+   stops this host's dispatcher. Pool and remote-placed cards are leased by
+   other machines, which keep claiming.
+5. Why was nothing checking? post_notice computes the card's queue place
+   (lane) but never compared it with the host the hold belongs to.
+
+Fix: post_notice drops core_update_* from extra unless the card's place is
+lane "local" (this host leases it). Pool (worker_pool), remote-placed
+(machine) and unplaceable cards get exactly the notice they get with no hold
+active: queue place, busy-pool or pacing admission. Hub-leasable cards keep
+the hold sentence and core_update_hold admission. An unknown place (position
+lookup failed) also drops the hold, since it does not prove this host leases
+the card. No change to the drain itself or to worker-side holds.
+
+Tests:
+- test_kanban_drain_wait_notice: a pool card that falls due in a real sweep
+  under an active hub hold gets the same payload and text as with no hold
+  (busy and non-busy pool); a worker_pool card gets "waiting for a pool
+  worker"; a local card under the hold keeps the hold sentence and admission;
+  with no hold a local card keeps the capacity notice.
+- test_kanban_label_backlog_wait / test_kanban_notice_pacing_admission: two
+  existing tests asserted the defect (hold over a pool card's busy-pool
+  reason); they now assert the pool reason, and the hold precedence on a
+  local card. New test for the incident shape: paced pool card under the
+  hold gets the llm_pacing notice.
+- RED on origin/main: 4 of the new/changed pool assertions fail; GREEN: the
+  21 test files importing kanban_parent_unclaimed / kanban_chat_wait /
+  core_update_hold pass (414 tests). scripts/check --base origin/main ok.
+---
+ hermes_cli/kanban_parent_unclaimed.py         | 11 +++
+ .../test_kanban_drain_wait_notice.py          | 73 +++++++++++++++++++
+ .../test_kanban_label_backlog_wait.py         | 13 ++--
+ .../test_kanban_notice_pacing_admission.py    | 19 ++++-
+ 4 files changed, 110 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index c9b59fe67c0c9ca8ddb51934560817cabdbf08e4..e955b85e3d01ac9c5bbf8bc31385aeab5d35bcf5 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -263,6 +263,16 @@ def _pacing_admission(conn, task_id: str, place: dict[str, Any], extra: Optional
+         return None
+ 
+ 
++def _host_hold_only_if_local(extra: Optional[dict[str, Any]], place: dict[str, Any]) -> Optional[dict[str, Any]]:
++    """``extra`` without this host's core-update hold (``core_update_*``) unless this host leases the card (lane
++    ``local``). The hold only stops this host's claims: a pool or remote-placed card is leased elsewhere, so its
++    notice keeps the queue/pacing reason (41 pool notices blamed the hub's own update swap, t_fc957aa5f46a6e47).
++    An unknown place is not proof the host leases it, so it drops the hold too. [daveey]"""
++    if not extra or not extra.get("core_update_hold") or place.get("lane") == "local":
++        return extra
++    return {k: v for k, v in extra.items() if not k.startswith("core_update_")}
++
++
+ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_seconds: float,
+                 ready_seconds: float, parent_title: Optional[str] = None, kind: str = NOTICE_KIND,
+                 extra: Optional[dict[str, Any]] = None) -> bool:
+@@ -278,6 +288,7 @@ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_se
+     if _already_posted(conn, task_id, waiting_on, wait_key, kind):
+         return False  # before the queue place: every tick asks again for each long-ready card [daveey]
+     place = _place(conn, waiting_on)
++    extra = _host_hold_only_if_local(extra, place)
+     busy = klb.busy(place.get("backlog"))
+     observed = {"board": place.get("board") or khc.board_of(conn), "observed_at": place.get("observed_at") or int(time.time()),
+                 "admission": ({"reason": "core_update_hold", "status": "held"} if (extra or {}).get("core_update_hold")
+diff --git a/tests/hermes_cli/test_kanban_drain_wait_notice.py b/tests/hermes_cli/test_kanban_drain_wait_notice.py
+index fa8e44d04c142b78d1b6f8a78197af268e94ae40..0155c2fe64be003a3c5065fec0aafa23915537f8 100644
+--- a/tests/hermes_cli/test_kanban_drain_wait_notice.py
++++ b/tests/hermes_cli/test_kanban_drain_wait_notice.py
+@@ -6,7 +6,10 @@ import json
+ import pytest
+ 
+ from agent import core_update_drain as drain
++from hermes_cli import kanban_chat_wait as kcw
++from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_sync as sync
++from tests.hermes_cli import test_kanban_label_backlog_wait as backlog
+ from tests.hermes_cli import test_kanban_missing_board_notice as helpers
+ 
+ kanban_home = helpers.kanban_home
+@@ -51,3 +54,73 @@ def test_dead_drain_writer_does_not_hide_capacity_advice(live, tmp_path, monkeyp
+     monkeypatch.setattr(drain, "_pid_alive", lambda pid: False)
+     text = helpers._notice(live, helpers._card(live))
+     assert "capacity first" in text and "bump" not in text
++
++
++# --- this host's hold only explains cards this host leases (t_fc957aa5f46a6e47) --------------------------------
++
++hub = backlog.hub
++HOLD_WORDS = "pending Hermes " + "update"
++
++
++def _hold(monkeypatch, tmp_path, active=True):
++    marker = tmp_path / "drain-hold"
++    marker.write_text(json.dumps({"pid": 12345, "started_at": START, "reason": "pending core update"}))
++    monkeypatch.setattr(drain, "hold_paths", lambda: [marker] if active else [])
++    monkeypatch.setattr(drain, "_pid_alive", lambda pid: pid == 12345)
++
++
++def _swept(conn, tid):
++    """The card's notice from a real dispatcher sweep, then cleared so the next sweep posts the episode again."""
++    assert kcw.sweep(conn) >= 1
++    row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?", (tid, kcw.NOTICE_KIND)).fetchone()
++    assert row is not None, "the due card got no notice"
++    with kb.write_txn(conn):
++        conn.execute("DELETE FROM task_events WHERE kind=?", (kcw.NOTICE_KIND,))
++    payload = json.loads(row[0])
++    return payload, kcw.notice_text(payload)
++
++
++def _stable(payload):
++    return {k: v for k, v in payload.items() if k not in ("observed_at", "checkpoint_diagnostic")}
++
++
++@pytest.mark.parametrize("claims", [0, 3])
++def test_hub_hold_does_not_explain_a_pool_card_the_hub_cannot_lease(hub, tmp_path, monkeypatch, claims):
++    tid = backlog._seed(hub.conn, claims=claims)
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET session_id='origin' WHERE id=?", (tid,))  # a chat waits on it
++    _hold(monkeypatch, tmp_path, active=False)
++    plain, plain_text = _swept(hub.conn, tid)
++    _hold(monkeypatch, tmp_path, active=True)
++    held, text = _swept(hub.conn, tid)
++    assert not any(k.startswith("core_update_") for k in held), held
++    assert held["admission"]["reason"] != "core_update_hold", held
++    assert HOLD_WORDS not in text and "2 card(s) with matching labels ahead of it" in text, text
++    assert _stable(held) == _stable(plain)  # exactly the notice it gets with no hold active
++    assert text.split(" [board")[0] == plain_text.split(" [board")[0]
++
++
++def test_hub_hold_does_not_explain_a_worker_pool_card(live, tmp_path, monkeypatch):
++    from hermes_cli.kanban_worker_placement import POLICY
++    _hold(monkeypatch, tmp_path)
++    tid = helpers._card(live)
++    with kb.write_txn(live):
++        live.execute("UPDATE tasks SET placement_policy=? WHERE id=?", (POLICY, tid))
++    payload, text = _swept(live, tid)
++    assert "core_update_hold" not in payload and payload["admission"]["reason"] != "core_update_hold", payload
++    assert "waiting for a pool worker" in text and HOLD_WORDS not in text, text
++
++
++def test_hub_hold_still_explains_a_card_this_host_leases(live, tmp_path, monkeypatch):
++    _hold(monkeypatch, tmp_path)
++    payload, text = _swept(live, helpers._card(live))
++    assert payload["core_update_hold"] is True
++    assert payload["admission"] == {"reason": "core_update_hold", "status": "held"}, payload
++    assert "claims are held for a " + HOLD_WORDS in text, text
++
++
++def test_no_hold_leaves_a_local_card_notice_unchanged(live, tmp_path, monkeypatch):
++    _hold(monkeypatch, tmp_path, active=False)
++    payload, text = _swept(live, helpers._card(live))
++    assert "core_update_hold" not in payload and payload["admission"]["reason"] != "core_update_hold", payload
++    assert HOLD_WORDS not in text and "capacity first" in text, text
+diff --git a/tests/hermes_cli/test_kanban_label_backlog_wait.py b/tests/hermes_cli/test_kanban_label_backlog_wait.py
+index 92ad76ce8f2a3bc2dab27456b9418877c4112f95..a45ca22c87860dfb0253503f9c96593e1253f9bb 100644
+--- a/tests/hermes_cli/test_kanban_label_backlog_wait.py
++++ b/tests/hermes_cli/test_kanban_label_backlog_wait.py
+@@ -250,17 +250,20 @@ def test_malformed_holders_are_not_evidence(raw):
+     assert klb._holder(raw) is None
+ 
+ 
+-def test_update_hold_takes_precedence_over_recent_pool_claims(hub):
++def test_hub_update_hold_does_not_hide_recent_pool_claims(hub):
++    """This host's update hold never stops a pool card it cannot lease: the busy-pool reason stays
++    (t_fc957aa5f46a6e47; this test used to assert the reverse)."""
+     tid = _seed(hub.conn, claims=1)
+     assert kpu.post_notice(hub.conn, tid, tid, wait_key="hold", waited_seconds=1900, ready_seconds=1900,
+-                           kind=kcw.NOTICE_KIND, extra={"core_update_hold": True})
++                           kind=kcw.NOTICE_KIND, extra={"core_update_hold": True, "core_update_started": "x"})
+     raw = hub.conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
+                            (tid, kcw.NOTICE_KIND)).fetchone()[0]
+     payload = json.loads(raw)
+-    assert payload["admission"] == {"reason": "core_update_hold", "status": "held"}
++    assert payload["admission"] == {"reason": "matching_pool_busy", "status": "queued"}, payload
++    assert not any(k.startswith("core_update_") for k in payload), payload
+     text = kcw.notice_text(payload)
+-    assert "claims are held for a pending Hermes update" in text
+-    assert "Not a placement problem" not in text
++    assert "claims are held for a pending Hermes" not in text
++    assert "Not a placement problem" in text
+ 
+ 
+ @pytest.mark.parametrize("transition", ["continued", "shared_blocker_wake", "clear_already_ready"])
+diff --git a/tests/hermes_cli/test_kanban_notice_pacing_admission.py b/tests/hermes_cli/test_kanban_notice_pacing_admission.py
+index 4b7556f393cf06e8dd940b451d4c1ca5021d9efb..ab5144481f9bed7f5a71bac1e059e85ab34133f1 100644
+--- a/tests/hermes_cli/test_kanban_notice_pacing_admission.py
++++ b/tests/hermes_cli/test_kanban_notice_pacing_admission.py
+@@ -330,8 +330,25 @@ def test_a_busy_pool_and_a_core_update_hold_still_come_first(hub):
+     hint = pu.ready_hint(hub.conn, kb.get_task(hub.conn, busy))
+     assert hint is not None and "Not a placement problem" in hint
+     assert "LLM quota pacing" not in hint
+-    held = _pool_card(hub.conn, title="held for an update")
++    # This host's update hold comes first only for a card this host leases; a pool card keeps its own reason, here
++    # the busy pool (t_fc957aa5f46a6e47: 41 pool notices blamed the hub's own update swap).
++    held = kb.create_task(hub.conn, title="hub-leasable, held for an update", assignee="default", session_id="owner-chat")
++    assert (kqp.position(hub.conn, kb.get_task(hub.conn, held)) or {}).get("lane") == "local"
+     assert _post(hub.conn, held, core_update_hold=True)["admission"] == {"reason": "core_update_hold", "status": "held"}
++    pooled = _post(hub.conn, _pool_card(hub.conn, title="queued, not held"), core_update_hold=True)
++    assert pooled["admission"] == {"reason": "matching_pool_busy", "status": "queued"}, pooled
++    assert "core_update_hold" not in pooled, pooled
++
++
++def test_this_hosts_update_hold_does_not_hide_a_pool_cards_pacing_wait(hub):
++    """The incident shape (t_fc957aa5f46a6e47): a pool card paced by the governor while the hub swaps its own
++    core gets the pacing notice, not the hub's hold sentence."""
++    _store(("anthropic", lp.PACED))
++    payload = _post(hub.conn, _pool_card(hub.conn), core_update_hold=True, core_update_started="x")
++    assert payload["admission"]["reason"] == "llm_pacing", payload
++    assert not any(k.startswith("core_update_") for k in payload), payload
++    text = cw.notice_text(payload)
++    assert "LLM quota pacing" in text and "claims are held for a pending" not in text, text
+ 
+ 
+ def test_a_card_missing_from_the_shared_board_is_not_a_pacing_wait(hub):
+-- 
+2.43.0
+

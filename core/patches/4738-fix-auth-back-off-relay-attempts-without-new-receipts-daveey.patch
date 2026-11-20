@@ -1,0 +1,128 @@
+From 86c3bb0bfd34543b3ed46caae8b4d9ea26ffe38b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 05:05:34 +0000
+Subject: [PATCH] fix(auth): back off relay attempts without new receipts
+ [daveey]
+
+Async kickstart success does not prove credentials applied. The fixed retry interval repeatedly consumed the full request deadline while the provider receipt stayed stale. Persist provider-scoped attempt counts under the existing relay lock, double retry spacing up to one hour, and reset on newer producer receipts. Keep missing-receipt fail-open and the original first-request 30-second budget. RED: repeated stale receipt regression failed on baseline. GREEN: six caller suites, 89 passed, one native macOS test skipped on Linux; full scripts/check passed all 21 gates.
+---
+ agent/credential_relay_preflight.py      | 21 +++++++--
+ tests/agent/test_relay_wake_preflight.py | 54 ++++++++++++++++++++++++
+ 2 files changed, 71 insertions(+), 4 deletions(-)
+
+diff --git a/agent/credential_relay_preflight.py b/agent/credential_relay_preflight.py
+index 262271ee08bc06caa91ff65cb1134039aa7b1a3a..4dbd617de42ed579051186c9c5c8ca69bd0e539e 100644
+--- a/agent/credential_relay_preflight.py
++++ b/agent/credential_relay_preflight.py
+@@ -49,7 +49,7 @@ def _wait(deadline: float) -> bool:
+     return True
+ 
+ 
+-def _claim_attempt(lock: Any, provider: str, cooldown: float) -> bool:
++def _claim_attempt(lock: Any, provider: str, cooldown: float, checked_at: float) -> bool:
+     """Bound repeated failures across sessions without pretending a pull succeeded."""
+     lock.seek(0)
+     try:
+@@ -59,10 +59,22 @@ def _claim_attempt(lock: Any, provider: str, cooldown: float) -> bool:
+     if not isinstance(attempts, dict):
+         attempts = {}
+     last = attempts.get(provider)
++    count = 0
++    if isinstance(last, dict):
++        previous = last.get("checked_at")
++        count = last.get("count", 0)
++        count = min(16, max(0, count)) if type(count) is int else 0
++        if not isinstance(previous, (int, float)) or isinstance(previous, bool) or not math.isfinite(previous) or checked_at > previous:
++            last, count = None, 0
++        else:
++            last = last.get("attempted_at")
+     now = time.time()
+-    if isinstance(last, (int, float)) and 0 <= now - last < cooldown:
++    delay = min(3600.0, cooldown * 2 ** max(0, count - 1))
++    if isinstance(last, (int, float)) and not isinstance(last, bool) and 0 <= now - last < delay:
+         return False
+-    attempts[provider] = now
++    # Count attempts against the same successful receipt, never command exits.
++    # A newer receipt resets this even if it aged before the next request.
++    attempts[provider] = {"attempted_at": now, "checked_at": checked_at, "count": min(16, count + 1)}
+     lock.seek(0)
+     lock.truncate()
+     json.dump(attempts, lock)
+@@ -77,7 +89,8 @@ def _pull_locked(cmd: list[str], stamp: Path, provider: str, deadline: float, lo
+     if current is None or not _stale(current):
+         return
+     remaining = deadline - time.monotonic()
+-    if remaining <= 0 or not _claim_attempt(lock, provider, min(300.0, max(60.0, 2 * current[1]))):
++    cooldown = min(300.0, max(60.0, 2 * current[1]))
++    if remaining <= 0 or not _claim_attempt(lock, provider, cooldown, current[0]):
+         return
+     env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
+     env.pop("PYTHONPATH", None)
+diff --git a/tests/agent/test_relay_wake_preflight.py b/tests/agent/test_relay_wake_preflight.py
+index bb04cba50ec916485cb2648fba0fe0b873f9eaa4..47ee2bcb2e681df5433501fa3f81426ad298972e 100644
+--- a/tests/agent/test_relay_wake_preflight.py
++++ b/tests/agent/test_relay_wake_preflight.py
+@@ -297,6 +297,60 @@ def test_disabled_during_pull_is_not_handed_out(home, monkeypatch):
+     assert pinned_anthropic_pool_token(pool, entry.id) == (False, None)
+ 
+ 
++def test_no_receipt_backoff_grows_and_is_bounded(home, monkeypatch):
++    pre, agent, clock = _controlled(home, monkeypatch)
++    calls = []
++    monkeypatch.setattr(pre.subprocess, "run", lambda *a, **k: calls.append(k) or SimpleNamespace(returncode=0))
++    start = 0
++    for cooldown in [240, 480, 960, 1920, 3600, 3600]:
++        clock.elapsed = start
++        before = len(calls)
++        assert pins._request_key(agent) == pins.B_1
++        assert len(calls) == before + 1
++        assert clock.elapsed == pytest.approx(start + 30)
++        clock.elapsed = start + cooldown - 1
++        assert pins._request_key(_relay_agent(home)) == pins.B_1
++        assert len(calls) == before + 1
++        assert clock.elapsed == start + cooldown - 1
++        start += cooldown
++
++
++def test_backoff_is_provider_scoped_and_migrates_legacy_history(home, monkeypatch):
++    pre, _agent, clock = _controlled(home, monkeypatch)
++    path = home / "state" / "oauth-relay-repull.lock"
++    path.write_text(json.dumps({"anthropic": clock.time(), "openai-codex": 9876}))
++    with path.open("a+") as lock:
++        assert not pre._claim_attempt(lock, "anthropic", 240, 9000)
++        clock.elapsed = 240
++        assert pre._claim_attempt(lock, "anthropic", 240, 9000)
++        for start in [480, 960]:
++            clock.elapsed = start
++            assert pre._claim_attempt(lock, "anthropic", 240, 9000)
++        assert not pre._claim_attempt(lock, "anthropic", 240, 9000)
++        assert pre._claim_attempt(lock, "openai-codex", 240, 9000)
++        assert not pre._claim_attempt(lock, "anthropic", 240, 9000)
++    data = json.loads(path.read_text())
++    assert data["anthropic"]["count"] == 3
++    assert data["openai-codex"]["count"] == 1
++
++
++def test_new_success_resets_backoff_even_if_aged_before_request(home, monkeypatch):
++    pre, agent, clock = _controlled(home, monkeypatch)
++    calls = []
++    monkeypatch.setattr(pre.subprocess, "run", lambda *a, **k: calls.append(k) or SimpleNamespace(returncode=0))
++    for start in [0, 240, 720]:
++        clock.elapsed = start
++        assert pins._request_key(agent) == pins.B_1
++    # A real producer success between requests, already stale on the next call.
++    _receipt(home, 10760)
++    clock.elapsed = 1010
++    assert pins._request_key(agent) == pins.B_1
++    assert len(calls) == 4
++    clock.elapsed = 1250
++    assert pins._request_key(agent) == pins.B_1
++    assert len(calls) == 5  # reset to base, not the previous 960s cooldown
++
++
+ def test_success_for_another_provider_does_not_complete_wait(home, monkeypatch):
+     pre, agent, clock = _controlled(home, monkeypatch)
+     path = home / "state" / "oauth-relay-success.json"
+-- 
+2.43.0
+

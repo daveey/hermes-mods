@@ -1,0 +1,277 @@
+From 8cdd241ccbbaef6f9a3fc09de40231ab3ab8d806 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 15:46:16 +0000
+Subject: [PATCH] [daveey] Reserve published external sources and scope
+ artifact staging to task board
+
+Fix review P1/P2: share journal-aware ownership checks before holder reuse and return-home mutations; serialize published attach observation with initial registration under the writer lock, including replay. Stage selected snapshots under attachment_board(conn, task), not ambient board.
+
+Proof: ownership RED 5 contract failures; board scope RED 2 assertions after correcting fixture helper name. Focused GREEN 43 tests; source regression 34 files, 587 passed; added fast-forward preservation coverage passed (7 ownership tests). Protocol advertisement remains 1.
+---
+ hermes_cli/kanban_source_launch.py            |   7 +-
+ hermes_cli/kanban_source_registration.py      |   2 +-
+ hermes_cli/kanban_source_resolver.py          |   7 +-
+ .../test_kanban_source_completion_stage.py    |  22 ++++
+ .../test_kanban_source_published_ownership.py | 121 ++++++++++++++++++
+ tools/kanban_tools_source.py                  |   7 +-
+ 6 files changed, 160 insertions(+), 6 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_source_published_ownership.py
+
+diff --git a/hermes_cli/kanban_source_launch.py b/hermes_cli/kanban_source_launch.py
+index b141f528af875d1d5f5efe6eaf8ffaa658a12956..7af385f0c3414da28b477ce9cf67d79b9627d46b 100644
+--- a/hermes_cli/kanban_source_launch.py
++++ b/hermes_cli/kanban_source_launch.py
+@@ -150,7 +150,12 @@ def attach(conn: sqlite3.Connection, claimed: Any, workspace: str, source: Any,
+         manifest_revision=revision, branch=(source.branch if source is not None else seen["branch"]),
+         path=source_path, pre_head=seen["head"], manifest=manifest, state="pending",
+         machine=_me(conn), source_protocol=protocol, source_identity=identity)
+-    board_calls.record_run(conn, run)  # before the call: an unanswered attach may have applied
++    from hermes_cli.kanban_db_connect import write_txn
++    from hermes_cli.kanban_source_registration import _owned_elsewhere
++    # Share initial registration's writer lock and predicate, including replay after a refusal.
++    with write_txn(conn):
++        _owned_elsewhere(conn, claimed.id, source_path)
++        board_calls.record_run(conn, run, allow_nested=True)  # reserve before an uncertain RPC
+     try:
+         board_calls.attach(conn, claimed.id, run_uid, mode=mode, manifest_revision=revision, source_protocol=protocol)
+     except board_calls.BoardLacksSource as exc:
+diff --git a/hermes_cli/kanban_source_registration.py b/hermes_cli/kanban_source_registration.py
+index 21dd8faa339c5f791508d0966f48dda1dfbb1d23..4f6e84b88ce15aca6c5e734e8911fa2e5f9ae48d 100644
+--- a/hermes_cli/kanban_source_registration.py
++++ b/hermes_cli/kanban_source_registration.py
+@@ -53,7 +53,7 @@ def _source_owner(conn, task_id, path) -> str | None:
+ 
+ def _owned_elsewhere(conn, task_id, path) -> None:
+     from hermes_cli.kanban_source_resolver import _occupied_by_other_task
+-    if _occupied_by_other_task(conn, task_id, path) is not None or _source_owner(conn, task_id, path) is not None:
++    if _occupied_by_other_task(conn, task_id, path) is not None:
+         _refuse("source belongs to another active task")
+ 
+ 
+diff --git a/hermes_cli/kanban_source_resolver.py b/hermes_cli/kanban_source_resolver.py
+index d50f0664bfd669bcebe7f10763b4cccb2c84a9b2..2e4a9afcbe3ff6b2def9668e1292c6bbf454fd4a 100644
+--- a/hermes_cli/kanban_source_resolver.py
++++ b/hermes_cli/kanban_source_resolver.py
+@@ -86,7 +86,10 @@ def _worktrees(bound: _Bound, clone: str) -> list[dict[str, str]]:
+ def _occupied_by_other_task(conn: sqlite3.Connection, task_id: str, path: str) -> Optional[str]:
+     row = conn.execute("SELECT id FROM tasks WHERE workspace_path = ? AND id != ? "
+                        "AND status NOT IN ('done', 'archived') LIMIT 1", (path, task_id)).fetchone()
+-    return row[0] if row else None
++    if row:
++        return row[0]
++    from hermes_cli.kanban_source_registration import _source_owner
++    return _source_owner(conn, task_id, path)
+ 
+ 
+ def _clean(bound: _Bound, path: str | Path) -> bool:
+@@ -221,6 +224,8 @@ def _resolve_source_workspace(conn, task, snapshot, *, me, cfg, bound, lookup):
+     if custody is not None and custody.source_holder == me:
+         local = _local_holder_copy(bound, task, manifest, cfg)
+         if local is not None:
++            if (other := _occupied_by_other_task(conn, task.id, local)) is not None:
++                raise WorkspaceSourceRefusal("occupied_path", f"{local} is {other}'s live workspace")
+             if manifest is not None:
+                 head = _head(bound, local)
+                 if head != manifest.commit and not (head and _is_ancestor(bound, local, manifest.commit, head)):
+diff --git a/tests/hermes_cli/test_kanban_source_completion_stage.py b/tests/hermes_cli/test_kanban_source_completion_stage.py
+index 78d857fe82d435bc7e3f5400e5a10c091dea92d0..6aac01b3ef6e2de72e4af10a7ea08bbd845f15f4 100644
+--- a/tests/hermes_cli/test_kanban_source_completion_stage.py
++++ b/tests/hermes_cli/test_kanban_source_completion_stage.py
+@@ -11,6 +11,28 @@ from tests.hermes_cli import test_kanban_source_registration as helpers
+ setup = helpers.setup
+ 
+ 
++@pytest.mark.parametrize("surface", ["heartbeat", "completion"])
++def test_selection_uses_connection_board_not_ambient(setup, tmp_path, monkeypatch, surface):
++    from tools import kanban_tools_source as tools_source
++    from hermes_cli.kanban_artifact_receipt import attachment_board
++    conn, _, tid, source, _, _, _ = setup
++    run = registration.register_initial(conn, tid, str(source))
++    expected_board = attachment_board(conn, tid)
++    monkeypatch.setattr(kb, "get_current_board", lambda: "other")
++    src = tmp_path / "report.txt"
++    src.write_bytes(b"board scoped report")
++    if surface == "heartbeat":
++        tools_source.heartbeat_source(conn, tid, {"artifacts": [str(src)]},
++                                      worker_task=tid, expected_run_id=run.run_id)
++    else:
++        tools_source.stage_completion(conn, tid, {"artifacts": [str(src)]}, expected_run_id=run.run_id)
++    selected = artifacts.selected(conn, tid, run.run_uid)
++    assert len(selected) == 1
++    row = artifacts._row(conn, tid, selected[0])
++    assert Path(row["stored_path"]).is_relative_to(kb.attachments_root(board=expected_board) / tid)
++    assert Path(row["stored_path"]).read_bytes() == b"board scoped report"
++
++
+ def test_completion_snapshot_survives_retry_and_ending_rollback(setup, tmp_path, monkeypatch):
+     from tools.kanban_tools_source import stage_completion
+     from hermes_cli.kanban_db_workspace import _managed_scratch_path_info
+diff --git a/tests/hermes_cli/test_kanban_source_published_ownership.py b/tests/hermes_cli/test_kanban_source_published_ownership.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2c328806e984550fbdfc0efddc6bd68d7b8cb139
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_source_published_ownership.py
+@@ -0,0 +1,121 @@
++"""Published sources share initial registration's external-path reservation."""
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_source_board as board
++from hermes_cli import kanban_source_launch as launch
++from hermes_cli import kanban_source_registration as reg
++from hermes_cli import kanban_source_resolver as resolver
++from hermes_cli import kanban_workspace_source as ws
++from tests.hermes_cli import test_kanban_source_registration as helpers
++from tests.hermes_cli import test_kanban_source_ownership_budget as owners
++from tests.hermes_cli.test_kanban_workspace_source import manifest
++
++setup = helpers.setup
++
++
++def published(source, tid):
++    raw = {**manifest(), "version": 2, "source_kind": "scratch_external",
++           "repository": {"id": 1, "full_name": "example/source", "url": "https://github.com/example/source"},
++           "branch": f"refs/heads/wt/{tid}", "commit": helpers.git(source, "rev-parse", "HEAD")}
++    snapshot = ws.SourceSnapshot(raw, ws.Custody("hub", "published", 1, source_protocol=2))
++    resolved = SimpleNamespace(path=str(source), branch=f"wt/{tid}", mode="holder_reuse", manifest_revision=1)
++    return snapshot, resolved
++
++
++@pytest.mark.parametrize("surface", ["holder", "return_home", "attach", "replay"])
++def test_published_source_refuses_another_initial_owner(setup, tmp_path, surface):
++    conn, b, tid, source, scratch, *_ = setup
++    other = owners._second_task(conn, tmp_path, f"wt/{tid}")
++    snapshot, resolved = published(source, tid)
++    task = kb.get_task(conn, other)
++    if surface == "replay":
++        b.refuse["source_attach"] = "invalid"
++        with pytest.raises(launch.AttachRefused):
++            launch.attach(conn, task, str(scratch), resolved, snapshot)
++        conn.execute("UPDATE kanban_source_runs SET state='refused' WHERE run_id=?", (task.current_run_id,))
++        conn.commit()
++        b.refuse.clear()
++    first = reg.register_initial(conn, tid, str(source))
++    before = helpers.git(source, "rev-parse", "HEAD")
++    calls = len(b.calls)
++    if surface == "holder":
++        with pytest.raises(ws.WorkspaceSourceRefusal, match="occupied_path"):
++            resolver.resolve_source_workspace(conn, task, snapshot, me="hub")
++    elif surface == "return_home":
++        with pytest.raises(ws.WorkspaceSourceRefusal, match="occupied_path"):
++            resolver._bring_to(resolver._Bound(60, time.monotonic), conn, other,
++                               str(source), snapshot.manifest())
++    else:
++        with pytest.raises(launch.AttachRefused, match="another active task"):
++            launch.attach(conn, task, str(scratch), resolved, snapshot)
++    assert helpers.git(source, "rev-parse", "HEAD") == before
++    assert len(b.calls) == calls
++    assert board.attached_run(conn, first.run_id).state == "attached"
++    other_run = board.attached_run(conn, task.current_run_id)
++    assert other_run is None or other_run.state == "refused"
++
++
++def test_published_observation_serializes_with_initial_and_reserves_before_rpc(setup, tmp_path, monkeypatch):
++    conn, b, tid, source, scratch, *_ = setup
++    other = owners._second_task(conn, tmp_path, f"wt/{tid}")
++    snapshot, resolved = published(source, tid)
++    original = b.answer
++    checked = []
++    ownership = reg._owned_elsewhere
++
++    def locked_owner(connection, task_id, path):
++        if task_id == tid:
++            assert connection.in_transaction, "published ownership must serialize with initial registration"
++        return ownership(connection, task_id, path)
++
++    monkeypatch.setattr(reg, "_owned_elsewhere", locked_owner)
++
++    def answer(body):
++        if body.get("action") == "source_attach":
++            with pytest.raises(launch.AttachRefused, match="another active task"):
++                reg.register_initial(conn, other, str(source))
++            checked.append(True)
++        return original(body)
++
++    b.answer = answer
++    assert launch.attach(conn, kb.get_task(conn, tid), str(scratch), resolved, snapshot).state == "attached"
++    assert checked
++
++
++def test_published_attach_rechecks_competitor_after_identity_proof(setup, tmp_path, monkeypatch):
++    conn, _b, tid, source, scratch, *_ = setup
++    other = owners._second_task(conn, tmp_path, f"wt/{tid}")
++    snapshot, resolved = published(source, tid)
++    original = reg.source_identity
++    raced = []
++
++    def identity(*args, **kwargs):
++        if not raced:
++            raced.append(True)
++            reg.register_initial(conn, tid, str(source))
++        return original(*args, **kwargs)
++
++    monkeypatch.setattr(reg, "source_identity", identity)
++    with pytest.raises(launch.AttachRefused, match="another active task"):
++        launch.attach(conn, kb.get_task(conn, other), str(scratch), resolved, snapshot)
++    assert raced
++    assert board.attached_run(conn, kb.get_task(conn, other).current_run_id) is None
++
++
++def test_return_home_does_not_fast_forward_another_tasks_source(setup, tmp_path):
++    conn, _, tid, source, _, _, clone = setup
++    reg.register_initial(conn, tid, str(source))
++    other = owners._second_task(conn, tmp_path, f"wt/{tid}")
++    snapshot, _ = published(source, tid)
++    before = helpers.git(source, "rev-parse", "HEAD")
++    helpers.git(clone, "-c", "user.name=Test", "-c", "user.email=test@example.com",
++                "commit", "--allow-empty", "-m", "next published commit")
++    snapshot.manifest_value["commit"] = helpers.git(clone, "rev-parse", "HEAD")
++    assert snapshot.manifest_value["commit"] != before
++    with pytest.raises(ws.WorkspaceSourceRefusal, match="occupied_path"):
++        resolver._bring_to(resolver._Bound(60, time.monotonic), conn, other, str(source), snapshot.manifest())
++    assert helpers.git(source, "rev-parse", "HEAD") == before
+diff --git a/tools/kanban_tools_source.py b/tools/kanban_tools_source.py
+index 5359d8854903a7bc342c2b47ab054741d5ad361c..dbf72a479905a90d605db067a14b32150a847a01 100644
+--- a/tools/kanban_tools_source.py
++++ b/tools/kanban_tools_source.py
+@@ -13,7 +13,7 @@ def heartbeat_source(conn, task_id, args, *, worker_task, expected_run_id):
+     use it (task scope + run id), never an operator or orchestrator on its behalf.
+     Returns None when no source field was given (plain liveness heartbeat).
+     """
+-    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_artifact_receipt import attachment_board
+     from hermes_cli import kanban_source_artifacts as artifacts
+     from hermes_cli import kanban_source_board as source
+     from hermes_cli import kanban_source_launch as launch
+@@ -32,7 +32,7 @@ def heartbeat_source(conn, task_id, args, *, worker_task, expected_run_id):
+         if path is not None:
+             registration.register_initial(conn, task_id, path, expected_run_id=expected_run_id)
+         if selection is not None:
+-            artifacts.stage_for_run(conn, task_id, selection, board=kb.get_current_board(),
++            artifacts.stage_for_run(conn, task_id, selection, board=attachment_board(conn, task_id),
+                                     expected_run_id=expected_run_id)
+     except (launch.AttachRefused, artifacts.ArtifactRefused) as exc:
+         raise ValueError(f"{exc.code}: {exc.detail}") from exc
+@@ -50,6 +50,7 @@ def stage_completion(conn, task_id, metadata, *, expected_run_id):
+     Committed snapshots survive a later refused/rolled-back ending for replay.
+     """
+     from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_artifact_receipt import attachment_board
+     from hermes_cli import kanban_source_artifacts as artifacts
+     from hermes_cli import kanban_source_board as source
+ 
+@@ -62,7 +63,7 @@ def stage_completion(conn, task_id, metadata, *, expected_run_id):
+         return metadata
+     try:
+         entries = artifacts.stage_for_run(
+-            conn, task_id, metadata["artifacts"], board=kb.get_current_board(),
++            conn, task_id, metadata["artifacts"], board=attachment_board(conn, task_id),
+             expected_run_id=expected_run_id,
+         )
+         # Only rows in this exact selection may supply the delivery path. A
+-- 
+2.43.0
+

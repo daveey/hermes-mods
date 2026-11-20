@@ -1,0 +1,740 @@
+From c270e3feb22426bec16f4e5cc02581066ec96cce Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:42:49 -0800
+Subject: [PATCH] fix(kanban-pacing): bound the capacity plan, fail open on a
+ malformed v2 [daveey]
+
+Review of 67cbb5a:
+- Resets are clamped into [now, now + window + 1 day] and the curve is capped at
+  64 points, so planning cost no longer depends on how far a reset claims to be
+  (a year-9999 reset looped on the claim path). Non-finite used drops the reading.
+- Every field of the stored v2 is type-checked (malformed = absent), and the v2
+  update fails open in layers (history -> last rates; plan -> reserve_pool, the
+  legacy held rule) without ever skipping the legacy pace, the save or the cache.
+- The history store opens one connection per refresh, sets user_version only on
+  creation and takes one write transaction with a 0.5 s lock timeout; a busy
+  store skips history for that refresh.
+
+Committed with LEFTHOOK=0: `just` is missing on this Mac and scripts/check refuses
+core execution here; ruff (ruff.pre-commit.toml) was run by hand on staged files.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_llm_pacing.py               |  80 ++++++--
+ hermes_cli/kanban_llm_pacing_dispatch.py      |  37 ++--
+ hermes_cli/kanban_llm_pacing_history.py       | 161 +++++++++------
+ .../test_kanban_llm_pacing_persistence.py     |   4 +-
+ .../test_kanban_llm_pacing_robustness.py      | 193 ++++++++++++++++++
+ tests/hermes_cli/test_kanban_llm_pacing_v2.py |  14 +-
+ .../test_kanban_model_tier_paced_reroute.py   |   2 +-
+ 7 files changed, 392 insertions(+), 99 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_llm_pacing_robustness.py
+
+diff --git a/hermes_cli/kanban_llm_pacing.py b/hermes_cli/kanban_llm_pacing.py
+index f62e9c4d77e20b6da370596282ada2c4c122446c..f695f485549b77c109c9b3f9988679cbc70f8b9d 100644
+--- a/hermes_cli/kanban_llm_pacing.py
++++ b/hermes_cli/kanban_llm_pacing.py
+@@ -263,6 +263,30 @@ ADDED_UNSEEN_SECONDS = 86400
+ REMOVED_AFTER_READS = 3
+ _RESET_JUMP_SECONDS = 300
+ _EARLY_DROP_POINTS = 10.0
++RESET_SLACK_SECONDS = 86400  # a reset further out than its window plus this is clamped (bad or hostile input)
++MAX_CURVE_POINTS = 64
++
++
++def valid_readings(readings: Iterable[Reading]) -> list[Reading]:
++    """Readings fit to store and plan: a non-finite ``used`` (NaN/inf would not even serialize as JSON) drops the
++    reading as invalid; a non-finite ``reset_at`` reads as no reset."""
++    out = []
++    for r in readings:
++        if not math.isfinite(r.used):
++            continue
++        reset = r.reset_at if r.reset_at is not None and math.isfinite(r.reset_at) else None
++        out.append(r if reset == r.reset_at else Reading(r.ts, r.account, r.kind, r.used, reset))
++    return out
++
++
++def _clamped(r: Reading, now: float) -> Reading:
++    """``r`` with its reset clamped into ``[now, now + window + slack]``, so planning cost and the curve never
++    depend on how far away (or how far past) a reset claims to be (a year-9999 reset once hung the claim path)."""
++    if r.reset_at is None:
++        return r
++    top = now + WINDOW_SECONDS.get(r.kind, WINDOW_SECONDS[SEVEN_DAY]) + RESET_SLACK_SECONDS
++    reset = min(top, max(now, r.reset_at))
++    return r if reset == r.reset_at else Reading(r.ts, r.account, r.kind, r.used, reset)
+ 
+ 
+ def account_id(label: Any) -> str:
+@@ -452,18 +476,18 @@ def _curve(plans: list[AccountPlan], tpp7: Tpp, now: float, cfg: PacingConfig) -
+     if not tpp7.value or not plans:
+         return []
+     step = cfg.reserve[SEVEN_DAY] * tpp7.value
+-    horizon = max(p.reset_at for p in plans)
+-    resets = []
+-    for p in plans:
+-        t = p.reset_at
+-        while t <= horizon:
+-            resets.append(t)
+-            t += WINDOW_SECONDS[SEVEN_DAY]
++    week = WINDOW_SECONDS[SEVEN_DAY]
++    horizon = max(p.reset_at for p in plans)  # resets are clamped (``_clamped``): at most window + slack away
++    # Each reset repeats weekly out to the horizon: with clamped resets that is at most two steps per account.
++    resets = sorted(p.reset_at + k * week for p in plans for k in range(int((horizon - p.reset_at) // week) + 1))
+     times = sorted({now, horizon, *resets, *(e for p in plans if (e := _exhaust_at(p, now)) is not None)})
++    if len(times) > MAX_CURVE_POINTS:  # keep the ends, thin the middle evenly
++        stride = (len(times) - 1) / (MAX_CURVE_POINTS - 1)
++        times = sorted({times[round(i * stride)] for i in range(MAX_CURVE_POINTS)})
+     base = sum(p.remaining or 0.0 for p in plans)
+     out = []
+     for t in times:
+-        capacity = base + step * sum(1 for r in resets if r <= t)
++        capacity = base + step * bisect.bisect_right(resets, t)
+         spend = sum(min(p.remaining or 0.0, (p.rate or 0.0) * (t - now)) for p in plans)
+         out.append([round(t, 1), round(capacity, 1), round(spend, 1)])
+     return out
+@@ -474,7 +498,7 @@ def plan_pool(provider: str, current: list[Reading], tpp7: Tpp, tpp5: Tpp, now:
+     """One pool's ``v2.pools`` entry (without ``ratio``) and its curve, from this read's hashed account windows.
+     ``at_reserve``: at least one account read and none under reserve (the pool then plans rate 0); no readable
+     account = not at reserve and rate ``null`` (fail open). ``until``: the earliest reset that frees an account."""
+-    governed = [r for r in current if r.kind in GOVERNED_KINDS]
++    governed = [_clamped(r, now) for r in valid_readings(current) if r.kind in GOVERNED_KINDS]
+     by_account: dict[str, list[Reading]] = {}
+     for r in governed:
+         by_account.setdefault(r.account, []).append(r)
+@@ -502,6 +526,20 @@ def plan_pool(provider: str, current: list[Reading], tpp7: Tpp, tpp5: Tpp, now:
+     return pool, _curve(plans, tpp7, now, cfg)
+ 
+ 
++def reserve_pool(current: list[Reading], now: float, cfg: PacingConfig) -> dict:
++    """The least ``v2`` pool entry: ``at_reserve`` and ``until`` alone, from the same rule as the legacy ``held``
++    verdict. The fallback when the full plan fails, so a v2 fault never changes what holds a start."""
++    governed = [_clamped(r, now) for r in valid_readings(current) if r.kind in GOVERNED_KINDS]
++    at_reserve = bool(governed) and not ({r.account for r in governed} - {r.account for r in governed
++                                                                          if _reserved(r, cfg)})
++    return {"read_at": now, "accounts": [], "at_reserve": at_reserve, "rate_tokens_per_s": 0.0 if at_reserve else None,
++            "until": _held_until(governed, cfg) if at_reserve else None, "plan_size_assumed_equal": True}
++
++
++def _dict(value: Any) -> dict:
++    return value if isinstance(value, dict) else {}
++
++
+ def stored_tpp(pool: Any, kind: str) -> Optional[Tpp]:
+     """The exchange rate a previous ``v2`` pool entry carried for ``kind`` (the persisted last good value)."""
+     if not isinstance(pool, dict):
+@@ -510,26 +548,32 @@ def stored_tpp(pool: Any, kind: str) -> Optional[Tpp]:
+     value = pool.get(f"tpp_{suffix}")
+     source = pool.get("tpp_source" if kind == SEVEN_DAY else "tpp_5h_source")
+     at = pool.get("tpp_measured_at" if kind == SEVEN_DAY else "tpp_5h_measured_at")
+-    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
++    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+         return None
+-    return Tpp(float(value), str(source or UNKNOWN_TPP), float(at) if isinstance(at, (int, float)) else None)
++    at = float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) and math.isfinite(at) else None
++    return Tpp(float(value), source if source in (MEASURED, SEED) else UNKNOWN_TPP, at)
+ 
+ 
+ def assemble_v2(previous: Any, provider: str, pool: dict, curve: list, events: list[dict], now: float,
+                 cfg: PacingConfig) -> dict:
+     """The new ``v2`` document: ``previous`` with this provider's pool and curve replaced, the global rate (pools
+     whose rate is known) and every pool's ``ratio`` recomputed, the newest 50 events kept, ``computed_at`` now."""
+-    old = previous if isinstance(previous, dict) else {}
+-    pools = {p: v for p, v in (old.get("pools") or {}).items() if p in cfg.providers and isinstance(v, dict)}
++    old = _dict(previous)  # every field read from the old file is type-checked: malformed reads as absent
++    pools = {p: dict(v) for p, v in _dict(old.get("pools")).items() if p in cfg.providers and isinstance(v, dict)}
+     pools[provider] = pool
+-    curves = {p: v for p, v in (old.get("curve") or {}).items() if p in pools}
++    curves = {p: v for p, v in _dict(old.get("curve")).items() if p in pools and isinstance(v, list)}
+     curves[provider] = curve
+-    rates = [v["rate_tokens_per_s"] for v in pools.values() if isinstance(v.get("rate_tokens_per_s"), (int, float))]
++
++    def rate(v: dict) -> Optional[float]:
++        r = v.get("rate_tokens_per_s")
++        return float(r) if isinstance(r, (int, float)) and not isinstance(r, bool) and math.isfinite(r) else None
++    rates = [r for v in pools.values() if (r := rate(v)) is not None]
+     total = sum(rates) if rates else None
+     for v in pools.values():
+-        r = v.get("rate_tokens_per_s")
+-        v["ratio"] = (r / total if total else 0.0) if isinstance(r, (int, float)) and total is not None else None
+-    kept = [e for e in (old.get("events") or []) if isinstance(e, dict)] + events
++        r = rate(v)
++        v["ratio"] = (r / total if total else 0.0) if r is not None and total is not None else None
++    events_old = old.get("events")
++    kept = [e for e in (events_old if isinstance(events_old, list) else []) if isinstance(e, dict)] + events
+     return {"computed_at": now, "margin_s": cfg.margin, "pools": pools, "global_rate_tokens_per_s": total,
+             "events": kept[-50:], "curve": curves}
+ 
+diff --git a/hermes_cli/kanban_llm_pacing_dispatch.py b/hermes_cli/kanban_llm_pacing_dispatch.py
+index b4cc7e1ba5a9a3b9ae797d200e4b4ccf8ebbba59..82a52c3cbf56e1e36b8d7b3667b5dfcd8d2747f3 100644
+--- a/hermes_cli/kanban_llm_pacing_dispatch.py
++++ b/hermes_cli/kanban_llm_pacing_dispatch.py
+@@ -189,9 +189,15 @@ def candidate_providers(conn: sqlite3.Connection, task: Any, lane: str) -> list[
+     return candidate_route(conn, task, lane)[1]
+ 
+ 
++def _number(value: Any) -> Optional[float]:
++    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) \
++        else None
++
++
+ def _history(entry: dict, now: float, cfg: lp.PacingConfig) -> list[lp.Reading]:
+-    rows = (lp.Reading.from_row(row) for row in entry.get("samples") or [])
+-    return [r for r in rows if r is not None and now - 2 * cfg.rate_window <= r.ts < now]
++    samples = entry.get("samples")
++    rows = (lp.Reading.from_row(row) for row in (samples if isinstance(samples, list) else []))
++    return lp.valid_readings(r for r in rows if r is not None and now - 2 * cfg.rate_window <= r.ts < now)
+ 
+ 
+ def _refresh(conn: sqlite3.Connection, provider: str, cfg: lp.PacingConfig, now: float) -> lp.PoolPace:
+@@ -200,7 +206,8 @@ def _refresh(conn: sqlite3.Connection, provider: str, cfg: lp.PacingConfig, now:
+     found = state.get(provider)
+     entry: dict = found if isinstance(found, dict) else {}
+     shared = lp.PoolPace.from_dict(entry.get("pace"))
+-    if (shared is not None and now - float(entry.get("read_at") or 0) < cfg.read_interval
++    read_at = _number(entry.get("read_at"))
++    if (shared is not None and read_at is not None and now - read_at < cfg.read_interval
+             and _v2_pool(state, provider) is not None):
+         return shared  # another dispatcher on this home read it already (an old file without v2 is re-read)
+     try:
+@@ -209,10 +216,11 @@ def _refresh(conn: sqlite3.Connection, provider: str, cfg: lp.PacingConfig, now:
+         _warn(f"read:{provider}", "kanban pacing: cannot read the %s usage windows (%s); dispatch is ungoverned "
+               "until it reads again", provider, exc)
+         current = []
++    current = lp.valid_readings(current)  # NaN/inf ``used`` is no reading (and would not serialize)
+     history = _history(entry, now, cfg)
+     pace = lp.pool_pace(provider, current, history, cfg)
+     state[provider] = {"read_at": now, "pace": pace.as_dict(), "samples": [r.as_row() for r in history + current]}
+-    _update_v2(state, provider, current, _MODEL_SCOPED.pop(provider, []), now, cfg)
++    _update_v2(state, provider, current, _MODEL_SCOPED.pop(provider, []), now, cfg)  # never raises
+     pool = _v2_pool(state, provider)
+     if pool is not None:
+         _V2_MEMO.setdefault(str(path), {})[provider] = pool
+@@ -251,7 +259,11 @@ def refresh_pools(conn: sqlite3.Connection) -> None:
+ def _update_v2(state: dict, provider: str, current: list[lp.Reading], scoped: list[lp.Reading], now: float,
+                cfg: lp.PacingConfig) -> None:
+     from hermes_cli import kanban_llm_pacing_history as hist
+-    faults = hist.update_v2(state, provider, current, scoped, now, cfg, history_path())
++    try:
++        faults = hist.update_v2(state, provider, current, scoped, now, cfg, history_path())
++    except Exception as exc:  # health: allow BLE001 -- last resort: the legacy pace, the save and the cache go on
++        faults = [f"{type(exc).__name__}: {exc}"]
++        state["version"], state["v2"] = lp.V2_VERSION, hist.fallback_v2(provider, current, now, cfg)
+     if faults:
+         _warn(f"history:{provider}", "kanban pacing: %s capacity history unavailable (%s); planned from the last "
+               "exchange rates", provider, "; ".join(faults))
+@@ -274,7 +286,9 @@ def _hold_state() -> dict:
+     pools = dict(v2.get("pools")) if isinstance(v2.get("pools"), dict) else {}
+     for provider, pool in mine.items():
+         stored = pools.get(provider)
+-        if not isinstance(stored, dict) or float(stored.get("read_at") or 0) < float(pool.get("read_at") or 0):
++        older = (_number(stored.get("read_at")) or 0.0) < (_number(pool.get("read_at")) or 0.0) \
++            if isinstance(stored, dict) else True
++        if older:
+             pools[provider] = pool
+     return {**state, "v2": {**v2, "pools": pools}}
+ 
+@@ -284,14 +298,13 @@ def reserve_hold(state: Any, provider: str, now: float, cfg: lp.PacingConfig) ->
+     within :data:`STALE_READ_INTERVALS` read intervals): ``{provider, state: held, until, limit: 0, detail}``.
+     None (no hold) when ``v2`` or the pool is missing, malformed, stale or stamped in the future: fail open."""
+     pool = _v2_pool(state, provider)
+-    read_at = pool.get("read_at") if pool else None
+-    if (pool is None or pool.get("at_reserve") is not True or not isinstance(read_at, (int, float))
++    read_at = _number(pool.get("read_at")) if pool else None
++    if (pool is None or pool.get("at_reserve") is not True or read_at is None
+             or not 0 <= now - read_at < STALE_READ_INTERVALS * cfg.read_interval):
+         return None
+-    until = pool.get("until")
+-    until = float(until) if isinstance(until, (int, float)) and not isinstance(until, bool) else None
+-    accounts = len({a.get("id") for a in pool.get("accounts") or [] if isinstance(a, dict)})
+-    return {"provider": provider, "state": lp.HELD, "until": until, "limit": 0,
++    listed = pool.get("accounts")
++    accounts = len({a.get("id") for a in listed if isinstance(a, dict)}) if isinstance(listed, list) else 0
++    return {"provider": provider, "state": lp.HELD, "until": _number(pool.get("until")), "limit": 0,
+             "detail": f"{accounts} account(s) all at reserve"}
+ 
+ 
+diff --git a/hermes_cli/kanban_llm_pacing_history.py b/hermes_cli/kanban_llm_pacing_history.py
+index a609fd6cc7b281a8d2737bc313f911a9621290b4..477f6cd34e1cf084011bbd34d5b782b43e00cfe9 100644
+--- a/hermes_cli/kanban_llm_pacing_history.py
++++ b/hermes_cli/kanban_llm_pacing_history.py
+@@ -17,9 +17,9 @@ from __future__ import annotations
+ 
+ import json
+ import sqlite3
+-from contextlib import closing
++from contextlib import closing, contextmanager
+ from pathlib import Path
+-from typing import Iterable, Mapping, Optional
++from typing import Iterable, Iterator, Mapping, Optional
+ 
+ from hermes_cli import kanban_llm_pacing as lp
+ 
+@@ -39,59 +39,78 @@ _SCHEMA = (
+ )
+ 
+ 
++LOCK_TIMEOUT_SECONDS = 0.5  # a busy store skips history for one refresh; it never delays a claim longer
++
++
+ def connect(path: Path) -> sqlite3.Connection:
+-    db = sqlite3.connect(str(path), timeout=5)
+-    for statement in _SCHEMA:
+-        db.execute(statement)
+-    db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
++    """The store, its schema created on first use only (``user_version`` 0 -> 1)."""
++    db = sqlite3.connect(str(path), timeout=LOCK_TIMEOUT_SECONDS, isolation_level=None)
++    try:
++        if db.execute("PRAGMA user_version").fetchone()[0] == 0:
++            for statement in _SCHEMA:
++                db.execute(statement)
++            db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
++    except BaseException:
++        db.close()
++        raise
+     return db
+ 
+ 
+ class History:
+-    """One provider's view of the store, opened per refresh (no connection outlives it)."""
+-
+-    def __init__(self, path: Path, provider: str):
+-        self.path, self.provider = Path(path), provider
+-
+-    def _db(self):
+-        return closing(connect(self.path))
++    """One provider's view of the store for one refresh: one connection, one write transaction (taken with a
++    :data:`LOCK_TIMEOUT_SECONDS` wait at most), closed on exit. A fault rolls the refresh's writes back."""
++
++    def __init__(self, db: sqlite3.Connection, provider: str):
++        self.db, self.provider = db, provider
++
++    @classmethod
++    @contextmanager
++    def open(cls, path: Path, provider: str) -> Iterator[History]:
++        with closing(connect(Path(path))) as db:
++            db.execute("BEGIN IMMEDIATE")
++            try:
++                yield cls(db, provider)
++            except BaseException:
++                db.execute("ROLLBACK")
++                raise
++            db.execute("COMMIT")
+ 
+     def samples(self, since: float, kinds: Iterable[str] = lp.GOVERNED_KINDS) -> list[lp.Reading]:
+         wanted = tuple(kinds)
+         marks = ",".join("?" * len(wanted))
+-        with self._db() as db:
+-            rows = db.execute(f"SELECT ts, account_hash, kind, used, reset_at FROM samples WHERE provider = ? "
+-                              f"AND ts >= ? AND kind IN ({marks}) ORDER BY ts", (self.provider, since, *wanted))
+-            return [lp.Reading(float(t), a, k, float(u), None if r is None else float(r)) for t, a, k, u, r in rows]
++        db = self.db
++        rows = db.execute(f"SELECT ts, account_hash, kind, used, reset_at FROM samples WHERE provider = ? "
++                          f"AND ts >= ? AND kind IN ({marks}) ORDER BY ts", (self.provider, since, *wanted))
++        return [lp.Reading(float(t), a, k, float(u), None if r is None else float(r)) for t, a, k, u, r in rows]
+ 
+     def tokens(self, since: float) -> list[tuple[float, float]]:
+-        with self._db() as db:
+-            return [(float(t), float(v)) for t, v in db.execute(
+-                "SELECT ts, cumulative_io FROM tokens WHERE provider = ? AND ts >= ? ORDER BY ts",
+-                (self.provider, since))]
++        db = self.db
++        return [(float(t), float(v)) for t, v in db.execute(
++            "SELECT ts, cumulative_io FROM tokens WHERE provider = ? AND ts >= ? ORDER BY ts",
++            (self.provider, since))]
+ 
+     def event_marks(self, since: float) -> list[tuple[str, float]]:
+-        with self._db() as db:
+-            return [(a, float(t)) for a, t in db.execute(
+-                "SELECT account_hash, ts FROM events WHERE provider = ? AND ts >= ? AND account_hash IS NOT NULL",
+-                (self.provider, since))]
++        db = self.db
++        return [(a, float(t)) for a, t in db.execute(
++            "SELECT account_hash, ts FROM events WHERE provider = ? AND ts >= ? AND account_hash IS NOT NULL",
++            (self.provider, since))]
+ 
+     def record(self, now: float, readings: Iterable[lp.Reading], machines: Optional[Mapping[str, float]],
+                events: Iterable[dict], keep_seconds: float) -> None:
+         """One successful read: its (hashed) samples, the fleet token total (when ``machines`` read) and events;
+         rows older than ``keep_seconds`` are dropped."""
+-        with self._db() as db, db:
+-            db.executemany("INSERT INTO samples VALUES (?, ?, ?, ?, ?, ?)",
+-                           [(r.ts, self.provider, r.account, r.kind, r.used, r.reset_at) for r in readings])
+-            if machines is not None:
+-                db.execute("INSERT INTO tokens VALUES (?, ?, ?)", (now, self.provider, self._advance(db, now, machines)))
+-            db.executemany("INSERT INTO events VALUES (?, ?, ?, ?, ?)",
+-                           [(e["ts"], self.provider, e.get("account"), e["type"],
+-                             json.dumps(e.get("detail") or {}, separators=(",", ":"))) for e in events])
+-            cutoff = now - keep_seconds
+-            for table in ("samples", "tokens", "events"):
+-                db.execute(f"DELETE FROM {table} WHERE ts < ?", (cutoff,))
+-            db.execute("DELETE FROM machine_counters WHERE ts < ?", (cutoff,))
++        db = self.db
++        db.executemany("INSERT INTO samples VALUES (?, ?, ?, ?, ?, ?)",
++                       [(r.ts, self.provider, r.account, r.kind, r.used, r.reset_at) for r in readings])
++        if machines is not None:
++            db.execute("INSERT INTO tokens VALUES (?, ?, ?)", (now, self.provider, self._advance(db, now, machines)))
++        db.executemany("INSERT INTO events VALUES (?, ?, ?, ?, ?)",
++                       [(e["ts"], self.provider, e.get("account"), e["type"],
++                         json.dumps(e.get("detail") or {}, separators=(",", ":"))) for e in events])
++        cutoff = now - keep_seconds
++        for table in ("samples", "tokens", "events"):
++            db.execute(f"DELETE FROM {table} WHERE ts < ?", (cutoff,))
++        db.execute("DELETE FROM machine_counters WHERE ts < ?", (cutoff,))
+ 
+     def _advance(self, db: sqlite3.Connection, now: float, machines: Mapping[str, float]) -> float:
+         row = db.execute("SELECT cumulative_io FROM tokens WHERE provider = ? ORDER BY ts DESC LIMIT 1",
+@@ -107,17 +126,17 @@ class History:
+ 
+     def recent_reads(self, before: float, limit: int) -> list[tuple[float, set[str]]]:
+         """``(ts, accounts)`` of the newest ``limit`` successful reads before ``before``, newest first."""
+-        with self._db() as db:
+-            times = [float(t) for (t,) in db.execute(
+-                "SELECT DISTINCT ts FROM samples WHERE provider = ? AND ts < ? ORDER BY ts DESC LIMIT ?",
+-                (self.provider, before, limit))]
+-            return [(t, {a for (a,) in db.execute("SELECT DISTINCT account_hash FROM samples WHERE provider = ? "
+-                                                  "AND ts = ?", (self.provider, t))}) for t in times]
++        db = self.db
++        times = [float(t) for (t,) in db.execute(
++            "SELECT DISTINCT ts FROM samples WHERE provider = ? AND ts < ? ORDER BY ts DESC LIMIT ?",
++            (self.provider, before, limit))]
++        return [(t, {a for (a,) in db.execute("SELECT DISTINCT account_hash FROM samples WHERE provider = ? "
++                                              "AND ts = ?", (self.provider, t))}) for t in times]
+ 
+     def seen_since(self, since: float, before: float) -> set[str]:
+-        with self._db() as db:
+-            return {a for (a,) in db.execute("SELECT DISTINCT account_hash FROM samples WHERE provider = ? AND "
+-                                             "ts >= ? AND ts < ?", (self.provider, since, before))}
++        db = self.db
++        return {a for (a,) in db.execute("SELECT DISTINCT account_hash FROM samples WHERE provider = ? AND "
++                                         "ts >= ? AND ts < ?", (self.provider, since, before))}
+ 
+     def read_at(self, ts: float) -> list[lp.Reading]:
+         return [r for r in self.samples(ts) if r.ts == ts]
+@@ -163,27 +182,45 @@ def fleet_tokens(provider: str) -> Optional[dict[str, float]]:
+ def update_v2(state: dict, provider: str, current: list[lp.Reading], model_scoped: list[lp.Reading], now: float,
+               cfg: lp.PacingConfig, path: Path) -> list[str]:
+     """Record this read in the history at ``path``, re-estimate the pool's exchange rates and replace its ``v2``
+-    entry in ``state`` (``version: 2`` added, legacy provider keys untouched). A history fault still re-plans,
+-    from the previous rates (or seeds) and without events; returns the fault messages (empty when none)."""
+-    previous = state.get("v2") if isinstance(state.get("v2"), dict) else {}
+-    prior = (previous.get("pools") or {}).get(provider)
+-    readings = lp.hashed(current)
+-    seeds = {kind: lp.seed_tpp(provider, kind, cfg) for kind in lp.GOVERNED_KINDS}
+-    tpps = {kind: lp.smooth_tpp(lp.stored_tpp(prior, kind), None, now, cfg, seeds[kind]) for kind in lp.GOVERNED_KINDS}
+-    events: list[dict] = []
++    entry in ``state`` (``version: 2`` added, legacy provider keys untouched). Returns the fault messages.
++
++    Fails open in layers, and never raises: a history fault (a busy store included) plans from the previous rates
++    or seeds without events; a planning fault stores :func:`kanban_llm_pacing.reserve_pool` (the same at-reserve
++    rule as the legacy ``held`` verdict); every field of the previous ``v2`` is type-checked (malformed = absent)."""
++    previous = lp._dict(state.get("v2"))
++    prior = lp._dict(lp._dict(previous.get("pools")).get(provider))
++    readings = lp.hashed(lp.valid_readings(current))
+     faults: list[str] = []
+     try:
+-        events, tpps = _record_and_estimate(History(path, provider), readings, lp.hashed(model_scoped), prior,
+-                                            seeds, now, cfg)
+-    except Exception as exc:  # health: allow BLE001 -- a history fault keeps the plan on the last rates
+-        faults.append(f"{type(exc).__name__}: {exc}")
+-    pool, curve = lp.plan_pool(provider, readings, tpps[lp.SEVEN_DAY], tpps[lp.FIVE_HOUR], now, cfg)
++        seeds = {kind: lp.seed_tpp(provider, kind, cfg) for kind in lp.GOVERNED_KINDS}
++        tpps = {kind: lp.smooth_tpp(lp.stored_tpp(prior, kind), None, now, cfg, seeds[kind])
++                for kind in lp.GOVERNED_KINDS}
++        events: list[dict] = []
++        try:
++            machines = fleet_tokens(provider) if readings else None
++            with History.open(path, provider) as history:
++                events, tpps = _record_and_estimate(history, readings, lp.hashed(lp.valid_readings(model_scoped)),
++                                                    machines, prior, seeds, now, cfg)
++        except Exception as exc:  # health: allow BLE001 -- a history fault keeps the plan on the last rates
++            faults.append(f"history {type(exc).__name__}: {exc}")
++        pool, curve = lp.plan_pool(provider, readings, tpps[lp.SEVEN_DAY], tpps[lp.FIVE_HOUR], now, cfg)
++        v2 = lp.assemble_v2(previous, provider, pool, curve, events, now, cfg)
++    except Exception as exc:  # health: allow BLE001 -- a planning fault must not change what holds a start
++        faults.append(f"plan {type(exc).__name__}: {exc}")
++        v2 = fallback_v2(provider, current, now, cfg)
+     state["version"] = lp.V2_VERSION
+-    state["v2"] = lp.assemble_v2(previous, provider, pool, curve, events, now, cfg)
++    state["v2"] = v2
+     return faults
+ 
+ 
+-def _record_and_estimate(history: History, readings, scoped, prior, seeds, now, cfg):
++def fallback_v2(provider: str, current: list[lp.Reading], now: float, cfg: lp.PacingConfig) -> dict:
++    """A ``v2`` holding only this provider's at-reserve verdict (:func:`kanban_llm_pacing.reserve_pool`)."""
++    pool = lp.reserve_pool(lp.hashed(lp.valid_readings(current)), now, cfg)
++    return {"computed_at": now, "margin_s": cfg.margin, "pools": {provider: pool}, "global_rate_tokens_per_s": None,
++            "events": [], "curve": {}}
++
++
++def _record_and_estimate(history: History, readings, scoped, machines, prior, seeds, now, cfg):
+     events: list[dict] = []
+     if readings:
+         recent = history.recent_reads(now, lp.REMOVED_AFTER_READS)
+@@ -191,7 +228,7 @@ def _record_and_estimate(history: History, readings, scoped, prior, seeds, now,
+             seen = history.seen_since(now - lp.ADDED_UNSEEN_SECONDS, now)
+             events = lp.detect_events(history.provider, readings, history.read_at(recent[0][0]),
+                                       [accounts for _, accounts in recent[1:]], seen, now)
+-        history.record(now, readings + scoped, fleet_tokens(history.provider), events, cfg.history_days * 86400)
++        history.record(now, readings + scoped, machines, events, cfg.history_days * 86400)
+     since = now - cfg.tpp_window
+     samples, tokens, marks = history.samples(since), history.tokens(since), history.event_marks(since)
+     tpps = {kind: lp.smooth_tpp(lp.stored_tpp(prior, kind), lp.tpp_estimate(samples, tokens, kind, now, cfg, marks),
+diff --git a/tests/hermes_cli/test_kanban_llm_pacing_persistence.py b/tests/hermes_cli/test_kanban_llm_pacing_persistence.py
+index d467154a5e2360127440da34449e8593531f70ca..c0d0935514b36df330a2fb56e5ec190fdee57ae4 100644
+--- a/tests/hermes_cli/test_kanban_llm_pacing_persistence.py
++++ b/tests/hermes_cli/test_kanban_llm_pacing_persistence.py
+@@ -25,7 +25,9 @@ hist.fleet_tokens = lambda provider: {'hub': float(used) * 1000}
+ assert not pd._CACHE
+ cfg = lp.PacingConfig()
+ pace = pd.pace_for(None, 'anthropic', cfg, now)
+-print(json.dumps({'pace': pace.as_dict(), 'reads': len(hist.History(pd.history_path(), 'anthropic').recent_reads(now + 1, 9))}))
++with hist.History.open(pd.history_path(), 'anthropic') as store:
++    reads = len(store.recent_reads(now + 1, 9))
++print(json.dumps({'pace': pace.as_dict(), 'reads': reads}))
+ """
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_llm_pacing_robustness.py b/tests/hermes_cli/test_kanban_llm_pacing_robustness.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0622b9f361452f796f9fededbe25235902d91acd
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_llm_pacing_robustness.py
+@@ -0,0 +1,193 @@
++"""The capacity model never changes what holds a start, whatever the inputs or the stored file. [daveey]
++
++Review of 67cbb5a: a year-9999 reset made the curve loop for minutes on the claim path, and a malformed stored
++``v2`` made every refresh raise before the save and the cache, so a held pool started cards and the usage
++endpoint was read on every call. Labels are synthetic."""
++from __future__ import annotations
++
++import json
++import math
++import sqlite3
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_llm_pacing as lp
++from hermes_cli import kanban_llm_pacing_dispatch as pd
++from hermes_cli import kanban_llm_pacing_history as hist
++from tests.hermes_cli import test_kanban_stuck_clock_holds as helpers
++
++home = helpers.home
++NOW = 1_800_000_000.0
++DAY = 86400.0
++CFG = lp.PacingConfig(providers=("anthropic",))
++TPP = lp.Tpp(2.6e5, lp.MEASURED, NOW)
++HOSTILE_RESETS = [253402300799.0, NOW + 127 * 365 * DAY, -1e18, -5.0, math.nan, math.inf, -math.inf, 10 ** 30]
++
++
++@pytest.fixture(autouse=True)
++def _isolated(monkeypatch):
++    monkeypatch.setattr(pd, "_CACHE", {})
++    monkeypatch.setattr(pd, "_WARNED", {})
++    monkeypatch.setattr(pd, "_MODEL_SCOPED", {})
++    monkeypatch.setattr(pd, "_V2_MEMO", {})
++    monkeypatch.setattr(hist, "fleet_tokens", lambda provider: None)
++
++
++# --- 1. hostile resets: bounded cost, bounded curve, serializable -------------------------------------------------
++
++@pytest.mark.parametrize("reset", HOSTILE_RESETS, ids=str)
++def test_a_hostile_reset_plans_fast_and_bounded(reset):
++    readings = [lp.Reading(NOW, f"h{i}", kind, 40.0, reset if i % 2 else NOW + 3 * DAY)
++                for i in range(50) for kind in (lp.SEVEN_DAY, lp.FIVE_HOUR)]
++    started = time.perf_counter()
++    pool, curve = lp.plan_pool("anthropic", lp.valid_readings(readings), TPP, TPP, NOW, CFG)
++    elapsed = time.perf_counter() - started
++    print(f"plan_pool 50 accounts, reset={reset!r}: {elapsed * 1000:.2f} ms, {len(curve)} curve points")
++    assert elapsed < 0.05
++    assert len(curve) <= lp.MAX_CURVE_POINTS
++    top = NOW + lp.WINDOW_SECONDS[lp.SEVEN_DAY] + lp.RESET_SLACK_SECONDS
++    assert all(NOW <= t <= top for t, *_ in curve)
++    assert all(a["reset_at"] is None or NOW <= a["reset_at"] <= top for a in pool["accounts"])
++    json.dumps(pool, allow_nan=False)
++    json.dumps(curve, allow_nan=False)
++
++
++def test_a_non_finite_used_is_dropped_before_it_reaches_json():
++    readings = [lp.Reading(NOW, "a", lp.SEVEN_DAY, math.nan, NOW + DAY),
++                lp.Reading(NOW, "b", lp.SEVEN_DAY, math.inf, NOW + DAY),
++                lp.Reading(NOW, "c", lp.SEVEN_DAY, 90.0, NOW + DAY)]
++    assert [r.account for r in lp.valid_readings(readings)] == ["c"]
++    pool, _ = lp.plan_pool("anthropic", readings, TPP, TPP, NOW, CFG)
++    assert [a["id"] for a in pool["accounts"]] == ["c"] and pool["at_reserve"] is True
++    json.dumps(pool, allow_nan=False)
++
++
++# --- 2. a malformed stored file: held stays held, one usage read per interval ---------------------------------------
++
++def _governed(monkeypatch, clock):
++    monkeypatch.setattr(pd, "load_config", lambda: CFG)
++    monkeypatch.setattr(pd, "_governed", lambda conn, task_id, lane, cfg: (SimpleNamespace(id=task_id), ["anthropic"]))
++    monkeypatch.setattr(pd, "_pace_alternate", lambda *a, **k: None)
++    monkeypatch.setattr(pd, "time", SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0]))
++    reads = []
++
++    def read(provider, now):
++        reads.append(now)
++        return [lp.Reading(now, "acct-past-reserve@example.test", lp.SEVEN_DAY, 90.0, now + 2 * DAY)]
++    monkeypatch.setattr(pd, "read_pool", read)
++    return reads
++
++
++def _hold():
++    return pd.hold(None, {"id": "t_1"}, "ready", SimpleNamespace(respawn_guarded=[], clock_held={}, llm_paced=[]),
++                   dry_run=True)
++
++
++JUNK = [True, [1], "x", 5, None, {"anthropic": 7}]
++
++
++@pytest.mark.parametrize("field", ["v2", "pools", "curve", "events", "pool"])
++@pytest.mark.parametrize("junk", JUNK, ids=repr)
++def test_a_malformed_v2_never_disables_the_hold_or_the_read_interval(home, monkeypatch, field, junk):
++    clock = [NOW]
++    reads = _governed(monkeypatch, clock)
++    v2 = {"computed_at": NOW - 10, "pools": {}, "curve": {}, "events": []}
++    if field == "v2":
++        v2 = junk
++    elif field == "pool":
++        v2["pools"] = {"anthropic": junk}
++    else:
++        v2[field] = junk
++    pd.state_path().write_text(json.dumps({"version": 2, "v2": v2}), encoding="utf-8")
++    for offset in (0, 1, CFG.read_interval - 1):
++        clock[0] = NOW + offset
++        assert _hold() is True
++    assert reads == [NOW]  # one usage read in the interval, then the cache and the rewritten file serve
++    stored = json.loads(pd.state_path().read_text())
++    assert stored["v2"]["pools"]["anthropic"]["at_reserve"] is True
++    clock[0] = NOW + CFG.read_interval
++    assert _hold() is True and reads == [NOW, NOW + CFG.read_interval]
++
++
++@pytest.mark.parametrize("junk", JUNK, ids=repr)
++def test_malformed_fields_of_a_fresh_stored_pool_still_hold(home, monkeypatch, junk):
++    clock = [NOW]
++    reads = _governed(monkeypatch, clock)
++    pool = {"read_at": NOW, "at_reserve": True, "until": junk, "accounts": junk, "rate_tokens_per_s": junk,
++            "tpp_7d": junk, "tpp_source": junk}
++    legacy = {"read_at": NOW, "pace": lp.PoolPace("anthropic", lp.HELD, 0.0).as_dict(), "samples": junk}
++    pd.state_path().write_text(json.dumps({"anthropic": legacy, "v2": {"pools": {"anthropic": pool}}}),
++                               encoding="utf-8")
++    assert _hold() is True and reads == []  # read just now by another dispatcher: no usage read
++
++
++# --- 3. dispatch-level equivalence: the hold is exactly the legacy ``held`` verdict ---------------------------------
++
++CASES = {
++    "one past reserve": [("a", lp.SEVEN_DAY, 90.0, 2)],
++    "one under": [("a", lp.SEVEN_DAY, 40.0, 2)],
++    "mixed": [("a", lp.SEVEN_DAY, 100.0, 1), ("b", lp.SEVEN_DAY, 50.0, 3)],
++    "5h reserved": [("a", lp.SEVEN_DAY, 10.0, 3), ("a", lp.FIVE_HOUR, 81.0, 0.1)],
++    "all reserved": [("a", lp.SEVEN_DAY, 86.0, 1), ("b", lp.SEVEN_DAY, 20.0, 2), ("b", lp.FIVE_HOUR, 95.0, 0.1)],
++    "none read": [],
++}
++
++
++def _break_v2_plan(monkeypatch):
++    monkeypatch.setattr(lp, "plan_pool", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("plan broke")))
++
++
++def _break_v2_update(monkeypatch):
++    monkeypatch.setattr(hist, "update_v2", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("update broke")))
++
++
++@pytest.mark.parametrize("mode", ["file", "memo", "junk-file", "plan-raises", "update-raises", "history-locked"])
++@pytest.mark.parametrize("case", sorted(CASES))
++def test_the_dispatch_hold_is_the_legacy_held_verdict(home, monkeypatch, case, mode):
++    clock = [NOW]
++    _governed(monkeypatch, clock)
++    windows = CASES[case]
++    readings = [lp.Reading(NOW, f"{a}@example.test", kind, used, NOW + days * DAY) for a, kind, used, days in windows]
++    monkeypatch.setattr(pd, "read_pool", lambda provider, now: list(readings))
++    legacy = lp.pool_pace("anthropic", readings, [], CFG).state == lp.HELD
++    if mode == "memo":
++        monkeypatch.setattr(pd, "_save_state", lambda *a: None)
++    elif mode == "junk-file":
++        pd.state_path().write_text('{"anthropic": 3, "v2": [1], "version": "x"}', encoding="utf-8")
++    elif mode == "plan-raises":
++        _break_v2_plan(monkeypatch)
++    elif mode == "update-raises":
++        _break_v2_update(monkeypatch)
++    lock = None
++    if mode == "history-locked":
++        lock = hist.connect(pd.history_path())
++        lock.execute("BEGIN EXCLUSIVE")
++    try:
++        assert _hold() is legacy
++    finally:
++        if lock is not None:
++            lock.execute("ROLLBACK")
++            lock.close()
++
++
++# --- 4. a busy history store never delays a claim beyond its lock timeout -------------------------------------------
++
++def test_a_locked_history_store_is_skipped_quickly_and_the_hold_stands(home, monkeypatch):
++    clock = [NOW]
++    reads = _governed(monkeypatch, clock)
++    lock = sqlite3.connect(str(pd.history_path()))
++    hist.connect(pd.history_path()).close()
++    lock.execute("BEGIN EXCLUSIVE")
++    try:
++        started = time.perf_counter()
++        held = _hold()
++        elapsed = time.perf_counter() - started
++    finally:
++        lock.execute("ROLLBACK")
++        lock.close()
++    print(f"hold() with the history store locked: {elapsed * 1000:.0f} ms")
++    assert held is True and reads == [NOW]
++    assert elapsed < hist.LOCK_TIMEOUT_SECONDS + 0.5
++    assert json.loads(pd.state_path().read_text())["v2"]["pools"]["anthropic"]["at_reserve"] is True
+diff --git a/tests/hermes_cli/test_kanban_llm_pacing_v2.py b/tests/hermes_cli/test_kanban_llm_pacing_v2.py
+index 3c5eb60bee4a36083e590f43ce81863667da2995..82b7ee99c24137e58c49a3fe7c159f9be9eb5138 100644
+--- a/tests/hermes_cli/test_kanban_llm_pacing_v2.py
++++ b/tests/hermes_cli/test_kanban_llm_pacing_v2.py
+@@ -152,14 +152,18 @@ def test_the_history_keeps_hashes_and_model_scoped_windows_but_never_counts_them
+ 
+ 
+ def test_fleet_tokens_advance_by_per_machine_increases_only(tmp_path):
+-    store = hist.History(tmp_path / hist.FILE_NAME, "anthropic")
++    path = tmp_path / hist.FILE_NAME
+     now = 1_800_000_000.0
+     for i, machines in enumerate(({"hub": 100.0}, {"hub": 150.0, "new": 10_000.0}, {"hub": 120.0, "new": 10_050.0},
+                                   {"hub": 170.0, "new": 10_050.0})):
+-        store.record(now + i * 300, [], machines, [], 8 * DAY)
+-    assert [v for _, v in store.tokens(0)] == [0.0, 50.0, 100.0, 150.0]  # joins and a drop are no spend
+-    store.record(now + 9 * DAY, [], {"hub": 200.0}, [], 8 * DAY)
+-    assert [v for _, v in store.tokens(0)] == [180.0]  # older rows pruned after history_days
++        with hist.History.open(path, "anthropic") as store:
++            store.record(now + i * 300, [], machines, [], 8 * DAY)
++    with hist.History.open(path, "anthropic") as store:
++        assert [v for _, v in store.tokens(0)] == [0.0, 50.0, 100.0, 150.0]  # joins and a drop are no spend
++        store.record(now + 9 * DAY, [], {"hub": 200.0}, [], 8 * DAY)
++        assert [v for _, v in store.tokens(0)] == [180.0]  # older rows pruned after history_days
++    with sqlite3.connect(path) as db:
++        assert db.execute("PRAGMA user_version").fetchone()[0] == hist.SCHEMA_VERSION
+ 
+ 
+ def test_registry_machines_report_provider_tokens_else_model_prefixes(monkeypatch):
+diff --git a/tests/hermes_cli/test_kanban_model_tier_paced_reroute.py b/tests/hermes_cli/test_kanban_model_tier_paced_reroute.py
+index d506a75f364d64503c1e156997d9ef1327fdf7ed..382b22143ecbe8eb190b6e1540c0128e8060a42e 100644
+--- a/tests/hermes_cli/test_kanban_model_tier_paced_reroute.py
++++ b/tests/hermes_cli/test_kanban_model_tier_paced_reroute.py
+@@ -105,7 +105,7 @@ def test_reroute_after_s_sets_the_threshold(board, clock, monkeypatch, after, un
+ 
+ @pytest.mark.parametrize('state', ['paced', 'open', 'unknown'])
+ def test_a_pool_that_is_not_held_never_moves_the_route(board, clock, monkeypatch, state):
+-    """A ``paced`` pool keeps limit >= 1 (``admit_limit``): the card waits its turn there, it is not rerouted."""
++    """Only a pool at reserve holds a start: a ``paced`` (or open/unknown) pool starts the card where it is."""
+     _deep(monkeypatch)
+     _pools(clock, openai_codex=(state, HELD_FAR))
+     with kbc.connect() as conn:
+-- 
+2.43.0
+

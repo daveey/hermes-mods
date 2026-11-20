@@ -1,0 +1,1048 @@
+From 5f23461b2b8eac171f0ba3b9033df10e759b725d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 02:29:09 +0000
+Subject: [PATCH] [daveey] kanban sync: back off failed rounds; one host card
+ for a host-wide Board outage
+
+Incident 2026-11-15 13:25-13:50 PST on laptop-1 (t_example): DNS resolution of the Board failed
+(URLError [Errno 8] nodename nor servname provided) on every synced board.
+
+Retry storm: wait_for_work ends its 0.5 s tick whenever a synced outbox has a pending row, push() keeps rows
+pending on a transport failure (correct), and SyncWork.select picked any board with pending rows even if its
+last round failed, so the loop retried every board about every 0.6 s. The feed socket's 1->60 s backoff never
+covered rounds. Now SyncWork backs a failed board off 1 s doubling to 60 s across every leg (pending outbox,
+dirty flag, poll, full recovery, deferred repairs, backlog); its pending outbox no longer ends the wait; a
+success or its feed socket reconnecting clears the backoff. Pending writes stay queued; healthy boards are
+unaffected.
+
+Alert fanout: kanban_sync_replica_age judged each board alone, so one cause filed ten cards. Round failures
+are now classified from the exception object (socket.gaierror -> dns; refused/reset/unreachable/timeout ->
+network; anything else unclassified). Boards that come due in one check with a classified cause from a recent
+round share one host card listing every board and its frozen cards; later boards are added by comment; the
+incident (persisted per boot) ends when all members recover and recurrence opens a fresh one. Unclassified
+causes and boards with no recent round keep their own per-board card on the same 20-awake-min bound.
+Archived boards (board.json archived: true) are no longer judged.
+
+Does not diagnose or change the host's DNS configuration.
+
+Tests: tests/hermes_cli/test_kanban_sync_host_outage.py (21) drive sync_all_once/run_forever against an
+in-memory Board with injected DNS/503 transport failures and the real Hub with getaddrinfo failing; 12 fail
+on origin/main (ten cards, 200 retries per 100 s). Adjacent kanban sync suite: 1625 passed.
+---
+ hermes_cli/kanban_sync_client.py              |  17 +-
+ hermes_cli/kanban_sync_host_outage.py         |  78 +++
+ hermes_cli/kanban_sync_outbox_age.py          |  12 +-
+ hermes_cli/kanban_sync_replica_age.py         | 112 +++-
+ hermes_cli/kanban_sync_work.py                |  49 +-
+ .../test_kanban_sync_host_outage.py           | 509 ++++++++++++++++++
+ .../test_kanban_sync_push_starvation.py       |   2 +-
+ 7 files changed, 752 insertions(+), 27 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_host_outage.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_host_outage.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 32b40f856b74e7e8b5e15411326a1fd67b9b1df4..5bb49b4110e46a3562cc9182a905d2d62134dde1 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -948,6 +948,7 @@ class RoundResult:
+     repair_deferred: bool = False  # a replica-only change waits for the repair window (see ``decide``)
+     behind: bool = False  # a pull stopped at its page budget: the loop runs this board again at once
+     skipped: bool = False  # SyncRoundBusy: another holder (a dispatcher tick) had the board; retried shortly
++    cause: Optional[str] = None  # a failure's host-to-Board transport class (kanban_sync_host_outage.classify)
+ 
+ 
+ def open_shadow(slug: str, gateway: str) -> sqlite3.Connection:
+@@ -1156,7 +1157,8 @@ def sync_all_once(hub: Optional[Hub] = None, *,
+             results.append(RoundResult(board=slug, mode="?", error=f"SyncRoundBusy: {exc}", skipped=True))
+         except (HubError, OSError, Resync, sqlite3.Error, SyncUnavailable) as exc:
+             _log.warning("kanban sync: round for %s failed (%s: %s)", slug, type(exc).__name__, exc)
+-            results.append(RoundResult(board=slug, mode="?", error=f"{type(exc).__name__}: {exc}"))
++            from hermes_cli.kanban_sync_host_outage import classify  # one host card, not one per board [daveey]
++            results.append(RoundResult(board=slug, mode="?", error=f"{type(exc).__name__}: {exc}", cause=classify(exc)))
+         finally:
+             sync_timing.board_end(mark, results)
+     return results
+@@ -1503,6 +1505,8 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+             selected = sync_timing.select(work.select, boards, time.monotonic(), outbox_pending)
+             selected += [b for b in deferred_repairs_due(boards, _repair_clock()) if b not in selected]
+             selected += [b for b in backlog.due(boards) if b not in selected]  # a pull backlog drains round by round
++            picked = time.monotonic()  # a board backing off a failed round waits for it, whatever else is due
++            selected = [b for b in selected if not work.backing_off(b[0], picked)]
+             outbox_age.round_started()
+             results = sync_all_once(hub, boards=selected)
+             ahead = [r for r in results if (r.error or "").startswith("SchemaAhead")]
+@@ -1511,11 +1515,12 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+                 on_give_up(runstate, ident.gateway, "gave up the sync role: ", [(r.board, r.error) for r in ahead])
+                 return
+             runstate.clear()  # a completed round: the loop runs
++            ended = time.monotonic()
+             for r in results:
+                 if r.skipped:
+                     work.changed(r.board)  # run it again after BUSY_RETRY_S, as a changed board
+                     continue
+-                work.finished(r.board, not r.error)
++                work.finished(r.board, not r.error, ended)  # a failure backs the board off (kanban_sync_work)
+                 if r.push and (r.push.sent or r.push.rejected):
+                     _log.info("kanban sync: %s %s pulled=%d pushed=%d rejected=%d", r.board, r.mode, r.pulled,
+                               r.push.sent, r.push.rejected)
+@@ -1532,7 +1537,13 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+             deferred_due = next_deferred_repair(boards)
+             if deferred_due is not None:
+                 remaining = min(remaining, max(0.0, deferred_due - _repair_clock()))
+-            sync_timing.wait(wait_for_work, wake, [p for _s, p in boards], remaining, keep_running)
++            # A failed board's pending outbox must not end the wait at once: it waits out its backoff.
++            now = time.monotonic()
++            retry_in = work.next_retry(now)
++            if retry_in is not None:
++                remaining = min(remaining, retry_in)
++            ready = [p for s, p in boards if not work.backing_off(s, now)]
++            sync_timing.wait(wait_for_work, wake, ready, remaining, keep_running)
+     finally:
+         rounds.close()
+         links.stop()
+diff --git a/hermes_cli/kanban_sync_host_outage.py b/hermes_cli/kanban_sync_host_outage.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..79a075c7d2ae2725965cd7e1af676f14d4f72f98
+--- /dev/null
++++ b/hermes_cli/kanban_sync_host_outage.py
+@@ -0,0 +1,78 @@
++"""One card per host when this host cannot reach the Board, instead of one per board. [daveey]
++
++Incident (2026-11-15, laptop-1, t_d3f56f1f216a033d): DNS resolution of the Board failed from 13:25 to 13:50 PST
++(``URLError: [Errno 8] nodename nor servname provided``) on every synced board at once, and the replica-freshness
++alarm (``kanban_sync_replica_age``) opened ten board-specific stale-replica cards for that one cause. Every board
++syncs against the same Board URL with the same identity, so a failed name lookup or connection is a fact about this
++host's path to the Board, not about any board.
++
++:func:`classify` names that class from the round's exception object (never its text): ``dns`` for a failed name
++lookup (``socket.gaierror``), ``network`` for a refused/reset/aborted connection, a timeout or an unreachable
++network or host. Anything else (an HTTP status, SQLite, a resync, a missing round) stays unclassified and keeps its
++own per-board card. The replica check gathers every board that comes due with a classified cause from a recent
++round into one host incident (:func:`report`): one card listing each affected board with its detail and the cards
++frozen behind it; a board that joins later is named in an unthrottled comment. The incident ends when none of its
++boards' replica incidents is open; the next one is fresh (a new card once the old one is done, else a "new
++incident" comment). This alarm does not diagnose why the resolver or network failed.
++"""
++from __future__ import annotations
++
++import errno
++import logging
++import socket
++import urllib.error
++from typing import Optional
++
++log = logging.getLogger(__name__)
++
++SLUG = "_host-network"  # the host card's idempotency suffix: never a board id (BOARD_ID_RE starts alphanumeric)
++_NET_ERRNOS = frozenset(getattr(errno, n) for n in (
++    "ENETUNREACH", "EHOSTUNREACH", "ENETDOWN", "EHOSTDOWN", "ECONNREFUSED", "ECONNRESET", "ECONNABORTED",
++    "ETIMEDOUT", "ENETRESET") if hasattr(errno, n))
++
++
++def classify(exc: Optional[BaseException]) -> Optional[str]:
++    """``dns``, ``network`` or None (not a host-to-Board transport failure), walking ``URLError.reason`` and the
++    exception chain."""
++    seen: set[int] = set()
++    cur = exc
++    while cur is not None and id(cur) not in seen:
++        seen.add(id(cur))
++        if isinstance(cur, socket.gaierror):
++            return "dns"
++        if isinstance(cur, (ConnectionError, TimeoutError, socket.timeout)):
++            return "network"
++        if isinstance(cur, OSError) and not isinstance(cur, urllib.error.URLError) and cur.errno in _NET_ERRNOS:
++            return "network"
++        reason = getattr(cur, "reason", None) if isinstance(cur, urllib.error.URLError) else None
++        cur = reason if isinstance(reason, BaseException) else (cur.__cause__ or cur.__context__)
++    return None
++
++
++def report(entries: list[tuple[str, str, str]], *, fresh: bool, cause: str) -> Optional[str]:
++    """Open the host incident's card, or comment the open one. ``entries``: ``(board, detail, frozen text)`` for
++    the boards new to the incident; ``fresh``: they start a new incident. Best effort: never raises."""
++    from hermes_cli import kanban_sync_outbox_age as outbox_age
++    from hermes_cli import kanban_sync_replica_age as replica_age
++    host = socket.gethostname()
++    boards = ", ".join(f"`{b}`" for b, _d, _f in entries)
++    detail = f"host {host}: cannot reach the Board ({cause}); replica stale on {boards}"
++    sections = "\n\n".join(f"### `{b}`\n{d}\n\n{f}" for b, d, f in entries)
++    body = (
++        f"This host could not reach the Board ({cause} failure on the sync rounds), so {len(entries)} synced "
++        "board replica(s) have not reached the feed head for over 20 awake minutes. One shared cause, one card: "
++        "every affected board and the cards frozen behind it are listed here (and in later comments), instead of "
++        "one card per board. Remote parents, missing-parent checks and ready notices read an old copy meanwhile "
++        "(they wait; nothing promotes on stale data). Pending local edits stay in each outbox and are sent once "
++        "the Board is reachable; the sync loop backs failed rounds off up to 60 s.\n\n"
++        f"{sections}\n\n"
++        "This alarm classifies the failure from the round's exception only; it does not know why name resolution "
++        "or the network failed. Check: `hermes kanban sync status`, agent.log `kanban sync: round for` lines, and "
++        "the host's resolver/network state. Done when every listed replica reaches the head again and the cause "
++        "is understood (precedent: t_d3f56f1f216a033d)."
++    )
++    comment = (("New incident: " if fresh else "Also affected: ") + detail + "\n\n" + sections)
++    return outbox_age.report(SLUG, detail, key=replica_age.KEY, author=replica_age.AUTHOR, body=body,
++                             what="Board unreachable", comment=comment,
++                             title=f"Kanban sync: {host} cannot reach the Board ({cause}); "
++                                   f"{len(entries)} board replica(s) stale 20+ awake min")
+diff --git a/hermes_cli/kanban_sync_outbox_age.py b/hermes_cli/kanban_sync_outbox_age.py
+index d7cacfe0f7e137b3325ee12399714bf031de0c1a..12bcebefad48af8cc73b4a166aef2bc96186ae0a 100644
+--- a/hermes_cli/kanban_sync_outbox_age.py
++++ b/hermes_cli/kanban_sync_outbox_age.py
+@@ -231,22 +231,23 @@ def _check_outbox(boards: list[tuple[str, Path]], mono, file_fn, age, awake=True
+ 
+ 
+ def report(slug: str, detail: str, *, key: str = KEY, author: str = AUTHOR, title: Optional[str] = None,
+-           body: Optional[str] = None, what: str = "outbox stalled") -> Optional[str]:
++           body: Optional[str] = None, what: str = "outbox stalled", comment: Optional[str] = None) -> Optional[str]:
+     """Open or comment the stalled-outbox card on the default board (or, with ``key``/``author``/``title``/
+-    ``body``, another alarm's card on the same one-card-per-incident path). Best effort: never raises."""
++    ``body``, another alarm's card on the same one-card-per-incident path). ``comment``: posted verbatim on an open
++    card and never throttled (news the card must carry, e.g. a board joining a host incident). Never raises."""
+     try:
+         from hermes_cli import kanban_db as kb
+         from hermes_cli import kanban_db_connect as kbc
+         log.warning("kanban sync: %s: %s", what, detail)
+         with kbc.connect_closing(kb.kanban_home() / "kanban.db") as conn:
+-            return _report(conn, slug, detail, key=key, author=author, title=title, body=body)
++            return _report(conn, slug, detail, key=key, author=author, title=title, body=body, comment=comment)
+     except Exception:  # health: allow BLE001 -- runs on the dispatcher tick
+         log.warning("kanban: could not file the %s card (%s)", what, detail, exc_info=True)
+         return None
+ 
+ 
+ def _report(conn: sqlite3.Connection, slug: str, detail: str, *, key: str = KEY, author: str = AUTHOR,
+-            title: Optional[str] = None, body: Optional[str] = None) -> str:
++            title: Optional[str] = None, body: Optional[str] = None, comment: Optional[str] = None) -> str:
+     from hermes_cli import kanban_db as kb
+     key = f"{key}:{slug}"
+     row = conn.execute(
+@@ -254,6 +255,9 @@ def _report(conn: sqlite3.Connection, slug: str, detail: str, *, key: str = KEY,
+         "ORDER BY status IN ('done', 'failed', 'cancelled'), created_at DESC, rowid DESC LIMIT 1", (key,),
+     ).fetchone()
+     if row and row[1] not in ("done", "failed", "cancelled"):
++        if comment is not None:
++            kb.add_comment(conn, row[0], author, comment)
++            return row[0]
+         recent = conn.execute("SELECT 1 FROM task_comments WHERE task_id = ? AND author = ? AND created_at >= ? LIMIT 1",
+                               (row[0], author, int(time.time()) - _COMMENT_EVERY)).fetchone()
+         if not recent:
+diff --git a/hermes_cli/kanban_sync_replica_age.py b/hermes_cli/kanban_sync_replica_age.py
+index 7fe853b1e5c18fae3ee5f222d50ee08d815f9042..5f36b258ec84fcbf3c892fa80158200d0d6fe565 100644
+--- a/hermes_cli/kanban_sync_replica_age.py
++++ b/hermes_cli/kanban_sync_replica_age.py
+@@ -27,6 +27,12 @@ observation, starts afresh. Old records resume with last=seen_at and excluded=0.
+ One check covers every shape: rounds ending behind, rounds failing, no rounds at all (a dead loop or a give-up),
+ and a missing replica. The card names the host, board, stamp (PT), awake minutes, the last round's outcome, the
+ loop's recorded stop, the pending outbox, the running core and the cards frozen behind a remote parent.
++
++Boards that come due while their last round (under :data:`NO_ROUND_S` ago) failed to reach the Board at all (DNS,
++refused/unreachable connection: ``kanban_sync_host_outage.classify``) share ONE host card naming every board and its
++frozen cards; ten board cards for one DNS outage (2026-11-15, t_d3f56f1f216a033d) was the alternative. Any other or
++unknown cause, and a loop with no recent round, keeps its own board card. Archived boards (``board.json``
++``archived: true``) are not judged, like detached ones.
+ """
+ from __future__ import annotations
+ 
+@@ -72,12 +78,14 @@ class _Round:
+     wall: float
+     error: Optional[str]
+     behind: bool
++    cause: Optional[str] = None  # kanban_sync_host_outage.classify of a failure
+ 
+ 
+ _LOCK = threading.Lock()
+ _SEEN: dict[str, _Seen] = {}
+ _ROUNDS: dict[str, _Round] = {}
+ _TELEMETRY_AT: dict[str, float] = {}
++_HOST = "__host__"  # memo key of the open host incident (never a board slug: BOARD_ID_RE starts alphanumeric)
+ 
+ 
+ def note_round(results: Iterable[Any], *, mono: Callable[[], float] = time.monotonic,
+@@ -85,7 +93,8 @@ def note_round(results: Iterable[Any], *, mono: Callable[[], float] = time.monot
+     """The sync loop completed a round (``kanban_sync_outbox_age.after_round``): remember each board's outcome."""
+     with _LOCK:
+         for r in results:
+-            _ROUNDS[r.board] = _Round(mono(), wall(), r.error, bool(r.behind))
++            _ROUNDS[r.board] = _Round(mono(), wall(), r.error, bool(r.behind),
++                                      getattr(r, "cause", None) if r.error else None)
+ 
+ 
+ def _pt(at: Optional[float]) -> str:
+@@ -133,21 +142,72 @@ def _core_sha() -> Optional[str]:
+ def check(boards: list[tuple[str, Path]], *, now: float, wall: Callable[[], float] = time.time,
+           file_fn: Optional[Callable[[str, str, str], Optional[str]]] = None,
+           board_status: Optional[Callable[[str, list[str]], dict[str, str]]] = None,
+-          awake_fn: Optional[Callable[[], bool]] = None) -> list[str]:
++          awake_fn: Optional[Callable[[], bool]] = None,
++          host_fn: Optional[Callable[..., Optional[str]]] = None) -> list[str]:
+     """One observation of every board (``now``: monotonic). Returns the card ids it filed or commented. Never
+-    raises."""
++    raises. Boards that come due together with a host-to-Board transport cause share one host card (``host_fn``,
++    default :func:`kanban_sync_host_outage.report`); every other due board files its own (``file_fn``)."""
+     awake = fully_awake(awake_fn)
+     out: list[str] = []
++    shared: list[tuple[str, Path, str, str]] = []
++    status_fn = board_status or _board_status
+     for slug, path in boards:
+         try:
+-            tid = _check_board(slug, path, now, wall, file_fn or report, board_status or _board_status, awake)
++            tid = _check_board(slug, path, now, wall, file_fn or report, status_fn, awake, shared)
+             if tid:
+                 out.append(tid)
+         except Exception:  # health: allow BLE001 -- an alert must never break the dispatcher tick
+             log.warning("kanban sync: replica freshness check failed for %s", slug, exc_info=True)
++    try:
++        tid = _host_incident(shared, status_fn, host_fn)
++        if tid:
++            out.append(tid)
++    except Exception:  # health: allow BLE001 -- an alert must never break the dispatcher tick
++        log.warning("kanban sync: host replica incident failed for %s", [s for s, *_ in shared], exc_info=True)
+     return out
+ 
+ 
++_HOST_REC: list[Optional[dict]] = [None]  # this process's open host incident: {"boards": [...]}
++
++
++def _host_incident(shared: list[tuple[str, Path, str, str]], board_status,
++                   host_fn: Optional[Callable[..., Optional[str]]]) -> Optional[str]:
++    """Fold the boards that came due with a transport cause into the host incident (kanban_sync_host_outage)."""
++    from hermes_cli import kanban_sync_host_outage as host_outage
++    boot = _boot_id()
++    kept = _load_memo().get(_HOST)
++    rec = _HOST_REC[0]
++    if rec is None and isinstance(kept, dict) and boot is not None and kept.get("boot") == boot \
++            and isinstance(kept.get("boards"), list):
++        rec = {"boards": [str(b) for b in kept["boards"]]}  # a restarted gateway keeps the same host incident
++    if rec is not None:
++        with _LOCK:
++            still = [b for b in rec["boards"] if (s := _SEEN.get(b)) is not None and s.open]
++        if not still:  # every member's replica reached the head again (or left sync): the incident is over
++            log.info("kanban sync: host replica incident over (%s)", ", ".join(rec["boards"]))
++            rec = None
++    if shared:
++        entries = [(slug, detail, _frozen_text(slug, path, board_status)) for slug, path, detail, _c in shared]
++        cause = "dns" if any(c == "dns" for *_x, c in shared) else "network"
++        host_fn = host_fn or host_outage.report
++        tid = host_fn(entries, fresh=rec is None, cause=cause)
++        rec = {"boards": sorted(set(rec["boards"] if rec else []) | {s for s, *_x in shared})}
++    else:
++        tid = None
++    _HOST_REC[0] = rec
++    if not shared and (rec is not None or kept is None):
++        return tid  # nothing new to record
++
++    def update(memo: dict[str, Any]) -> None:
++        if rec is None or boot is None:
++            memo.pop(_HOST, None)
++        else:
++            memo[_HOST] = {"boards": rec["boards"], "boot": boot}
++
++    _save_memo(update)
++    return tid
++
++
+ def fully_awake(awake_fn: Optional[Callable[[], bool]] = None) -> bool:
+     """Shared fail-awake probe policy for both sync alarms; sample once per entry call."""
+     try:
+@@ -239,9 +299,27 @@ def _remember(slug: str, seen: Optional[_Seen], now: float) -> None:
+     _save_memo(update)
+ 
+ 
++def _archived(slug: str) -> bool:
++    """The board was archived (``board.json`` tombstone ``archived: true``, as ``kanban boards`` writes it): no
++    replica alarm, since nobody works it. Unreadable metadata reads not archived, so the alarm stays on."""
++    from hermes_cli import kanban_db as kb
++    try:
++        return bool(kb.read_board_metadata(slug).get("archived"))
++    except Exception:  # health: allow BLE001 -- unknown metadata must keep the alarm, not silence it
++        return False
++
++
++def _shared_cause(rnd: Optional[_Round], now: float) -> Optional[str]:
++    """The host-to-Board transport cause of a recent failed round (None: another or no cause, or no recent round,
++    e.g. a dead loop, which stays the board's own incident)."""
++    if rnd is None or not rnd.error or not rnd.cause or now - rnd.mono >= NO_ROUND_S:
++        return None
++    return rnd.cause
++
++
+ def _check_board(slug: str, path: Path, now: float, wall: Callable[[], float], file_fn, board_status,
+-                 awake: bool = True) -> Optional[str]:
+-    if _mode(path) not in ("primary", "shadow"):
++                 awake: bool = True, shared: Optional[list] = None) -> Optional[str]:
++    if _mode(path) not in ("primary", "shadow") or _archived(slug):
+         with _LOCK:
+             known = _SEEN.pop(slug, None)  # detached or unsynced: nothing to judge, and a later attach starts afresh
+         if known is not None or slug in _load_memo():
+@@ -276,6 +354,10 @@ def _check_board(slug: str, path: Path, now: float, wall: Callable[[], float], f
+     if not due:
+         return None
+     detail = _detail(slug, path, seen, elapsed, rnd, now, wall())
++    cause = _shared_cause(rnd, now)
++    if cause is not None and shared is not None:
++        shared.append((slug, path, detail, cause))  # one host card for every board this tick (check)
++        return None
+     return file_fn(slug, detail, _body(slug, path, detail, board_status))
+ 
+ 
+@@ -370,7 +452,8 @@ def _board_status(board: str, ids: list[str]) -> dict[str, str]:
+     return out
+ 
+ 
+-def _body(slug: str, path: Path, detail: str, board_status) -> str:
++def _frozen_text(slug: str, path: Path, board_status) -> str:
++    """The cards homed on ``slug`` that wait on a remote parent, each with its parent's status."""
+     frozen: list = []
+     try:
+         frozen = frozen_children(path)
+@@ -388,11 +471,15 @@ def _body(slug: str, path: Path, detail: str, board_status) -> str:
+             else:
+                 where = f"{mirrored or 'unknown'} (local mirror, may be stale)"
+             lines.append(f"- `{child}` ({status}) waits on remote parent `{parent}`: {where}")
+-    frozen_text = ("Cards homed here that wait on a remote parent (nothing promotes them while this replica is "
+-                   "stale; after 10 min the home may block them parent_missing). Re-place each card's next step on "
+-                   "a worker, following kanban-orchestrator references/stuck-card-recovery.md item 3 (precedent: "
+-                   "t_01a1d42acdce8e23):\n" + "\n".join(lines) if lines else
+-                   "No card homed here waits on a remote parent.")
++    return ("Cards homed here that wait on a remote parent (nothing promotes them while this replica is "
++            "stale; after 10 min the home may block them parent_missing). Re-place each card's next step on "
++            "a worker, following kanban-orchestrator references/stuck-card-recovery.md item 3 (precedent: "
++            "t_3803219c9ef59730):\n" + "\n".join(lines) if lines else
++            "No card homed here waits on a remote parent.")
++
++
++def _body(slug: str, path: Path, detail: str, board_status) -> str:
++    frozen_text = _frozen_text(slug, path, board_status)
+     return (
+         "This host's replica of a synced board has not reached the Board's feed head for over 20 awake minutes, "
+         "so remote parents, missing-parent checks and ready notices read an old copy (and since #1931 they wait "
+@@ -417,3 +504,4 @@ def reset() -> None:
+         _SEEN.clear()
+         _ROUNDS.clear()
+     _TELEMETRY_AT.clear()
++    _HOST_REC[0] = None
+diff --git a/hermes_cli/kanban_sync_work.py b/hermes_cli/kanban_sync_work.py
+index 035736636c90378a8f7ce02f40d7283321d67e69..3226d8efde36e7dd66a0573ad64c2cf47dba2e97 100644
+--- a/hermes_cli/kanban_sync_work.py
++++ b/hermes_cli/kanban_sync_work.py
+@@ -1,9 +1,19 @@
+-"""Feed-keyed invalidation, disconnected polling and independent full recovery."""
++"""Feed-keyed invalidation, disconnected polling, failed-round backoff and independent full recovery."""
+ from __future__ import annotations
+ 
+ import threading
+ from pathlib import Path
+ from collections.abc import Callable
++from typing import Optional
++
++# A board whose round failed is not rerun for its pending outbox, a dirty flag or the poll until this backoff
++# passes: 1 s, doubling, capped at the feed socket's own 60 s reconnect cap. Incident (2026-11-15, laptop-1,
++# t_d3f56f1f216a033d): DNS failed for 25 min and pending local edits reselected every board on each 0.5 s wait
++# tick, so the loop retried the failing rounds about every 0.6 s (the socket's backoff never covered rounds). The
++# outbox rows stay pending (push keeps them on a transport failure); a success, or the board's feed socket
++# reconnecting (the Board is reachable again), clears the backoff. [daveey]
++FAIL_BACKOFF_MIN_S = 1.0
++FAIL_BACKOFF_MAX_S = 60.0
+ 
+ 
+ class SyncWork:
+@@ -16,6 +26,8 @@ class SyncWork:
+         self._lock = threading.Lock()
+         self._dirty: set[str] = set()
+         self._known: set[tuple[str, Path]] = set()
++        self._streak: dict[str, int] = {}  # board -> consecutive failed rounds
++        self._retry_at: dict[str, float] = {}  # board -> monotonic end of its failed-round backoff
+ 
+     def changed(self, board: str) -> None:
+         with self._lock:
+@@ -25,15 +37,35 @@ class SyncWork:
+         with self._lock:
+             if connected:
+                 self._connected.add(board)
++                self._retry_at.pop(board, None)  # the Board answered the socket: retry the round now
+             else:
+                 self._connected.discard(board)
+ 
+-    def finished(self, board: str, success: bool) -> None:
++    def finished(self, board: str, success: bool, now: Optional[float] = None) -> None:
++        """Record a round's outcome. A failure with ``now`` (monotonic) starts or doubles the board's backoff."""
+         # Only the sync thread owns this set; feed callbacks never clear retries.
+         if success:
+             self._failed.discard(board)
+-        else:
+-            self._failed.add(board)
++            with self._lock:
++                self._streak.pop(board, None)
++                self._retry_at.pop(board, None)
++            return
++        self._failed.add(board)
++        if now is None:
++            return
++        with self._lock:
++            streak = self._streak[board] = self._streak.get(board, 0) + 1
++            self._retry_at[board] = now + min(FAIL_BACKOFF_MIN_S * 2 ** min(streak - 1, 16), FAIL_BACKOFF_MAX_S)
++
++    def backing_off(self, board: str, now: float) -> bool:
++        with self._lock:
++            return now < self._retry_at.get(board, 0.0)
++
++    def next_retry(self, now: float) -> Optional[float]:
++        """Seconds until the earliest backing-off board may run again (None: no board is backing off)."""
++        with self._lock:
++            due = [at for at in self._retry_at.values() if at > now]
++        return min(due) - now if due else None
+ 
+     def select(self, boards: list[tuple[str, Path]], now: float,
+                pending: Callable[[list[Path]], bool]) -> list[tuple[str, Path]]:
+@@ -42,6 +74,8 @@ class SyncWork:
+         with self._lock:
+             dirty, self._dirty = self._dirty, set()
+             connected = self._connected.copy()
++            waiting = {slug for slug, at in self._retry_at.items() if now < at}
++            self._dirty |= dirty & waiting  # a backing-off board keeps its flag for the round after the backoff
+         current = set(boards)
+         new = current - self._known
+         self._known = current
+@@ -52,7 +86,8 @@ class SyncWork:
+             # Connected boards invalidate through feed frames, not a timer-only TTL.
+             # Retain an independent safety audit for an undetected missed frame.
+             self._recovery_deadline = now + max(60.0, self.period)
+-            return boards
++            return [(slug, path) for slug, path in boards if slug not in waiting]
+         return [(slug, path) for slug, path in boards
+-                if (slug, path) in new or slug in dirty
+-                or (poll and (slug not in connected or slug in self._failed)) or pending([path])]
++                if slug not in waiting and ((slug, path) in new or slug in dirty
++                                            or (poll and (slug not in connected or slug in self._failed))
++                                            or pending([path]))]
+diff --git a/tests/hermes_cli/test_kanban_sync_host_outage.py b/tests/hermes_cli/test_kanban_sync_host_outage.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e8469f5e4ee2cbb4de699883db1eb29899b098e0
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_host_outage.py
+@@ -0,0 +1,509 @@
++"""Host-wide Board outages: one alarm card per host, and bounded round retries. [daveey]
++
++Incident (2026-11-15 13:25-13:50 PST, laptop-1, t_d3f56f1f216a033d): DNS resolution of the Board failed
++(``URLError: [Errno 8] nodename nor servname provided, or not known``) on every synced board. The sync loop retried
++the failing rounds about every 0.6 s, and the replica-freshness alarm opened ten board-specific cards for one cause.
++
++These tests drive the real entry paths: ``sync_all_once``/``sync_board`` on real synced board files against an
++in-memory Board whose transport raises what ``urllib`` raises for a failed name lookup (and once the real ``Hub``
++with ``getaddrinfo`` failing), the sync loop's ``after_round``, the dispatcher tick's ``outbox_age.check`` filing
++real cards on the default board, and ``run_forever`` on a simulated clock.
++"""
++from __future__ import annotations
++
++import errno
++import itertools
++import json
++import socket
++import sqlite3
++import time as _time
++import urllib.error
++from types import SimpleNamespace
++from typing import Any
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_sync_host_outage as host_outage
++from hermes_cli import kanban_sync_outbox_age as outbox_age
++from hermes_cli import kanban_sync_replica_age as replica_age
++from hermes_cli.kanban_sync_work import FAIL_BACKOFF_MAX_S, SyncWork
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++ME = "macbook"
++MIN = 60.0
++DNS = "nodename nor servname provided, or not known"
++TEN = ["default", "alpha", "runners", "example-collab", "example-e2e", "example-org", "home-board", "research",
++       "example-bot", "example-world"]
++
++
++def _dns_error() -> urllib.error.URLError:
++    """What ``Hub`` raises for a failed name lookup (``urllib`` wraps the resolver's ``socket.gaierror``)."""
++    return urllib.error.URLError(socket.gaierror(8, DNS))
++
++
++class OutageHub:
++    """The in-memory Board behind a transport that fails per board: ``down`` boards get the DNS failure,
++    ``broken`` boards a Board-side 503 (not a host cause)."""
++
++    def __init__(self, inner) -> None:
++        self._inner, self.ident = inner, inner.ident
++        self.down: set[str] = set()
++        self.broken: set[str] = set()
++
++    def report_metrics(self, *_a, **_k) -> None:  # the loop's Reporter is stubbed; nothing reads this
++        return None
++
++    def __getattr__(self, name):
++        attr = getattr(self._inner, name)
++        if not callable(attr):
++            return attr
++
++        def call(*args, **kwargs):
++            board = args[0] if args and isinstance(args[0], str) else kwargs.get("board")
++            if "*" in self.down or board in self.down:
++                raise _dns_error()
++            if board in self.broken:
++                raise ksc.HubError(503, "storage unavailable")
++            return attr(*args, **kwargs)
++        return call
++
++
++@pytest.fixture(autouse=True)
++def _fresh(monkeypatch):
++    from cron import restart_rerun
++    monkeypatch.setattr(restart_rerun, "host_fully_awake", lambda: True)
++    outbox_age.reset()
++    yield
++    outbox_age.reset()
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    h = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(h, True)
++    monkeypatch.setattr(replica_age, "_core_sha", lambda: "2cc7101849aa")
++    monkeypatch.setattr(ksc, "load_identity", lambda: (_ for _ in ()).throw(ksc.SyncUnavailable("no Board in tests")))
++    return h
++
++
++def _board(home, slug: str):
++    path = home / "kanban.db" if slug == "default" else kb.board_dir(slug) / "kanban.db"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    conn = kbc.connect(path)
++    try:
++        ksc.ensure_identity(conn, slug, ME)
++        sync.set_mode(conn, "primary")
++    finally:
++        conn.close()
++    return slug, path
++
++
++def _write(path, title: str) -> str:
++    conn = kbc.connect(path)
++    try:
++        return kb.create_task(conn, title=title)
++    finally:
++        conn.close()
++
++
++def _pending(path) -> int:
++    with kbc.connect_closing(path) as conn:
++        return conn.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE state = 'pending'").fetchone()[0]
++
++
++def _cards(home) -> list[sqlite3.Row]:
++    with kbc.connect_closing(home / "kanban.db") as conn:
++        conn.row_factory = sqlite3.Row
++        return conn.execute("SELECT id, title, body, status FROM tasks WHERE created_by = ? ORDER BY created_at, "
++                            "rowid", (replica_age.AUTHOR,)).fetchall()
++
++
++def _comments(home, tid: str) -> list[str]:
++    with kbc.connect_closing(home / "kanban.db") as conn:
++        return [r[0] for r in conn.execute("SELECT body FROM task_comments WHERE task_id = ? ORDER BY id", (tid,))]
++
++
++class Host:
++    """One gateway: a sync round (the real ``sync_all_once`` plus the loop's ``after_round``) and a dispatcher
++    tick (the real ``outbox_age.check``, which runs the replica check and files real cards) every awake minute."""
++
++    def __init__(self, home, slugs, *, svc=None) -> None:
++        self.home = home
++        self.boards = [_board(home, s) for s in slugs]
++        self.svc = svc or FakeService()
++        self.hub = OutageHub(self.svc.hub(ME))
++        self.mono = 10_000.0
++        self.rounding = {s for s in slugs}  # boards the loop still runs rounds for (others: a dead loop)
++
++    def minute(self) -> None:
++        self.mono += MIN
++        live = [b for b in self.boards if b[0] in self.rounding]
++        results = ksc.sync_all_once(self.hub, boards=live) if live else []
++        outbox_age.after_round(results, self.boards, mono=lambda: self.mono)
++        outbox_age.check(mono=lambda: self.mono, boards=self.boards, awake_fn=lambda: True)
++
++    def run(self, minutes: int) -> None:
++        for _ in range(minutes):
++            self.minute()
++
++
++def _host_cards(home):
++    return [c for c in _cards(home) if "cannot reach the Board" in c["title"]]
++
++
++# --- one host cause, one card ---------------------------------------------------------------------------------------
++
++def test_ten_boards_failing_on_one_dns_cause_file_one_card_naming_every_board_and_frozen_card(home):
++    host = Host(home, TEN)
++    child = _write(host.boards[1][1], "rework after review")  # bb: a card frozen behind a remote parent
++    with kbc.connect_closing(host.boards[1][1]) as conn, kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (child,))
++        conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", ("t_remote_parent", child))
++    host.run(1)  # every replica reaches the feed head
++    host.hub.down.add("*")
++    host.run(19)
++    assert _cards(home) == []
++    host.run(3)
++    cards = _cards(home)
++    assert len(cards) == 1, [c["title"] for c in cards]
++    card = cards[0]
++    assert "cannot reach the Board (dns)" in card["title"] and "10 board replica(s)" in card["title"]
++    for slug in TEN:
++        assert f"### `{slug}`" in card["body"]
++    assert child in card["body"] and "t_remote_parent" in card["body"]
++    assert f"[Errno 8] {DNS}" in card["body"]
++    assert "does not know why name resolution" in card["body"]
++    host.run(60)
++    assert len(_cards(home)) == 1 and _comments(home, card["id"]) == []  # the same incident files once
++
++
++def test_an_unrelated_board_failure_keeps_its_own_card(home):
++    host = Host(home, TEN + ["ledger"])
++    host.run(1)
++    host.hub.down |= set(TEN)
++    host.hub.broken.add("ledger")  # a Board-side 503 on one board: not a host cause
++    host.run(22)
++    cards = _cards(home)
++    assert len(cards) == 2, [c["title"] for c in cards]
++    (shared,) = _host_cards(home)
++    (own,) = [c for c in cards if c["id"] != shared["id"]]
++    assert "`ledger`" not in shared["body"]
++    assert own["title"] == "Kanban sync: ledger replica has not reached the feed head for 20+ awake min"
++    assert "HubError: hub 503: storage unavailable" in own["body"]
++
++
++def test_an_archived_board_is_not_judged(home):
++    host = Host(home, ["default", "bb", "goalfix-e2e"])
++    meta = kb.board_dir("goalfix-e2e") / "board.json"
++    meta.write_text(json.dumps({"name": "goalfix-e2e", "archived": True}))
++    host.run(1)
++    host.hub.down.add("*")
++    host.run(22)
++    (card,) = _cards(home)
++    assert "### `bb`" in card["body"] and "### `default`" in card["body"]
++    assert "goalfix-e2e" not in card["body"] and "2 board replica(s)" in card["title"]
++    memo = json.loads((kb.kanban_home() / "kanban" / ".replica-age.json").read_text())
++    assert "goalfix-e2e" not in memo
++
++
++def test_a_board_without_a_recent_round_keeps_its_own_bounded_card(home):
++    """No round for a while (a dead loop): the last DNS failure is no longer evidence of the cause, so the board
++    files its own card on time instead of waiting to be classified."""
++    host = Host(home, ["default", "bb"])
++    host.run(1)
++    host.hub.down.add("*")
++    host.run(2)
++    host.rounding.discard("bb")  # bb's rounds stop; default keeps failing on DNS
++    host.run(20)
++    titles = sorted(c["title"] for c in _cards(home))
++    assert len(titles) == 2, titles
++    assert any("bb replica has not reached the feed head" in t for t in titles)
++    (shared,) = _host_cards(home)
++    assert "### `default`" in shared["body"] and "`bb`" not in shared["body"]
++
++
++def test_unclassified_failures_on_every_board_stay_per_board_and_bounded(home):
++    host = Host(home, ["default", "bb"])
++    host.run(1)
++    host.hub.broken |= {"default", "bb"}
++    host.run(19)
++    assert _cards(home) == []
++    host.run(2)
++    assert sorted(c["title"].split(":")[1].split()[0] for c in _cards(home)) == ["bb", "default"]
++    assert _host_cards(home) == []
++
++
++def test_a_board_joining_later_is_named_on_the_same_card(home):
++    host = Host(home, ["default", "bb", "runners"])
++    host.run(1)
++    host.hub.down |= {"default", "bb"}
++    host.run(5)
++    host.hub.down.add("runners")  # its replica went stale 5 min later
++    host.run(17)
++    (card,) = _cards(home)
++    assert "### `runners`" not in card["body"]
++    host.run(6)
++    assert len(_cards(home)) == 1
++    (comment,) = _comments(home, card["id"])
++    assert comment.startswith("Also affected: ") and "### `runners`" in comment
++
++
++def test_a_restart_mid_incident_keeps_the_same_host_card(home):
++    host = Host(home, ["default", "bb"])
++    host.run(1)
++    host.hub.down.add("default")
++    host.run(22)
++    (card,) = _cards(home)
++    outbox_age.reset()  # a new gateway process: in-memory state gone, .replica-age.json kept
++    host.hub.down.add("bb")
++    host.run(22)
++    assert len(_cards(home)) == 1
++    (comment,) = _comments(home, card["id"])
++    assert comment.startswith("Also affected: ") and "`bb`" in comment
++
++
++@pytest.mark.parametrize("closed", [False, True])
++def test_recovery_then_recurrence_is_a_fresh_incident(home, closed):
++    host = Host(home, ["default", "bb"])
++    host.run(1)
++    host.hub.down.add("*")
++    host.run(22)
++    (first,) = _cards(home)
++    host.hub.down.clear()
++    host.run(2)  # both replicas reach the head: the host incident ends
++    assert replica_age._HOST_REC[0] is None
++    if closed:
++        with kbc.connect_closing(home / "kanban.db") as conn, kbc.write_txn(conn):
++            conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (first["id"],))
++    host.hub.down.add("*")
++    host.run(22)
++    cards = _cards(home)
++    if closed:
++        assert len(cards) == 2 and cards[1]["id"] != first["id"]
++        assert "### `default`" in cards[1]["body"] and "### `bb`" in cards[1]["body"]
++    else:
++        assert len(cards) == 1
++        (comment,) = _comments(home, first["id"])
++        assert comment.startswith("New incident: ") and "`default`" in comment and "`bb`" in comment
++
++
++# --- the real transport --------------------------------------------------------------------------------------------
++
++def test_the_real_hub_classifies_a_failed_name_lookup_and_keeps_the_outbox(home, monkeypatch):
++    for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
++        monkeypatch.delenv(var, raising=False)
++    slug, path = _board(home, "default")
++    _write(path, "a local edit")
++    before = _pending(path)
++    assert before > 0
++
++    def no_dns(*_a, **_k):
++        raise socket.gaierror(8, DNS)
++
++    monkeypatch.setattr(socket, "getaddrinfo", no_dns)
++    hub = ksc.Hub(ksc.Identity("https://board.example.invalid", "k", ME))
++    (result,) = ksc.sync_all_once(hub, boards=[(slug, path)])
++    assert result.cause == "dns" and DNS in result.error
++    assert _pending(path) == before  # nothing dropped or rejected
++
++
++@pytest.mark.parametrize("exc,want", [
++    (urllib.error.URLError(socket.gaierror(8, DNS)), "dns"),
++    (urllib.error.URLError(ConnectionRefusedError(61, "Connection refused")), "network"),
++    (urllib.error.URLError(OSError(errno.ENETUNREACH, "Network is unreachable")), "network"),
++    (urllib.error.URLError(TimeoutError("timed out")), "network"),
++    (urllib.error.URLError("no reason object"), None),
++    (ksc.HubError(503, "storage unavailable"), None),
++    (sqlite3.OperationalError("database is locked"), None),
++    (OSError("hub unreachable"), None),
++])
++def test_classify(exc, want):
++    assert host_outage.classify(exc) == want
++
++
++# --- the sync loop: bounded retries, nothing lost, prompt recovery --------------------------------------------------
++
++class Loop:
++    """``run_forever`` with the real rounds and real ``wait_for_work`` on a simulated monotonic clock: the wait's
++    ``wake.wait(timeout)`` advances it. Feed sockets are stubbed (disconnected, as in a DNS outage)."""
++
++    def __init__(self, home, monkeypatch, slugs) -> None:
++        self.clock = [100_000.0]
++        self.boards = [_board(home, s) for s in slugs]
++        self.svc = FakeService()
++        self.hub = OutageHub(self.svc.hub(ME))
++        self.rounds: dict[str, list[tuple[float, bool]]] = {s: [] for s in slugs}
++        self.on_state: dict[str, Any] = {}
++        self.hooks: list[tuple[float, Any]] = []
++        self.restored = 0.0
++        loop = self
++
++        class Event:
++            def __init__(self):
++                self.flag = False
++
++            def set(self):
++                self.flag = True
++
++            def clear(self):
++                self.flag = False
++
++            def is_set(self):
++                return self.flag
++
++            def wait(self, timeout=None):
++                if not self.flag:
++                    loop.clock[0] += max(0.0, timeout or 0.0)
++                loop._fire()
++                return self.flag
++
++        class Watcher:
++            def __init__(self, ident, board, wake, keep_running, **kwargs):
++                loop.on_state[board] = kwargs.get("on_state")
++
++            def run(self):
++                pass
++
++        class Thread:
++            def __init__(self, target=None, **kwargs):
++                self.target = target
++
++            def start(self):
++                self.target()
++
++            def is_alive(self):
++                return True
++
++        real_round = ksc.sync_board
++
++        def sync_board(slug, path, hub, gateway):
++            try:
++                result = real_round(slug, path, hub, gateway)
++            except Exception:
++                self.rounds[slug].append((self.clock[0], False))
++                raise
++            self.rounds[slug].append((self.clock[0], True))
++            return result
++
++        from hermes_cli import machine_metrics
++        monkeypatch.setattr(machine_metrics, "Reporter",
++                            lambda _: SimpleNamespace(report_due=lambda: None, pending_wake_in=lambda: None))
++        monkeypatch.setattr(ksc, "load_identity", lambda: self.hub.ident)
++        monkeypatch.setattr(ksc, "Hub", lambda ident: self.hub)
++        monkeypatch.setattr(ksc, "board_paths", lambda: self.boards)
++        monkeypatch.setattr(ksc.sync, "set_lease_client", lambda _: None)
++        monkeypatch.setattr(ksc, "publish_pickup_if_changed", lambda _: None)
++        monkeypatch.setattr(ksc, "reconcile_links", lambda *a, **k: None)
++        clock = self.clock
++
++        class FakeTime:  # the loop's module clock: simulated monotonic time, real wall time
++            @staticmethod
++            def monotonic():
++                return clock[0]
++
++            @staticmethod
++            def sleep(_s):
++                return None
++
++            def __getattr__(self, name):
++                return getattr(_time, name)
++
++        monkeypatch.setattr(ksc, "time", FakeTime())
++        monkeypatch.setattr(ksc, "threading", SimpleNamespace(Thread=Thread, Event=Event))
++        monkeypatch.setattr(ksc, "FeedWatcher", Watcher)
++        monkeypatch.setattr(ksc, "sync_board", sync_board)
++
++    def at(self, offset: float, fn) -> None:
++        self.hooks.append((self.clock[0] + offset, fn))
++
++    def _fire(self) -> None:
++        due = [h for h in self.hooks if h[0] <= self.clock[0]]
++        self.hooks = [h for h in self.hooks if h[0] > self.clock[0]]
++        for _at, fn in due:
++            fn()
++
++    def run(self, seconds: float, *, cap: int = 400) -> None:
++        end = self.clock[0] + seconds
++        ksc.run_forever(lambda: self.clock[0] < end and sum(map(len, self.rounds.values())) < cap, interval=5)
++
++    def failed(self, slug: str) -> list[float]:
++        return [t for t, ok in self.rounds[slug] if not ok]
++
++
++def test_a_dns_outage_backs_rounds_off_keeps_the_outbox_and_recovers_promptly(home, monkeypatch):
++    loop = Loop(home, monkeypatch, ["default", "bb"])
++    for _slug, path in loop.boards:
++        _write(path, "edit made during the outage")
++    pending = {slug: _pending(path) for slug, path in loop.boards}
++    loop.hub.down.add("*")
++    start = loop.clock[0]
++
++    def restore():
++        loop.hub.down.clear()
++        loop.restored = loop.clock[0]
++        loop.on_state["default"]("default", True)  # default's feed socket reconnects; bb's does not
++
++    loop.at(180.0, restore)
++    loop.run(260.0)
++    for slug, _path in loop.boards:
++        fails = [t for t in loop.failed(slug) if t < start + 180.0]
++        # 1, 2, 4 ... 60 s apart: about 8 attempts in 3 min, not one every 0.6 s (~300)
++        assert 5 <= len(fails) <= 10, (slug, len(fails))
++        gaps = [b - a for a, b in itertools.pairwise(fails)]
++        assert all(g >= 1.0 for g in gaps) and max(gaps) <= FAIL_BACKOFF_MAX_S + 1.0, gaps
++    by_slug = dict(loop.boards)
++    # recovery: the reconnected board runs within a wait tick, the other within one backoff cap
++    first_ok = {slug: min(t for t, ok in loop.rounds[slug] if ok and t >= loop.restored) for slug in by_slug}
++    assert first_ok["default"] - loop.restored <= 1.0
++    assert first_ok["bb"] - loop.restored <= FAIL_BACKOFF_MAX_S + 1.0
++    for slug, path in loop.boards:
++        assert pending[slug] > 0 and _pending(path) == 0  # every edit made during the outage reached the Board
++        with kbc.connect_closing(path) as conn:
++            assert conn.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE state = 'rejected'").fetchone()[0] == 0
++        assert loop.svc.board(slug)["rows"].get("tasks")
++
++
++def test_a_failing_board_never_slows_a_healthy_one(home, monkeypatch):
++    loop = Loop(home, monkeypatch, ["default", "bb"])
++    loop.hub.down.add("default")
++    _write(dict(loop.boards)["default"], "stuck behind DNS")
++    written: list[tuple[str, float]] = []
++
++    def edit():
++        written.append((_write(dict(loop.boards)["bb"], "healthy edit"), loop.clock[0]))
++
++    for offset in (30.0, 61.5, 97.25):
++        loop.at(offset, edit)
++    loop.run(120.0)
++    assert len(written) == 3
++    for _tid, at in written:
++        ok = [t for t, good in loop.rounds["bb"] if good and t >= at]
++        assert ok and ok[0] - at <= 1.0  # pushed within a wait tick, as before
++    assert _pending(dict(loop.boards)["bb"]) == 0
++    assert len(loop.failed("default")) <= 9
++
++
++def test_sync_work_backoff_keeps_dirty_flags_and_clears_on_success_or_reconnect():
++    from pathlib import Path
++    work = SyncWork(5)
++    boards = [("a", Path("a")), ("b", Path("b"))]
++    assert work.select(boards, 100, lambda _p: True) == boards  # first audit
++    work.finished("a", False, 100)
++    work.changed("a")
++    assert work.select(boards, 100.5, lambda _p: True) == boards[1:]  # a backs off 1 s, b's write goes now
++    assert work.select(boards, 101.0, lambda _p: False) == boards[:1]  # its kept dirty flag runs it after
++    for streak, now in enumerate((101.0, 103.0, 107.0, 115.0, 131.0, 163.0, 227.0), start=2):
++        work.finished("a", False, now)
++        assert work.next_retry(now) == min(2 ** (streak - 1), FAIL_BACKOFF_MAX_S)
++    assert work.backing_off("a", 286.0)
++    work.feed_state("a", True)
++    assert not work.backing_off("a", 286.0)
++    work.finished("a", False, 300.0)
++    assert work.next_retry(300.0) == FAIL_BACKOFF_MAX_S  # the streak carries until a round succeeds
++    work.finished("a", True, 301.0)
++    assert not work.backing_off("a", 301.0) and work.next_retry(301.0) is None
+diff --git a/tests/hermes_cli/test_kanban_sync_push_starvation.py b/tests/hermes_cli/test_kanban_sync_push_starvation.py
+index ae86aebb52833d335a99b721dbcf94eb69b3d33b..35a35e4f1a09c9d60595b9112b9f73f051833f1b 100644
+--- a/tests/hermes_cli/test_kanban_sync_push_starvation.py
++++ b/tests/hermes_cli/test_kanban_sync_push_starvation.py
+@@ -335,7 +335,7 @@ def test_a_round_a_tick_holds_off_is_skipped_not_failed_and_retried_shortly(monk
+     finished: list = []
+     real_finished = kanban_sync_work.SyncWork.finished
+     monkeypatch.setattr(kanban_sync_work.SyncWork, "finished",
+-                        lambda self, board, ok: finished.append((board, ok)) or real_finished(self, board, ok))
++                        lambda self, board, ok, now=None: finished.append((board, ok)) or real_finished(self, board, ok, now))
+ 
+     def sync_board(slug, path, *args):
+         rounds[-1].append(slug)
+-- 
+2.43.0
+

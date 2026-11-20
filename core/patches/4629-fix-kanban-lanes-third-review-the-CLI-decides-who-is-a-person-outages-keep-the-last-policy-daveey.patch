@@ -1,0 +1,413 @@
+From b343ad54e6c9ac346abed9cddfd30a5387c34d13 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 15:16:51 -0800
+Subject: [PATCH] fix(kanban): lanes third review: the CLI decides who is a
+ person; outages keep the last policy [daveey]
+
+- hermes kanban create keeps the user/dashboard labels only for a typed slash command or a human shell, and
+  stores agent otherwise (lanes configured only); creation no longer guesses from the environment
+- a worker card behind the call counts only in the dispatcher-owned worker context
+- an unreadable config keeps the last policy this process read, so an outage does not open the gate
+- held excludes cards the sweep or decompose released; lanes held --lane filters by the lane a card counts in
+- an agent's CLI admit spends the daily budget; delegated children cannot run lanes
+- lane_tenant applies the board's project and workdir defaults as creation does
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ hermes_cli/kanban.py                       |   7 +-
+ hermes_cli/kanban_lanes.py                 | 100 ++++++++++++++-------
+ hermes_cli/kanban_lanes_cli.py             |   5 +-
+ tests/hermes_cli/test_kanban_lanes.py      |  56 ++++++++----
+ tests/hermes_cli/test_kanban_lanes_plan.py |  39 ++++++++
+ website/docs/user-guide/features/kanban.md |   4 +-
+ 6 files changed, 155 insertions(+), 56 deletions(-)
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 881eb5772c9b42f5711704f49f93f1507ad633b8..835ffd9aa9c989956f8e3996b3033bc84b3c827f 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -58,6 +58,7 @@ from hermes_cli.kanban_claim_cli import cmd_claim as _cmd_claim  # moved; re-exp
+ from hermes_cli.kanban_source_cli import cmd_source_release as _cmd_source_release
+ from hermes_cli.kanban_sync_cli import cmd_sync as _cmd_sync
+ from hermes_cli.kanban_admission_explain import cmd_queue as _cmd_queue
++from hermes_cli.kanban_lanes import cli_creator as _lane_creator
+ from hermes_cli.kanban_lanes_cli import command as _cmd_lanes
+ from hermes_cli.kanban_assignees_cli import cmd_assignees as _cmd_assignees  # moved; re-exported for callers
+ from hermes_cli.kanban_archive_scope import (  # moved here from this module; re-exported for callers
+@@ -262,7 +263,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
+     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair", "recover",
+     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
+     "request-review", "request-changes", "reopen-review", "reopen", "resume", "quota-release", "source-release",
+-    "gc", "origin-bind", "origin-create", "origin-adopt", "sync", "supervisor-requests", "spend-budget",
++    "gc", "origin-bind", "origin-create", "origin-adopt", "sync", "supervisor-requests", "spend-budget", "lanes",
+ })
+ 
+ _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
+@@ -475,7 +476,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
+                 chat_origin=origin.ref if origin else getattr(args, "origin_session", None),
+                 # [daveey] Same declaration gate as the kanban_create tool, for agent/worker shells only.
+                 require_declaration=(in_worker or _agent_invoked()) and declaration_required(),
+-                created_by=args.created_by or _profile_author(),
++                created_by=_lane_creator(args, args.created_by or _profile_author()),
+                 workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
+                 project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
+                 admission_class=getattr(args, "admission_class", "normal"),
+@@ -579,7 +580,7 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
+         created = ks.create_swarm(
+             conn, goal=args.goal, workers=workers, verifier_assignee=args.verifier,
+             synthesizer_assignee=args.synthesizer, tenant=args.tenant,
+-            created_by=args.created_by or _profile_author(), priority=args.priority,
++            created_by=_lane_creator(args, args.created_by or _profile_author()), priority=args.priority,
+             idempotency_key=getattr(args, "idempotency_key", None),
+         )
+     if getattr(args, "json", False):
+diff --git a/hermes_cli/kanban_lanes.py b/hermes_cli/kanban_lanes.py
+index 158e0a00b59aa670d6450941132a0e0997313b58..6245b49dda034c8feabe4efda15db37aa6bc5b8b 100644
+--- a/hermes_cli/kanban_lanes.py
++++ b/hermes_cli/kanban_lanes.py
+@@ -62,7 +62,7 @@ def held_sql(alias: str = "tasks") -> str:
+     return (f"{alias}.status = 'triage' AND COALESCE({alias}.block_kind, '') = 'lane_gate' "
+             f"AND NOT EXISTS (SELECT 1 FROM task_runs hr WHERE hr.task_id = {alias}.id) "
+             f"AND NOT EXISTS (SELECT 1 FROM task_events he WHERE he.task_id = {alias}.id "
+-            f"AND he.kind IN ('lane_admitted', 'promoted_manual', 'unblocked'))")
++            f"AND he.kind IN ('lane_admitted', 'promoted_manual', 'unblocked', 'triage_swept', 'decomposed'))")
+ 
+ 
+ HELD = held_sql()
+@@ -183,24 +183,36 @@ def policy() -> Optional[Policy]:
+ 
+ 
+ _WARNED: set = set()
++_LAST_GOOD: list = []
+ 
+ 
+ def safe_policy() -> Optional[Policy]:
+-    """:func:`policy` for creation and dispatch: an unreadable or malformed mapping reads as no lanes.
++    """:func:`policy` for creation and dispatch; never raises.
+ 
+-    Logged once per distinct error per process: this runs on every create, rank and triage check.
++    A malformed mapping reads as no lanes (the config says something, and it is wrong). A config that cannot
++    be read at all (backend outage, I/O error) keeps the last policy this process read, so an outage does not
++    open the gate; with none read yet it is no lanes. Logged once per distinct error per process.
+     """
+     from hermes_cli.config_backend import ConfigBackendUnavailable
+ 
+     try:
+-        return policy()
++        pol = policy()
++    except ValueError as exc:
++        _warn(exc)
++        return None
+     # ConfigBackendUnavailable is a SystemExit, so ``Exception`` alone would let a config outage stop creation.
+     except (Exception, ConfigBackendUnavailable) as exc:  # health: allow BLE001 -- config must never stop creation
+-        key = f"{type(exc).__name__}: {exc}"
+-        if key not in _WARNED:
+-            _WARNED.add(key)
+-            _LOG.warning("kanban.admission.lanes is unreadable or malformed; lanes are off until it is fixed: %s", key)
+-        return None
++        _warn(exc)
++        return _LAST_GOOD[0] if _LAST_GOOD else None
++    _LAST_GOOD[:] = [pol]
++    return pol
++
++
++def _warn(exc) -> None:
++    key = f"{type(exc).__name__}: {exc}"
++    if key not in _WARNED:
++        _WARNED.add(key)
++        _LOG.warning("kanban.admission.lanes is unreadable or malformed: %s", key)
+ 
+ 
+ def enforced() -> Optional[Policy]:
+@@ -242,9 +254,19 @@ def _rule_lane(pol: Policy, opts: dict) -> Optional[str]:
+ 
+ 
+ def _agent_task(opts: dict) -> Optional[str]:
+-    """The card whose worker is creating this one: the explicit creator, else the worker shell's own card."""
+-    return opts.get("creator_task_id") or os.environ.get("HERMES_KANBAN_WORKER_TASK") \
+-        or os.environ.get("HERMES_KANBAN_TASK") or None
++    """The card whose worker is creating this one: the explicit creator, else the card this process owns.
++
++    A delegated child or a cron run beside a worker inherits ``HERMES_KANBAN_TASK`` without owning the card, so
++    the environment counts only in the dispatcher-owned worker context.
++    """
++    if creator := opts.get("creator_task_id"):
++        return creator
++    owned = os.environ.get("HERMES_KANBAN_WORKER_TASK") or os.environ.get("HERMES_KANBAN_TASK")
++    if not owned:
++        return None
++    from agent.delegation_context import is_dispatcher_owned_worker_context
++
++    return owned if is_dispatcher_owned_worker_context() else None
+ 
+ 
+ def _human_shell() -> bool:
+@@ -254,16 +276,19 @@ def _human_shell() -> bool:
+     return cli_actor() == "user"
+ 
+ 
+-def _by_user(opts: dict) -> bool:
+-    """Created by the person, not an agent.
++def cli_creator(args, label: str) -> str:
++    """``created_by`` for a CLI create. ``--created-by`` defaults to ``user`` for every caller and takes any
++    string, so the user labels are kept only for a person: a typed slash command or a human shell. Anything
++    else asking for one is stored as ``agent``. Unchanged when no lanes are configured."""
++    if label not in USER_CREATORS or safe_policy() is None:
++        return label
++    return label if getattr(args, "_slash_typed", False) or _human_shell() else "agent"
+ 
+-    ``hermes kanban create`` writes ``created_by='user'`` for every caller, so that label counts only from a
+-    human shell with no worker card behind it; the dashboard's own label is the person by construction.
+-    """
+-    creator = opts.get("created_by")
+-    if creator not in USER_CREATORS or _agent_task(opts) is not None:
+-        return False
+-    return creator != "user" or _human_shell()
++
++def _by_user(opts: dict) -> bool:
++    """Created by the person: a user label (the CLI keeps those for people only, see :func:`cli_creator`; the
++    dashboard writes its own) and no worker card behind the call."""
++    return opts.get("created_by") in USER_CREATORS and _agent_task(opts) is None
+ 
+ 
+ def _creator_row(conn, opts):
+@@ -319,12 +344,20 @@ def lane_tenant(conn, parents, initial_status, triage, tenant, opts) -> Optional
+ 
+     opts = dict(opts)
+     if "project_repo" not in opts:
+-        try:
+-            opts["project_repo"] = kb._resolve_project_link(
+-                conn, opts.get("project_id"), opts.get("project_source_task_id"),
+-                opts.get("workspace_kind") or "scratch", opts.get("workspace_path"))[2]
+-        except (ValueError, LookupError, sqlite3.Error):
+-            opts["project_repo"] = None  # creation will raise the same error with its own message
++        kind, project = opts.get("workspace_kind"), opts.get("project_id")
++        board = {}
++        if (project is None and kind != "scratch") or opts.get("workspace_path") is None:
++            try:
++                board = kb._board_meta_for(opts.get("board"))
++            except Exception:  # health: allow BLE001 -- create_task ignores an unreadable board the same way
++                board = {}
++        if project is None and kind != "scratch":
++            project = (board.get("project_id") or "").strip() or None
++        project, _obj, repo, kind = kb._resolve_project_link(
++            conn, project, opts.get("project_source_task_id"), kind or "scratch", opts.get("workspace_path"))
++        opts["project_repo"] = repo
++        if opts.get("workspace_path") is None and repo is None and kind in {"dir", "worktree"}:
++            opts["workspace_path"] = board.get("default_workdir")
+     return initial_state(conn, parents, initial_status, triage, tenant, opts)[1]
+ 
+ 
+@@ -382,12 +415,13 @@ def assign(conn, task_id: str, lane: str, *, source: str, reason: str, pol: Opti
+ 
+ 
+ def held(conn, lane: Optional[str] = None) -> list[sqlite3.Row]:
+-    """Cards waiting at a lane gate, oldest first."""
+-    sql = f"SELECT id, title, tenant, priority, created_at, created_by FROM tasks WHERE {HELD}"
+-    params: tuple = ()
+-    if lane is not None:
+-        sql, params = sql + " AND tenant = ?", (lane,)
+-    return conn.execute(sql + " ORDER BY created_at, id", params).fetchall()
++    """Cards waiting at a lane gate, oldest first; ``lane`` filters by the lane a card counts in."""
++    rows = conn.execute(f"SELECT id, title, tenant, priority, created_at, created_by FROM tasks WHERE {HELD} "
++                        "ORDER BY created_at, id").fetchall()
++    if lane is None:
++        return rows
++    pol = safe_policy()
++    return [row for row in rows if (row["tenant"] if pol is None else pol.lane_of(row["tenant"])) == lane]
+ 
+ 
+ def day_start(now: Optional[float] = None) -> int:
+diff --git a/hermes_cli/kanban_lanes_cli.py b/hermes_cli/kanban_lanes_cli.py
+index 811e31fb7f3267523f18b3ece4cbbe60e852a3bd..6cfe1c7732d6d9168ec84cd8361af5f521d536de 100644
+--- a/hermes_cli/kanban_lanes_cli.py
++++ b/hermes_cli/kanban_lanes_cli.py
+@@ -116,8 +116,9 @@ def _admit(args) -> int:
+     from hermes_cli.kanban_cli_actor import cli_actor
+ 
+     with kbc.connect_closing() as conn:
+-        # The user's own admit does not spend the planner's daily budget.
+-        done = lanes.admit(conn, args.task_id, actor=cli_actor(), reason=args.reason or "", budget=False)
++        # The user's own admit does not spend the daily budget; an agent's does.
++        actor = cli_actor()
++        done = lanes.admit(conn, args.task_id, actor=actor, reason=args.reason or "", budget=actor != "user")
+     print(f"{args.task_id}: {'admitted' if done else 'not held at a lane gate'}")
+     return 0 if done else 1
+ 
+diff --git a/tests/hermes_cli/test_kanban_lanes.py b/tests/hermes_cli/test_kanban_lanes.py
+index bb78e66ff7be1b6fe68efc0a74a4b9d4445ba803..810eba748874ce795c7c80b545c1c6f3da95ce50 100644
+--- a/tests/hermes_cli/test_kanban_lanes.py
++++ b/tests/hermes_cli/test_kanban_lanes.py
+@@ -10,6 +10,7 @@ from hermes_cli.kanban_db_dispatch_queries import lane_rows
+ from tests.hermes_cli import test_kanban_parent_first_dispatch as helpers
+ 
+ conn = helpers.conn
++REAL_HUMAN_SHELL = lanes._human_shell  # the detector itself; the ``person`` fixture stubs the module's
+ 
+ LANES = {
+     "myapp": {"share": 35, "describe": "Example app"},
+@@ -28,6 +29,8 @@ def person(monkeypatch):
+     for name in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK", "HERMES_TENANT"):
+         monkeypatch.delenv(name, raising=False)
+     monkeypatch.setattr(lanes, "_human_shell", lambda: True)
++    monkeypatch.setattr(lanes, "_LAST_GOOD", [])  # process state: the last policy read, and warnings already logged
++    monkeypatch.setattr(lanes, "_WARNED", set())
+ 
+ 
+ @pytest.fixture
+@@ -396,24 +399,13 @@ def test_forced_decompose_still_refuses_a_held_card(conn, configured):
+     assert _task(conn, held)["status"] == "triage"
+ 
+ 
+-def test_an_agent_session_shell_is_not_the_user(conn, configured, monkeypatch):
+-    monkeypatch.setattr(lanes, "_human_shell", lambda: False)  # a chat or cron agent's terminal
+-    tid = kb.create_task(conn, title="main is red", assignee="default", priority=1000, created_by="user",
+-                         tenant="hermes", idempotency_key="ci-main-watch:1")
+-    row = _task(conn, tid)
+-    assert (row["status"], row["priority"]) == ("triage", 100)
+-
+-
+ def test_human_shell_detection_reads_the_session_markers(monkeypatch):
+-    from hermes_cli import kanban_lanes
+-
+-    monkeypatch.undo()  # the real detector, not this module's stand-in
+     for name in ("HERMES_SESSION_KEY", "HERMES_SESSION_ID", "HERMES_SESSION_SOURCE", "HERMES_RPC_SOCKET",
+                  "HERMES_KERNEL_SENTINEL", "HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK"):
+         monkeypatch.delenv(name, raising=False)
+-    assert kanban_lanes._human_shell() is True
++    assert REAL_HUMAN_SHELL() is True
+     monkeypatch.setenv("HERMES_SESSION_ID", "chat-1")
+-    assert kanban_lanes._human_shell() is False
++    assert REAL_HUMAN_SHELL() is False
+ 
+ 
+ def test_a_parked_or_held_waiter_does_not_release_a_held_card(conn, configured):
+@@ -423,8 +415,9 @@ def test_a_parked_or_held_waiter_does_not_release_a_held_card(conn, configured):
+     _parent, held = _held_card(conn)
+     owner2 = kb.create_task(conn, title="p2", assignee="default", created_by="user", tenant="infra2")
+     gated_child = kb.create_task(conn, title="needs it", assignee="default", creator_task_id=owner2,
+-                                 parents=[held])
+-    assert _task(conn, gated_child)["block_kind"] == lanes.GATE_KIND  # held in its own gated lane
++                                 tenant="infra2", parents=[held])
++    row = _task(conn, gated_child)
++    assert (row["tenant"], row["block_kind"]) == ("infra2", lanes.GATE_KIND)  # another lane, itself held
+     assert _task(conn, held)["status"] == "triage"
+     kb.create_task(conn, title="parked", assignee="default", tenant="myapp", created_by="user", triage=True,
+                    parents=[held])
+@@ -441,6 +434,7 @@ def test_a_tenant_that_names_no_lane_is_gated_as_the_default_lane(conn, configur
+     child = kb.create_task(conn, title="follow-up", assignee="default", creator_task_id=old)
+     row = _task(conn, child)
+     assert (row["tenant"], row["status"], row["block_kind"]) == ("legacy-team", "triage", lanes.GATE_KIND)
++    assert [r["id"] for r in lanes.held(conn, "other")] == [child] and lanes.held(conn, "myapp") == []
+ 
+ 
+ def test_a_promoted_card_sent_back_to_triage_before_it_ran_is_not_held(conn, configured):
+@@ -458,8 +452,38 @@ def test_non_finite_and_negative_shares_are_rejected(share):
+         lanes.parse({"lanes": {"other": {"share": share}}})
+ 
+ 
+-def test_lane_tenant_resolves_what_creation_will_store(conn, configured):
++def test_lane_tenant_matches_what_creation_stores_for_a_workspace_repo(conn, configured):
+     opts = {"created_by": "default", "workspace_path": "/src/hermes-agent", "workspace_kind": "dir"}
+     assert lanes.lane_tenant(conn, (), "running", False, "myapp", opts) == "hermes"
+     made = kb.create_task(conn, title="x", assignee="default", tenant="myapp", **opts)
+     assert _task(conn, made)["tenant"] == "hermes"
++
++
++def test_a_card_the_sweep_released_is_not_held_again(conn, configured):
++    from hermes_cli.kanban_triage_sweep import sweep_stale_triage
++
++    _parent, held = _held_card(conn)
++    conn.execute("UPDATE tasks SET created_at = created_at - 100000")
++    conn.execute("UPDATE task_events SET created_at = created_at - 100000")
++    conn.commit()
++    configured(lane_shadow=True)
++    assert held in sweep_stale_triage(conn)
++    configured()
++    conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (held,))
++    conn.commit()
++    assert lanes.held(conn) == []
++
++
++def test_an_unreadable_config_keeps_the_last_policy_and_a_malformed_one_turns_lanes_off(conn, configured, monkeypatch):
++    from hermes_cli import kanban_admission_pools as pools
++
++    assert lanes.safe_policy() is not None
++    real = pools.admission_policy
++    monkeypatch.setattr(pools, "admission_policy", lambda: (_ for _ in ()).throw(OSError("backend down")))
++    parent = _hermes_parent(conn)
++    child = kb.create_task(conn, title="follow-up", assignee="default", creator_task_id=parent,
++                           workspace_path="/src/hermes-agent")
++    assert _task(conn, child)["status"] == "triage"  # the gate stays shut through the outage
++    monkeypatch.setattr(pools, "admission_policy", real)
++    configured({"Bad Name": {"share": 1}})
++    assert lanes.safe_policy() is None
+diff --git a/tests/hermes_cli/test_kanban_lanes_plan.py b/tests/hermes_cli/test_kanban_lanes_plan.py
+index 49bc5edbfad9e6188a413b0f8bf17353928ac867..ba2c9acfc8cc54f708ee67422f3241d0b1d7377e 100644
+--- a/tests/hermes_cli/test_kanban_lanes_plan.py
++++ b/tests/hermes_cli/test_kanban_lanes_plan.py
+@@ -187,3 +187,42 @@ def test_set_lane_writes_the_root_config_from_a_profile(conn, configured, monkey
+     assert "lanes" not in (profile / "config.yaml").read_text()
+     with pytest.raises(ValueError):
+         kanban_lanes_cli.set_lane("myapp", share=-1)
++
++
++def _stored(conn, title):
++    return conn.execute("SELECT status, priority, created_by, tenant FROM tasks WHERE title=?", (title,)).fetchone()
++
++
++def test_cli_create_keeps_the_user_label_only_for_a_person(conn, configured, monkeypatch, capsys):
++    hermes = ["--assignee", "default", "--tenant", "hermes", "--priority", "1000",
++              "--idempotency-key"]
++    assert cli("create", "typed by me", *hermes, "ci-main-watch:1") == 0
++    assert tuple(_stored(conn, "typed by me")) == ("ready", 1000, "user", "hermes")
++    monkeypatch.setattr(lanes, "_human_shell", lambda: False)  # a chat or cron agent's terminal
++    assert cli("create", "agent default label", *hermes, "ci-main-watch:2") == 0
++    assert tuple(_stored(conn, "agent default label")) == ("triage", 100, "agent", "hermes")
++    assert cli("create", "agent claims dashboard", *hermes, "ci-main-watch:3", "--created-by", "dashboard") == 0
++    assert tuple(_stored(conn, "agent claims dashboard")) == ("triage", 100, "agent", "hermes")
++    # A person typing /kanban create inside a chat runs in a process that carries session markers.
++    parser = argparse.ArgumentParser()
++    build_parser(parser.add_subparsers())
++    args = parser.parse_args(["kanban", "create", "typed in chat", *hermes, "ci-main-watch:4"])
++    args._slash_typed = True
++    assert kanban.kanban_command(args) == 0
++    assert tuple(_stored(conn, "typed in chat")) == ("ready", 1000, "user", "hermes")
++
++
++def test_cli_create_label_is_untouched_without_lanes(conn, monkeypatch):
++    monkeypatch.setattr(lanes, "_human_shell", lambda: False)
++    assert cli("create", "no lanes", "--assignee", "default") == 0
++    assert _stored(conn, "no lanes")["created_by"] == "user"
++
++
++def test_an_agents_cli_admit_spends_the_budget(conn, configured, monkeypatch):
++    from hermes_cli import kanban_cli_actor
++
++    parent = base._hermes_parent(conn)
++    held = _held(conn, parent)
++    monkeypatch.setattr(kanban_cli_actor, "cli_actor", lambda: "agent (chat c1)")
++    assert cli("lanes", "admit", held) == 0
++    assert lanes.admitted_today(conn, "hermes") == 1
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 4f438b27a7034f972bb3438745f88211f60c97d5..2dbca6eae88f170a59164f6800e90c9b1dd8bd52 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -1573,12 +1573,12 @@ kanban:
+ 
+ - **Classification** happens once, at creation: the user's explicit `tenant`, then a lane whose `match` fits (creator name, idempotency-key prefix, repository directory name, or a declared `self_work`), then a tenant an agent passed (workers pass their own card's), the parent's or the creating card's lane, then `lane_default` with a `lane_unclassified` event. Every decision is a `lane_assigned` event with its source.
+ - **Shares are targets, not ceilings.** Under contention each free slot goes to the lane running the fewest cards relative to its `share`; inside a lane the admission score decides. A lane with nothing ready lends its share. Land-turn owners, `urgent`/`capacity` cards and alarm cards go first, in score order, ahead of every lane pick. `paused: true` stops a lane's cards from being dispatched.
+-- **The gate.** In a `gated` lane a card filed by another card, or by a `match` creator or key prefix, starts in `triage` with `block_kind = lane_gate` until it is admitted. The user's own cards (created from a human shell or the dashboard: no worker card and no agent session behind the call), kernel recovery cards, alarm-keyed and `urgent` cards, and `gate_exempt` titles under an admitted creating card are not held. A worker that runs `hermes kanban create` from its shell is an agent, whatever `--created-by` says. A held card that a runnable (todo, ready, running or review) card of another lane is linked to wait on is admitted at once, outside the budget, unless its title is `never_admit`. While the gate is enforced, the stale-triage sweep, `specify` and `decompose` (the auto-decomposer and `--force` included) leave held cards alone; with lanes removed or in shadow they treat them as ordinary triage, so a rollback strands nothing.
++- **The gate.** In a `gated` lane a card filed by another card, or by a `match` creator or key prefix, starts in `triage` with `block_kind = lane_gate` until it is admitted. The user's own cards (a human shell, a slash command the person typed, or the dashboard, with no worker card behind the call), kernel recovery cards, alarm-keyed and `urgent` cards, and `gate_exempt` titles under an admitted creating card are not held. With lanes configured, `hermes kanban create` from an agent's terminal stores `created_by: agent` when it would have stored `user` or `dashboard`. A held card that a runnable (todo, ready, running or review) card of another lane is linked to wait on is admitted at once, outside the budget, unless its title is `never_admit`. While the gate is enforced, the stale-triage sweep, `specify` and `decompose` (the auto-decomposer and `--force` included) leave held cards alone; with lanes removed or in shadow they treat them as ordinary triage, so a rollback strands nothing.
+ - **Shadow mode.** `lane_shadow: true` is the step before enforcement: cards are classified and `hermes kanban lanes` reports them, and each `lane_assigned` event records `would_gate`, but the gate, the cap, the lane ordering and `paused` do nothing.
+ - **Priority cap.** `agent_priority_cap` bounds the stored priority of a card the user did not create, at creation. Later edits are not capped, and the planner may set 0 to 1000.
+ - **Limits.** Worker nodes order foreign pickup with their own board copy, so lane order is exact only on the board that holds the cards; `paused` applies where `lanes` is configured. A worker that parks on a held follow-up card waits until that card is admitted.
+ 
+-`hermes kanban lanes` (default `show`) prints target against actual share of run-hours over `--hours` (default 6), running, ready, held and open cards per lane; on a synced board it reads the fleet replica unless `--local`. `held` and `unclassified` list cards; `assign <id> <lane>`, `admit <id>`, `pin <id> [--off]` and `set <lane> [--share N] [--admit-per-day N] [--pause|--resume]` (always written to the installation-root config) are the controls; a manual `admit` does not spend the daily budget; `explain <id>` says which lane a card is in and why it waits.
++`hermes kanban lanes` (default `show`) prints target against actual share of run-hours over `--hours` (default 6), running, ready, held and open cards per lane; on a synced board it reads the fleet replica unless `--local`. `held` and `unclassified` list cards; `assign <id> <lane>`, `admit <id>`, `pin <id> [--off]` and `set <lane> [--share N] [--admit-per-day N] [--pause|--resume]` (always written to the installation-root config) are the controls; a person's `admit` does not spend the daily budget (an agent's does); `promote` and `unblock` also release a held card and are not budgeted; `explain <id>` says which lane a card is in and why it waits.
+ 
+ `hermes kanban lanes apply <file|->` applies a planner's JSON action list. Each action is validated on its own and refused with a reason when it breaks a limit: `admit` (at most `admit_per_day` per local day, never a `never_admit` title), `merge` (a held card into an open card of the same lane; it stays held), `reprioritize` (0 to 1000, never a pinned card), `relane` (only a card placed by inheritance or by default, never into or out of a gated lane) and `note`. Every action except `note` needs a one-line `reason`; one plan applies at most 50 actions.
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,335 @@
+From fbaa2bf9edf978447c727a8228e59f9cb0cd4666 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 01:13:21 +0000
+Subject: [PATCH] [daveey] Attest native chat creation locally for qualified
+ forwarding
+
+---
+ hermes_cli/kanban_db.py                      |   3 +
+ hermes_cli/kanban_origin_forward.py          |  10 +-
+ hermes_cli/kanban_origin_forward_adapter.py  |   2 +
+ hermes_cli/kanban_origin_forward_decision.py |   4 +-
+ hermes_cli/kanban_origin_native.py           | 101 +++++++++++++++++++
+ tests/hermes_cli/test_origin_native.py       |  94 +++++++++++++++++
+ tools/kanban_tools.py                        |   4 +
+ 7 files changed, 214 insertions(+), 4 deletions(-)
+ create mode 100644 hermes_cli/kanban_origin_native.py
+ create mode 100644 tests/hermes_cli/test_origin_native.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 150f0eaafb3d7d832c4a899e53a0c3b0c0a259b7..a4d71242e926f55734b13e0484938cd12dfabdc7 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1202,6 +1202,7 @@ def create_task(
+     validate_workspace: bool = False, validate_skills: bool = False,
+     human_request: Optional[dict] = None,
+     origin_intent: Optional[dict] = None, chat_origin: Optional[str] = None,
++    native_origin: Optional[dict] = None,
+     requires: Optional[list[str]] = None,
+     lint_blocked: bool = True, runs_on: Optional[Iterable[str]] = None, require_declaration: bool = False,
+     placement_policy: Optional[str] = None,
+@@ -1376,6 +1377,8 @@ def create_task(
+                 )
+                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
+                 initialize_ownership(conn, task_id, creator_task_id, parents, now, chat_origin)
++                from hermes_cli.kanban_origin_native import record as record_native_origin
++                record_native_origin(conn, task_id, native_origin, now)
+             return task_id
+         except sqlite3.IntegrityError:
+             if attempt == 1:
+diff --git a/hermes_cli/kanban_origin_forward.py b/hermes_cli/kanban_origin_forward.py
+index c3a161989a6b5e915593385f65e53d34a8d5d0d7..d53c7175e9f9563cf97ce359420118a177defed1 100644
+--- a/hermes_cli/kanban_origin_forward.py
++++ b/hermes_cli/kanban_origin_forward.py
+@@ -60,7 +60,7 @@ def read_lease(hub, board: str, task_id: str) -> dict | None:
+ 
+ def authorize(*, ledger: Path, origin: dict, creator: dict, gateway: str,
+               profile: str, sender: str, run_uid: str, lease: dict,
+-              now_ms: int, session_exists) -> dict:
++              now_ms: int, session_exists, native_lookup=None) -> dict:
+     """Return an accepted local binding, or refuse without modifying any store.
+ 
+     Authority is admission-time: the transport must freeze a successful decision
+@@ -75,7 +75,13 @@ def authorize(*, ledger: Path, origin: dict, creator: dict, gateway: str,
+             or not isinstance(run_uid, str) or not run_uid
+             or not session_exists(origin["session"])):
+         raise ValueError("origin_forward_identity_invalid")
+-    binding = _local_binding(ledger, origin, creator)
++    binding = native_lookup(origin, creator) if native_lookup is not None else None
++    if binding is None:
++        binding = _local_binding(ledger, origin, creator)
++    else:
++        validate_binding(binding)
++        if binding["origin"] != origin or binding["owner"] != creator or creator["gateway"] != gateway:
++            raise ValueError("origin_forward_binding_missing")
+     if (not isinstance(lease, dict) or lease.get("task_id") != creator["task_id"]
+             or lease.get("holder") != sender[3:] or lease.get("run_uid") != run_uid
+             or type(lease.get("expires")) is not int or lease["expires"] <= now_ms):
+diff --git a/hermes_cli/kanban_origin_forward_adapter.py b/hermes_cli/kanban_origin_forward_adapter.py
+index 9938f31b602d00651272511c5a197661b605cfdc..2b6d9630b60e02625421185805a226064ad04e6f 100644
+--- a/hermes_cli/kanban_origin_forward_adapter.py
++++ b/hermes_cli/kanban_origin_forward_adapter.py
+@@ -34,7 +34,9 @@ def receive(request):
+         # Construct lazily: durable replay needs neither a live lease nor network.
+         return read_lease(Hub(load_identity()), board, task)
+ 
++    from hermes_cli.kanban_origin_native import lookup as native_lookup
+     outbound = prepare(request, path=home / "kanban/origin-forward.db",
++                       native_lookup=lambda origin, creator: native_lookup(origin, creator, gateway=gateway),
+                        ledger=home / "kanban/origin-ledger.db", gateway=gateway, profile=profile,
+                        lease_lookup=lookup, now_ms=lambda: int(time.time() * 1000),
+                        session_exists=lambda sid: bool(_resolve_session(home / "state.db", sid)))
+diff --git a/hermes_cli/kanban_origin_forward_decision.py b/hermes_cli/kanban_origin_forward_decision.py
+index f06af1a5d691820b1f431bb413e54f54f36a4798..bdd0789e66d30e7285b84087b296332349d6267e 100644
+--- a/hermes_cli/kanban_origin_forward_decision.py
++++ b/hermes_cli/kanban_origin_forward_decision.py
+@@ -87,7 +87,7 @@ def _existing(db, identity, canonical):
+ 
+ 
+ def prepare(request: dict, *, path: Path, ledger: Path, gateway: str, profile: str,
+-            lease_lookup, now_ms, session_exists) -> dict:
++            lease_lookup, now_ms, session_exists, native_lookup=None) -> dict:
+     canonical = _canonical(_validated(request, gateway, profile))
+     # Work only with a detached JSON snapshot, including across network I/O.
+     request = json.loads(canonical)
+@@ -111,7 +111,7 @@ def prepare(request: dict, *, path: Path, ledger: Path, gateway: str, profile: s
+         lease = lease_lookup(creator["board"], creator["task_id"])
+         authorize(ledger=ledger, origin=args["origin"], creator=creator, gateway=gateway,
+                   profile=profile, sender=request["from"], run_uid=args["run_uid"],
+-                  lease=lease, now_ms=now_ms(), session_exists=session_exists)
++                  lease=lease, now_ms=now_ms(), session_exists=session_exists, native_lookup=native_lookup)
+         destination = args["destination"]
+         envelope = {"id": "origin-forward-" + hashlib.sha256(identity.encode()).hexdigest(),
+                     "to_gw": destination["gateway"], "coll": "tasks", "action": "create",
+diff --git a/hermes_cli/kanban_origin_native.py b/hermes_cli/kanban_origin_native.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d141a6e967db2ee6b1a7ad1985c01f6a446260f7
+--- /dev/null
++++ b/hermes_cli/kanban_origin_native.py
+@@ -0,0 +1,101 @@
++"""Machine-local creation attestations; never reconstructed from synced rows.
++
++The tool captures interactive context, and create_task records it in its own
++transaction. An inherited receipt is read only from that same primary board.
++"""
++from __future__ import annotations
++
++from contextlib import closing
++import json
++import os
++import sqlite3
++
++from hermes_cli.kanban_origin_ledger import validate_binding
++
++
++def capture(creator_task_id, *, courier=False):
++    """Trusted ambient context, never the tool's session/origin arguments."""
++    if courier:
++        return None
++    worker = os.environ.get("HERMES_KANBAN_TASK")
++    if worker:
++        return {"creator": worker} if creator_task_id == worker else None
++    if creator_task_id:
++        return None
++    from gateway.session_context import get_session_env
++    from hermes_cli.kanban_origin import gateway_names
++    from hermes_cli.profiles import get_active_profile_name
++    from hermes_cli.kanban_session_provenance import _local_session_sources, _INTERACTIVE_SOURCES
++    from hermes_cli.kanban_placement import is_placeholder_session
++    sid = get_session_env("HERMES_SESSION_ID")
++    gateway, profile = gateway_names()[0], get_active_profile_name()
++    if (not gateway or profile == "custom" or not sid or is_placeholder_session(sid)
++            or _local_session_sources([sid]).get(sid) not in _INTERACTIVE_SOURCES):
++        return None
++    return {"origin": {"gateway": gateway, "profile": profile, "session": sid}}
++
++
++def _receipt(conn, task_id):
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='origin_native_receipts'").fetchone():
++        return None
++    row = conn.execute("SELECT binding_json FROM origin_native_receipts WHERE task_id=?", (task_id,)).fetchone()
++    if row is None:
++        return None
++    binding = json.loads(row[0])
++    validate_binding(binding)
++    return binding
++
++
++def record(conn, task_id, context, created_at):
++    """Called inside create_task's transaction; no event or sync projection."""
++    if context is None:
++        return
++    from hermes_cli.kanban_db_sync import _db_key
++    from hermes_cli.kanban_execution_observations import board_owner_profile
++    from hermes_cli.kanban_placement_forward import opened_board
++    from hermes_cli.kanban_origin import gateway_names
++    gateway = gateway_names()[0]
++    profile = board_owner_profile(_db_key(conn))
++    board = opened_board(conn)
++    if not all((gateway, profile, board)):
++        return
++    creator = context.get("creator")
++    if creator:
++        parent = _receipt(conn, creator)
++        expected = {"gateway": gateway, "profile": profile, "board": board, "task_id": creator}
++        if parent is None or parent["owner"] != expected:
++            return
++        origin = parent["origin"]
++    else:
++        origin = context["origin"]
++    if origin["gateway"] != gateway:
++        return
++    binding = {"binding_id": "native-" + task_id, "version": 1, "publication_version": 1,
++               "origin": origin, "owner": {"gateway": gateway, "profile": profile, "board": board,
++                                           "task_id": task_id},
++               "task_record_key": f"{profile}/{board}/{task_id}"}
++    validate_binding(binding)
++    conn.execute("CREATE TABLE IF NOT EXISTS origin_native_receipts (task_id TEXT PRIMARY KEY, "
++                 "binding_json TEXT NOT NULL, inherited_from TEXT, created_at INTEGER NOT NULL)")
++    conn.execute("INSERT INTO origin_native_receipts VALUES (?,?,?,?)",
++                 (task_id, json.dumps(binding, sort_keys=True), creator, created_at))
++
++
++def lookup(origin, creator, *, gateway):
++    """Read only the qualified local primary board; never a shadow replica."""
++    if creator["gateway"] != gateway:
++        return None
++    from hermes_cli.kanban_db import kanban_db_path
++    from hermes_cli.kanban_execution_observations import board_owner_profile
++    from hermes_cli import kanban_lockguard
++    path = kanban_db_path(creator["board"])
++    if not path.exists() or board_owner_profile(path) != creator["profile"]:
++        return None
++    with closing(kanban_lockguard.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
++        from hermes_cli.kanban_placement_forward import opened_board
++        if opened_board(conn) != creator["board"]:
++            return None
++        binding = _receipt(conn, creator["task_id"])
++    if binding and binding["owner"] == creator and binding["origin"] == origin:
++        return binding
++    return None
+diff --git a/tests/hermes_cli/test_origin_native.py b/tests/hermes_cli/test_origin_native.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ae3cbccfe74cff8f7e79f11c2122434cde1a0b31
+--- /dev/null
++++ b/tests/hermes_cli/test_origin_native.py
+@@ -0,0 +1,94 @@
++"""Native attestations are local transaction state, not synced provenance."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_origin_native as native
++
++
++@pytest.fixture
++def scope(monkeypatch):
++    from hermes_cli import kanban_origin, kanban_execution_observations, kanban_placement_forward
++    monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("macbook", []))
++    monkeypatch.setattr(kanban_execution_observations, "board_owner_profile", lambda path: "default")
++    monkeypatch.setattr(kanban_placement_forward, "opened_board", lambda conn: "default")
++    return {"origin": {"gateway": "macbook", "profile": "default", "session": "chat-1"}}
++
++
++def test_transaction_and_inheritance(scope):
++    conn = sqlite3.connect(":memory:")
++    conn.execute("BEGIN")
++    native.record(conn, "t_root", scope, 1)
++    native.record(conn, "t_child", {"creator": "t_root"}, 2)
++    assert native._receipt(conn, "t_child")["origin"] == scope["origin"]
++    assert conn.execute("SELECT inherited_from FROM origin_native_receipts WHERE task_id='t_child'").fetchone()[0] == "t_root"
++    conn.rollback()
++    assert native._receipt(conn, "t_root") is None
++
++
++def test_missing_receipt_and_synced_ancestry_cannot_authorize(scope):
++    conn = sqlite3.connect(":memory:")
++    conn.execute("CREATE TABLE task_chat_links (task_id, chat_gateway, chat_profile, chat_session)")
++    conn.execute("INSERT INTO task_chat_links VALUES ('t_fake','macbook','default','chat-1')")
++    native.record(conn, "t_child", {"creator": "t_fake"}, 2)
++    assert native._receipt(conn, "t_child") is None
++
++
++def test_foreign_parent_namespace_rejected(scope, monkeypatch):
++    conn = sqlite3.connect(":memory:")
++    native.record(conn, "t_root", scope, 1)
++    from hermes_cli import kanban_execution_observations
++    monkeypatch.setattr(kanban_execution_observations, "board_owner_profile", lambda path: "other")
++    native.record(conn, "t_child", {"creator": "t_root"}, 2)
++    assert native._receipt(conn, "t_child") is None
++
++
++@pytest.mark.parametrize("source", ["kanban", "cron", "oneshot", "subagent", None])
++def test_capture_rejects_noninteractive(scope, monkeypatch, source):
++    from gateway import session_context
++    from hermes_cli import kanban_session_provenance, profiles
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.setattr(session_context, "get_session_env", lambda name: "chat-1")
++    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
++    monkeypatch.setattr(kanban_session_provenance, "_local_session_sources", lambda sids: {"chat-1": source})
++    assert native.capture(None) is None
++
++
++def test_capture_ambient_interactive_only(scope, monkeypatch):
++    from gateway import session_context
++    from hermes_cli import kanban_session_provenance, profiles
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.setattr(session_context, "get_session_env", lambda name: "chat-1")
++    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
++    monkeypatch.setattr(kanban_session_provenance, "_local_session_sources", lambda sids: {"chat-1": "desktop"})
++    assert native.capture(None) == scope
++    assert native.capture(None, courier=True) is None
++    assert native.capture("t_forged") is None
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
++    assert native.capture(None) is None
++    assert native.capture("t_other") is None
++    assert native.capture("t_worker") == {"creator": "t_worker"}
++
++
++def test_real_tool_creation_authorizes_native_worker_forward(tmp_path, monkeypatch, capsys):
++    from tests.tools import test_kanban_worker_created_chats as fixtures
++    from hermes_cli import kanban_origin, kanban_db_connect as kbc
++    from hermes_cli.kanban_origin_forward import authorize
++    home = fixtures.make_home(tmp_path, monkeypatch)
++    monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("here", {"here"}))
++    monkeypatch.setenv("HERMES_SESSION_ID", fixtures.CHAT)
++    task = fixtures.create("tool", monkeypatch, capsys)
++    with kbc.connect_closing() as conn:
++        binding = native._receipt(conn, task)
++    assert binding is not None
++    assert binding["origin"] == {"gateway": "here", "profile": "default", "session": fixtures.CHAT}
++    kwargs = dict(ledger=home / "missing-ledger.db", origin=binding["origin"], creator=binding["owner"],
++                  gateway="here", profile="default", sender="gw:worker-7", run_uid="run-1",
++                  lease={"task_id": task, "holder": "worker-7", "run_uid": "run-1", "expires": 200},
++                  now_ms=100, session_exists=lambda sid: sid == fixtures.CHAT,
++                  native_lookup=lambda origin, creator: native.lookup(origin, creator, gateway="here"))
++    assert authorize(**kwargs) == binding
++    kwargs["lease"]["holder"] = "worker-8"
++    with pytest.raises(ValueError, match="lease_invalid"):
++        authorize(**kwargs)
++    assert not (home / "missing-ledger.db").exists()
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 9a2b23cbc6b080b7363d60ae21cd98df6cba17fc..76dee84a188ea4a13b5e1c3fa682bc0881219881 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1657,6 +1657,9 @@ def _handle_create(args: dict, **kw) -> str:
+         marker_placement, runs_on = _landing_placement(conn, args, origin, courier_intent, marker_placement, runs_on,
+                                                        title=title, assignee=assignee, skills=skills, project_id=project_id)
+         _admission_refused(marker_placement)  # raises the typed refusal for a denied hub pin
++        from hermes_cli.kanban_origin_native import capture as capture_native_origin
++        native_origin = (capture_native_origin(self_tid, courier=courier_intent is not None)
++                         if origin is None else None)
+         try:
+             creation_options = dict(
+                 title=_redact(str(title).strip()), body=_redact_opt(args.get("body")), assignee=str(assignee),
+@@ -1690,6 +1693,7 @@ def _handle_create(args: dict, **kw) -> str:
+                 initial_status=str(args.get("initial_status") or "running"),
+                 human_request=kb.redact_review_value(args.get("human_request")),
+                 created_by=(selfwork_intent['sender'] if selfwork_intent is not None else _persisted_identity()), session_id=session_id,
++                native_origin=native_origin,
+                 origin_intent=origin_intent, chat_origin=origin.ref if origin else args.get("origin_session"),
+                 # Reject a worktree path the dispatcher could never resolve now, to the
+                 # creator, instead of burning spawn retries on it later. [daveey]
+-- 
+2.43.0
+

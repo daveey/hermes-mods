@@ -1,0 +1,281 @@
+From 81664154b2719e49706dda384a14b4f7de3e8434 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 00:29:24 +0000
+Subject: [PATCH] fix(sync): preserve loop early-exit telemetry labels [daveey]
+
+The loop service was suspended inside an iteration generator. Closing that
+iterator in the caller's finally injected GeneratorExit, so intentional
+SchemaAhead give-up looked like an error and actual failures lost their type.
+CPU partitions and completion counts were correct; label-only assertions
+were missing from the original early-close test.
+
+Own the active service through an ExitStack in the caller's lexical context.
+Normal iteration completion closes it before checking keep_running again;
+early return exits cleanly, and real exceptions reach the service unchanged.
+Resource cleanup remains outside the measured scope.
+
+Deterministic real-loop regression: SchemaAhead return, RuntimeError and
+KeyboardInterrupt all failed on original source, then passed after the fix.
+Each asserts one record per partition and exact 2 local / 3 Board / 5 total
+CPU units, plus identity-preserving propagation. Added zero/two-iteration
+count and predicate boundary checks. Initial targeted suite 42 passed;
+scripts/check --base origin/main: 21 checks passed. Full consumer run is
+tracked by t_425b16143964c2be. No live CPU P1 or threshold changes.
+---
+ hermes_cli/kanban_sync_client.py              | 105 +++++++++---------
+ hermes_cli/kanban_sync_cpu.py                 |  19 ++--
+ tests/hermes_cli/test_kanban_sync_cpu.py      |  27 ++++-
+ .../test_kanban_sync_schema_guard.py          |  38 +++++++
+ 4 files changed, 125 insertions(+), 64 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 54903e7017093a647360d885b382b39df52f7fd6..ea8512e1de18becd5fc8144aab4e3a32baa7a82a 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1491,61 +1491,60 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+     from hermes_cli.machine_metrics_sender import MetricsSender, board_post
+     sender = MetricsSender(metrics, board_post(ident))
+     sender.start()
+-    rounds = sync_cpu.iterations(keep_running)
+     try:
+-        for _round in rounds:
+-            boards = board_paths()
+-            sweep_gone_board_handles()  # a removed board is never read again: close what it pins (2026-11-13)
+-            for slug, _path in boards:
+-                if slug not in watchers or not watchers[slug].is_alive():
+-                    watcher = FeedWatcher(ident, slug, wake, keep_running, on_change=work.changed,
+-                                          on_state=work.feed_state)
+-                    watchers[slug] = threading.Thread(target=watcher.run, daemon=True, name=f"kanban-feed-{slug}")
+-                    watchers[slug].start()
+-            selected = sync_timing.select(work.select, boards, time.monotonic(), outbox_pending)
+-            selected += [b for b in deferred_repairs_due(boards, _repair_clock()) if b not in selected]
+-            selected += [b for b in backlog.due(boards) if b not in selected]  # a pull backlog drains round by round
+-            picked = time.monotonic()  # a board backing off a failed round waits for it, whatever else is due
+-            selected = [b for b in selected if not work.backing_off(b[0], picked)]
+-            outbox_age.round_started()
+-            results = sync_all_once(hub, boards=selected)
+-            ahead = [r for r in results if (r.error or "").startswith("SchemaAhead")]
+-            if ahead:
+-                _log.error("kanban sync: a newer core migrated this host's board; giving up the sync role")
+-                on_give_up(runstate, ident.gateway, "gave up the sync role: ", [(r.board, r.error) for r in ahead])
+-                return
+-            runstate.clear()  # a completed round: the loop runs
+-            ended = time.monotonic()
+-            for r in results:
+-                if r.skipped:
+-                    work.changed(r.board)  # run it again after BUSY_RETRY_S, as a changed board
+-                    continue
+-                work.finished(r.board, not r.error, ended)  # a failure backs the board off (kanban_sync_work)
+-                if r.push and (r.push.sent or r.push.rejected):
+-                    _log.info("kanban sync: %s %s pulled=%d pushed=%d rejected=%d", r.board, r.mode, r.pulled,
+-                              r.push.sent, r.push.rejected)
+-            # WARNING: an unsent edit older than 10 min after a good round (a skipped round judges nothing)
+-            outbox_age.after_round([r for r in results if not r.skipped], boards)
+-            if time.monotonic() >= next_links and links.request(boards):  # busy: ask again next iteration
+-                next_links = time.monotonic() + LINKS_EVERY_S
+-            sync_timing.report(sender.loop_report)
+-            # From this round's results: a board that stopped behind the head reruns at once; one a tick held is
+-            # retried shortly (a skipped board's stale behind flag would otherwise spin with zero wait).
+-            remaining = 0.0 if any(r.behind for r in results) else max(0.0, work.deadline - time.monotonic())
+-            if any(r.skipped for r in results):
+-                remaining = min(remaining, BUSY_RETRY_S)
+-            now = time.monotonic()
+-            ready = [(s, p) for s, p in boards if not work.backing_off(s, now)]
+-            deferred_due = next_deferred_repair(ready)
+-            if deferred_due is not None:
+-                remaining = min(remaining, max(0.0, deferred_due - _repair_clock()))
+-            # Failed boards' outboxes and deferred repairs wait for backoff; neither may force a zero wait.
+-            retry_in = work.next_retry(now)
+-            if retry_in is not None:
+-                remaining = min(remaining, retry_in)
+-            sync_timing.wait(wait_for_work, wake, [p for _, p in ready], remaining, keep_running)
++        with sync_cpu.iterations(keep_running) as rounds:
++            for _round in rounds:
++                boards = board_paths()
++                sweep_gone_board_handles()  # a removed board is never read again: close what it pins (2026-11-13)
++                for slug, _path in boards:
++                    if slug not in watchers or not watchers[slug].is_alive():
++                        watcher = FeedWatcher(ident, slug, wake, keep_running, on_change=work.changed,
++                                              on_state=work.feed_state)
++                        watchers[slug] = threading.Thread(target=watcher.run, daemon=True, name=f"kanban-feed-{slug}")
++                        watchers[slug].start()
++                selected = sync_timing.select(work.select, boards, time.monotonic(), outbox_pending)
++                selected += [b for b in deferred_repairs_due(boards, _repair_clock()) if b not in selected]
++                selected += [b for b in backlog.due(boards) if b not in selected]  # a pull backlog drains round by round
++                picked = time.monotonic()  # a board backing off a failed round waits for it, whatever else is due
++                selected = [b for b in selected if not work.backing_off(b[0], picked)]
++                outbox_age.round_started()
++                results = sync_all_once(hub, boards=selected)
++                ahead = [r for r in results if (r.error or "").startswith("SchemaAhead")]
++                if ahead:
++                    _log.error("kanban sync: a newer core migrated this host's board; giving up the sync role")
++                    on_give_up(runstate, ident.gateway, "gave up the sync role: ", [(r.board, r.error) for r in ahead])
++                    return
++                runstate.clear()  # a completed round: the loop runs
++                ended = time.monotonic()
++                for r in results:
++                    if r.skipped:
++                        work.changed(r.board)  # run it again after BUSY_RETRY_S, as a changed board
++                        continue
++                    work.finished(r.board, not r.error, ended)  # a failure backs the board off (kanban_sync_work)
++                    if r.push and (r.push.sent or r.push.rejected):
++                        _log.info("kanban sync: %s %s pulled=%d pushed=%d rejected=%d", r.board, r.mode, r.pulled,
++                                  r.push.sent, r.push.rejected)
++                # WARNING: an unsent edit older than 10 min after a good round (a skipped round judges nothing)
++                outbox_age.after_round([r for r in results if not r.skipped], boards)
++                if time.monotonic() >= next_links and links.request(boards):  # busy: ask again next iteration
++                    next_links = time.monotonic() + LINKS_EVERY_S
++                sync_timing.report(sender.loop_report)
++                # From this round's results: a board that stopped behind the head reruns at once; one a tick held is
++                # retried shortly (a skipped board's stale behind flag would otherwise spin with zero wait).
++                remaining = 0.0 if any(r.behind for r in results) else max(0.0, work.deadline - time.monotonic())
++                if any(r.skipped for r in results):
++                    remaining = min(remaining, BUSY_RETRY_S)
++                now = time.monotonic()
++                ready = [(s, p) for s, p in boards if not work.backing_off(s, now)]
++                deferred_due = next_deferred_repair(ready)
++                if deferred_due is not None:
++                    remaining = min(remaining, max(0.0, deferred_due - _repair_clock()))
++                # Failed boards' outboxes and deferred repairs wait for backoff; neither may force a zero wait.
++                retry_in = work.next_retry(now)
++                if retry_in is not None:
++                    remaining = min(remaining, retry_in)
++                sync_timing.wait(wait_for_work, wake, [p for _, p in ready], remaining, keep_running)
+     finally:
+-        rounds.close()
+         links.stop()
+         _LINKS_RUNNER = None  # no stale runner for the next loop's tests to wait on
+         sender.close()
+diff --git a/hermes_cli/kanban_sync_cpu.py b/hermes_cli/kanban_sync_cpu.py
+index d08c0bfb682eb6be6594fd505293695e4f880c93..e69613233c30d8a2f0286d1ce4f15d2e117f8e43 100644
+--- a/hermes_cli/kanban_sync_cpu.py
++++ b/hermes_cli/kanban_sync_cpu.py
+@@ -9,7 +9,7 @@ are nested subsets, NOT additive. All three counters use the same completed-serv
+ boundary; readers reconciling snapshots must require equal runs (record publishes
+ separately). The local counter alone is a directly measured exclusive CPU total.
+ """
+-from contextlib import contextmanager
++from contextlib import ExitStack, contextmanager
+ from functools import wraps
+ import os
+ import threading
+@@ -66,12 +66,17 @@ def board_call(fn):
+     return wrapped
+ 
+ 
++@contextmanager
+ def iterations(keep_running):
+-    """Bracket each complete loop iteration, including its bounded wait.
++    """Own iteration services in the caller's scope, including its bounded wait.
+ 
+-    The caller closes this generator in finally so an early return/exception
+-    closes the suspended service immediately, without relying on garbage collection.
++    The stack sees the caller's real exit, not GeneratorExit from closing a
++    suspended generator. Completed iterations publish before the next predicate.
+     """
+-    while keep_running():
+-        with service("loop"):
+-            yield
++    with ExitStack() as scope:
++        def rounds():
++            while keep_running():
++                scope.enter_context(service("loop"))
++                yield
++                scope.close()
++        yield rounds()
+diff --git a/tests/hermes_cli/test_kanban_sync_cpu.py b/tests/hermes_cli/test_kanban_sync_cpu.py
+index aea02e5941aa6b54a27dd6b7542543499fa04cbb..4fd0331e2c94a4ca0d65a76d7e003e8b428fe7ec 100644
+--- a/tests/hermes_cli/test_kanban_sync_cpu.py
++++ b/tests/hermes_cli/test_kanban_sync_cpu.py
+@@ -131,16 +131,35 @@ def test_board_facade_records_local_work_and_restores(measured, monkeypatch):
+ 
+ def test_iteration_includes_wait_cpu_and_closes_on_early_return(measured):
+     clock, records = measured
+-    rounds = cpu.iterations(lambda: True)
+-    try:
++    with cpu.iterations(lambda: True) as rounds:
+         next(rounds)
+         clock[0] += 5  # local work, including CPU consumed by wait_for_work
+-    finally:
+-        rounds.close()
+     assert values(records, "loop")["sync.cpu.local"] == 5
++    assert len(records) == 3
++    assert all(not data["error"] and data["error_kind"] is None for _, data in records)
+     assert cpu._local.frames == ()
+ 
+ 
++@pytest.mark.parametrize("count", [0, 2])
++def test_iteration_completion_counts_and_predicate_boundary(measured, count):
++    clock, records = measured
++    completed = 0
++
++    def keep_running():
++        assert getattr(cpu._local, "frames", ()) == ()
++        assert len(records) == completed * 3
++        clock[0] += 10  # predicate CPU is outside the iteration, as before
++        return completed < count
++
++    with cpu.iterations(keep_running) as rounds:
++        for _ in rounds:
++            clock[0] += 2
++            completed += 1
++    assert len(records) == count * 3
++    assert all(not data["error"] for _, data in records)
++    assert sum(data["cpu_s"] for name, data in records if name == "sync.cpu.total/loop") == count * 2
++
++
+ def test_inflight_service_is_not_published_until_complete(measured):
+     clock, records = measured
+     with cpu.service("test"):
+diff --git a/tests/hermes_cli/test_kanban_sync_schema_guard.py b/tests/hermes_cli/test_kanban_sync_schema_guard.py
+index 499d1149808d2568706c780957ce8a264378ee89..3fed3ab6402eb4b34860cae6031cabc29b164a4b 100644
+--- a/tests/hermes_cli/test_kanban_sync_schema_guard.py
++++ b/tests/hermes_cli/test_kanban_sync_schema_guard.py
+@@ -418,6 +418,44 @@ def test_mid_loop_schema_ahead_give_up_is_recorded_and_not_overwritten(kanban_ho
+     assert "stopped" not in described
+ 
+ 
++@pytest.mark.parametrize("failure", [None, RuntimeError, KeyboardInterrupt])
++def test_loop_cpu_early_exit_labels_and_partitions(kanban_home, pre_rename_live, svc, monkeypatch, failure):
++    from hermes_cli import kanban_sync_cpu as cpu
++    from types import SimpleNamespace
++
++    clock, records = [0.0], []
++    monkeypatch.setattr(cpu.time, "thread_time", lambda: clock[0])
++    monkeypatch.setattr(cpu.loop_accounting, "record", lambda name, **kw: records.append((name, kw)))
++    boom = failure("round failed") if failure else None
++
++    @cpu.board_call
++    def board_call():
++        clock[0] += 3
++
++    def round_once(hub, boards):
++        clock[0] += 2
++        board_call()
++        if boom is not None:
++            raise boom
++        return [SimpleNamespace(board=BOARD, error="SchemaAhead: tasks: newer_field")]
++
++    monkeypatch.setattr(ksc, "sync_all_once", round_once)
++    if failure:
++        with pytest.raises(failure) as raised:
++            _run_sync_loop(kanban_home, svc, monkeypatch, rounds=3)
++        assert raised.value is boom
++    else:
++        assert _run_sync_loop(kanban_home, svc, monkeypatch, rounds=3) == []
++    loop = [(name, data) for name, data in records if name.endswith("/loop")]
++    assert len(loop) == 3  # exactly one completed run in each partition
++    assert {name: data["cpu_s"] for name, data in loop} == {
++        "sync.cpu.local/loop": 2, "sync.cpu.board_call/loop": 3, "sync.cpu.total/loop": 5}
++    assert all(data["error"] == bool(failure) for _, data in loop)
++    assert all(data["error_kind"] == (failure.__name__ if failure else None) for _, data in loop)
++    assert cpu._local.frames == ()
++    assert not cpu._local.in_call
++
++
+ def test_sync_loop_crash_is_recorded_and_reraised(kanban_home, pre_rename_live, svc, monkeypatch):
+     boom = RuntimeError("board exploded")
+ 
+-- 
+2.43.0
+

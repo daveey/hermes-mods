@@ -1,0 +1,305 @@
+From ea76f21ca945197daf63f333f7ade61adae4ce0a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 15:31:30 +0000
+Subject: [PATCH] fix(kanban): avoid unchanged containment trigger DDL on feed
+ pages [daveey]
+
+Why: every prepare_apply on a containment-enabled replica unconditionally
+recreated eight triggers. Each page advanced schema_version by sixteen even
+when only heartbeat/cursor bookkeeping changed. The links activity key includes
+that cookie, so transport-only pages defeated the new unchanged-board skip.
+The earlier links tests bypassed apply_remote_changes and missed this churn.
+
+Generate the wanted trigger SQL, compare stored definitions, and replace only
+missing/different triggers under the existing atomic writer transaction. When
+definitions and marker observations are settled, register connection functions
+but skip the writer transaction and INSERT backfill. Recheck after acquiring
+the writer. Observation-trigger definitions also receive repair checks.
+
+Preserve recovery of deleted marker observations: exact trigger coverage alone
+is insufficient before a later task page clears its marker. A read-only anti-
+join still scans task markers; this change does NOT claim to remove that scan
+or meet the whole-family live CPU target. No TTL, active-stream, or pending-
+terminal semantics change. Keep the failed-upgrade test with a real schema
+upgrade precondition rather than requiring writes on an unchanged install.
+
+Proof:
+- Parent guard identical to 204e60d772: initial regression file 8 behavioral
+  failures, including schema +16 and real heartbeat feed links-key change.
+- Canonical 32 containment/links files: 527 passed, zero failed.
+- Seven exact-anchor mutants killed: omitted fast return, writer recheck,
+  selective DDL, SQL comparison, observation recovery, episode match, table guard.
+- Full scripts/check --base origin/main passed.
+- Real apply heartbeat pages preserve _links_inputs and skip reconcile/backfill;
+  missing observations still survive a later marker-clear page as a hold.
+
+Follow-up acceptance on owner t_09269f57c7cf61e6: independent exact-head review
+and required CI, canonical ship, natural Mac deployment, then read-only idle
+snapshot family <0.5% of a core at uptime >=3000s. No live measurement claimed.
+---
+ hermes_cli/kanban_containment_guard.py        |  52 +++++-
+ .../test_kanban_containment_paging.py         |   2 +
+ ...est_kanban_containment_schema_stability.py | 158 ++++++++++++++++++
+ 3 files changed, 203 insertions(+), 9 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_containment_schema_stability.py
+
+diff --git a/hermes_cli/kanban_containment_guard.py b/hermes_cli/kanban_containment_guard.py
+index 5bb611f58caef9aec648477e771ceb2176cc1f0d..741f93b7d3dcef72fab8e0a9a3bc230ea015dc15 100644
+--- a/hermes_cli/kanban_containment_guard.py
++++ b/hermes_cli/kanban_containment_guard.py
+@@ -121,9 +121,33 @@ def install(conn: sqlite3.Connection, *, verify_release: Callable[
+     DB. A connection without them fails closed at SQLite, not open on restart.
+     """
+     register(conn, verify_release=verify_release)
++    if _schema_current(conn):
++        return
+     from hermes_cli import kanban_db as kb
+     with kb.write_txn(conn, allow_nested=True):
+-        _install_schema(conn)
++        # Recheck after acquiring the writer: another connection may have repaired
++        # the schema, or changed the columns from which the fence is generated.
++        if not _schema_current(conn):
++            _install_schema(conn)
++
++
++def _stored_triggers(conn: sqlite3.Connection) -> dict[str, str]:
++    return dict(conn.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name GLOB 'containment_*'"))
++
++
++def _schema_current(conn: sqlite3.Connection) -> bool:
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='containment_observations'").fetchone():
++        return False
++    wanted = _trigger_statements(conn)
++    stored = _stored_triggers(conn)
++    if not all(stored.get(name) == sql for name, sql in wanted.items()):
++        return False
++    # Preserve recovery of a missing observation before a later feed page can
++    # clear its task marker. Intact triggers alone do not certify backfill.
++    return conn.execute(
++        "SELECT 1 FROM tasks t WHERE containment_episode IS NOT NULL AND NOT EXISTS "
++        "(SELECT 1 FROM containment_observations o WHERE o.task_id=t.id AND o.episode=t.containment_episode) LIMIT 1"
++    ).fetchone() is None
+ 
+ 
+ def _install_schema(conn: sqlite3.Connection) -> None:
+@@ -132,15 +156,24 @@ def _install_schema(conn: sqlite3.Connection) -> None:
+                  "PRIMARY KEY(task_id,episode))")
+     conn.execute("INSERT OR IGNORE INTO containment_observations SELECT id,containment_episode FROM tasks "
+                  "WHERE containment_episode IS NOT NULL")
+-    for operation in ("INSERT", "UPDATE OF containment_episode"):
+-        name = operation.split()[0].lower()
+-        conn.execute(f"CREATE TRIGGER IF NOT EXISTS containment_observe_{name} AFTER {operation} ON tasks "
+-                     "WHEN NEW.containment_episode IS NOT NULL BEGIN INSERT OR IGNORE INTO containment_observations "
+-                     "VALUES (NEW.id,NEW.containment_episode); END")
+     _triggers(conn)
+ 
+ 
+ def _triggers(conn: sqlite3.Connection) -> None:
++    stored = _stored_triggers(conn)
++    for name, sql in _trigger_statements(conn).items():
++        if stored.get(name) != sql:
++            conn.execute(f'DROP TRIGGER IF EXISTS "{name}"')
++            conn.execute(sql)
++
++
++def _trigger_statements(conn: sqlite3.Connection) -> dict[str, str]:
++    wanted = {}
++    for operation in ("INSERT", "UPDATE OF containment_episode"):
++        name = "containment_observe_" + operation.split()[0].lower()
++        wanted[name] = (f"CREATE TRIGGER {name} AFTER {operation} ON tasks "
++                        "WHEN NEW.containment_episode IS NOT NULL BEGIN INSERT OR IGNORE INTO containment_observations "
++                        "VALUES (NEW.id,NEW.containment_episode); END")
+     held = "kanban_containment_held"
+     permit = "kanban_containment_write"
+     fail = "SELECT RAISE(ABORT,'containment_pending');"
+@@ -173,6 +206,7 @@ def _triggers(conn: sqlite3.Connection) -> None:
+         if op == "insert":
+             condition = f"({condition}) AND NOT kanban_containment_sync_edge(NEW.parent_id,NEW.child_id)"
+         statements[f"edge_{op}"] = (f"BEFORE {op.upper()} ON task_links", condition)
+-    for name, (operation, condition) in statements.items():
+-        conn.execute(f"DROP TRIGGER IF EXISTS containment_{name}")
+-        conn.execute(f"CREATE TRIGGER containment_{name} {operation} WHEN {condition} BEGIN {fail} END")
++    for suffix, (operation, condition) in statements.items():
++        name = f"containment_{suffix}"
++        wanted[name] = f"CREATE TRIGGER {name} {operation} WHEN {condition} BEGIN {fail} END"
++    return wanted
+diff --git a/tests/hermes_cli/test_kanban_containment_paging.py b/tests/hermes_cli/test_kanban_containment_paging.py
+index ac502f40c5f73edb4879a4c4c54b09e15183ac04..6ba663f46586f6432fadc77ef777299472c483af 100644
+--- a/tests/hermes_cli/test_kanban_containment_paging.py
++++ b/tests/hermes_cli/test_kanban_containment_paging.py
+@@ -78,6 +78,8 @@ def test_failed_trigger_upgrade_retains_prior_fence(board, monkeypatch):
+         conn.execute("DROP TRIGGER containment_task_update")
+         raise sqlite3.OperationalError("fixture interrupted migration")
+ 
++    # A settled install is read-only. Change a real input to request an upgrade.
++    board.execute("ALTER TABLE task_events ADD COLUMN fixture_upgrade TEXT")
+     monkeypatch.setattr(guard, "_triggers", interrupted)
+     with pytest.raises(sqlite3.OperationalError, match="interrupted migration"):
+         guard.install(board)
+diff --git a/tests/hermes_cli/test_kanban_containment_schema_stability.py b/tests/hermes_cli/test_kanban_containment_schema_stability.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c99e4958ec8b06f112285d4ad1d2c4cdcf47d690
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_containment_schema_stability.py
+@@ -0,0 +1,158 @@
++"""Containment feed preparation must not invalidate unchanged replica readers."""
++import contextlib
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_activity_revision as rev
++from hermes_cli import kanban_containment_guard as guard
++from hermes_cli import kanban_containment_replica as replica
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from tests.hermes_cli import test_kanban_sync_steady_links as f
++
++kanban_home = f.kanban_home
++ledger = f.ledger
++live = f.live
++spies = f.spies
++scope = f.scope
++
++
++@pytest.fixture
++def shadow(live, scope):
++    conn = ksc.open_shadow(f.BOARD, f.ME)
++    guard.install(conn)
++    conn.execute('PRAGMA wal_autocheckpoint=0')
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def test_prepare_apply_preserves_schema_and_revision(shadow):
++    before = rev.read_key(shadow, rev.SHADOW_TABLES)
++    assert before is not None
++    cookie = shadow.execute('PRAGMA schema_version').fetchone()[0]
++    for _ in range(2):
++        replica.prepare_apply(shadow, [])
++        assert shadow.execute('PRAGMA schema_version').fetchone()[0] == cookie
++        assert rev.read_key(shadow, rev.SHADOW_TABLES) == before
++
++
++def test_settled_install_is_read_only_but_registers_functions(shadow):
++    sql = []
++    shadow.set_trace_callback(sql.append)
++    try:
++        guard.install(shadow)
++    finally:
++        shadow.set_trace_callback(None)
++    assert not any(s.upper().startswith(('BEGIN', 'SAVEPOINT', 'INSERT', 'CREATE', 'DROP')) for s in sql), sql
++    path = shadow.execute('PRAGMA database_list').fetchone()[2]
++    peer = sqlite3.connect(path)
++    try:
++        guard.install(peer)
++        assert peer.execute("SELECT kanban_containment_write('none')").fetchone()[0] == 0
++        assert not peer.in_transaction
++    finally:
++        peer.close()
++
++
++@pytest.mark.parametrize('damage', ['missing', 'different', 'column', 'observe', 'table'])
++def test_install_repairs_changed_schema_and_preserves_fence(shadow, damage):
++    expected = dict(shadow.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name GLOB 'containment_*'"))
++    if damage == 'column':
++        shadow.execute('ALTER TABLE task_events ADD COLUMN fixture_extra TEXT')
++    elif damage == 'table':
++        shadow.execute('DROP TABLE containment_observations')
++    else:
++        name = 'containment_observe_update' if damage == 'observe' else 'containment_task_update'
++        shadow.execute(f'DROP TRIGGER {name}')
++        if damage != 'missing':
++            shadow.execute(f'CREATE TRIGGER {name} BEFORE UPDATE ON tasks BEGIN SELECT 1; END')
++    cookie = shadow.execute('PRAGMA schema_version').fetchone()[0]
++    guard.install(shadow)
++    repaired = dict(shadow.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name GLOB 'containment_*'"))
++    after = shadow.execute('PRAGMA schema_version').fetchone()[0]
++    assert after > cookie
++    if damage in ('different', 'column', 'observe'):
++        assert after == cookie + 2, 'only the changed trigger should be replaced'
++    if damage == 'missing':
++        assert after == cookie + 1
++    if damage == 'column':
++        assert 'fixture_extra' in repaired['containment_event_update']
++    else:
++        assert repaired == expected
++    shadow.execute("INSERT INTO tasks (id,title,status,created_at,containment_episode) VALUES ('t_held','held','triage',1,'episode')")
++    assert shadow.execute("SELECT episode FROM containment_observations WHERE task_id='t_held'").fetchone()[0] == 'episode'
++    with pytest.raises(sqlite3.IntegrityError, match='containment_pending'):
++        shadow.execute("UPDATE tasks SET status='ready' WHERE id='t_held'")
++    stable = shadow.execute('PRAGMA schema_version').fetchone()[0]
++    guard.install(shadow)
++    assert shadow.execute('PRAGMA schema_version').fetchone()[0] == stable
++
++
++def test_prepare_apply_repairs_missing_observation_before_marker_clear(shadow):
++    shadow.execute("INSERT INTO tasks (id,title,status,created_at,containment_episode) VALUES ('t_repair','held','triage',1,'episode')")
++    shadow.execute("DELETE FROM containment_observations WHERE task_id='t_repair'")
++    # A different episode for the same task must not mask the missing marker.
++    shadow.execute("INSERT INTO containment_observations VALUES ('t_repair','older')")
++    cookie = shadow.execute('PRAGMA schema_version').fetchone()[0]
++    replica.prepare_apply(shadow, [])
++    assert shadow.execute("SELECT 1 FROM containment_observations WHERE task_id='t_repair' AND episode='episode'").fetchone()
++    assert shadow.execute('PRAGMA schema_version').fetchone()[0] == cookie
++    change = sync.RemoteChange(1, 'tasks', 't_repair', 'upsert',
++                               {'status': 'ready', 'containment_episode': None}, 100, '', f.OTHER)
++    sync.apply_remote_changes(shadow, [change], new_cursor=1, board=f.BOARD, observers=False)
++    assert guard.pending(shadow, 't_repair')
++    assert shadow.execute("SELECT status FROM tasks WHERE id='t_repair'").fetchone()[0] == 'triage'
++
++
++def test_rechecks_after_writer_acquisition(shadow, monkeypatch):
++    from hermes_cli import kanban_db as kb
++
++    path = shadow.execute('PRAGMA database_list').fetchone()[2]
++    peer = sqlite3.connect(path, isolation_level=None)
++    guard.register(peer)
++    wanted = shadow.execute("SELECT sql FROM sqlite_master WHERE name='containment_task_update'").fetchone()[0]
++    shadow.execute('DROP TRIGGER containment_task_update')
++    original = kb.write_txn
++    repaired = []
++
++    @contextlib.contextmanager
++    def raced(conn, **kwargs):
++        # A different installer finishes after the first check, before our lock.
++        with original(peer):
++            peer.execute(wanted)
++        repaired.append(True)
++        with original(conn, **kwargs):
++            yield
++
++    def unexpected_backfill(conn):
++        pytest.fail('a peer already repaired the schema; no backfill is needed')
++
++    monkeypatch.setattr(kb, 'write_txn', raced)
++    monkeypatch.setattr(guard, '_install_schema', unexpected_backfill)
++    try:
++        guard.install(shadow)
++        assert repaired == [True]
++    finally:
++        peer.close()
++
++
++def test_heartbeat_feed_page_keeps_links_inputs_and_skips(shadow, live, ledger, kanban_home, spies):
++    settled = f._settled(live, ledger, kanban_home, spies)
++    def inputs():
++        return ksc._links_inputs(live, kanban_home / 'kanban.db', f.BOARD, f.ME,
++                                 sync.board_mode(live), {}, ())
++    before = inputs()
++    assert before is not None
++    for seq in (1, 2):
++        change = sync.RemoteChange(seq, 'task_events', sync.uuid7(), 'upsert',
++                                   {'task_id': 't_foreign', 'kind': 'heartbeat', 'payload': '{}', 'created_at': seq},
++                                   seq, '', f.OTHER)
++        sync.apply_remote_changes(shadow, [change], new_cursor=seq, board=f.BOARD, observers=False)
++        assert shadow.execute("SELECT COUNT(*) FROM task_events WHERE kind='heartbeat'").fetchone()[0] == seq
++        assert inputs() == before
++        f._pass(kanban_home)
++    assert spies == {'reconcile': 0, 'backfill': 0}
++    assert f._links(live) == settled
+-- 
+2.43.0
+

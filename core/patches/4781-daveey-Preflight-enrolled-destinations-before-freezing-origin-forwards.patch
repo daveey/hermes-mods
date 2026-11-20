@@ -1,0 +1,262 @@
+From ccfa93a41dadadb0857c9e72b16a36e239100314 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 06:42:33 +0000
+Subject: [PATCH] [daveey] Preflight enrolled destinations before freezing
+ origin forwards
+
+Read fresh authenticated /v2/machines only after origin and lease authorization; never use synced discovery as authority. Durable retries skip the lookup. Unknown destinations reject, malformed/unavailable inventory remains pending. Proof: focused suites, real courier three-hop fixture, and 12 exact-anchor killing mutations.
+---
+ hermes_cli/kanban_origin_destination.py       |  29 +++++
+ hermes_cli/kanban_origin_forward_adapter.py   |   3 +-
+ hermes_cli/kanban_origin_forward_decision.py  |   6 +-
+ tests/hermes_cli/test_origin_destination.py   | 114 ++++++++++++++++++
+ .../hermes_cli/test_origin_forward_adapter.py |   3 +
+ .../test_origin_forward_decision.py           |   2 +
+ tests/origin_transport/test_forwarding.py     |   2 +
+ 7 files changed, 157 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/kanban_origin_destination.py
+ create mode 100644 tests/hermes_cli/test_origin_destination.py
+
+diff --git a/hermes_cli/kanban_origin_destination.py b/hermes_cli/kanban_origin_destination.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..693e171a1a7384ccce3aac42a6690ed437d8bdae
+--- /dev/null
++++ b/hermes_cli/kanban_origin_destination.py
+@@ -0,0 +1,29 @@
++"""Admission-only destination evidence from the authenticated enrollment registry.
++
++GET /v2/machines reads active Mailbox enrollments directly (no pagination).
++Never use the synced gateway discovery records or the worker-node cache here.
++Enrollment is not origin authority, placement permission, or receiver liveness.
++"""
++import re
++
++
++_COMPONENT = r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}"
++
++
++def require_destination(inventory, *, gateway, destination):
++    """Validate a fresh complete registry reply before accepting its membership."""
++    if (not isinstance(inventory, dict) or inventory.get("me") != gateway
++            or not isinstance(inventory.get("machines"), list)):
++        raise ValueError("origin_forward_inventory_unavailable")
++    names = set()
++    for row in inventory["machines"]:
++        if (not isinstance(row, dict) or not isinstance(row.get("name"), str)
++                or re.fullmatch(_COMPONENT, row["name"]) is None
++                or row.get("state") != "active" or row["name"] in names):
++            raise ValueError("origin_forward_inventory_unavailable")
++        names.add(row["name"])
++    # The authenticated caller must appear in the same active registry snapshot.
++    if gateway not in names:
++        raise ValueError("origin_forward_inventory_unavailable")
++    if destination not in names:
++        raise ValueError("origin_forward_destination_unknown")
+diff --git a/hermes_cli/kanban_origin_forward_adapter.py b/hermes_cli/kanban_origin_forward_adapter.py
+index 2b6d9630b60e02625421185805a226064ad04e6f..68bfce52ffecf519e0bfd811f4440c2e08b2adbb 100644
+--- a/hermes_cli/kanban_origin_forward_adapter.py
++++ b/hermes_cli/kanban_origin_forward_adapter.py
+@@ -38,6 +38,7 @@ def receive(request):
+     outbound = prepare(request, path=home / "kanban/origin-forward.db",
+                        native_lookup=lambda origin, creator: native_lookup(origin, creator, gateway=gateway),
+                        ledger=home / "kanban/origin-ledger.db", gateway=gateway, profile=profile,
++                       inventory_lookup=lambda: Hub(load_identity()).machines(),
+                        lease_lookup=lookup, now_ms=lambda: int(time.time() * 1000),
+                        session_exists=lambda sid: bool(_resolve_session(home / "state.db", sid)))
+     return {"status": "prepared", "handoff_complete": False, "outbound": outbound}
+@@ -57,7 +58,7 @@ def command(args):
+         if not re.fullmatch(r"origin_[a-z_]+", code):
+             code = "origin_forward_request_invalid"
+         # Incomplete snapshots are absence of evidence, not a terminal decision.
+-        status = "pending" if code == "origin_forward_lease_unavailable" else "rejected"
++        status = "pending" if code in {"origin_forward_lease_unavailable", "origin_forward_inventory_unavailable"} else "rejected"
+         result = {"status": status, "code": code, "handoff_complete": False}
+     print(json.dumps(result))
+     return 0
+diff --git a/hermes_cli/kanban_origin_forward_decision.py b/hermes_cli/kanban_origin_forward_decision.py
+index 223724775519382a54fdd928b073a1f7b8e48529..9a2b2295e788e7883d6bb54d2cdf0584a0f4dc33 100644
+--- a/hermes_cli/kanban_origin_forward_decision.py
++++ b/hermes_cli/kanban_origin_forward_decision.py
+@@ -87,7 +87,7 @@ def _existing(db, identity, canonical):
+ 
+ 
+ def prepare(request: dict, *, path: Path, ledger: Path, gateway: str, profile: str,
+-            lease_lookup, now_ms, session_exists, native_lookup=None) -> dict:
++            lease_lookup, inventory_lookup, now_ms, session_exists, native_lookup=None) -> dict:
+     canonical = _canonical(_validated(request, gateway, profile))
+     # Work only with a detached JSON snapshot, including across network I/O.
+     request = json.loads(canonical)
+@@ -113,6 +113,10 @@ def prepare(request: dict, *, path: Path, ledger: Path, gateway: str, profile: s
+                   profile=profile, sender=request["from"], run_uid=args["run_uid"],
+                   lease=lease, now_ms=now_ms(), session_exists=session_exists, native_lookup=native_lookup)
+         destination = args["destination"]
++        from hermes_cli.kanban_origin_destination import require_destination
++        # Membership is admission evidence only, never origin authority. A fresh
++        # authenticated read follows authorization; durable replay skips it.
++        require_destination(inventory_lookup(), gateway=gateway, destination=destination["gateway"])
+         envelope = {"id": "origin-forward-" + hashlib.sha256(identity.encode()).hexdigest(),
+                     "to_gw": destination["gateway"], "coll": "tasks", "action": "create",
+                     "key": f"{destination['profile']}/{destination['board']}",
+diff --git a/tests/hermes_cli/test_origin_destination.py b/tests/hermes_cli/test_origin_destination.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..27922724525d7226cfe6a58c686f34fa244d7812
+--- /dev/null
++++ b/tests/hermes_cli/test_origin_destination.py
+@@ -0,0 +1,114 @@
++"""Enrollment preflight is fresh evidence, not forwarding authority."""
++import copy
++import sqlite3
++
++import pytest
++
++from hermes_cli.kanban_origin_destination import require_destination
++from tests.hermes_cli import test_origin_forward_decision as decisions
++from tests.hermes_cli import test_origin_forward_adapter as adapter
++
++forwarding = decisions.forwarding
++authority = decisions.authority
++world = adapter.world
++envelope = adapter.envelope
++
++
++def inventory(*names):
++    return {"me": "macbook", "machines": [{"name": n, "state": "active"} for n in names]}
++
++
++@pytest.mark.parametrize("value", [None, [], {}, {"me": "other", "machines": []},
++    inventory("macbook", "hub") | {"me": "other"},
++    {"me": "macbook", "machines": tuple(inventory("macbook", "hub")["machines"])},
++    {"me": "macbook", "machines": {}}, inventory(), inventory("hub"),
++    {"me": "macbook", "machines": [None]},
++    {"me": "macbook", "machines": [{"name": 1, "state": "active"}]},
++    inventory("bad/name", "macbook", "hub"), inventory("macbook", "hub", "hub"),
++    {"me": "macbook", "machines": [{"name": "macbook", "state": "active"},
++                                      {"name": "hub", "state": "revoked"}]}])
++def test_malformed_registry_is_unavailable(value):
++    with pytest.raises(ValueError, match="^origin_forward_inventory_unavailable$"):
++        require_destination(value, gateway="macbook", destination="hub")
++
++
++def test_valid_registry_distinguishes_unknown_destination():
++    require_destination(inventory("macbook", "hub"), gateway="macbook", destination="hub")
++    with pytest.raises(ValueError, match="^origin_forward_destination_unknown$"):
++        require_destination(inventory("macbook"), gateway="macbook", destination="hub")
++
++
++def test_preflight_is_after_authorization_before_freeze(forwarding):
++    calls = []
++
++    def lookup():
++        calls.append(True)
++        return inventory("macbook")
++
++    with pytest.raises(ValueError, match="origin_forward_lease_invalid"):
++        decisions.decide(forwarding, lease_lookup=lambda *args: None, inventory_lookup=lookup)
++    assert calls == []
++    with pytest.raises(ValueError, match="origin_forward_destination_unknown"):
++        decisions.decide(forwarding, inventory_lookup=lookup)
++    assert calls == [True]
++    with sqlite3.connect(forwarding[1]["path"]) as db:
++        assert db.execute("SELECT count(*) FROM decisions").fetchone()[0] == 0
++
++
++def test_new_admission_reads_fresh_inventory_but_replay_skips_it(forwarding):
++    calls = []
++
++    def lookup():
++        calls.append(True)
++        return inventory("macbook", "hub") if len(calls) == 1 else inventory("macbook")
++
++    first = decisions.decide(forwarding, inventory_lookup=lookup)
++    assert decisions.decide(forwarding, inventory_lookup=lookup) == first
++    assert len(calls) == 1
++    changed = copy.deepcopy(forwarding[0])
++    changed["id"] += "-new"
++    with pytest.raises(ValueError, match="origin_forward_destination_unknown"):
++        decisions.decide(forwarding, changed, inventory_lookup=lookup)
++    assert len(calls) == 2
++
++
++def test_inventory_is_not_creator_equality_or_liveness_gate(forwarding):
++    # A third enrolled destination need not be creator, origin, or recently seen.
++    changed = copy.deepcopy(forwarding[0])
++    changed["args"]["destination"]["gateway"] = "third"
++    data = inventory("macbook", "third")
++    data["machines"][1].update(last_seen=0, pickup=None, hold=True)
++    assert decisions.decide(forwarding, changed, inventory_lookup=lambda: data)["to_gw"] == "third"
++
++
++def test_lease_expiry_during_inventory_read_is_rechecked(forwarding):
++    clock = [1000]
++
++    def lookup():
++        clock[0] = 2000
++        return inventory("macbook", "hub")
++
++    with pytest.raises(ValueError, match="origin_forward_lease_invalid"):
++        decisions.decide(forwarding, inventory_lookup=lookup, now_ms=lambda: clock[0])
++
++
++@pytest.mark.parametrize("mode,status,code", [
++    ("unknown", "rejected", "origin_forward_destination_unknown"),
++    ("malformed", "pending", "origin_forward_inventory_unavailable"),
++    ("offline", "pending", "origin_forward_evidence_unavailable")])
++def test_real_adapter_inventory_failure_and_recovery(world, monkeypatch, capsys, envelope, mode, status, code):
++    from hermes_cli.kanban_sync_client import Hub
++
++    def unavailable(self):
++        if mode == "offline":
++            raise OSError("offline")
++        if mode == "malformed":
++            return {}
++        return {"me": "origin", "machines": [{"name": "origin", "state": "active"}]}
++
++    monkeypatch.setattr(Hub, "machines", unavailable)
++    result = adapter.invoke(world, monkeypatch, capsys, envelope)
++    assert result == {"status": status, "code": code, "handoff_complete": False}
++    monkeypatch.setattr(Hub, "machines", lambda self: {"me": "origin", "machines": [
++        {"name": "origin", "state": "active"}, {"name": "owner", "state": "active"}]})
++    assert adapter.invoke(world, monkeypatch, capsys, envelope)["status"] == "prepared"
+diff --git a/tests/hermes_cli/test_origin_forward_adapter.py b/tests/hermes_cli/test_origin_forward_adapter.py
+index 5e26c55b179c2c1f41b665060907b434beb35b86..c0c6787219ed0611ad27e69653b51833bf321277 100644
+--- a/tests/hermes_cli/test_origin_forward_adapter.py
++++ b/tests/hermes_cli/test_origin_forward_adapter.py
+@@ -26,6 +26,9 @@ def envelope(world, monkeypatch, capsys):
+     assert helpers.invoke(world, monkeypatch, capsys)["status"] == "accepted"
+     binding = world[3]["args"]["binding"]
+     monkeypatch.setattr(kanban_sync_client, "load_identity", lambda: None)
++    monkeypatch.setattr(kanban_sync_client.Hub, "machines", lambda self: {
++        "me": "origin", "machines": [{"name": "origin", "state": "active"},
++                                      {"name": "owner", "state": "active"}]})
+     monkeypatch.setattr(kanban_sync_client.Hub, "snapshot_page", lambda *a, **k: {
+         "table": "leases", "rows": [{"task_id": "t_one", "holder": "worker-7", "run_uid": "run-1",
+                                     "expires": 9999999999999}], "more": False})
+diff --git a/tests/hermes_cli/test_origin_forward_decision.py b/tests/hermes_cli/test_origin_forward_decision.py
+index f87dc282907b3cb277434747a47f5e6086f9ffa3..001234f9acafa64b4b523d99dda3d62dada06ec7 100644
+--- a/tests/hermes_cli/test_origin_forward_decision.py
++++ b/tests/hermes_cli/test_origin_forward_decision.py
+@@ -26,6 +26,8 @@ def forwarding(authority, tmp_path):
+         return lease
+ 
+     options = dict(path=tmp_path / "forward.db", ledger=path, gateway="macbook", profile="default",
++                   inventory_lookup=lambda: {"me": "macbook", "machines": [
++                       {"name": "macbook", "state": "active"}, {"name": "hub", "state": "active"}]},
+                    lease_lookup=lookup, now_ms=lambda: 1000, session_exists=lambda sid: sid == "chat-1")
+     return request, options, calls
+ 
+diff --git a/tests/origin_transport/test_forwarding.py b/tests/origin_transport/test_forwarding.py
+index 747154554c2bae4dbf8ef421bcdc76d9a7531c72..b9b07d1b85a80bcb9ab4cee91d45510dc9ca19f2 100644
+--- a/tests/origin_transport/test_forwarding.py
++++ b/tests/origin_transport/test_forwarding.py
+@@ -118,6 +118,8 @@ def network(courier, tmp_path, monkeypatch):
+     with host("hub"):
+         kb.init_db()
+     monkeypatch.setattr(kanban_sync_client, "load_identity", lambda: None)
++    monkeypatch.setattr(kanban_sync_client.Hub, "machines", lambda self: {
++        "me": "macbook", "machines": [{"name": name, "state": "active"} for name in roots]})
+     monkeypatch.setattr(kanban_sync_client.Hub, "snapshot_page", lambda *a, **k: {
+         "table": "leases", "rows": [{"task_id": "t_parent", "holder": "worker-7", "run_uid": "run-one",
+                                     "expires": 9999999999999}], "more": False})
+-- 
+2.43.0
+

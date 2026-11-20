@@ -1,0 +1,406 @@
+From f518c3aec38057e0a9954e2de1ef74b0332f3f85 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 22:48:17 +0000
+Subject: [PATCH] feat(kanban): partition sync-thread local and Board CPU
+ [daveey]
+
+The first post-deployment P1 could not resolve the unchanged local <=1%
+acceptance: sync.board includes synchronous Board HTTP and JSON CPU. The
+saved 1.98% inclusive result therefore proved neither local success nor
+failure. A scope amendment authorized bounded accounting and one new P1,
+not a threshold waiver or further performance/harness experiments.
+
+Measure completed same-thread loop iterations and nested board services;
+exclude only outermost Hub._call CPU, including serialization, HTTP/TLS,
+retries, fallback and decoding. Keep wait_for_work CPU and attachment
+caller preparation conservative/local. Preserve existing inclusive passes.
+Separate-thread attachment transfers, feed and metrics work are explicitly
+outside this envelope, never subtracted from calling-thread CPU. Document
+completed-service and equal-run snapshot requirements.
+
+Proof: decorator-omission RED gives 4 failures; restored 82 tests across
+partition/timing suites and 74 loop-accounting/metrics consumers pass.
+Full scripts/check --base origin/main passes. Full affected consumer gate
+runs separately before publication. No new live P1 or runtime change.
+---
+ docs/sync-cpu-accounting.md              |  42 ++++++
+ hermes_cli/kanban_sync_client.py         |   6 +-
+ hermes_cli/kanban_sync_cpu.py            |  77 +++++++++++
+ hermes_cli/kanban_sync_timing.py         |   8 +-
+ tests/hermes_cli/test_kanban_sync_cpu.py | 160 +++++++++++++++++++++++
+ 5 files changed, 290 insertions(+), 3 deletions(-)
+ create mode 100644 docs/sync-cpu-accounting.md
+ create mode 100644 hermes_cli/kanban_sync_cpu.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_cpu.py
+
+diff --git a/docs/sync-cpu-accounting.md b/docs/sync-cpu-accounting.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..04fa543bb23cd0e874e1cb12e44c2db4c40a80b2
+--- /dev/null
++++ b/docs/sync-cpu-accounting.md
+@@ -0,0 +1,42 @@
++# Sync CPU partition
++
++The always-on loop accounting snapshot includes `sync.cpu.local/loop`,
++`sync.cpu.board_call/loop`, and `sync.cpu.total/loop`. These measure completed
++iterations of the synchronous sync loop with `time.thread_time`, including
++selection, handle maintenance, outbox checks, board work, and CPU consumed by
++`wait_for_work`. Blocked wall time consumes no thread CPU.
++
++Only synchronous `Hub._call` is excluded from local CPU. This includes request
++serialization, HTTP/TLS, retries, redirect fallback, response decoding and error
++handling. Nested calls count once. Calls on other threads or outside a service
++are not attributed. Attachment preparation and caller-side waiting remain local
++(conservative); detached attachment transfers, metrics sender and feed watchers
++are separate threads, not falsely subtracted from the calling thread.
++
++`sync.cpu.{local,board_call,total}/board/<slug>` is a nested subset of the loop,
++not an additional cost. Existing `sync.board/*` and `sync.parents/*` retain their
++inclusive semantics. The total partition scope is slightly wider than the old
++board pass, since it includes that pass's bookkeeping. Do not subtract one family
++from the other. The asynchronous links pass is also a separate thread: these
++counters alone make no assertion about its CPU or the entire gateway process.
++
++## Reading an authorized observation
++
++Use two fresh snapshots from one PID/process-start identity, after deployment and
++normal gateway restart. Require a sufficient elapsed interval and unchanged code
++identity; retain both raw snapshots. Subtract cumulative CPU and runs, divide CPU
++seconds by elapsed seconds, and multiply by 100 for percent of one core. Never
++subtract a historical network estimate. The local counter is an exclusive
++measurement, not a residual inferred from other threads.
++
++The three counters publish separately, once at service exit. Require equal runs
++for the three members at **both** endpoints before reconciling total = local +
++Board-call. A snapshot taken during publication is not a usable reconciliation
++endpoint. In-flight iterations are not published until completion, so these are
++completed-service deltas, not exact integration over snapshot timestamps. Keep
++this boundary qualification with the result. A shutdown closes the suspended
++iteration in finally; a pre-fork scope is not mixed with a child's CPU clock.
++
++The local-loop measurement is wider than the original per-board envelope but
++still thread-scoped. Do not present it as all-thread gateway acceptance. Preserve
++any task-specific side-thread accounting requirements and correctness gates.
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index b3d4d1ead1ffaa5b16bdd4db05ba14d26ab84cd9..32b40f856b74e7e8b5e15411326a1fd67b9b1df4 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -46,6 +46,7 @@ from hermes_cli import kanban_sync_backlog as backlog  # page budget per pull; b
+ from hermes_cli import kanban_sync_outbox_age as outbox_age  # oldest pending op: status, WARNING, defect card
+ from hermes_cli.kanban_sync_backlog import BUSY_RETRY_S, PULL_PAGE_BUDGET, Pulled
+ from hermes_cli import kanban_sync_timing as sync_timing  # off unless kanban.sync.diagnostics.timing_until arms it
++from hermes_cli import kanban_sync_cpu as sync_cpu
+ from hermes_cli.kanban_sync_connections import connection, connection_scope, invalidate
+ from hermes_cli.kanban_sync_hub_routes import HubRoutesMixin
+ from hermes_cli.kanban_sync_client_attempt import note_attempt, raise_bounded_error, replay_after_timeout
+@@ -286,6 +287,7 @@ class Hub(HubRoutesMixin):
+                 raise BoardBudgetExhausted("Board request budget exhausted")
+         return timeout
+ 
++    @sync_cpu.board_call
+     def _call(self, method: str, path: str, body: Optional[dict] = None, *, replay_safe: bool = False) -> dict:
+         timeout = self._remaining()
+         data = None if body is None else json.dumps(body).encode()
+@@ -1487,8 +1489,9 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+     from hermes_cli.machine_metrics_sender import MetricsSender, board_post
+     sender = MetricsSender(metrics, board_post(ident))
+     sender.start()
++    rounds = sync_cpu.iterations(keep_running)
+     try:
+-        while keep_running():
++        for _round in rounds:
+             boards = board_paths()
+             sweep_gone_board_handles()  # a removed board is never read again: close what it pins (2026-11-13)
+             for slug, _path in boards:
+@@ -1531,6 +1534,7 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+                 remaining = min(remaining, max(0.0, deferred_due - _repair_clock()))
+             sync_timing.wait(wait_for_work, wake, [p for _s, p in boards], remaining, keep_running)
+     finally:
++        rounds.close()
+         links.stop()
+         _LINKS_RUNNER = None  # no stale runner for the next loop's tests to wait on
+         sender.close()
+diff --git a/hermes_cli/kanban_sync_cpu.py b/hermes_cli/kanban_sync_cpu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d08c0bfb682eb6be6594fd505293695e4f880c93
+--- /dev/null
++++ b/hermes_cli/kanban_sync_cpu.py
+@@ -0,0 +1,77 @@
++"""Same-thread local/Board CPU partition for completed sync services. [daveey]
++
++Only Hub._call is excluded: JSON encode/decode, HTTP/TLS and its retries. Local
++row work and attachment preparation remain local. Detached transfer/feed/metrics
++threads are outside this envelope, never subtracted from the caller's CPU.
++
++The loop scope includes discovery, maintenance and wait_for_work CPU. Board scopes
++are nested subsets, NOT additive. All three counters use the same completed-service
++boundary; readers reconciling snapshots must require equal runs (record publishes
++separately). The local counter alone is a directly measured exclusive CPU total.
++"""
++from contextlib import contextmanager
++from functools import wraps
++import os
++import threading
++import time
++
++from hermes_cli import loop_accounting
++
++_local = threading.local()
++
++
++@contextmanager
++def service(name):
++    """Publish one completed service, including exceptional exits, on this thread."""
++    frames = getattr(_local, "frames", ())
++    frame = {"board": 0.0}
++    _local.frames = (*frames, frame)
++    pid = os.getpid()
++    start = time.thread_time()
++    error = None
++    try:
++        yield
++    except BaseException as exc:
++        error = type(exc).__name__
++        raise
++    finally:
++        total = time.thread_time() - start
++        _local.frames = frames
++        # Never combine pre-fork thread CPU with the child's clock.
++        if os.getpid() == pid:
++            excluded = min(total, frame["board"])
++            for kind, cpu in (("local", total - excluded), ("board_call", excluded), ("total", total)):
++                loop_accounting.record(f"sync.cpu.{kind}/{name}", cpu_s=cpu,
++                                       error=error is not None, error_kind=error, outer=False)
++
++
++def board_call(fn):
++    """Exclude one outermost synchronous Board call from active services only."""
++    @wraps(fn)
++    def wrapped(*args, **kwargs):
++        frames = getattr(_local, "frames", ())
++        if not frames or getattr(_local, "in_call", False):
++            return fn(*args, **kwargs)
++        _local.in_call = True
++        pid = os.getpid()
++        start = time.thread_time()
++        try:
++            return fn(*args, **kwargs)
++        finally:
++            cpu = time.thread_time() - start
++            _local.in_call = False
++            if os.getpid() == pid:
++                for frame in frames:
++                    frame["board"] += cpu
++    return wrapped
++
++
++def iterations(keep_running):
++    """Bracket each complete loop iteration, including its bounded wait.
++
++    The caller closes this generator in finally so an early return/exception
++    closes the suspended service immediately, without relying on garbage collection.
++    """
++    while keep_running():
++        with service("loop"):
++            yield
+diff --git a/hermes_cli/kanban_sync_timing.py b/hermes_cli/kanban_sync_timing.py
+index f34d92e4dbbbde223f23c5cef0b9d92dfa87ff11..f51a57b3e0683dc38b4bd18584bde7101cbda08f 100644
+--- a/hermes_cli/kanban_sync_timing.py
++++ b/hermes_cli/kanban_sync_timing.py
+@@ -595,14 +595,17 @@ def board_start(slug: str, results: list) -> tuple:
+     """Start one board's service: the timing diagnostics' token (None while off) and its ``loop_accounting``
+     pass ``sync.board/<slug>`` (always on: runs, rows pulled, busy skips, errors, CPU)."""
+     from hermes_cli import loop_accounting
++    from hermes_cli.kanban_sync_cpu import service
+     diag = _DIAG.board_start(slug, results)
+     acct = loop_accounting.pass_(f"sync.board/{slug}")
++    partition = service(f"board/{slug}")
++    partition.__enter__()
+     acct.__enter__()  # last: nothing between here and the caller's ``finally: board_end`` can raise
+-    return diag, acct, len(results)
++    return diag, acct, len(results), partition
+ 
+ 
+ def board_end(token: tuple, results: list) -> None:
+-    diag, acct, before = token
++    diag, acct, before, partition = token
+     try:
+         _DIAG.board_end(diag, results)
+     finally:
+@@ -613,6 +616,7 @@ def board_end(token: tuple, results: list) -> None:
+             acct.skip()
+         failed = result is None or (bool(getattr(result, "error", None)) and not skipped)
+         acct.__exit__(RuntimeError if failed else None, None, None)
++        partition.__exit__(None, None, None)
+ 
+ 
+ def report(fn: Callable[[], Any]) -> Any:
+diff --git a/tests/hermes_cli/test_kanban_sync_cpu.py b/tests/hermes_cli/test_kanban_sync_cpu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..aea02e5941aa6b54a27dd6b7542543499fa04cbb
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_cpu.py
+@@ -0,0 +1,160 @@
++"""Deterministic same-thread CPU partition, without network or live captures."""
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_sync_cpu as cpu
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_sync_timing as timing
++
++
++@pytest.fixture
++def measured(monkeypatch):
++    clock = [0.0]
++    records = []
++    monkeypatch.setattr(cpu.time, "thread_time", lambda: clock[0])
++    monkeypatch.setattr(cpu.loop_accounting, "record", lambda name, **kw: records.append((name, kw)))
++    monkeypatch.setattr(cpu, "_local", threading.local())
++    return clock, records
++
++
++def values(records, name):
++    return {k.split('/')[0]: v["cpu_s"] for k, v in records if k.endswith('/' + name)}
++
++
++def test_nested_services_and_calls_partition_once(measured):
++    clock, records = measured
++
++    @cpu.board_call
++    def inner():
++        clock[0] += 3
++
++    @cpu.board_call
++    def outer():
++        clock[0] += 2
++        inner()
++
++    with cpu.service("loop"):
++        clock[0] += 1
++        with cpu.service("board/test"):
++            clock[0] += 4
++            outer()
++        clock[0] += 2
++    assert values(records, "board/test") == {
++        "sync.cpu.local": 4, "sync.cpu.board_call": 5, "sync.cpu.total": 9}
++    assert values(records, "loop") == {
++        "sync.cpu.local": 7, "sync.cpu.board_call": 5, "sync.cpu.total": 12}
++    assert all(not r["outer"] for _, r in records)
++
++
++def test_exception_publishes_and_restores(measured):
++    clock, records = measured
++
++    @cpu.board_call
++    def fail():
++        clock[0] += 3
++        raise ValueError("test")
++
++    with pytest.raises(ValueError, match="test"), cpu.service("failed"):
++        clock[0] += 2
++        fail()
++    assert values(records, "failed")["sync.cpu.local"] == 2
++    assert all(r["error_kind"] == "ValueError" for _, r in records)
++    assert cpu._local.frames == ()
++    assert not cpu._local.in_call
++
++
++@pytest.mark.parametrize("proxied", [False, True])
++@pytest.mark.parametrize("failed", [False, True])
++def test_real_hub_call_routes_include_serialization_and_errors(measured, monkeypatch, proxied, failed):
++    clock, records = measured
++    hub = client.Hub(client.Identity("http://example.invalid", "test", "key"))
++    monkeypatch.setattr(hub, "_proxied", lambda parts: proxied)
++    original = client.json.dumps
++
++    def encode(body):
++        clock[0] += 2
++        return original(body)
++
++    def transport(*args, **kwargs):
++        clock[0] += 3
++        if failed:
++            raise OSError("test transport")
++        return {"ok": True}
++
++    monkeypatch.setattr(client.json, "dumps", encode)
++    monkeypatch.setattr(hub, "_call_urlopen" if proxied else "_call_kept_alive", transport)
++    with cpu.service("hub"):
++        clock[0] += 1
++        if failed:
++            with pytest.raises(OSError, match="test transport"):
++                hub._call("POST", "/test", {"payload": 1})
++        else:
++            assert hub._call("POST", "/test", {"payload": 1}) == {"ok": True}
++    assert values(records, "hub") == {
++        "sync.cpu.local": 1, "sync.cpu.board_call": 5, "sync.cpu.total": 6}
++
++
++def test_unscoped_and_other_thread_calls_are_not_attributed(measured):
++    clock, records = measured
++
++    @cpu.board_call
++    def remote():
++        return bool(getattr(cpu._local, "in_call", False))
++
++    assert remote() is False
++    outcomes = []
++    with cpu.service("owner"):
++        thread = threading.Thread(target=lambda: outcomes.append(remote()))
++        thread.start()
++        thread.join(2)
++        assert not thread.is_alive()
++        clock[0] += 4
++    assert outcomes == [False]
++    assert values(records, "owner")["sync.cpu.board_call"] == 0
++    assert values(records, "owner")["sync.cpu.local"] == 4
++
++
++def test_board_facade_records_local_work_and_restores(measured, monkeypatch):
++    clock, records = measured
++    monkeypatch.setattr(timing._DIAG, "board_start", lambda *args: None)
++    monkeypatch.setattr(timing._DIAG, "board_end", lambda *args: None)
++    results = []
++    mark = timing.board_start("test", results)
++    clock[0] += 4
++    results.append(SimpleNamespace(pulled=1, skipped=False, error=None))
++    timing.board_end(mark, results)
++    assert values(records, "board/test")["sync.cpu.local"] == 4
++    assert cpu._local.frames == ()
++
++
++def test_iteration_includes_wait_cpu_and_closes_on_early_return(measured):
++    clock, records = measured
++    rounds = cpu.iterations(lambda: True)
++    try:
++        next(rounds)
++        clock[0] += 5  # local work, including CPU consumed by wait_for_work
++    finally:
++        rounds.close()
++    assert values(records, "loop")["sync.cpu.local"] == 5
++    assert cpu._local.frames == ()
++
++
++def test_inflight_service_is_not_published_until_complete(measured):
++    clock, records = measured
++    with cpu.service("test"):
++        clock[0] += 7
++        assert records == []
++    assert values(records, "test")["sync.cpu.total"] == 7
++
++
++def test_prefork_service_does_not_publish_mixed_clock(measured, monkeypatch):
++    clock, records = measured
++    pid = [1]
++    monkeypatch.setattr(cpu.os, "getpid", lambda: pid[0])
++    with cpu.service("fork"):
++        clock[0] += 2
++        pid[0] = 2
++    assert records == []
++    assert cpu._local.frames == ()
+-- 
+2.43.0
+

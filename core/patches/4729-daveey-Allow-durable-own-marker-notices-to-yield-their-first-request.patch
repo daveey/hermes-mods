@@ -1,0 +1,129 @@
+From 5f8571d393a6319dcb45437c7a1584ffbd878a69 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 03:41:26 +0000
+Subject: [PATCH] [daveey] Allow durable own-marker notices to yield their
+ first request
+
+---
+ .../test_update_pause_first_request.py        | 47 +++++++++++++++++--
+ tui_gateway/prompt_turn.py                    |  9 +++-
+ 2 files changed, 51 insertions(+), 5 deletions(-)
+
+diff --git a/tests/tui_gateway/test_update_pause_first_request.py b/tests/tui_gateway/test_update_pause_first_request.py
+index 61d967acd3f42f81fcd9c71bd38ddc0bd151bed1..28c850f4250109acd1c70e96999a1352e9dd4468 100644
+--- a/tests/tui_gateway/test_update_pause_first_request.py
++++ b/tests/tui_gateway/test_update_pause_first_request.py
+@@ -22,6 +22,7 @@ def home(monkeypatch, tmp_path):
+     monkeypatch.setattr(server, "_hermes_home", tmp_path)
+     monkeypatch.setattr(server, "_load_cfg", lambda: CFG)
+     monkeypatch.setattr(up, "start_mid_tool_cancel", lambda *a: (lambda: None))
++    monkeypatch.setattr(up, "start_in_place_watcher", lambda *a: None)
+     monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+     for name, value in {"_emit": lambda *a, **k: None, "_wire_callbacks": lambda sid: None,
+                         "_sync_agent_model_with_config": lambda sid, s: None,
+@@ -32,7 +33,7 @@ def home(monkeypatch, tmp_path):
+     return tmp_path
+ 
+ 
+-def _submit(home, **kwargs):
++def _submit(home, *, text="go", session_values=None, **kwargs):
+     seen = []
+ 
+     def _run(message, **_kw):
+@@ -44,17 +45,57 @@ def _submit(home, **kwargs):
+                "history_version": 0, "running": True, "attached_images": [], "image_counter": 0, "cols": 80,
+                "slash_worker": None, "show_reasoning": False, "tool_progress_mode": "all", "inflight_turn": None,
+                "profile_home": str(home)}
+-    server._run_prompt_submit("rid", "ui-sid", session, "go", **kwargs)
++    session.update(session_values or {})
++    server._run_prompt_submit("rid", "ui-sid", session, text, **kwargs)
+     return seen, agent
+ 
+ 
++def test_a_notice_with_its_own_durable_prompt_may_yield(home):
++    seen, agent = _submit(home, display_kind="kanban_notice")
++    assert seen == [(True, True)]
++    assert agent.update_pause_first_request is False
++
++
++@pytest.mark.parametrize("stale", [False, True])
++def test_a_notice_without_a_successful_marker_write_cannot_yield(home, monkeypatch, stale):
++    from tui_gateway.turn_marker import record_turn_start
++    if stale:
++        assert record_turn_start(home, "session-key", "an earlier notice")
++    monkeypatch.setattr(server, "record_turn_start", lambda *a, **k: False)
++    seen, _ = _submit(home, display_kind="kanban_notice")
++    assert seen == [(False, True)]
++
++
++@pytest.mark.parametrize("values", [
++    {"_auto_continue_prompt": "different root"},
++    {"_turn_cancel_requested": True},
++])
++def test_notice_without_its_exact_resume_prompt_is_not_first_request_eligible(home, values):
++    seen, _ = _submit(home, display_kind="kanban_notice", session_values=values)
++    assert seen[0][0] is False
++
++
++def test_notice_carrying_a_previous_pause_cannot_yield_before_persisting_itself(home):
++    from tui_gateway.turn_marker import mark_turn_paused, record_turn_start
++    assert record_turn_start(home, "session-key", "original paused turn")
++    assert mark_turn_paused(home, "session-key", up.PAUSE_REASON)
++    seen, _ = _submit(home, display_kind="kanban_notice", session_values={"_synthesized_turn": True})
++    assert seen == [(False, True)]
++
++
++def test_notice_with_truncated_marker_cannot_yield_before_persisting_full_prompt(home):
++    from tui_gateway.turn_marker import _MAX_PROMPT_CHARS
++    seen, _ = _submit(home, text="x" * (_MAX_PROMPT_CHARS + 1), display_kind="kanban_notice")
++    assert seen[0][0] is False
++
++
+ def test_a_continuation_turn_may_yield_before_its_first_request(home):
+     seen, agent = _submit(home, display_kind="auto_continue")
+     assert seen == [(True, True)]
+     assert agent.update_pause_first_request is False  # for that turn only
+ 
+ 
+-@pytest.mark.parametrize("kind", [None, "kanban_notice", "process_complete"])
++@pytest.mark.parametrize("kind", [None, "process_complete"])
+ def test_any_other_turn_waits_for_a_real_step_boundary(home, kind):
+     seen, agent = _submit(home, display_kind=kind)
+     assert seen[0][0] is False  # a literal False, not 0 or another falsy value (== below rejects None)
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 29e87698183f70ae477decf464c9963424f158cb..40cf822bbad286479000be08da74dcb74fb71070 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -258,6 +258,7 @@ def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
+     can rotate session_key mid-turn).  A surviving marker means the process died mid-turn.
+     The key is published before the disk write so an interrupt racing startup can retire
+     it; the post-write cancel check closes the inverse race (Stop landed first, no file)."""
++    session["_first_request_prompt_secured"] = False
+     marker_home = _session_home(session)
+     marker_key = str(session.get("session_key") or "")
+     marker_attempt = int(session.pop("_auto_continue_attempt", 0) or 0)
+@@ -304,6 +305,7 @@ def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
+             # this turn was started with, so the exit journal stops reporting those separately.
+             exit_keeps = session.get("_exit_keeps_turn_marker") and not session.get(USER_STOP_AT_EXIT)
+             marker_cancelled = bool(session.get("_turn_cancel_requested")) and not exit_keeps
++            session["_first_request_prompt_secured"] = bool(recorded and not marker_cancelled)
+             if recorded:  # only verified persistence secures the carried notices; a failed write keeps custody
+                 unsecured = session.get(COMPLETION_UNSECURED) or {}
+                 for pid in carried:
+@@ -1026,8 +1028,11 @@ def _invoke_agent(
+     pause_key = effective_pause_key(session, st.marker_key)
+     agent.step_boundary_pause = boundary_pause_hook(session, pause_key, carried=not st.marker_key) \
+         if pause_key else None
+-    # [daveey] t_01a1d31bf400d56c: a continuation may yield before its first model request (it redoes nothing).
+-    agent.update_pause_first_request = bool(st.marker_key) and display_kind == "auto_continue"
++    # A notice can redo its first request only when its own FULL prompt is durable. Carried,
++    # failed or truncated markers cannot recover this input after a pre-turn pause.
++    notice_secured = (display_kind == "kanban_notice" and session.pop("_first_request_prompt_secured", False)
++                      and st.own_marker is not None and st.own_marker.get("prompt") == text)
++    agent.update_pause_first_request = bool(st.marker_key) and (display_kind == "auto_continue" or bool(notice_secured))
+     _mid_tool_stop = None
+     if pause_key:
+         install_clarify_pause_provider()  # a blocked clarify is withdrawn so the pause can land
+-- 
+2.43.0
+

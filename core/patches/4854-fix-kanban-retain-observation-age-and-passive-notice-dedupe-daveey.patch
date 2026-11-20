@@ -1,0 +1,162 @@
+From 794239345f7a904eecee9875b6507c2999682c65 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 10:25:07 +0000
+Subject: [PATCH] fix(kanban): retain observation age and passive notice dedupe
+ [daveey]
+
+---
+ gateway/kanban_wake_fold.py                   | 11 ++++----
+ .../test_kanban_remote_owner_delivery.py      |  6 +++--
+ .../tui_gateway/test_kanban_remote_rehome.py  | 27 +++++++++++++++++--
+ tui_gateway/kanban_remote_identity.py         |  2 +-
+ tui_gateway/kanban_remote_notices.py          |  6 +++++
+ tui_gateway/kanban_remote_observations.py     |  7 ++---
+ 6 files changed, 45 insertions(+), 14 deletions(-)
+
+diff --git a/gateway/kanban_wake_fold.py b/gateway/kanban_wake_fold.py
+index ad8d89dd884844da77cb224af70ab472c26d70cd..efac9a8f9efb7a7ad8e54144fa9001bd939e46b7 100644
+--- a/gateway/kanban_wake_fold.py
++++ b/gateway/kanban_wake_fold.py
+@@ -275,13 +275,12 @@ def _guidance(text, cards):
+     lines = last['text'].rstrip().split('\n')
+     rest = lines[1:] if _LEGACY_HEAD.match(lines[0]) else lines
+     tail = '\n'.join(rest).rstrip()
+-    if tail:  # refresh_card keeps every line after the head, in order, at the end of the card
++    if tail and text.find(tail, pos) < 0 and f"[kanban] Task {last.get('task_id')} " in text:
++        # A relabel removes the obsolete ask; an ask-only tail becomes a one-line card.
++        tail = '\n'.join(line for line in rest if not line.startswith(
++            ('Next action for the user:', 'Why only the user:', 'Scope:', 'Open task:'))).rstrip()
++    if tail:
+         end = text.find(tail, pos)
+-        if end < 0 and f"[kanban] Task {last.get('task_id')} " in text:
+-            # A relabel removes the obsolete human ask, but retains the remaining tail verbatim.
+-            tail = '\n'.join(line for line in rest if not line.startswith(
+-                ('Next action for the user:', 'Why only the user:', 'Scope:', 'Open task:'))).rstrip()
+-            end = text.find(tail, pos) if tail else -1
+         if end < 0:
+             return None
+         end += len(tail)
+diff --git a/tests/gateway/test_kanban_remote_owner_delivery.py b/tests/gateway/test_kanban_remote_owner_delivery.py
+index b614998c35175b13a17943bdc2fe6608bbd6f398..8a7bad33a757fb5d2052ff293ef42c6ab1c874a3 100644
+--- a/tests/gateway/test_kanban_remote_owner_delivery.py
++++ b/tests/gateway/test_kanban_remote_owner_delivery.py
+@@ -86,9 +86,11 @@ def test_remote_outcome_metadata_never_relabels(monkeypatch, state, kind):
+     assert grouped['task_id'] == grouped['board'] == '' and grouped['kinds'] == []
+ 
+ 
+-def test_remote_relabel_preserves_guidance_at_claim(monkeypatch):
++@pytest.mark.parametrize('original', ['Remote blocked\nNext action for the user: choose\nContext',
++                                       '[kanban] Task t_78d2b488ee11aa70 blocked.\nNext action for the user: choose'])
++def test_remote_relabel_preserves_guidance_at_claim(monkeypatch, original):
+     item = {'ref': 'worker-6/default/default/t_78d2b488ee11aa70', 'state': 'blocked@1',
+-            'event_key': 'event', 'text': 'Remote blocked\nNext action for the user: choose\nContext'}
++            'event_key': 'event', 'text': original}
+     card = kro._metadata(item)['kanban_cards'][0]
+     monkeypatch.setattr(kanban_wake_fold, '_live_task', lambda _: ('ready', ''))
+     text = kanban_wake_fold._compose([card], GUIDANCE)
+diff --git a/tests/tui_gateway/test_kanban_remote_rehome.py b/tests/tui_gateway/test_kanban_remote_rehome.py
+index 35bf48045955b32ca53e066d72569dd62f25d114..999483c8f1a0e3bc8f077d828619c08c43f25f06 100644
+--- a/tests/tui_gateway/test_kanban_remote_rehome.py
++++ b/tests/tui_gateway/test_kanban_remote_rehome.py
+@@ -15,7 +15,7 @@ def _move(path, gateway):
+     krn._reset_for_tests()
+ 
+ 
+-@pytest.mark.parametrize('door', ['collect', 'sweep'])
++@pytest.mark.parametrize('door', ['collect', 'sweep', 'passive'])
+ def test_delivered_state_is_settled_moved_without_another_turn(tmp_path, door):
+     now = time.time()
+     hub = once._hub(tmp_path, now)
+@@ -31,7 +31,7 @@ def test_delivered_state_is_settled_moved_without_another_turn(tmp_path, door):
+             assert krn.collect(once.CHAT, 'default', hub_db=hub, ledger=ledger, now=now + 10) == []
+         else:
+             assert krn.sweep_remote_notices(replica_path=hub, gateway='macbook', session_db=opener,
+-                                            ledger=ledger, now=now + 10, waker=waker) == []
++                                            ledger=ledger, now=now + 10, waker=None if door == 'passive' else waker) == []
+         assert waker.calls == 0
+         assert len(db.get_messages(once.CHAT)) == 1
+     with sqlite3.connect(ledger) as conn:
+@@ -72,6 +72,29 @@ def test_dead_holder_old_home_transcript_key_is_not_reoffered(tmp_path, monkeypa
+     assert old['event_key'] in seen
+ 
+ 
++def test_delivered_moved_old_state_does_not_log_undelivered(tmp_path, caplog):
++    from tests.tui_gateway import test_kanban_remote_late_observed as late
++    ledger = tmp_path / 'ledger.db'
++    hub = late._observed_then_starved(tmp_path, ledger)
++    [old] = krn.collect(late.CHAT, 'default', hub_db=hub, ledger=ledger, now=late.T0 + 3 * 3600)
++    assert krn.ack(old, ledger=ledger)
++    _move(hub, 'worker-6')
++    assert krn.collect(late.CHAT, 'default', hub_db=hub, ledger=ledger, now=late.T0 + 88 * 3600) == []
++    assert 'dropped undelivered notice' not in caplog.text
++
++
++def test_live_holder_keeps_custody_after_home_move(tmp_path):
++    now = time.time()
++    hub = once._hub(tmp_path, now)
++    ledger = tmp_path / 'ledger.db'
++    _move(hub, 'worker-6')
++    [old] = krn.collect(once.CHAT, 'default', hub_db=hub, ledger=ledger, now=now)
++    _move(hub, 'hub')
++    assert krn.collect(once.CHAT, 'default', hub_db=hub, ledger=ledger, now=now + 10) == []
++    assert krn.ack(old, ledger=ledger)
++    assert krn.collect(once.CHAT, 'default', hub_db=hub, ledger=ledger, now=now + 20) == []
++
++
+ def test_new_terminal_state_after_move_still_delivers_once(tmp_path):
+     now = time.time()
+     hub = once._hub(tmp_path, now)
+diff --git a/tui_gateway/kanban_remote_identity.py b/tui_gateway/kanban_remote_identity.py
+index 4ca1240e26966b1a77c3cc33b05beddf66670013..740a68082424c6990b3efc1c772982de3c515eea 100644
+--- a/tui_gateway/kanban_remote_identity.py
++++ b/tui_gateway/kanban_remote_identity.py
+@@ -19,7 +19,7 @@ def moved_claim(conn, *, session, ref, state, now, notice_key, swept_key, transc
+                          'VALUES (?,?,?,?,?,?,1,?)',
+                          (session, ref, state, now, notices.SETTLED, notice_key, 'moved'))
+             notices._swept_row(conn, swept_key, 'moved')
+-        return 'settled'
++        return 'moved'
+     if any(notices._holder_alive(row['holder_pid'], row['holder_start']) for row in aliases):
+         return 'skip'
+     return None
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index be8d28c4a4aae18fa73d052c886109cd0a52d5ac..50998dc1213aa1ac41e8ce6226b14d810783c25e 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -1352,6 +1352,12 @@ def _deliver_link(owner, key, task, link, *, me, ref, state, path, live, session
+                 _note_wait(sid, ref, state, f"left to gateway pid {gw_pid}: its turn holds the chat's lease")
+                 return
+             if waker is None:
++                from tui_gateway.kanban_remote_identity import moved_claim
++                with contextlib.closing(_ledger(ledger)) as conn:
++                    if moved_claim(conn, session=sid, ref=ref, state=state, now=now or time.time(),
++                                   notice_key=event_key, swept_key=memo_key,
++                                   transcript_has=lambda k, t: notice_in_transcript(db, tip, k, t)) is not None:
++                        return
+                 from tui_gateway.kanban_notice_session_store import notice_writer
+                 with notice_writer(db) as wdb:
+                     row_id = wdb.append_kanban_notice(tip, text, metadata)
+diff --git a/tui_gateway/kanban_remote_observations.py b/tui_gateway/kanban_remote_observations.py
+index 6e91583f1cc1bd3f86714b822ae6c6daa798574c..d36cbff06eed15590e4b6421c47627367b708bf5 100644
+--- a/tui_gateway/kanban_remote_observations.py
++++ b/tui_gateway/kanban_remote_observations.py
+@@ -168,12 +168,13 @@ def _persist(source: str, cards: list[tuple], ledger, now: float, extra=()) -> d
+             for key, state, ref, at, answer in missing:
+                 # Unknown ages and frozen legacy keys cannot establish local freshness.
+                 seen = now if at is not None and key.count('/') >= 2 and (not initial or now - at <= FRESH_S) else None
+-                rows = conn.execute("SELECT first_seen FROM observations WHERE source=? AND state=? "
++                rows = conn.execute("SELECT ref, first_seen FROM observations WHERE source=? AND state=? "
+                                     "AND substr(ref, instr(ref, '/') + 1)=?",
+                                     (source, state, key)).fetchall()
+                 if rows:
+-                    seen = None if any(row[0] is None for row in rows) else min(row[0] for row in rows)
+-                conn.execute("INSERT OR IGNORE INTO observations VALUES (?,?,?,?)", (source, ref, state, seen))
++                    seen = None if any(row[1] is None for row in rows) else min(row[1] for row in rows)
++                if not any(row[0] == ref for row in rows):
++                    conn.execute("INSERT INTO observations VALUES (?,?,?,?)", (source, ref, state, seen))
+                 if answer:
+                     added[(ref, state)] = seen
+             conn.commit()
+-- 
+2.43.0
+

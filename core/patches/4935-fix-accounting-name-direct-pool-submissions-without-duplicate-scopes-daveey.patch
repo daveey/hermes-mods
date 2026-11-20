@@ -1,0 +1,479 @@
+From 9b3b7de52b2050efbb11671c33ee9ad0a7094c2f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 08:07:42 +0000
+Subject: [PATCH] fix(accounting): name direct pool submissions without
+ duplicate scopes [daveey]
+
+Why: idle native snapshots attribute CPU to concurrent.futures.thread._worker,
+not the submitted function. Existing asyncio instrumentation misses direct
+ThreadPoolExecutor.submit calls. Physical-work custody is not CPU accounting,
+and context/custody wrappers can hide the original callable.
+
+Instrument the public submit boundary, retain the logical target through
+partial/context/custody carriers, and make layered thread scopes idempotent.
+Keep execution through the original custody/context wrapper. Daemon pool
+submissions retain per-submission context with an inspectable partial.
+
+Name Context.run thread targets by their original callable. Fold exited
+native IDs before replacement targets begin and at final booking: exit-only
+folding leaves a stale nested-scope baseline and double-books inner CPU.
+
+Proof: original pool RED 7 failed/2 passed; thread-followup RED 2 failed;
+nested-reuse RED 1 failed/26 passed. Expanded GREEN 125 passed, 2 skipped;
+prior broader importing-consumer run 372 passed, 13 skipped. Full scripts/check
+passed. Scope/custody matrix includes active ownership, exception identity,
+context changes, repeated submissions, disabled scopes and hook restoration.
+Existing physical-lifetime tests now also run with executor hooks enabled.
+Mutation baseline: 28 passed; all 6 targeted mutants killed, no survivors.
+Final restored-tree full scripts/check --base origin/main passed.
+
+This is attribution, not a claimed live CPU reduction. Native idle Mac
+measurement and any measured >=1%-core caller optimization remain owned by
+t_84a411c80a478c57; no live restart/update is part of this patch.
+---
+ hermes_cli/local_work_threads.py              |   9 +-
+ hermes_cli/loop_accounting.py                 |  52 +++++-
+ tests/hermes_cli/test_local_work_threads.py   |  12 ++
+ .../test_loop_accounting_pool_submit.py       | 155 ++++++++++++++++++
+ .../test_loop_accounting_thread_targets.py    |  64 ++++++++
+ tools/daemon_pool.py                          |   7 +-
+ 6 files changed, 283 insertions(+), 16 deletions(-)
+ create mode 100644 tests/hermes_cli/test_loop_accounting_pool_submit.py
+
+diff --git a/hermes_cli/local_work_threads.py b/hermes_cli/local_work_threads.py
+index d247261574c9d302a9f60002c30b0b83d6f3d387..d641bdada6b6d807447aca4054da5797d7ea80d1 100644
+--- a/hermes_cli/local_work_threads.py
++++ b/hermes_cli/local_work_threads.py
+@@ -6,6 +6,7 @@ not finish a running target. No helper here claims complete runtime coverage.
+ import asyncio
+ from concurrent.futures import ThreadPoolExecutor
+ from contextvars import copy_context
++from functools import partial
+ import os
+ import threading
+ from typing import TYPE_CHECKING
+@@ -165,14 +166,16 @@ def _refused_before_enqueue(executor):
+ 
+ def _submit_owned(executor, function, args, kwargs, owner, kind):
+     reservation = _Reservation(owner, kind, copy_context())
++    call = partial(reservation.run, function, args, kwargs)
++    # Attribution may inspect the logical target, but must execute custody intact.
++    call._la_target = (function, args)  # type: ignore[attr-defined]
+     try:
+         # Bypass ScopeAwareExecutor.submit to avoid wrapping the same boundary
+         # twice. Nested physical work inside the target is still scope-aware.
+         if isinstance(executor, ScopeAwareExecutor):
+-            future = ThreadPoolExecutor.submit(executor, reservation.run,
+-                                               function, args, kwargs)
++            future = ThreadPoolExecutor.submit(executor, call)
+         else:
+-            future = executor.submit(reservation.run, function, args, kwargs)
++            future = executor.submit(call)
+     except BaseException:
+         if _refused_before_enqueue(executor):
+             # A stdlib pool refuses a shut-down/broken submit under its lock BEFORE enqueuing.
+diff --git a/hermes_cli/loop_accounting.py b/hermes_cli/loop_accounting.py
+index 09440c65fbb0f99522f5abaee0e47950af220b7a..20a02a7ffa8db6033b2895f64259d7edd482f099 100644
+--- a/hermes_cli/loop_accounting.py
++++ b/hermes_cli/loop_accounting.py
+@@ -882,10 +882,16 @@ def scope(name: str) -> Scope:
+     return Scope(name)
+ 
+ 
+-def _callable_name(fn: Any, args: tuple = ()) -> str:
+-    """``module.qualname`` of what a thread pool will run (``partial`` / ``Context.run`` unwrapped)."""
+-    for _ in range(6):
++def _callable_target(fn: Any, args: tuple = ()) -> Any:
++    """Inspect carriers without changing the invocation's context or custody."""
++    for _ in range(12):
+         if isinstance(fn, functools.partial):
++            if getattr(fn, "_la_thread_scope", False) is True:
++                break
++            target = getattr(fn, "_la_target", None)
++            if target is not None:
++                fn, args = target
++                continue
+             args = fn.args + args
+             fn = fn.func
+             continue
+@@ -894,6 +900,14 @@ def _callable_name(fn: Any, args: tuple = ()) -> str:
+             fn, args = args[0], args[1:]
+             continue
+         break
++    return fn
++
++
++def _callable_name(fn: Any, args: tuple = ()) -> str:
++    """Logical function behind partial, context and physical-custody carriers."""
++    fn = _callable_target(fn, args)
++    if getattr(fn, "_la_thread_scope", False) is True:
++        return fn._la_target_name
+     qual = getattr(fn, "__qualname__", None) or type(fn).__name__
+     mod = getattr(fn, "__module__", None) or ""
+     return f"{mod}.{qual}" if mod else str(qual)
+@@ -907,7 +921,13 @@ def _run_scoped(name: str, fn: Callable, *args: Any, **kwargs: Any) -> Any:
+ def scoped_call(prefix: str, fn: Callable, args: tuple = ()) -> Callable:
+     """``fn`` wrapped so each call is one :class:`Scope` named ``<prefix>/<fn qualname>`` (``args`` are only
+     read, to name a ``Context.run(func, ...)`` submission by ``func``)."""
+-    return functools.partial(_run_scoped, f"{prefix}/{_callable_name(fn, args)}", fn)
++    if prefix == "thread" and getattr(_callable_target(fn, args), "_la_thread_scope", False) is True:
++        return fn
++    name = _callable_name(fn, args)
++    wrapped: Any = functools.partial(_run_scoped, f"{prefix}/{name}", fn)
++    wrapped._la_thread_scope = prefix == "thread"
++    wrapped._la_target_name = name
++    return wrapped
+ 
+ 
+ _cb_stats: dict[str, _Stat] = {}  # callback name -> counters (at most MAX_CALLBACK_KEYS + the other bucket)
+@@ -948,11 +968,20 @@ _instrumented: dict[str, Any] = {}
+ 
+ 
+ def instrument_executors() -> bool:
+-    """Name the submitted function of every ``loop.run_in_executor`` (so ``asyncio.to_thread``) and
+-    ``anyio.to_thread.run_sync`` call as a residual scope ``thread/<qualname>``. Idempotent."""
++    """Name direct pool, asyncio and AnyIO submissions; nested hooks share one residual scope."""
+     if _instrumented.get("executors"):
+         return False
+     _instrumented["executors"] = True
++    from concurrent.futures import ThreadPoolExecutor
++    pool_orig = ThreadPoolExecutor.submit
++
++    def submit(self, func, /, *args, **kwargs):
++        if scopes_enabled():
++            func = scoped_call("thread", func, args)
++        return pool_orig(self, func, *args, **kwargs)
++
++    submit._la_orig = pool_orig  # type: ignore[attr-defined]
++    ThreadPoolExecutor.submit = submit  # type: ignore[method-assign]
+     import asyncio.base_events as be
+     orig = be.BaseEventLoop.run_in_executor
+ 
+@@ -1019,8 +1048,9 @@ MAX_TARGET_KEYS = 64  # distinct thread targets; later ones fold into TARGET_OTH
+ TARGET_OTHER = "other"
+ 
+ 
+-def _target_key(target: Any) -> str:
++def _target_key(target: Any, args: tuple = ()) -> str:
+     """Name of a ``Thread`` target (``module.qualname``; a lambda also gets its line number)."""
++    target = _callable_target(target, args)
+     name = _callable_name(target)
+     code = getattr(getattr(target, "__func__", target), "__code__", None)
+     if name.endswith("<lambda>") and code is not None:
+@@ -1047,8 +1077,10 @@ def instrument_thread_targets() -> bool:
+         tid = _native_id()
+         key: Optional[str]
+         try:
+-            key = _target_key(target)
++            key = _target_key(target, getattr(self, "_args", ()))
+             with _lock:
++                if _exited_tids:
++                    _fold_exited()
+                 if key not in _target_exited and key not in _thread_targets.values():
+                     if len({*_thread_targets.values(), *_target_exited}) >= MAX_TARGET_KEYS:
+                         key = TARGET_OTHER
+@@ -1063,6 +1095,8 @@ def instrument_thread_targets() -> bool:
+                 try:
+                     cpu = _thread_time()
+                     with _lock:
++                        if _exited_tids:
++                            _fold_exited()
+                         acc = _thread_accounted.get(tid, 0.0)
+                         if _thread_targets.get(tid) == key:
+                             del _thread_targets[tid]
+@@ -1085,6 +1119,8 @@ def uninstrument() -> None:
+     if _instrumented.pop("threads", None):
+         threading.Thread.run = threading.Thread.run._la_orig  # type: ignore[attr-defined,method-assign]
+     if _instrumented.pop("executors", None):
++        from concurrent.futures import ThreadPoolExecutor
++        ThreadPoolExecutor.submit = ThreadPoolExecutor.submit._la_orig  # type: ignore[attr-defined,method-assign]
+         import asyncio.base_events as be
+         be.BaseEventLoop.run_in_executor = be.BaseEventLoop.run_in_executor._la_orig  # type: ignore[attr-defined]
+         try:
+diff --git a/tests/hermes_cli/test_local_work_threads.py b/tests/hermes_cli/test_local_work_threads.py
+index 71886546095bd2a82e1d4242bd29a2b15d64ba77..23f0647cd92d1256744b8f6e683d967198834431 100644
+--- a/tests/hermes_cli/test_local_work_threads.py
++++ b/tests/hermes_cli/test_local_work_threads.py
+@@ -12,6 +12,18 @@ from hermes_cli.local_work_threads import (
+ )
+ 
+ 
++@pytest.fixture(autouse=True, params=[False, True])
++def executor_accounting(request):
++    from hermes_cli import loop_accounting
++
++    if request.param:
++        loop_accounting.instrument_executors()
++    yield
++    if request.param:
++        loop_accounting.uninstrument()
++        loop_accounting.reset()
++
++
+ def setup_owner(tmp_path):
+     home = str(tmp_path)
+     return Registry(homes=[home]), home
+diff --git a/tests/hermes_cli/test_loop_accounting_pool_submit.py b/tests/hermes_cli/test_loop_accounting_pool_submit.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9d509ab2d6bbdecbdae1daf49d223d54a8aa8e16
+--- /dev/null
++++ b/tests/hermes_cli/test_loop_accounting_pool_submit.py
+@@ -0,0 +1,155 @@
++"""Direct pool submissions retain logical CPU names through context and custody."""
++import asyncio
++from concurrent.futures import ThreadPoolExecutor
++from contextvars import ContextVar, copy_context
++from functools import partial
++import time
++
++import pytest
++
++from hermes_cli import loop_accounting as la
++from hermes_cli import local_work_threads as threads
++from hermes_cli.local_work import ACTIVE_SCOPE, Registry
++from tools.daemon_pool import DaemonThreadPoolExecutor
++
++
++@pytest.fixture(autouse=True)
++def accounting():
++    la.stop()
++    la.reset()
++    yield
++    la.uninstrument()
++    la.stop()
++    la.reset()
++
++
++def burn(seconds):
++    end = time.thread_time() + seconds
++    while time.thread_time() < end:
++        pass
++
++
++@pytest.mark.parametrize("pool_type", [ThreadPoolExecutor, threads.ScopeAwareExecutor, DaemonThreadPoolExecutor])
++@pytest.mark.parametrize("tracked", [False, True])
++def test_direct_submit_names_function_and_preserves_context(tmp_path, pool_type, tracked):
++    la.instrument_executors()
++    registry = Registry(homes=[str(tmp_path)])
++    value = ContextVar("value", default="unset")
++    value.set("submitted")
++
++    def job(positional, *, keyword):
++        burn(0.02)
++        with la.pass_("pool.inner"):
++            burn(0.02)
++        return positional, keyword, value.get()
++
++    call = partial(copy_context().run, job, 7, keyword=9)
++    with pool_type(max_workers=1) as pool:
++        if tracked:
++            future = threads.submit_tracked(pool, call, registry=registry, home=str(tmp_path), source="test")
++        else:
++            future = pool.submit(call)
++        assert future.result(timeout=10) == (7, 9, "submitted")
++    names = {k: v for k, v in la.counters().items() if k.startswith("thread/")}
++    assert len(names) == 1, names
++    name, stat = next(iter(names.items()))
++    assert name.endswith(".<locals>.job"), names
++    assert stat["runs"] == 1
++    assert stat["cpu_s"] >= 0.015
++    assert la.counters()["pool.inner"]["cpu_s"] >= 0.015
++    assert la.snapshot()["process"]["accounted_cpu_s"] == pytest.approx(
++        stat["cpu_s"] + la.counters()["pool.inner"]["cpu_s"], abs=0.005)
++    assert registry.snapshot().active == 0
++
++
++@pytest.mark.parametrize("route", ["asyncio", "custody"])
++def test_layered_executor_hooks_count_one_run(monkeypatch, tmp_path, route):
++    la.instrument_executors()
++    registry = Registry(homes=[str(tmp_path)])
++    monkeypatch.setattr(threads, "installed_registry", lambda: registry)
++    monkeypatch.setattr(threads, "current_home", lambda: str(tmp_path))
++
++    def job():
++        return 42
++
++    async def run():
++        if route == "asyncio":
++            return await asyncio.to_thread(job)
++        return await threads.run_in_pool(None, copy_context(), job)
++
++    assert asyncio.run(run()) == 42
++    names = {k: v for k, v in la.counters().items() if k.startswith("thread/")}
++    assert len(names) == 1, names
++    assert next(iter(names)).endswith(".<locals>.job")
++    assert next(iter(names.values()))["runs"] == 1
++    assert registry.snapshot().active == 0
++
++
++@pytest.mark.parametrize("pool_type", [ThreadPoolExecutor, threads.ScopeAwareExecutor, DaemonThreadPoolExecutor])
++def test_tracked_failure_keeps_custody_and_original_exception(tmp_path, pool_type):
++    la.instrument_executors()
++    registry = Registry(homes=[str(tmp_path)])
++    failure = ValueError("original failure")
++
++    def failing_job():
++        assert registry.snapshot().active > 0
++        owner = ACTIVE_SCOPE.get()
++        assert owner is not None and owner.home == str(tmp_path)
++        raise failure
++
++    with pool_type(max_workers=1) as pool:
++        future = threads.submit_tracked(pool, failing_job, registry=registry,
++                                        home=str(tmp_path), source="test")
++        with pytest.raises(ValueError) as exc:
++            future.result(timeout=10)
++        assert exc.value is failure
++    assert registry.snapshot().active == 0
++    names = {k: v for k, v in la.counters().items() if k.startswith("thread/")}
++    assert len(names) == 1
++    assert next(iter(names)).endswith(".failing_job")
++    assert next(iter(names.values()))["runs"] == 1
++
++
++def test_automatic_custody_and_prescoped_context_count_each_submission(tmp_path):
++    la.instrument_executors()
++    registry = Registry(homes=[str(tmp_path)])
++
++    def job(value):
++        owner = ACTIVE_SCOPE.get()
++        assert owner is not None and owner.home == str(tmp_path)
++        assert registry.snapshot().active == 2  # submitting scope + physical work
++        return value
++
++    with threads.ScopeAwareExecutor(max_workers=1) as pool:
++        with registry.scope("turn", home=str(tmp_path), source="test"):
++            for value in (1, 2):
++                call = partial(copy_context().run, la.scoped_call("thread", job), value)
++                assert pool.submit(call).result(timeout=10) == value
++    assert registry.snapshot().active == 0
++    names = {k: v for k, v in la.counters().items() if k.startswith("thread/")}
++    assert len(names) == 1
++    assert next(iter(names)).endswith(".job")
++    assert next(iter(names.values()))["runs"] == 2
++
++
++def test_daemon_pool_context_is_captured_for_each_submission():
++    la.instrument_executors()
++    value = ContextVar("daemon-value", default="unset")
++    with DaemonThreadPoolExecutor(max_workers=1) as pool:
++        for expected in ("first", "second"):
++            value.set(expected)
++            assert pool.submit(value.get).result(timeout=10) == expected
++
++
++def test_submit_hook_restores_original_and_honors_disabled_scopes(monkeypatch):
++    original = ThreadPoolExecutor.submit
++    assert la.instrument_executors()
++    assert ThreadPoolExecutor.submit is not original
++    assert not la.instrument_executors()
++    monkeypatch.setitem(la._state, "scopes", False)
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        assert pool.submit(lambda: 42).result(timeout=10) == 42
++    assert not {k for k in la.counters() if k.startswith("thread/")}
++    la.uninstrument()
++    assert ThreadPoolExecutor.submit is original
++    la.uninstrument()
+diff --git a/tests/hermes_cli/test_loop_accounting_thread_targets.py b/tests/hermes_cli/test_loop_accounting_thread_targets.py
+index 933cb408dcaaaace6a8d2e21d413c9cb736ae1e4..dac65b922e886e488e9fda0f3a40512b73f13926 100644
+--- a/tests/hermes_cli/test_loop_accounting_thread_targets.py
++++ b/tests/hermes_cli/test_loop_accounting_thread_targets.py
+@@ -199,6 +199,70 @@ def test_user_system_split_matches_cpu_and_family_sum_still_reconciles():
+     assert total == pytest.approx(res["unaccounted_cpu_s"], abs=1e-3)
+ 
+ 
++def test_reused_native_id_does_not_inherit_exited_accounting(monkeypatch):
++    la.instrument_thread_targets()
++    monkeypatch.setattr(la, "_native_id", lambda: 123456789)
++    monkeypatch.setattr(la, "_thread_time", lambda: 0.2)
++    # The previous lifetime has ended but no snapshot/new scope has folded it.
++    la._thread_accounted[123456789] = 0.2
++    la._exited_tids.append(123456789)
++
++    def replacement():
++        pass
++
++    th = threading.Thread(target=replacement)
++    th.start()
++    th.join()
++    row = la._target_exited[la._target_key(replacement)]
++    assert row["accounted_cpu_s"] == 0.0
++    assert row["unaccounted_cpu_s"] == pytest.approx(0.2)
++
++
++def test_reused_native_id_nested_scopes_do_not_double_count(monkeypatch):
++    la.instrument_thread_targets()
++    monkeypatch.setattr(la, "_native_id", lambda: 123456789)
++    la._thread_accounted[123456789] = 0.2
++    la._exited_tids.append(123456789)
++    ticks = iter((0.0, 0.0, 0.1, 0.2, 0.2))
++    monkeypatch.setattr(la, "_thread_time", lambda: next(ticks))
++
++    def replacement():
++        with la.scope("replacement.outer"):
++            with la.scope("replacement.inner"):
++                pass
++
++    th = threading.Thread(target=replacement)
++    th.start()
++    th.join()
++    assert la.counters()["replacement.inner"]["cpu_s"] == pytest.approx(0.1)
++    assert la.counters()["replacement.outer"]["cpu_s"] == pytest.approx(0.1)
++    assert la._target_exited[la._target_key(replacement)]["accounted_cpu_s"] == pytest.approx(0.2)
++
++
++def test_context_thread_names_original_target():
++    from contextvars import Context
++
++    la.instrument_thread_targets()
++
++    def original(value):
++        assert value == 42
++
++    th = threading.Thread(target=Context().run, args=(original, 42))
++    th.start()
++    th.join()
++    assert la._target_key(original) in la._target_exited
++    assert not any("Context.run" in key for key in la._target_exited)
++
++
++@pytest.mark.parametrize("clear", [la.reset, la._after_fork_child])
++def test_lifetime_reset_clears_both_target_maps(clear):
++    la._thread_targets[123] = "old.target"
++    la._target_exited["old.target"] = {"threads": 1, "cpu_s": 0.2}
++    clear()
++    assert la._thread_targets == {}
++    assert la._target_exited == {}
++
++
+ def test_thread_start_overhead_is_small():
+     """One wrapped thread lifecycle adds two lock rounds: pin the added cost under 50 µs per thread."""
+     def noop():
+diff --git a/tools/daemon_pool.py b/tools/daemon_pool.py
+index ddc35ed5ca74af01e627688bd41aab62c0893ba0..7c4da259ac14b1bc61851ce31fbdcfd84f9a1e31 100644
+--- a/tools/daemon_pool.py
++++ b/tools/daemon_pool.py
+@@ -16,6 +16,7 @@ import weakref
+ from concurrent.futures import ThreadPoolExecutor
+ from concurrent.futures.thread import _worker
+ from contextvars import copy_context
++from functools import partial
+ 
+ __all__ = ["DaemonThreadPoolExecutor"]
+ 
+@@ -29,11 +30,7 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
+         Thread-start context cannot track later submissions from other profiles
+         (#54937). The stdlib worker context manages initialization, not contextvars.
+         """
+-        ctx = copy_context()
+-
+-        def _run_with_context(*call_args, **call_kwargs):
+-            return ctx.run(fn, *call_args, **call_kwargs)
+-        return super().submit(_run_with_context, *args, **kwargs)
++        return super().submit(partial(copy_context().run, fn), *args, **kwargs)
+ 
+     def _adjust_thread_count(self) -> None:
+         # Mirrors CPython's implementation with two changes:
+-- 
+2.43.0
+

@@ -1,0 +1,562 @@
+From a5410330027414701c26aaaedfa46d1be730f8f3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 13:05:12 +0000
+Subject: [PATCH] feat(kanban): add containment episode reducer and local
+ storage fences [daveey]
+
+Keep containment as an unreleased episode set, independent of insertion order or generic lifecycle events. Require explicit authenticated-release verification; reject stale predicate hashes and reused producer run/event identities. Add opt-in local task/history/edge fences with transaction- and task-scoped writer permits. These seams are not installed by normal connections: lifecycle, Board/courier and durable canonical-release verification remain prerequisites before activation.
+
+Proof: canonical scripts/run_tests.sh tests/hermes_cli/test_kanban_containment_state.py tests/hermes_cli/test_kanban_containment_policy.py tests/hermes_cli/test_kanban_containment_legacy_paths.py: 115 passed, 0 failed. scripts/check --base origin/main passed. Local fence tests preserve the relay consumer edge and reject status/history/edge writes across new SQLite connections; not a deployed CLI/tool containment claim.
+---
+ hermes_cli/kanban_containment_guard.py        |  88 ++++++
+ hermes_cli/kanban_containment_state.py        | 145 +++++++++
+ .../test_kanban_containment_state.py          | 290 ++++++++++++++++++
+ 3 files changed, 523 insertions(+)
+ create mode 100644 hermes_cli/kanban_containment_guard.py
+ create mode 100644 hermes_cli/kanban_containment_state.py
+ create mode 100644 tests/hermes_cli/test_kanban_containment_state.py
+
+diff --git a/hermes_cli/kanban_containment_guard.py b/hermes_cli/kanban_containment_guard.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..182e298deff95f5a5b53b2a8393f4b127a2a5f0e
+--- /dev/null
++++ b/hermes_cli/kanban_containment_guard.py
+@@ -0,0 +1,88 @@
++"""Local containment backstop; ingress authorization is deliberately separate.
++
++Not installed by normal connections until the lifecycle and sync capability
++contract is complete. Installing it is a fail-closed storage fence, not an API
++for containing or resuming a card. Release verification is supplied by the
++canonical ingress owner, never inferred from generic lifecycle events.
++"""
++from __future__ import annotations
++
++import contextlib
++import contextvars
++import sqlite3
++from collections.abc import Callable, Iterator, Mapping
++from typing import Any
++
++from hermes_cli.kanban_containment_state import reduce_events
++
++_WRITE: contextvars.ContextVar[tuple[int, str] | None] = contextvars.ContextVar("containment_write", default=None)
++
++
++@contextlib.contextmanager
++def authorized_write(conn: sqlite3.Connection, task_id: str) -> Iterator[None]:
++    """Internal writer seam AFTER scoped verification; requires an active txn.
++
++    Only task-state changes and new containment receipts use this seam. It does
++    not permit deleting history, removing edges or completing held dependents.
++    """
++    if not conn.in_transaction:
++        raise ValueError("containment writer requires an active transaction")
++    token = _WRITE.set((id(conn), task_id))
++    try:
++        yield
++    finally:
++        _WRITE.reset(token)
++
++
++def pending(conn: sqlite3.Connection, task_id: str, *, verify_release: Callable | None = None) -> bool:
++    """Read only; old no-UID histories remain held rather than inventing identity."""
++    columns = {r[1] for r in conn.execute("PRAGMA table_info(task_events)")}
++    uid = "uid" if "uid" in columns else "NULL AS uid"
++    cursor = conn.execute(f"SELECT {uid},task_id,kind,payload FROM task_events WHERE task_id=? "
++                          "AND kind IN ('contained','containment_released')", (task_id,))
++    names = [column[0] for column in cursor.description]
++    events = [dict(zip(names, row)) for row in cursor]
++    return reduce_events(events, verify_release=verify_release) is not None
++
++
++def install(conn: sqlite3.Connection, *, verify_release: Callable[
++    [Mapping[str, Any], Mapping[str, Any]], bool] | None = None,
++) -> None:
++    """Register this connection's read/permit functions and idempotent triggers.
++
++    Every writer connection must register the functions before opening a fenced
++    DB. A connection without them fails closed at SQLite, not open on restart.
++    """
++    conn.create_function("kanban_containment_held", 1,
++                         lambda task: int(pending(conn, task, verify_release=verify_release)))
++    conn.create_function("kanban_containment_write", 1,
++                         lambda task: int(conn.in_transaction and _WRITE.get() == (id(conn), task)))
++    _triggers(conn)
++
++
++def _triggers(conn: sqlite3.Connection) -> None:
++    held = "kanban_containment_held"
++    permit = "kanban_containment_write"
++    fail = "SELECT RAISE(ABORT,'containment_pending');"
++    protected = "('contained','containment_released')"
++    statements = {
++        "task_update": ("BEFORE UPDATE OF status,current_run_id,completed_at ON tasks",
++                        f"{held}(OLD.id) AND (OLD.status IS NOT NEW.status OR OLD.current_run_id IS NOT NEW.current_run_id "
++                        "OR OLD.completed_at IS NOT NEW.completed_at) AND ("
++                        f"NOT {permit}(OLD.id) OR NEW.status != 'triage' "
++                        "OR NEW.current_run_id IS NOT NULL OR NEW.completed_at IS NOT NULL)"),
++        "task_delete": ("BEFORE DELETE ON tasks", f"{held}(OLD.id)"),
++        "event_insert": ("BEFORE INSERT ON task_events",
++                         f"NEW.kind IN {protected} AND NOT {permit}(NEW.task_id)"),
++        "event_delete": ("BEFORE DELETE ON task_events", f"OLD.kind IN {protected}"),
++    }
++    columns = [r[1] for r in conn.execute("PRAGMA table_info(task_events)")]
++    same = " AND ".join(f'OLD."{c}" IS NEW."{c}"' for c in columns if c != "uid")
++    uid_fill = (f"OLD.uid IS NULL AND NEW.uid IS NOT NULL AND ({same})" if "uid" in columns else "0")
++    statements["event_update"] = ("BEFORE UPDATE ON task_events",
++                                  f"(OLD.kind IN {protected} OR NEW.kind IN {protected}) AND NOT ({uid_fill})")
++    for op, refs in (("insert", ("NEW",)), ("delete", ("OLD",)), ("update", ("OLD", "NEW"))):
++        condition = " OR ".join(f"{held}({ref}.{end}_id)" for ref in refs for end in ("parent", "child"))
++        statements[f"edge_{op}"] = (f"BEFORE {op.upper()} ON task_links", condition)
++    for name, (operation, condition) in statements.items():
++        conn.execute(f"CREATE TRIGGER IF NOT EXISTS containment_{name} {operation} WHEN {condition} BEGIN {fail} END")
+diff --git a/hermes_cli/kanban_containment_state.py b/hermes_cli/kanban_containment_state.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f334a13e965f8fadf39f0468cf4e830f6d4c7cba
+--- /dev/null
++++ b/hermes_cli/kanban_containment_state.py
+@@ -0,0 +1,145 @@
++"""Fail-closed, replica-order-independent non-human containment state.
++
++This reducer does not authorize a release. Its caller must authenticate each
++release before providing it; generic lifecycle events never satisfy a hold.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import uuid
++from collections.abc import Callable, Iterable, Mapping
++from dataclasses import dataclass
++from typing import Any
++
++from hermes_cli.kanban_containment_policy import ContainmentPolicyError, identity, policy
++
++
++@dataclass(frozen=True)
++class Hold:
++    """Unreleased episodes, or malformed history requiring scoped repair."""
++
++    episodes: tuple[str, ...] = ()
++    unresolved: bool = False
++
++
++def _uid(value: Any) -> bool:
++    try:
++        parsed = uuid.UUID(value) if isinstance(value, str) else None
++    except ValueError:
++        return False
++    return parsed is not None and parsed.version == 7 and str(parsed) == value
++
++
++def _payload(event: Mapping[str, Any]) -> dict | None:
++    raw = event.get("payload")
++    try:
++        value = json.loads(raw) if isinstance(raw, str) else raw
++    except ValueError:
++        return None
++    return value if isinstance(value, dict) else None
++
++
++def _stop(event: Mapping[str, Any]) -> dict | None:
++    data = _payload(event)
++    if not _uid(event.get("uid")) or data is None or data.keys() != {
++        "version", "target", "policy", "producer_baseline",
++    }:
++        return None
++    if type(data["version"]) is not int or data["version"] != 1:
++        return None
++    try:
++        target = identity(data["target"])
++        spec = policy(data["policy"], target=target)
++    except ContainmentPolicyError:
++        return None
++    if target["task_id"] != event.get("task_id"):
++        return None
++    baseline = data["producer_baseline"]
++    if baseline is not None and ("producer" not in spec or not isinstance(baseline, dict)
++                                or baseline.keys() != {"event_uid", "run_uid"}
++                                or not all(_uid(v) for v in baseline.values())):
++        return None
++    return data
++
++
++def fingerprint(payload: dict) -> str:
++    """Bind a release to the exact frozen predicate, not a mutable task row."""
++    data = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
++    return hashlib.sha256(data.encode("utf-8")).hexdigest()
++
++
++def _evidence(data: Any, stop: dict) -> bool:
++    if not isinstance(data, dict) or data.get("kind") not in ("authority", "producer"):
++        return False
++    kind = data["kind"]
++    keys = {"kind", kind, "run_uid"} | ({"event_uid"} if kind == "producer" else set())
++    if data.keys() != keys or not _uid(data["run_uid"]):
++        return False
++    try:
++        actor = identity(data[kind])
++    except ContainmentPolicyError:
++        return False
++    expected = stop["policy"].get(kind)
++    if expected is None or any(actor[k] != expected[k] for k in ("board", "task_id")):
++        return False
++    if kind == "producer":
++        baseline = stop["producer_baseline"]
++        if not _uid(data["event_uid"]) or (baseline is not None and (
++            data["event_uid"] == baseline["event_uid"] or data["run_uid"] == baseline["run_uid"]
++        )):
++            return False
++    return True
++
++
++def _release(event: Mapping[str, Any], stop: Mapping[str, Any]) -> bool:
++    data = _payload(event)
++    if not _uid(event.get("uid")) or event.get("task_id") != stop.get("task_id") or data is None:
++        return False
++    if data.keys() != {"version", "episode", "containment_sha256", "resume_status", "evidence"}:
++        return False
++    if type(data["version"]) is not int or data["version"] != 1 or data["episode"] != stop["uid"]:
++        return False
++    payload = _stop(stop)
++    return (payload is not None and data["containment_sha256"] == fingerprint(payload)
++            and data["resume_status"] == "ready" and _evidence(data["evidence"], payload))
++
++
++def reduce_events(
++    events: Iterable[Mapping[str, Any]], *,
++    verify_release: Callable[[Mapping[str, Any], Mapping[str, Any]], bool] | None = None,
++) -> Hold | None:
++    """Reduce an episode set, never latest-event-wins.
++
++    ``verify_release`` must verify authenticated canonical provenance and the
++    episode's authority/new-producer proof, not just the receipt's shape. No
++    verifier (including an offline replica) means no releases. A raised verifier
++    error propagates so callers cannot mistake an unknown result for permission.
++    """
++    stops: dict[str, Mapping[str, Any]] = {}
++    releases = []
++    unresolved = False
++    for event in events:
++        if event.get("kind") == "containment_released":
++            releases.append(event)
++        if event.get("kind") != "contained":
++            continue
++        data = _stop(event)
++        if data is None:
++            unresolved = True
++            continue
++        uid = event["uid"]
++        if uid in stops and _stop(stops[uid]) != data:
++            unresolved = True
++        stops[uid] = event
++    active = set(stops)
++    if verify_release is not None:
++        for receipt in releases:
++            data = _payload(receipt)
++            episode = data.get("episode") if data else None
++            if not isinstance(episode, str) or episode not in stops:
++                continue
++            stop = stops[episode]
++            if _release(receipt, stop) and verify_release(receipt, stop) is True:
++                active.discard(episode)
++    return Hold(tuple(sorted(active)), unresolved) if active or unresolved else None
+diff --git a/tests/hermes_cli/test_kanban_containment_state.py b/tests/hermes_cli/test_kanban_containment_state.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..dffb308d6a590497f644ed47a4100797fa3374a7
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_containment_state.py
+@@ -0,0 +1,290 @@
++"""Replica-order-independent containment episodes; no lifecycle or authority shortcuts."""
++from __future__ import annotations
++
++import copy
++import json
++import sqlite3
++
++import pytest
++
++from tests.hermes_cli import test_kanban_containment_legacy_paths as legacy
++
++board = legacy.board
++
++TARGET = {"gateway": "fixture-home", "board": "fixture", "task_id": "t_da066fc02a25c3b2"}
++AUTHORITY = {**TARGET, "task_id": "t_1123456789abcdef"}
++PRODUCER = {**TARGET, "task_id": "t_2123456789abcdef"}
++STOP_UID = "019a98b4-0000-7000-8000-000000000001"
++
++
++def stop(uid=STOP_UID):
++    return {"uid": uid, "kind": "contained", "task_id": TARGET["task_id"], "payload": {
++        "version": 1, "target": TARGET, "policy": {"version": 1, "authority": AUTHORITY},
++        "producer_baseline": None,
++    }}
++
++
++def test_valid_episode_survives_restart_and_event_reordering():
++    from hermes_cli.kanban_containment_state import reduce_events
++
++    first, second = stop(), stop("019a98b4-0000-7000-8000-000000000002")
++    expected = (first["uid"], second["uid"])
++    for events in ([first, second], [second, first], [second, first, second],
++                   json.loads(json.dumps([first, second]))):
++        hold = reduce_events(events)
++        assert hold.episodes == expected
++        assert hold.unresolved is False
++    assert reduce_events([]) is None
++    assert reduce_events([{"kind": "unblocked"}]) is None
++
++
++
++def release(episode, *, kind="authority"):
++    from hermes_cli.kanban_containment_state import fingerprint
++
++    evidence = {"kind": kind, kind: AUTHORITY if kind == "authority" else PRODUCER,
++                "run_uid": "019a98b4-0000-7000-8000-000000000099"}
++    if kind == "producer":
++        evidence["event_uid"] = "019a98b4-0000-7000-8000-000000000098"
++    return {"uid": "019a98b4-0000-7000-8000-000000000003", "kind": "containment_released",
++            "task_id": TARGET["task_id"], "payload": {"version": 1, "episode": episode["uid"],
++                "containment_sha256": fingerprint(episode["payload"]), "resume_status": "ready",
++                "evidence": evidence}}
++
++
++def test_release_needs_verified_episode_bound_receipt_and_only_releases_its_episode():
++    from hermes_cli.kanban_containment_state import reduce_events
++
++    first, second = stop(), stop("019a98b4-0000-7000-8000-000000000002")
++    receipt = release(first)
++    assert reduce_events([first, receipt]).episodes == (first["uid"],)
++    assert reduce_events([first, receipt], verify_release=lambda *_: False).episodes == (first["uid"],)
++    assert reduce_events([first, receipt], verify_release=lambda *_: 1).episodes == (first["uid"],)
++    for events in ([first, receipt], [receipt, first], json.loads(json.dumps([receipt, first]))):
++        seen = []
++        def verified(event, episode):
++            seen.append((event["uid"], episode["uid"]))
++            return True
++        assert reduce_events(events, verify_release=verified) is None
++        assert seen == [(receipt["uid"], first["uid"])]
++    assert reduce_events([first, receipt, second], verify_release=lambda *_: True).episodes == (second["uid"],)
++
++
++@pytest.mark.parametrize("field,value", [
++    ("version", True), ("version", 2), ("episode", "019a98b4-0000-7000-8000-000000000002"),
++    ("containment_sha256", "0" * 64), ("resume_status", "review"), ("extra", 1),
++    ("evidence", {}), ("evidence", {"kind": "timer"}),
++])
++def test_malformed_or_stale_release_cannot_reach_verifier(field, value):
++    from hermes_cli.kanban_containment_state import reduce_events
++
++    first = stop()
++    receipt = release(first)
++    receipt["payload"][field] = value
++    def forbidden(*_):
++        pytest.fail("invalid receipt must not reach authority verifier")
++    assert reduce_events([first, receipt], verify_release=forbidden).episodes == (first["uid"],)
++
++
++@pytest.mark.parametrize("change", [
++    lambda e: e.update(uid=None), lambda e: e.update(uid=STOP_UID.upper()),
++    lambda e: e.update(uid=STOP_UID.replace("-7000-", "-4000-")),
++    lambda e: e.update(payload="not json"), lambda e: e.update(payload="[]"),
++    lambda e: e["payload"].update(version=True), lambda e: e["payload"].update(version=2),
++    lambda e: e["payload"].update(extra=1), lambda e: e["payload"].update(target={}),
++    lambda e: e["payload"]["policy"].update(authority=TARGET),
++    lambda e: e.update(task_id=AUTHORITY["task_id"]),
++    lambda e: e["payload"].update(producer_baseline={"event_uid": STOP_UID, "run_uid": STOP_UID}),
++])
++def test_malformed_containment_is_never_erased_by_a_release(change):
++    from hermes_cli.kanban_containment_state import reduce_events
++
++    first = stop()
++    receipt = release(first)
++    change(first)
++    hold = reduce_events([receipt, first], verify_release=lambda *_: True)
++    assert hold is not None and hold.unresolved is True
++
++
++@pytest.mark.parametrize("change", [
++    lambda e: e.update(uid=None), lambda e: e.update(task_id=AUTHORITY["task_id"]),
++    lambda e: e["payload"].update(evidence=[]),
++    lambda e: e["payload"]["evidence"].update(run_uid=42),
++    lambda e: e["payload"]["evidence"].update(extra=True),
++    lambda e: e["payload"]["evidence"].update(authority={}),
++    lambda e: e["payload"]["evidence"]["authority"].update(task_id=PRODUCER["task_id"]),
++    lambda e: e["payload"]["evidence"]["authority"].update(board="other"),
++])
++def test_release_identity_must_match_scope_before_verification(change):
++    from hermes_cli.kanban_containment_state import reduce_events
++
++    first = stop()
++    receipt = copy.deepcopy(release(first))
++    change(receipt)
++    def forbidden(*_):
++        pytest.fail("invalid release identity reached verifier")
++    assert reduce_events([first, receipt], verify_release=forbidden) is not None
++
++
++def test_new_producer_proof_is_distinct_from_the_frozen_event_and_run():
++    from hermes_cli.kanban_containment_state import reduce_events
++
++    first = stop()
++    first["payload"]["policy"]["producer"] = PRODUCER
++    first["payload"]["producer_baseline"] = {"run_uid": STOP_UID, "event_uid": STOP_UID}
++    receipt = release(first, kind="producer")
++    assert reduce_events([receipt, first], verify_release=lambda *_: True) is None
++    for key in ("run_uid", "event_uid"):
++        old = copy.deepcopy(receipt)
++        old["payload"]["evidence"][key] = STOP_UID
++        assert reduce_events([first, old], verify_release=lambda *_: True) is not None
++    no_producer = stop()
++    assert reduce_events([no_producer, release(no_producer, kind="producer")],
++                         verify_release=lambda *_: True) is not None
++
++
++def _guarded(board):
++    from hermes_cli import kanban_containment_guard as guard
++    from hermes_cli import kanban_db as kb
++
++    relay, consumer = legacy._relay(board)
++    if "uid" not in {r[1] for r in board.execute("PRAGMA table_info(task_events)")}:
++        board.execute("ALTER TABLE task_events ADD COLUMN uid TEXT")
++    guard.install(board)
++    episode = copy.deepcopy(stop())
++    episode["task_id"] = relay
++    episode["payload"]["target"]["task_id"] = relay
++    with kb.write_txn(board):
++        with guard.authorized_write(board, relay):
++            kb._append_event(board, relay, "contained", episode["payload"])
++            board.execute("UPDATE task_events SET uid=? WHERE task_id=? AND kind='contained'", (STOP_UID, relay))
++            board.execute("UPDATE tasks SET status='triage',current_run_id=NULL WHERE id=?", (relay,))
++    assert guard.pending(board, relay)
++    return relay, consumer
++
++
++@pytest.mark.parametrize("sql", [
++    "DELETE FROM tasks WHERE id=?", "UPDATE tasks SET status='review' WHERE id=?",
++    "UPDATE tasks SET current_run_id=999 WHERE id=?", "UPDATE tasks SET completed_at=1 WHERE id=?",
++    "DELETE FROM task_events WHERE task_id=? AND kind='contained'",
++    "UPDATE task_events SET kind='ignored' WHERE task_id=? AND kind='contained'",
++    "UPDATE task_events SET payload='{}' WHERE task_id=? AND kind='contained'",
++    "UPDATE task_events SET uid='changed' WHERE task_id=? AND kind='contained'",
++    "DELETE FROM task_links WHERE parent_id=?",
++    "INSERT INTO task_links (parent_id,child_id) SELECT id,id FROM tasks WHERE id=?",
++    "UPDATE task_links SET parent_id=child_id WHERE parent_id=?",
++])
++def test_backstop_blocks_status_history_and_edge_mutation(board, sql):
++    from hermes_cli import kanban_db as kb
++
++    relay, _ = _guarded(board)
++    with pytest.raises(sqlite3.IntegrityError, match="containment_pending"):
++        with kb.write_txn(board):
++            board.execute(sql, (relay,))
++
++
++def test_writer_permit_is_transaction_connection_and_task_scoped(board):
++    from hermes_cli import kanban_containment_guard as guard
++    from hermes_cli import kanban_db as kb
++
++    relay, consumer = _guarded(board)
++    with pytest.raises(ValueError, match="active transaction"):
++        with guard.authorized_write(board, relay):
++            pass
++    with kb.write_txn(board):
++        for granted in (relay, consumer):
++            with guard.authorized_write(board, granted):
++                for status in ("done", "archived", "ready", "review", "todo"):
++                    with pytest.raises(sqlite3.IntegrityError, match="containment_pending"):
++                        board.execute("UPDATE tasks SET status=? WHERE id=?", (status, relay))
++    # A new connection registers its own functions against the durable triggers.
++    path = board.execute("PRAGMA database_list").fetchone()[2]
++    with sqlite3.connect(path, isolation_level=None) as peer:
++        guard.install(peer)
++        assert guard.pending(peer, relay)
++        with kb.write_txn(board):
++            with guard.authorized_write(board, relay):
++                assert peer.execute("SELECT kanban_containment_write(?)", (relay,)).fetchone()[0] == 0
++        with pytest.raises(sqlite3.IntegrityError, match="containment_pending"):
++            peer.execute("UPDATE tasks SET status='ready' WHERE id=?", (relay,))
++    with pytest.raises(sqlite3.IntegrityError, match="containment_pending"):
++        with kb.write_txn(board):
++            board.execute("UPDATE tasks SET status='ready' WHERE id=?", (relay,))
++
++
++def test_protected_receipt_insert_needs_exact_task_transaction_permit(board):
++    from hermes_cli import kanban_containment_guard as guard
++    from hermes_cli import kanban_db as kb
++
++    relay, consumer = _guarded(board)
++    for kind in ("contained", "containment_released"):
++        with pytest.raises(sqlite3.IntegrityError, match="containment_pending"):
++            with kb.write_txn(board):
++                kb._append_event(board, consumer, kind, {})
++        with kb.write_txn(board):
++            with guard.authorized_write(board, relay):
++                with pytest.raises(sqlite3.IntegrityError, match="containment_pending"):
++                    kb._append_event(board, consumer, kind, {})
++    # Permits may not destroy evidence or dependencies, even for the named task.
++    with kb.write_txn(board):
++        with guard.authorized_write(board, relay):
++            for sql in ("DELETE FROM task_events WHERE task_id=? AND kind='contained'",
++                        "DELETE FROM task_links WHERE parent_id=?"):
++                with pytest.raises(sqlite3.IntegrityError, match="containment_pending"):
++                    board.execute(sql, (relay,))
++
++
++def test_conflicting_same_uid_containment_never_releases(board):
++    from hermes_cli.kanban_containment_state import reduce_events
++
++    first = stop()
++    conflict = copy.deepcopy(first)
++    conflict["payload"]["target"]["gateway"] = "different-home"
++    for events in ([first, conflict], [conflict, first]):
++        hold = reduce_events([*events, release(first), release(conflict)], verify_release=lambda *_: True)
++        assert hold is not None and hold.unresolved is True
++
++
++def test_local_backstop_preserves_edges_and_refuses_generic_completion(board):
++    from hermes_cli import kanban_containment_guard as guard
++    from hermes_cli import kanban_db as kb
++    import sqlite3
++
++    relay, consumer = legacy._relay(board)
++    guard.install(board)
++    episode = stop()
++    episode["task_id"] = relay
++    episode["payload"]["target"] = {**TARGET, "task_id": relay}
++    with kb.write_txn(board):
++        with guard.authorized_write(board, relay):
++            kb._append_event(board, relay, "contained", episode["payload"])
++            board.execute("UPDATE tasks SET status='triage',current_run_id=NULL WHERE id=?", (relay,))
++    before = legacy._edges(board)
++    with kb.write_txn(board):
++        with guard.authorized_write(board, relay):
++            with pytest.raises(sqlite3.IntegrityError, match="containment_pending"):
++                board.execute("UPDATE tasks SET status='done' WHERE id=?", (relay,))
++    assert kb.complete_task(board, relay, summary="Must not release dependency") is False
++    with pytest.raises(sqlite3.IntegrityError, match="containment_pending"):
++        with kb.write_txn(board):
++            board.execute("UPDATE tasks SET status='done' WHERE id=?", (relay,))
++    assert kb.get_task(board, relay).status == "triage"
++    assert kb.get_task(board, consumer).status == "todo"
++    assert legacy._edges(board) == before
++    with pytest.raises(sqlite3.IntegrityError, match="containment_pending"):
++        with kb.write_txn(board):
++            board.execute("DELETE FROM task_links WHERE parent_id=?", (relay,))
++    assert legacy._edges(board) == before
++
++
++def test_containment_is_not_released_by_generic_lifecycle_events():
++    from hermes_cli.kanban_containment_state import reduce_events
++
++    events = [{"uid": "019a98b4-0000-7000-8000-000000000001", "kind": "contained",
++               "payload": json.dumps({"version": 1}), "task_id": "t_da066fc02a25c3b2"}]
++    events.extend({"kind": kind, "payload": "{}"} for kind in (
++        "unblocked", "promoted_manual", "reopened", "completed", "review_requested", "archived"))
++    hold = reduce_events(events)
++    assert hold is not None
++    assert hold.unresolved is True
++    assert hold.episodes == ()
+-- 
+2.43.0
+

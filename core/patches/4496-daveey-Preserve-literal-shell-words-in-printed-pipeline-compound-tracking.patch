@@ -1,0 +1,283 @@
+From 3f135289309f0ee6209fc7c2b621875bb6bf8b01 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 16:44:59 +0000
+Subject: [PATCH] [daveey] Preserve literal shell words in printed-pipeline
+ compound tracking
+
+Carry quote/escape provenance on ShellWord without changing decoded argv. Only lexical operators and reserved words alter printed-unit or case phases; retain heredoc ownership and inherited stdin flow from PR3210.
+
+Proof: focused regressions 70 fail on base 726ac2e8900d; 93 pass on fix. Full lifecycle: 9830 passed across 54 files. Nine structural/metadata mutants killed; harmless real Bash FED markers prove pipe reachability. Bounded 11-command parser replay changes only three closer repros. Function-indirected producer flow is separately tracked in t_028a39b21383a50d.
+---
+ cron/lifecycle_guard_nested_shells.py         |  41 +++---
+ cron/lifecycle_guard_words.py                 |  16 ++-
+ .../test_lifecycle_guard_printed_compounds.py | 133 ++++++++++++++++++
+ 3 files changed, 171 insertions(+), 19 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_printed_compounds.py
+
+diff --git a/cron/lifecycle_guard_nested_shells.py b/cron/lifecycle_guard_nested_shells.py
+index 06376f340b8f6eeeae71fddbf993dc8f7dbcf5c0..11ea390861e25b3065c6a7ef440fbd91efcd18ba 100644
+--- a/cron/lifecycle_guard_nested_shells.py
++++ b/cron/lifecycle_guard_nested_shells.py
+@@ -342,24 +342,40 @@ class _PrintedUnit:
+ def _case_word_role(cases: dict[int, str], depth: int, word: str) -> Optional[str]:
+     """Keep case subjects/pattern punctuation out of command and group tracking."""
+     phase = cases.get(depth)
++    syntax = not getattr(word, "quoted", False)
+     if phase == "subject":
+         cases[depth] = "header"
+-    elif phase == "header" and word == "in":
++    elif phase == "header" and syntax and word == "in":
+         cases[depth] = "pattern"
+-    elif phase in ("pattern", "pattern-word") and word == ")":
++    elif phase in ("pattern", "pattern-word") and syntax and word == ")":
+         cases[depth] = "body"
+         return "arm"
+-    elif phase == "pattern" and word == "(":
++    elif phase == "pattern" and syntax and word == "(":
+         cases[depth] = "pattern-word"
+-    elif phase == "body" and word == ";;":
++    elif phase == "body" and syntax and word == ";;":
+         cases[depth] = "pattern"
+-    elif phase == "pattern" and word == "esac":
++    elif phase == "pattern" and syntax and word == "esac":
+         return "end"
+     if phase in ("subject", "header", "pattern", "pattern-word"):
+         return "data"
+     return None
+ 
+ 
++def _printed_word_role(word: str, command_position: bool) -> tuple[str, bool]:
++    """Only lexical shell syntax changes compound depth or command position."""
++    if getattr(word, "quoted", False):
++        return "word", False
++    if word in _PIPE_OPERATORS or word in _LIST_OPERATORS or word in ("(", ")"):
++        role = ("pipe" if word in _PIPE_OPERATORS else "list"
++                if word in _LIST_OPERATORS else "open" if word == "(" else "close")
++        return role, True
++    if command_position and word in _GROUP_OPEN_WORDS:
++        return "open", word in _COMMAND_PREFIX_WORDS
++    if command_position and word in _GROUP_CLOSE_WORDS:
++        return "close", False
++    return "word", command_position and word in _COMMAND_PREFIX_WORDS
++
++
+ def _printed_pipeline_units(command: str) -> list[_PrintedUnit]:
+     """Split *command* into printed-text units: top-level lists, with compound groups and
+     pipe-newline continuations kept whole. Event roles are ``word``, ``open``, ``close``,
+@@ -388,7 +404,8 @@ def _printed_pipeline_units(command: str) -> list[_PrintedUnit]:
+                 command_position = True
+             for token in tokens:
+                 words = re.findall(r"\|&|&&|\|\||;;|[;&|()]", token) if (
+-                    token and set(token) <= _CONTROL_CHARS) else [token]
++                    token and not getattr(token, "quoted", False)
++                    and set(token) <= _CONTROL_CHARS) else [token]
+                 for word in words:
+                     case_role = _case_word_role(cases, depth, word)
+                     if case_role == "arm":
+@@ -400,17 +417,7 @@ def _printed_pipeline_units(command: str) -> list[_PrintedUnit]:
+                     if case_role == "data":
+                         unit.events.append(("data", word))
+                         continue
+-                    if word in _PIPE_OPERATORS or word in _LIST_OPERATORS or word in ("(", ")"):
+-                        role = ("pipe" if word in _PIPE_OPERATORS else "list"
+-                                if word in _LIST_OPERATORS else "open" if word == "(" else "close")
+-                        command_position = True
+-                    elif command_position and word in _GROUP_OPEN_WORDS:
+-                        role, command_position = "open", word in _COMMAND_PREFIX_WORDS
+-                    elif command_position and word in _GROUP_CLOSE_WORDS:
+-                        role, command_position = "close", False
+-                    else:
+-                        role = "word"
+-                        command_position = command_position and word in _COMMAND_PREFIX_WORDS
++                    role, command_position = _printed_word_role(word, command_position)
+                     if role == "close":
+                         cases.pop(depth, None)
+                     depth = depth + 1 if role == "open" else max(0, depth - (role == "close"))
+diff --git a/cron/lifecycle_guard_words.py b/cron/lifecycle_guard_words.py
+index 676004ae75d51d6a3cf8c6abdd772963b38596e3..1734b1a23952a5e2bc6dbe8c895784ba97e84672 100644
+--- a/cron/lifecycle_guard_words.py
++++ b/cron/lifecycle_guard_words.py
+@@ -15,10 +15,12 @@ class ShellWord(str):
+     """A decoded word plus the redirection parsed before quoted punctuation is decoded."""
+ 
+     redirection: tuple[str, str, str] | None
++    quoted: bool
+ 
+-    def __new__(cls, text: str, redirection: tuple[str, str, str] | None):
++    def __new__(cls, text: str, redirection: tuple[str, str, str] | None, *, quoted: bool = False):
+         word = super().__new__(cls, text)
+         word.redirection = redirection
++        word.quoted = quoted
+         return word
+ 
+ 
+@@ -38,8 +40,14 @@ def tokenize_redirections(line: str, tokenize: Callable[[str], list[str]],
+     replacements = {ch: f"{marker}{index}{marker}" for index, ch in enumerate(alphabet)}
+     protected: list[str] = []
+     single = double = escaped = False
++    quote_marker = marker + "5" + marker
+     for ch in line:
+         literal = single or double or escaped
++        # Mark the boundary, including empty quoted pieces. The escape marker
++        # itself is encoded below, so literal input cannot synthesize this tag.
++        if not escaped and (ch == "\\" and not single
++                            or ch == "'" and not double or ch == '"' and not single):
++            protected.append(quote_marker)
+         if escaped:
+             escaped = False
+         elif ch == "\\" and not single:
+@@ -55,7 +63,11 @@ def tokenize_redirections(line: str, tokenize: Callable[[str], list[str]],
+ 
+     words: list[str] = []
+     for token in tokenize(split_glued_redirections("".join(protected))):
++        tags = list(re.finditer(marker + r"([0-5])" + marker, token))
++        quoted = any(match[1] == "5" for match in tags)
++        token = re.sub(marker + r"([0-5])" + marker,
++                       lambda m: "" if m[1] == "5" else m[0], token)
+         match = pattern.match(token)
+         parts = (restore(match[1]), restore(match[2]), restore(match[3])) if match else None
+-        words.append(ShellWord(restore(token), parts))
++        words.append(ShellWord(restore(token), parts, quoted=quoted))
+     return words
+diff --git a/tests/cron/test_lifecycle_guard_printed_compounds.py b/tests/cron/test_lifecycle_guard_printed_compounds.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4b9416f7d1af12437269e55996bbc2a19195f15e
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_printed_compounds.py
+@@ -0,0 +1,133 @@
++"""Quoted shell words must not change printed pipeline structure."""
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from cron.lifecycle_guard_nested_shells import _printed_pipeline_units
++from tests.cron import test_lifecycle_guard_session_aliases as aliases
++
++live_kanban_db = aliases.live_kanban_db
++
++
++@pytest.mark.parametrize("literal", ['"}"', "'}'", r"\}", "''}", '""}', '"fi"', r"\done", "'esac'"])
++@pytest.mark.parametrize("separator", [";", "\n"])
++def test_literal_closer_does_not_end_printed_group(tmp_path, live_kanban_db, literal, separator):
++    text = f"printf 't ( bash {live_kanban_db} )' | {{ echo x; {literal}{separator} bash -l; }}"
++    unsafe, refusal = scan_gateway_lifecycle(
++        text, cwd=str(tmp_path), session_aliases=frozenset({"zz"}))
++    assert unsafe and refusal is not None and "SQLite" in refusal
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("literal", ['"}"', r"\}", "''}"])
++def test_real_bash_literal_closer_leaves_pipe_available(tmp_path, literal):
++    text = f"printf 'echo FED\\n' | {{ echo x; {literal}; bash --noprofile --norc; }}"
++    result = subprocess.run(
++        ["bash", "--noprofile", "--norc", "-c", text], cwd=tmp_path,
++        capture_output=True, text=True, encoding="utf-8", timeout=10, check=True)
++    assert result.stdout == "x\nFED\n"
++    assert "command not found" in result.stderr
++
++
++@pytest.mark.parametrize("literal", ['"{"', r"\{", "''{", "'('", r"\(", '"if"', '"case"'])
++def test_literal_opener_does_not_join_unrelated_pipelines(tmp_path, live_kanban_db, literal):
++    text = f"printf 't ( bash {live_kanban_db} )' | bash; {literal}; printf ':' | bash -l"
++    assert scan_gateway_lifecycle(
++        text, cwd=str(tmp_path), session_aliases=frozenset({"zz"})) == (False, None)
++    assert len(_printed_pipeline_units(text)) == 3
++
++
++@pytest.mark.parametrize("group", [
++    "if :; then {literal}; bash -l; fi",
++    "while :; do {literal}; bash -l; break; done",
++    "for x in once; do {literal}; bash -l; done",
++    "case x in x) {literal}; bash -l;; esac",
++    "( case x in (x) {literal}; bash -l;; esac )",
++    "{ echo }; {literal}; bash -l; }",
++])
++@pytest.mark.parametrize("literal", ['"fi"', r"\done", "'esac'", '"}"'])
++def test_keyword_compound_keeps_literal_closer(tmp_path, live_kanban_db, group, literal):
++    sink = group.replace("{literal}", literal)
++    text = f"printf 't ( bash {live_kanban_db} )' | {sink}"
++    assert len(_printed_pipeline_units(text)) == 1
++    unsafe, refusal = scan_gateway_lifecycle(
++        text, cwd=str(tmp_path), session_aliases=frozenset({"zz"}))
++    assert unsafe and refusal is not None and "SQLite" in refusal
++
++
++@pytest.mark.parametrize("word", ['";"', r"\|", "'('", "')'", "'&&'", "''}"])
++def test_literal_control_keeps_word_event(word):
++    unit, = _printed_pipeline_units(f"echo x; {word}")[-1:]
++    assert len(unit.events) == 1
++    assert unit.events[0][0] == "word"
++
++
++@pytest.mark.parametrize("operator", ["|", "|&"])
++@pytest.mark.parametrize("continuation", ["\n", " # comment\n", " \\\n"])
++def test_pipe_continuation_keeps_unit(operator, continuation):
++    assert len(_printed_pipeline_units(f"printf ':' {operator}{continuation}bash -l")) == 1
++
++
++@pytest.mark.parametrize("redirect", ["2>&1", "0<&3", "&>out", ">|out"])
++def test_redirection_does_not_split_pipeline(redirect):
++    assert len(_printed_pipeline_units(f"printf ':' {redirect} | bash -l")) == 1
++
++
++@pytest.mark.parametrize("definition", ["f()", "function f", "function 'f'"])
++def test_function_definition_remains_separate_from_call(definition):
++    units = _printed_pipeline_units(definition + " { printf ':'; }; f | bash -l")
++    assert len(units) >= 2
++    assert units[-1].text() == "f | bash -l"
++
++
++@pytest.mark.parametrize("pattern", ["'esac'", '"("', r"\)", "';;'", '"in"'])
++def test_quoted_case_patterns_are_data(tmp_path, live_kanban_db, pattern):
++    text = (f"printf 't ( bash {live_kanban_db} )' | "
++            f"case x in {pattern}) :;; *) bash -l;; esac")
++    unit, = _printed_pipeline_units(text)
++    assert sum(role == "open" for role, _ in unit.events) == 1
++    assert sum(role == "close" for role, _ in unit.events) == 1
++    unsafe, refusal = scan_gateway_lifecycle(
++        text, cwd=str(tmp_path), session_aliases=frozenset({"zz"}))
++    assert unsafe and refusal is not None and "SQLite" in refusal
++
++
++@pytest.mark.parametrize("source,expected,quoted", [
++    ("}", "}", False), ('"}"', "}", True), ("''}", "}", True),
++    (r"\}", "}", True), ("fi", "fi", False), ("f'i'", "fi", True),
++    ("''", "", True), (r"\;", ";", True), ("';'", ";", True),
++    ("\ue0005\ue000", "\ue0005\ue000", False),
++    ("'\ue000'5'\ue000'", "\ue0005\ue000", True),
++    ("$'}'", "}", True),
++])
++def test_lexical_quote_metadata_roundtrip(source, expected, quoted):
++    from cron.lifecycle_guard_tokens import _iter_plain_token_lists
++
++    words = list(_iter_plain_token_lists(source))[-1]
++    assert len(words) == 1
++    assert words[0] == expected
++    assert words[0].quoted is quoted
++
++
++def test_quoted_prefix_does_not_expose_later_group():
++    units = _printed_pipeline_units('"time" {; printf : | bash -l')
++    assert len(units) == 2
++    assert all(role == "word" for role, _ in units[0].events)
++
++
++@pytest.mark.parametrize("phase,word", [
++    ("header", "in"), ("pattern", ")"), ("pattern-word", ")"),
++    ("pattern", "("), ("body", ";;"), ("pattern", "esac"),
++])
++def test_case_phase_ignores_literal_syntax(phase, word):
++    from cron.lifecycle_guard_nested_shells import _case_word_role
++    from cron.lifecycle_guard_words import ShellWord
++
++    cases = {1: phase}
++    result = _case_word_role(cases, 1, ShellWord(word, None, quoted=True))
++    assert cases == {1: phase}
++    assert result == (None if phase == "body" else "data")
++    plain = {1: phase}
++    plain_result = _case_word_role(plain, 1, word)
++    assert plain != cases or plain_result != result
+-- 
+2.43.0
+

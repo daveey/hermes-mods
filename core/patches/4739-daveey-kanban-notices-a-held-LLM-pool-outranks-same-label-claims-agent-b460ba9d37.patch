@@ -1,0 +1,165 @@
+From 1469a31d4b24147d51b554650f7bf92914bd5425 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 04:30:22 +0000
+Subject: [PATCH] [daveey] kanban notices: a held LLM pool outranks same-label
+ claims (agent-b460ba9d37)
+
+A ready pool card's stall notice said 'admission reason matching_pool_busy ... Not a placement
+problem' whenever workers had claimed same-label cards in the last 30 min, and skipped the
+LLM pacing read entirely. On 2026-11-15 openai-codex went held (limit 0 on every worker) at
+16:44Z; the 17:17Z notice for default-routed t_fc957aa5f46a6e47 still said matching_pool_busy
+because anthropic-routed cards had been claimed, and the owner chat forecast pickup 'as slots
+free up' for cards that could not start until the codex reset days later.
+
+Claims prove a queue only for a pool that admits starts. post_notice and ready_hint now ask the
+governor's read-only view when the backlog is busy: if every candidate pool is held, the held
+pacing admission (with its until) replaces matching_pool_busy and _options gives the pacing
+advice. A paced pool still admits starts, so its claims keep the queue words; a failing or
+non-positive read keeps today's behaviour.
+---
+ hermes_cli/kanban_parent_unclaimed.py         | 41 ++++++++++++++--
+ .../test_kanban_notice_pacing_admission.py    | 49 +++++++++++++++++++
+ 2 files changed, 85 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index 2e5653b61f2c941465da4a4fd8bd7e9ed4d840cd..1f0bd898c3db0e7a435829cb3ee49c1619d8fb7e 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -123,15 +123,17 @@ def _options(parent_id: str, evidence: Optional[dict[str, Any]] = None,
+              payload: Optional[dict[str, Any]] = None, now: Optional[float] = None) -> str:
+     """Capacity advice, or the recorded skip's (or the unrecorded skip's) advice without priority changes. A card
+     whose matching machines claimed same-label cards during the wait is queued, so no re-place is offered; one whose
+-    pool the LLM pacing governor holds starts on its own, so neither is a priority change or a re-place."""
++    pool the LLM pacing governor holds starts on its own, so neither is a priority change or a re-place. A stored
++    pacing admission is checked first: a notice records one over same-label claims only for a held pool
++    (:func:`_queued`)."""
+     from hermes_cli import kanban_label_backlog as klb
+-    if klb.busy((payload or {}).get("label_backlog")):
+-        return f"Not a placement problem, do not re-place: {klb.ADVICE}"
+     from hermes_cli import kanban_llm_pacing_dispatch as pacing
+     from hermes_cli.kanban_dispatch_skip import advice as skip_advice
+     held = pacing.admission_skip((payload or {}).get("admission"))
+     if held:
+         return f"{NO_FIX}: " + skip_advice(held, now=now)
++    if klb.busy((payload or {}).get("label_backlog")):
++        return f"Not a placement problem, do not re-place: {klb.ADVICE}"
+     from hermes_cli.kanban_dispatch_skip import notice_advice
+     from hermes_cli.kanban_priority import advice
+     return f"{NO_FIX}: " + (notice_advice(payload or {}, now=now) or advice(parent_id, evidence))
+@@ -170,7 +172,9 @@ def ready_hint(conn, task, *, now: Optional[float] = None) -> Optional[str]:
+     fields = {**notice_fields(place, waited), **({"pool_hint": pool} if pool else {}), **_backlog(place)}
+     from hermes_cli import kanban_host_counts as khc
+     from hermes_cli import kanban_label_backlog as klb
+-    admission = None if klb.busy(place.get("backlog")) else _pacing_admission(conn, task.id, place, None)
++    held_over_claims = _held_over_claims(conn, task.id, place)
++    admission = held_over_claims or (None if klb.busy(place.get("backlog"))
++                                     else _pacing_admission(conn, task.id, place, None))
+     if admission:
+         fields.update(admission=admission, board=place.get("board") or khc.board_of(conn),
+                       observed_at=place.get("observed_at") or int(now))
+@@ -268,6 +272,33 @@ def _pacing_admission(conn, task_id: str, place: dict[str, Any], extra: Optional
+         return None
+ 
+ 
++def _held_over_claims(conn, task_id: str, place: dict[str, Any]) -> Optional[dict[str, Any]]:
++    """The pacing ``admission`` for a card whose place shows same-label claims (``kanban_label_backlog.busy``) while
++    the governor holds EVERY pool the card may run on; None otherwise.
++
++    Claims prove a queue only for a pool that admits starts. A ``held`` pool admits none on any worker, so claims of
++    same-label cards routed to other providers say nothing about this card (agent-b460ba9d37: openai-codex held for
++    five days, yet a default-routed card's notice said ``matching_pool_busy`` because anthropic cards were claimed,
++    and its owner chat forecast pickup as slots freed). A ``paced`` pool still admits starts, so its claims stand.
++    The governor read is advisory: a failing or non-positive read keeps the busy verdict. [daveey]"""
++    from hermes_cli import kanban_label_backlog as klb
++    if not klb.busy(place.get("backlog")):
++        return None
++    try:
++        paces = _read_pacing(conn, task_id)
++    except Exception:  # health: allow BLE001 -- the governor read is advisory; keep the queue verdict
++        _log.debug("parent-unclaimed: pacing read unavailable for %s", task_id, exc_info=True)
++        return None
++    pools = (paces or {}).get("providers") or []
++    return paces if pools and all(p.get("state") == "held" for p in pools) else None  # lp.HELD, by value (NOTICE_VIEW)
++
++
++def _queued(conn, task_id: str, place: dict[str, Any]) -> bool:
++    """True when same-label claims make the wait a queue wait: busy, and no held pool (:func:`_held_over_claims`)."""
++    from hermes_cli import kanban_label_backlog as klb
++    return klb.busy(place.get("backlog")) and _held_over_claims(conn, task_id, place) is None
++
++
+ def _host_hold_only_if_local(extra: Optional[dict[str, Any]], place: dict[str, Any]) -> Optional[dict[str, Any]]:
+     """``extra`` without this host's core-update hold (``core_update_*``) unless this host leases the card (lane
+     ``local``). The hold only stops this host's claims: a pool or remote-placed card is leased elsewhere, so its
+@@ -294,7 +325,7 @@ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_se
+         return False  # before the queue place: every tick asks again for each long-ready card [daveey]
+     place = _place(conn, waiting_on)
+     extra = _host_hold_only_if_local(extra, place)
+-    busy = klb.busy(place.get("backlog"))
++    busy = _queued(conn, waiting_on, place)
+     from hermes_cli import kanban_notice_verdict
+     verdict = ({} if busy or (extra or {}).get("core_update_hold") else
+                kanban_notice_verdict.fields(conn, waiting_on, place, ready_seconds, _read_pacing))
+diff --git a/tests/hermes_cli/test_kanban_notice_pacing_admission.py b/tests/hermes_cli/test_kanban_notice_pacing_admission.py
+index 5f5341eb53ccff900fc4f8f56de5ce7e0680de26..e5fcce3df53d2bb4fc6e33264ba863b95083b4bf 100644
+--- a/tests/hermes_cli/test_kanban_notice_pacing_admission.py
++++ b/tests/hermes_cli/test_kanban_notice_pacing_admission.py
+@@ -353,6 +353,55 @@ def test_a_busy_pool_and_a_core_update_hold_still_come_first(hub):
+     assert "core_update_hold" not in pooled, pooled
+ 
+ 
++def _claimed_by_the_pool(conn, n=3):
++    """``n`` same-label cards the pool claimed within 30 min: what makes a notice say matching_pool_busy."""
++    now = int(time.time())
++    for i in range(n):
++        claimed = pool_wait._card(conn, f"claimed {i}", now - 4000 + i)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (claimed,))
++            kb._append_event(conn, claimed, "claimed", {"holder": f"worker-{3 + i % 2}", "run_uid": f"r{i}"})
++
++
++@pytest.mark.parametrize("recorded", ["hub_only", "stale_paced_verdict"])
++@pytest.mark.parametrize("path", sorted(NOTICES))
++def test_a_held_pool_beats_same_label_claims_on_other_providers(hub, path, recorded):
++    """Defect agent-b460ba9d37 (hub, 2026-11-15 17:17Z): openai-codex went ``held`` (all accounts at 100% of the
++    7-day window, limit 0 on every worker) at 16:44Z, yet the stall notice for default-routed t_fc957aa5f46a6e47 said
++    "admission reason matching_pool_busy ... Not a placement problem ... Check current admission holds", because
++    workers had claimed two same-label cards routed to anthropic. The owner chat forecast pickup "as slots free up";
++    the card could not start until the codex reset days later. Claims on other providers prove nothing about a pool
++    that admits nothing: a held pool is named, with its until, ahead of the claim count. ``stale_paced_verdict``: the
++    card's newest capable skip still says ``paced`` (recorded once, before the hold), as on #3206 that morning."""
++    until = int(time.time()) + 5 * DAY
++    _store(("anthropic", lp.HELD, until))
++    tid = _hub_card(hub.conn)
++    if recorded == "stale_paced_verdict":
++        assert skips.record(hub.conn, tid, "llm_paced", detail="anthropic paced",
++                            extra={"providers": [{"provider": "anthropic", "state": "paced", "limit": 1,
++                                                  "running": 1}]})
++    _claimed_by_the_pool(hub.conn)
++    payload, text = NOTICES[path](hub.conn, tid)
++    assert payload["admission"]["status"] == "held", payload
++    assert payload["admission"]["providers"] == [{"provider": "anthropic", "state": "held", "until": until}], payload
++    stamp = time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(until))
++    assert f"(anthropic held pool) until {stamp}" in text, text
++    assert "matching_pool_busy" not in text and "Not a placement problem" not in text, text
++    hint = pu.ready_hint(hub.conn, kb.get_task(hub.conn, tid), now=payload["observed_at"])
++    assert hint is not None and f"(anthropic held pool) until {stamp}" in hint, hint
++    assert "Not a placement problem" not in hint, hint
++
++
++def test_a_paced_pool_with_same_label_claims_stays_a_queue_wait(hub):
++    """The guard's boundary: a paced pool still admits starts (the claims show it), so the busy queue words stand."""
++    _store(("anthropic", lp.PACED))
++    tid = _hub_card(hub.conn)
++    _claimed_by_the_pool(hub.conn)
++    payload, text = _chat_wait(hub.conn, tid)
++    assert payload["admission"] == {"reason": "matching_pool_busy", "status": "queued"}, payload
++    assert "Not a placement problem" in text, text
++
++
+ def test_this_hosts_update_hold_does_not_hide_a_pool_cards_pacing_wait(hub):
+     """The incident shape (t_fc957aa5f46a6e47): a pool card paced by the governor while the hub swaps its own
+     core gets the pacing notice, not the hub's hold sentence."""
+-- 
+2.43.0
+

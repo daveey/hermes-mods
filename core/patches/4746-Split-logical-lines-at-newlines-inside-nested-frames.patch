@@ -1,0 +1,181 @@
+From 76b972a015d7aa05f19fb070cc0d78b02eb956a8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 09:25:03 +0000
+Subject: [PATCH] Split logical lines at newlines inside nested $() frames
+
+Framing ${...} as one opaque span hid newline command separators inside a
+nested $(...) from the logical-line splitter, so `echo ${x:-$(true<NL>bash ./r.sh)}`
+(and the comment form) ran ./r.sh unread; main refused both. The span walkers
+now report those separator offsets and _scan splits the framed span there.
+Backtick bodies and double-quoted frames are unchanged (t_0a7e8d4a61542b7f).
+
+Review: pullrequestreview-5901906614 (t_edfd05653f7ce9d4). Card t_60e1b62eed385db5.
+---
+ cron/lifecycle_guard_lines.py                 | 61 +++++++++++++++----
+ .../test_lifecycle_guard_nested_comments.py   | 26 ++++++++
+ 2 files changed, 75 insertions(+), 12 deletions(-)
+
+diff --git a/cron/lifecycle_guard_lines.py b/cron/lifecycle_guard_lines.py
+index da724825bdd170226dd25ead4624da2c869bd4ad..b7d0e7e44e3df54112fe3de6896a80e8a10f20d6 100644
+--- a/cron/lifecycle_guard_lines.py
++++ b/cron/lifecycle_guard_lines.py
+@@ -51,8 +51,12 @@ def _double_span(text: str, start: int, *, shlex_quotes: bool) -> tuple[int, str
+     return pos, "".join(parts)
+ 
+ 
+-def _command_span(text: str, start: int, *, shlex_quotes: bool) -> tuple[int, str]:
+-    """Find a substitution's closing parenthesis in its own shell comment frame."""
++def _command_span(text: str, start: int, *, shlex_quotes: bool,
++                  breaks: list[int] | None = None) -> tuple[int, str]:
++    """Find a substitution's closing parenthesis in its own shell comment frame.
++
++    With *breaks*, record (relative to the returned span) each newline that separates commands
++    in this frame or a nested parameter/command frame, so a logical-line split still sees them."""
+     pos = copied = start
+     depth = 1
+     word_start = True
+@@ -76,18 +80,24 @@ def _command_span(text: str, start: int, *, shlex_quotes: bool) -> tuple[int, st
+             pos = _quoted_end(text, pos + 1, char, escapes=False)
+             word_start = False
+             continue
++        nested: list[int] | None = None
+         if char == '"':
+             end, span = _double_span(text, pos + 1, shlex_quotes=shlex_quotes)
+         elif char in "$`":
+-            end, span = _expansion(text, pos, in_double=False, shlex_quotes=shlex_quotes)
++            nested = [] if breaks is not None else None
++            end, span = _expansion(text, pos, in_double=False, shlex_quotes=shlex_quotes,
++                                   breaks=nested)
+         else:
+             end, span = pos, ""
+         if span:
++            _shift_breaks(breaks, nested, _out_len(parts) + pos - copied)
+             parts.extend((text[copied:pos], span))
+             pos = copied = end
+             word_start = False
+             continue
+-        if char == "(":
++        if char == "\n" and breaks is not None:
++            breaks.append(_out_len(parts) + pos - copied)
++        elif char == "(":
+             depth += 1
+         elif char == ")":
+             depth -= 1
+@@ -100,7 +110,8 @@ def _command_span(text: str, start: int, *, shlex_quotes: bool) -> tuple[int, st
+     return pos, "".join(parts)
+ 
+ 
+-def _parameter_span(text: str, start: int, *, shlex_quotes: bool) -> tuple[int, str]:
++def _parameter_span(text: str, start: int, *, shlex_quotes: bool,
++                    breaks: list[int] | None = None) -> tuple[int, str]:
+     """Keep parameter words opaque to the OUTER comment/line scanner.
+ 
+     Nested expansions and quoted closing braces do not end the parameter. Contents
+@@ -116,7 +127,10 @@ def _parameter_span(text: str, start: int, *, shlex_quotes: bool) -> tuple[int,
+         ):
+             # Nested backticks need the same inner-comment normalization as root
+             # substitutions; otherwise a comment's quote leaks into outer shlex.
+-            end, span = _expansion(text, pos, in_double=False, shlex_quotes=shlex_quotes)
++            nested = [] if breaks is not None else None
++            end, span = _expansion(text, pos, in_double=False, shlex_quotes=shlex_quotes,
++                                   breaks=nested)
++            _shift_breaks(breaks, nested, _out_len(parts) + pos - copied)
+             parts.extend((text[copied:pos], span))
+             pos = copied = end
+             continue
+@@ -144,12 +158,25 @@ def _parameter_span(text: str, start: int, *, shlex_quotes: bool) -> tuple[int,
+     return pos, "".join(parts)
+ 
+ 
+-def _expansion(text: str, pos: int, *, in_double: bool, shlex_quotes: bool) -> tuple[int, str]:
+-    """Return an opaque span, or an empty span when ordinary scanning should proceed."""
++def _out_len(parts: list[str]) -> int:
++    return sum(map(len, parts))
++
++
++def _shift_breaks(breaks: list[int] | None, nested: list[int] | None, offset: int) -> None:
++    if breaks is not None and nested:
++        breaks.extend(offset + brk for brk in nested)
++
++
++def _expansion(text: str, pos: int, *, in_double: bool, shlex_quotes: bool,
++               breaks: list[int] | None = None) -> tuple[int, str]:
++    """Return an opaque span, or an empty span when ordinary scanning should proceed.
++
++    *breaks* collects command-separating newlines of nested ``$(...)`` frames (see
++    ``_command_span``); backtick bodies and double-quoted frames do not report them."""
+     if text.startswith("${", pos):
+-        return _parameter_span(text, pos + 2, shlex_quotes=shlex_quotes)
++        return _parameter_span(text, pos + 2, shlex_quotes=shlex_quotes, breaks=breaks)
+     elif text.startswith("$(", pos) and not text.startswith("$((", pos):
+-        return _command_span(text, pos + 2, shlex_quotes=shlex_quotes)
++        return _command_span(text, pos + 2, shlex_quotes=shlex_quotes, breaks=breaks)
+     elif text[pos] == "`":
+         end = _quoted_end(text, pos + 1, "`")
+         if shlex_quotes and text[end - 1:end] == "`":
+@@ -190,13 +217,23 @@ def _scan(text: str, *, split: bool, keep_comments: bool, shlex_quotes: bool = F
+                 and not text.startswith("$(", pos)):
+             # Root $() traversal stays visible to logical-line consumers; only
+             # nested opaque words need the substitution framed as a whole.
+-            end, span = _expansion(text, pos, in_double=in_double, shlex_quotes=shlex_quotes)
++            breaks: list[int] | None = [] if split and not in_double else None
++            end, span = _expansion(text, pos, in_double=in_double, shlex_quotes=shlex_quotes,
++                                   breaks=breaks)
+             if span:
+                 if shlex_quotes and in_double:
+                     # shlex has no nested shell frames: keep the normalized
+                     # substitution's quotes inside the enclosing quoted word.
+                     span = span.replace("\\", "\\\\").replace('"', '\\"')
+-                current.append(span)
++                # A newline separating commands in a nested $() still ends the logical
++                # line (as an unframed scan does), so the command after it is read.
++                prev = 0
++                for brk in breaks or ():
++                    current.append(span[prev:brk])
++                    lines.append("".join(current))
++                    current = []
++                    prev = brk + 1
++                current.append(span[prev:])
+                 word_start = False
+                 continue
+         if in_comment:
+diff --git a/tests/cron/test_lifecycle_guard_nested_comments.py b/tests/cron/test_lifecycle_guard_nested_comments.py
+index 3d1d30d2b92ce17a012089ae30a6ea0ec72b8f6e..c428ae45d012b138dab3051477c85f1ced1a64c0 100644
+--- a/tests/cron/test_lifecycle_guard_nested_comments.py
++++ b/tests/cron/test_lifecycle_guard_nested_comments.py
+@@ -63,6 +63,32 @@ def test_nested_context_does_not_hide_following_command(tmp_path, prefix, danger
+     assert refused is dangerous, reason
+ 
+ 
++# A newline inside a `$(...)` nested in a parameter word separates commands there, so the
++# command after it runs even though the `${...}` word is framed as one opaque span.
++NEWLINE_FRAMES = [
++    "echo ${x:-$(true\n{cmd})}",
++    "echo ${x:-$(echo #c\n{cmd})}",
++    "echo ${x:-$(echo #it's\n{cmd})}",
++    "echo ${x:-${y:-$(true\n{cmd})}}",
++    "echo ${x:-$(echo ${y:-$(true\n{cmd})})}",
++    "echo $(echo ${x:-$(true\n{cmd})})",
++    "echo ${x:-$(true\ntrue\n{cmd})}",
++    # A quoted newline inside the nested substitution is data, not a separator.
++    "echo ${x:-$(echo \"a\nb\")}\n{cmd}",
++    "echo ${x:-$(echo 'a\nb')}; {cmd}",
++]
++
++
++@pytest.mark.parametrize("frame", NEWLINE_FRAMES)
++@pytest.mark.parametrize("dangerous", [True, False], ids=["RUN", "clean"])
++def test_newline_in_nested_substitution_separates_commands(tmp_path, frame, dangerous):
++    helpers._tree(tmp_path)
++    command = frame.replace("{cmd}", "bash ./r.sh" if dangerous else "python3 ./clean.py")
++    assert helpers._bash_runs(tmp_path, command) is dangerous
++    refused, reason = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert refused is dangerous, reason
++
++
+ @pytest.mark.parametrize("escape", [r"\0", r"\x00"])
+ @pytest.mark.parametrize("dangerous", [True, False], ids=["RUN", "clean"])
+ def test_ansi_nul_truncates_only_quoted_span(tmp_path, escape, dangerous):
+-- 
+2.43.0
+

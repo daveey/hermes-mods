@@ -1,0 +1,399 @@
+From 37ee919a3bf4cbe4f885e468e9f3a496ce52507a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 09:02:18 +0000
+Subject: [PATCH] [daveey] Wire foreground native CLI custody through local
+ terminal
+
+---
+ tests/tools/test_origin_cli_bridge.py   |   8 ++
+ tests/tools/test_origin_cli_terminal.py | 152 ++++++++++++++++++++++++
+ tools/environments/base.py              |   5 +-
+ tools/environments/local.py             |  12 +-
+ tools/origin_cli_bridge.py              |   5 +
+ tools/origin_cli_terminal.py            |  54 +++++++++
+ tools/terminal_tool.py                  |  10 +-
+ 7 files changed, 241 insertions(+), 5 deletions(-)
+ create mode 100644 tests/tools/test_origin_cli_terminal.py
+ create mode 100644 tools/origin_cli_terminal.py
+
+diff --git a/tests/tools/test_origin_cli_bridge.py b/tests/tools/test_origin_cli_bridge.py
+index 6742bd9cd289348b9ab5b6b9ce4d15ee4c557b01..ef9bba19d305d77f83049cd1c06442035db60439 100644
+--- a/tests/tools/test_origin_cli_bridge.py
++++ b/tests/tools/test_origin_cli_bridge.py
+@@ -31,6 +31,14 @@ def echo_launch(monkeypatch):
+         assert not launch._thread.is_alive()
+ 
+ 
++def test_request_count_is_bounded(echo_launch, monkeypatch):
++    from tools import origin_cli_bridge as bridge
++    monkeypatch.setattr(bridge, "MAX_REQUESTS", 1)
++    assert bridge.request(echo_launch.locator, {"title": "first"})["ok"]
++    assert not bridge.request(echo_launch.locator, {"title": "second"})["ok"]
++    assert len(echo_launch.retire()) == 1
++
++
+ def test_empty_packet_does_not_poison_launch(echo_launch):
+     from tools import origin_cli_bridge as bridge
+     packet(echo_launch, b"")
+diff --git a/tests/tools/test_origin_cli_terminal.py b/tests/tools/test_origin_cli_terminal.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..72314d004932eee14e1cdec785e04a111367add5
+--- /dev/null
++++ b/tests/tools/test_origin_cli_terminal.py
+@@ -0,0 +1,152 @@
++"""Foreground launch custody and no-retry boundaries."""
++import json
++import sys
++import shlex
++import os
++from types import SimpleNamespace
++
++import pytest
++
++from tests.hermes_cli import test_origin_native_admission as admission_fixtures
++
++turn = admission_fixtures.turn
++
++
++def test_launch_executes_real_local_shell(turn, monkeypatch, tmp_path):
++    from tools import origin_cli_terminal as boundary
++    from tools.environments.local import LocalEnvironment
++    from tools.origin_cli_bridge import ENV_KEY
++    from tests.tools.test_origin_cli_bridge import policy_launch
++    launch = policy_launch(monkeypatch, "test")
++    monkeypatch.setattr(boundary, "offer", lambda *a, **k: launch)
++    env = LocalEnvironment(cwd=str(tmp_path), persistent=False)
++    try:
++        result = boundary.execute(env, f"printf '%s' \"${ENV_KEY}\"", env_type="local", task_id="test",
++                                  timeout=5, cwd=str(tmp_path))
++        assert json.loads(result["output"].splitlines()[0])["nonce"] == json.loads(launch.locator)["nonce"]
++        assert launch._closed
++    finally:
++        env.cleanup()
++        launch.close()
++
++
++def test_offer_requires_live_custody_and_supported_backend(turn, monkeypatch):
++    from tools import origin_cli_terminal as boundary
++    from tools.environments.local import LocalEnvironment
++    monkeypatch.setattr(boundary, "current_policy", lambda: object())
++    env = object.__new__(LocalEnvironment)
++    assert boundary.offer(env, "ssh", None, None) is None
++    assert boundary.offer(object(), "local", None, None) is None
++    assert boundary.offer(env, "local", object(), None) is None
++    monkeypatch.setattr(boundary, "supported", lambda: False)
++    assert boundary.offer(env, "local", None, None) is None
++    monkeypatch.setattr(boundary, "supported", lambda: True)
++    launch = boundary.offer(env, "local", None, None)
++    assert launch is not None
++    launch.close()
++    turn.release()
++    assert boundary.offer(env, "local", None, None) is None
++
++
++def test_execute_disables_yield_and_retires_on_failure(monkeypatch):
++    from tools import origin_cli_terminal as boundary
++    calls = []
++    class Launch:
++        def retire(self):
++            calls.append("retire")
++            return [{"outcome": "outcome_unknown", "task_id": "fixture"}]
++        def close(self):
++            calls.append("close")
++    launch = Launch()
++    monkeypatch.setattr(boundary, "offer", lambda *a, **k: launch)
++    def fail(*a, **kw):
++        assert "yield_handler" not in kw
++        assert kw["origin_cli_launch"] is launch
++        raise OSError("transient")
++    with pytest.raises(boundary.NoRetry) as err:
++        boundary.execute(SimpleNamespace(execute=fail), "cmd", env_type="local", task_id=None,
++                         yield_handler=object())
++    assert calls == ["retire", "close"]
++    assert "outcome_unknown" in str(err.value)
++
++
++def test_terminal_does_not_retry_offered_bridge(monkeypatch):
++    from tools import terminal_tool as terminal
++    from tools import origin_cli_terminal as boundary
++    calls = []
++    monkeypatch.setattr(terminal, "_resolve_command_cwd", lambda **k: "/")
++    monkeypatch.setattr(terminal, "_yield_kwargs", lambda *a, **k: {})
++    monkeypatch.setattr(terminal, "_survivable_foreground", lambda *a, **k: None)
++    def fail(*a, **kw):
++        calls.append(1)
++        raise boundary.NoRetry("unknown; do not retry")
++    monkeypatch.setattr(boundary, "execute", fail)
++    plan = SimpleNamespace(env_type="local", effective_task_id="test", effective_timeout=5, cwd="/", host_cwd=None)
++    result = json.loads(terminal._run_foreground("true", object(), plan, task_id=None, session_id=None,
++                      session_key="test", cwd_key="test", workdir=None, approval_note=None,
++                      clear_interrupt=False, metered=False))
++    assert calls == [1]
++    assert "do not retry" in result["error"]
++
++
++@pytest.mark.parametrize("revoke", [False, True])
++def test_terminal_cli_real_dispatch_receipt(turn, monkeypatch, tmp_path, revoke):
++    import model_tools
++    from hermes_cli import lifecycle, kanban_db_connect as kbc, kanban_origin_native as native
++    from tools import terminal_tool as terminal, kanban_tools
++    from tools.environments.local import LocalEnvironment
++    from tools.registry import registry
++    from tests.hermes_cli import test_origin_native_admission as fixtures
++    old = registry._tools.copy()
++    events = []
++    monkeypatch.setattr(lifecycle, "has_hook", lambda name: name in {"pre_tool_call", "post_tool_call"})
++    monkeypatch.setattr(lifecycle, "invoke_hook", lambda name, **kw: events.append((name, kw)) or [])
++    monkeypatch.setattr(model_tools, "_select_tool_names", lambda *a, **kw: {"kanban_create"})
++    registry.register(name="kanban_create", toolset="kanban", schema=kanban_tools.KANBAN_CREATE_SCHEMA,
++                      handler=lambda args, **kw: kanban_tools._handle_create(args))
++    env = LocalEnvironment(cwd=os.getcwd(), persistent=True, env={"PYTHONPATH": os.getcwd()})
++    plan = SimpleNamespace(env_type="local", effective_task_id="test", effective_timeout=20,
++                           cwd=os.getcwd(), host_cwd=None)
++    monkeypatch.setattr(terminal, "_survivable_foreground", lambda *a, **kw: None)
++    command = shlex.join([sys.executable, "-m", "hermes_cli.main", "kanban", "create", "composed child",
++                          "--assignee", "default", "--no-requires", "--json"])
++    if revoke:
++        from tools import origin_cli_terminal as boundary
++        original_offer = boundary.offer
++        def revoke_after_offer(*a, **kw):
++            launch = original_offer(*a, **kw)
++            assert launch is not None
++            turn.release()
++            return launch
++        monkeypatch.setattr(boundary, "offer", revoke_after_offer)
++    def run(args, **kw):
++        return terminal._run_foreground(command, env, plan, task_id="test", session_id="parent",
++                        session_key="test", cwd_key="test", workdir=os.getcwd(), approval_note=None,
++                        clear_interrupt=False, metered=False)
++    registry.register(name="origin_terminal_probe", toolset="terminal",
++                      schema={"name": "origin_terminal_probe", "parameters": {}}, handler=run)
++    try:
++        result = json.loads(model_tools.handle_function_call("origin_terminal_probe", {},
++                    enabled_tools=["terminal", "kanban_create"], session_id="parent"))
++        # Revoke after offer, not before: otherwise ordinary legacy CLI is intended.
++        if revoke:
++            assert result["exit_code"] == 2, result
++            with kbc.connect_closing() as conn:
++                assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
++        else:
++            assert result["exit_code"] == 0, result
++            value = json.loads(result["output"].splitlines()[0])
++            assert value["ok"], value
++            assert "Native CLI admission" in result["output"]
++            with kbc.connect_closing() as conn:
++                assert native._receipt(conn, value["task_id"])["origin"]["session"] == fixtures.fixtures.CHAT
++            names = [(name, kw.get("tool_name")) for name, kw in events]
++            assert ("pre_tool_call", "kanban_create") in names
++            assert ("post_tool_call", "kanban_create") in names
++        # A subsequent command must never inherit the retired endpoint via snapshot.
++        next_result = env.execute("printf '%s' \"${HERMES_ORIGIN_CLI_BRIDGE-unset}\"", timeout=5)
++        assert next_result["output"].strip() == "unset"
++    finally:
++        env.cleanup()
++        registry._tools.clear()
++        registry._tools.update(old)
+diff --git a/tools/environments/base.py b/tools/environments/base.py
+index 3f96d7f63a70eeabdac8d8ecda1ae1866a9e73e0..7c2d23dd10feb5e11840608f92d2540cc64dca17 100644
+--- a/tools/environments/base.py
++++ b/tools/environments/base.py
+@@ -800,7 +800,7 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
+         rewrite_compound_background: bool = True,
+         bounded_capture: bool = False,
+         yield_handler: Callable[[ProcessHandle, str], dict] | None = None,
+-        survivable: Any = None) -> dict:
++        survivable: Any = None, origin_cli_launch: Any = None) -> dict:
+         """Execute a command, return {"output": str, "returncode": int}. ``survivable`` (local backend
+         only): a ``process_registry_survivable.SurvivableForeground`` spawning the command in its own scope. ``bounded_capture=True``
+         caps retention at ``tool_output.max_bytes`` WHILE draining; only the foreground terminal
+@@ -813,6 +813,8 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
+         is drained (head/tail window) instead of holding the full output in memory (#64435).
+         See #94285.
+         """
++        if origin_cli_launch is not None and (survivable is not None or yield_handler is not None):
++            raise ValueError("CLI custody cannot survive or yield its foreground launch")
+         self._before_execute()
+ 
+         exec_command, sudo_stdin = self._prepare_command(command)
+@@ -852,6 +854,7 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
+             spawned = None
+             try:
+                 spawned = self._run_bash(wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin,
++                                         **({"origin_cli_launch": origin_cli_launch} if origin_cli_launch is not None else {}),
+                                          **({"survivable": survivable} if survivable is not None else {}))
+             finally:
+                 fenced = _leave_foreground_spawn(self, spawned)
+diff --git a/tools/environments/local.py b/tools/environments/local.py
+index 50c1453d9f0f8e6907ec4bc66b5aa4aa408fda93..cc23e02059574cb8c046ebb010559a7b43a004fa 100644
+--- a/tools/environments/local.py
++++ b/tools/environments/local.py
+@@ -1159,7 +1159,8 @@ class LocalEnvironment(BaseEnvironment):
+     def _snapshot_excluded_passthrough_names(self) -> tuple[str, ...]:
+         """Plus the plugins' session env names: each command gets its own session's values."""
+         from hermes_cli.plugins_session_env import session_env_names
+-        return tuple(sorted({*super()._snapshot_excluded_passthrough_names(), *session_env_names()}))
++        return tuple(sorted({*super()._snapshot_excluded_passthrough_names(), *session_env_names(),
++                             "HERMES_ORIGIN_CLI_BRIDGE"}))
+ 
+     def __init__(self, cwd: str = "", timeout: int = 60, env: dict | None = None, persistent: bool = True):
+         super().__init__(cwd=_resolve_local_initial_cwd(cwd), timeout=timeout, env=env, persist_env=persistent)
+@@ -1232,9 +1233,15 @@ class LocalEnvironment(BaseEnvironment):
+         self.cwd = safe_cwd
+ 
+     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
+-                  stdin_data: str | None = None, survivable=None) -> subprocess.Popen:
++                  stdin_data: str | None = None, survivable=None, origin_cli_launch=None) -> subprocess.Popen:
++        from tools.origin_cli_bridge import ENV_KEY
++        if origin_cli_launch is not None and (survivable is not None or _IS_WINDOWS):
++            raise ValueError("unsupported CLI custody launch")
+         bash = _find_bash()
+         run_env = _make_run_env(self.env)
++        run_env.pop(ENV_KEY, None)
++        if origin_cli_launch is not None:
++            run_env[ENV_KEY] = origin_cli_launch.locator
+         # Login invocations (init_session's env snapshot) source the user's rc /
+         # custom init files so nvm/asdf/pyenv land on PATH in the snapshot; then the
+         # spawn env's dirs a resetting profile dropped are re-appended (#56634).
+@@ -1258,6 +1265,7 @@ class LocalEnvironment(BaseEnvironment):
+             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+             # detached-spawn: ok — owned via own_process_groups right below
+             start_new_session=True, cwd=self.cwd,
++            **({"pass_fds": (origin_cli_launch.child_fd,)} if origin_cli_launch is not None else {}),
+             **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
+         if not _IS_WINDOWS:
+             # The command dies with this process however it dies: a SIGKILLed / OOM-killed host left a
+diff --git a/tools/origin_cli_bridge.py b/tools/origin_cli_bridge.py
+index f99a9aba23c17b3104efabe63f7db3d62a9bd102..47c12dbab7e38f34cc2303434398cfa91b06a666 100644
+--- a/tools/origin_cli_bridge.py
++++ b/tools/origin_cli_bridge.py
+@@ -17,6 +17,7 @@ from hermes_cli.kanban_origin_admission import strict_local_creation
+ from hermes_cli.kanban_origin_cli_gate import LaunchGate
+ 
+ LIMIT = 65536
++MAX_REQUESTS = 64
+ ENV_KEY = "HERMES_ORIGIN_CLI_BRIDGE"
+ 
+ 
+@@ -45,6 +46,7 @@ class Launch:
+         self._server, self._child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+         self._server.settimeout(0.1)
+         self._closed = False
++        self._requests = 0
+         self._thread = Thread(target=self._serve, name="origin-cli-bridge", daemon=True)
+         try:
+             self._thread.start()
+@@ -108,6 +110,9 @@ class Launch:
+                 poller.register(reply, select.POLLHUP | select.POLLERR)
+                 if poller.poll(0):
+                     return
++                if self._requests >= MAX_REQUESTS:
++                    raise ValueError("CLI launch request limit exceeded")
++                self._requests += 1
+                 gate = self._gate.dispatch()
+                 result = self._ctx.copy().run(self._invoke, value["args"], gate)
+             except Exception:  # health: allow BLE001 -- tool dispatch boundary; preserve gate outcome without leaking tool exceptions
+diff --git a/tools/origin_cli_terminal.py b/tools/origin_cli_terminal.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..aa75c34a2f029e5221f0d47c1ae4af5a944efa4c
+--- /dev/null
++++ b/tools/origin_cli_terminal.py
+@@ -0,0 +1,54 @@
++"""Local foreground bridge lifetime; no retries after offering CLI custody."""
++import json
++import select
++import socket
++import sys
++
++from hermes_cli import kanban_origin_native as native
++from tools.origin_cli_bridge import Launch
++from tools.origin_cli_policy import current_policy
++
++
++class NoRetry(RuntimeError):
++    """The shell may already have committed a create through the parent."""
++
++
++def supported():
++    return (sys.platform.startswith("linux") and hasattr(socket, "SOCK_SEQPACKET")
++            and hasattr(socket, "MSG_CMSG_CLOEXEC") and hasattr(select, "poll"))
++
++
++def offer(env, env_type, survivable, task_id):
++    from agent.delegation_context import is_delegated_child_context
++    from tools.environments.local import LocalEnvironment
++    if (not supported() or type(env) is not LocalEnvironment or env_type != "local"
++            or survivable is not None or is_delegated_child_context()
++            or current_policy() is None or native.capture(None) is None):
++        return None
++    return Launch(task_id)
++
++
++def execute(env, command, *, env_type, task_id, attempt=None, **kwargs):
++    launch = offer(env, env_type, kwargs.get("survivable"), task_id)
++    if launch is None:
++        return env.execute(command, **kwargs)
++    if attempt is not None:
++        attempt.append(True)  # outer post-processing must not retry this shell either
++    # A custody-bearing shell cannot be handed to background execution. Ordinary
++    # shells and update-survivable launches retain their existing behavior.
++    kwargs.pop("yield_handler", None)
++    kwargs["origin_cli_launch"] = launch
++    reports = []
++    try:
++        try:
++            result = env.execute(command, **kwargs)
++        finally:
++            reports = launch.retire()
++    except Exception as exc:  # health: allow BLE001 -- convert every backend failure to a non-retryable outcome
++        raise NoRetry("CLI custody launch failed; do not retry automatically. "
++                      + json.dumps(reports)) from exc
++    finally:
++        launch.close()
++    if reports:
++        result["output"] = result.get("output", "") + "\n[Native CLI admission: " + json.dumps(reports) + "]"
++    return result
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index 61ed33711d91abeb5b7d5682bfb5ba690b45cfcf..724616913da5b123bfadfb47cd3d85edcd0341f5 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -1467,6 +1467,7 @@ def _run_foreground(
+     """Execute in the foreground with retry on transient errors, then finalize. ``metered``
+     is False for Hermes' own control-plane commands (``_host_local``)."""
+     from hermes_cli.observability.shared_metrics_harness import record_terminal_outcome
++    from tools import origin_cli_terminal
+     max_retries = 3
+     env_type, eff, effective_timeout = plan.env_type, plan.effective_task_id, plan.effective_timeout
+ 
+@@ -1480,6 +1481,7 @@ def _run_foreground(
+         clear_current_thread_interrupt()
+ 
+     for retry_count in range(max_retries + 1):
++        cli_attempt = []
+         try:
+             command_cwd = _resolve_command_cwd(
+                 workdir=workdir, default_cwd=plan.cwd, session_key=cwd_key, env_type=env_type,
+@@ -1498,8 +1500,8 @@ def _run_foreground(
+             oom_watch = OomWatch(survivable) if env_type == "local" else None  # OOM kills in its scope [daveey]
+             try:
+                 _execute_started = time.monotonic()
+-                result = env.execute(command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
+-                                     **exec_kwargs)
++                result = origin_cli_terminal.execute(env, command, env_type=env_type, task_id=task_id,
++                    attempt=cli_attempt, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True, **exec_kwargs)
+                 # This attempt's own run time, for the wait hint: not approval, sandbox start or retries.
+                 _note_execute_seconds(time.monotonic() - _execute_started)
+             finally:
+@@ -1509,6 +1511,10 @@ def _run_foreground(
+                 result["oom_note"] = oom_watch.note(result.get("returncode"))
+             break
+         except Exception as e:
++            if isinstance(e, origin_cli_terminal.NoRetry):
++                return _error_json(str(e))
++            if cli_attempt:
++                return _error_json("CLI custody launch outcome unknown; do not retry automatically")
+             # A backend exception (e.g. an SSH connect timeout) never reached an exit status, so it
+             # is not a terminal outcome; Hermes' own deadline arrives as ``hermes_timed_out``.
+             if "timeout" in str(e).lower():
+-- 
+2.43.0
+

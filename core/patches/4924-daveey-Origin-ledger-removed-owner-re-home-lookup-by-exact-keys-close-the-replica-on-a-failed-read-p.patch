@@ -1,0 +1,266 @@
+From 9b74d438869a5e1f8ae48b98cdc049753d050cd0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 06:08:30 +0000
+Subject: [PATCH] [daveey] Origin ledger: removed-owner re-home lookup by exact
+ keys; close the replica on a failed read; pin the review's mutants
+
+Answers review 5965756952 (approve with three non-blocking points) on PR #3633.
+
+1. Performance: `_published_elsewhere` ran `key GLOB '*/board/id'` once per removed-owner obligation on every
+   projection, a full replica scan each (about 20 ms on 20,000 rows). A first replacement, one pass over all task
+   keys, still cost 37 ms on the MacBook's 23,000 (the scan is not index-covered). `_Publications` now reads each
+   gateway's `gateway/info` scope list once per projection, only when a removed owner's row asks, and then does
+   exact primary-key reads at `profile/board/id` for the gateways that collect that board. Measured on the
+   MacBook's live ledger and replica, five projections each: installed 85-92 ms, this head 86-101 ms (no
+   measurable cost); the first commit of this PR measured 131-180 ms. A gateway that announces no scope for the
+   board is not consulted: the binding is kept and the row stays unknown (never wrongly dropped).
+2. Unpinned clauses: tests for a removed owner's archive with evidence (closed_uncompleted), an owner with task
+   records but no info row (not removed), the same id and created_at on another board, a record without
+   created_at, and a re-home found only through an announced scope. The own-card clause stays untested here: this
+   gateway always publishes its own records, so it is always listed; the clause is a guard for a replica without
+   them.
+3. `_listed_gateways` and the publications reader now run inside the `try` whose `finally` closes the replica
+   connection; a test makes the read fail and checks every opened connection is closed.
+
+Tests: tests/hermes_cli/test_kanban_release_survives_owner_offline.py, 19 tests.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_origin_ledger.py            |  76 +++++++++----
+ ...t_kanban_release_survives_owner_offline.py | 101 +++++++++++++++++-
+ 2 files changed, 155 insertions(+), 22 deletions(-)
+
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 4e4bba51d3750eb10a0351abf05188b678e2248e..81d8188f6bce315a79dac3723bb0c40eb7b52eb2 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -445,7 +445,7 @@ def _listed_gateways(source: sqlite3.Connection | None) -> frozenset:
+         "SELECT DISTINCT gw FROM replica WHERE coll IN ('gateway','tasks')"))
+ 
+ 
+-def _removed_owner(source, listed: frozenset, owner: dict, task: dict, me: tuple) -> bool | None:
++def _removed_owner(elsewhere: _Publications, listed: frozenset, owner: dict, task: dict, me: tuple) -> bool | None:
+     """True when this binding's owner is a machine the Board removed and its stored observation of the card is closed
+     (done or archived), so that observation is its final word; None when the card was re-homed and the binding is not
+     projected; False otherwise. [daveey]
+@@ -456,28 +456,60 @@ def _removed_owner(source, listed: frozenset, owner: dict, task: dict, me: tuple
+     gateway's own cards and an empty or stale replica (``listed`` empty) never count as removed."""
+     if not listed or owner['gateway'] in listed or (owner['gateway'], owner['profile']) == me:
+         return False
+-    if _published_elsewhere(source, owner, task):
++    if elsewhere.has_other(owner, task):
+         return None
+     # Only a closed card's last word is final: an open one could have moved on before the removal, so it stays unknown.
+     return task.get('status') in ('done', 'archived')
+ 
+ 
+-def _published_elsewhere(source: sqlite3.Connection, owner: dict, task: dict) -> bool:
+-    """Another gateway's replica record of this card: same board and id, same non-null ``created_at`` (a re-home
+-    keeps it; an unrelated card that reuses the id does not). [daveey]"""
+-    created = task.get('created_at')
+-    if created is None or isinstance(created, bool) or not isinstance(created, (int, float, str)):
++class _Publications:
++    """Which gateways publish a card, for ``_removed_owner``. [daveey]
++
++    Exact primary-key reads only: each gateway's ``gateway/info`` row lists the (profile, board) scopes it collects,
++    so another gateway's record of a card is at one of a few known keys ``profile/board/id``. The scope list is read
++    once per projection and only when a removed owner's row asks. A per-obligation ``key GLOB`` scanned the whole
++    replica (about 20 ms on 20,000 rows) on every projection, and a scan of all task keys costs 37 ms on the MacBook's
++    23,000 (review 5965756952). A gateway that publishes no info row is not consulted: the binding is then kept,
++    which only errs towards showing the card as unknown."""
++
++    def __init__(self, source: sqlite3.Connection | None):
++        self.source = source
++        self.scopes: dict[str, list[tuple[str, str]]] | None = None  # board -> [(gateway, profile)]
++
++    def _scopes(self) -> dict[str, list[tuple[str, str]]]:
++        if self.scopes is None:
++            self.scopes = {}
++            for gw, raw in self.source.execute("SELECT gw, data FROM replica WHERE coll='gateway' AND key='info'"):
++                try:
++                    info = json.loads(raw)
++                    scopes = info.get('task_scopes') if isinstance(info, dict) else None
++                except (TypeError, ValueError):
++                    continue
++                for scope in scopes if isinstance(scopes, list) else ():
++                    if isinstance(scope, dict) and isinstance(scope.get('profile'), str) \
++                            and isinstance(scope.get('board'), str):
++                        self.scopes.setdefault(scope['board'], []).append((str(gw), scope['profile']))
++        return self.scopes
++
++    def has_other(self, owner: dict, task: dict) -> bool:
++        """Another gateway's replica record of this card: same board and id, same non-null ``created_at`` (a re-home
++        keeps it; an unrelated card that reuses the id does not)."""
++        created = task.get('created_at')
++        if self.source is None or created is None or isinstance(created, bool) \
++                or not isinstance(created, (int, float, str)):
++            return False
++        for gw, profile in self._scopes().get(owner['board'], ()):
++            if gw == owner['gateway']:
++                continue
++            row = self.source.execute("SELECT data FROM replica WHERE gw=? AND coll='tasks' AND key=?",
++                                      (gw, f"{profile}/{owner['board']}/{owner['task_id']}")).fetchone()
++            try:
++                other = json.loads(row[0]) if row else None
++            except (TypeError, ValueError):
++                continue
++            if isinstance(other, dict) and other.get('created_at') == created:
++                return True
+         return False
+-    pattern = '*/' + owner['board'] + '/' + owner['task_id']
+-    for (data,) in source.execute(
+-            "SELECT data FROM replica WHERE coll='tasks' AND gw != ? AND key GLOB ?", (owner['gateway'], pattern)):
+-        try:
+-            other = json.loads(data)
+-        except (TypeError, ValueError):
+-            continue
+-        if isinstance(other, dict) and other.get('created_at') == created:
+-            return True
+-    return False
+ 
+ 
+ def _lock_busy(exc: sqlite3.Error) -> bool:
+@@ -529,10 +561,12 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+         fresh = False
+     result = []
+     infos: dict[str, tuple] = {}  # owner gateway -> (decoded gateway/info, or the error decoding it)
+-    # [daveey] Gateways the fresh replica still knows (an info row or any task record). An offline owner keeps its
+-    # info row; a machine removed from the Board has neither (``removed`` below). Read once per projection.
+-    listed = _listed_gateways(source if fresh else None)
+     try:
++        # [daveey] Gateways the fresh replica still knows (an info row or any task record). An offline owner keeps
++        # its info row; a machine removed from the Board has neither (``_removed_owner``). Read once per projection,
++        # inside the try so a failed read still closes the replica connection (review 5965756952).
++        listed = _listed_gateways(source if fresh else None)
++        elsewhere = _Publications(source)
+         with closing(_ro(path)) as conn:
+             from hermes_cli.kanban_origin_legacy import aliases_for_projection
+             alias_receipts = {}
+@@ -582,7 +616,7 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+                     current = current and readable and live
+                 # [daveey] An owner the Board removed (``_removed_owner``): a re-homed card's binding is dropped, and
+                 # otherwise its stored observation is its last word (``final``), as a current record would be.
+-                final = _removed_owner(source, listed, owner, task, (gateway, profile))
++                final = _removed_owner(elsewhere, listed, owner, task, (gateway, profile))
+                 if final is None:
+                     continue
+                 if (owner['gateway'], owner['profile']) == (gateway, profile):
+diff --git a/tests/hermes_cli/test_kanban_release_survives_owner_offline.py b/tests/hermes_cli/test_kanban_release_survives_owner_offline.py
+index 0d953279d53bd1802d9258ba4638054c298c69eb..b30399174a583bb073460d18c0bb099f85931159 100644
+--- a/tests/hermes_cli/test_kanban_release_survives_owner_offline.py
++++ b/tests/hermes_cli/test_kanban_release_survives_owner_offline.py
+@@ -125,7 +125,8 @@ def _remove_owner(replica, when, path=None):
+     with sqlite3.connect(replica) as db:
+         db.execute("DELETE FROM replica WHERE gw='owner'")
+         db.execute("INSERT OR REPLACE INTO replica VALUES ('other','gateway','info',1,?)",
+-                   (json.dumps({'gateway': 'other', 'task_scopes': []}),))
++                   (json.dumps({'gateway': 'other', 'task_scopes': [
++                       {'profile': 'default', 'board': 'default', 'state': 'ok', 'observed_at': when}]}),))
+         db.execute("UPDATE meta SET v=? WHERE k='last_ok'", (str(when),))
+ 
+ 
+@@ -197,3 +198,101 @@ def test_a_removed_owners_open_card_stays_unknown(world, board):
+     _remove_owner(replica, 5000, path)
+     row = _project(path, replica, 5001)
+     assert (row['status'], row['unfinished'], row['stale']) == ('unknown', True, True)
++
++
++# ---------------------------------------------------------------- review 5965756952: unpinned clauses
++
++
++def test_a_removed_owners_archive_with_evidence_is_closed_not_completed(world, board):
++    """An archive the owner published with its evidence but no verified completion: closed, not done."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tests.hermes_cli.test_kanban_origin_evidence import create_bound, publish_observed
++    from tests.hermes_cli.test_kanban_origin_ledger import accept
++    path, replica, binding = world
++    with kbc.connect_closing() as conn:
++        tid = create_bound(conn, binding)
++        publish_observed(conn, replica, binding, version=3)
++        accept(world)
++        assert kb.archive_task(conn, tid)
++        publish_observed(conn, replica, binding, version=4)
++    _remove_owner(replica, 5000, path)
++    row = _project(path, replica, 5001)
++    assert (row['status'], row['unfinished'], row.get('closed_uncompleted')) == ('archived', False, True)
++
++
++def test_an_owner_with_task_records_but_no_info_row_is_not_removed(world, board):
++    path, replica = _bound_done(world, verified_completion=False)
++    _project(path, replica, 1001)
++    with sqlite3.connect(replica) as db:
++        db.execute("DELETE FROM replica WHERE gw='owner' AND coll='gateway'")
++        db.execute("INSERT INTO replica VALUES ('owner','tasks','default/default/t_unrelated',1,'{}')")
++        db.execute("UPDATE meta SET v='5000' WHERE k='last_ok'")
++    row = _project(path, replica, 5001)
++    assert row['status'] == 'unknown' and row['unfinished']
++
++
++@pytest.mark.parametrize('variant', ['other-board', 'no-created-at-anywhere'])
++def test_a_publication_that_is_not_the_same_card_keeps_the_binding(world, board, variant):
++    path, replica = _bound_done(world, verified_completion=False)
++    _, _, binding = world
++    with sqlite3.connect(replica) as db:
++        task = json.loads(db.execute("SELECT data FROM replica WHERE coll='tasks' AND gw='owner'").fetchone()[0])
++        if variant == 'other-board':
++            task['created_at'] = 1234
++            db.execute("UPDATE replica SET data=?, version=6 WHERE coll='tasks' AND gw='owner'", (json.dumps(task),))
++    _remove_owner(replica, 5000, path)
++    other = {k: v for k, v in task.items() if k != 'origin_observation'} | {'gateway': 'other', 'status': 'running'}
++    board_name = 'elsewhere' if variant == 'other-board' else binding['owner']['board']
++    key = '/'.join((binding['owner']['profile'], board_name, binding['owner']['task_id']))
++    with sqlite3.connect(replica) as db:
++        db.execute("INSERT INTO replica VALUES ('other','tasks',?,1,?)", (key, json.dumps(other)))
++    from hermes_cli import kanban_origin_ledger as ledger
++    rows = ledger.project(path, replica=replica, gateway='origin', profile='default', now=5001)
++    assert len(rows) == 1 and rows[0]['status'] == 'unknown'
++
++
++def test_a_failed_listed_gateways_read_still_closes_the_replica(world, board, monkeypatch):
++    from hermes_cli import kanban_origin as origin
++    from hermes_cli import kanban_origin_ledger as ledger
++    path, replica = _bound_done(world)
++    _hub_synced_at(replica, 1000)
++    opened = []
++    real = origin._ro
++
++    def tracking(p):
++        conn = real(p)
++        opened.append(conn)
++        return conn
++    monkeypatch.setattr(origin, '_ro', tracking)
++
++    def boom(_source):
++        raise sqlite3.OperationalError('disk I/O error')
++    monkeypatch.setattr(ledger, '_listed_gateways', boom)
++    with pytest.raises(sqlite3.OperationalError):
++        ledger.project(path, replica=replica, gateway='origin', profile='default', now=1001)
++    for conn in opened:
++        with pytest.raises(sqlite3.ProgrammingError):
++            conn.execute('SELECT 1')
++
++
++def test_a_rehome_is_found_only_through_a_scope_the_new_owner_announces(world, board):
++    """The lookup reads exact keys from the scopes in each gateway's info row: a gateway that does not collect the
++    card's board is not consulted, so the binding is kept (unknown), never wrongly dropped."""
++    path, replica = _bound_done(world, verified_completion=False)
++    _, _, binding = world
++    with sqlite3.connect(replica) as db:
++        task = json.loads(db.execute("SELECT data FROM replica WHERE coll='tasks' AND gw='owner'").fetchone()[0])
++        task['created_at'] = 1234
++        db.execute("UPDATE replica SET data=?, version=6 WHERE coll='tasks' AND gw='owner'", (json.dumps(task),))
++    _remove_owner(replica, 5000, path)
++    moved = {k: v for k, v in task.items() if k != 'origin_observation'} | {'gateway': 'third', 'status': 'running'}
++    key = '/'.join((binding['owner']['profile'], binding['owner']['board'], binding['owner']['task_id']))
++    with sqlite3.connect(replica) as db:
++        db.execute("INSERT INTO replica VALUES ('third','tasks',?,1,?)", (key, json.dumps(moved)))
++        db.execute("INSERT INTO replica VALUES ('third','gateway','info',1,?)",
++                   (json.dumps({'gateway': 'third', 'task_scopes': [
++                       {'profile': 'default', 'board': 'elsewhere', 'state': 'ok', 'observed_at': 5000}]}),))
++    from hermes_cli import kanban_origin_ledger as ledger
++    rows = ledger.project(path, replica=replica, gateway='origin', profile='default', now=5001)
++    assert len(rows) == 1 and rows[0]['status'] == 'unknown'
+-- 
+2.43.0
+

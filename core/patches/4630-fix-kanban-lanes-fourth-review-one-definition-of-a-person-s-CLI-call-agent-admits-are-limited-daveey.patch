@@ -1,0 +1,119 @@
+From 84921649372a9c5a94e6b8e2204e4de96976e461 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 15:25:01 -0800
+Subject: [PATCH] fix(kanban): lanes fourth review: one definition of a
+ person's CLI call; agent admits are limited [daveey]
+
+- a typed /kanban lanes admit is the person's and outside the budget, like a typed create
+- an agent's lanes admit goes through the planner's limits (admit_per_day, never_admit)
+- specify is a release event; a malformed config drops the kept policy
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_lanes.py                 | 12 ++++++++++--
+ hermes_cli/kanban_lanes_cli.py             | 17 ++++++++++++++---
+ tests/hermes_cli/test_kanban_lanes_plan.py | 21 +++++++++++++++------
+ 3 files changed, 39 insertions(+), 11 deletions(-)
+
+diff --git a/hermes_cli/kanban_lanes.py b/hermes_cli/kanban_lanes.py
+index 6245b49dda034c8feabe4efda15db37aa6bc5b8b..ee82d0877b46f962c0abe450053b5785ba025926 100644
+--- a/hermes_cli/kanban_lanes.py
++++ b/hermes_cli/kanban_lanes.py
+@@ -62,7 +62,7 @@ def held_sql(alias: str = "tasks") -> str:
+     return (f"{alias}.status = 'triage' AND COALESCE({alias}.block_kind, '') = 'lane_gate' "
+             f"AND NOT EXISTS (SELECT 1 FROM task_runs hr WHERE hr.task_id = {alias}.id) "
+             f"AND NOT EXISTS (SELECT 1 FROM task_events he WHERE he.task_id = {alias}.id "
+-            f"AND he.kind IN ('lane_admitted', 'promoted_manual', 'unblocked', 'triage_swept', 'decomposed'))")
++            f"AND he.kind IN ('lane_admitted', 'promoted_manual', 'unblocked', 'triage_swept', 'decomposed', 'specified'))")
+ 
+ 
+ HELD = held_sql()
+@@ -199,6 +199,7 @@ def safe_policy() -> Optional[Policy]:
+         pol = policy()
+     except ValueError as exc:
+         _warn(exc)
++        _LAST_GOOD.clear()  # the config was read and is wrong: an older policy must not come back later
+         return None
+     # ConfigBackendUnavailable is a SystemExit, so ``Exception`` alone would let a config outage stop creation.
+     except (Exception, ConfigBackendUnavailable) as exc:  # health: allow BLE001 -- config must never stop creation
+@@ -282,7 +283,14 @@ def cli_creator(args, label: str) -> str:
+     else asking for one is stored as ``agent``. Unchanged when no lanes are configured."""
+     if label not in USER_CREATORS or safe_policy() is None:
+         return label
+-    return label if getattr(args, "_slash_typed", False) or _human_shell() else "agent"
++    return label if cli_person(args) else "agent"
++
++
++def cli_person(args) -> bool:
++    """Whether a CLI call is the person's: a slash command they typed (which runs inside a process that
++    carries agent session markers) or a human shell. Known limit: an agent that strips its environment, for
++    example over ssh, looks like a human shell."""
++    return bool(getattr(args, "_slash_typed", False)) or _human_shell()
+ 
+ 
+ def _by_user(opts: dict) -> bool:
+diff --git a/hermes_cli/kanban_lanes_cli.py b/hermes_cli/kanban_lanes_cli.py
+index 6cfe1c7732d6d9168ec84cd8361af5f521d536de..6ef40473c36a8c3950ec1dee279099df56c83166 100644
+--- a/hermes_cli/kanban_lanes_cli.py
++++ b/hermes_cli/kanban_lanes_cli.py
+@@ -113,12 +113,23 @@ def _assign(args) -> int:
+ 
+ 
+ def _admit(args) -> int:
++    """The person's admit is theirs to make and outside the daily budget. An agent's goes through the same
++    limits as a planner's (``admit_per_day``, ``never_admit``) and spends the budget."""
+     from hermes_cli.kanban_cli_actor import cli_actor
+ 
++    reason = args.reason or ""
+     with kbc.connect_closing() as conn:
+-        # The user's own admit does not spend the daily budget; an agent's does.
+-        actor = cli_actor()
+-        done = lanes.admit(conn, args.task_id, actor=actor, reason=args.reason or "", budget=actor != "user")
++        if lanes.cli_person(args):
++            done = lanes.admit(conn, args.task_id, actor="user", reason=reason, budget=False)
++        else:
++            from hermes_cli import kanban_lanes_plan as plan
++
++            result = plan.apply(conn, [{"action": "admit", "card": args.task_id,
++                                        "reason": reason or f"admitted by {cli_actor()}"}])
++            if result["rejected"]:
++                print(f"{args.task_id}: {result['rejected'][0]['why']}")
++                return 1
++            done = True
+     print(f"{args.task_id}: {'admitted' if done else 'not held at a lane gate'}")
+     return 0 if done else 1
+ 
+diff --git a/tests/hermes_cli/test_kanban_lanes_plan.py b/tests/hermes_cli/test_kanban_lanes_plan.py
+index ba2c9acfc8cc54f708ee67422f3241d0b1d7377e..3f3be0aca7142dbb54a63af456b9174d4f61423e 100644
+--- a/tests/hermes_cli/test_kanban_lanes_plan.py
++++ b/tests/hermes_cli/test_kanban_lanes_plan.py
+@@ -218,11 +218,20 @@ def test_cli_create_label_is_untouched_without_lanes(conn, monkeypatch):
+     assert _stored(conn, "no lanes")["created_by"] == "user"
+ 
+ 
+-def test_an_agents_cli_admit_spends_the_budget(conn, configured, monkeypatch):
+-    from hermes_cli import kanban_cli_actor
++def _typed(*argv):
++    """A slash command the person typed, through the real slash entry point."""
++    return kanban.run_slash(" ".join(argv), human_typed=True)
+ 
++
++def test_an_agents_cli_admit_is_limited_like_the_planners_and_a_typed_one_is_the_persons(conn, configured, monkeypatch):
+     parent = base._hermes_parent(conn)
+-    held = _held(conn, parent)
+-    monkeypatch.setattr(kanban_cli_actor, "cli_actor", lambda: "agent (chat c1)")
+-    assert cli("lanes", "admit", held) == 0
+-    assert lanes.admitted_today(conn, "hermes") == 1
++    cards = [_held(conn, parent, f"infra {i}") for i in range(4)]
++    guard = _held(conn, parent, "Lifecycle guard false refusal")
++    monkeypatch.setattr(lanes, "_human_shell", lambda: False)  # every call below runs in an agent-marked process
++    assert cli("lanes", "admit", guard) == 1  # never_admit
++    assert cli("lanes", "admit", cards[0]) == 0 and cli("lanes", "admit", cards[1]) == 0
++    assert cli("lanes", "admit", cards[2]) == 1  # admit_per_day is 2
++    assert lanes.admitted_today(conn, "hermes") == 2
++    _typed("lanes", "admit", cards[2])  # the person, typing in a chat
++    assert base._task(conn, cards[2])["status"] == "ready"
++    assert lanes.admitted_today(conn, "hermes") == 2
+-- 
+2.43.0
+

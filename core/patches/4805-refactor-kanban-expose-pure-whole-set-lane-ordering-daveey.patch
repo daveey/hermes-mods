@@ -1,0 +1,288 @@
+From 29aa30b8ad3978ad832adae3dfabfeb321ce9df1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 08:08:24 +0000
+Subject: [PATCH] refactor(kanban): expose pure whole-set lane ordering
+ [daveey]
+
+Reuse actual lane partition and interleave semantics for alternate-pending replay. Preserve live reader short circuits, default-lane fallback and claim-refused candidates charging their lane. This does not activate traces or certify fairness. Proof: 500-case frozen-algorithm differential test, pending-subset and within-tick regressions, caller read-count and identity controls; all lane and scorer consumers pass.
+---
+ hermes_cli/kanban_lane_order.py            |  57 ++++++++
+ hermes_cli/kanban_lanes.py                 |  29 +---
+ tests/hermes_cli/test_kanban_lane_order.py | 160 +++++++++++++++++++++
+ 3 files changed, 222 insertions(+), 24 deletions(-)
+ create mode 100644 hermes_cli/kanban_lane_order.py
+ create mode 100644 tests/hermes_cli/test_kanban_lane_order.py
+
+diff --git a/hermes_cli/kanban_lane_order.py b/hermes_cli/kanban_lane_order.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2d433a64d33dd8fd174074cf6f274fd0465e27b6
+--- /dev/null
++++ b/hermes_cli/kanban_lane_order.py
+@@ -0,0 +1,57 @@
++"""Pure, whole-candidate-set lane ordering shared by live admission and replay.
++
++This is not an eligibility evaluator or a trace-completeness certificate.
++Candidate lane values must be canonical policy lane names, not raw tenants.
++"""
++from dataclasses import dataclass
++
++
++@dataclass(frozen=True)
++class Partition:
++    """Immutable queue structure; row/breakdown objects remain caller-owned."""
++
++    front: tuple
++    queues: tuple
++    paused: tuple
++
++
++def prepare(scored, pol, candidate_lanes, alarms) -> Partition:
++    """Partition in score order, retaining the live missing-card default."""
++    front, queues, paused = [], {}, []
++    for index, item in enumerate(scored):
++        row, parts = item
++        lane = pol.lanes[candidate_lanes.get(row["id"], pol.default)]
++        if parts.turn_owner or parts.class_rank > 0 or row["id"] in alarms:
++            front.append(item)
++        elif lane.paused:
++            paused.append(item)
++        else:
++            queues.setdefault(lane.name, []).append((index, item))
++    return Partition(tuple(front), tuple((name, tuple(queue)) for name, queue in queues.items()), tuple(paused))
++
++
++def order_prepared(partition: Partition, pol, running) -> list:
++    """Order a pending set without mutating its partition or observed loads.
++
++    Pass the same unchanged policy used by prepare; this synchronous helper
++    does not attest policy identity or freeze caller-owned rows for storage.
++    Every ordinary listed candidate consumes a lane pick, even if a later claim
++    gate refuses it. Multiple queues require explicit running counts; missing
++    counts raise KeyError rather than inventing zero occupancy. Zero/one queue
++    needs no running observation, preserving the live lazy-read boundary.
++    """
++    queues = {name: list(queue) for name, queue in partition.queues}
++    if len(queues) < 2:
++        return list(partition.front) + [item for queue in queues.values() for _i, item in queue] + list(partition.paused)
++    load = dict(running)
++    out = []
++    while queues:
++        def cost(name):
++            share = pol.lanes[name].share
++            return (load[name] / share if share > 0 else float("inf"), queues[name][0][0])
++        name = min(queues, key=cost)
++        out.append(queues[name].pop(0)[1])
++        load[name] += 1
++        if not queues[name]:
++            del queues[name]
++    return list(partition.front) + out + list(partition.paused)
+diff --git a/hermes_cli/kanban_lanes.py b/hermes_cli/kanban_lanes.py
+index d664a8e07fd5dcb01d934bef237ce24fb9c9ba72..94ff67729e2308c7ad18b8484f75c1cfb801b20e 100644
+--- a/hermes_cli/kanban_lanes.py
++++ b/hermes_cli/kanban_lanes.py
+@@ -549,31 +549,12 @@ def order(conn, scored: list, *, pol: Optional[Policy] = None) -> list:
+     pol = safe_policy() if pol is None else pol
+     if pol is None or pol.shadow or len(scored) < 2:
+         return scored
++    from hermes_cli.kanban_lane_order import prepare, order_prepared
++
+     lanes, alarms = _candidate_lanes(conn, pol, [row["id"] for row, _parts in scored])
+-    front, queues, paused = [], {}, []
+-    for index, item in enumerate(scored):
+-        row, parts = item
+-        lane = pol.lanes[lanes.get(row["id"], pol.default)]
+-        if parts.turn_owner or parts.class_rank > 0 or row["id"] in alarms:
+-            front.append(item)
+-        elif lane.paused:
+-            paused.append(item)
+-        else:
+-            queues.setdefault(lane.name, []).append((index, item))
+-    if len(queues) < 2:
+-        return front + [item for queue in queues.values() for _i, item in queue] + paused
+-    load = _running(conn, pol)
+-    out = []
+-    while queues:
+-        def cost(name):
+-            share = pol.lanes[name].share
+-            return (load[name] / share if share > 0 else float("inf"), queues[name][0][0])
+-        name = min(queues, key=cost)
+-        out.append(queues[name].pop(0)[1])
+-        load[name] += 1
+-        if not queues[name]:
+-            del queues[name]
+-    return front + out + paused
++    partition = prepare(scored, pol, lanes, alarms)
++    running = _running(conn, pol) if len(partition.queues) > 1 else {}
++    return order_prepared(partition, pol, running)
+ 
+ 
+ def drop_paused(conn, rows: list) -> list:
+diff --git a/tests/hermes_cli/test_kanban_lane_order.py b/tests/hermes_cli/test_kanban_lane_order.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..15739eacf982adb0ab557b5398f4613604f01952
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_lane_order.py
+@@ -0,0 +1,160 @@
++"""Pure lane ordering, including alternate-pending replay sets."""
++from dataclasses import dataclass
++import random
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_lanes as lanes
++
++
++@dataclass(frozen=True)
++class Parts:
++    turn_owner: bool = False
++    class_rank: int = 0
++
++
++def policy():
++    return lanes.parse({"lanes": {"a": {"share": 1}, "b": {"share": 1}, "other": {"share": 1}}})
++
++
++def pure(scored, pol, names, alarms, load):
++    from hermes_cli.kanban_lane_order import prepare, order_prepared
++    return order_prepared(prepare(scored, pol, names, alarms), pol, load)
++
++
++def items(ids):
++    return [({"id": key}, Parts()) for key in ids]
++
++
++def ids(scored):
++    return [row["id"] for row, _ in scored]
++
++
++def test_pending_subset_changes_order_before_claim_gate():
++    pol = policy()
++    names = {"a1": "a", "a2": "a", "b1": "b"}
++    load = {"a": 0, "b": 0, "other": 0}
++    full = ids(pure(items(names), pol, names, set(), load))
++    subset = ids(pure(items(["a2", "b1"]), pol, names, set(), load))
++    assert full == ["a1", "b1", "a2"]
++    assert subset == ["a2", "b1"]
++    assert next(key for key in full if key != "a1") != subset[0]
++
++
++def test_repeat_does_not_mutate_partition_or_running():
++    from hermes_cli.kanban_lane_order import prepare, order_prepared
++    pol = policy()
++    rows = items(["b1", "a1", "a2", "b2"])
++    names = {key: key[0] for key in ids(rows)}
++    load = {"a": 0, "b": 0, "other": 0}
++    part = prepare(rows, pol, names, set())
++    first = order_prepared(part, pol, load)
++    assert ids(first) == ["b1", "a1", "a2", "b2"]
++    first.clear()
++    assert ids(order_prepared(part, pol, load)) == ["b1", "a1", "a2", "b2"]
++    assert load == {"a": 0, "b": 0, "other": 0}
++    assert ids(rows) == ["b1", "a1", "a2", "b2"]
++    assert ids(pure(rows[1:], pol, names, set(), load)) == ["a1", "b2", "a2"]
++
++
++def test_missing_load_is_not_invented():
++    with pytest.raises(KeyError):
++        pure(items(["a1", "b1"]), policy(), {"a1": "a", "b1": "b"}, set(), {"a": 0})
++
++
++def test_front_paused_and_aliases_without_load():
++    from hermes_cli.kanban_lane_order import prepare, order_prepared
++    ps = {key: SimpleNamespace(name=key, share=1, paused=True) for key in ("a", "other")}
++    pol = SimpleNamespace(lanes=ps, default="other")
++    rows = [({"id": "paused"}, Parts()), ({"id": "owner"}, Parts(True)),
++            ({"id": "marked"}, Parts(False, 1)), ({"id": "alarm"}, Parts())]
++    names, alarms = {"owner": "a"}, {"alarm"}
++    part = prepare(rows, pol, names, alarms)
++    assert part.queues == ()
++    got = order_prepared(part, pol, {})
++    assert ids(got) == ["owner", "marked", "alarm", "paused"]
++    assert all(got[i] is rows[j] for i, j in enumerate([1, 2, 3, 0]))
++    assert names == {"owner": "a"} and alarms == {"alarm"}
++    assert ids(rows) == ["paused", "owner", "marked", "alarm"]
++
++
++def test_unknown_lane_fails_before_running_read(monkeypatch):
++    monkeypatch.setattr(lanes, "_candidate_lanes", lambda *a: ({"a1": "raw-tenant"}, set()))
++    monkeypatch.setattr(lanes, "_running", lambda *a: pytest.fail("unexpected running read"))
++    with pytest.raises(KeyError, match="raw-tenant"):
++        lanes.order(None, items(["a1", "a2"]), pol=policy())
++
++
++def test_disabled_live_policy_keeps_identity(monkeypatch):
++    rows = items(["a1", "a2"])
++    monkeypatch.setattr(lanes, "safe_policy", lambda: None)
++    assert lanes.order(None, rows) is rows
++
++
++def test_single_queue_does_not_need_load():
++    assert ids(pure(items(["a1", "a2"]), policy(), {"a1": "a", "a2": "a"}, set(), {})) == ["a1", "a2"]
++
++
++def legacy(scored, pol, names, alarms, running):
++    """Frozen pre-extraction algorithm (26343c4), differential oracle."""
++    front, queues, paused = [], {}, []
++    for index, item in enumerate(scored):
++        row, parts = item
++        lane = pol.lanes[names.get(row["id"], pol.default)]
++        if parts.turn_owner or parts.class_rank > 0 or row["id"] in alarms:
++            front.append(item)
++        elif lane.paused:
++            paused.append(item)
++        else:
++            queues.setdefault(lane.name, []).append((index, item))
++    if len(queues) < 2:
++        return front + [item for queue in queues.values() for _, item in queue] + paused
++    load, out = dict(running), []
++    while queues:
++        def cost(name):
++            share = pol.lanes[name].share
++            return (load[name] / share if share > 0 else float("inf"), queues[name][0][0])
++        name = min(queues, key=cost)
++        out.append(queues[name].pop(0)[1])
++        load[name] += 1
++        if not queues[name]:
++            del queues[name]
++    return front + out + paused
++
++
++def test_differential_old_algorithm():
++    rng = random.Random(731)
++    for _ in range(500):
++        ps = {key: SimpleNamespace(name=key, share=rng.choice([0, 1, 3]), paused=rng.choice([False, True]))
++              for key in ("a", "b", "other")}
++        pol = SimpleNamespace(lanes=ps, default="other")
++        scored = [({"id": str(i)}, Parts(rng.randrange(8) == 0, rng.randrange(5) == 0))
++                  for i in range(rng.randrange(20))]
++        names = {row["id"]: rng.choice(list(ps)) for row, _ in scored if rng.randrange(5)}
++        alarms = {row["id"] for row, _ in scored if rng.randrange(5) == 0}
++        load = {key: rng.randrange(5) for key in ps}
++        assert pure(scored, pol, names, alarms, load) == legacy(scored, pol, names, alarms, load)
++
++
++@pytest.mark.parametrize("count,shadow", [(0, False), (1, False), (2, True)])
++def test_live_fast_path_preserves_identity(monkeypatch, count, shadow):
++    pol = SimpleNamespace(shadow=shadow)
++    rows = items([str(i) for i in range(count)])
++    monkeypatch.setattr(lanes, "_candidate_lanes", lambda *a: pytest.fail("unexpected candidate read"))
++    assert lanes.order(None, rows, pol=pol) is rows
++
++
++@pytest.mark.parametrize("names,expected_reads", [({"a1": "a", "b1": "a"}, 0), ({"a1": "a", "b1": "b"}, 1)])
++def test_live_readers_stay_lazy(monkeypatch, names, expected_reads):
++    pol, rows, calls = policy(), items(["a1", "b1"]), []
++    def candidates(*args):
++        calls.append("candidates")
++        return names, set()
++    def running(*args):
++        calls.append("running")
++        return {"a": 0, "b": 0, "other": 0}
++    monkeypatch.setattr(lanes, "_candidate_lanes", candidates)
++    monkeypatch.setattr(lanes, "_running", running)
++    assert ids(lanes.order(None, rows, pol=pol)) == ["a1", "b1"]
++    assert calls == ["candidates"] + ["running"] * expected_reads
+-- 
+2.43.0
+

@@ -1,0 +1,497 @@
+From 1c55764fc5c467a2f1dd12d25fe3558991d69c33 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 04:16:18 +0000
+Subject: [PATCH] fix(auth): preflight stale Anthropic relay receipts before
+ pinned requests [daveey]
+
+Why: a sleeping host can miss relay pulls while hub refresh revokes its old access token. Reactive recovery only runs after the avoidable first 401; auth.json mtime and launchctl kickstart acknowledgement do not prove application.
+
+Use provider-scoped success receipts, wall-clock 2x-cadence freshness and the existing relay lock. Bound lock/command/async receipt wait to one 30s budget, fail open, coalesce failed attempts for 2x cadence (60-300s), then sync the pinned row outside the relay lock. Recheck disable after the wait. Missing receipts preserve old-producer behavior. Scope is Anthropic pinned requests, not Codex or unpinned auxiliary resolvers.
+
+Proof: first-request real pull subprocess RED then GREEN; disable-during-wait and failed-attempt backoff RED then GREEN. Canonical 8-file regression: 1545 passed, 1 skipped. Fourteen guard mutations killed. scripts/check all 21 checks passed; account-usage compatibility pins unchanged. Producer ordering contract delivered separately in state PR3532.
+---
+ agent/credential_pool_pin.py             |   5 +
+ agent/credential_relay_preflight.py      | 130 ++++++++++
+ tests/agent/test_relay_wake_preflight.py | 310 +++++++++++++++++++++++
+ 3 files changed, 445 insertions(+)
+ create mode 100644 agent/credential_relay_preflight.py
+ create mode 100644 tests/agent/test_relay_wake_preflight.py
+
+diff --git a/agent/credential_pool_pin.py b/agent/credential_pool_pin.py
+index 4b24f9e899e61de11026d3f546fb675895d528f8..732c89d44b02d133b4a4b737e4e143ca474abd60 100644
+--- a/agent/credential_pool_pin.py
++++ b/agent/credential_pool_pin.py
+@@ -32,6 +32,8 @@ def pinned_anthropic_pool_token(pool: Any, credential_id: str) -> tuple[bool, Op
+     if is_credential_disabled(getattr(pool, "provider", "anthropic"), entry):
+         # Disabled mid-session: report it gone so the caller re-resolves onto an enabled account.
+         return False, None
++    from agent.credential_relay_preflight import before_pinned_request
++    before_pinned_request(getattr(pool, "provider", "anthropic"), entry)
+     if entry.auth_type == AUTH_TYPE_OAUTH:
+         # Token authority: the shared Claude Code file for the borrowed row, the pool store otherwise.
+         if entry.source == "claude_code":
+@@ -46,6 +48,9 @@ def pinned_anthropic_pool_token(pool: Any, credential_id: str) -> tuple[bool, Op
+                     credential_id)
+                 return True, None
+             entry = refreshed
++    # A disable can arrive while the relay preflight waits or adopts a replacement.
++    if is_credential_disabled(getattr(pool, "provider", "anthropic"), entry):
++        return False, None
+     token = (getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", None) or "").strip()
+     return True, token or None
+ 
+diff --git a/agent/credential_relay_preflight.py b/agent/credential_relay_preflight.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..262271ee08bc06caa91ff65cb1134039aa7b1a3a
+--- /dev/null
++++ b/agent/credential_relay_preflight.py
+@@ -0,0 +1,130 @@
++"""Bounded, fail-open Anthropic relay catch-up before a pinned request. [daveey]
++
++Only a producer's successful provider receipt proves freshness; auth.json mtime
++also changes on pool persistence. The existing relay lock serializes processes,
++including 401 recovery. Never call this while holding a pool/auth-store lock.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import math
++import subprocess
++import time
++from pathlib import Path
++from typing import Any
++
++logger = logging.getLogger(__name__)
++_WAIT_S = 30.0
++_POLL_S = 0.1
++
++
++def _receipt(path: Path, provider: str) -> tuple[float, float] | None:
++    try:
++        data = json.loads(path.read_text(encoding="utf-8-sig"))
++        if not isinstance(data, dict) or data.get("version") != 1:
++            return None
++        providers = data.get("providers")
++        row = providers.get(provider) if isinstance(providers, dict) else None
++        if not isinstance(row, dict):
++            return None
++        values = (row.get("checked_at"), row.get("interval_s"))
++        if any(type(v) not in (int, float) or not math.isfinite(v) or v <= 0 for v in values):
++            return None
++        return values
++    except (OSError, ValueError, OverflowError):
++        return None
++
++
++def _stale(receipt: tuple[float, float]) -> bool:
++    checked_at, interval = receipt
++    return time.time() - checked_at > 2 * interval
++
++
++def _wait(deadline: float) -> bool:
++    remaining = deadline - time.monotonic()
++    if remaining <= 0:
++        return False
++    time.sleep(min(_POLL_S, remaining))
++    return True
++
++
++def _claim_attempt(lock: Any, provider: str, cooldown: float) -> bool:
++    """Bound repeated failures across sessions without pretending a pull succeeded."""
++    lock.seek(0)
++    try:
++        attempts = json.load(lock)
++    except ValueError:
++        attempts = {}
++    if not isinstance(attempts, dict):
++        attempts = {}
++    last = attempts.get(provider)
++    now = time.time()
++    if isinstance(last, (int, float)) and 0 <= now - last < cooldown:
++        return False
++    attempts[provider] = now
++    lock.seek(0)
++    lock.truncate()
++    json.dump(attempts, lock)
++    lock.flush()
++    return True
++
++
++def _pull_locked(cmd: list[str], stamp: Path, provider: str, deadline: float, lock: Any) -> None:
++    """Recheck after lock acquisition; wait for async launchd apply, not kickstart exit."""
++    from tools.environments.local import build_subprocess_env
++    current = _receipt(stamp, provider)
++    if current is None or not _stale(current):
++        return
++    remaining = deadline - time.monotonic()
++    if remaining <= 0 or not _claim_attempt(lock, provider, min(300.0, max(60.0, 2 * current[1]))):
++        return
++    env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
++    env.pop("PYTHONPATH", None)
++    env.pop("PYTHONHOME", None)
++    remaining = deadline - time.monotonic()
++    if remaining <= 0:
++        return
++    result = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
++                            stderr=subprocess.DEVNULL, timeout=remaining, check=False, env=env)
++    if result.returncode:
++        return
++    while time.monotonic() < deadline:
++        fresh = _receipt(stamp, provider)
++        if fresh is not None and fresh[0] > current[0] and not _stale(fresh):
++            return
++        if not _wait(deadline):
++            return
++
++
++def before_pinned_request(provider: str, entry: Any) -> None:
++    """Catch up a stale successful-pull receipt; caller then re-reads its pinned row.
++
++    Missing receipts are old producers, not evidence of a long pull gap. A failed
++    pull keeps existing request/401 recovery behavior. No token material is logged.
++    """
++    from agent.credential_relay_repull import is_relay_managed, pull_command
++    from hermes_constants import get_hermes_home
++    if not is_relay_managed(entry):
++        return
++    try:
++        import fcntl
++        stamp = Path(get_hermes_home()) / "state" / "oauth-relay-success.json"
++        receipt = _receipt(stamp, provider)
++        if receipt is None or not _stale(receipt):
++            return
++        cmd = pull_command()
++        if not cmd:
++            return
++        deadline = time.monotonic() + _WAIT_S
++        with (stamp.parent / "oauth-relay-repull.lock").open("a+", encoding="utf-8") as lock:
++            while True:
++                try:
++                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++                    break
++                except BlockingIOError:
++                    if not _wait(deadline):
++                        return
++            _pull_locked(cmd, stamp, provider, deadline, lock)
++    except (ImportError, OSError, ValueError, subprocess.SubprocessError):
++        logger.debug("OAuth relay preflight unavailable; retaining reactive recovery")
+diff --git a/tests/agent/test_relay_wake_preflight.py b/tests/agent/test_relay_wake_preflight.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bb04cba50ec916485cb2648fba0fe0b873f9eaa4
+--- /dev/null
++++ b/tests/agent/test_relay_wake_preflight.py
+@@ -0,0 +1,310 @@
++"""First physical Anthropic request after a relay pull gap uses the applied token."""
++from __future__ import annotations
++
++import json
++import sys
++import time
++import subprocess
++from types import SimpleNamespace
++
++import pytest
++
++from tests.agent import test_anthropic_pool_pin as pins
++
++home = pins.home
++
++
++def _receipt(home, checked_at=None):
++    path = home / "state" / "oauth-relay-success.json"
++    path.parent.mkdir(exist_ok=True)
++    path.write_text(json.dumps({"version": 1, "providers": {"anthropic": {
++        "checked_at": time.time() - 1000 if checked_at is None else checked_at,
++        "interval_s": 120,
++    }}}))
++    return path
++
++
++def _relay_agent(home):
++    data = json.loads((home / "auth.json").read_text())
++    for row in data["credential_pool"]["anthropic"]:
++        row.update(source="manual:hub_minted", refresh_token=None,
++                   expires_at_ms=int(time.time() * 1000) + 3600000)
++    (home / "auth.json").write_text(json.dumps(data))
++    return pins._pinned_agent()
++
++
++def test_first_request_after_gap_uses_applied_token(home, monkeypatch, caplog):
++    agent = _relay_agent(home)
++    receipt = _receipt(home)
++    # A real child applies auth then publishes success. No provider request/network.
++    script = home / "pull.py"
++    script.write_text('''import fcntl, json, os, pathlib, sys, time
++home = pathlib.Path(sys.argv[1])
++assert "PYTHONPATH" not in os.environ and "PYTHONHOME" not in os.environ
++with (home / "auth.lock").open("a") as lock:
++    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++p = home / "auth.json"
++d = json.loads(p.read_text())
++for row in d["credential_pool"]["anthropic"]:
++    if row["id"] == "acct-B": row["access_token"] = "new-relay-token"
++p.write_text(json.dumps(d))
++r = home / "state" / "oauth-relay-success.json"
++d = json.loads(r.read_text())
++d["providers"]["anthropic"]["checked_at"] = time.time()
++r.write_text(json.dumps(d))
++(home / "pulled").write_text("yes")
++''')
++    monkeypatch.setenv("PYTHONPATH", "/fixture/foreign-python")
++    monkeypatch.setenv("PYTHONHOME", "/fixture/foreign-python")
++    monkeypatch.setattr("agent.credential_relay_repull.pull_command",
++                        lambda: [sys.executable, str(script), str(home)])
++    pool = agent._credential_pool
++    sync = pool._sync_entry_from_pool_store
++    def sync_after_unlock(entry):
++        import fcntl
++        with (home / "state" / "oauth-relay-repull.lock").open("a") as lock:
++            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        return sync(entry)
++    monkeypatch.setattr(pool, "_sync_entry_from_pool_store", sync_after_unlock)
++    assert pins._request_key(agent) == "new-relay-token"
++    assert json.loads(receipt.read_text())["providers"]["anthropic"]["checked_at"] > time.time() - 10
++    assert "401" not in caplog.text
++    assert agent._credential_pool_entry_id == "acct-B"
++
++
++def test_failed_pull_is_coalesced_across_sessions(home, monkeypatch):
++    from agent import credential_relay_preflight as pre
++    agent = _relay_agent(home)
++    _receipt(home)
++    calls = []
++    monkeypatch.setattr("agent.credential_relay_repull.pull_command", lambda: ["fake-pull"])
++    monkeypatch.setattr(pre.subprocess, "run", lambda *a, **k: calls.append(k) or SimpleNamespace(returncode=1))
++    assert pins._request_key(agent) == pins.B_1
++    assert pins._request_key(_relay_agent(home)) == pins.B_1
++    assert len(calls) == 1
++
++
++@pytest.mark.parametrize("age", [0, 239, 240, -3600])
++def test_fresh_or_future_receipt_never_pulls(home, monkeypatch, age):
++    agent = _relay_agent(home)
++    from agent import credential_relay_preflight as pre
++    monkeypatch.setattr(pre, "time", SimpleNamespace(time=lambda: 10000))
++    _receipt(home, 10000 - age)
++    monkeypatch.setattr("agent.credential_relay_repull.pull_command", lambda: pytest.fail("fresh pull"))
++    assert pins._request_key(agent) == pins.B_1
++
++
++@pytest.mark.parametrize("data", [None, "broken", [], {"version": 2,
++    "providers": {"anthropic": {"checked_at": 1, "interval_s": 120}}},
++    {"version": 1, "providers": []}, {"version": 1, "providers": {"openai-codex": {}}},
++    *[{"version": 1, "providers": {"anthropic": {"checked_at": value, "interval_s": 120}}}
++      for value in [None, "123", True, 0, -1, float("nan"), float("inf")]],
++    *[{"version": 1, "providers": {"anthropic": {"checked_at": 1, "interval_s": value}}}
++      for value in [None, "120", True, 0, -1, float("nan"), float("inf")]]])
++def test_unknown_receipt_does_not_start_pull(home, monkeypatch, data):
++    agent = _relay_agent(home)
++    path = _receipt(home)
++    if data is None:
++        path.unlink()
++    else:
++        path.write_text(data if isinstance(data, str) else json.dumps(data))
++    from agent.credential_relay_preflight import _receipt as read_receipt
++    assert read_receipt(path, "anthropic") is None
++    monkeypatch.setattr("agent.credential_relay_repull.pull_command", lambda: pytest.fail("unknown pull"))
++    assert pins._request_key(agent) == pins.B_1
++
++
++@pytest.mark.parametrize("source,refresh,auth_type", [
++    ("manual", None, "oauth"), ("manual:hub_minted", "owned", "oauth"),
++    ("manual:hub_minted", None, "api_key"), ("claude_code", None, "oauth")])
++def test_other_credentials_do_not_inspect_receipts(home, monkeypatch, source, refresh, auth_type):
++    from agent import credential_relay_preflight as pre
++    monkeypatch.setattr(pre, "_receipt", lambda *a: pytest.fail("unrelated credential"))
++    pre.before_pinned_request("anthropic", SimpleNamespace(
++        source=source, refresh_token=refresh, auth_type=auth_type))
++
++
++class _Clock:
++    def __init__(self):
++        self.elapsed = 0.0
++        self.on_sleep = lambda: None
++
++    def monotonic(self):
++        return self.elapsed
++
++    def time(self):
++        return 10000 + self.elapsed
++
++    def sleep(self, duration):
++        self.elapsed += duration
++        self.on_sleep()
++
++
++def _controlled(home, monkeypatch):
++    from agent import credential_relay_preflight as pre
++    agent = _relay_agent(home)
++    _receipt(home, 9000)
++    clock = _Clock()
++    monkeypatch.setattr(pre, "time", clock)
++    monkeypatch.setattr("agent.credential_relay_repull.pull_command", lambda: ["fake-pull"])
++    return pre, agent, clock
++
++
++def test_async_kickstart_waits_for_applied_receipt(home, monkeypatch):
++    pre, agent, clock = _controlled(home, monkeypatch)
++    monkeypatch.setattr(pre.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0))
++
++    def apply():
++        data = json.loads((home / "auth.json").read_text())
++        data["credential_pool"]["anthropic"][1]["access_token"] = "async-token"
++        (home / "auth.json").write_text(json.dumps(data))
++        _receipt(home, clock.time())
++
++    clock.on_sleep = apply
++    assert pins._request_key(agent) == "async-token"
++    assert clock.elapsed > 0
++
++
++def test_async_receipt_timeout_fails_open_with_one_deadline(home, monkeypatch):
++    pre, agent, clock = _controlled(home, monkeypatch)
++    calls = []
++
++    def kick(*a, **kw):
++        calls.append(kw)
++        clock.elapsed += 12
++        return SimpleNamespace(returncode=0)
++
++    monkeypatch.setattr(pre.subprocess, "run", kick)
++    assert pins._request_key(agent) == pins.B_1
++    assert clock.elapsed == pytest.approx(30)
++    assert len(calls) == 1 and calls[0]["timeout"] <= 30
++
++
++def test_lock_wait_consumes_command_budget(home, monkeypatch):
++    import fcntl
++    pre, agent, clock = _controlled(home, monkeypatch)
++    calls = []
++
++    def flock(*args):
++        if clock.elapsed < 10:
++            raise BlockingIOError()
++
++    def run(*args, **kw):
++        calls.append(kw)
++        raise subprocess.TimeoutExpired("fake-pull", kw["timeout"])
++
++    monkeypatch.setattr(fcntl, "flock", flock)
++    monkeypatch.setattr(pre.subprocess, "run", run)
++    assert pins._request_key(agent) == pins.B_1
++    assert 0 < calls[0]["timeout"] <= 20
++
++
++def test_busy_lock_times_out_without_command(home, monkeypatch):
++    import fcntl
++    pre, agent, clock = _controlled(home, monkeypatch)
++
++    def busy(*args):
++        raise BlockingIOError()
++
++    monkeypatch.setattr(fcntl, "flock", busy)
++    monkeypatch.setattr(pre.subprocess, "run", lambda *a, **k: pytest.fail("locked pull"))
++    assert pins._request_key(agent) == pins.B_1
++    assert clock.elapsed == pytest.approx(30)
++
++
++def test_peer_success_rechecked_after_lock(home, monkeypatch):
++    import fcntl
++    pre, agent, clock = _controlled(home, monkeypatch)
++    monkeypatch.setattr(fcntl, "flock", lambda *args: _receipt(home, clock.time()))
++    monkeypatch.setattr(pre.subprocess, "run", lambda *a, **k: pytest.fail("duplicate pull"))
++    assert pins._request_key(agent) == pins.B_1
++
++
++def test_no_command_fails_open(home, monkeypatch):
++    pre, agent, _clock = _controlled(home, monkeypatch)
++    monkeypatch.setattr("agent.credential_relay_repull.pull_command", lambda: None)
++    monkeypatch.setattr(pre.subprocess, "run", lambda *a, **k: pytest.fail("no command"))
++    assert pins._request_key(agent) == pins.B_1
++
++
++def test_failed_attempt_is_retried_after_cooldown(home, monkeypatch):
++    pre, agent, clock = _controlled(home, monkeypatch)
++    calls = []
++    monkeypatch.setattr(pre.subprocess, "run", lambda *a, **k: calls.append(k) or SimpleNamespace(returncode=1))
++    assert pins._request_key(agent) == pins.B_1
++    clock.elapsed = 30
++    assert pins._request_key(agent) == pins.B_1
++    assert len(calls) == 1  # failed pulls do not consume 30s on every next request
++    clock.elapsed = 240
++    assert pins._request_key(agent) == pins.B_1
++    assert len(calls) == 2
++
++
++@pytest.mark.parametrize("contents", ["[]", "broken"])
++def test_bad_attempt_history_does_not_prevent_catchup(home, monkeypatch, contents):
++    pre, agent, _clock = _controlled(home, monkeypatch)
++    (home / "state" / "oauth-relay-repull.lock").write_text(contents)
++    calls = []
++    monkeypatch.setattr(pre.subprocess, "run", lambda *a, **k: calls.append(k) or SimpleNamespace(returncode=1))
++    assert pins._request_key(agent) == pins.B_1
++    assert len(calls) == 1
++
++
++@pytest.mark.parametrize("stage", ["lock", "env"])
++def test_expired_total_budget_never_starts_command(home, monkeypatch, stage):
++    import fcntl
++    pre, agent, clock = _controlled(home, monkeypatch)
++    if stage == "lock":
++        monkeypatch.setattr(fcntl, "flock", lambda *a: setattr(clock, "elapsed", 30))
++    else:
++        def env(**kwargs):
++            clock.elapsed = 30
++            return {}
++        monkeypatch.setattr("tools.environments.local.build_subprocess_env", env)
++    monkeypatch.setattr(pre.subprocess, "run", lambda *a, **k: pytest.fail("expired budget"))
++    assert pins._request_key(agent) == pins.B_1
++    assert pre._wait(clock.monotonic()) is False
++    if stage == "lock":
++        assert (home / "state" / "oauth-relay-repull.lock").read_text() == ""
++
++
++def test_receipt_disappears_while_waiting_for_lock(home, monkeypatch):
++    import fcntl
++    pre, agent, _clock = _controlled(home, monkeypatch)
++    monkeypatch.setattr(fcntl, "flock", lambda *a: (home / "state" / "oauth-relay-success.json").unlink())
++    monkeypatch.setattr(pre.subprocess, "run", lambda *a, **k: pytest.fail("unknown receipt"))
++    assert pins._request_key(agent) == pins.B_1
++
++
++def test_command_error_fails_open(home, monkeypatch):
++    pre, agent, _clock = _controlled(home, monkeypatch)
++    def fail(*a, **k):
++        raise OSError("fixture error")
++    monkeypatch.setattr(pre.subprocess, "run", fail)
++    assert pins._request_key(agent) == pins.B_1
++
++
++def test_disabled_during_pull_is_not_handed_out(home, monkeypatch):
++    from agent.credential_pool_disabled import set_credential_disabled
++    from agent.credential_pool_pin import pinned_anthropic_pool_token
++    pre, agent, _clock = _controlled(home, monkeypatch)
++    pool = agent._credential_pool
++    entry = next(e for e in pool.entries() if e.id == "acct-B")
++    def run(*a, **k):
++        set_credential_disabled("anthropic", entry, True)
++        return SimpleNamespace(returncode=1)
++    monkeypatch.setattr(pre.subprocess, "run", run)
++    assert pinned_anthropic_pool_token(pool, entry.id) == (False, None)
++
++
++def test_success_for_another_provider_does_not_complete_wait(home, monkeypatch):
++    pre, agent, clock = _controlled(home, monkeypatch)
++    path = home / "state" / "oauth-relay-success.json"
++    def run(*a, **k):
++        data = json.loads(path.read_text())
++        data["providers"]["openai-codex"] = {"checked_at": clock.time(), "interval_s": 30}
++        path.write_text(json.dumps(data))
++        return SimpleNamespace(returncode=0)
++    monkeypatch.setattr(pre.subprocess, "run", run)
++    assert pins._request_key(agent) == pins.B_1
++    assert clock.elapsed == pytest.approx(30)
+-- 
+2.43.0
+

@@ -1,0 +1,380 @@
+From 2a234f4444dea7c0ad8947f0678fa642d13b080d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 17:20:47 +0000
+Subject: [PATCH] [daveey] Remembered rows: tell a removed owner from an
+ offline one, and use bulk publication lookups only
+
+The first commit of this PR failed four existing tests on Linux, each pinning a real rule:
+- test_kanban_remote_moved_owner "named owner offline: its silence proves nothing": an owner with a stale info row
+  and no records is offline, not removed, and its copy must not be retired.
+- test_kanban_replica_bystander_memory (three): the remembered-card path may not scan an all-row aggregate, a dead
+  scope's publication keys are not looked up, and a malformed created_at must not raise.
+
+Changes:
+- "Removed" now means: no `gateway/info` row (`known_gateways`, read on every call and never memoized, so an
+  unrelated gateway's row rebuilds nothing), no task record (`publishing`, the projection's per-gateway seen set)
+  and no fresh scope heartbeat. Evidence without `known_gateways` counts nothing as removed. This also tightens
+  the `owner_removed` release of e9c07f61d27 the same way.
+- No walk of the owner set: `_release_removed_owners` takes only the moved evidence. "Nobody publishes the card"
+  for the aged-out case and "another gateway publishes it" for the copy case both use the publications
+  `remembered_publications` resolves in one scan; that now also covers rows of unlisted gateways.
+- A row with no usable created_at proves nothing in either case.
+
+Tests: tests/hermes_cli/test_kanban_release_removed_owner_rows.py adds the offline-versus-removed distinction on
+the pure rule and the malformed created_at case; the replica fixtures give cards a created_at. The four existing
+tests pass unchanged.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_replica_aggregates.py       | 11 +--
+ hermes_cli/kanban_scope_heartbeat.py          |  6 ++
+ hermes_cli/kanban_session_activity.py         | 26 ++++--
+ hermes_cli/kanban_session_activity_records.py | 86 ++++++++++---------
+ .../test_kanban_release_removed_owner_rows.py | 48 ++++++-----
+ 5 files changed, 101 insertions(+), 76 deletions(-)
+
+diff --git a/hermes_cli/kanban_replica_aggregates.py b/hermes_cli/kanban_replica_aggregates.py
+index e6406d48386ca303cb0b1f5c7feee9461327f11f..b681fa5babf59ad0a0dbe38518ae4622e6822235 100644
+--- a/hermes_cli/kanban_replica_aggregates.py
++++ b/hermes_cli/kanban_replica_aggregates.py
+@@ -69,15 +69,15 @@ def remembered_publications(moved, previous):
+     published = moved.get('published')
+     if isinstance(published, Published):
+         keys = set()
+-        live_gateways = {scope[0] for scope in moved.get('live_scopes', ())}
++        known = moved.get('known_gateways')  # None: this evidence cannot tell a removed owner from an offline one
+         for card in previous or ():
+             # Match _retire_moved's eligibility before touching publication keys.
+             if card.get('ownership_state') != 'qualified' or card.get('created_at') is None:
+                 continue
+             scope = (card.get('gateway'), card.get('owner_profile'), card.get('board'))
+-            # ...or _release_removed_owners': an owner with no live scope at all may be gone, and its row is then
+-            # retired when another gateway publishes the card.
+-            if scope not in moved.get('live_scopes', ()) and card.get('gateway') in live_gateways:
++            # ...or _release_removed_owners': the row of an owner the Board no longer lists is retired when another
++            # gateway publishes the card.
++            if scope not in moved.get('live_scopes', ()) and (known is None or card.get('gateway') in known):
+                 continue
+             key = (card.get('board'), card.get('id'), card.get('created_at'))
+             try:
+@@ -131,4 +131,5 @@ def snapshot(state):
+         seen[gw] = max(seen.get(gw, 0.0), (updated or 0) / 1000.0)
+     return {'owners': EvidenceSet(() if stale else state.owners, scalars, 'owners', stale, fresh),
+             'closed': EvidenceSet(state.closed, scalars, 'closed', stale, fresh), 'seen': seen,
+-            'moved': {} if stale else {'published': Published(state.published_out, scalars), 'live_scopes': frozenset(fresh)}}
++            'moved': {} if stale else {'published': Published(state.published_out, scalars), 'live_scopes': frozenset(fresh),
++                                       'publishing': frozenset(seen)}}
+diff --git a/hermes_cli/kanban_scope_heartbeat.py b/hermes_cli/kanban_scope_heartbeat.py
+index 066b399365494dc6626a4bbafe9836c1f1464a26..c10ed575486ff5f9e30535442122f17a951c4a30 100644
+--- a/hermes_cli/kanban_scope_heartbeat.py
++++ b/hermes_cli/kanban_scope_heartbeat.py
+@@ -123,6 +123,12 @@ def attests(verdicts, scope, published_at: Any) -> bool:
+     return published_before_silence(last, last, published_at)
+ 
+ 
++def known_gateways(info_rows) -> frozenset:
++    """Every gateway the replica holds a ``gateway/info`` row for, readable or not. An offline owner keeps its row
++    (its heartbeat just goes stale); a machine removed from the Board loses it."""
++    return frozenset(str(gw) for gw, _raw in info_rows)
++
++
+ def fresh_scopes(heartbeats: dict[tuple[str, str, str], tuple[float, float]], now: float) -> ScopeVerdicts:
+     """The ``scope_heartbeats`` keys ``fresh`` at ``now``, and the last beat of the others (``ScopeVerdicts``): all a
+     replica projection learns from the heartbeats."""
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 2030634dc0c172c519b460ca37318ff7fbd743f1..ebeddb2dd08932f68c5f87917685d181ffd0ff76 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -38,7 +38,7 @@ from hermes_cli.kanban_session_activity_release import PENDING_RELEASE_STATUSES,
+ from hermes_cli.kanban_session_activity_release import owner_attests_terminal as _owner_attests_terminal
+ from hermes_cli.kanban_db_sync import sync_enabled as _board_sync_enabled
+ from hermes_cli.kanban_scope_heartbeat import scope_heartbeats as _scope_heartbeats
+-from hermes_cli.kanban_session_activity_records import (OwnerSink as _OwnerSink, _fold_legacy_aliases, _moved_evidence,
++from hermes_cli.kanban_session_activity_records import (_fold_legacy_aliases, _moved_evidence,
+                                                           _release_removed_owners, _retire_moved)
+ from hermes_cli.kanban_session_activity_attention import AttentionCache as _AttentionCache
+ from hermes_cli.kanban_session_activity_attention import run_checks as _run_done_checks
+@@ -581,6 +581,14 @@ _REPLICA_PROBE = ("SELECT count(*), count(seq), max(seq), total(seq), total(vers
+                   "FROM replica WHERE coll = 'tasks'")
+ 
+ 
++def _note_known_gateways(moved_out: dict | None, info_rows: list) -> None:
++    """Add the gateways the replica holds an info row for to non-empty (not stale) moved evidence. Read on every
++    call and never memoized: an unrelated gateway's row must not rebuild a projection, and a removed owner is told
++    from an offline one by this list alone (``_release_removed_owners``). [daveey]"""
++    if moved_out:
++        moved_out['known_gateways'] = _scope_hb.known_gateways(info_rows)
++
++
+ def _read_remote_links(path: Path, now: float | None = None, *,
+                        qualified_out: set | None = None,
+                        owners_out: set | None = None,
+@@ -632,13 +640,16 @@ def _read_remote_links(path: Path, now: float | None = None, *,
+                     moved_out.update(memo[9])
+                 if closed_out is not None:
+                     closed_out.update(memo[10])
++                _note_known_gateways(moved_out, info_rows)
+                 return list(memo[3])  # cards are read-only, as in ``_links_cache``
+         if key is not None:  # [daveey] a miss reads and re-projects only the rows whose seq moved
+             from hermes_cli.kanban_replica_memo import finish
+             view = _replica_rows.read(conn, path, version_column, probe, ident, me=me)
+-            return finish(view, now, me, info_rows, last_ok, offline, key, stale,
++            cards = finish(view, now, me, info_rows, last_ok, offline, key, stale,
+                           qualified_out=qualified_out, owners_out=owners_out,
+                           moved_out=moved_out, closed_out=closed_out)
++            _note_known_gateways(moved_out, info_rows)
++            return cards
+         else:
+             # Aggregate raw text, not json(data): malformed task JSON retains its per-row decode semantics.
+             # sqlite3 releases/reacquires the GIL per fetched row; under contention 12k rows can stall for 90s.
+@@ -648,9 +659,11 @@ def _read_remote_links(path: Path, now: float | None = None, *,
+     finally:
+         conn.close()
+     if key is None:
+-        return _project_replica(path, now, me, rows, info_rows, last_ok, offline,
++        cards = _project_replica(path, now, me, rows, info_rows, last_ok, offline,
+                                 qualified_out=qualified_out, owners_out=owners_out, moved_out=moved_out,
+                                 closed_out=closed_out)
++        _note_known_gateways(moved_out, info_rows)
++        return cards
+ 
+ 
+ 
+@@ -727,6 +740,7 @@ def _project_replica(path: Path, now: float, me: str, rows: list, info_rows: lis
+         owners_out.update((gw, board, tid) for gw, _, board, tid in tasks)
+     if moved_out is not None and not stale:
+         moved_out.update(_moved_evidence(tasks, heartbeats, now))
++        moved_out['publishing'] = frozenset(seen_at)  # every gateway with a task record (``_release_removed_owners``)
+     blank_before = {key for key in tasks if key[1] is None}
+     _fold_legacy_aliases(tasks, raw)
+     # Only a proven-identity alias is the same card as its qualified twin (folded above, links carried
+@@ -1085,9 +1099,9 @@ def _legacy_remote_links() -> list[dict[str, Any]]:
+             raise FileNotFoundError("no hub.db")
+         qualified: set[tuple[str, str, str]] = set()
+         from hermes_cli.kanban_replica_aggregates import BorrowedSet, remembered_publications
+-        closed, owners = BorrowedSet(), _OwnerSink()
++        closed = BorrowedSet()
+         moved: dict[str, Any] = {}
+-        cards = _read_remote_links(path, qualified_out=qualified, closed_out=closed, moved_out=moved, owners_out=owners)
++        cards = _read_remote_links(path, qualified_out=qualified, closed_out=closed, moved_out=moved)
+         remembered_publications(moved, previous)
+     except Exception as exc:  # a broken replica must never break the sidebar
+         if previous is None:
+@@ -1119,7 +1133,7 @@ def _legacy_remote_links() -> list[dict[str, Any]]:
+                  and not (c.get("ownership_state") == "unknown"
+                           and (c["session"], c.get("gateway"), c.get("board"), c.get("id")) in qualified_now)
+                  # Fresh replica: the named owner publishes the scope without it, another gateway owns the card.
+-                 and not _retire_moved(c, moved)]), owners.value, moved))
++                 and not _retire_moved(c, moved)]), moved))
+     if _snapshot_saved != (scope, cards):
+         # The durable snapshot only speeds a cold start. Losing a write race (database is locked) must not
+         # fail this read: the sidebar would mark every row kanban_unknown. The next changed read retries.
+diff --git a/hermes_cli/kanban_session_activity_records.py b/hermes_cli/kanban_session_activity_records.py
+index 5af98df6ed42475af8a33571cfb1b61a2e13eaf1..63fe0dc3ab1d2d2e3b5981204c306526405ebfdc 100644
+--- a/hermes_cli/kanban_session_activity_records.py
++++ b/hermes_cli/kanban_session_activity_records.py
+@@ -43,28 +43,23 @@ def _retire_moved(card: dict[str, Any], moved: dict[str, Any]) -> bool:
+ _INFERRED = ('owner_removed', 'aged_out')
+ 
+ 
+-class OwnerSink:
+-    """``owners_out`` sink for ``_release_removed_owners``: borrows a projection's owner set, and takes a full
+-    read's one-shot generator as a set at once (the tasks it walks are folded afterwards)."""
+-    def __init__(self):
+-        self.value = ()
+-
+-    def update(self, value):
+-        self.value = value if hasattr(value, '__contains__') else set(value)
+-
+-
+-def _release_removed_owners(carried: list[dict[str, Any]], owners, moved: dict[str, Any]) -> list[dict[str, Any]]:
+-    """Remembered rows of an owner gateway a FRESH replica no longer carries at all, last reported done or archived:
+-    released, as the owner reported them. [daveey]
+-
+-    The Board drops a removed machine's records. Its cards were then remembered rows with no record left to attest
+-    them, ``unknown`` forever: 1,231 finished cards in 68 hub chats and 1,409 in 28 MacBook chats after workers 2-8
+-    were removed (2026-11-18). Absence of ONE record is still never closure (a live owner publishing other cards
+-    keeps its rows as they are, see ``_retire_moved``); this is the absence of the whole owner: no task record from
+-    that gateway and no fresh scope heartbeat, in a replica that is not stale (``owners`` is filled only then). An
+-    open, unknown-status or unqualified row is left alone, and so is everything while the replica is stale (an
+-    earlier release included: a stale read neither makes nor takes back the inference).
+-    ``owners`` is the projection's ``(gateway, board, id)`` set; it is walked only when a candidate row exists."""
++def _release_removed_owners(carried: list[dict[str, Any]], moved: dict[str, Any]) -> list[dict[str, Any]]:
++    """Settle remembered rows a fresh replica can no longer attest record by record. [daveey]
++
++    The Board drops a removed machine's records, and a collector stops publishing a card archived past its recent
++    window. Such cards stayed remembered rows for good: 1,231 finished cards in 68 hub chats and 1,409 in 28
++    MacBook chats after workers 2-8 were removed (2026-11-18), then 44 "open" copies and 20 closed leftovers.
++    Three cases, for qualified unreleased rows, never on a stale replica (``moved`` is empty then):
++    - owner removed (no ``gateway/info`` row, no task record, no fresh scope heartbeat; an offline owner keeps its
++      info row and its records) and
++      the row last reported done or archived: released as reported (``owner_removed``);
++    - owner removed and another gateway publishes the same card (board, id, created_at): the row is retired,
++      whatever it reported;
++    - owner alive with a clean fresh read of the row's exact scope, nobody publishing the card, and the row last
++      reported done or archived: released as reported (``aged_out``).
++    Absence of ONE record of an owner that is otherwise present still closes nothing for a card last reported open
++    (``_retire_moved`` covers the proven move). Evidence without ``known_gateways`` cannot tell removed from offline,
++    so then nothing counts as removed. Publication lookups are the bulk ones ``remembered_publications`` resolved."""
+     if not moved:
+         return carried
+     # ``owner_removed`` and ``aged_out`` are inferences, re-made on every fresh read, never completion receipts: such
+@@ -72,35 +67,42 @@ def _release_removed_owners(carried: list[dict[str, Any]], owners, moved: dict[s
+     # machine, even one republishing this very card as running with its session links dropped) takes the release back.
+     rows = [({**{k: v for k, v in c.items() if k not in _INFERRED}, 'status': 'unknown', 'unfinished': True,
+               'released': False} if any(c.get(k) for k in _INFERRED) else c) for c in carried]
+-    if all(c.get('released') for c in rows):
+-        return carried
+-    records = set(owners)
+-    if not records:  # a read that carries no task record at all proves nothing about who is gone
+-        return carried
++    # Removed, not offline: an offline owner keeps its info row; a machine the Board has dropped has none (and no
++    # fresh heartbeat). Evidence without ``known_gateways`` cannot tell them apart, so nothing counts as removed.
++    known = moved.get('known_gateways')
+     live = moved.get('live_scopes', ())
+-    publishing = {record[0] for record in records} | {scope[0] for scope in live}
++    listed = None if known is None else set(known) | {scope[0] for scope in live} | set(moved.get('publishing', ()))
+     published = moved.get('published', {})
++
++    def publishers(c):
++        """The gateways publishing a qualified record of this exact card (board, id, created_at), resolved in bulk
++        by ``remembered_publications``; None for a row with no usable created_at, which proves nothing."""
++        key = (c.get('board'), c.get('id'), c.get('created_at'))
++        try:
++            return frozenset(published.get(key, ())) if c.get('created_at') is not None else None
++        except TypeError:  # an unhashable created_at
++            return None
++
+     out = []
+     for c in rows:
+-        gw, qualified = c.get('gateway'), c.get('ownership_state') == 'qualified'
++        gw = c.get('gateway')
+         closed = c.get('status') == 'unknown' and c.get('reported_status') in ('done', 'archived')
+-        if c.get('released') or not gw or not qualified:
++        if c.get('released') or not gw or c.get('ownership_state') != 'qualified':
+             out.append(c)
+-        elif gw not in publishing:
+-            # The owner is gone. Another gateway publishing the same card (board, id and created_at) is its real
+-            # owner: this row was a worker node's copy, and that record speaks for the card (``_retire_moved``,
+-            # which needs the named owner alive to say so). Hub, 2026-11-18: 44 cards listed open "on" removed
+-            # workers; 36 were done or archived and 7 were live hub cards.
+-            others = published.get((c.get('board'), c.get('id'), c.get('created_at')), ()) if c.get('created_at') is not None else ()
+-            if any(other != gw for other in others):
++        elif listed is not None and gw not in listed:
++            # The owner is gone. Another gateway publishing the same card is its real owner: this row was a worker
++            # node's copy, and that record speaks for the card (``_retire_moved``, which needs the named owner
++            # alive to say so). Hub, 2026-11-18: 44 cards listed open "on" removed workers; 36 were done or
++            # archived and 7 were live hub cards.
++            if any(other != gw for other in publishers(c) or ()):
+                 continue
+             out.append({**c, 'status': c['reported_status'], 'unfinished': False, 'released': True,
+                         'owner_removed': True} if closed else c)
+-        elif (closed and (gw, c.get('owner_profile'), c.get('board')) in live
+-                and (gw, c.get('board'), c.get('id')) not in records):
+-            # The owner is alive and has just read this exact scope cleanly, and it no longer publishes the card.
+-            # A collector publishes every card of a scope except those archived past its recent window, so a
+-            # card last reported done or archived that has left the scope is archived or deleted: closed.
++        elif closed and (gw, c.get('owner_profile'), c.get('board')) in live and publishers(c) == frozenset():
++            # The owner is alive and has just read this exact scope cleanly, and nobody publishes the card any
++            # more (a record of it that merely dropped this chat's link would still be published). A collector
++            # publishes every card of a scope except those archived past its recent window, so a card last
++            # reported done or archived that has left the scope is archived or deleted: closed.
+             out.append({**c, 'status': c['reported_status'], 'unfinished': False, 'released': True, 'aged_out': True})
+         else:
+             out.append(c)
+diff --git a/tests/hermes_cli/test_kanban_release_removed_owner_rows.py b/tests/hermes_cli/test_kanban_release_removed_owner_rows.py
+index edf2c2a44b5eafdfecb83e23eb443ce1345853f2..22906375bfa5f89ad525b007e2504bb4020c5276 100644
+--- a/tests/hermes_cli/test_kanban_release_removed_owner_rows.py
++++ b/tests/hermes_cli/test_kanban_release_removed_owner_rows.py
+@@ -13,13 +13,14 @@ import pytest
+ 
+ from hermes_cli import kanban_db
+ from hermes_cli import kanban_session_activity as activity
+-from hermes_cli.kanban_session_activity_records import OwnerSink, _release_removed_owners
++from hermes_cli.kanban_session_activity_records import _release_removed_owners
+ from tests.hermes_cli import test_kanban_replica_read_memo as memo_helpers
+ from tests.hermes_cli.test_kanban_replica_read_memo import card
+ from tests.hermes_cli.test_kanban_replica_read_memo_heartbeat import ok, set_info, tick
+ 
+ hub = memo_helpers.hub
+-FRESH = {'published': {}, 'live_scopes': frozenset({('alive', 'work', 'build')})}
++FRESH = {'published': {}, 'live_scopes': frozenset({('alive', 'work', 'build')}),
++         'known_gateways': frozenset({'alive', 'other'}), 'publishing': frozenset({'publishes'})}
+ 
+ 
+ def row(tid, gateway, reported, **extra):
+@@ -32,7 +33,7 @@ def test_only_finished_rows_of_a_wholly_absent_owner_are_released():
+     rows = [row('t_done', 'gone', 'done'), row('t_arch', 'gone', 'archived'), row('t_open', 'gone', 'running'),
+             row('t_none', 'gone', None), row('t_unq', 'gone', 'done', ownership_state='unknown'),
+             row('t_pub', 'publishes', 'done'), row('t_beat', 'alive', 'done')]
+-    out = _release_removed_owners(rows, {('publishes', 'build', 't_other')}, FRESH)
++    out = _release_removed_owners(rows, FRESH)
+     got = {r['id']: (r['status'], r['released'], r['unfinished'], r.get('owner_removed', False)) for r in out}
+     assert got == {'t_done': ('done', True, False, True), 't_arch': ('archived', True, False, True),
+                    't_open': ('unknown', False, True, False), 't_none': ('unknown', False, True, False),
+@@ -42,27 +43,15 @@ def test_only_finished_rows_of_a_wholly_absent_owner_are_released():
+     assert rows[0]['status'] == 'unknown', 'the remembered rows are not edited in place'
+ 
+ 
+-def test_a_stale_or_empty_replica_releases_nothing():
++def test_a_stale_replica_releases_nothing():
+     rows = [row('t_done', 'gone', 'done')]
+-    assert _release_removed_owners(rows, (), FRESH) == rows, 'no owner set and no heartbeat: the read proves nothing'
+-    assert _release_removed_owners(rows, {('publishes', 'build', 't_x')}, {}) == rows, 'stale: no moved evidence'
+-    assert _release_removed_owners(rows, (), {}) == rows
+-
+-
+-def test_owner_sink_takes_a_generator_once_and_borrows_a_set():
+-    sink = OwnerSink()
+-    assert tuple(sink.value) == ()
+-    owners = frozenset({('a', 'b', 't')})
+-    sink.update(owners)
+-    assert sink.value is owners
+-    sink.update(o for o in [('a', 'b', 't')])
+-    assert sink.value == {('a', 'b', 't')} and list(sink.value) == list(sink.value)
++    assert _release_removed_owners(rows, {}) == rows, 'stale: no moved evidence'
+ 
+ 
+ def put(path, gateway, tid, seq, **extra):
+     with sqlite3.connect(path) as db:
+         db.execute("INSERT INTO replica VALUES (?,'tasks',?,1,?,?,1000000)",
+-                   (gateway, f'work/build/{tid}', seq, json.dumps(card(tid, gateway=gateway, **extra))))
++                   (gateway, f'work/build/{tid}', seq, json.dumps(card(tid, gateway=gateway, **{'created_at': 100 + seq, **extra}))))
+ 
+ 
+ @pytest.fixture
+@@ -194,13 +183,26 @@ def test_a_stale_read_keeps_an_earlier_release(world):
+     assert by_id(activity._legacy_remote_links())['t_done'] == ('done', True, True)
+ 
+ 
+-def test_released_rows_are_restored_by_the_pure_rule_when_the_owner_publishes():
+-    released = _release_removed_owners([row('t_done', 'gone', 'done')], {('other', 'build', 't_x')}, FRESH)
++def test_released_rows_are_restored_by_the_pure_rule_when_the_owner_is_listed_again():
++    released = _release_removed_owners([row('t_done', 'gone', 'done')], FRESH)
+     assert released[0]['owner_removed'] is True
+-    assert _release_removed_owners(released, {('other', 'build', 't_x')}, FRESH) == released, 'stable while it is gone'
+-    back = _release_removed_owners(released, {('gone', 'build', 't_new')}, FRESH)
++    assert _release_removed_owners(released, FRESH) == released, 'stable while it is gone'
++    back = _release_removed_owners(released, {**FRESH, 'known_gateways': FRESH['known_gateways'] | {'gone'}})
+     assert back == [row('t_done', 'gone', 'done')]
+-    assert _release_removed_owners(released, (), {}) == released and _release_removed_owners(released, (), FRESH) == released
++    assert _release_removed_owners(released, {}) == released, 'a stale read neither makes nor takes back'
++
++
++def test_without_the_list_of_known_gateways_nothing_counts_as_removed():
++    rows = [row('t_done', 'gone', 'done')]
++    evidence = {k: v for k, v in FRESH.items() if k != 'known_gateways'}
++    assert _release_removed_owners(rows, evidence) == rows
++    listed = {**FRESH, 'known_gateways': FRESH['known_gateways'] | {'gone'}}
++    assert _release_removed_owners(rows, listed) == rows, 'offline, not removed'
++
++
++def test_a_malformed_created_at_proves_nothing_and_does_not_raise():
++    rows = [row('t_bad', 'gone', 'ready', created_at=[1]), row('t_live', 'alive', 'done', created_at=[1], owner_profile='work')]
++    assert _release_removed_owners(rows, FRESH) == rows
+ 
+ 
+ def test_a_live_owners_closed_card_that_left_its_scope_is_released_as_aged_out(world):
+-- 
+2.43.0
+

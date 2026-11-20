@@ -1,0 +1,139 @@
+From 43227271a7056300a17bbbd1098136de44ca10ed Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 04:18:25 +0000
+Subject: [PATCH] [daveey] Treat output process substitutions as shell sinks
+
+Cause: heredoc/output masking recognized pipes but not stdout redirected into a process substitution running a shell. Reuse the conservative pipe shell vocabulary and wrapper handling, bounded by the substitution close. This retains cat/tee data controls and descriptor feeds.
+
+Proof: 141 generated cases pass, including 60 real-Bash marker/data controls. Removing the alternative gives 56 failures on main 70607520f6; echo-paren additionally requires an independent direct-sink invariant because base accidentally matched its quoted ($(. Full cron/heredoc/subprocess suite: 295 files, 14111 passed, 9 skipped. Additional importer suites: 549 passed. scripts/check: 21 checks green. Read-only historical hub terminal classifier replay: 158 literal process-substitution candidates, zero classification changes (helper only, not filesystem replay). Bash rejects >>(sh) as syntax; executable controls cover > >(sh), 1> >(sh), and descriptor routing.
+---
+ ...est_lifecycle_guard_output_process_sink.py | 101 ++++++++++++++++++
+ tools/shell_heredoc.py                        |   4 +
+ 2 files changed, 105 insertions(+)
+ create mode 100644 tests/cron/test_lifecycle_guard_output_process_sink.py
+
+diff --git a/tests/cron/test_lifecycle_guard_output_process_sink.py b/tests/cron/test_lifecycle_guard_output_process_sink.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..cedf5b4775fa7a9460c58bd4a16337f8b9f6336c
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_output_process_sink.py
+@@ -0,0 +1,101 @@
++"""Output process substitutions execute producer text, just like shell pipes."""
++
++import shutil
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from tools.shell_heredoc import output_reaches_shell
++
++
++_PRODUCERS = {
++    "heredoc": "python3 <<'EOF' {redirect}\nprint('bash {script}')\nEOF\n",
++    "printf": "printf '%s\\n' \"$(python3 <<'EOF'\nprint('bash {script}')\nEOF\n)\" {redirect}\n",
++    "echo": "echo \"$(python3 <<'EOF'\nprint('bash {script}')\nEOF\n)\" {redirect}\n",
++    "echo-paren": "echo \"($(python3 <<'EOF'\nprint('bash {script}')\nEOF\n))\" {redirect}\n",
++}
++_REDIRECTS = {
++    "spaced": ("", "> >({consumer})", "wait\n"),
++    "explicit-stdout": ("", "1> >({consumer})", "wait\n"),
++    "descriptor": ("exec 3> >({consumer})\n", ">&3", "exec 3>&-\nwait\n"),
++}
++
++
++def _command(producer, redirect, consumer, script):
++    prefix, target, suffix = _REDIRECTS[redirect]
++    return (prefix.format(consumer=consumer)
++            + _PRODUCERS[producer].format(
++                redirect=target.format(consumer=consumer), script=script)
++            + suffix)
++
++
++@pytest.mark.parametrize("producer", _PRODUCERS)
++@pytest.mark.parametrize("redirect", _REDIRECTS)
++@pytest.mark.parametrize("consumer", ["bash", "sh", "env bash"])
++def test_output_process_shell_refuses_oversized_script(tmp_path, producer, redirect, consumer):
++    script = tmp_path / "large.sh"
++    script.write_text("# padding\n" * 150_000, encoding="utf-8")
++    command = _command(producer, redirect, consumer, script)
++    wrapper = tmp_path / "wrapper.sh"
++    wrapper.write_text(command, encoding="utf-8")
++    assert output_reaches_shell(command)
++    # Independently require the direct sink: echo-paren used to match only by
++    # accident through the command-position `($(` anchor inside its quoted word.
++    assert output_reaches_shell(command.replace("$(python3", "(python3"))
++    unsafe, refusal = scan_gateway_lifecycle(f"bash -l {wrapper}", cwd=str(tmp_path))
++    assert unsafe and refusal and "scan cap" in refusal, (command, refusal)
++
++
++@pytest.mark.parametrize("producer", _PRODUCERS)
++@pytest.mark.parametrize("redirect", _REDIRECTS)
++@pytest.mark.parametrize("consumer", ["bash", "sh", "env bash", "cat", "tee copied"])
++def test_generated_real_bash_marker(tmp_path, producer, redirect, consumer):
++    bash = shutil.which("bash")
++    if bash is None:
++        pytest.skip("requires bash")
++    marker = tmp_path / "marker"
++    script = tmp_path / "payload.sh"
++    script.write_text(f"printf RAN > '{marker}'\n", encoding="utf-8")
++    command = _command(producer, redirect, consumer, script)
++    result = subprocess.run(
++        [bash, "--noprofile", "--norc", "-c", command], cwd=tmp_path,
++        capture_output=True, text=True, encoding="utf-8", timeout=10, check=False,
++    )
++    assert result.returncode == 0, result.stderr
++    if consumer in {"cat", "tee copied"}:
++        assert not marker.exists()
++        assert "bash " in result.stdout
++    else:
++        assert marker.read_text(encoding="utf-8") == "RAN"
++
++
++@pytest.mark.parametrize("consumer", ["cat", "tee copied"])
++@pytest.mark.parametrize("producer", ["heredoc", "printf", "echo"])
++@pytest.mark.parametrize("redirect", _REDIRECTS)
++def test_output_process_data_stays_data(tmp_path, consumer, producer, redirect):
++    script = tmp_path / "large.sh"
++    script.write_text("# padding\n" * 150_000, encoding="utf-8")
++    command = _command(producer, redirect, consumer, script)
++    assert not output_reaches_shell(command)
++    wrapper = tmp_path / "wrapper.sh"
++    wrapper.write_text(command, encoding="utf-8")
++    assert scan_gateway_lifecycle(f"bash -l {wrapper}", cwd=str(tmp_path)) == (False, None)
++
++
++@pytest.mark.parametrize("consumer", [
++    "bash", "dash", "zsh", "ksh", "mksh", "tcsh", "csh", "fish", "ash", "sh",
++    "busybox sh", "ssh host", "su", "sudo -s", "sudo -is", "eval",
++    "env bash", "env A=1 /bin/sh", "sudo bash", "command bash", "timeout 5 bash",
++])
++def test_process_shell_sink_vocabulary(consumer):
++    assert output_reaches_shell(f"producer > >({consumer})")
++
++
++@pytest.mark.parametrize("text", [
++    "producer > >(cat)", "producer > >(tee file)",
++    "producer > >(bashrc)", "producer > >(bash.sh)",
++    "producer > >(cat); bash clean.sh", "producer > >(cat) bash",
++])
++def test_process_sink_boundary_controls(text):
++    assert not output_reaches_shell(text)
+diff --git a/tools/shell_heredoc.py b/tools/shell_heredoc.py
+index 564aa45d36cbb899dc3ecde1b81abea373336216..4e711402e2d8de4f7bae525beae8002c66701e9e 100644
+--- a/tools/shell_heredoc.py
++++ b/tools/shell_heredoc.py
+@@ -491,6 +491,10 @@ _WORD_START, _WORD_END = r"(?<![\w.-])", r"(?![\w.-])"
+ # `eval`, `. <(…)`/`source /dev/stdin`, `bash <(…)`/`<<<`, `sh -c "$(…)"`, `$(…)` as a command.
+ _SHELL_SINK_TEMPLATE = (
+     rf"(?<!\|)\|&?(?!\|)[^|;&\n]*?{_WORD_START}(?:{_SINK_SHELLS}|eval){_WORD_END}"
++    # An output process substitution reads producer stdout as code, including descriptor
++    # feeds (`exec 3> >(bash); producer >&3`). Like pipes, retain wrapper operands;
++    # stop at its closing parenthesis so a later ordinary shell command is not a sink.
++    rf"|>\([^()|;&\n]*?{_WORD_START}(?:{_SINK_SHELLS}|eval){_WORD_END}"
+     rf"|{_WORD_START}eval{_WORD_END}"
+     r"|(?:^|[\s;&|({])(?:source|\.)\s+(?:<\s*\(|/dev/(?:stdin|fd/)|/proc/self/fd/)"
+     rf"|{_WORD_START}{_SINK_SHELLS}{_WORD_END}[^|;&\n]*?(?:<\(|<<<)"
+-- 
+2.43.0
+

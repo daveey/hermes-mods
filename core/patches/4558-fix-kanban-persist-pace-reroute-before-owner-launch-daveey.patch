@@ -1,0 +1,96 @@
+From 4a4c28a0cae1d9e519a18e37fdaf6efb65ce67dd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 16:48:43 +0000
+Subject: [PATCH] fix(kanban): persist pace reroute before owner launch
+ [daveey]
+
+Resolve review P1: owner_model_pin reloads model_tier rather than the in-memory spawn task. Apply the pace offer before writing that authoritative receipt and refuse launch if it cannot be persisted. Four regressions (default and strong-class owner reload plus receipt failure) fail on the prior head and pass with this fix; all 17 pace tests pass.
+---
+ hermes_cli/kanban_model_tier.py              | 17 ++++++------
+ tests/hermes_cli/test_kanban_pace_reroute.py | 28 ++++++++++++++++++++
+ 2 files changed, 37 insertions(+), 8 deletions(-)
+
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index 7e646d2a2da0f99c94856f994687a6d742435e09..b70d869ae6436726951c6b5dedc82c8ccabde2fd 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -296,14 +296,6 @@ def apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Opt
+     plus the run's resolved ``run_route`` receipt (every spawn, tier off included).
+     Returns the reason. Review resolution/receipt failures refuse admission rather than reusing an author pin."""
+     reason = _apply_model_tier(conn, task, lane=lane, cfg=cfg)
+-    # The claim-time quota governor started this card on a pool with room instead of holding it on a paced one
+-    # (kanban_pace_reroute): move the run there, only when this resolution landed on the route it judged. [daveey]
+-    from hermes_cli.kanban_pace_reroute import REASON as _PACED, take as _take_pace_move
+-    moved = _take_pace_move(getattr(task, "id", ""), (getattr(task, "model_override", None),
+-                                                      getattr(task, "provider_override", None)))
+-    if moved:
+-        task.model_override, task.provider_override = moved[0], moved[1]
+-        reason = f"{reason}+{_PACED}:{moved[2]}"
+     record_run_route(conn, task, lane=lane, reason=reason)
+     return reason
+ 
+@@ -445,6 +437,12 @@ def _apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Op
+                            model, why, getattr(task, "id", "?"))
+             reason = f"{reason}+unroutable:{model}:{why}"
+             model = provider = None
++    # Persist the pace choice before the owner reloads its authoritative model_tier receipt.
++    from hermes_cli.kanban_pace_reroute import REASON as _PACED, take as _take_pace_move
++    moved = _take_pace_move(getattr(task, "id", ""), (model, provider))
++    if moved:
++        model, provider = moved[0], moved[1]
++        reason = f"{reason}+{_PACED}:{moved[2]}"
+     origin = (getattr(task, "model_override", None), getattr(task, "provider_override", None))
+     repinned = bool(model) and reason.startswith("pinned+pin_quota_reroute")
+     if model:
+@@ -471,6 +469,9 @@ def _apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Op
+                     from hermes_cli.kanban_pin_reroute import record
+                     record(conn, task, (_str(origin[0]), _str(origin[1]).lower()), (_str(model), _str(provider)))
+         except Exception as exc:
++            if moved:
++                task.model_override, task.provider_override = origin
++                raise RuntimeError("Cannot persist pace reroute model receipt") from exc
+             if is_review:
+                 from hermes_cli.kanban_review_model import ReviewModelUnavailable
+                 raise ReviewModelUnavailable("Cannot persist review model receipt") from exc
+diff --git a/tests/hermes_cli/test_kanban_pace_reroute.py b/tests/hermes_cli/test_kanban_pace_reroute.py
+index 4c5412b047bc49f1d41230d8d7a07f0a273c051c..4b6f9553b6a14aa74b33859663bb4c5f4b9250e5 100644
+--- a/tests/hermes_cli/test_kanban_pace_reroute.py
++++ b/tests/hermes_cli/test_kanban_pace_reroute.py
+@@ -72,6 +72,34 @@ def _paced_events(conn, tid):
+     return [e for e in kb.list_events(conn, tid) if e.kind == pd.EVENT_KIND]
+ 
+ 
++@pytest.mark.parametrize("title", ["routine work", "security work"])
++def test_pace_route_reaches_fresh_owner(pool, strong_pattern, monkeypatch, title):
++    _pools(monkeypatch, {"anthropic": 99, "openai-codex": 99})
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title=title, assignee="a")
++        seen, _ = _dispatch(conn)
++        assert seen == [(tid, *GROK)]
++        assert tier.owner_model_pin(conn, kb.get_task(conn, tid)) == GROK
++
++
++@pytest.mark.parametrize("title", ["routine work", "security work"])
++def test_pace_receipt_failure_refuses_spawn(pool, strong_pattern, monkeypatch, title):
++    _pools(monkeypatch, {"anthropic": 99, "openai-codex": 99})
++    append = kb._append_event
++
++    def fail_receipt(conn, tid, kind, *args, **kwargs):
++        if kind == "model_tier":
++            raise RuntimeError("receipt unavailable")
++        return append(conn, tid, kind, *args, **kwargs)
++
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title=title, assignee="a")
++        monkeypatch.setattr(kb, "_append_event", fail_receipt)
++        seen, _ = _dispatch(conn)
++        assert seen == []
++        assert _route_receipt(conn, tid) is None
++
++
+ def test_default_card_starts_on_grok_when_codex_and_claude_are_paced(pool, monkeypatch):
+     _pools(monkeypatch, {"anthropic": 99, "openai-codex": 99})
+     with kbc.connect() as conn:
+-- 
+2.43.0
+

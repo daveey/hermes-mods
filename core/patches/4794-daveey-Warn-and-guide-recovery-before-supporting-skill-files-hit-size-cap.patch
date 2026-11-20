@@ -1,0 +1,221 @@
+From 9cf6032f21da336db10d651f4c9654d1e4b3d437 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 07:14:05 +0000
+Subject: [PATCH] [daveey] Warn and guide recovery before supporting skill
+ files hit size cap
+
+Supporting reference writes could grow silently to the 100k cap; refusal then
+recommended splitting SKILL.md rather than the actual reference. The earlier
+SKILL.md pressure fix excluded file_path patches and write_file operations.
+Tests covered rejection but not reference warning or actionable recovery.
+
+Apply label-aware pressure warnings on every growing supporting-file write,
+include section sizes and ordered split/shrink/retry advice in cap errors.
+Retain the cap, atomic rollback, and user-owned content movement. Structured
+files explicitly require syntax/caller preservation instead of prose pointers.
+
+Proof: three new regression cases failed before the fix. Focused size and
+manager suites pass 114 tests; adjacent importer suites pass (390 tests in
+initial run, with an extra out-of-scope binary-input test removed because
+_guarded_write already rejects that input). Five source mutations killed,
+covering recipe selection, both warning call sites, prior-size comparison,
+and path-resolution refusal. scripts/check --base origin/main passes.
+Recovery test preserves source and rolls back preceding batch writes on
+failure, then preserves relocated text through split/shrink/retry.
+---
+ tests/tools/test_skill_size_limits.py | 61 ++++++++++++++++++++++++++-
+ tools/skill_manager_tool.py           | 48 +++++++++++++--------
+ 2 files changed, 90 insertions(+), 19 deletions(-)
+
+diff --git a/tests/tools/test_skill_size_limits.py b/tests/tools/test_skill_size_limits.py
+index 5065a765a73d5e386fd090d9f03a582a933d6833..85e5238ef8f35b72830030d73b8cbe3c3dca3f87 100644
+--- a/tests/tools/test_skill_size_limits.py
++++ b/tests/tools/test_skill_size_limits.py
+@@ -219,7 +219,7 @@ class TestSizePressure:
+     def test_batch_surfaces_size_warning(self, isolate_skills):
+         content = _sectioned_skill("big4", {"A": 60_000})
+         skill_manage(action="create", name="big4", content=content)
+-        r = json.loads(skill_manage(action=None, name=None, operations=[
++        r = json.loads(skill_manage(action="", name="", operations=[
+             {"action": "patch", "name": "big4", "old_string": "## A\n", "new_string": "## A\nx\n"}]))
+         assert r["success"] is True
+         assert "size_warning" in r["results"][0]
+@@ -240,7 +240,7 @@ class TestSizePressure:
+         content = _sectioned_skill("full2", {"Giant": 80_000, "Other": 19_000})
+         skill_manage(action="create", name="full2", content=content)
+         giant = "## Giant\n\n" + "z" * 80_000 + "\n\n"
+-        r = json.loads(skill_manage(action=None, name=None, operations=[
++        r = json.loads(skill_manage(action="", name="", operations=[
+             {"action": "write_file", "name": "full2", "file_path": "references/giant.md",
+              "file_content": giant},
+             {"action": "patch", "name": "full2", "old_string": giant,
+@@ -250,6 +250,63 @@ class TestSizePressure:
+         ]))
+         assert r["success"] is True, r
+ 
++    @pytest.mark.parametrize("action", ["patch", "write_file"])
++    def test_reference_growth_warns_and_shrink_stays_quiet(self, isolate_skills, action):
++        skill_manage(action="create", name="ref-size", content=_make_skill_content(100))
++        path = "references/triage.md"
++        text = "## Large\n" + "x" * 60_000
++        first = json.loads(skill_manage(action="write_file", name="ref-size",
++                                       file_path=path, file_content=text))
++        assert path in first["size_warning"]
++        for suffix in ("more", "more again"):
++            grown = text + suffix
++            args = ({"old_string": text, "new_string": grown} if action == "patch"
++                    else {"file_content": grown})
++            result = json.loads(skill_manage(action=action, name="ref-size", file_path=path, **args))
++            assert result["success"] and path in result["size_warning"]
++            assert "## Large" in result["size_warning"]
++            text = grown
++        args = ({"old_string": text, "new_string": "small"} if action == "patch"
++                else {"file_content": "small"})
++        result = json.loads(skill_manage(action=action, name="ref-size", file_path=path, **args))
++        assert result["success"] and "size_warning" not in result
++
++    def test_reference_cap_recovery_batch_preserves_content(self, isolate_skills):
++        name, path = "ref-recover", "references/triage.md"
++        skill_manage(action="create", name=name, content=_make_skill_content(100))
++        section = "## Large\n" + "x" * 80_000 + "\n"
++        rest = "## Other\n" + "y" * 19_000
++        original = section + rest
++        skill_manage(action="write_file", name=name, file_path=path, file_content=original)
++        growth = {"action": "patch", "name": name, "file_path": path,
++                  "old_string": "## Other\n", "new_string": "## Other\n" + "z" * 2_000}
++        failed = json.loads(skill_manage(action="", name="", operations=[
++            {"action": "write_file", "name": name, "file_path": "references/rolled-back.md",
++             "file_content": "must be rolled back"}, growth]))
++        assert not failed["success"]
++        assert "chars over" in failed["error"] and "## Large" in failed["error"]
++        assert "patch that section in references/triage.md" in failed["error"]
++        assert "smaller SKILL.md" not in failed["error"]
++        source = isolate_skills / name / path
++        assert source.read_text() == original
++        assert not (source.parent / "rolled-back.md").exists()
++        result = json.loads(skill_manage(action="", name="", operations=[
++            {"action": "write_file", "name": name, "file_path": "references/large.md",
++             "file_content": section},
++            {"action": "patch", "name": name, "file_path": path,
++             "old_string": section, "new_string": "See large.md.\n"}, growth]))
++        assert result["success"], result
++        assert (isolate_skills / name / "references/large.md").read_text() == section
++        assert source.read_text() == "See large.md.\n" + rest.replace("## Other\n", growth["new_string"])
++
++
++    def test_reference_equal_size_rewrite_is_quiet(self, isolate_skills):
++        skill_manage(action="create", name="equal-size", content=_make_skill_content(100))
++        for char in ("x", "y"):
++            result = json.loads(skill_manage(action="write_file", name="equal-size",
++                                            file_path="references/a.md", file_content=char * 60_000))
++        assert result["success"] and "size_warning" not in result
++
+     def test_section_sizes_ignore_fenced_headings(self):
+         from tools.skill_manager_tool import _section_sizes
+         text = "## Real\n```\n## fake\n```\nbody\n## Two\nx\n"
+diff --git a/tools/skill_manager_tool.py b/tools/skill_manager_tool.py
+index 143c8979a05bba82aad9da79634d9056f8494a2f..da2a0cfd81eb2268f1104772f9646a6623a3a9fd 100644
+--- a/tools/skill_manager_tool.py
++++ b/tools/skill_manager_tool.py
+@@ -16,7 +16,7 @@ import re
+ import shutil
+ from collections import Counter
+ from pathlib import Path
+-from typing import Any, Dict, List, Optional, Tuple
++from typing import Any, Dict, List, Optional, Tuple, cast
+ 
+ import hermes_yaml as yaml
+ 
+@@ -183,7 +183,7 @@ def _validate_frontmatter(content: str) -> Optional[str]:
+     return None
+ 
+ 
+-# A SKILL.md write that grows the file past this share of the hard cap gets a ``size_warning``
++# A skill-file write that grows the file past this share of the hard cap gets a ``size_warning``
+ # on EVERY growing write. The linter's ``oversized-body`` finding fires only on the write that
+ # first crosses its soft budget, so without this a skill grew silently from ~24k to the 100k cap
+ # and every later patch failed outright (myapp-development, 2026-10).
+@@ -233,29 +233,38 @@ def _description_budget_error(content: str, before: Optional[str] = None) -> Opt
+ 
+ def _validate_content_size(content: str, label: str = "SKILL.md") -> Optional[str]:
+     if len(content) > MAX_SKILL_CONTENT_CHARS:
+-        msg = (
++        over = len(content) - MAX_SKILL_CONTENT_CHARS
++        return (
+             f"{label} content is {len(content):,} characters (limit: {MAX_SKILL_CONTENT_CHARS:,}). "
+-            f"Consider splitting into a smaller SKILL.md with supporting files in references/ "
+-            f"or templates/.")
+-        if label == "SKILL.md":
+-            over = len(content) - MAX_SKILL_CONTENT_CHARS
+-            msg += (f" This write is {over:,} chars over; free well more than that so the next "
+-                    f"write fits too. {_largest_sections_note(content)}{_SKILL_SPLIT_RECIPE}")
+-        return msg
++            f"This write is {over:,} chars over; free well more than that so the next "
++            f"write fits too. {_largest_sections_note(content)}{_split_recipe(label)}")
+     return None
+ 
+ 
+-def _attach_size_warning(result: dict[str, Any], before: str, after: str) -> dict[str, Any]:
+-    """Advisory on a SKILL.md write that GREW the file and leaves it past the warn share of the
++def _split_recipe(label: str) -> str:
++    if label == "SKILL.md":
++        return _SKILL_SPLIT_RECIPE
++    return (
++        "To make room, in ONE skill_manage batch: write_file a NEW supporting file with the text "
++        f"of one large section, then patch that section in {label} down to a pointer to the new "
++        "file, then your change. Ops apply in order, so the shrinking ops must come before the "
++        "growing one. Keep each file below the cap; split large sections further if needed. "
++        "For scripts or structured data, preserve valid syntax and update callers/references "
++        "instead of inserting a prose pointer.")
++
++
++def _attach_size_warning(result: dict[str, Any], before: str, after: str,
++                         label: str = "SKILL.md") -> dict[str, Any]:
++    """Advisory on a skill-file write that GREW the file and leaves it past the warn share of the
+     hard cap: the next writes will start failing, so name the sections to move out now."""
+     if len(after) <= len(before) or len(after) < _SKILL_SIZE_WARN_FRACTION * MAX_SKILL_CONTENT_CHARS:
+         return result
+     pct = len(after) * 100 // MAX_SKILL_CONTENT_CHARS
+     result["size_warning"] = (
+-        f"The write succeeded, but SKILL.md is now {len(after):,} chars, {pct}% of the "
++        f"The write succeeded, but {label} is now {len(after):,} chars, {pct}% of the "
+         f"{MAX_SKILL_CONTENT_CHARS:,}-char hard cap. A write that crosses the cap fails. Stop growing "
+-        f"SKILL.md: add new detail to references/ instead, and move a large section out soon. "
+-        f"{_largest_sections_note(after)}{_SKILL_SPLIT_RECIPE}")
++        f"{label}: add new detail to another supporting file, and move a large section out soon. "
++        f"{_largest_sections_note(after)}{_split_recipe(label)}")
+     return result
+ def _description_of(content: Optional[str]) -> Optional[str]:
+     """Normalized frontmatter description of a SKILL.md text; None when absent or unparseable."""
+@@ -682,7 +691,7 @@ def _patch_skill(name: str, old_string: str, new_string: str, file_path: str | N
+     # (oversized-body, incident-log-shape) — a clean patch attaches nothing and stays quiet.
+     if not file_path:
+         _attach_lint_findings(result, target, before=content)
+-        _attach_size_warning(result, content, new_content)
++    _attach_size_warning(result, content, new_content, target_label)
+     return result
+ 
+ 
+@@ -743,13 +752,18 @@ def _write_file(name: str, file_path: str, file_content: str) -> dict[str, Any]:
+     if guard:
+         return guard
+     target, err = _resolve_supporting_file(skill_dir, file_path)
+-    if guard := err or _guarded_write(name, skill_dir, target, "write_file", file_path, file_content):
++    if err:
++        return err
++    target = cast(Path, target)  # successful resolution always returns a Path
++    before = target.read_text(encoding="utf-8-sig") if target.is_file() else ""
++    if guard := _guarded_write(name, skill_dir, target, "write_file", file_path, file_content):
+         return guard
+     result = {"success": True, "message": f"File '{file_path}' written to skill '{name}'.", "path": str(target)}
+     # references/ is where per-session hoarding shows up; surface the sprawl finding on the write
+     # that crosses the line so the review fork sees it in the same turn.
+     if file_path.startswith("references/") and (skill_dir / "SKILL.md").exists():
+         _attach_lint_findings(result, skill_dir / "SKILL.md")
++    _attach_size_warning(result, before, file_content, file_path)
+     return result
+ 
+ 
+-- 
+2.43.0
+

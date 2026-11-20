@@ -1,0 +1,188 @@
+From f1fb52d592fd29260fa82d8a1b4cc885d0846b97 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 03:25:15 +0000
+Subject: [PATCH] fix(kanban): recover an abandoned updater pause only for its
+ own attempt [daveey]
+
+Review of 3c94b431 (t_67e13d17bcd768f9) found that recover_and_drain checked
+the saved intent against a task snapshot, then called kb.reclaim_task with only
+the task id. That call reselects whatever attempt is current. If observer A
+stalls after its matching read while observer B finishes the same pause and the
+dispatcher starts a replacement, A fences, signals and closes the replacement.
+
+Recovery now adopts the exact intent atomically: under one write transaction it
+requires the same token, the same abandoned owner and a task row still matching
+the intent's run/claim/PID/start identity in `running`, and moves ownership to
+itself. Otherwise it is a no-op and never creates a fresh command for the
+current run. It then finishes the pause through _reclaim with the intent's own
+identity: termination targets the intent's PID + fingerprint and the close is a
+CAS on that identity, both outside the adoption transaction. The fence's
+unwind/cleanup is shared as _settle, so an adopted pause that unwinds stays
+durable for the next observer.
+
+RED at 3c94b431 with only the new test:
+test_stale_recovery_never_touches_a_replacement_attempt[finished|replaced]
+2 failed, "replacement worker was signalled by stale recovery; run 2 ready".
+GREEN: 7 passed in the recovery file; 89 reclaim/crash-sweep files,
+1758 passed, 0 failed, 16 skipped.
+---
+ hermes_cli/kanban_update_reclaim_intent.py    | 77 +++++++++++++++----
+ .../test_kanban_update_reclaim_recovery.py    | 42 ++++++++++
+ 2 files changed, 105 insertions(+), 14 deletions(-)
+
+diff --git a/hermes_cli/kanban_update_reclaim_intent.py b/hermes_cli/kanban_update_reclaim_intent.py
+index 24b499e41f92a19334941ad822628f6bb8c09eae..7bbcce7c4506c8f09a584a046403b13ee2c6e14a 100644
+--- a/hermes_cli/kanban_update_reclaim_intent.py
++++ b/hermes_cli/kanban_update_reclaim_intent.py
+@@ -52,7 +52,6 @@ def task_pending(conn, task_id) -> bool:
+ 
+ def recover_and_drain(conn):
+     """Before the observer's transaction, resume abandoned pauses then drain neutral results."""
+-    from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_neutral_release import drain
+ 
+     if _exists(conn):
+@@ -61,15 +60,72 @@ def recover_and_drain(conn):
+                 continue
+             row = conn.execute("SELECT * FROM tasks WHERE id=?", (intent["task_id"],)).fetchone()
+             if _matching(intent, row) and row["status"] == "running":
+-                kb.reclaim_task(conn, intent["task_id"], reason=CORE_UPDATE_REQUEUE_REASON,
+-                                **{key: intent[key] for key in ATTRIBUTION})
++                _resume(conn, intent)
+             else:
+-                with kb.write_txn(conn):
+-                    conn.execute(f"DELETE FROM {TABLE} WHERE task_id=? AND token=?",
+-                                 (intent["task_id"], intent["token"]))
++                _settle(conn, intent["task_id"], intent, intent["token"])
+     return drain(conn)
+ 
+ 
++def _adopt(conn, intent) -> bool:
++    """Atomically take over this exact abandoned command, or do nothing.
++
++    The snapshot read in recover_and_drain is only a filter: another observer may
++    finish the same pause and the dispatcher start a replacement before we act.
++    Ownership moves only while the same token, the same abandoned owner and the
++    same attempt still hold; otherwise recovery is a no-op.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_dispatch as dispatch
++
++    owner_pid = os.getpid()
++    owner_started_at = dispatch._process_fingerprint(owner_pid)
++    if owner_started_at is None:
++        return False
++    with kb.write_txn(conn):
++        current = conn.execute(f"SELECT * FROM {TABLE} WHERE task_id=? AND token=?",
++                               (intent["task_id"], intent["token"])).fetchone()
++        row = conn.execute("SELECT * FROM tasks WHERE id=?", (intent["task_id"],)).fetchone()
++        if (current is None or (current["owner_pid"], current["owner_started_at"])
++                != (intent["owner_pid"], intent["owner_started_at"])
++                or not _matching(current, row) or row["status"] != "running"):
++            return False
++        conn.execute(f"UPDATE {TABLE} SET owner_pid=?, owner_started_at=? WHERE task_id=? AND token=?",
++                     (owner_pid, owner_started_at, intent["task_id"], intent["token"]))
++    return True
++
++
++def _resume(conn, intent) -> bool:
++    """Finish an adopted pause against its own attempt, never the task's current one."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_manual_reclaim import _reclaim
++
++    task_id = intent["task_id"]
++    if kb._sync.refuse_foreign_reclaim(conn, task_id) or not _adopt(conn, intent):
++        return False
++    attribution = kb._cu_requeue.reclaim_attribution(
++        CORE_UPDATE_REQUEUE_REASON, *(intent[key] for key in ATTRIBUTION))
++    try:
++        # Termination targets the intent's PID + fingerprint, and the close is a CAS
++        # on its run/claim/PID identity, so a replacement attempt is never touched.
++        return _reclaim(conn, task_id, intent, CORE_UPDATE_REQUEUE_REASON, None, attribution)
++    finally:
++        _settle(conn, task_id, intent, intent["token"])
++
++
++def _settle(conn, task_id, selected, token):
++    """Drop a finished or stale command; keep an unfinished one for the next observer."""
++    from hermes_cli import kanban_db as kb
++
++    with kb.write_txn(conn):
++        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
++        if not _matching(selected, row) or row["status"] != "running":
++            conn.execute(f"DELETE FROM {TABLE} WHERE task_id=? AND token=?", (task_id, token))
++        else:
++            # This call unwound without closing its run. Relinquish execution,
++            # not the durable pause decision, so the next observer resumes it.
++            conn.execute(f"UPDATE {TABLE} SET owner_pid=0 WHERE task_id=? AND token=?", (task_id, token))
++
++
+ @contextmanager
+ def fence(conn, task_id, selected, reason, attribution=None):
+     """Publish before signalling; stale selection or concurrent reclaim sends no signal."""
+@@ -104,11 +160,4 @@ def fence(conn, task_id, selected, reason, attribution=None):
+     try:
+         yield True
+     finally:
+-        with kb.write_txn(conn):
+-            row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+-            if not _matching(selected, row) or row["status"] != "running":
+-                conn.execute(f"DELETE FROM {TABLE} WHERE task_id=? AND token=?", (task_id, token))
+-            else:
+-                # This call unwound without closing its run. Relinquish execution,
+-                # not the durable pause decision, so the next observer resumes it.
+-                conn.execute(f"UPDATE {TABLE} SET owner_pid=0 WHERE task_id=? AND token=?", (task_id, token))
++        _settle(conn, task_id, selected, token)
+diff --git a/tests/hermes_cli/test_kanban_update_reclaim_recovery.py b/tests/hermes_cli/test_kanban_update_reclaim_recovery.py
+index d7a5bffdbf08fd5c79859efb959546516154b363..2e9ccd22fb1d65aa778a4da02c0546469e6f378c 100644
+--- a/tests/hermes_cli/test_kanban_update_reclaim_recovery.py
++++ b/tests/hermes_cli/test_kanban_update_reclaim_recovery.py
+@@ -89,3 +89,45 @@ def test_resumed_pause_keeps_explicit_operator_attribution(board, monkeypatch):
+     assert reclaimed[0].get("interrupt_target") == target
+     assert kb.get_task(board, tid).status == "ready"
+     assert not intent.task_pending(board, tid)
++
++
++@pytest.mark.parametrize("then", ["finished", "replaced"])
++def test_stale_recovery_never_touches_a_replacement_attempt(board, monkeypatch, then):
++    """Observer A matches an abandoned pause, then stalls; observer B finishes it and
++    the dispatcher starts a new attempt (optionally fenced by a new pause). A must
++    become a no-op: no signal, no reclaimed receipt and no close for the new run."""
++    tid, alive = race.running(board, monkeypatch)
++    row = board.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
++    with intent.fence(board, tid, row, CORE_UPDATE_REQUEUE_REASON):
++        pass  # the updater died after publishing: an abandoned, exact-run pause
++    assert intent.task_pending(board, tid)
++    original = intent._matching
++    replacement = {}
++
++    def stall_after_match(saved, current):
++        matched = original(saved, current)
++        if replacement or saved is None or saved["current_run_id"] != row["current_run_id"]:
++            return matched
++        replacement["run"] = None  # fire once: everything below happens while A stalls
++        intent.recover_and_drain(board)  # observer B completes the same pause
++        assert kb.get_task(board, tid).status == "ready"
++        assert kb.claim_task(board, tid)
++        alive[race.PID + 1] = True
++        dispatch._set_worker_pid(board, tid, race.PID + 1)
++        replacement["run"] = kb.get_task(board, tid).current_run_id
++        if then == "replaced":
++            fresh = board.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
++            with intent.fence(board, tid, fresh, CORE_UPDATE_REQUEUE_REASON):
++                pass
++        return matched
++
++    monkeypatch.setattr(intent, "_matching", stall_after_match)
++    intent.recover_and_drain(board)  # observer A resumes after its matching read
++    task = kb.get_task(board, tid)
++    new_run = replacement["run"]
++    assert new_run is not None and new_run != row["current_run_id"]
++    assert alive[race.PID + 1], f"replacement worker was signalled by stale recovery; run {new_run} {task.status}"
++    assert task.status == "running" and task.current_run_id == new_run
++    assert not [e for e in kb.list_events(board, tid) if e.kind == "reclaimed" and e.run_id == new_run]
++    # A replacement's own pause stays durable for a later, legitimate recovery.
++    assert intent.task_pending(board, tid) is (then == "replaced")
+-- 
+2.43.0
+

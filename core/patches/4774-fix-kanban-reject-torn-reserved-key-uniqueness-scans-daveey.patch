@@ -1,0 +1,171 @@
+From 1d52fb1c6ab7d8c12e99b906d5a2d064deef8ff7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 06:16:47 +0000
+Subject: [PATCH] fix(kanban): reject torn reserved-key uniqueness scans
+ [daveey]
+
+Pin snapshot head across all pages and require tasks table identity. Preserve preview/apply refusal with no writes and the original malformed-envelope/cursor coverage. Proof: old source 5 failing regressions with 2 positive controls; updated 8-file recovery/sync suites 882 passed; scripts/check --base origin/main passed; four guard mutations killed by eligibility assertions. Addresses independent review 5951573377.
+---
+ hermes_cli/kanban_sync_reserved_key.py        |  7 +++
+ .../test_kanban_sync_reserved_key_extra2.py   | 10 ++--
+ .../test_kanban_sync_reserved_key_safety.py   | 14 ++---
+ .../test_kanban_sync_reserved_key_snapshot.py | 54 +++++++++++++++++++
+ 4 files changed, 73 insertions(+), 12 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_reserved_key_snapshot.py
+
+diff --git a/hermes_cli/kanban_sync_reserved_key.py b/hermes_cli/kanban_sync_reserved_key.py
+index 5bfa6a22c47b7c59116421b30b6cb36a74b14af7..507e645f9a8f18058f0caa7abf06beb60aa7e62f 100644
+--- a/hermes_cli/kanban_sync_reserved_key.py
++++ b/hermes_cli/kanban_sync_reserved_key.py
+@@ -287,6 +287,7 @@ def _remote_key_refusal(hub: Any, board: str, new_key: str) -> Optional[str]:
+     from hermes_cli.kanban_sync_client import HubError, SyncUnavailable
+     incomplete = "authoritative_snapshot_incomplete"
+     after = ""
++    snapshot_head = None
+     for _ in range(MAX_SNAPSHOT_PAGES):
+         try:
+             page = hub.snapshot_page(board, "tasks", after)
+@@ -295,6 +296,12 @@ def _remote_key_refusal(hub: Any, board: str, new_key: str) -> Optional[str]:
+         if (not isinstance(page, dict) or not isinstance(page.get("rows"), list) or not isinstance(page.get("head"), int)
+                 or not isinstance(page.get("more"), bool) or not all(isinstance(r, dict) for r in page["rows"])):
+             return incomplete + ": malformed page"
++        if page.get("table") != "tasks":
++            return incomplete + ": table identity mismatch"
++        if snapshot_head is None:
++            snapshot_head = page["head"]
++        if page["head"] != snapshot_head:
++            return incomplete + ": snapshot head changed"
+         if any(r.get("idempotency_key") == new_key for r in page["rows"]):
+             return "replacement_key_in_remote_use"
+         if not page["more"]:
+diff --git a/tests/hermes_cli/test_kanban_sync_reserved_key_extra2.py b/tests/hermes_cli/test_kanban_sync_reserved_key_extra2.py
+index 16dba7b8eefefcb93e87c036703b885793e2de64..f80ed3520f6b6baad2b0bd32c88b3f5ca96b917a 100644
+--- a/tests/hermes_cli/test_kanban_sync_reserved_key_extra2.py
++++ b/tests/hermes_cli/test_kanban_sync_reserved_key_extra2.py
+@@ -113,10 +113,10 @@ class _Cursor:
+ 
+ 
+ @pytest.mark.parametrize("page_factory", [
+-    lambda: types.MappingProxyType({"head": 1, "rows": [], "more": False}),
+-    lambda: {"head": 1, "rows": {}, "more": False},
+-    lambda: {"head": 1, "rows": [types.MappingProxyType({"uid": "a"})], "more": False},
+-    lambda: {"head": 1, "rows": [], "more": 0},
++    lambda: types.MappingProxyType({"head": 1, "table": "tasks", "rows": [], "more": False}),
++    lambda: {"head": 1, "table": "tasks", "rows": {}, "more": False},
++    lambda: {"head": 1, "table": "tasks", "rows": [types.MappingProxyType({"uid": "a"})], "more": False},
++    lambda: {"head": 1, "table": "tasks", "rows": [], "more": 0},
+ ], ids=["page_not_dict", "rows_not_list", "row_not_dict", "more_not_bool"])
+ def test_snapshot_envelope_each_clause_refuses(live, svc, monkeypatch, page_factory):
+     """snap_page_dict / snap_rows_list / snap_row_dict / snap_more_bool: shapes that only one clause rejects."""
+@@ -132,7 +132,7 @@ def test_snapshot_next_cursor_must_be_a_string(live, svc, monkeypatch):
+     """snap_next_str: a non-string cursor refuses; it must not be accepted and followed to a clean second page."""
+     tid, _ = base.bad_card(live, svc, monkeypatch)
+     hub = svc.hub(base.ME)
+-    pages = [{"head": 1, "rows": [], "more": True, "next": _Cursor()}, {"head": 1, "rows": [], "more": False}]
++    pages = [{"head": 1, "table": "tasks", "rows": [], "more": True, "next": _Cursor()}, {"head": 1, "table": "tasks", "rows": [], "more": False}]
+     monkeypatch.setattr(hub, "snapshot_page", lambda *a, **k: pages.pop(0))
+     report = rk.plan(live, hub, base.BOARD, tid, base.GOOD, base.REASON)
+     assert not report["eligible"], report
+diff --git a/tests/hermes_cli/test_kanban_sync_reserved_key_safety.py b/tests/hermes_cli/test_kanban_sync_reserved_key_safety.py
+index eede587da442978191308766b8a0f790a321ccc9..3ec62006b822b2bd8b70b76f9c486312b471f410 100644
+--- a/tests/hermes_cli/test_kanban_sync_reserved_key_safety.py
++++ b/tests/hermes_cli/test_kanban_sync_reserved_key_safety.py
+@@ -475,12 +475,12 @@ def test_remote_snapshot_is_authenticated_exhaustive_and_paged(live, svc, monkey
+ 
+ 
+ @pytest.mark.parametrize("page", [
+-    {"head": 1, "rows": [], "next": "", "more": True},          # claims more but cannot advance
+-    {"head": 1, "rows": []},                                      # no completeness flag
+-    {"head": 1, "rows": "nope", "more": False},                   # malformed
++    {"head": 1, "table": "tasks", "rows": [], "next": "", "more": True},          # claims more but cannot advance
++    {"head": 1, "table": "tasks", "rows": []},                                      # no completeness flag
++    {"head": 1, "table": "tasks", "rows": "nope", "more": False},                   # malformed
+     {"rows": [], "more": False},                                  # no head
+-    {"head": 1, "rows": [{"uid": "a"}], "more": True, "next": "a"},  # never ends (cap)
+-    {"head": 1, "rows": [], "more": "no", "next": ""},            # non-boolean flag
++    {"head": 1, "table": "tasks", "rows": [{"uid": "a"}], "more": True, "next": "a"},  # never ends (cap)
++    {"head": 1, "table": "tasks", "rows": [], "more": "no", "next": ""},            # non-boolean flag
+ ])
+ def test_incomplete_or_malformed_snapshot_refuses(live, svc, monkeypatch, page):
+     tid, _ = bad_card(live, svc, monkeypatch)
+@@ -518,7 +518,7 @@ def test_hub_without_snapshot_route_refuses(live, svc, monkeypatch):
+ def test_snapshot_cursor_must_advance(live, svc, monkeypatch):
+     tid, _ = bad_card(live, svc, monkeypatch)
+     hub = svc.hub(ME)
+-    monkeypatch.setattr(hub, "snapshot_page", lambda *a, **k: {"head": 1, "rows": [], "next": "", "more": True})
++    monkeypatch.setattr(hub, "snapshot_page", lambda *a, **k: {"head": 1, "table": "tasks", "rows": [], "next": "", "more": True})
+     assert "cursor" in plan_with(live, hub, tid)["refusal"]
+ 
+ 
+@@ -527,7 +527,7 @@ def test_snapshot_page_cap_is_incomplete_even_when_cursor_advances(live, svc, mo
+     monkeypatch.setattr(rk, "MAX_SNAPSHOT_PAGES", 3)
+     hub = svc.hub(ME)
+     monkeypatch.setattr(hub, "snapshot_page", lambda b, t, after="", *a: {
+-        "head": 1, "rows": [{"uid": after + "a"}], "next": after + "a", "more": True})
++        "head": 1, "table": "tasks", "rows": [{"uid": after + "a"}], "next": after + "a", "more": True})
+     assert "page cap" in plan_with(live, hub, tid)["refusal"]
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_sync_reserved_key_snapshot.py b/tests/hermes_cli/test_kanban_sync_reserved_key_snapshot.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f8e9a343ee15798ce75613c1e08183a5a00d940d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_reserved_key_snapshot.py
+@@ -0,0 +1,54 @@
++"""Refuse torn/mislabelled remote uniqueness scans before reserved-key recovery writes."""
++import pytest
++
++from hermes_cli import kanban_sync_reserved_key as rk
++from tests.hermes_cli import test_kanban_sync_reserved_key_safety as helpers
++
++kanban_home = helpers.kanban_home
++svc = helpers.svc
++live = helpers.live
++
++
++@pytest.mark.parametrize("fault", ["head_changed", "head_zero_changed", "foreign_table", "missing_table", "later_table"])
++def test_snapshot_identity_refuses_preview_and_apply(live, svc, monkeypatch, fault):
++    tid, _ = helpers.bad_card(live, svc, monkeypatch)
++    hub = svc.hub(helpers.ME)
++    token = helpers.plan_with(live, hub, tid)["token"]
++    before = helpers.dump(live)
++
++    def snapshot(board, table, after=""):
++        page = {"head": 0 if fault == "head_zero_changed" else 1, "table": "tasks",
++                "rows": [], "more": not after, "next": "a"}
++        if fault in ("head_changed", "head_zero_changed") and after:
++            page["head"] = 2
++        if fault == "foreign_table" or (fault == "later_table" and after):
++            page["table"] = "task_comments"
++        if fault == "missing_table":
++            del page["table"]
++        return page
++
++    monkeypatch.setattr(hub, "snapshot_page", snapshot)
++    report = helpers.plan_with(live, hub, tid)
++    assert not report["eligible"], report
++    assert report["refusal"].startswith("authoritative_snapshot_incomplete"), report
++    result = rk.apply(live, hub, helpers.BOARD, tid, helpers.GOOD, token, reason=helpers.REASON)
++    assert result["action"] == "refused", result
++    assert helpers.dump(live) == before
++
++
++@pytest.mark.parametrize("head", [0, 7])
++def test_stable_tasks_snapshot_allows_recovery(live, svc, monkeypatch, head):
++    tid, _ = helpers.bad_card(live, svc, monkeypatch)
++    hub = svc.hub(helpers.ME)
++    calls = []
++
++    def snapshot(board, table, after=""):
++        calls.append(after)
++        return {"head": head, "table": "tasks", "rows": [], "more": not after, "next": "a"}
++
++    monkeypatch.setattr(hub, "snapshot_page", snapshot)
++    report = helpers.plan_with(live, hub, tid)
++    assert report["eligible"], report
++    assert calls == ["", "a"]
++    result = rk.apply(live, hub, helpers.BOARD, tid, helpers.GOOD, report["token"], reason=helpers.REASON)
++    assert result["action"] == "applied", result
+-- 
+2.43.0
+

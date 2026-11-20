@@ -1,0 +1,314 @@
+From 36e76e1f2072a538a9927cecf9c495290d97402a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 16:02:28 +0000
+Subject: [PATCH] perf(unloaded): gate notices on orphan subs and
+ remote_notices on settled ledger (host_pass idle CPU)
+
+Hub profile (600 s idle, py-spy): notices held hot by ONE orphan sub (chat in no store, task done 6 d),
+remote_notices hot because any terminal card was 'hot' and the key held the replica commit counter.
+notices: an orphan sub (chat in no profile store, card not archived, no inflight claim) is part of the key, not a reason to run.
+remote_notices: hot only while an owed notice lacks a settled ledger row, a holder-claimed row exists, a chat is open or a wake runs; key is the card digest + ledger revision.
+---
+ .../tui_gateway/test_kanban_unloaded_gates.py | 151 +++++++++++++++++-
+ tui_gateway/kanban_unloaded_gates.py          |  79 +++++++--
+ 2 files changed, 217 insertions(+), 13 deletions(-)
+
+diff --git a/tests/tui_gateway/test_kanban_unloaded_gates.py b/tests/tui_gateway/test_kanban_unloaded_gates.py
+index 1fac24c1680808f09fb6c30d19eff650a4eff193..d768cd9250482c6c37558df6c42c30c81ac2f3a8 100644
+--- a/tests/tui_gateway/test_kanban_unloaded_gates.py
++++ b/tests/tui_gateway/test_kanban_unloaded_gates.py
+@@ -59,8 +59,14 @@ def test_host_rechecks_live_set_even_when_stores_do_not_change(host):
+     assert calls == ['notices', 'notices']
+ 
+ 
+-def test_pending_notice_returning_empty_keeps_busy_retry_hot(host):
++def test_pending_notice_returning_empty_keeps_busy_retry_hot(host, monkeypatch, tmp_path):
++    from hermes_state import SessionDB
++    from tui_gateway import kanban_unloaded_gates as gates
+     tid, _, calls = host
++    # The chat exists (a busy retry); an absent chat is the orphan case below, which has nothing to retry.
++    db = SessionDB(tmp_path / 'state.db')
++    db.create_session('chat', 'desktop')
++    monkeypatch.setattr(gates, '_profile_paths', lambda every_store=True: [db.db_path])
+     with contextlib.closing(kbc.connect()) as conn:
+         kb.complete_task(conn, tid, summary='ready')
+     ku.host_pass()
+@@ -208,6 +214,9 @@ def test_host_delivers_after_deferral_with_no_new_event(host, monkeypatch, tmp_p
+     db = SessionDB(tmp_path / 'chat.db')
+     db.create_session('chat', 'desktop')
+     db.append_message('chat', 'user', 'work')
++    from tui_gateway import kanban_unloaded_gates as gates
++    # The injected opener and the production lookup name the same store: the chat exists, so it is no orphan.
++    monkeypatch.setattr(gates, '_profile_paths', lambda every_store=True: [db.db_path])
+     with contextlib.closing(kbc.connect()) as conn:
+         kb.complete_task(conn, tid, summary='ready')
+     now = time.time() + 60
+@@ -292,3 +301,143 @@ def test_probe_failure_does_not_skip_host_work(host, monkeypatch):
+     ku.host_pass()
+     ku.host_pass()
+     assert calls == ['notices', 'notices']
++
++
++# --- orphan subs: a chat in no store has nothing to deliver to (t_48c41072e7cba68d) --------------------------------
++
++@pytest.fixture
++def orphan(host, monkeypatch, tmp_path):
++    """A completed card whose subscriber chat 'chat' is in no profile store (the hub's t_d717e9bdd5a021db shape)."""
++    from hermes_state import SessionDB
++    from tui_gateway import kanban_unloaded_gates as gates
++    tid, _live, calls = host
++    db = SessionDB(tmp_path / 'state.db')
++    monkeypatch.setattr(gates, '_profile_paths', lambda every_store=True: [db.db_path])
++    with contextlib.closing(kbc.connect()) as conn:
++        kb.complete_task(conn, tid, summary='ready')
++    yield tid, db, calls
++    db.close()
++
++
++def test_orphan_sub_does_not_hold_the_notice_sweep_hot(orphan):
++    _, _, calls = orphan
++    ku.host_pass()
++    ku.host_pass()
++    ku.host_pass()
++    assert calls == ['notices']
++
++
++def test_orphan_sub_runs_again_when_its_chat_appears(orphan):
++    _, db, calls = orphan
++    ku.host_pass()
++    ku.host_pass()
++    db.create_session('chat', 'desktop')
++    ku.host_pass()
++    ku.host_pass()
++    assert calls == ['notices', 'notices', 'notices']  # hot once the chat exists: a busy retry stays pending
++
++
++def test_orphan_sub_of_an_archived_card_still_runs(orphan):
++    from hermes_cli.kanban_db_archive import archive_task
++    tid, _, calls = orphan
++    with contextlib.closing(kbc.connect()) as conn:
++        archive_task(conn, tid)
++    ku.host_pass()
++    ku.host_pass()
++    assert calls == ['notices', 'notices']  # the sweep drops an archived card's sub
++
++
++def test_orphan_with_an_inflight_claim_stays_hot(orphan):
++    tid, _, calls = orphan
++    with contextlib.closing(kbc.connect()) as conn:
++        with conn:
++            conn.execute('UPDATE kanban_notify_subs SET inflight_from = 1, inflight_pid = 1 WHERE task_id = ?', (tid,))
++    ku.host_pass()
++    ku.host_pass()
++    assert calls == ['notices', 'notices']  # dead-holder recovery is not structure
++
++
++def test_orphan_probe_failure_stays_hot(orphan, monkeypatch):
++    from tui_gateway import kanban_unloaded_gates as gates
++    _, _, calls = orphan
++    def unreadable(*a, **k):
++        raise OSError('store unreadable')
++    monkeypatch.setattr(gates, '_profile_paths', unreadable)
++    ku.host_pass()
++    ku.host_pass()
++    assert calls == ['notices', 'notices']
++
++
++# --- remote_notices: a replica commit that changes no owed notice is not work (t_48c41072e7cba68d) ------------------
++
++@pytest.fixture
++def remote_host(monkeypatch, tmp_path):
++    from hermes_cli import kanban_origin
++    from tui_gateway import kanban_remote_notices as remote
++    from tui_gateway import kanban_replica_observer as observer
++    from tui_gateway import kanban_unloaded_gates as gates
++
++    replica = tmp_path / 'hub.db'
++    replica.write_bytes(b'')
++    ledger = tmp_path / 'remote-notices.db'
++    stamp = [1]
++    cards = [('macbook', 'default/t_1', {'id': 't_1', 'status': 'done', 'completed_at': 100.0},
++              [{'profile': 'default', 'session': 'chat-a'}])]
++    monkeypatch.setattr(kanban_origin, '_hub_db', lambda: replica)
++    monkeypatch.setattr(kanban_origin, 'gateway_names', lambda: ['hub'])
++    monkeypatch.setattr(remote, 'ledger_path', lambda: ledger)
++    monkeypatch.setattr(observer, 'fingerprint', lambda path: ('stamp', stamp[0]))
++    monkeypatch.setattr(remote, '_sweep_snapshot', lambda path, me: (list(cards), {}))
++    gates.reset_for_tests()
++    remote._ledger(ledger).close()
++
++    def settle(session='chat-a', state=None, delivered=remote.DELIVERED, holder=None):
++        with contextlib.closing(remote._ledger(ledger)) as conn, conn:
++            conn.execute('INSERT OR REPLACE INTO notices (session, ref, state, at, delivered, holder_pid, notice_key) '
++                         'VALUES (?,?,?,?,?,?,?)',
++                         (session, 'macbook/default/t_1', state or remote._notice_state(cards[0][2]), 1.0,
++                          delivered, holder, 'k'))
++    return gates, cards, stamp, settle
++
++
++def test_remote_probe_stays_hot_until_every_owed_notice_is_settled(remote_host):
++    gates, _, _, settle = remote_host
++    assert gates._remote().pending
++    settle()
++    assert not gates._remote().pending
++
++
++def test_remote_probe_key_ignores_unrelated_replica_commits(remote_host):
++    gates, _, stamp, settle = remote_host
++    settle()
++    first = gates._remote()
++    stamp[0] += 1
++    assert gates._remote() == first
++
++
++def test_remote_probe_key_changes_with_the_card_state_and_the_ledger(remote_host):
++    gates, cards, _, settle = remote_host
++    settle()
++    first = gates._remote()
++    settle(session='chat-b')
++    assert gates._remote().key != first.key
++    cards[0] = (*cards[0][:2], {'id': 't_1', 'status': 'blocked', 'blocked_at': 200.0}, cards[0][3])
++    assert gates._remote().pending  # the new state has no settled row: it runs
++
++
++def test_remote_probe_open_chat_in_flight_claim_and_woken_stay_hot(remote_host):
++    from tui_gateway import kanban_remote_notices as remote
++    gates, _, _, settle = remote_host
++    settle()
++    assert not gates._remote().pending
++    assert gates._remote(frozenset({'chat-a'})).pending
++    settle(session='chat-b', delivered=0, holder=12345)
++    assert gates._remote().pending
++    settle(session='chat-b', delivered=remote.DELIVERED)
++    with remote._woken_lock:
++        remote._woken['x'] = 1
++    try:
++        assert gates._remote().pending
++    finally:
++        with remote._woken_lock:
++            remote._woken.clear()
+diff --git a/tui_gateway/kanban_unloaded_gates.py b/tui_gateway/kanban_unloaded_gates.py
+index 9c87e16db0b23aa6172fe40129d683a5d6ae5726..53a06ece5cc4cf4bf7b587fcefe5c53302ae71f9 100644
+--- a/tui_gateway/kanban_unloaded_gates.py
++++ b/tui_gateway/kanban_unloaded_gates.py
+@@ -98,13 +98,42 @@ def _notices(live: frozenset = frozenset()) -> Inputs:
+             # pending (dead-holder recovery is a process-liveness decision, not structure). The board's own
+             # revision is NOT in the key: a live board is rewritten by bookkeeping all the time, and the
+             # emptiness of the candidate set is re-evaluated by every probe.
+-            if any(sub.get('inflight_from') is not None or str(sub.get('chat_id') or '') not in live
+-                   for sub in subscriptions(conn, _KANBAN_NOTIFY_KINDS)):
++            orphans = []
++            for sub in subscriptions(conn, _KANBAN_NOTIFY_KINDS):
++                chat = str(sub.get('chat_id') or '')
++                if sub.get('inflight_from') is None and chat in live:
++                    continue
++                if sub.get('inflight_from') is None and _orphan_chat(conn, sub, chat):
++                    orphans.append((str(sub.get('task_id')), chat, sub.get('last_event_id')))
++                    continue
+                 return Inputs()
+-            keys.append((str(path),))
++            # An orphan is part of the key: a new one (or one whose cursor moved) runs the sweep once.
++            keys.append((str(path), tuple(sorted(orphans, key=repr))))
+     return Inputs(tuple(keys), pending=False)
+ 
+ 
++def _orphan_chat(conn, sub: dict, chat: str) -> bool:
++    """True when the sweep can do nothing for this sub until one of its inputs changes: its chat is in NO profile
++    store, so the delivery path ends at ``session_db(chat) -> (None, None)`` ("no store holds this chat: leave the
++    cursor alone, the chat may still appear"). A chat appearing in any store, the card being archived (that path
++    drops the sub) or a placement placeholder id (dropped) is NOT an orphan: those run. One such sub whose chat was
++    deleted six days ago held the whole pass hot on the hub, opening every profile store each pass (t_48c41072e7cba68d).
++    Any read failure raises: the probe's caller treats that as unknown (``Inputs()``)."""
++    from hermes_cli.kanban_placement import is_placeholder_session
++    from tui_gateway.kanban_notice_session_store import profile_store, reader_of
++
++    if not chat or is_placeholder_session(chat):
++        return False
++    status = conn.execute('SELECT status FROM tasks WHERE id = ?', (sub.get('task_id'),)).fetchone()
++    if status is None or status[0] == 'archived':
++        return False
++    for path in _profile_paths():
++        with profile_store(path) as store:
++            if store is not None and reader_of(store)._read_one('SELECT 1 FROM sessions WHERE id = ?', (chat,)) is not None:
++                return False
++    return True
++
++
+ def _profile_paths(every_store: bool = True) -> list:
+     from pathlib import Path
+     from hermes_constants import get_hermes_home
+@@ -221,7 +250,7 @@ def _session_empty(kind: str) -> Inputs:
+                   due=time.time() + RECOVER_EVERY_S if kind == 'delegation' else float('inf'))
+ 
+ 
+-def _remote() -> Inputs:
++def _remote(live: frozenset = frozenset()) -> Inputs:
+     from hermes_cli.kanban_origin import _hub_db, gateway_names
+     from hermes_cli.kanban_reader_retention import reader
+     from tui_gateway import kanban_remote_notices as remote
+@@ -235,10 +264,6 @@ def _remote() -> Inputs:
+     if not me or stamp is None:
+         return Inputs()
+     cards, _states = remote._sweep_snapshot(path, me)
+-    # Even already delivered terminal cards are conservatively hot. Freshness,
+-    # live unloads, ledger releases and _woken running flags are not DB commits.
+-    if cards:
+-        return Inputs()
+     with remote._woken_lock:
+         if remote._woken:
+             return Inputs()
+@@ -247,9 +272,39 @@ def _remote() -> Inputs:
+     if ledger.exists():
+         with reader(ledger) as conn:
+             ledger_stamp = _revision(conn)
+-            if conn.execute('SELECT 1 FROM notices WHERE delivered=0 LIMIT 1').fetchone():
+-                return Inputs()  # preserve holder-death and stale-claim recovery
+-    return Inputs((str(path), me, stamp, str(ledger), ledger_stamp), pending=False)
++            # Holder-death and stale-claim recovery: only a claim WITH a holder is ever settled by the sweep.
++            if conn.execute('SELECT 1 FROM notices WHERE delivered=0 AND holder_pid IS NOT NULL LIMIT 1').fetchone():
++                return Inputs()
++            if cards and not _cards_settled(conn, cards, live):
++                return Inputs()
++    elif cards:
++        return Inputs()
++    # The key is what the pass would read, not the replica's commit counter: the hub's replica commits on every
++    # sync, and none of those commits changed a card this host owes a notice for (t_48c41072e7cba68d).
++    digest = hashlib.sha256()
++    for owner, key, task, links in cards:
++        digest.update(repr((owner, key, remote._notice_state(task),
++                            tuple((link.get('profile'), link.get('session')) for link in links))).encode())
++    return Inputs((str(path), me, digest.hexdigest(), str(ledger), ledger_stamp), pending=False)
++
++
++def _cards_settled(conn, cards, live) -> bool:
++    """True when every notice the sweep could deliver already has a settled ledger row, so the pass has nothing to
++    deliver, claim, wait on or count. Anything unproven (a link without a settled row, an open chat, whose poller
++    the sweep notes) keeps the pass hot. Blank and placement-placeholder links are dropped by the delivery
++    itself, with no effect."""
++    from hermes_cli.kanban_placement import is_placeholder_session
++    from tui_gateway import kanban_remote_notices as remote
++
++    for owner, key, task, links in cards:
++        ref, state = f'{owner}/{key}', remote._notice_state(task)
++        for link in links:
++            profile, sid = link.get('profile'), link.get('session')
++            if not profile or not sid or is_placeholder_session(sid):
++                continue
++            if sid in live or not remote._ledger_settled(conn, (sid,), ref, state):
++                return False
++    return True
+ 
+ 
+ def probe(kind: str, *, every_store: bool = True, live: frozenset | set = frozenset()) -> Inputs:
+@@ -267,7 +322,7 @@ def probe(kind: str, *, every_store: bool = True, live: frozenset | set = frozen
+         if kind == 'guarantee_pass':
+             return _guarantee()
+         if kind == 'remote_notices':
+-            return _remote()
++            return _remote(frozenset(live))
+         if kind in ('delegation', 'killed_notices'):
+             return _session_empty(kind)
+     except Exception:  # health: allow BLE001 -- admission failure must retain the recovery path
+-- 
+2.43.0
+

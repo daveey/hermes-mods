@@ -1,0 +1,86 @@
+From c7f66d28abcd570c03485c22817a4c6f928cd57c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 14:01:09 -0800
+Subject: [PATCH] feat(kanban): lane report carries completions, tokens and
+ estimated cost [daveey]
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_lanes.py                   | 20 +++++++++++++++++++-
+ tests/hermes_cli/test_kanban_lanes.py        |  6 ++++++
+ tests/tools/test_kanban_lanes_tool_create.py |  2 +-
+ 3 files changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_lanes.py b/hermes_cli/kanban_lanes.py
+index a41aed0a62adc7ae34a5adc7d9740c9fe50ef14e..c15acb4beb5ee19de17bdb8f50fdeed926aaef9c 100644
+--- a/hermes_cli/kanban_lanes.py
++++ b/hermes_cli/kanban_lanes.py
+@@ -434,7 +434,8 @@ def usage(conn, pol: Policy, *, window_s: int, now: Optional[float] = None) -> d
+     cutoff = now - window_s
+     out = {name: {"share": lane.share, "paused": lane.paused, "gated": lane.gated,
+                   "admit_per_day": lane.admit_per_day, "run_seconds": 0, "runs": 0, "running": 0, "ready": 0,
+-                  "held": 0, "open": 0, "oldest_ready_s": None, "admitted_today": 0}
++                  "held": 0, "open": 0, "oldest_ready_s": None, "admitted_today": 0, "done": 0, "cost_usd": 0.0,
++                  "tokens": 0, "usage_runs": 0}
+            for name, lane in pol.lanes.items()}
+     for tenant, seconds, runs in conn.execute(
+             "SELECT t.tenant, SUM(MIN(COALESCE(r.ended_at, ?), ?) - MAX(r.started_at, ?)), COUNT(*) "
+@@ -457,6 +458,23 @@ def usage(conn, pol: Policy, *, window_s: int, now: Optional[float] = None) -> d
+             row["oldest_ready_s"] = age if row["oldest_ready_s"] is None else max(row["oldest_ready_s"], age)
+         elif status == "triage" and kind == GATE_KIND:
+             row["held"] += count
++    for tenant, count in conn.execute(
++            "SELECT tenant, COUNT(*) FROM tasks WHERE status = 'done' AND completed_at > ? GROUP BY tenant", (cutoff,)):
++        out[pol.lane_of(tenant)]["done"] += count
++    # Cost is what managed workers reported on their runs' receipts (kanban_spend_budget.usage_fields): an
++    # estimate, and only for runs that reported; ``usage_runs`` against ``runs`` says how much that covers.
++    for tenant, cost, tokens, runs in conn.execute(
++            "SELECT tenant, SUM(cost), SUM(tokens), COUNT(*) FROM ("
++            "SELECT t.tenant AS tenant, MAX(COALESCE(json_extract(e.payload, '$.usage.cost_usd'), 0)) AS cost, "
++            "MAX(COALESCE(json_extract(e.payload, '$.usage.input_tokens'), 0) "
++            "+ COALESCE(json_extract(e.payload, '$.usage.output_tokens'), 0)) AS tokens "
++            "FROM task_events e JOIN tasks t ON t.id = e.task_id WHERE e.kind = 'worker_result' "
++            "AND e.created_at > ? AND json_extract(e.payload, '$.usage') IS NOT NULL "
++            "GROUP BY e.task_id, e.run_id) GROUP BY tenant", (cutoff,)):
++        row = out[pol.lane_of(tenant)]
++        row["cost_usd"] = round(row["cost_usd"] + float(cost or 0), 2)
++        row["tokens"] += int(tokens or 0)
++        row["usage_runs"] += runs
+     total_share = sum(lane.share for lane in pol.lanes.values() if not lane.paused) or 1
+     total_run = sum(row["run_seconds"] for row in out.values()) or 1
+     for name, row in out.items():
+diff --git a/tests/hermes_cli/test_kanban_lanes.py b/tests/hermes_cli/test_kanban_lanes.py
+index 845b19fedbd7188368746a82e8efbd76a951ab63..12ce6f825bea88f6a0c0bac9bc3ee4e8ca605445 100644
+--- a/tests/hermes_cli/test_kanban_lanes.py
++++ b/tests/hermes_cli/test_kanban_lanes.py
+@@ -228,8 +228,14 @@ def test_usage_reports_target_actual_and_backlog(conn, configured):
+     now = 1_000_000
+     conn.execute("INSERT INTO task_runs (task_id, status, started_at, ended_at) VALUES (?, 'done', ?, ?)",
+                  (parent, now - 7200, now - 3600))
++    run_id = conn.execute("SELECT MAX(id) FROM task_runs").fetchone()[0]
++    for cost in (1.0, 2.5):  # two receipts for one run: the larger is the run's total, not a second charge
++        conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)",
++                     (parent, run_id, "worker_result",
++                      json.dumps({"usage": {"cost_usd": cost, "input_tokens": 1000, "output_tokens": 50}}), now - 3600))
+     conn.commit()
+     out = lanes.usage(conn, lanes.policy(), window_s=6 * 3600, now=now)
++    assert (out["hermes"]["cost_usd"], out["hermes"]["tokens"], out["hermes"]["usage_runs"]) == (2.5, 1050, 1)
+     assert out["hermes"]["run_seconds"] == 3600 and out["hermes"]["actual"] == 1.0
+     assert out["hermes"]["held"] == 1 and out["myapp"]["ready"] == 1
+     assert round(out["myapp"]["target"], 3) == round(35 / 65, 3)
+diff --git a/tests/tools/test_kanban_lanes_tool_create.py b/tests/tools/test_kanban_lanes_tool_create.py
+index 17e2425235a6bc208b1ee31eeb69e7be8b3891bf..35ad50dca7f3a60bdc979c1319a02fe0f5c3286c 100644
+--- a/tests/tools/test_kanban_lanes_tool_create.py
++++ b/tests/tools/test_kanban_lanes_tool_create.py
+@@ -2,7 +2,7 @@
+ import json
+ from pathlib import Path
+ 
+-from tests.tools.test_kanban_tools import worker_env  # noqa: F401  (fixture)
++from tests.tools.test_kanban_tools import worker_env  # the fixture
+ 
+ 
+ def _configure():
+-- 
+2.43.0
+

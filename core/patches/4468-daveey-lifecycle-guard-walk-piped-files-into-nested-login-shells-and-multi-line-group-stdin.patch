@@ -1,0 +1,174 @@
+From 311f9afb10392926dd4e59497b3aa21f26455e63 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:20:13 +0000
+Subject: [PATCH] [daveey] lifecycle guard: walk piped files into nested login
+ shells and multi-line group stdin
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two fail-open gaps found while fixing t_9c70f1b1c26d1894 (card t_46647e5c2ec63ae5):
+
+1. A file piped into a nested startup-file shell was not walked in nested scope, and the
+   session walk handed a piped file only to a plain shell, never to su/sudo/ssh at all:
+   `cat f | su -l bob`, `cat f | { su -l bob; }`, `cat f |& su -l bob`, `cat f | sudo -i`,
+   `cat f | ssh h`, `cat f | bash -l` were allowed under {zz} (and the su/sudo/ssh shapes under
+   unknown names too). `_iter_nested_shell_inputs` now walks every file a pipe or an enclosing
+   group feeds to a stdin-reading nested shell (`_fed_shell_inputs`, from
+   `_iter_segment_contexts`), as a nested-scope script; /dev/null is skipped as before.
+
+2. The session walk read one logical line at a time, so a compound command spanning lines lost
+   its feed and its closer's redirection: `( bash ) < f` refused under unknown names but
+   `(\nbash\n) < f`, `{\nbash\n} < f`, `while …; do\nbash\ndone < f`, `cat f | {\nbash\n}`
+   were allowed. `_iter_segment_contexts` now walks all logical lines as one token list, each
+   line ending its command as `;` does (`join_command_lines`), so group state carries across
+   lines. Pipe-ending lines are still joined first.
+
+Stacked on PR #3039 (wt/compound-stdin-nested, itself on #2911). Independent of PR #2928
+(printed payloads), which touches the same function: expect a small merge there.
+
+Proof: tests/cron/test_lifecycle_guard_session_aliases.py RED on the stack base: 19 failed
+(11 nested piped shapes, 8 multi-line session shapes); GREEN: 324 passed. Controls stay allowed
+under {zz}: `cat f | cat`, `{\ncat\n} < f`, `(\ncat\n) < f`, plain `(\nbash\n) < f`,
+`cat f; su -l bob`, `su -l bob | cat f`, `cat f | su -l bob -c true`; and under unknown names a
+group closed before the redirected command, or a pipe feeding only a cat group, stays allowed.
+Lifecycle consumer suites (45 test files naming the guard): 2916 passed, 5 skipped. scripts/check vs #3039: 20 checks ok.
+
+Replay: 13,669 distinct multi-line or piped terminal commands (command + workdir) from
+worker-7's state.db, old vs new (measured with #2928's earlier commit also applied), under none/zz/stock/unknown alias
+sets: 54,676 comparisons, 0 changed verdicts, no errors; wall time old 1093 s vs new 1052 s
+summed over 4 shards. Stored text was scanned, never executed; the corpus stays private.
+---
+ cron/lifecycle_guard_nested_shells.py         | 19 ++++++
+ .../test_lifecycle_guard_session_aliases.py   | 64 +++++++++++++++++++
+ 2 files changed, 83 insertions(+)
+
+diff --git a/cron/lifecycle_guard_nested_shells.py b/cron/lifecycle_guard_nested_shells.py
+index 2c90c9993bff10fefe077b7d182535c306d407e3..06376f340b8f6eeeae71fddbf993dc8f7dbcf5c0 100644
+--- a/cron/lifecycle_guard_nested_shells.py
++++ b/cron/lifecycle_guard_nested_shells.py
+@@ -534,6 +534,8 @@ def _iter_nested_shell_inputs(
+     for owner, body in (iter_heredoc_bodies(command) if heredocs else ()):
+         if _feeds_nested_shell(owner) or (grouped and _closes_compound(owner or "")):
+             yield body, None
++    if grouped:
++        yield from _fed_shell_inputs(walk_command, cwd=cwd)
+     for view, found in classified:
+         if grouped and _compound_redirections(view):
+             yield from _redirected_shell_inputs(view, cwd=cwd)
+@@ -549,6 +551,23 @@ def _iter_nested_shell_inputs(
+             yield from _redirected_shell_inputs(view, cwd=cwd)
+ 
+ 
++def _fed_shell_inputs(walk_command: str, *, cwd: Optional[str]) -> Iterator[tuple[None, Path]]:
++    """Files fed to such a shell's stdin by a pipe or an enclosing group's redirection (``cat f |
++    su -l bob``, ``cat f | { su -l bob; }``, ``{``⏎``su -l bob``⏎``} < f``): the ordinary walk
++    hands a piped file only to a plain shell, and in the session's scope. A call-argument segment
++    counts too (``t ( su -l bob )``): unknown alias names may make that ``(`` a subshell."""
++    from cron.lifecycle_guard import _command_segment_views, _iter_segment_contexts
++
++    for segment, _call_argument, piped in _iter_segment_contexts(walk_command):
++        if piped and any(_nested_shell_input(view) == ("stdin", None)
++                         for view in _command_segment_views(segment)):
++            for source in piped:
++                if source == "/dev/null":
++                    continue  # feeds the shell nothing (and is no regular file to walk)
++                for path in _resolved_or_nothing(source, cwd):
++                    yield None, path
++
++
+ def _redirected_shell_inputs(
+     view: list[str], *, cwd: Optional[str],
+ ) -> Iterator[tuple[Optional[str], Optional[Path]]]:
+diff --git a/tests/cron/test_lifecycle_guard_session_aliases.py b/tests/cron/test_lifecycle_guard_session_aliases.py
+index 5094265a8e4dc06e1f0e4ada26c3f94a749eff81..ba72db4ee164933d54f99b8b0a281635d8ae06d3 100644
+--- a/tests/cron/test_lifecycle_guard_session_aliases.py
++++ b/tests/cron/test_lifecycle_guard_session_aliases.py
+@@ -315,6 +315,21 @@ _NESTED_FOREIGN_SHELLS = [
+     "{{ doas -s; }} < {script}",
+     "{{ ssh host; }} < {script}",
+     "{{ su -l bob < /dev/null; }} < {script}",  # fails closed: own redirections are not tracked
++    # A file piped into the login shell (t_46647e5c2ec63ae5): base walked none of these in
++    # nested scope, and handed a piped file to `su`/`sudo`/`ssh` in no scope at all.
++    "cat {script} | su -l bob",
++    "cat {script} | {{ su -l bob; }}",
++    "cat {script} | ( su -l bob )",
++    "cat {script} |& su -l bob",
++    "cat {script} |\nsu -l bob",
++    "cat < {script} | su -l bob",
++    "cat {script} | bash -l",
++    "cat {script} | sudo -i",
++    "cat {script} | ssh host",
++    "cat {script} | {{\nsu -l bob\n}}",
++    "cat {script} | while read l; do\nsu -l bob\ndone",
++    "(\nsu -l bob\n) < {script}",
++    "while true; do\nsu -l bob\ndone < {script}",
+ ]
+ 
+ 
+@@ -378,6 +393,16 @@ def test_nested_login_shell_body_treats_names_as_unknown(tmp_path, live_kanban_d
+     "su -l bob < /dev/null",
+     "ssh host < /dev/null",
+     "{{ su -l bob; }} < /dev/null",
++    # A piped file or a multi-line group's redirection with no login shell reading it.
++    "cat {script} | cat",
++    "{{\ncat\n}} < {script}",
++    "(\ncat\n) < {script}",
++    "(\nbash\n) < {script}",
++    "{{\nbash\n}} < {script}",
++    "while true; do\nbash\ndone < {script}",
++    "cat {script}; su -l bob",
++    "su -l bob | cat {script}",
++    "cat {script} | su -l bob -c true",
+ ])
+ def test_plain_child_shell_keeps_session_names(tmp_path, live_kanban_db, shape):
+     """Controls: no login/interactive shell, so the session's names still decide (#2358)."""
+@@ -389,6 +414,45 @@ def test_plain_child_shell_keeps_session_names(tmp_path, live_kanban_db, shape):
+         False, None)
+ 
+ 
++@pytest.mark.parametrize("shape", [
++    "( bash ) < {script}",  # one line: refused before this change too
++    # The group spans lines (t_46647e5c2ec63ae5): the session walk read one line at a time, so
++    # the closer's redirection or the pipe never reached the shell lines earlier.
++    "(\nbash\n) < {script}",
++    "{{\nbash\n}} < {script}",
++    "while true; do\nbash\ndone < {script}",
++    "if true; then\nsh\nfi < {script}",
++    "{{\ntrue\n{{\nbash\n}}\n}} < {script}",
++    "cat {script} | {{\nbash\n}}",
++    "cat {script} | while read l; do\nbash\ndone",
++    "cat {script} | (\nbash\n)",
++])
++def test_multiline_group_feeds_its_plain_shell_in_session_walk(tmp_path, live_kanban_db, shape):
++    """With unknown names the walked file's `t (` may be a subshell: refused as on one line."""
++    assert "alias" not in str(tmp_path).lower()
++    script = tmp_path / "inner.sh"
++    script.write_text(f"t ( bash {live_kanban_db} )\n")
++    text = shape.format(script=script)
++    unsafe, refusal = scan_gateway_lifecycle(text, cwd=str(tmp_path), session_aliases=None)
++    assert unsafe is True and refusal is not None and "SQLite" in refusal, shape
++    assert scan_gateway_lifecycle(text, cwd=str(tmp_path), session_aliases=frozenset({"zz"})) == (
++        False, None)
++
++
++@pytest.mark.parametrize("shape", [
++    "{{\ncat\n}} < {script}",
++    "(\ncat\n) < {script}",
++    "{{\nbash\n}}\ncat < {script}",  # the group closed before the redirected command
++    "{{\nbash\n}}; cat {script} | cat",
++    "cat {script} | {{\ncat\n}}\nbash",  # the pipe feeds only the group
++])
++def test_multiline_group_without_a_fed_shell_stays_allowed(tmp_path, live_kanban_db, shape):
++    script = tmp_path / "inner.sh"
++    script.write_text(f"t ( bash {live_kanban_db} )\n")
++    text = shape.format(script=script)
++    assert scan_gateway_lifecycle(text, cwd=str(tmp_path), session_aliases=None) == (False, None)
++
++
+ @pytest.mark.parametrize("option", [
+     "--group root", "--group=root", "-g root", "-groot",
+     "--supp-group root", "--supp-group=root", "-G root", "-Groot",
+-- 
+2.43.0
+

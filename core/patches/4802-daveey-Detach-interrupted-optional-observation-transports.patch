@@ -1,0 +1,112 @@
+From c2c57deb7a7670a752b279bbf73e15d689e244a1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 07:39:26 +0000
+Subject: [PATCH] [daveey] Detach interrupted optional observation transports
+
+Preserve cancellation exceptions while discarding outcome-unknown reply queues before subsequent durable writes. Proof: real SIGINT review probe reproduced stale read accepted as persist before fix; six send/receive SIGINT, SystemExit and RuntimeError cases plus nine deadline controls pass.
+---
+ agent/runtime_session_store.py                | 10 +--
+ .../test_origin_observation_interrupt.py      | 63 +++++++++++++++++++
+ 2 files changed, 69 insertions(+), 4 deletions(-)
+ create mode 100644 tests/agent/test_origin_observation_interrupt.py
+
+diff --git a/agent/runtime_session_store.py b/agent/runtime_session_store.py
+index b4a22a359b2630617718fa99ecec2186dd7ed119..b4d3b9ee1c06f10ecde8a4e4fa0b9d62595d0368 100644
+--- a/agent/runtime_session_store.py
++++ b/agent/runtime_session_store.py
+@@ -353,9 +353,9 @@ class WorkerRPC:
+                 with interrupt_at_deadline(link.ws):
+                     link.send(self.request_id, message)
+                     response = link.receive(remaining())
+-            except (OSError, ConnectionClosed) as exc:
+-                # A timed-out reply has no authority. Correlation discards it if
+-                # it arrives later; durable writes never inherit this deadline.
++            except BaseException as exc:
++                # Cancellation also abandons an outcome-unknown observation.
++                # Never let its queued reply answer a subsequent durable write.
+                 link.awaiting = None
+                 # Never reuse this reply queue: the reader may already have
+                 # queued a late observation while the timer was joining.
+@@ -363,7 +363,9 @@ class WorkerRPC:
+                 import socket
+                 with contextlib.suppress(OSError):
+                     link.ws.socket.shutdown(socket.SHUT_RDWR)
+-                raise WorkerPersistenceError('origin_observation_unavailable') from exc
++                if isinstance(exc, (OSError, ConnectionClosed)):
++                    raise WorkerPersistenceError('origin_observation_unavailable') from exc
++                raise
+             if 'error' in response:
+                 raise WorkerPersistenceError(response['error'].get('message', 'origin_observation_refused'))
+             return response['result']
+diff --git a/tests/agent/test_origin_observation_interrupt.py b/tests/agent/test_origin_observation_interrupt.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..436ae74a7168373876685047fab95675ae775a33
+--- /dev/null
++++ b/tests/agent/test_origin_observation_interrupt.py
+@@ -0,0 +1,63 @@
++"""Abandoned optional observations must never answer subsequent durable writes."""
++import os
++import signal
++import time
++
++import pytest
++
++from agent import origin_observation_budget as budget
++from tests.hermes_cli.test_origin_record_rpc_contention import socket_rpc
++
++
++@pytest.mark.parametrize('failure', ['sigint', 'system_exit', 'runtime_error'])
++@pytest.mark.parametrize('boundary', ['send', 'receive'])
++def test_interrupted_observation_cannot_answer_next_write(tmp_path, monkeypatch, failure, boundary):
++    calls = []
++
++    def dispatch(method, **params):
++        calls.append(method)
++        if method == 'worker.persist':
++            return {'kind': 'persist', '_receipt': {'execution_id': 'exec', 'sequence': 1}}
++        return {'kind': 'observation'}
++
++    # Keep the reply-queued signal probe independent of the deadline timeout.
++    monkeypatch.setattr(budget, 'RECORD_TIMEOUT', 3)
++    error = {'sigint': KeyboardInterrupt, 'system_exit': SystemExit, 'runtime_error': RuntimeError}[failure]
++    with socket_rpc(tmp_path, dispatch, lambda request: None, expect_disconnect=True) as rpc:
++        link = rpc.link
++        assert link is not None
++        original = getattr(link, boundary)
++
++        def interrupted(*args):
++            if boundary == 'send':
++                original(*args)
++            deadline = time.monotonic() + 1
++            while link.replies.empty() and time.monotonic() < deadline:
++                time.sleep(0.001)
++            assert not link.replies.empty()
++            if failure == 'sigint':
++                os.kill(os.getpid(), signal.SIGINT)
++                pytest.fail('SIGINT failed to interrupt')
++            raise error('observation interrupted')
++
++        monkeypatch.setattr(link, boundary, interrupted)
++
++        @budget.bounded_record
++        def observe():
++            rpc('worker.nativeOrigin')
++
++        with pytest.raises(error):
++            observe()
++        monkeypatch.setattr(link, boundary, original)
++        assert budget.remaining() is None
++        assert rpc.link is None
++        link.reader.join(1)
++        link.ws.recv_events_thread.join(1)
++        assert not link.reader.is_alive()
++        assert not link.ws.recv_events_thread.is_alive()
++        # A real redial must return the write's own receipt, not the queued read.
++        with socket_rpc(tmp_path, dispatch, lambda request: None) as fresh:
++            monkeypatch.setattr(rpc, '_connection', lambda: rpc.link if rpc.link is not None else fresh.link)
++            result = rpc('worker.persist', execution_id='exec', sequence=1)
++            assert result == {'kind': 'persist'}
++            assert calls == ['worker.nativeOrigin', 'worker.persist']
+-- 
+2.43.0
+

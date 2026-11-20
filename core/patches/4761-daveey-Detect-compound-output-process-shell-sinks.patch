@@ -1,0 +1,189 @@
+From 98e2e010213cff2153403c94a26d435e88348b80 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 04:58:27 +0000
+Subject: [PATCH] [daveey] Detect compound output-process shell sinks
+
+Treat output substitution stdin as an implicit pipe across compound lists and nested groups, using the existing pipe consumer matcher. Restore the enclosing stdin at the substitution close; top-level &&/|| do not inherit a preceding pipeline.
+
+Proof: generated harmless Bash marker controls across nine bodies and four consumers; base RED 45 failures, focused GREEN 252 tests before opt-in test. Related scanner consumers: 99 files, 12236 passed. Four feed/restoration/opt-in mutants killed. scripts/check --base origin/main passed.
+---
+ cron/lifecycle_guard_nested_shells.py         | 23 +++++-
+ ...st_lifecycle_guard_compound_output_sink.py | 75 +++++++++++++++++++
+ tools/shell_heredoc.py                        |  9 ++-
+ 3 files changed, 100 insertions(+), 7 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_compound_output_sink.py
+
+diff --git a/cron/lifecycle_guard_nested_shells.py b/cron/lifecycle_guard_nested_shells.py
+index cd5b16af9f88df8f33f8819b6298b73cf4098cde..016c674d8b10fd3db6b3c99019291ca98e63792f 100644
+--- a/cron/lifecycle_guard_nested_shells.py
++++ b/cron/lifecycle_guard_nested_shells.py
+@@ -557,16 +557,21 @@ def _reads_nested_stdin(words: list[str]) -> bool:
+     return any(_nested_shell_input(view) == ("stdin", None) for view in _command_segment_views(words))
+ 
+ 
+-def pipe_feeds_consumer(command: str, reads: Callable[[list[str]], bool]) -> bool:
++def pipe_feeds_consumer(
++    command: str, reads: Callable[[list[str]], bool], *, output_processes: bool = False,
++) -> bool:
+     """Whether a pipe in *command* feeds a command whose words satisfy *reads*, including a
+     command inside a compound command the pipe feeds (``| { echo x; bash; }``, ``| ( :; bash )``,
+-    ``| while read l; do bash; done``): every command there reads the compound's stdin."""
+-    return "|" in command and any(_unit_feeds_nested_stdin(unit, reads)[0]
+-                                  for unit in _printed_pipeline_units(command))
++    ``| while read l; do bash; done``): every command there reads the compound's stdin.
++    With *output_processes*, also count the implicit pipe feeding each ``>(...)``."""
++    return ("|" in command or output_processes) and any(
++        _unit_feeds_nested_stdin(unit, reads, output_processes=output_processes)[0]
++        for unit in _printed_pipeline_units(command))
+ 
+ 
+ def _unit_feeds_nested_stdin(
+     unit: _PrintedUnit, reads: Callable[[list[str]], bool] = _reads_nested_stdin,
++    *, output_processes: bool = False,
+ ) -> tuple[bool, bool]:
+     """``(printed text, heredoc body output)``: whether a pipe in *unit* feeds a command *reads*
+     accepts (by default a startup shell reading stdin), and whether a heredoc-owning producer
+@@ -575,6 +580,7 @@ def _unit_feeds_nested_stdin(
+     feeds = feeds_body = False
+     piped = carried = own_body = False
+     frames: list[list[bool]] = []  # [piped, carried, holds a body] at each open group
++    suspended: dict[int, tuple[bool, bool, bool]] = {}
+     words: list[str] = []
+     for role, word in [*unit.events, ("list", ";")]:
+         if role == "data":
+@@ -589,6 +595,8 @@ def _unit_feeds_nested_stdin(
+         if words and piped and reads(words):
+             feeds = True
+             feeds_body = feeds_body or carried
++        process = (output_processes and role == "open" and word == "("
++                   and bool(words) and words[-1] == ">" and _syntax_word(words[-1]))
+         words = []
+         if role == "pipe":
+             piped, carried, own_body = True, carried or own_body, False
+@@ -596,10 +604,17 @@ def _unit_feeds_nested_stdin(
+             piped, carried = (frames[-1][0], frames[-1][1]) if frames else (False, False)
+             own_body = False
+         elif role == "open":
++            if process:
++                # The substitution receives a new stdin, inherited by its lists
++                # and nested groups. Its enclosing command keeps its own stdin.
++                suspended[len(frames)] = (piped, carried, own_body)
++                piped, carried = True, carried or own_body
+             frames.append([piped, carried, False])
+             own_body = False
+         elif frames:  # close: the group is the pipeline's command now
+             piped, carried, own_body = frames.pop()
++            if len(frames) in suspended:
++                piped, carried, own_body = suspended.pop(len(frames))
+         else:
+             piped = carried = own_body = False
+     return feeds, feeds_body
+diff --git a/tests/cron/test_lifecycle_guard_compound_output_sink.py b/tests/cron/test_lifecycle_guard_compound_output_sink.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1cbf2ba93239ba20e0a9d70032da1d191bbd7aa8
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_compound_output_sink.py
+@@ -0,0 +1,75 @@
++"""Generated stdin-inheritance controls for pipes and output substitutions."""
++
++import shutil
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from tools.shell_heredoc import output_reaches_shell
++
++
++_BODIES = ["cd .; {sink}", ":; {sink}", "( {sink} )", "\n{sink}\n",
++           "true && {sink}", "false || {sink}", "{{ :; {sink}; }}",
++           "if true; then {sink}; fi", "case x in x) {sink};; esac"]
++
++
++@pytest.mark.parametrize("body", _BODIES)
++@pytest.mark.parametrize("transport", ["> >( {body} )", "| ( {body} )"])
++@pytest.mark.parametrize("sink", ["bash", "env bash", "cat", "tee copied"])
++def test_generated_compound_stdin(tmp_path, body, transport, sink):
++    script = tmp_path / "large.sh"
++    marker = tmp_path / "marker"
++    script.write_text(f"printf RAN > '{marker}'\n" + "# padding\n" * 150_000,
++                      encoding="utf-8")
++    # Keep the heredoc complete before the multiline consumer starts.
++    producer = f"(python3 <<'EOF'\nprint('bash {script}')\nEOF\n)"
++    command = producer + " " + transport.format(body=body.format(sink=sink)) + "\nwait\n"
++    shell = sink in {"bash", "env bash"}
++    wrapper = tmp_path / "wrapper.sh"
++    wrapper.write_text(command, encoding="utf-8")
++    _assert_execution(command, tmp_path, marker, shell)
++    assert output_reaches_shell(command) is shell, command
++    unsafe, reason = scan_gateway_lifecycle(f"bash -l {wrapper}", cwd=str(tmp_path))
++    assert unsafe is shell, (command, reason)
++    if shell:
++        assert reason and "scan cap" in reason
++
++
++def _assert_execution(command, tmp_path, marker, shell):
++    bash = shutil.which("bash")
++    if bash is None:
++        return  # scanner policy remains unconditional without optional Bash
++    result = subprocess.run([bash, "--noprofile", "--norc", "-c", command],
++                            cwd=tmp_path, capture_output=True, text=True,
++                            encoding="utf-8", timeout=15, check=False)
++    assert result.returncode == 0, result.stderr
++    assert marker.exists() is shell, command
++    if shell:
++        assert marker.read_text(encoding="utf-8") == "RAN"
++
++
++@pytest.mark.parametrize("command", [
++    "p > >(cat); bash", "p > >(cat) && bash", "p > >(cat) || bash",
++    "p | true && bash", "p | false || bash",
++    "p > >(:; cat)", "p > >(true && tee file)",
++    "echo '> >( :; bash )'", "echo \"> >( :; bash )\"",
++    "p > >(cat) bash", "{ p > >(cat); bash; }",
++    "p > >(cat > >(tee file)); bash",
++])
++def test_unfed_shell_controls(command):
++    assert not output_reaches_shell(command)
++
++
++def test_process_walk_is_explicitly_opted_in():
++    from cron.lifecycle_guard_nested_shells import pipe_feeds_consumer
++
++    command = "p > >(:; bash) | cat"
++    assert not pipe_feeds_consumer(command, lambda words: "bash" in words)
++    assert pipe_feeds_consumer(command, lambda words: "bash" in words, output_processes=True)
++
++
++@pytest.mark.parametrize("body", _BODIES)
++@pytest.mark.parametrize("opener", [">(", ">\\\n(", ">\\\n\\\n("])
++def test_compound_sink_continuations(body, opener):
++    assert output_reaches_shell("p > " + opener + " " + body.format(sink="bash") + " )")
+diff --git a/tools/shell_heredoc.py b/tools/shell_heredoc.py
+index 4e711402e2d8de4f7bae525beae8002c66701e9e..7c067e80fe746ceaf4cb3b6f20313a74e46b730b 100644
+--- a/tools/shell_heredoc.py
++++ b/tools/shell_heredoc.py
+@@ -579,14 +579,17 @@ def _grouped_pipe_reaches_shell(command: str, sink: re.Pattern[str]) -> bool:
+     break: every command in ``| { echo x; bash; }``, ``| ( :; bash -l )`` or ``| while read l;
+     do bash; done`` reads the pipe, yet the pipe alternative stops at the first ``;``. Each
+     command reading the pipe is matched as if piped into directly (``| bash``). Text the
+-    printed-unit walk cannot tokenize fails closed (t_326b169246d7306a)."""
+-    if "|" not in command or not _SINK_SHELL_WORD_RE.search(command):
++    printed-unit walk cannot tokenize fails closed (t_326b169246d7306a). Output
++    process substitutions inherit an implicit pipe across the same compounds."""
++    output_processes = re.search(r">(?:\\\n)*\(", command) is not None
++    if ("|" not in command and not output_processes) or not _SINK_SHELL_WORD_RE.search(command):
+         return False
+     from cron.lifecycle_guard_nested_shells import pipe_feeds_consumer
+ 
+     try:
+         return pipe_feeds_consumer(
+-            command, lambda words: sink.search("| " + " ".join(words)) is not None)
++            command, lambda words: sink.search("| " + " ".join(words)) is not None,
++            output_processes=output_processes)
+     except ValueError:
+         return True
+ 
+-- 
+2.43.0
+

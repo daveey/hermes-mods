@@ -1,0 +1,99 @@
+From 9b092e679c710c9a93f452477c8cda1541a2f64d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 04:06:29 +0000
+Subject: [PATCH] fix(profiles): recheck completed memo before starting a fill
+ [daveey]
+
+A caller can observe a miss before taking the flight lock, then resume after another leader stores its memo and retires. Recheck the memo under the flight lock, but copy outside it. The old path inspected only active flights, so a completed fill was invisible to a delayed miss. Deterministic Event-gated regression fails on main (2 computes instead of 1); different-signature completion still computes independently and copied results remain isolated. Singleflight and four consumer suites: 65 passed; scripts/check: 20 checks passed.
+---
+ .../test_profile_roster_cache_singleflight.py | 46 +++++++++++++++++++
+ tui_gateway/profile_roster_cache.py           |  8 +++-
+ 2 files changed, 53 insertions(+), 1 deletion(-)
+
+diff --git a/tests/tui_gateway/test_profile_roster_cache_singleflight.py b/tests/tui_gateway/test_profile_roster_cache_singleflight.py
+index 3182ff858c10f437a3fb3befc865a131f278e75e..4cbd84abbe3dfdabda7a6d172d4dae6f37c081e3 100644
+--- a/tests/tui_gateway/test_profile_roster_cache_singleflight.py
++++ b/tests/tui_gateway/test_profile_roster_cache_singleflight.py
+@@ -189,6 +189,52 @@ def test_invalidate_during_a_fill_is_not_joined_or_stored():
+     assert _fill("/p", ("A",), lambda: pytest.fail("must hit")) == {"v": "after"}
+ 
+ 
++@pytest.mark.parametrize("signature, expected_runs", [(("A",), 1), (("B",), 2)])
++def test_miss_resuming_after_completed_fill_rechecks_signature(signature, expected_runs):
++    observed, release = threading.Event(), threading.Event()
++
++    class PausedMiss(dict):
++        def get(self, key, default=None):
++            value = super().get(key, default)
++            if threading.current_thread().name == "stale-reader" and not observed.is_set():
++                observed.set()
++                assert release.wait(5)
++            return value
++
++    memo, flights, runs = PausedMiss(), {}, []
++
++    def compute():
++        runs.append(1)
++        return {"v": 1}
++
++    def copier(value):
++        assert cache._FLIGHT_LOCK.acquire(blocking=False), "copier ran under flight lock"
++        cache._FLIGHT_LOCK.release()
++        return dict(value)
++
++    def fill(sig):
++        return cache._cached(memo, flights, "/p", sig, compute, copier)
++
++    threads, results, errors = _threads(1, lambda: fill(signature))
++    thread = threads[0]
++    thread.name = "stale-reader"
++    thread.start()
++    try:
++        assert observed.wait(5)
++        assert fill(("A",)) == {"v": 1}
++        assert runs == [1] and not flights
++    finally:
++        release.set()
++        thread.join(10)
++    assert not thread.is_alive()
++    assert not errors
++    assert results == [{"v": 1}]
++    assert len(runs) == expected_runs
++    results[0]["extra"] = True
++    assert memo["/p"] == (signature, {"v": 1})
++    assert not flights
++
++
+ def test_late_caller_after_fill_hits_the_memo():
+     gate = _Gate()
+     gate.release.set()
+diff --git a/tui_gateway/profile_roster_cache.py b/tui_gateway/profile_roster_cache.py
+index c110f3a2b6ee8a5ea60ce67084dfa2060e1948db..a76c8ca610131068cc1ccaae8e839725eafdc9a4 100644
+--- a/tui_gateway/profile_roster_cache.py
++++ b/tui_gateway/profile_roster_cache.py
+@@ -95,8 +95,12 @@ def _cached(cache: dict, flights: dict, key: Any, signature: Optional[tuple], co
+         return copier(hit[1])
+     me = threading.get_ident()
+     with _FLIGHT_LOCK:
++        # A fill may have stored and retired since our unlocked miss.
++        hit = cache.get(key)
+         flight = flights.get(key)
+-        if flight is not None and flight.owner == me:
++        if hit is not None and hit[0] == signature:
++            lead = False  # Copy only after releasing the lock, just like the fast hit.
++        elif flight is not None and flight.owner == me:
+             flight = None  # re-entered from our own fill: never wait on ourselves
+             lead = False
+         elif flight is not None and flight.signature == signature:
+@@ -105,6 +109,8 @@ def _cached(cache: dict, flights: dict, key: Any, signature: Optional[tuple], co
+         else:
+             flight = flights[key] = _Flight(signature, me)
+             lead = True
++    if hit is not None and hit[0] == signature:
++        return copier(hit[1])
+     if flight is None:
+         return compute()
+     if not lead:
+-- 
+2.43.0
+

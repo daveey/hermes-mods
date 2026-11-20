@@ -1,0 +1,111 @@
+From 755dd67e6eff4596923bad22b7fe1dfdfd24f39c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 23:20:36 +0000
+Subject: [PATCH] [daveey] kanban start gate: no pickup-stall repair for a
+ gated pin; diagnostics name the plugin's word
+
+Delta review of fcbda044: a gate holding longer than pickup_stall_seconds
+made the stall detector file a repair card per card pinned to the gated
+machine, and held_in_ready showed neither the word nor "last observed".
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_diagnostics.py           |  5 +++-
+ hermes_cli/kanban_pickup_stall.py          | 10 ++++++-
+ tests/hermes_cli/test_kanban_start_gate.py | 32 ++++++++++++++++++++++
+ 3 files changed, 45 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_diagnostics.py b/hermes_cli/kanban_diagnostics.py
+index b44bcbb0246387cc543969ecce6e87f4b978483a..07d32fd4ddbbc1743441495d253d86b866f664de 100644
+--- a/hermes_cli/kanban_diagnostics.py
++++ b/hermes_cli/kanban_diagnostics.py
+@@ -973,6 +973,8 @@ def _rule_held_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
+     if reason == "pinned_quota_wall":
+         hold_until = _pinned_quota_hold_until(events, now)
+     paced = _llm_paced_hold(events, now) if reason == "llm_paced" else None
++    if reason == "start_gate":
++        guard_reason = str(_episode_skip(events).get("detail") or "") or None  # the plugin's word
+     if paced:
+         guard_reason = str(paced.get("detail") or "") or None
+         hold_until = int(paced["until"]) if isinstance(paced.get("until"), (int, float)) else None
+@@ -982,7 +984,8 @@ def _rule_held_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
+         hold += f", until {stamp}" if hold_until > now else f", expired {stamp}"
+     return [Diagnostic(
+         kind="held_in_ready", severity="warning",
+-        title=(f"Ready {int(age / 60)}m, last observed hold ({hold})" if reason in ("respawn_guarded", "llm_paced")
++        title=(f"Ready {int(age / 60)}m, last observed hold ({hold})"
++               if reason in ("respawn_guarded", "llm_paced", "start_gate")
+                else f"Ready {int(age / 60)}m, held ({hold})"),
+         detail=("The last recorded dispatch decision was a guard hold; the current hold is not verified. "
+                 "A cleared blocker, capacity limit, or missing pickup can leave this historical event "
+diff --git a/hermes_cli/kanban_pickup_stall.py b/hermes_cli/kanban_pickup_stall.py
+index e643476ff8dca8abd1b36f133516c772de8e0dec..fbec70c1b38c8a4432bff71466b18256e5acf13f 100644
+--- a/hermes_cli/kanban_pickup_stall.py
++++ b/hermes_cli/kanban_pickup_stall.py
+@@ -540,6 +540,14 @@ def _open_coverage(conn, own: str) -> dict[str, str]:
+     return out
+ 
+ 
++def _start_gate_expected(skip: Mapping[str, Any]) -> bool:
++    """Pickup skipped the card because a plugin start gate holds this machine's card starts (``kanban_start_gate``;
++    pickup records ``other`` with detail ``start_gate:<word> (...)``). That is a deliberate fleet-wide wait, e.g.
++    the token throttle while spend is over its cap: a repair card per pinned card would only add work to a fleet
++    that is being told to start none. The gate is asked again every pass, so the skip ends with it."""
++    return skip.get("reason") == "other" and str(skip.get("detail") or "").startswith("start_gate:")
++
++
+ def file_repairs(conn, own: str, cards: list[dict[str, Any]], *, now: Optional[float] = None) -> list[str]:
+     """One repair per stalled card with a card-specific last reason; one per host per host-wide cause
+     (:data:`_HOST_GROUPS`), naming the oldest card. A card an open repair about this host already lists under
+@@ -559,7 +567,7 @@ def file_repairs(conn, own: str, cards: list[dict[str, Any]], *, now: Optional[f
+         if (card["skip"]["reason"] == "evidence_missing"
+                 and now_ms - card["skip"]["first_at"] < stall_seconds() * 1000):
+             continue
+-        if _quota_hold_expected(card["skip"], now_ms):
++        if _quota_hold_expected(card["skip"], now_ms) or _start_gate_expected(card["skip"]):
+             continue
+         group = _group(card)
+         if group is not None:
+diff --git a/tests/hermes_cli/test_kanban_start_gate.py b/tests/hermes_cli/test_kanban_start_gate.py
+index 3b17f948410ac261853519f942e26b5a278ed987..483495e24ecd1e1601a9ada68acabbbffcda21e9 100644
+--- a/tests/hermes_cli/test_kanban_start_gate.py
++++ b/tests/hermes_cli/test_kanban_start_gate.py
+@@ -188,3 +188,35 @@ def test_pickup_skips_a_foreign_card_this_machines_gate_would_hold(monkeypatch):
+     assert asked == [dict(task_id="t_1", lane="ready", assignee="default", board=None)]
+     monkeypatch.setattr(pd, "pickup_hold", lambda *a, **k: "anthropic held")
+     assert wn._paced(None, None, card) == ("other", "llm_paced: anthropic held (local dispatch would hold it)")
++
++
++def test_a_long_gate_hold_files_no_pickup_stall_repair(paced_board, monkeypatch):
++    from hermes_cli import kanban_pickup_stall as kps
++    gated = {"reason": "other", "detail": "start_gate:token_throttle (local dispatch would hold it)", "first_at": 0}
++    assert kps._start_gate_expected(gated) is True
++    for skip in ({"reason": "other", "detail": "llm_paced: anthropic held (local dispatch would hold it)"},
++                 {"reason": "other", "detail": "machine registry unavailable"}, {"reason": "other", "detail": None},
++                 {"reason": "budget_exhausted", "detail": "start_gate:token_throttle"}, {"reason": "guard_held"}):
++        assert kps._start_gate_expected(skip) is False, skip
++    created = []
++    monkeypatch.setattr(kps, "_create", lambda *a, **k: created.append(k) or "t_repair")
++    card = {"id": "t_1", "title": "pinned", "tenant": None, "since_ms": 0, "skip": gated}
++    with kbc.connect() as conn:
++        assert kps.file_repairs(conn, "worker-1", [card], now=10 * 3600.0) == [] and created == []  # hours on: none
++        other = dict(card, id="t_2", skip={"reason": "other", "detail": "something else", "first_at": 0, "last_at": 0, "passes": 3})
++        assert kps.file_repairs(conn, "worker-1", [other], now=10 * 3600.0) == ["t_repair"]  # the control
++
++
++def test_held_in_ready_names_the_gate_and_its_word_for_both_event_forms(paced_board, monkeypatch):
++    import time
++    from hermes_cli import kanban_diagnostics as kd
++    _write_cfg(paced_board)
++    _hook(monkeypatch, [{"hold": True, "reason": "token_throttle"}])
++    with kbc.connect() as conn:
++        tid = _opus_card(conn)
++        _dispatch(conn)
++        task, events = kb.get_task(conn, tid), kb.list_events(conn, tid)
++    later = time.time() + 3 * 3600
++    (diag,) = kd._rule_held_in_ready(task, events, [], later, {})
++    assert diag.kind == "held_in_ready" and "last observed hold (start_gate: token_throttle)" in diag.title
++    assert "plugin start gate" in diag.detail and diag.data["hold_reason"] == "start_gate"
+-- 
+2.43.0
+

@@ -1,0 +1,158 @@
+From f091f1fd64ad7eeeeee6c1c3a78f88a313657206 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 20:50:05 +0000
+Subject: [PATCH] [daveey] Origin ledger: an owner's explicit archive stays
+ closed when the owner goes quiet
+
+Problem: hub chat 20261111_091916_d2d36a stayed "waiting" on MacBook card t_d3caf2c71c64010a (status=unknown,
+unfinished) after the user had it archived without verification. Ledger row: archived, origin_observation
+verified=false, released=0 (by design: an unverified archive is `closed_uncompleted`, never released as done).
+Why 1: kanban_origin_ledger.project() reports `unknown` unless the record is `current`: version == replica version,
+transport fresh AND the owner's scope heartbeat within its window. Evidence: hub chat-tasks keep-row
+status=unknown unfinished released=false via=origin at 20:32Z, 0 unfinished at ~20:35Z (state.db messages
+1353819, 1353856).
+Why 2: the archive record reached the hub minutes after the 20:29:51Z archive (replica lag) so it was not current;
+that wait is fail-closed by design and unchanged here.
+Why 3 (defect): once current, `settled` (a record still the owner's latest word survives the owner going quiet) was
+set only for verified releases, so a closed archive flipped back to `unknown`/unfinished whenever the owner's
+heartbeat lapsed (a laptop sleeping: the same card's notices record the MacBook offline for hours). The replica
+reader already keeps a silent owner's archive (published_before_silence); the ledger reader did not.
+Root (happened): two readers, one release rule, only one of them settled the closed-archive case.
+Root (not caught): tests covered quiet owners only for done/open cards.
+Not a cause (traced, no effect): the origin notify subscription on the MacBook: with it present and the replica
+caught up the outcome was waiting only on the repair subagent; an archived card writes no owner hub link
+(`_owner_hub_links` is open-cards-only; test added).
+Fix: `settled` also covers a current archived record carrying owner evidence; `closed` reads `observed`.
+Verified completion semantics, unverified/unknown/open cards (still unknown+stale) and other observers unchanged.
+Tests: owner archive stays closed on a quiet owner (verified and unverified), lag then catch-up, open card on a quiet
+owner still waits, leftover hub sub on an archived card writes no link while an open card's sub is kept.
+---
+ hermes_cli/kanban_origin_ledger.py            |  9 ++-
+ .../test_kanban_chat_links_owner_hub_subs.py  | 16 +++++
+ .../hermes_cli/test_kanban_origin_evidence.py | 61 +++++++++++++++++++
+ 3 files changed, 84 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 7810111acac8da07cbab5624824d75893433439d..233b93d18abd61a82db9af90f680b57872d7a1b2 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -486,7 +486,12 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+                     # every card a stopped worker had finished went back to unknown 450 s after the stop
+                     # (2026-11-16, workers 2, 5 and 7). The replica read keeps such a record released too
+                     # (``kanban_scope_heartbeat.published_before_silence``).
+-                    settled = current and released
++                    # [daveey] An explicit owner archive without a verified completion is settled the same way: the
++                    # card is closed (``closed`` below), and a sleeping owner must not turn it back into an unknown
++                    # obligation that keeps the origin chat waiting (hub chat 20261111_091916_d2d36a, 2026-11-18).
++                    # Only a newer owner record reopens it; an unproven or open record is never settled.
++                    settled = current and (released or (task.get('status') == 'archived'
++                                                         and bool(_owner_evidence(task))))
+                     # A successful origin pull does not prove the owner could
+                     # read this board. Consume the collector's qualified scope
+                     # inventory; missing/ambiguous inventory is not healthy.
+@@ -539,8 +544,8 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+                                    'blocked', 'triage', 'done', 'archived')
+                 # [daveey] A currently observed owner archive without a verified completion produces nothing: the
+                 # card is closed, not completed. It neither waits nor counts as done, and never releases as done.
+-                closed = bool(current and status == 'archived' and not released and _owner_evidence(task))
+                 observed = current or settled
++                closed = bool(observed and status == 'archived' and not released and _owner_evidence(task))
+                 if not observed or not known or (status in ('done', 'archived') and not released and not closed):
+                     status = 'unknown'
+                 from hermes_cli.kanban_completion_receipt_projection import remote_fields
+diff --git a/tests/hermes_cli/test_kanban_chat_links_owner_hub_subs.py b/tests/hermes_cli/test_kanban_chat_links_owner_hub_subs.py
+index 3fb63049c9d66124e4471bda295913aba833afce..d13727bffdda7959e1bf5363e2e6ac4db57c6da9 100644
+--- a/tests/hermes_cli/test_kanban_chat_links_owner_hub_subs.py
++++ b/tests/hermes_cli/test_kanban_chat_links_owner_hub_subs.py
+@@ -375,3 +375,19 @@ def test_task_chat_links_has_a_task_id_index_in_board_files_and_replicas_and_mig
+         assert not ksc.schema_ahead(reopened)
+     finally:
+         reopened.close()
++
++
++def test_archived_card_publishes_no_owner_link_for_its_leftover_hub_sub_and_keeps_the_open_card_link(gws):
++    """A hub sub left on an archived card (the chat that placed it is long gone) writes no link, so it cannot keep
++    that chat waiting; an unrelated open card's sub for the same chat is untouched. [daveey]"""
++    gws.at(OWNER)
++    conn = gws.conns[OWNER]
++    archived = kb.create_task(conn, title="withdrawn", assignee="default")
++    open_card = kb.create_task(conn, title="still going", assignee="default")
++    _sub(conn, archived, "hub/default/chat-same", "shepherd")
++    _sub(conn, open_card, "hub/default/chat-same", "shepherd")
++    assert kb.archive_task(conn, archived)
++    links.reconcile(conn, BOARD, OWNER)
++    assert _owner_links(conn, archived) == []
++    assert _owner_links(conn, open_card) == [("hub", "default", "chat-same", "shepherd", 0)]
++    assert conn.execute("SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?", (open_card,)).fetchone()[0] == 1
+diff --git a/tests/hermes_cli/test_kanban_origin_evidence.py b/tests/hermes_cli/test_kanban_origin_evidence.py
+index 8352d09e5a555ee086e25fe806977a19a49b1966..10601fa8e82834e5f3dbcd428267a991dddf6331 100644
+--- a/tests/hermes_cli/test_kanban_origin_evidence.py
++++ b/tests/hermes_cli/test_kanban_origin_evidence.py
+@@ -250,3 +250,64 @@ def test_owner_observation_proves_current_local_completion(board):
+         # the collector's per-scope heartbeat, not a per-task stamp).
+         assert observe(conn, task, now=2000) == observed
+         assert task.get('origin_observation') is None
++
++
++def _quiet_owner(replica, last_ok):
++    with sqlite3.connect(replica) as db:
++        db.execute("UPDATE meta SET v=? WHERE k='last_ok'", (str(last_ok),))
++
++
++def _archive_published(world, board, *, completed):
++    path, replica, binding = world
++    with kbc.connect_closing() as conn:
++        tid = create_bound(conn, binding)
++        publish_observed(conn, replica, binding, version=3)
++        accept(world)
++        if completed:
++            assert kb.complete_task(conn, tid, summary='Built and tested')
++        assert kb.archive_task(conn, tid)
++        publish_observed(conn, replica, binding, version=4)
++    return path, replica
++
++
++@pytest.mark.parametrize('completed', [False, True])
++def test_owner_archive_stays_closed_when_the_owner_goes_quiet(world, board, completed):
++    """An explicit owner archive (no artifact verification) ends the origin wait, and the owner going quiet
++    afterwards (a sleeping laptop) does not turn it back into an unknown obligation: the archive is the owner's
++    latest published record, as a verified completion is (2026-11-18, hub chat 20261111_091916_d2d36a)."""
++    path, replica = _archive_published(world, board, completed=completed)
++    row = ledger.project(path, replica=replica, gateway='origin', profile='default', now=1001)[0]
++    assert row['status'] == 'archived' and not row['unfinished']
++    _quiet_owner(replica, 1500)  # owner silent past its heartbeat window, transport itself fresh
++    row = ledger.project(path, replica=replica, gateway='origin', profile='default', now=1501)[0]
++    assert row['status'] == 'archived' and not row['unfinished'] and not row['stale']
++    assert row.get('closed_uncompleted', False) is not completed
++
++
++def test_archive_not_yet_seen_stays_unknown_then_closes_on_catchup(world, board):
++    """Replica lag: until the owner's archive record arrives the card is not known closed; after the catch-up it is."""
++    path, replica, binding = world
++    with kbc.connect_closing() as conn:
++        tid = create_bound(conn, binding)
++        publish_observed(conn, replica, binding, version=3)
++        accept(world)
++        assert kb.archive_task(conn, tid)
++        # the replica still holds the pre-archive record and the owner is silent: nothing authoritative to trust
++        _quiet_owner(replica, 1500)
++        row = ledger.project(path, replica=replica, gateway='origin', profile='default', now=1501)[0]
++        assert row['unfinished'] and row['status'] == 'unknown'
++        publish_observed(conn, replica, binding, version=4, now=1500)
++    row = ledger.project(path, replica=replica, gateway='origin', profile='default', now=1501)[0]
++    assert row['status'] == 'archived' and not row['unfinished']
++
++
++def test_nonterminal_owner_going_quiet_still_waits(world, board):
++    path, replica, binding = world
++    with kbc.connect_closing() as conn:
++        create_bound(conn, binding)
++        publish_observed(conn, replica, binding, version=3)
++        accept(world)
++        publish_observed(conn, replica, binding, version=4)
++    _quiet_owner(replica, 1500)
++    row = ledger.project(path, replica=replica, gateway='origin', profile='default', now=1501)[0]
++    assert row['unfinished'] and row['status'] == 'unknown'
+-- 
+2.43.0
+

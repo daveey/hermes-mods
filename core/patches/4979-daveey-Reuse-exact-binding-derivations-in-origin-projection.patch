@@ -1,0 +1,305 @@
+From 72639a34d591468bbb41a2d018a9cf1023c2a583 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:49:16 +0000
+Subject: [PATCH] [daveey] Reuse exact binding derivations in origin projection
+
+Origin projection and observation refresh repeatedly decode and validate the
+same bounded binding JSON even when fresh SQL returns identical bytes. Keep
+bounded exact-text decode and digest memos, returning caller-owned mappings.
+Hashing remains at its former consumer boundary; oversized and nontext values
+follow the literal path. No task projection, owner freshness, active stream,
+alias resolution or terminal deadline is cached.
+
+Proof: canonical direct-ledger importer suite: 41 files, 775 tests pass.
+Expanded binding and accounting suites: 9 tests pass. Original work-count test
+fails against parent source. Mutants removing nested copying, digest reuse,
+and ensure_boards accounting fail behaviorally. Full scripts/check passes.
+Captured-input diagnostic improves .1404-.1572s to .1264-.1437s; unpaired,
+plain SQLite openers and frozen clock, NOT live CPU-budget acceptance.
+
+This is one structural optimization for t_09269f57c7cf61e6, not completion of
+its under-0.5%-of-a-core Mac acceptance. No live Mac changes were made.
+---
+ hermes_cli/kanban_origin_ledger.py            |  12 +-
+ hermes_cli/kanban_origin_structure.py         |  57 +++++++
+ .../test_kanban_origin_structural_reuse.py    | 142 ++++++++++++++++++
+ .../test_kanban_sync_links_accounting.py      |  13 ++
+ 4 files changed, 219 insertions(+), 5 deletions(-)
+ create mode 100644 hermes_cli/kanban_origin_structure.py
+ create mode 100644 tests/hermes_cli/test_kanban_origin_structural_reuse.py
+
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index f5066f7bb13146fd94b586fbe73b7bc65c996db4..46ee7c23120e77638b0556aca40bde24bf60abbd 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -338,8 +338,9 @@ def _stuck_unreleased(task_raw: str, released: int) -> bool:
+ 
+ def _advanced_observation(binding_raw: str, observed: int, source: sqlite3.Connection) -> tuple | None:
+     """``(task, version, released)`` when the replica holds a newer, exactly bound record for this obligation."""
+-    binding = json.loads(binding_raw)
+-    validate_binding(binding)
++    from hermes_cli.kanban_origin_structure import binding as read_binding
++
++    binding = read_binding(binding_raw)
+     row = source.execute(
+         "SELECT version,data FROM replica WHERE gw=? AND coll='tasks' AND key=?",
+         (binding['owner']['gateway'], binding['task_record_key'])).fetchone()
+@@ -572,8 +573,9 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+                     alias_receipts.setdefault(ack['binding_hash'], []).append(ack)
+             for raw, resolved, payload, version, released in conn.execute(
+                     "SELECT binding_json,resolved_session,task_json,observation_version,released FROM origin_obligations"):
+-                binding = json.loads(raw)
+-                validate_binding(binding)
++                from hermes_cli import kanban_origin_structure as structure
++
++                binding = structure.binding(raw)
+                 origin, owner = binding['origin'], binding['owner']
+                 if (origin['gateway'], origin['profile']) != (gateway, profile):
+                     continue
+@@ -651,7 +653,7 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+                     **({'closed_uncompleted': True} if closed else {}),
+                     'stale': not observed, 'synced_at': last_ok,
+                     'remote': True, 'via': 'origin',
+-                    'legacy_aliases': aliases_for_projection(alias_receipts.get(binding_hash(binding), []), binding),
++                    'legacy_aliases': aliases_for_projection(alias_receipts.get(structure.digest(raw, binding), []), binding),
+                     # [daveey] Bounded run fields for what the card waits on (kanban_wait_info, display only).
+                     'park': _park_of(task),
+                     **{k: task[k] for k in ('awaiting', 'wake_check', 'human_request') if task.get(k)},
+diff --git a/hermes_cli/kanban_origin_structure.py b/hermes_cli/kanban_origin_structure.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..aa404c802e729003a8b0f84acfeeea187f6ec5ed
+--- /dev/null
++++ b/hermes_cli/kanban_origin_structure.py
+@@ -0,0 +1,57 @@
++"""Bounded exact-content derivations for origin reads, never live verdicts.
++
++Fresh SQL still supplies every raw value. No connection, projection, clock,
++active stream, alias resolution or pending deadline is retained here.
++"""
++from __future__ import annotations
++
++import json
++from functools import lru_cache
++
++_MAX_BINDING_CHARS = 4096
++
++
++def _decode_binding(raw):
++    from hermes_cli.kanban_origin_ledger import validate_binding
++
++    value = json.loads(raw)
++    validate_binding(value)  # exceptions are not cached
++    return value
++
++
++@lru_cache(maxsize=1024)
++def _binding(raw: str):
++    return _decode_binding(raw)
++
++
++def binding(raw):
++    """Return caller-owned validated structure; reuse only bounded exact text.
++
++    Validation bounds each nested mapping to string scalars, so copying these
++    two mappings is sufficient. Non-text/oversized inputs take the literal path
++    (including its errors), rather than growing retained memory without bound.
++    """
++    value = (_binding(raw) if type(raw) is str and len(raw) <= _MAX_BINDING_CHARS
++             else _decode_binding(raw))
++    return {**value, 'owner': dict(value['owner']), 'origin': dict(value['origin'])}
++
++
++@lru_cache(maxsize=1024)
++def _digest(raw: str):
++    from hermes_cli.kanban_origin_ledger import binding_hash
++
++    return binding_hash(_binding(raw))
++
++
++def digest(raw, value):
++    """Hash only at the original consumer boundary, after earlier errors."""
++    from hermes_cli.kanban_origin_ledger import binding_hash
++
++    return (_digest(raw) if type(raw) is str and len(raw) <= _MAX_BINDING_CHARS
++            else binding_hash(value))
++
++
++def clear() -> None:
++    """Retire all retained structural inputs (also useful for cold-read proofs)."""
++    _binding.cache_clear()
++    _digest.cache_clear()
+diff --git a/tests/hermes_cli/test_kanban_origin_structural_reuse.py b/tests/hermes_cli/test_kanban_origin_structural_reuse.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ec29c75bbbc3d9de09e8b61c39025d31858423d1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_structural_reuse.py
+@@ -0,0 +1,142 @@
++"""Structural input reuse must not freeze the live origin projection."""
++import json
++import sqlite3
++from contextlib import closing
++
++import pytest
++
++from hermes_cli import kanban_origin_ledger as ledger
++from tests.hermes_cli import test_kanban_origin_ledger as fixtures
++
++world = fixtures.world
++
++
++def _prepare(world):
++    path, replica, binding = world
++    fixtures.publish(replica, binding)
++    fixtures.accept(world)
++    with sqlite3.connect(replica) as conn:
++        conn.execute('CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)')
++        conn.execute("INSERT INTO meta VALUES ('last_ok', '1000')")
++        info = {'gateway': 'owner', 'task_scopes': [
++            {'profile': 'work', 'board': 'build', 'state': 'ok', 'observed_at': 1000}]}
++        conn.execute("INSERT INTO replica VALUES ('owner', 'gateway', 'info', 1, ?)",
++                     (json.dumps(info),))
++    with sqlite3.connect(path) as conn:
++        raw = conn.execute('SELECT binding_json FROM origin_obligations').fetchone()[0]
++    return path, replica, raw
++
++
++def test_unchanged_binding_is_not_decoded_again_after_a_minute(world, monkeypatch):
++    path, replica, raw = _prepare(world)
++    calls = []
++    original = json.loads
++
++    def counted(value, *args, **kwargs):
++        if value == raw:
++            calls.append(value)
++        return original(value, *args, **kwargs)
++
++    monkeypatch.setattr(json, 'loads', counted)
++    first = ledger.project(path, replica=replica, gateway='origin', profile='default', now=1001)
++    calls.clear()
++    second = ledger.project(path, replica=replica, gateway='origin', profile='default', now=1061)
++    assert second == first
++    assert calls == [], 'unchanged structural binding decoded again'
++
++
++def test_structural_reuse_does_not_hide_ledger_edit_or_result_mutation(world):
++    path, replica, _ = _prepare(world)
++    args = dict(replica=replica, gateway='origin', profile='default', now=1001)
++    first = ledger.project(path, **args)
++    first[0]['title'] = 'caller mutation'
++    first[0]['legacy_aliases'].append('caller mutation')
++    second = ledger.project(path, **args)
++    assert second[0]['title'] != 'caller mutation'
++    assert 'caller mutation' not in second[0]['legacy_aliases']
++    with sqlite3.connect(path) as conn:
++        conn.execute("UPDATE origin_obligations SET resolved_session='s_new_tip'")
++    assert ledger.project(path, **args)[0]['session'] == 's_new_tip'
++    with sqlite3.connect(path) as conn:
++        conn.execute("UPDATE origin_obligations SET binding_json='{broken'")
++    with pytest.raises(ValueError):
++        ledger.project(path, **args)
++
++
++def test_binding_cache_returns_owned_nested_mappings_and_retires_churn(world):
++    from hermes_cli import kanban_origin_structure as structure
++
++    _, _, raw = _prepare(world)
++    structure.clear()
++    original = json.loads(raw)
++    value = structure.binding(raw)
++    value['owner']['board'] = 'mutated'
++    value['origin']['session'] = 'mutated'
++    assert structure.binding(raw) == original
++    for version in range(1, 2200):
++        changed = {**original, 'version': version}
++        text = json.dumps(changed)
++        assert structure.binding(text) == changed
++        assert structure.digest(text, changed) == ledger.binding_hash(changed)
++    assert structure._binding.cache_info().currsize == 1024
++    assert structure._digest.cache_info().currsize == 1024
++    # Sustained churn still admits the most recent generation.
++    before = structure._binding.cache_info().hits
++    structure.binding(text)
++    assert structure._binding.cache_info().hits == before + 1
++    structure.clear()
++    assert structure._binding.cache_info().currsize == 0
++    assert structure._digest.cache_info().currsize == 0
++
++
++def test_large_and_nontext_binding_inputs_are_not_retained(world):
++    from hermes_cli import kanban_origin_structure as structure
++
++    _, _, raw = _prepare(world)
++    structure.clear()
++    for text in (raw.encode(), ' ' * 5000 + raw):
++        assert structure.binding(text) == json.loads(raw)
++        assert structure.digest(text, json.loads(raw)) == ledger.binding_hash(json.loads(raw))
++    assert structure._binding.cache_info().currsize == 0
++    assert structure._digest.cache_info().currsize == 0
++
++
++def test_exact_binding_text_changes_hash_and_origin_without_reset(world, monkeypatch):
++    from hermes_cli import kanban_origin_structure as structure
++
++    path, replica, raw = _prepare(world)
++    structure.clear()
++    original = json.loads(raw)
++    first_digest = structure.digest(raw, original)
++    changed = {**original, 'origin': {**original['origin'], 'session': 's_changed'}}
++    changed_raw = json.dumps(changed)
++    expected = ledger.binding_hash(changed)
++    assert expected != first_digest
++    calls = []
++    real_hash = ledger.binding_hash
++
++    def counted(value):
++        calls.append(value)
++        return real_hash(value)
++
++    monkeypatch.setattr(ledger, 'binding_hash', counted)
++    assert structure.digest(changed_raw, changed) == expected
++    assert len(calls) == 1
++    calls.clear()
++    assert structure.digest(changed_raw, changed) == expected
++    assert calls == []
++    with closing(sqlite3.connect(path)) as conn, conn:
++        conn.execute('UPDATE origin_obligations SET binding_json=?', (changed_raw,))
++    rows = ledger.project(path, replica=replica, gateway='origin', profile='default', now=1001)
++    assert rows[0]['origin_session'] == 's_changed'
++    assert structure.digest(raw, original) == first_digest
++
++
++def test_warm_binding_does_not_freeze_freshness(world):
++    path, replica, _ = _prepare(world)
++    args = dict(replica=replica, gateway='origin', profile='default')
++    first = ledger.project(path, **args, now=1001)
++    assert first[0]['status'] != 'unknown'
++    stale = ledger.project(path, **args, now=2000)
++    assert stale[0]['status'] == 'unknown'
++    assert ledger.project(path, **args, now=1001) == first
+diff --git a/tests/hermes_cli/test_kanban_sync_links_accounting.py b/tests/hermes_cli/test_kanban_sync_links_accounting.py
+index 59f30f6c22cc07bf84a895796186b0c634a037c5..22ff9b314091dd60b541f6ebc7ebbf9f6f752b4d 100644
+--- a/tests/hermes_cli/test_kanban_sync_links_accounting.py
++++ b/tests/hermes_cli/test_kanban_sync_links_accounting.py
+@@ -20,6 +20,19 @@ def test_links_substeps_account_work_and_unchanged_pass(live, ledger, kanban_hom
+     assert spies == {"reconcile": 0, "backfill": 0}
+ 
+ 
++def test_link_only_board_creation_is_accounted(live, ledger, kanban_home, scope):
++    ledger.append(helpers._ledger_row("t_remote", "s_chat", board="only-links"))
++    before = la.snapshot()["loops"]
++    helpers._pass(kanban_home)
++    after = la.snapshot()["loops"]
++    name = "sync.links.ensure_boards"
++    assert after.get(name, {}).get("runs", 0) == before.get(name, {}).get("runs", 0) + 1
++    paths = dict(helpers.ksc.board_paths())
++    assert "only-links" in paths
++    with helpers.kbc.connect(paths["only-links"]) as conn:
++        assert ("t_remote", "s_chat", "shepherd", 0) in helpers._links(conn)
++
++
+ def test_links_reconcile_substeps_are_accounted(live, ledger, kanban_home, scope):
+     before = la.snapshot()["loops"]
+     helpers._seed(live, ledger)
+-- 
+2.43.0
+

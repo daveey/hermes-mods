@@ -1,0 +1,262 @@
+From 0367f940835e7031416677fb1a31dab7180ee9ae Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 03:42:26 +0000
+Subject: [PATCH] fix(kanban-sync): retire audited fenced phantom event uploads
+ [daveey]
+
+Why: live_claim restoration intentionally tombstones a phantom lifecycle event, but generic rejection resolution vetoes that tombstone forever. Add a narrow primary-only retirement proof using fresh never-existed Board evidence, a matching rejection audit and compare-and-delete local revalidation. Leave audit, tombstone and worker lease untouched; never replay historical intent.
+
+Proof: normal-sync regression failed before the fix and passes after it; negative predicate and provenance-race controls; each permissive atom removal is killed. Live read-only replay at authenticated empty head 3579946 selects only the incident event. Recovery remains gated on review, CI and normal deployment.
+---
+ hermes_cli/kanban_sync_rejected_event.py      |  47 ++++++
+ hermes_cli/kanban_sync_rejections.py          |   5 +
+ .../test_kanban_rejected_phantom_event.py     | 159 ++++++++++++++++++
+ 3 files changed, 211 insertions(+)
+ create mode 100644 hermes_cli/kanban_sync_rejected_event.py
+ create mode 100644 tests/hermes_cli/test_kanban_rejected_phantom_event.py
+
+diff --git a/hermes_cli/kanban_sync_rejected_event.py b/hermes_cli/kanban_sync_rejected_event.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..05fb2265917ac376c3da0b109e2cde765ae09e2c
+--- /dev/null
++++ b/hermes_cli/kanban_sync_rejected_event.py
+@@ -0,0 +1,47 @@
++"""Retire only an upload the live-claim fence already removed locally. [daveey]"""
++from __future__ import annotations
++
++import json
++
++from hermes_cli import kanban_db_sync as sync
++
++
++def snapshot(conn, op, task):
++    """Include provenance and mode in the resolver's compare-and-delete snapshot."""
++    if op['table_name'] != 'task_events' or not task:
++        return None
++    audits = []
++    for row in conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='sync_rejected'", (task,)):
++        try:
++            payload = json.loads(row['payload'] or '')
++        except (ValueError, TypeError):
++            continue
++        if isinstance(payload, dict) and payload.get('op_id') == op['op_id']:
++            audits.append(dict(row))
++    return {'mode': (sync.sync_state(conn) or {}).get('mode'), 'audits': audits}
++
++
++def moot_event(op, before, evidence):
++    """Never replay a phantom lifecycle event or remove its anti-resurrection tombstone.
++
++    This does not authorize a lifecycle write: another worker may still hold the lease.
++    The immutable rejection audit and exact local tombstone survive outbox retirement.
++    """
++    stamp = before.get('fenced_event') or {}
++    audits = stamp.get('audits') or []
++    tombs = before['tombstones']
++    if (op['table_name'] != 'task_events' or op['op'] not in ('upsert', 'compat')
++            or str(op.get('last_error') or '').partition(':')[0] != 'live_claim'
++            or stamp.get('mode') != 'primary' or before['row'] is not None
++            or not before['parent'] or before['parent_ops'] or before['pending'] or before['receipt']
++            or len(tombs) != 1 or tuple(tombs[0][:2]) != ('task_events', op['row_uid'])
++            or len(audits) != 1):
++        return False
++    audit = json.loads(audits[0]['payload'])
++    fields = json.loads(op['fields'])
++    return bool(
++        audit.get('table') == 'task_events' and audit.get('uid') == op['row_uid']
++        and audit.get('reason') == op['last_error'] and audit.get('fields') == sorted(fields)
++        and fields.get('task_id') == before['task']
++        and evidence.get('state') == 'never_existed' and evidence.get('floor') == 0
++        and evidence.get('row') is None and evidence.get('tombstone') is None)
+diff --git a/hermes_cli/kanban_sync_rejections.py b/hermes_cli/kanban_sync_rejections.py
+index a6eeb1171caeea42c08f82533d2e31e7d8897a15..58b49e35212db87637a8bbd5e2d5240abe6d7567 100644
+--- a/hermes_cli/kanban_sync_rejections.py
++++ b/hermes_cli/kanban_sync_rejections.py
+@@ -56,7 +56,9 @@ def _inputs(conn, rejected):
+     parent = _local(conn, "tasks", task) if task else None
+     parent_ops = [tuple(r) for r in conn.execute(
+         "SELECT * FROM kanban_sync_outbox WHERE table_name='tasks' AND row_uid=?", (task,))] if task else []
++    from hermes_cli.kanban_sync_rejected_event import snapshot
+     return {"row": dict(row) if row else None, "fields": fields, "task": task,
++            "fenced_event": snapshot(conn, rejected, task),
+             "parent": dict(parent) if parent else None, "parent_ops": parent_ops,
+             "pending": pending, "tombstones": tombs, "run": dict(run_row) if run_row else None,
+             "receipt": reserved_key.receipt_for_op(conn, rejected["op_id"])}
+@@ -90,6 +92,9 @@ def _moot_release(op, before, evidence, run_evidence):
+ 
+ def _classify(op, before, evidence, parent_evidence, run_evidence=None):
+     from hermes_cli import kanban_sync_client as client
++    from hermes_cli.kanban_sync_rejected_event import moot_event
++    if moot_event(op, before, evidence):
++        return "moot", "live-claim fenced phantom event remains tombstoned with its rejection audit; never stored by Board"
+     if before["pending"] or before["tombstones"]:
+         return "unresolved", "pending local work or local tombstone"
+     gate = reserved_key.receipt_resolution(op, before, evidence, parent_evidence)
+diff --git a/tests/hermes_cli/test_kanban_rejected_phantom_event.py b/tests/hermes_cli/test_kanban_rejected_phantom_event.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d9c0fe07cd795535ee38a1f94fb0651225a53d48
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_rejected_phantom_event.py
+@@ -0,0 +1,159 @@
++"""A fenced phantom event stays tombstoned, but its rejected upload can retire."""
++import copy
++import json
++
++import pytest
++
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_live_claim_child_rows as child
++from tests.hermes_cli.test_kanban_remote_archive import _running_on_worker
++
++svc = child.svc
++gws = child.gws
++
++
++def test_normal_round_retires_fenced_event_and_keeps_audit_and_tombstone(gws, svc):
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    child._old_core_complete(hub.conn, tid)
++    op = dict(hub.conn.execute("SELECT * FROM kanban_sync_outbox WHERE table_name='task_events' "
++                               "AND json_extract(fields,'$.kind')='completed'").fetchone())
++    hub.round()
++    uid = op['row_uid']
++    tomb = tuple(hub.conn.execute("SELECT * FROM kanban_sync_tombstones WHERE table_name='task_events' "
++                                  "AND row_uid=?", (uid,)).fetchone())
++    audits = [tuple(r) for r in hub.conn.execute("SELECT uid,payload FROM task_events WHERE kind='sync_rejected'")
++              if json.loads(r['payload']).get('op_id') == op['op_id']]
++    assert len(audits) == 1
++    hub.round()
++    assert hub.conn.execute("SELECT 1 FROM kanban_sync_outbox WHERE op_id=?", (op['op_id'],)).fetchone() is None
++    assert tuple(hub.conn.execute("SELECT * FROM kanban_sync_tombstones WHERE table_name='task_events' "
++                                  "AND row_uid=?", (uid,)).fetchone()) == tomb
++    assert [tuple(r) for r in hub.conn.execute("SELECT uid,payload FROM task_events WHERE kind='sync_rejected'")
++            if json.loads(r['payload']).get('op_id') == op['op_id']] == audits
++    assert uid not in svc.board(child.BOARD)['rows']['task_events']
++    assert svc.board(child.BOARD)['leases'][tid]['holder'] == child.WORKER
++    assert client.status(hub.conn)['rejected'] == 0
++
++
++@pytest.fixture
++def refused(gws, svc, monkeypatch):
++    from hermes_cli import kanban_sync_rejected_event as event
++    from hermes_cli.kanban_sync_rejections import _inputs
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    child._old_core_complete(hub.conn, tid)
++    with monkeypatch.context() as patch:
++        patch.setattr(event, 'moot_event', lambda *args: False)
++        hub.round()
++    op = dict(hub.conn.execute("SELECT * FROM kanban_sync_outbox WHERE table_name='task_events' "
++                               "AND state='rejected'").fetchone())
++    before = _inputs(hub.conn, op)
++    evidence = svc.hub(child.HUB).row_evidence(child.BOARD, 'task_events', op['row_uid'])
++    assert event.moot_event(op, before, evidence)
++    return hub, op, before, evidence
++
++
++@pytest.mark.parametrize('veto', [
++    'table', 'operation', 'reason', 'shadow', 'row', 'parent', 'parent_ops', 'pending', 'receipt',
++    'no_tomb', 'parent_tomb', 'wrong_tomb', 'no_audit', 'duplicate_audit', 'audit_table', 'audit_uid',
++    'audit_reason', 'audit_fields', 'task_id', 'remote_live', 'floor', 'remote_row', 'remote_tomb',
++])
++def test_every_retirement_predicate_fails_closed(refused, veto):
++    from hermes_cli.kanban_sync_rejected_event import moot_event
++    _, op, before, evidence = copy.deepcopy((None, *refused[1:]))
++    if veto in ('table', 'operation', 'reason'):
++        op[{'table': 'table_name', 'operation': 'op', 'reason': 'last_error'}[veto]] = 'wrong'
++        if veto == 'reason':
++            audit = before['fenced_event']['audits'][0]
++            payload = json.loads(audit['payload'])
++            payload['reason'] = 'wrong'
++            audit['payload'] = json.dumps(payload)
++    elif veto == 'shadow':
++        before['fenced_event']['mode'] = 'shadow'
++    elif veto == 'row':
++        before['row'] = {'uid': op['row_uid']}
++    elif veto == 'parent':
++        before['parent'] = None
++    elif veto in ('parent_ops', 'pending', 'receipt'):
++        before[veto] = ['unsettled']
++    elif veto == 'no_tomb':
++        before['tombstones'] = []
++    elif veto == 'parent_tomb':
++        before['tombstones'].append(('tasks', before['task'], 1))
++    elif veto == 'wrong_tomb':
++        before['tombstones'] = [('tasks', before['task'], 1)]
++    elif veto == 'no_audit':
++        before['fenced_event']['audits'] = []
++    elif veto == 'duplicate_audit':
++        before['fenced_event']['audits'] *= 2
++    elif veto.startswith('audit_'):
++        audit = before['fenced_event']['audits'][0]
++        payload = json.loads(audit['payload'])
++        payload[veto.removeprefix('audit_')] = 'wrong'
++        audit['payload'] = json.dumps(payload)
++    elif veto == 'task_id':
++        fields = json.loads(op['fields'])
++        fields['task_id'] = 'another'
++        op['fields'] = json.dumps(fields)
++    else:
++        key, value = {'remote_live': ('state', 'live'), 'floor': ('floor', 1),
++                      'remote_row': ('row', {}), 'remote_tomb': ('tombstone', {})}[veto]
++        evidence[key] = value
++    assert not moot_event(op, before, evidence), veto
++
++
++@pytest.mark.parametrize('race', ['audit', 'mode', 'tombstone'])
++def test_evidence_read_revalidates_retirement_provenance(refused, svc, monkeypatch, race):
++    from hermes_cli.kanban_sync_rejections import resolve_rejections
++    hub, op, before, _ = refused
++    transport = svc.hub(child.HUB)
++    original = transport.row_evidence
++
++    def read(*args):
++        evidence = original(*args)
++        with hub.conn:
++            if race == 'audit':
++                hub.conn.execute("UPDATE task_events SET payload='{}' WHERE uid=?",
++                                 (before['fenced_event']['audits'][0]['uid'],))
++            elif race == 'mode':
++                hub.conn.execute("UPDATE kanban_sync_state SET mode='shadow'")
++            else:
++                hub.conn.execute("DELETE FROM kanban_sync_tombstones WHERE table_name='task_events' AND row_uid=?",
++                                 (op['row_uid'],))
++        return evidence
++
++    monkeypatch.setattr(transport, 'row_evidence', read)
++    report = resolve_rejections(hub.conn, transport, child.BOARD)
++    assert report[0]['action'] == 'retained'
++    assert report[0]['proof'] == 'local state changed during evidence read'
++    assert hub.conn.execute("SELECT 1 FROM kanban_sync_outbox WHERE op_id=?", (op['op_id'],)).fetchone()
++
++
++def test_each_allow_more_guard_removal_is_killed(refused, monkeypatch):
++    """Adjacent-valid controls must detect removing each atom, not just inverting the whole guard."""
++    import ast
++    import inspect
++    from hermes_cli import kanban_sync_rejected_event as event
++    source = ast.parse(inspect.getsource(event.moot_event))
++    guard = next(n for n in ast.walk(source) if isinstance(n, ast.If))
++    success = next(n for n in ast.walk(source) if isinstance(n, ast.BoolOp) and isinstance(n.op, ast.And))
++    vetoes = test_every_retirement_predicate_fails_closed.pytestmark[0].args[1]
++    for node, value in [(guard.test, False), (success, True)]:
++        for index in range(len(node.values)):
++            tree = copy.deepcopy(source)
++            target = next(n for n in ast.walk(tree) if isinstance(n, ast.BoolOp)
++                          and n.lineno == node.lineno and n.col_offset == node.col_offset)
++            target.values[index] = ast.Constant(value=value)
++            namespace = dict(event.__dict__)
++            exec(compile(ast.fix_missing_locations(tree), '<guard-removal>', 'exec'), namespace)
++            with monkeypatch.context() as patch:
++                patch.setattr(event, 'moot_event', namespace['moot_event'])
++                killed = False
++                for veto in vetoes:
++                    try:
++                        test_every_retirement_predicate_fails_closed(refused, veto)
++                    except (AssertionError, IndexError):
++                        killed = True
++                        break
++                assert killed, f'guard removal survived: {ast.unparse(node.values[index])}'
+-- 
+2.43.0
+

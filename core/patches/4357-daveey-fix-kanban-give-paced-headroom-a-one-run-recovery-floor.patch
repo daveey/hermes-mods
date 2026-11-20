@@ -1,0 +1,177 @@
+From 7d5a864798738e15545430eee49586b27e965b01 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 22:43:38 +0000
+Subject: [PATCH] [daveey] fix(kanban): give paced headroom a one-run recovery
+ floor
+
+PACED at idle was an absorbing zero: floor(avg_running * factor) admitted nothing, so the next average stayed zero. Preserve one shared provider slot after deferrable scaling; HELD still admits none. Known quota walls already reroute before pacing, so govern the destination rather than treating ordinary pacing as a wall.
+
+Proof: new recovery suite RED 9 failures on base; GREEN 63 tests across pacing, recovery and quota wall/release suites. Includes far-walled default reroute with destination pacing and occupied-floor rejection.
+---
+ hermes_cli/kanban_llm_pacing.py               |  6 +-
+ tests/hermes_cli/test_kanban_llm_pacing.py    |  1 +
+ .../test_kanban_llm_pacing_followups.py       |  5 +-
+ .../hermes_cli/test_kanban_pacing_recovery.py | 67 +++++++++++++++++++
+ website/docs/user-guide/features/kanban.md    |  2 +-
+ 5 files changed, 77 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_pacing_recovery.py
+
+diff --git a/hermes_cli/kanban_llm_pacing.py b/hermes_cli/kanban_llm_pacing.py
+index 3ab5bf610e3b7dbe5a1b1ff9aea0ebc3c6faa2a7..13bd2972be5595c148004863e82ecc8905fbbe89 100644
+--- a/hermes_cli/kanban_llm_pacing.py
++++ b/hermes_cli/kanban_llm_pacing.py
+@@ -205,7 +205,9 @@ def admit_limit(pace: PoolPace, avg_running: float, *, deferrable: bool, cfg: Pa
+     host does the same, and the fleet's burn lands on the sustainable rate. Deferrable work (review lane,
+     negative priority, scheduled wakes) gets ``deferrable_share`` of that, so it yields first. Just behind pace
+     (factor < ``OPEN_RAMP_FACTOR``) the host may grow to ``factor`` x its recent concurrency (at least one run),
+-    so a pool coming off a hold ramps up instead of bursting back into the wall."""
++    so a pool coming off a hold ramps up instead of bursting back into the wall. PACED also has headroom:
++    retain a one-run floor after the deferrable share, otherwise idle hosts remain at zero forever. HELD
++    alone means no readable headroom and keeps a zero allowance."""
+     if pace.state == UNKNOWN or (pace.state == OPEN and (pace.factor is None or pace.factor >= OPEN_RAMP_FACTOR)):
+         return None
+     if pace.state == HELD:
+@@ -213,4 +215,4 @@ def admit_limit(pace: PoolPace, avg_running: float, *, deferrable: bool, cfg: Pa
+     if pace.state == OPEN:
+         return max(1, math.ceil(max(0.0, avg_running) * float(pace.factor or 1.0)))
+     limit = math.floor(max(0.0, avg_running) * float(pace.factor or 0.0))
+-    return math.floor(limit * cfg.deferrable_share) if deferrable else limit
++    return max(1, math.floor(limit * cfg.deferrable_share) if deferrable else limit)
+diff --git a/tests/hermes_cli/test_kanban_llm_pacing.py b/tests/hermes_cli/test_kanban_llm_pacing.py
+index 7c390439d976b3d60f2b37680d1502252b0a5d1f..78b5780f2825b0b58a2ff3d74bf04abcd6775c93 100644
+--- a/tests/hermes_cli/test_kanban_llm_pacing.py
++++ b/tests/hermes_cli/test_kanban_llm_pacing.py
+@@ -153,6 +153,7 @@ def _opus_card(conn, title="work", **kw):
+ def test_pool_ahead_of_pace_defers_spawns(paced_board, monkeypatch):
+     _write_cfg(paced_board)
+     _usage(monkeypatch, 70, 6 * DAY)  # 70% in the week's first day: ~490% projected at reset
++    monkeypatch.setattr(pd, "local_running", lambda *_a: 1)  # recovery floor occupied
+     with kbc.connect() as conn:
+         tid = _opus_card(conn)
+         seen, result = _dispatch(conn)
+diff --git a/tests/hermes_cli/test_kanban_llm_pacing_followups.py b/tests/hermes_cli/test_kanban_llm_pacing_followups.py
+index b00b7ffbfce28e87029d4df297459e23e52fbdb4..7c6522ab501d5f27d9f34ec399be0ddd1b49d4ac 100644
+--- a/tests/hermes_cli/test_kanban_llm_pacing_followups.py
++++ b/tests/hermes_cli/test_kanban_llm_pacing_followups.py
+@@ -136,6 +136,7 @@ def test_paced_hold_records_a_skip_the_notices_and_diagnostics_name(paced_board,
+     _config(paced_board)
+     _paced_reads(monkeypatch)
+     monkeypatch.setattr(qp, "_running_and_limit", lambda *_a: (1, 7))  # free slots: the unrecorded case
++    monkeypatch.setattr(pd, "local_running", lambda *_a: 1)  # recovery floor occupied
+     start = time.time()
+     with kbc.connect() as conn:
+         tid = _opus(conn, "paced", session_id="chat")
+@@ -144,7 +145,7 @@ def test_paced_hold_records_a_skip_the_notices_and_diagnostics_name(paced_board,
+         assert result.llm_paced and result.llm_paced[0][:3] == (tid, "anthropic paced", None)
+         [skip] = _skips(conn, tid)
+         assert (skip["reason"], skip["detail"]) == (skips.LLM_PACED, "anthropic paced")
+-        assert skip["providers"] == [{"provider": "anthropic", "state": lp.PACED, "limit": 0, "running": 0}]
++        assert skip["providers"] == [{"provider": "anthropic", "state": lp.PACED, "limit": 1, "running": 1}]
+         _tick(conn)
+         assert len(_skips(conn, tid)) == 1  # one row per episode, not one per tick
+ 
+@@ -197,6 +198,7 @@ def test_held_pool_skip_carries_the_reset(paced_board, monkeypatch):
+ 
+ 
+ def test_dry_run_records_the_hold_on_the_result_only(paced_board, monkeypatch):
++    monkeypatch.setattr(pd, "local_running", lambda *_a: 1)  # recovery floor occupied
+     _config(paced_board)
+     _paced_reads(monkeypatch)
+     with kbc.connect() as conn:
+@@ -247,6 +249,7 @@ def _class_config(home, *providers):
+ 
+ 
+ def test_class_selector_is_paced_on_its_class_providers(paced_board, monkeypatch):
++    monkeypatch.setattr(pd, "local_running", lambda *_a: 1)  # recovery floor occupied
+     _class_config(paced_board, "anthropic")
+     _paced_reads(monkeypatch)
+     with kbc.connect() as conn:
+diff --git a/tests/hermes_cli/test_kanban_pacing_recovery.py b/tests/hermes_cli/test_kanban_pacing_recovery.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f0fc5edeef1a179ab830218ea70c1ca67f3c3e6d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pacing_recovery.py
+@@ -0,0 +1,67 @@
++"""Paced headroom must not trap idle dispatchers at zero concurrency. [daveey]"""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_llm_pacing as lp
++from hermes_cli import kanban_llm_pacing_dispatch as pd
++from hermes_cli import kanban_model_tier as tier
++from hermes_cli import kanban_provider_walls as walls
++from tests.hermes_cli import test_kanban_quota_episode as helpers
++from tests.hermes_cli.test_kanban_quota_episode_walls import LIVE_CFG, _clock
++
++board = helpers.board
++
++
++@pytest.mark.parametrize('average', [0, 0.5, 1, 6])
++@pytest.mark.parametrize('deferrable', [False, True])
++def test_paced_headroom_has_a_one_run_floor(average, deferrable):
++    pace = lp.PoolPace('openai-codex', lp.PACED, 0.15)
++    assert lp.admit_limit(pace, average, deferrable=deferrable, cfg=lp.PacingConfig()) == 1
++
++
++@pytest.mark.parametrize('deferrable', [False, True])
++def test_no_headroom_still_holds(deferrable):
++    pace = lp.PoolPace('openai-codex', lp.HELD, 0.0)
++    assert lp.admit_limit(pace, 0, deferrable=deferrable, cfg=lp.PacingConfig()) == 0
++
++
++@pytest.mark.parametrize('destination', [lp.PACED, lp.HELD])
++def test_far_wall_reroutes_before_pacing_and_destination_limits_claims(
++        board, monkeypatch, all_assignees_spawnable, destination):
++    clock = _clock(monkeypatch)
++    config, _ = helpers.routing(monkeypatch)
++    route = config['model_routing']['routes']['standard'][0]
++    config['model_routing']['routes'] = {'deep': [dict(route, model='claude-opus-5-5'),
++        dict(route, provider='openai-codex', model='gpt-6-astra')]}
++    monkeypatch.setattr(tier, 'load_tier_config', lambda: LIVE_CFG)
++    monkeypatch.setattr(walls, 'active_walls', lambda **kw: {'openai-codex': float(clock[0] + 6 * 86400)})
++    monkeypatch.setattr(walls, 'live_quota_wall', lambda *a, **kw: None)
++    monkeypatch.setattr(pd, 'load_config', lp.PacingConfig)
++    monkeypatch.setattr(pd, 'avg_running', lambda *a: 0)
++    consulted = []
++
++    def pace_for(conn, provider, cfg, now):
++        consulted.append(provider)
++        return lp.PoolPace(provider, destination if provider == 'anthropic' else lp.HELD, 0.15)
++
++    monkeypatch.setattr(pd, 'pace_for', pace_for)
++    with kbc.connect() as conn:
++        ids = [kb.create_task(conn, title=f'fresh default {i}', assignee='a') for i in range(2)]
++        seen = []
++        result = dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: seen.append(
++            (task.id, task.model_override, task.provider_override)))
++        assert consulted and set(consulted) == {'anthropic'}
++        if destination == lp.HELD:
++            assert seen == []
++            assert len(result.llm_paced) == 2
++        else:
++            assert len(seen) == 1
++            assert seen[0][0] in ids
++            assert seen[0][1:] == ('claude-opus-5-5', 'anthropic')
++            assert len(result.llm_paced) == 1
++            assert result.llm_paced[0][3]['providers'] == [
++                {'provider': 'anthropic', 'state': lp.PACED, 'limit': 1, 'running': 1}]
++            receipts = [e.payload for e in kb.list_events(conn, seen[0][0]) if e.kind == 'run_route']
++            assert receipts[-1]['tier_reason'] == 'default+wall:openai-codex'
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 15736198540d48d1ec21890e1719296fdd7200d2..c8259877906b428b2b655b1157c811b8f5041abf 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -1558,7 +1558,7 @@ To see why a ready card is not spawning, run `hermes kanban dispatch --dry-run`
+ Before claiming a ready or review card, the dispatcher checks the OAuth pool of the provider the card's next run would use (for a `class:*` selector, every provider the class may route to; the card waits only when all of them hold it). It reads each account's account-wide usage windows (`five_hour` and `seven_day` from `/api/oauth/usage`; Codex `Session`/`Weekly`) at most every `read_interval_seconds`, measures each window's burn rate from its recent samples, and compares the pool's burn with the rate that would bring every account with headroom to `target_percent` exactly at its window's reset. An account whose window has not started yet (the endpoint reports `null` for an idle `five_hour`) counts as a fresh full window; an account read successfully with both windows `null` (idle or brand-new) counts as two. A failed usage read adds no headroom.
+ 
+ - **open**: the pool is on or behind pace, so claims proceed (just behind pace, this host may grow only to its recent concurrency × the pace factor, at least one run).
+-- **paced**: the pool is ahead of pace, so this host keeps its recent average concurrency on that provider × the pace factor. Review-lane, negative-priority and continuation-woken cards get only `deferrable_share` of that limit.
++- **paced**: the pool is ahead of pace, so this host keeps its recent average concurrency on that provider × the pace factor. Review-lane, negative-priority and continuation-woken cards get only `deferrable_share` of that limit. The final limit has a one-run floor, including deferrable work: paced pools still have headroom, and an idle host must be able to restart rather than remain at zero forever. That floor is shared with running work on the provider, not an extra slot per card; it can exceed the proportional rate at low concurrency. Known quota walls are resolved before this check, and a rerouted card is governed by its destination provider's limit.
+ - **held**: every readable account is past its reserve (`reserve_five_hour_percent` / `reserve_seven_day_percent`), so no Kanban claim starts until the earliest reset frees one; the remaining headroom is left to chats, cron and notices.
+ 
+ A held card stays `ready` and unclaimed. The dispatcher records an `llm_paced` event (providers, state, limit, running) and a `dispatch_skipped` row with reason `llm_paced`. Queue position, the chat-wait and parent-unclaimed notices, and `hermes kanban diagnostics` (`held_in_ready`) name the hold instead of "skip reason unrecorded". Raising the card's priority does not lift it. If no account can be read, the governor fails open, and mandatory model pins and ungoverned providers always start. Only Kanban dispatch consults it.
+-- 
+2.43.0
+

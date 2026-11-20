@@ -1,0 +1,145 @@
+From ed8a0e47f59bd60318fa919b63a5086cb9663635 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:52:35 +0000
+Subject: [PATCH] fix(cron): fall back when speculative heredocs obscure
+ command frames [daveey]
+
+---
+ cron/lifecycle_guard_lines.py                 | 28 +++++++++--
+ ..._lifecycle_guard_heredoc_frame_fallback.py | 50 +++++++++++++++++++
+ 2 files changed, 75 insertions(+), 3 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_heredoc_frame_fallback.py
+
+diff --git a/cron/lifecycle_guard_lines.py b/cron/lifecycle_guard_lines.py
+index ef93a7bc7614ddf74859c3608c25c3cc4eb03cc1..eb7db4986d86f51ee60c1801af53094ef1d0c0ec 100644
+--- a/cron/lifecycle_guard_lines.py
++++ b/cron/lifecycle_guard_lines.py
+@@ -162,6 +162,9 @@ class _HereDocs:
+         self._pending: list[tuple[str, bool]] = []
+         self._arith = -1
+ 
++        self.unbounded = False
++        self.skipped = False
++
+     def bodies_end(self, text: str, pos: int, depth: int, *, word_start: bool) -> int:
+         """Advance on the character at *pos*; when it is the newline before complete bodies,
+         return the position after them, else *pos*."""
+@@ -178,6 +181,8 @@ class _HereDocs:
+         elif char == "\n" and self._pending:
+             end = _heredoc_bodies_end(text, pos + 1, self._pending)
+             self._pending = []
++            self.unbounded |= end < 0
++            self.skipped |= end > pos
+             return max(end, pos)
+         return pos
+ 
+@@ -194,6 +199,20 @@ def _command_span(text: str, start: int, *, shlex_quotes: bool,
+ 
+     With *breaks*, record (relative to the returned span) each newline that separates commands
+     in this frame or a nested parameter/command frame, so a logical-line split still sees them."""
++    initial_breaks = len(breaks) if breaks is not None else 0
++    end, span, retry = _walk_command_span(text, start, shlex_quotes, breaks, fallback=False)
++    if retry:
++        # A misread shift can skip the real closer. Discard speculative breaks and
++        # retry without body skipping or case patterns rather than hide outer commands.
++        if breaks is not None:
++            del breaks[initial_breaks:]
++        end, span, _ = _walk_command_span(text, start, shlex_quotes, breaks, fallback=True)
++    return end, span
++
++
++def _walk_command_span(text: str, start: int, shlex_quotes: bool,
++                       breaks: list[int] | None, *, fallback: bool) -> tuple[int, str, bool]:
++    """Walk one frame; request a conservative retry if skipped data hid its closer."""
+     pos = copied = start
+     depth = 1
+     word_start = True
+@@ -203,7 +222,10 @@ def _command_span(text: str, start: int, *, shlex_quotes: bool,
+     at_command = True
+     while pos < len(text):
+         char = text[pos]
+-        end = docs.bodies_end(text, pos, depth, word_start=word_start)
++        end = pos if fallback else docs.bodies_end(text, pos, depth, word_start=word_start)
++        if docs.unbounded:
++            # Unknown delimiter: body words cannot safely open case clauses.
++            cases = _CaseClauses()
+         if end > pos:
+             _newline_breaks(breaks, text, pos, end, _out_len(parts) + pos - copied)
+             pos = end
+@@ -219,7 +241,7 @@ def _command_span(text: str, start: int, *, shlex_quotes: bool,
+                 parts.append(text[pos:end].rstrip("\r").rstrip("\\"))
+             pos = copied = end
+             continue
+-        if word_start and char not in _WORD_BREAKS:
++        if word_start and char not in _WORD_BREAKS and not (fallback or docs.unbounded):
+             at_command = cases.word(_plain_word(text, pos), depth, at_command=at_command)
+         if char == "\\":
+             if text[pos + 1:pos + 2] != "\n":
+@@ -266,7 +288,7 @@ def _command_span(text: str, start: int, *, shlex_quotes: bool,
+         word_start = char in _WORD_BREAKS
+         pos += 1
+     parts.append(text[copied:pos])
+-    return pos, "".join(parts)
++    return pos, "".join(parts), bool(depth and docs.skipped)
+ 
+ 
+ def _parameter_span(text: str, start: int, *, shlex_quotes: bool,
+diff --git a/tests/cron/test_lifecycle_guard_heredoc_frame_fallback.py b/tests/cron/test_lifecycle_guard_heredoc_frame_fallback.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0bf76d1c2d4bec26a28c1071c524717765399b7c
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_heredoc_frame_fallback.py
+@@ -0,0 +1,50 @@
++"""Ambiguous heredocs must not extend a substitution past real shell commands."""
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from tests.cron import test_lifecycle_guard_comment_words as helpers
++
++
++ARITHMETIC = [
++    ("echo $[1<<2]", "2]"),
++    ("a[1<<2]=3", "2]=3"),
++    ("a=( $[1<<2] )", "2]"),
++    ("if((1<<2)); then :; fi", "2"),
++    ("while((0<<2)); do :; done", "2"),
++    ("!((1<<2))", "2"),
++]
++DELIMITERS = [
++    ("$'E'", "E"),
++    ('$"E"', "E"),
++    ("$'E\\x41'", "EA"),
++    ("`echo E`", "`echo E`"),
++    ("'E\\'", "E\\"),
++]
++FRAMES = ['echo "${x:-$(BODY)}"', 'echo ${x:-"$(BODY)"}',
++          'x="${x:-$(BODY)}"', 'echo "${x:-${y:-$(BODY)}}"']
++
++
++@pytest.mark.parametrize("body,tail", ARITHMETIC)
++@pytest.mark.parametrize("dangerous", [True, False], ids=["RUN", "clean"])
++def test_arithmetic_shift_is_not_a_heredoc(tmp_path, body, tail, dangerous):
++    helpers._tree(tmp_path)
++    cmd = "bash ./r.sh" if dangerous else "python3 ./clean.py"
++    command = 'echo "${x:-$(' + body + '\n)}"; ' + cmd + '\n' + tail
++    assert helpers._bash_runs(tmp_path, command) is dangerous
++    refused, reason = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert refused is dangerous, reason
++
++
++@pytest.mark.parametrize("delimiter,terminator", DELIMITERS)
++@pytest.mark.parametrize("frame", FRAMES)
++@pytest.mark.parametrize("dangerous", [True, False], ids=["RUN", "clean"])
++def test_unrecognized_heredoc_does_not_open_phantom_case(
++        tmp_path, delimiter, terminator, frame, dangerous):
++    helpers._tree(tmp_path)
++    body = 'cat <<' + delimiter + '\ncase x in\n' + terminator + '\n'
++    cmd = "bash ./r.sh" if dangerous else "python3 ./clean.py"
++    command = frame.replace("BODY", body) + '; ' + cmd
++    assert helpers._bash_runs(tmp_path, command) is dangerous
++    refused, reason = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert refused is dangerous, reason
+-- 
+2.43.0
+

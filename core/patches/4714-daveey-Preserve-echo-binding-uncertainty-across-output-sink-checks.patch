@@ -1,0 +1,201 @@
+From cf631abc6d001d65a993e790ed63e7847b38c00e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 21:49:31 +0000
+Subject: [PATCH] [daveey] Preserve echo binding uncertainty across output sink
+ checks
+
+A locally shadowed echo can evaluate its quoted argument. Revoke the parentheses exemption on functions, binding-changing commands, escapes and dynamic parameter words, and retain the raw source through secondary masking. Ordinary literal revision echoes remain allowed. The optional parameter-prefix allowance is deliberately withdrawn.
+
+Proof: 74 focused tests green before one additional passing heredoc-context test; 18 generated real Bash marker cases exercise function, alias, source and computed-loader bindings. Public oversized-script regressions remain refused. Full final-head cron suite and independent review pending.
+---
+ cron/lifecycle_guard_output.py                |  3 +-
+ .../cron/test_lifecycle_guard_echo_binding.py | 86 +++++++++++++++++++
+ .../test_lifecycle_guard_quoted_echo_sink.py  |  4 +-
+ tools/shell_heredoc.py                        | 21 ++++-
+ 4 files changed, 109 insertions(+), 5 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_echo_binding.py
+
+diff --git a/cron/lifecycle_guard_output.py b/cron/lifecycle_guard_output.py
+index 4f5cbdc282b84ad246aa86607d106694d099a144..0c99c357176edd677e5c07d381c192a7b6482329 100644
+--- a/cron/lifecycle_guard_output.py
++++ b/cron/lifecycle_guard_output.py
+@@ -73,7 +73,8 @@ def iter_printed_shell_payloads(
+     # or arguments carrying `$(`, backticks, `<(`… are never masked), so a real sink survives
+     # (self-heal lifecycleguard-f82a8e8dd311).
+     if not shell_sink and not output_reaches_shell(
+-            guard._mask_data_sink_arguments(guard.join_line_continuations(command))):
++            guard._mask_data_sink_arguments(guard.join_line_continuations(command)),
++            binding_source=command):
+         return
+     seen: set[str] = set()
+ 
+diff --git a/tests/cron/test_lifecycle_guard_echo_binding.py b/tests/cron/test_lifecycle_guard_echo_binding.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3f2bbcb5e5fc397d3fb3f8216d484bc7e72490f6
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_echo_binding.py
+@@ -0,0 +1,86 @@
++"""A literal echo spelling is not proof of a non-evaluating consumer."""
++
++import shlex
++import shutil
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from tools.shell_heredoc import output_reaches_shell
++
++
++_DEFINITIONS = [
++    'echo() { bash -c "$1"; };',
++    'function echo { bash -c "$1"; };',
++    'ec\\\nho () { bash -c "$1"; };',
++    'shopt -s expand_aliases; alias echo="bash -c"\n',
++    'source DEFINITIONS;',
++    '. DEFINITIONS;',
++    'sour"ce" DEFINITIONS;',
++    'loader=source; $loader DEFINITIONS;',
++    'loader=source; ${loader} DEFINITIONS;',
++]
++
++
++@pytest.mark.parametrize("definition", _DEFINITIONS)
++@pytest.mark.parametrize("producer", ["$(printf %s PAYLOAD)", "`printf %s PAYLOAD`"])
++def test_rebound_echo_real_shell_and_public_scanner(tmp_path, definition, producer):
++    marker = tmp_path / "marker"
++    payload = tmp_path / "payload"
++    payload.write_text("#!/bin/bash\nprintf reached > " + shlex.quote(str(marker)) + "\n", encoding="utf-8")
++    payload.chmod(0o700)
++    definitions = tmp_path / "definitions"
++    definitions.write_text('echo() { bash -c "$1"; }\n', encoding="utf-8")
++    prefix = definition.replace("DEFINITIONS", shlex.quote(str(definitions)))
++    command = prefix + '\necho "(' + producer.replace("PAYLOAD", shlex.quote(str(payload))) + ')"\n'
++    bash = shutil.which("bash")
++    assert bash is not None
++    result = subprocess.run([bash, "--noprofile", "--norc", "-c", command],
++                            capture_output=True, text=True, encoding="utf-8", timeout=10, check=False)
++    assert result.returncode == 0, result.stderr
++    assert marker.read_text(encoding="utf-8") == "reached"
++    assert output_reaches_shell(command)
++    # The public walk must still follow printed producer output, including its
++    # secondary data-argument-masked sink check. Never execute this large fixture.
++    large = tmp_path / "large"
++    large.write_text("# padding\n" * 150000, encoding="utf-8")
++    script = tmp_path / "script.sh"
++    script.write_text(prefix + '\necho "($(python3 <<\'EOF\'\n'
++                      + f'print("bash {large}")\nEOF\n))"\n', encoding="utf-8")
++    unsafe, reason = scan_gateway_lifecycle(f"bash -l {shlex.quote(str(script))}")
++    assert unsafe, reason
++    assert reason is not None and "cap" in reason.lower(), reason
++
++
++@pytest.mark.parametrize("prefix", [
++    'enable -n echo;', 'hash -p /somewhere/echo echo;',
++    'trap callback DEBUG;', 'export -f echo;',
++    'declare -f echo;', 'typeset -f echo;',
++    '\'echo\' () { :; };', 'ec"ho" () { :; };', 'ec\\ho () { :; };',
++    '$loader definitions;', '${loader} definitions;',
++    'sour"ce" definitions;', 'al"ias" echo=consumer;',
++    'e\\nable -n echo;', 'helper () { :; }; helper;',
++])
++def test_uncertain_binding_retains_sink(prefix):
++    assert output_reaches_shell(prefix + ' echo "($(printf payload))"')
++
++
++def test_original_binding_context_survives_secondary_mask(monkeypatch):
++    from cron import lifecycle_guard as guard
++    from cron.lifecycle_guard_output import iter_printed_shell_payloads
++
++    masked = 'echo "($(printf payload))"'
++    original = 'echo() { bash -c "$1"; }; ' + masked
++    assert not output_reaches_shell(masked)
++    assert output_reaches_shell(masked, binding_source=original)
++    monkeypatch.setattr(guard, "_mask_data_sink_arguments", lambda _: masked)
++    assert list(iter_printed_shell_payloads(original))
++
++
++def test_heredoc_mask_keeps_original_binding_uncertainty():
++    from tools.shell_heredoc import strip_inert_heredoc_bodies
++
++    command = 'python3 <<\'EOF\'\nprint("source")\nEOF\necho "($(printf payload))"'
++    assert strip_inert_heredoc_bodies(command) == command
++
+diff --git a/tests/cron/test_lifecycle_guard_quoted_echo_sink.py b/tests/cron/test_lifecycle_guard_quoted_echo_sink.py
+index 97fa2ad2558336a01fdb7271be4ed0e4b7c400d3..c11ef5aad23a817de8ab39abba841ecfccfebe6d 100644
+--- a/tests/cron/test_lifecycle_guard_quoted_echo_sink.py
++++ b/tests/cron/test_lifecycle_guard_quoted_echo_sink.py
+@@ -10,7 +10,7 @@ from cron.lifecycle_guard import scan_gateway_lifecycle
+ from tools.shell_heredoc import output_reaches_shell, strip_inert_heredoc_bodies
+ 
+ 
+-@pytest.mark.parametrize("prefix", ["", "revision ", "${v:-revision} "])
++@pytest.mark.parametrize("prefix", ["", "revision "])
+ @pytest.mark.parametrize("parens", ["(", "(("])
+ @pytest.mark.parametrize("producer", ["$(printf revision)", "`printf revision`"])
+ def test_quoted_parentheses_are_data(tmp_path, prefix, parens, producer):
+@@ -69,6 +69,8 @@ def test_arithmetic_output_remains_a_sink():
+ @pytest.mark.parametrize("command", [
+     'bash -c "bash <(printf payload)"',
+     'echo "bash <(printf payload)"',  # preserve the existing broad direct-sink policy
++    'echo "${v:-revision} ($(printf revision))"',
++    'echo "${v:-revision} (`printf revision`)"',
+     'unknown "revision ($(printf revision))"',
+     './"($(printf payload))"',
+     'echo "$(echo \"revision ($(printf revision))\")"',
+diff --git a/tools/shell_heredoc.py b/tools/shell_heredoc.py
+index 751ba373d2af119f112cbbea3d537cac79198b87..564aa45d36cbb899dc3ecde1b81abea373336216 100644
+--- a/tools/shell_heredoc.py
++++ b/tools/shell_heredoc.py
+@@ -519,7 +519,21 @@ _DATE_REBIND_RE = re.compile(
+     re.MULTILINE)
+ 
+ 
+-def output_reaches_shell(command: str) -> bool:
++def _echo_binding_uncertain(command: str) -> bool:
++    """Only certify ordinary builtin echo, never inferred command identities.
++
++    This raw-source overapproximation deliberately includes comments and heredoc
++    data. Quote concatenation, functions, dynamic words and caller-mutating
++    builtins must not disappear when another pass masks data arguments.
++    """
++    if "\\" in command or re.search(r"\$(?!\()", command):
++        return True
++    words = command.replace("'", "").replace('"', "")
++    return bool(_DATE_REBIND_RE.search(words) or re.search(
++        r"\(\s*\)|\b(?:function|eval|trap|read|unset|unalias|shopt)\b", words))
++
++
++def output_reaches_shell(command: str, *, binding_source: str | None = None) -> bool:
+     """Whether some command's output in *command* may be run as shell code (see
+     ``_SHELL_SINK_RE``). Deliberately broad: a match only stops treating consumer heredoc bodies
+     and printed string literals as data (the lifecycle walk then scans them as commands); it never
+@@ -530,6 +544,7 @@ def output_reaches_shell(command: str) -> bool:
+     from tools.shell_comments import mask_root_comment_lines
+ 
+     date_exempt = not _DATE_REBIND_RE.search(command)
++    echo_uncertain = _echo_binding_uncertain(command if binding_source is None else binding_source)
+     command = mask_root_comment_lines(command)
+     sink = _SHELL_SINK_NUMERIC_RE if date_exempt else _SHELL_SINK_RE
+     # The regex sees a substitution only in command position; inside arithmetic bash also runs
+@@ -542,7 +557,7 @@ def output_reaches_shell(command: str) -> bool:
+     # Literal '(' inside a double-quoted word is not a shell command boundary.
+     # Use the existing heredoc/expansion-aware lexical walk, and only its complete
+     # successful proof; a flat quote pass would misread quotes in heredoc data.
+-    if -1 in quoted_parens:
++    if echo_uncertain or -1 in quoted_parens:
+         quoted_parens.clear()
+     lexical = list(command)
+     for index in quoted_parens:
+@@ -785,7 +800,7 @@ def strip_inert_heredoc_bodies(command: str, *, nested: bool = False, _depth: in
+             stdin.intact = False
+         command_start = body_cursor
+     result = _apply_replacements(command, replacements)
+-    if replacements and output_reaches_shell(result):
++    if replacements and output_reaches_shell(result, binding_source=command):
+         # Some output here may be run as shell code (`( python3 - <<'PY' … ) | bash`, `f | bash`,
+         # `eval "$(…)"`): a consumer's body may be the shell's program, so mask nothing.
+         return command
+-- 
+2.43.0
+

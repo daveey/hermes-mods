@@ -1,0 +1,342 @@
+From 7252a1fb5a5dc38fa7638caa955198dfe669fb7d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 19:15:41 +0000
+Subject: [PATCH] perf(unloaded): gate card_change_pass (bookkeeping-only
+ board, unchanged remote inputs); remote gate observes first-seen terminal
+ cards (review #3349)
+
+---
+ tests/tui_gateway/test_h2_gate_mutations.py   |  3 +
+ tests/tui_gateway/test_h2_remainder_c11.py    | 29 ++++++++
+ .../tui_gateway/test_kanban_unloaded_gates.py | 21 ++++++
+ .../tui_gateway/test_remote_card_outcomes.py  | 71 +++++++++++++++++++
+ tui_gateway/kanban_unloaded_gates.py          | 21 ++++++
+ tui_gateway/notice_fanout.py                  | 67 ++++++++++++++++-
+ 6 files changed, 210 insertions(+), 2 deletions(-)
+
+diff --git a/tests/tui_gateway/test_h2_gate_mutations.py b/tests/tui_gateway/test_h2_gate_mutations.py
+index e0f7ed7a1450ce06a74cbb4ec98b99577804848a..8b10cc2545a47794bf318049be3dbd0945d9f586 100644
+--- a/tests/tui_gateway/test_h2_gate_mutations.py
++++ b/tests/tui_gateway/test_h2_gate_mutations.py
+@@ -339,6 +339,7 @@ def test_remote_pending_inputs_stay_hot(monkeypatch, tmp_path):
+     monkeypatch.setattr(kanban_origin, '_hub_db', lambda: tmp_path / 'hub.db')
+     monkeypatch.setattr(kanban_origin, 'gateway_names', lambda: ['me'])
+     monkeypatch.setattr(observer, 'fingerprint', lambda p: ('fp', 1))
++    monkeypatch.setattr(gates, '_replica_tasks_signature', lambda p: (1, 1, 1))
+     monkeypatch.setattr(remote, '_sweep_snapshot', lambda p, me: ([], {}))
+     monkeypatch.setattr(remote, 'ledger_path', lambda: ledger)
+     remote._woken.clear()
+@@ -360,6 +361,7 @@ def test_remote_pending_inputs_stay_hot(monkeypatch, tmp_path):
+     assert gates.probe('remote_notices').pending  # unknown replica state
+     monkeypatch.setattr(kanban_origin, 'gateway_names', lambda: [''])
+     monkeypatch.setattr(observer, 'fingerprint', lambda p: ('fp', 1))
++    monkeypatch.setattr(gates, '_replica_tasks_signature', lambda p: (1, 1, 1))
+     assert gates.probe('remote_notices').pending  # unknown gateway name
+ 
+ 
+@@ -376,6 +378,7 @@ def test_remote_each_key_component_moves_the_key_independently(monkeypatch, tmp_
+     monkeypatch.setattr(kanban_origin, '_hub_db', lambda: tmp_path / 'hub.db')
+     monkeypatch.setattr(kanban_origin, 'gateway_names', lambda: [state['me']])
+     monkeypatch.setattr(observer, 'fingerprint', lambda p: state['fp'])
++    monkeypatch.setattr(gates, '_replica_tasks_signature', lambda p: (1, 1, 1))
+     monkeypatch.setattr(remote, '_sweep_snapshot', lambda p, me: ([], {}))
+     monkeypatch.setattr(remote, 'ledger_path', lambda: state['ledger'])
+     remote._woken.clear()
+diff --git a/tests/tui_gateway/test_h2_remainder_c11.py b/tests/tui_gateway/test_h2_remainder_c11.py
+index 1c4f61bab91c1b0a9e16dc269c63b06793133d3d..a88e6a6f071ac724d67e765248bbe08b7c74e238 100644
+--- a/tests/tui_gateway/test_h2_remainder_c11.py
++++ b/tests/tui_gateway/test_h2_remainder_c11.py
+@@ -72,6 +72,35 @@ def test_unchanged_board_is_skipped_without_connecting(db, monkeypatch):
+     assert boards == []  # no per-pass board connect when the cursor equals the board's newest event
+ 
+ 
++def test_bookkeeping_events_keep_the_board_idle_and_advance_the_cursor(db, monkeypatch):
++    """A comment/heartbeat moves the newest event id but is no STATUS kind: ``_changed_tasks`` would return no card,
++    so the pass must not connect to the board (t_48c41072e7cba68d: the hub's default board never went idle)."""
++    tid = _card()
++    nf.card_change_pass(session_db=_opener(db))
++    ident = str(kb.kanban_db_path("default").resolve())
++    with contextlib.closing(kbc.connect()) as conn:
++        kb.add_comment(conn, tid, "someone", "a note")
++        top = conn.execute("SELECT MAX(id) FROM task_events").fetchone()[0]
++    from tui_gateway import notice_fanout_state as state
++    assert state.get_cursor(ident) < top
++    real, boards = kbc.connect, []
++    monkeypatch.setattr(kbc, "connect", lambda *a, **k: boards.append(k.get("board")) or real(*a, **k))
++    assert nf.card_change_pass(session_db=_opener(db)) == []
++    assert boards == [] and state.get_cursor(ident) == top
++
++
++def test_a_status_event_behind_bookkeeping_events_still_runs_the_pass(db, monkeypatch):
++    tid = _card()
++    nf.card_change_pass(session_db=_opener(db))
++    with contextlib.closing(kbc.connect()) as conn:
++        kb.add_comment(conn, tid, "someone", "a note")
++        assert kb.complete_task(conn, tid, summary="done")
++        kb.add_comment(conn, tid, "someone", "after")
++    ksa._reset_cache_for_tests()
++    changed = nf.card_change_pass(session_db=_opener(db))
++    assert [(c["task_id"], c["status"]) for c in changed] == [(tid, "done")]
++
++
+ def test_outcome_change_is_picked_up_within_one_pass(db, monkeypatch):
+     tid = _card()
+     nf.card_change_pass(session_db=_opener(db))
+diff --git a/tests/tui_gateway/test_kanban_unloaded_gates.py b/tests/tui_gateway/test_kanban_unloaded_gates.py
+index d768cd9250482c6c37558df6c42c30c81ac2f3a8..901cc6366e4765a207cdabbbca76b313abad5311 100644
+--- a/tests/tui_gateway/test_kanban_unloaded_gates.py
++++ b/tests/tui_gateway/test_kanban_unloaded_gates.py
+@@ -388,6 +388,9 @@ def remote_host(monkeypatch, tmp_path):
+     monkeypatch.setattr(remote, 'ledger_path', lambda: ledger)
+     monkeypatch.setattr(observer, 'fingerprint', lambda path: ('stamp', stamp[0]))
+     monkeypatch.setattr(remote, '_sweep_snapshot', lambda path, me: (list(cards), {}))
++    tasks = [(1, 1, 1)]
++    monkeypatch.setattr(gates, '_replica_tasks_signature', lambda path: tasks[0])
++    stamp.append(tasks)
+     gates.reset_for_tests()
+     remote._ledger(ledger).close()
+ 
+@@ -441,3 +444,21 @@ def test_remote_probe_open_chat_in_flight_claim_and_woken_stay_hot(remote_host):
+     finally:
+         with remote._woken_lock:
+             remote._woken.clear()
++
++
++def test_remote_probe_runs_when_an_unlinked_terminal_card_arrives(remote_host):
++    """``observe`` records the first sighting of every terminal state, linked or not; skipping the pass that would
++    record it lets a later link resurrect an expired notice (review of PR #3349)."""
++    gates, _, stamp, settle = remote_host
++    settle()
++    first = gates._remote()
++    assert not first.pending
++    stamp[1][0] = (2, 2, 3)  # a task row arrived; no card the sweep owes a notice for changed
++    assert gates._remote().key != first.key
++
++
++def test_remote_probe_unreadable_task_signature_stays_hot(remote_host):
++    gates, _, stamp, settle = remote_host
++    settle()
++    stamp[1][0] = None
++    assert gates._remote().pending
+diff --git a/tests/tui_gateway/test_remote_card_outcomes.py b/tests/tui_gateway/test_remote_card_outcomes.py
+index eb7b98db3d9ccd9bdaf4d5712747a06e6255853c..e60b85690d3222b6d408e91ca8e38ce1c55aedf0 100644
+--- a/tests/tui_gateway/test_remote_card_outcomes.py
++++ b/tests/tui_gateway/test_remote_card_outcomes.py
+@@ -162,3 +162,74 @@ def test_origin_alias_and_duplicate_rows_refresh_once(db, remote):
+     remote.extend([row, dict(row)])
+     assert len(run(db)) == 1
+     assert so.get_outcome(CHAT, db=db)["kind"] == "waiting"
++
++
++# --- the pass is skipped while its inputs are unchanged (t_48c41072e7cba68d) ------------------------------------------
++
++@pytest.fixture
++def gated(db, remote, monkeypatch):
++    """A controllable input key; ``reads`` counts the passes that actually read the projection."""
++    ledger, key, reads = [], [("gw", "default", ())], []
++    monkeypatch.setattr(nf, "_remote_inputs_key", lambda: None if key[0] is None else (key[0], list(ledger)))
++    real = remote
++
++    def read(ids, statuses, stale_ok):
++        reads.append(1)
++        return list(real)
++    monkeypatch.setattr(ksa, "_remote_cards", read)
++    return ledger, key, reads
++
++
++def test_unchanged_inputs_skip_the_remote_read(db, remote, gated):
++    _ledger, _key, reads = gated
++    run(db)  # seeds
++    run(db)
++    n = len(reads)
++    for _ in range(3):
++        assert run(db) == []
++    assert len(reads) == n  # three more passes, no read
++
++
++def test_a_changed_input_runs_the_pass_and_a_card_change_is_fanned_out(db, remote, gated):
++    _ledger, key, _reads = gated
++    assert so.refresh_outcome(CHAT, "manual", db=db)["kind"] == "done"
++    run(db)
++    run(db)
++    remote.append(card())
++    key[0] = ("gw", "default", ("revision", 2))
++    assert len(run(db)) == 1
++    assert so.get_outcome(CHAT, db=db)["kind"] == "waiting"
++
++
++def test_a_new_ledger_projection_runs_the_pass(db, remote, gated):
++    ledger, _key, reads = gated
++    run(db)
++    run(db)
++    n = len(reads)
++    ledger.append({"key": "x"})
++    run(db)
++    assert len(reads) > n
++
++
++def test_unvouched_inputs_never_skip(db, remote, gated):
++    _ledger, key, reads = gated
++    key[0] = None
++    run(db)
++    n = len(reads)
++    run(db)
++    run(db)
++    assert len(reads) > n
++
++
++def test_a_failed_refresh_is_retried_not_memoised(db, remote, gated, monkeypatch):
++    _ledger, key, reads = gated
++    run(db)
++    run(db)
++    remote.append(card())
++    key[0] = ("gw", "default", ("revision", 3))
++    with monkeypatch.context() as patch:
++        patch.setattr(so, "refresh_outcomes_quietly", lambda *a, **k: False)
++        assert run(db) == []
++    n = len(reads)
++    assert len(run(db)) == 1  # same inputs, but the chat was never acknowledged: the pass runs again
++    assert len(reads) > n
+diff --git a/tui_gateway/kanban_unloaded_gates.py b/tui_gateway/kanban_unloaded_gates.py
+index 53a06ece5cc4cf4bf7b587fcefe5c53302ae71f9..a2916e3b02e510ada87acd152cc02c4b0e492aa2 100644
+--- a/tui_gateway/kanban_unloaded_gates.py
++++ b/tui_gateway/kanban_unloaded_gates.py
+@@ -281,13 +281,34 @@ def _remote(live: frozenset = frozenset()) -> Inputs:
+         return Inputs()
+     # The key is what the pass would read, not the replica's commit counter: the hub's replica commits on every
+     # sync, and none of those commits changed a card this host owes a notice for (t_48c41072e7cba68d).
++    # ``observe`` records this host's first sighting of EVERY terminal state, linked or not, and a later link must
++    # not resurrect a notice that expired unseen: so a replica whose task rows changed is never skipped, even when
++    # no card the sweep owes a notice for changed. Unreadable = unknown = hot.
++    tasks = _replica_tasks_signature(path)
++    if tasks is None:
++        return Inputs()
+     digest = hashlib.sha256()
++    digest.update(repr(tasks).encode())
+     for owner, key, task, links in cards:
+         digest.update(repr((owner, key, remote._notice_state(task),
+                             tuple((link.get('profile'), link.get('session')) for link in links))).encode())
+     return Inputs((str(path), me, digest.hexdigest(), str(ledger), ledger_stamp), pending=False)
+ 
+ 
++def _replica_tasks_signature(path):
++    """The replica's task rows as ``observe`` reads them (count, newest seq, seq total): unchanged across the sync
++    pulls that commit only cursors or other collections. None when unreadable."""
++    import contextlib
++    import sqlite3
++
++    from tui_gateway.kanban_remote_notices import _ro
++    try:
++        with contextlib.closing(_ro(path)) as conn:
++            return tuple(conn.execute("SELECT COUNT(*), MAX(seq), TOTAL(seq) FROM replica WHERE coll='tasks'").fetchone())
++    except (OSError, sqlite3.Error, TypeError):
++        return None
++
++
+ def _cards_settled(conn, cards, live) -> bool:
+     """True when every notice the sweep could deliver already has a settled ledger row, so the pass has nothing to
+     deliver, claim, wait on or count. Anything unproven (a link without a settled row, an open chat, whose poller
+diff --git a/tui_gateway/notice_fanout.py b/tui_gateway/notice_fanout.py
+index 4603376969a951035ee7306375c822747bc2c641..dce3114fc513fbc04c9fe2b4094fde2dc914d0b3 100644
+--- a/tui_gateway/notice_fanout.py
++++ b/tui_gateway/notice_fanout.py
+@@ -49,6 +49,8 @@ _TASK_ID = re.compile(r"Kanban (t_[0-9A-Za-z_]+)")
+ 
+ 
+ def _reset_for_tests() -> None:
++    global _remote_memo
++    _remote_memo = None
+     from tui_gateway import notice_fanout_state
+     notice_fanout_state.reset_for_tests()
+ 
+@@ -182,8 +184,20 @@ def _board_idle(ident: str) -> bool:
+         if since is None:
+             return False
+         with reader(Path(ident)) as ro:
+-            top = ro.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0]
+-        return int(top) == since
++            top = int(ro.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0])
++            if top == since:
++                return True
++            if top < since:
++                return False
++            # Heartbeats, comments and other bookkeeping events move the newest id every few seconds on a live
++            # board, but ``_changed_tasks`` fans out only STATUS_EVENT_KINDS: when none lies in (since, top] the
++            # full pass would return no card, and only advance the cursor, which is all this does (t_48c41072e7cba68d).
++            kinds = ",".join("?" * len(STATUS_EVENT_KINDS))
++            if ro.execute(f"SELECT 1 FROM task_events WHERE id > ? AND id <= ? AND kind IN ({kinds}) LIMIT 1",
++                          (since, top, *STATUS_EVENT_KINDS)).fetchone() is not None:
++                return False
++        state.set_cursor(ident, top)
++        return True
+     except Exception:  # health: allow BLE001 -- an unreadable board is not idle; the full pass decides
+         logger.debug("card-change idle check unavailable for %s", ident, exc_info=True)
+         return False
+@@ -231,8 +245,55 @@ def _fan_out_changes(conn: sqlite3.Connection, _kb: Any, session_db: Callable, s
+     return out
+ 
+ 
++# The input key of the last remote pass that left every chat acknowledged, with the ledger cards it was computed over
++# (held, so an object identity in the key cannot be reused). A pass over the same inputs reads the same snapshot.
++_remote_memo: Optional[tuple] = None
++
++
++def _remote_inputs_key() -> Optional[tuple]:
++    """Everything ``activity._remote_cards`` reads for the replica projection that ``_remote_change_pass`` keeps
++    (card key, status, chat, origin chat), or None when any of it cannot be vouched for. That is each synced board's
++    replica content revision (trigger-backed only: a stat fallback never vouches), the origin-ledger projection's
++    card objects (``_remote_links`` returns the same dicts until it re-projects), this gateway and profile, and
++    the reader mode. A pull that moves only ``pulled_at`` changes none of them (t_48c41072e7cba68d)."""
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_session_activity as activity
++    from hermes_cli import kanban_sync_client as ksc
++    from hermes_cli.kanban_activity_revision import SHADOW_TABLES, is_revision
++    from hermes_cli.profiles import get_active_profile_name
++
++    if sync.sync_config().get("links_reader") != "replica":
++        return None
++    try:
++        gateway = ksc.load_identity().gateway
++    except ksc.SyncUnavailable:
++        return None
++    if not gateway:
++        return None
++    boards = []
++    for slug, _path in ksc.board_paths():
++        path = ksc.shadow_path(slug)
++        content = activity._board_content_key(path, SHADOW_TABLES)
++        if not is_revision(content):
++            return None
++        boards.append((slug, str(path), content))
++    ledger = activity._remote_links(stale_ok=True)
++    return (gateway, get_active_profile_name(), tuple(boards)), ledger
++
++
+ def _remote_change_pass(session_db: Callable) -> list[dict]:
+     """Observe the same remote projection as outcomes; failed reads never mean cards finished."""
++    global _remote_memo
++    try:
++        inputs = _remote_inputs_key()
++    except Exception:  # health: allow BLE001 -- an unreadable input is unknown: run the pass
++        logger.debug("remote card-change inputs unavailable", exc_info=True)
++        inputs = None
++    memo = _remote_memo
++    if inputs is not None and memo is not None and memo[0] == inputs[0] and len(memo[1]) == len(inputs[1]) \
++            and all(a is b for a, b in zip(memo[1], inputs[1])):
++        return []
++    _remote_memo = None
+     from hermes_cli import kanban_session_activity as activity
+     from hermes_state_outcome import refresh_outcomes_quietly
+     from tui_gateway import notice_fanout_state as state
+@@ -269,6 +330,8 @@ def _remote_change_pass(session_db: Callable) -> list[dict]:
+         out.append({"board": None, "task_id": None, "chat_id": chat, "session_id": tip,
+                     "status": None, "skipped": skipped, "source": "remote"})
+     state.ack_remote(acked)
++    if inputs is not None and all(previous.get(c) == snapshot.get(c) or c in acked for c in previous.keys() | snapshot.keys()):
++        _remote_memo = inputs
+     return out
+ 
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,321 @@
+From bc92377b37416718f7661273c028ea638c57cd8a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 12:23:58 +0000
+Subject: [PATCH] feat(kanban): define strict containment policy wire contract
+ [daveey]
+
+Foundation only: no lifecycle transition or production integration yet. Preserve the four legacy route boundaries as controls. Primary Opus scope review requires board-global task identity, same-board predicates, home-authoritative release and a Board companion fence before synced activation. Proof: canonical focused suites and policy guard mutations; full lifecycle, CLI/tool and replica proofs remain on the implementation owner.
+---
+ hermes_cli/kanban_containment_policy.py       |  61 ++++++++++
+ .../test_kanban_containment_legacy_paths.py   | 113 ++++++++++++++++++
+ .../test_kanban_containment_policy.py         | 110 +++++++++++++++++
+ 3 files changed, 284 insertions(+)
+ create mode 100644 hermes_cli/kanban_containment_policy.py
+ create mode 100644 tests/hermes_cli/test_kanban_containment_legacy_paths.py
+ create mode 100644 tests/hermes_cli/test_kanban_containment_policy.py
+
+diff --git a/hermes_cli/kanban_containment_policy.py b/hermes_cli/kanban_containment_policy.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f1ee04379ba45f6b452596154fc1c3c2695d4629
+--- /dev/null
++++ b/hermes_cli/kanban_containment_policy.py
+@@ -0,0 +1,61 @@
++"""Strict wire policy for non-human containment; authorization is separate.
++
++Parsing this policy NEVER grants permission or releases a task. Mutation callers
++must additionally establish current scoped authority or new producer evidence.
++"""
++from __future__ import annotations
++
++import re
++from typing import Any
++
++_IDENTITY_KEYS = frozenset({"gateway", "board", "task_id"})
++_POLICY_KEYS = frozenset({"version", "authority", "producer"})
++_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
++_TASK = re.compile(r"t_[0-9a-f]{8,16}\Z")
++
++
++class ContainmentPolicyError(ValueError):
++    """Malformed, ambiguous or self-authorizing containment policy."""
++
++    code = "invalid_containment_policy"
++
++
++def identity(value: Any) -> dict[str, str]:
++    """Copy one qualified task identity without repairing malformed identifiers."""
++    if not isinstance(value, dict) or value.keys() != _IDENTITY_KEYS:
++        raise ContainmentPolicyError("identity requires exactly gateway, board and task_id")
++    for key, pattern in (("gateway", _NAME), ("board", _NAME), ("task_id", _TASK)):
++        text = value[key]
++        if not isinstance(text, str) or not pattern.fullmatch(text):
++            raise ContainmentPolicyError(f"invalid identity {key}")
++    return dict(value)
++
++
++def policy(value: Any, *, target: Any) -> dict[str, Any]:
++    """A version-1 policy naming a distinct authority and optional distinct producer.
++
++    Keep the returned value independent of the caller's mutable objects: the
++    containment writer freezes it into its durable episode. Unknown keys fail
++    closed instead of silently promising a predicate the verifier cannot enforce.
++    """
++    subject = identity(target)
++    if not isinstance(value, dict) or not {"version", "authority"} <= value.keys() <= _POLICY_KEYS:
++        raise ContainmentPolicyError("policy requires version and authority; only producer is optional")
++    if type(value["version"]) is not int or value["version"] != 1:
++        raise ContainmentPolicyError("unsupported containment policy version")
++    authority = identity(value["authority"])
++    if authority["board"] != subject["board"]:
++        raise ContainmentPolicyError("authority must be on the contained task's board")
++    # Task IDs are board-global; gateway is an observed home, not identity.
++    # Rehome must neither strand a grant nor permit self-authorization.
++    if authority["task_id"] == subject["task_id"]:
++        raise ContainmentPolicyError("contained task cannot authorize its own resumption")
++    result: dict[str, Any] = {"version": 1, "authority": authority}
++    if "producer" in value:
++        producer = identity(value["producer"])
++        if producer["board"] != subject["board"]:
++            raise ContainmentPolicyError("producer must be on the contained task's board")
++        if producer["task_id"] == subject["task_id"]:
++            raise ContainmentPolicyError("contained task cannot be its own readiness producer")
++        result["producer"] = producer
++    return result
+diff --git a/tests/hermes_cli/test_kanban_containment_legacy_paths.py b/tests/hermes_cli/test_kanban_containment_legacy_paths.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..029eef4d690bea51c01de9276d199688e10ea8a0
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_containment_legacy_paths.py
+@@ -0,0 +1,113 @@
++"""Executable legacy-path evidence: none is a non-human containment operation.
++
++These controls intentionally retain the old semantics. The protected containment
++suite must supply a different transition, not weaken any of these boundaries.
++"""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_assignment_routing as assignment
++from hermes_cli import kanban_awaiting as awaiting
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK", "HERMES_KANBAN_RUN_ID",
++                "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_SESSION_ID",
++                "HERMES_DELEGATED_CHILD_CONTEXT"):
++        monkeypatch.delenv(key, raising=False)
++    from tests.hermes_cli.kanban_sync_support import write_sync_config
++    write_sync_config(home, False)
++    kb.init_db()
++    with kbc.connect_closing() as conn:
++        yield conn
++
++
++def _relay(conn):
++    relay = kb.create_task(conn, title="Lifecycle relay fixture", assignee="default", created_by="default")
++    consumer = kb.create_task(conn, title="Dependent consumer fixture", assignee="default", parents=[relay])
++    kb.recompute_ready(conn)
++    assert kb.claim_task(conn, relay, claimer="default") is not None
++    return relay, consumer
++
++
++def _edges(conn):
++    return {(row[0], row[1]) for row in conn.execute("SELECT parent_id, child_id FROM task_links")}
++
++
++@pytest.mark.parametrize("status", ["triage", "archived"])
++def test_remote_inactive_producer_cannot_be_a_scheduled_containment(board, monkeypatch, status):
++    """Use the real tool/confirmation seam; fake only the remote read transport."""
++    from hermes_cli import kanban_wait_check
++    from tools import kanban_tools
++    relay, consumer = _relay(board)
++    before = _edges(board)
++    producer = "t_aabbccdd11223344"
++    monkeypatch.setattr(kanban_wait_check, "check_remote", lambda *a, **kw: (1, f"{producer} {status}"))
++    monkeypatch.setenv("HERMES_KANBAN_TASK", relay)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb.get_task(board, relay).current_run_id))
++    result = json.loads(kanban_tools._handle_schedule({
++        "task_id": relay, "reason": "Wait for the named producer",
++        "awaiting": {"kind": "card", "ref": producer, "gateway": "fixture-peer"},
++    }))
++    assert awaiting.AGENT_ACTION_WAIT in json.dumps(result), result
++    assert kb.get_task(board, relay).status == "running"
++    assert kb.get_task(board, consumer).status == "todo"
++    assert _edges(board) == before
++
++
++def test_gate_only_creator_is_not_an_assignment_supervisor(board, monkeypatch):
++    from hermes_cli import config
++    from hermes_cli import kanban_profile_runnable
++    from hermes_cli import profiles
++    from hermes_cli.config_backend import config_exists as real_config_exists
++    import hermes_cli.config_backend as backend
++
++    relay, consumer = _relay(board)
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET created_by='fixture-gate' WHERE id=?", (relay,))
++    monkeypatch.setattr(config, "load_config_readonly", dict)
++    monkeypatch.setattr(profiles, "resolve_profile_env", lambda name: Path.home() / name)
++    monkeypatch.setattr(backend, "config_exists", lambda p: p.parent.name == "fixture-gate" or real_config_exists(p))
++    # Only the configured admission gate can run this creator. Model the actual
++    # registry/profile-read boundary, not an invented gate-only supervisor API.
++    monkeypatch.setattr(kanban_profile_runnable, "runnable", lambda name: name != "fixture-gate")
++    task = kb.get_task(board, relay)
++    with pytest.raises(assignment.AssignmentRoutingError, match="no_capable_supervisor"):
++        with kb.write_txn(board):
++            assignment.route(board, task, {"reason": "profile capability mismatch"})
++    assert kb.get_task(board, relay).status == "running"
++    assert kb.get_task(board, consumer).status == "todo"
++
++
++def test_review_transition_is_dispatchable_not_containment(board):
++    relay, consumer = _relay(board)
++    before = _edges(board)
++    assert kb.request_review(board, relay, summary="Review fixture")
++    assert kb.get_task(board, relay).status == "review"
++    # Direct review claim is the actual dispatch admission primitive, no model launch.
++    assert kb.claim_review_task(board, relay, claimer="independent-reviewer") is not None
++    assert kb.get_task(board, relay).status == "running"
++    assert kb.get_task(board, consumer).status == "todo"
++    assert _edges(board) == before
++
++
++def test_completion_releases_consumer_and_is_not_containment(board):
++    relay, consumer = _relay(board)
++    before = _edges(board)
++    assert kb.complete_task(board, relay, summary="Completed fixture")
++    kb.recompute_ready(board)
++    assert kb.get_task(board, relay).status == "done"
++    assert kb.get_task(board, consumer).status == "ready"
++    assert kb.claim_task(board, consumer, claimer="consumer") is not None
++    assert _edges(board) == before
+diff --git a/tests/hermes_cli/test_kanban_containment_policy.py b/tests/hermes_cli/test_kanban_containment_policy.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a3e34482dad8bcdeb9d4b726cb348604b72f3228
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_containment_policy.py
+@@ -0,0 +1,110 @@
++"""Containment wire validation is strict and never confers lifecycle authority."""
++from __future__ import annotations
++
++import copy
++
++import pytest
++
++from hermes_cli.kanban_containment_policy import ContainmentPolicyError, identity, policy
++
++TARGET = {"gateway": "fixture-home", "board": "work", "task_id": "t_11111111"}
++AUTHORITY = {"gateway": "fixture-home", "board": "work", "task_id": "t_22222222"}
++PRODUCER = {"gateway": "fixture-peer", "board": "work", "task_id": "t_33333333"}
++
++
++def test_policy_is_a_detached_exact_copy_not_an_authorization():
++    original = {"version": 1, "authority": dict(AUTHORITY), "producer": dict(PRODUCER)}
++    result = policy(original, target=TARGET)
++    assert result == original
++    original["authority"]["gateway"] = "changed"
++    original["producer"]["task_id"] = "t_44444444"
++    assert result == {"version": 1, "authority": AUTHORITY, "producer": PRODUCER}
++    assert policy({"version": 1, "authority": AUTHORITY}, target=TARGET) == {
++        "version": 1, "authority": AUTHORITY,
++    }
++
++
++@pytest.mark.parametrize("value", [None, [], "authority", 1, True])
++def test_non_object_policy_is_refused(value):
++    with pytest.raises(ContainmentPolicyError):
++        policy(value, target=TARGET)
++
++
++@pytest.mark.parametrize("version", [None, True, False, 1.0, "1", 0, 2])
++def test_version_is_exact_integer_one(version):
++    with pytest.raises(ContainmentPolicyError, match="version"):
++        policy({"version": version, "authority": AUTHORITY}, target=TARGET)
++
++
++@pytest.mark.parametrize("removed", ["version", "authority"])
++def test_required_policy_keys(removed):
++    value = {"version": 1, "authority": AUTHORITY}
++    del value[removed]
++    with pytest.raises(ContainmentPolicyError):
++        policy(value, target=TARGET)
++
++
++def test_unknown_predicate_is_not_silently_ignored():
++    with pytest.raises(ContainmentPolicyError):
++        policy({"version": 1, "authority": AUTHORITY, "timer": 60}, target=TARGET)
++
++
++@pytest.mark.parametrize("field", ["gateway", "board", "task_id"])
++@pytest.mark.parametrize("bad", [None, [], {}, True, "", " ", "bad value", "\n"])
++def test_identity_field_types_and_grammar(field, bad):
++    value = dict(AUTHORITY, **{field: bad})
++    with pytest.raises(ContainmentPolicyError):
++        identity(value)
++
++
++@pytest.mark.parametrize("value", [None, [], "task", {}, {**AUTHORITY, "profile": "default"},
++                                   {"gateway": "fixture-home", "task_id": "t_22222222"}])
++def test_identity_requires_exact_object_keys(value):
++    with pytest.raises(ContainmentPolicyError):
++        identity(value)
++
++
++@pytest.mark.parametrize("bad", ["t_ABCDEF12", "t_1234567", "t_123456789abcdef01", " t_12345678",
++                                 "t_12345678\n", "t_12345678 ", "12345678"])
++def test_task_tokens_are_not_normalized(bad):
++    with pytest.raises(ContainmentPolicyError):
++        identity({**AUTHORITY, "task_id": bad})
++
++
++@pytest.mark.parametrize("field", ["authority", "producer"])
++def test_same_task_id_on_another_gateway_is_still_self(field):
++    value = {"version": 1, "authority": AUTHORITY, field: {**TARGET, "gateway": "fixture-peer"}}
++    with pytest.raises(ContainmentPolicyError, match="own"):
++        policy(value, target=TARGET)
++
++
++@pytest.mark.parametrize("field", ["authority", "producer"])
++def test_cross_board_predicates_are_refused(field):
++    value = {"version": 1, "authority": AUTHORITY, field: {**PRODUCER, "board": "other"}}
++    with pytest.raises(ContainmentPolicyError, match="board"):
++        policy(value, target=TARGET)
++
++
++def test_different_task_on_another_gateway_is_allowed():
++    authority = {**AUTHORITY, "gateway": "fixture-peer"}
++    assert policy({"version": 1, "authority": authority}, target=TARGET)["authority"] == authority
++
++
++@pytest.mark.parametrize("field", ["authority", "producer"])
++def test_self_resume_routes_are_refused(field):
++    value = {"version": 1, "authority": AUTHORITY, field: copy.deepcopy(TARGET)}
++    with pytest.raises(ContainmentPolicyError, match="own"):
++        policy(value, target=TARGET)
++
++
++def test_explicit_null_producer_is_not_an_omission():
++    with pytest.raises(ContainmentPolicyError):
++        policy({"version": 1, "authority": AUTHORITY, "producer": None}, target=TARGET)
++
++
++@pytest.mark.parametrize("field", ["gateway", "board"])
++def test_identity_name_bounds_and_literal_preservation(field):
++    value = {**AUTHORITY, field: "A" + "-" * 63}
++    assert identity(value) == value
++    with pytest.raises(ContainmentPolicyError):
++        identity({**value, field: value[field] + "x"})
+-- 
+2.43.0
+

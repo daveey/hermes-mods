@@ -1,0 +1,175 @@
+From 55d8ccf83e8ded2f2cf4a85a25ff7c84777b471d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 12:05:22 +0000
+Subject: [PATCH] [daveey] lifecycle guard: follow multi-hop ssh to the stdin
+ consumer before walking a file as a remote shell
+
+Self-heal lifecycleguard-6d64a5ee3d48 (came back after t_example): on laptop-1
+`ssh hub "ssh worker python3 -" < takeover.py` was refused because `/Users/.../kanban.db`
+"is a SQLite database open in this gateway process". `_remote_reads_stdin` failed closed on
+any further ssh hop, so the Python file was walked as a remote login shell's script under
+unknown alias names, where `sqlite3.connect("<db>")` reads as `NAME ( <db> )` (executed).
+
+Follow each ssh hop through `_nested_shell_input` (capped at 4 hops, fail closed beyond)
+to the command that actually reads stdin. A chain ending in a data consumer (`python3 -`,
+`cat`) reads the file as data; one ending in a shell, a hop with no command, or a remote
+user switch (sudo/su/runuser/doas) still walks it as a nested shell. A remote `sudo -i`,
+which main allowed (the wrapper peeled to nothing), now fails closed too.
+
+Tests: 7 multi-hop data-consumer shapes (the card's exact command included) stay allowed,
+7 multi-hop shell shapes still refuse; 8 failed on base 2e51977721. tests/cron: 11404
+passed (1 load-timing failure, test_large_no_sink_heredoc_scan_stays_fast, passes 3/3
+alone).
+---
+ cron/lifecycle_guard_nested_shells.py         | 34 ++++++---
+ .../test_lifecycle_guard_session_aliases.py   | 71 +++++++++++++++++++
+ 2 files changed, 94 insertions(+), 11 deletions(-)
+
+diff --git a/cron/lifecycle_guard_nested_shells.py b/cron/lifecycle_guard_nested_shells.py
+index 35e5bac6f3114f45cec9d2205de4fdf5979cd9ff..37c1100e9b60db091e1c8387ce6b38078ff7da82 100644
+--- a/cron/lifecycle_guard_nested_shells.py
++++ b/cron/lifecycle_guard_nested_shells.py
+@@ -207,11 +207,22 @@ def _shell_inputs(arguments: list[str], shell: str) -> tuple[str, Optional[str]]
+     return "stdin", None
+ 
+ 
+-def _remote_reads_stdin(remote: list[str]) -> bool:
++# ssh hops followed to the command that reads stdin (`ssh hub "ssh worker python3 -" < f`);
++# a longer chain fails closed.
++_MAX_SSH_HOPS = 4
++
++
++def _remote_reads_stdin(remote: list[str], hops: int = 1) -> bool:
+     """Whether an ssh remote command (its words, as ssh joins them) hands stdin to a shell:
+-    none (a login shell), unparsable, or any segment running a shell that reads stdin."""
++    none (a login shell), unparsable, any segment running a shell that reads stdin, or a
++    further hop whose own input is such a shell (another ``ssh``), or a user switch (``sudo``,
++    ``su``, ``runuser``, ``doas``: not modelled, fail closed).
++    A further ssh hop is followed to its remote command, so a chain ending in a data consumer
++    (``python3 -``, ``cat``) reads the file as data (self-heal lifecycleguard-6d64a5ee3d48)."""
+     if not remote:
+         return True
++    if hops > _MAX_SSH_HOPS:
++        return True
+     text = " ".join(remote)
+     try:
+         views = list(_iter_command_segment_views(text))
+@@ -219,18 +230,19 @@ def _remote_reads_stdin(remote: list[str]) -> bool:
+         return True
+     for view in views:
+         index = _executed_command_index(view)
+-        if index is None:
++        name = _executable_name(view[index]) if index is not None else None
++        if index is not None and name in _SHELL_EXECUTABLES:
++            if _shell_inputs(_split_redirections(view[index + 1:])[0], name)[0] == "stdin":
++                return True
+             continue
+-        name = _executable_name(view[index])
+-        if name in _SHELL_EXECUTABLES and _shell_inputs(
+-                _split_redirections(view[index + 1:])[0], name)[0] == "stdin":
+-            return True
+-        if name in ("sudo", "su", "ssh"):
+-            return True  # another hop: fail closed rather than model it
++        if _nested_shell_input(view, hops=hops + 1) is not None:
++            return True  # an ssh hop feeding a shell, or a user switch's shell (`su -l`, `sudo -i`)
++        if name in ("sudo", "su", "runuser", "doas"):
++            return True  # a user switch on the remote side: fail closed rather than model it
+     return False
+ 
+ 
+-def _nested_shell_input(view: list[str]) -> Optional[tuple[str, Optional[str]]]:
++def _nested_shell_input(view: list[str], hops: int = 1) -> Optional[tuple[str, Optional[str]]]:
+     """``_shell_inputs`` of the nested shell *view* starts when that shell holds aliases of its
+     own (see above), else ``None``. For ssh only stdin counts: a remote ``-c`` or script names
+     remote text and paths. Command wrappers are peeled one at a time (``env su -l bob``,
+@@ -296,7 +308,7 @@ def _shell_input(
+         from tools.shell_heredoc import _SSH_VALUE_OPTIONS
+ 
+         _options, host = _option_words(arguments, frozenset(_SSH_VALUE_OPTIONS))
+-        return ("stdin", None) if _remote_reads_stdin(arguments[host + 1:]) else None
++        return ("stdin", None) if _remote_reads_stdin(arguments[host + 1:], hops) else None
+     if name not in _SHELL_EXECUTABLES:
+         return None
+     options_end = _shell_options_end(arguments, name)[0]
+diff --git a/tests/cron/test_lifecycle_guard_session_aliases.py b/tests/cron/test_lifecycle_guard_session_aliases.py
+index 62d7517221f01be57a039ba5de3b515ca6154fa8..63e0a4098948f7ecb4aea2cf113ec85c189e05d8 100644
+--- a/tests/cron/test_lifecycle_guard_session_aliases.py
++++ b/tests/cron/test_lifecycle_guard_session_aliases.py
+@@ -797,3 +797,74 @@ def test_script_shared_by_nested_and_session_scope_is_walked_in_both(tmp_path, s
+     unsafe, _refusal = scan_gateway_lifecycle(
+         shape, cwd=str(tmp_path), session_aliases=frozenset({"python3"}))
+     assert unsafe is True, shape
++
++
++# Self-heal lifecycleguard-6d64a5ee3d48 (came back after t_c8576f0d37494b77): a Python script
++# fed over TWO ssh hops (`ssh hub "ssh worker python3 -" < takeover.py`) was walked as a remote
++# login shell's script under unknown alias names, so `sqlite3.connect("<live kanban.db>")` read
++# as `NAME ( <db> )` and failed closed ("is a SQLite database open in this gateway process").
++# `_remote_reads_stdin` treated every further ssh hop as a stdin shell instead of following it to
++# the command that actually reads stdin. A hop chain ending in a data consumer reads the file as
++# data; one ending in a shell (or a hop with no command) still walks it as a nested shell.
++_PY_TAKEOVER = (
++    "import os, sqlite3\n"
++    "DB = os.path.expanduser('~/.hermes/kanban.db')\n"
++    "con = sqlite3.connect(\"{db}\")\n"
++    "print(con.execute('select 1').fetchall())\n"
++)
++
++_MULTI_HOP_DATA_CONSUMERS = [
++    # The card's exact shape (2026-11-15 02:18 PST, laptop-1).
++    "TZ=America/Los_Angeles date '+start %T %Z'\n"
++    "ssh -o BatchMode=yes -o ConnectTimeout=20 ubuntu@192.0.2.10 \"ssh -o BatchMode=yes "
++    "-o ConnectTimeout=15 worker-host python3 -\" < {py} 2>&1 | grep -vE 'gh[ps]_|eyJ' "
++    "| cut -c1-600\necho \"rc=${{PIPESTATUS[0]}}\"",
++    "ssh h1 'ssh h2 python3 -' < {py}",
++    "ssh h1 ssh h2 python3 - < {py}",
++    "ssh -p 22 h1 \"ssh -J j h2 'timeout 20 python3 -'\" < {py}",
++    "ssh h1 \"ssh h2 'ssh h3 python3 -'\" < {py}",
++    "ssh h1 'ssh h2 cat' < {script}",
++    "ssh h1 \"ssh h2 python3 -\" <<'PY'\n" + _PY_TAKEOVER + "PY",
++]
++
++
++@pytest.mark.parametrize("shape", _MULTI_HOP_DATA_CONSUMERS)
++def test_multi_hop_ssh_data_consumer_reads_stdin_as_data(tmp_path, live_kanban_db, shape):
++    """Detection guard for lifecycleguard-6d64a5ee3d48: every ssh hop is followed to the
++    command that reads stdin, and a data consumer there never makes the file a shell script."""
++    py = tmp_path / "takeover.py"
++    py.write_text(_PY_TAKEOVER.format(db=live_kanban_db))
++    script = tmp_path / "inner.sh"
++    script.write_text(f"t ( bash {live_kanban_db} )\n")
++    text = shape.format(db=live_kanban_db, py=py, script=script)
++    # Unknown session aliases (None) may rename a heredoc's consumer, so a heredoc body is
++    # visible there even for a bare `python3 - <<'PY'` (main's rule); a stdin file is not.
++    names_list = (frozenset({"zz"}), frozenset()) if "<<" in shape else (
++        frozenset({"zz"}), frozenset(), None)
++    for names in names_list:
++        assert scan_gateway_lifecycle(text, cwd=str(tmp_path), session_aliases=names) == (
++            False, None), (shape, names)
++
++
++_MULTI_HOP_SHELLS = [
++    "ssh h1 'ssh h2' < {script}",  # the last hop has no command: a remote login shell
++    "ssh h1 'ssh h2 bash -s' < {script}",
++    "ssh h1 \"ssh h2 'bash -l'\" < {script}",
++    "ssh h1 \"ssh h2 'ssh h3'\" < {script}",
++    "ssh h1 'ssh h2 python3 -; bash' < {script}",  # any shell segment reading stdin counts
++    "ssh h1 'sudo -i' < {script}",  # other hops are still not modelled: fail closed
++    "ssh h1 'ssh h2 su -l bob' < {script}",
++    "ssh h1 \"ssh h2 'ssh h3 \\\"ssh h4 'ssh h5 python3 -'\\\"'\" < {script}",  # hop cap: closed
++]
++
++
++@pytest.mark.parametrize("shape", _MULTI_HOP_SHELLS)
++def test_multi_hop_ssh_shell_still_walks_stdin_as_nested_script(tmp_path, live_kanban_db, shape):
++    """Controls: a hop chain that ends in a shell reading stdin (or that the walk cannot model)
++    keeps walking the file as that remote shell's script, under unknown alias names."""
++    script = tmp_path / "inner.sh"
++    script.write_text(f"t ( bash {live_kanban_db} )\n")
++    text = shape.format(db=live_kanban_db, script=script)
++    for names in (frozenset({"zz"}), frozenset(), None):
++        unsafe, refusal = scan_gateway_lifecycle(text, cwd=str(tmp_path), session_aliases=names)
++        assert unsafe is True and refusal is not None and "SQLite" in refusal, (shape, names)
+-- 
+2.43.0
+

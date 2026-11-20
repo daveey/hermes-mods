@@ -1,0 +1,437 @@
+From 0fd8469a2babf21dd467ce5103ae0ae329b6944f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:44:43 +0000
+Subject: [PATCH] [daveey] fix(upsync): reconcile fork behavior with upstream
+ b46e214954
+
+- await the fork's async journal save on a draining submit refusal (cron)
+- move the claim-loop admission/checkpoint reads off the owner loop
+- prefer upstream's per-task shell-state chain; fork overlay as fallback
+- notification/auto-continue claims settle via _notif_release_claim
+- adapt upstream tests to fork surfaces (refusal frame, pinned-unit notice,
+  full-tree detect job, legacy fixtures) and keep file caps
+---
+ agent/credential_pool.py                      |  5 +---
+ cron/scheduler_authority.py                   |  2 +-
+ gateway/run_class_routing.py                  |  2 +-
+ gateway/run_turn_prepare.py                   | 15 ++++++++---
+ gateway/session_authority.py                  |  9 ++++---
+ gateway/session_managed_worker.py             |  2 +-
+ hermes_cli/kanban_db_dispatch.py              |  2 +-
+ hermes_cli/main.py                            |  3 +--
+ tests/agent/test_redact.py                    | 13 ----------
+ tests/agent/test_redact_tavily.py             | 26 +++++++++++++++++++
+ tests/ci/test_classify_changes.py             |  4 ++-
+ .../test_update_pause_pinned_runtime.py       |  4 ++-
+ tests/hermes_cli/test_ux_messages_startup.py  |  2 +-
+ .../test_idle_lease_refusal_edges.py          |  8 ++++--
+ .../test_idle_lease_release_races.py          |  4 ++-
+ tools/environments/base.py                    | 20 +++++++-------
+ tui_gateway/methods_prompt.py                 |  3 ++-
+ tui_gateway/session_auto_continue.py          |  3 ++-
+ tui_gateway/session_notifications.py          |  8 ------
+ tui_gateway/session_notifications_surface.py  |  8 ++++++
+ 20 files changed, 86 insertions(+), 57 deletions(-)
+ create mode 100644 tests/agent/test_redact_tavily.py
+
+diff --git a/agent/credential_pool.py b/agent/credential_pool.py
+index 9dcc8a0db91f2f48bb47b83119a41d77af0c7d25..a37ba4017a76c7e263a3482ada932ceab69cbd65 100644
+--- a/agent/credential_pool.py
++++ b/agent/credential_pool.py
+@@ -25,10 +25,7 @@ from agent.secret_scope import get_secret as _get_secret, get_secret_str
+ from hermes_cli.auth_plugin_providers import plugin_refresh_hook
+ from agent.credential_pool_plugin import apply_plugin_refresh_result, plugin_row_is_expiring, recover_failed_plugin_refresh
+ from agent.credential_persistence import (
+-    fingerprint_secret_value,
+-    is_borrowed_credential_source,
+-    sanitize_borrowed_credential_payload,
+-)
++    fingerprint_secret_value, is_borrowed_credential_source, sanitize_borrowed_credential_payload)
+ import hermes_cli.auth as auth_mod
+ from hermes_cli.auth_oauth_grants import owned_profile_reads_root_state
+ from hermes_cli.auth import (
+diff --git a/cron/scheduler_authority.py b/cron/scheduler_authority.py
+index 8cb6efe8e4f88708869988ff6cf7152a0d7769d2..931962c61aee47b9f4e3c6795915889f3fb83e38 100644
+--- a/cron/scheduler_authority.py
++++ b/cron/scheduler_authority.py
+@@ -270,7 +270,7 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
+                     # Durable before the absence check: if that check is lost too, journal
+                     # recovery still knows the owner refused this fire as not ready.
+                     record['submit_refused'] = refused
+-                    save()
++                    await save()
+                 state = await call('recover', params)
+                 if state['status'] == 'missing' and refused:
+                     # [daveey] Refused while draining for a restart and proven never admitted:
+diff --git a/gateway/run_class_routing.py b/gateway/run_class_routing.py
+index a351d9e4ae950bcf74731023ee18dfe5911162dd..7854b9e3bea9e4d9b965338b703fd19a1793c1ea 100644
+--- a/gateway/run_class_routing.py
++++ b/gateway/run_class_routing.py
+@@ -58,7 +58,7 @@ def stored_route(runner, session_key):
+     entry = getattr(store, "_entries", {}).get(session_key) if session_key else None
+     db = getattr(runner, "_session_db", None)
+     db = getattr(db, "_db", db)
+-    if entry is None or db is None:
++    if entry is None or db is None or not isinstance(getattr(entry, "session_id", None), str):
+         return None
+     row = db.get_session(entry.session_id)
+     if not isinstance(row, dict):
+diff --git a/gateway/run_turn_prepare.py b/gateway/run_turn_prepare.py
+index 90b4e0eea4d00e50e25b672ceca82730408f8cc5..cb277dffab56e3ad899ca4cbb09bee6bbeac07ae 100644
+--- a/gateway/run_turn_prepare.py
++++ b/gateway/run_turn_prepare.py
+@@ -192,6 +192,16 @@ def _resolve_channel_runtime(runner, source, model, runtime_kwargs) -> tuple[str
+     return model, runtime_kwargs
+ 
+ 
++def _unavailable_override_notice(notice, unavailable_override, runtime_kwargs, model):
++    """The fallback notice for a turn whose session /model provider was unavailable (unless the
++    runtime resolution already carried one)."""
++    if not unavailable_override or notice:
++        return notice
++    from hermes_cli.fallback_config import pre_agent_fallback_notice
++    return pre_agent_fallback_notice(
++        unavailable_override["provider"], unavailable_override.get("model"), runtime_kwargs.get("provider"), model)
++
++
+ class GatewayTurnPrepareMixin:
+     def _resolve_session_agent_runtime(
+         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
+@@ -287,10 +297,7 @@ class GatewayTurnPrepareMixin:
+         if runtime_model:
+             logger.info("Runtime provider supplied explicit model override: %s -> %s", model, runtime_model)
+             model = runtime_model
+-        if unavailable_override and not notice:
+-            from hermes_cli.fallback_config import pre_agent_fallback_notice
+-            notice = pre_agent_fallback_notice(
+-                unavailable_override["provider"], unavailable_override.get("model"), runtime_kwargs.get("provider"), model)
++        notice = _unavailable_override_notice(notice, unavailable_override, runtime_kwargs, model)
+         if record_notice:
+             self._pre_agent_fallback_notice = notice
+ 
+diff --git a/gateway/session_authority.py b/gateway/session_authority.py
+index 8f9f6d67a5d9b2093521d1badbf64a9c596f9853..030aeead57512d1f82ccad7fe6f468b8b71da58a 100644
+--- a/gateway/session_authority.py
++++ b/gateway/session_authority.py
+@@ -1128,11 +1128,11 @@ class SessionAuthority:
+             from gateway.session_notifier_drain import eligible, queued_head
+             # A started update checkpoint precedes every queued row; only queued selection skips
+             # notifier wakes held by a core-update drain.
+-            checkpoint = checkpoint_head(self, ref)
++            checkpoint = await asyncio.to_thread(checkpoint_head, self, ref)
+             if checkpoint is not None and update_held(self):
+                 return UPDATE_PAUSED, None
+-            first = (get_session_admission(self.db, admission_id=checkpoint['admission_id']) if checkpoint
+-                     else queued_head(pending))
++            first = (await asyncio.to_thread(get_session_admission, self.db, admission_id=checkpoint['admission_id'])
++                     if checkpoint else queued_head(pending))
+             if attempted is not None:
+                 attempted[:] = [first]
+             if checkpoint is None and first is None and any(row['status'] == 'queued' for row in pending):
+@@ -1309,7 +1309,8 @@ class SessionAuthority:
+                     refusing = None
+                 # Remember the attempted FIFO identity, including a started checkpoint. A
+                 # refusal must never select a queued follower behind unfinished work.
+-                attempted = next(iter(list_session_admissions(self.db, session_id=ref.session_id)), None)
++                attempted = next(iter(await asyncio.to_thread(
++                    list_session_admissions, self.db, session_id=ref.session_id)), None)
+                 # The row the claim actually validated: a held notifier wake is skipped, so the
+                 # queued FIFO front is not necessarily the attempted queued identity.
+                 selected = _Attempt()
+diff --git a/gateway/session_managed_worker.py b/gateway/session_managed_worker.py
+index 30b873e73861f6d953222b8f0e515c6b848a88d4..1473754e9f469706072fd05a5f7aab3ef8176590 100644
+--- a/gateway/session_managed_worker.py
++++ b/gateway/session_managed_worker.py
+@@ -714,7 +714,7 @@ def _unsupported_command_result(row):
+     session's frozen route and never binds a preset, so every route into it (raw ``prompt.submit``,
+     a queued row, a slash.exec that got past its own check) is refused here instead of handing the
+     worker the literal command. A finite prompt's exit code is its only verdict, so it fails."""
+-    text = row['payload'].get('text')
++    text = (row.get('payload') or {}).get('text')
+     if not isinstance(text, str):
+         return None
+     from gateway.platforms.event import MessageEvent
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 122cbfc1c80167fe02e30de48b32db20a8a74af9..3fe0ee5eeae2733d0485e6e7b53a2aecff8d19ea 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2514,7 +2514,7 @@ def _open_worker_log(task: Task, board: Optional[str]):
+     log_path = log_dir / f"{task.id}.log"
+     from hermes_cli.kanban_worker_log import open_worker_log
+     log = open_worker_log(log_path)
+-    log.write(f'\n[kanban-worker-start] run_id={task.current_run_id}\n'.encode())
++    log.write(f'\n[kanban-worker-start] run_id={getattr(task, "current_run_id", None)}\n'.encode())
+     log.flush()  # must reach disk before a child can fail (even before importing its client)
+     return log
+ 
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 2e8c4f6b4b54c59ac2b4ee3444d8c758efc2a071..c745029fa1244746cf99f3d6d5381df365f14417 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -413,8 +413,7 @@ def _s6_supervised_gateway_run(argv: list) -> bool:
+     current profile, and it is the image's own CMD. Following the sticky ``active_profile`` there
+     started that profile's named slot on every container boot: the one the boot reconciler just
+     registered down, because a started named slot is a second gateway beside the multiplexer.
+-    ``--no-supervise`` (or any abbreviation argparse accepts) keeps the foreground run, which follows
+-    ``active_profile`` as before (#22502).
++    ``--no-supervise`` (or an argparse abbreviation) keeps the foreground run on ``active_profile`` (#22502).
+     """
+     words = [a for a in argv if not a.startswith("-")]
+     if words[:2] != ["gateway", "run"]:
+diff --git a/tests/agent/test_redact.py b/tests/agent/test_redact.py
+index db1d688acb51f7e798409838a24fc9812edf8da9..16174a1984606fe174a82c8734d5a911f061a65f 100644
+--- a/tests/agent/test_redact.py
++++ b/tests/agent/test_redact.py
+@@ -675,19 +675,6 @@ class TestElevenLabsTavilyExaKeys:
+ 
+ 
+ 
+-    def test_tavily_environment_scoped_keys_redacted(self):
+-        # Current Tavily keys carry a tvly-dev-/tvly-prod- segment (#72925).
+-        for env in ("dev", "prod"):
+-            key = "tvly-" + env + "-Ab3dE5fG7hJ9kL1mN2pQ4rS6"
+-            for text in (f"echo {key} done", f'{{"query": "{key}"}}'):
+-                result = redact_sensitive_text(text)
+-                assert "E5fG7hJ9kL1m" not in result, result
+-
+-    def test_hyphenated_tavily_names_are_not_keys(self):
+-        # Package/file names starting with tvly- are not keys; only an env segment may carry a hyphen.
+-        for text in ("pip install tvly-python-client", "tvly-config-file"):
+-            assert redact_sensitive_text(text) == text
+-
+     def test_all_three_in_env_dump(self):
+         env_dump = (
+             "HOME=/home/user\n"
+diff --git a/tests/agent/test_redact_tavily.py b/tests/agent/test_redact_tavily.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5157dfbd4e2d5d9d4f47341010ce7a9b88ca4289
+--- /dev/null
++++ b/tests/agent/test_redact_tavily.py
+@@ -0,0 +1,26 @@
++"""Tavily key shapes: environment-scoped tvly-dev-/tvly-prod- keys (#72925). Split from test_redact.py (file cap)."""
++
++import pytest
++
++from agent.redact import redact_sensitive_text
++
++
++@pytest.fixture(autouse=True)
++def _ensure_redaction_enabled(monkeypatch):
++    monkeypatch.delenv("HERMES_REDACT_SECRETS", raising=False)
++    monkeypatch.setattr("agent.redact._REDACT_ENABLED", True)
++
++
++def test_tavily_environment_scoped_keys_redacted():
++    # Current Tavily keys carry a tvly-dev-/tvly-prod- segment (#72925).
++    for env in ("dev", "prod"):
++        key = "tvly-" + env + "-Ab3dE5fG7hJ9kL1mN2pQ4rS6"
++        for text in (f"echo {key} done", f'{{"query": "{key}"}}'):
++            result = redact_sensitive_text(text)
++            assert "E5fG7hJ9kL1m" not in result, result
++
++
++def test_hyphenated_tavily_names_are_not_keys():
++    # Package/file names starting with tvly- are not keys; only an env segment may carry a hyphen.
++    for text in ("pip install tvly-python-client", "tvly-config-file"):
++        assert redact_sensitive_text(text) == text
+diff --git a/tests/ci/test_classify_changes.py b/tests/ci/test_classify_changes.py
+index e165ef3929784658392edd79a241377fe2cf454f..896347cd3376d1282fe19f2cbeee6f0fd2019da9 100644
+--- a/tests/ci/test_classify_changes.py
++++ b/tests/ci/test_classify_changes.py
+@@ -626,7 +626,9 @@ def test_every_lane_reaches_the_composite_action():
+ def test_classifier_runs_in_the_detect_jobs_sparse_checkout(tmp_path):
+     """The detect job checks out only its sparse list; an import outside it fails CI on every PR."""
+     steps = _yaml(".github/workflows/ci.yaml")["jobs"]["detect"]["steps"]
+-    sparse = next(s["with"]["sparse-checkout"] for s in steps if "sparse-checkout" in s.get("with", {}))
++    sparse = next((s["with"]["sparse-checkout"] for s in steps if "sparse-checkout" in s.get("with", {})), None)
++    if sparse is None:
++        pytest.skip("[daveey] the fork's detect job checks out the full tree: nothing outside it to import")
+     for rel in sparse.split():
+         (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+         if (_REPO / rel).is_dir():
+diff --git a/tests/hermes_cli/test_update_pause_pinned_runtime.py b/tests/hermes_cli/test_update_pause_pinned_runtime.py
+index 3973aa5610047589c2cd97519e999aa088949ed0..bbac8e67c100a6ab207fed155dc1fa97afd6c807 100644
+--- a/tests/hermes_cli/test_update_pause_pinned_runtime.py
++++ b/tests/hermes_cli/test_update_pause_pinned_runtime.py
+@@ -131,7 +131,9 @@ def test_update_proceeds_past_a_pinned_unit_that_cannot_idle_pause(host, capsys,
+     assert verdict is None, f"the update was deferred on a gateway it cannot affect: {verdict}"
+     assert host["asked"] == [], "the pinned gateway was asked for an idle pause it cannot answer"
+     assert host["writes"] == [] and host["repairs"] == [], "the pinned unit was touched through systemd"
+-    assert UNIT in out and "running its own checkout" in out and str(host["core"]) in out, out
++    # [daveey] Either probe may name it first: the live code root or (upstream) the unit's own checkout.
++    assert UNIT in out and ("running its own checkout" in out or "another Hermes checkout" in out), out
++    assert str(host["core"]) in out, out
+     assert host["procs"][0].poll() is None, "the pinned gateway was stopped"
+     assert host["dropin"].read_bytes() == host["dropin_before"], "the pin (drop-in ExecStart) changed"
+     assert not deferrals.state_path().exists(), "a pause that went through left a deferral streak"
+diff --git a/tests/hermes_cli/test_ux_messages_startup.py b/tests/hermes_cli/test_ux_messages_startup.py
+index 933299223f0c7052c7c6c6e94827aa2bdd36c227..b94bc15b549d587dc054b627a5797761bffc2ccd 100644
+--- a/tests/hermes_cli/test_ux_messages_startup.py
++++ b/tests/hermes_cli/test_ux_messages_startup.py
+@@ -69,7 +69,7 @@ def test_title_cased_profile_label_is_normalised_not_rejected(monkeypatch):
+ def test_invalid_dash_p_after_a_subcommand_is_left_to_that_subcommand(monkeypatch):
+     # A plugin/subcommand flag such as `hermes kanban serve -p "Work Bot"` is not our profile selector.
+     monkeypatch.setattr(sys, "argv", ["hermes", "kanban", "serve", "-p", "Work Bot"])
+-    assert _main._scan_profile_flag(sys.argv[1:]) == (None, 0, None)
++    assert scan_profile_flag(sys.argv[1:]) == (None, 0, None)
+ 
+ 
+ _REPO = Path(__file__).resolve().parents[2]
+diff --git a/tests/tui_gateway/test_idle_lease_refusal_edges.py b/tests/tui_gateway/test_idle_lease_refusal_edges.py
+index 3948581a592ed6b956907541ef1844638d8c1b48..4d3e28e5a85931d17c1e82fabb8e4e4d7cdd41ea 100644
+--- a/tests/tui_gateway/test_idle_lease_refusal_edges.py
++++ b/tests/tui_gateway/test_idle_lease_refusal_edges.py
+@@ -146,7 +146,9 @@ def _user_turn_in_refusal_gap(chat, monkeypatch, competitor):
+     user_turn = []
+ 
+     def emit(event, sid, payload=None, **_kw):
+-        if event == "error" and not user_turn:  # admission already set running=False here
++        # [daveey] the fork closes a refused turn with an error message.complete frame (_emit_terminal_turn_error)
++        if (event == "error" or (event == "message.complete" and (payload or {}).get("status") == "error")) \
++                and not user_turn:  # admission already set running=False here
+             competitor.release()
+             err, _ = server._lock_in_submit_turn("user", chat.sid, chat.record, "hello", {}, False, None, None, None)
+             user_turn.append(err)
+@@ -212,7 +214,9 @@ def _user_turn_after_refusal(chat, monkeypatch):
+     user_turn = []
+ 
+     def emit(event, sid, payload=None, **_kw):
+-        if event == "error" and not user_turn:
++        # [daveey] the fork closes a refused turn with an error message.complete frame (_emit_terminal_turn_error)
++        if (event == "error" or (event == "message.complete" and (payload or {}).get("status") == "error")) \
++                and not user_turn:
+             chat.lease.release()
+             # The user's own turn claims running in the gap (any admitted turn source does the same).
+             with chat.record["history_lock"]:
+diff --git a/tests/tui_gateway/test_idle_lease_release_races.py b/tests/tui_gateway/test_idle_lease_release_races.py
+index 09ec410840e3cef9180b2d411a45c7afae3d817a..d721c66c706946a66fad62ca9aad15c0390f1840 100644
+--- a/tests/tui_gateway/test_idle_lease_release_races.py
++++ b/tests/tui_gateway/test_idle_lease_release_races.py
+@@ -151,7 +151,9 @@ def test_a_refused_loop_tick_never_clears_a_user_turn_that_started_in_the_gap(ch
+     user_turn = []
+ 
+     def emit(event, sid, payload=None, **_kw):
+-        if event == "error" and not user_turn:  # the refusal frame: running is already False here
++        # [daveey] the fork closes a refused turn with an error message.complete frame (_emit_terminal_turn_error)
++        if (event == "error" or (event == "message.complete" and (payload or {}).get("status") == "error")) \
++                and not user_turn:  # the refusal frame: running is already False here
+             competitor.release()
+             err, _fields = server._lock_in_submit_turn(
+                 "user", chat.sid, chat.record, "hello", {}, False, None, None, None)
+diff --git a/tools/environments/base.py b/tools/environments/base.py
+index 2eb7b3871bd3b7ba8eadaeea094f5bb7c2211c5c..3f96d7f63a70eeabdac8d8ecda1ae1866a9e73e0 100644
+--- a/tools/environments/base.py
++++ b/tools/environments/base.py
+@@ -533,26 +533,26 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
+     def _wrap_command(self, command: str, cwd: str) -> str:
+         """Full bash script: source snapshot, cd, run, re-dump env, emit CWD markers.
+ 
+-        Inside a delegate_task child the script reads and writes that child's overlay snapshot
+-        (falling back to the enclosing child's, then the parent's), because children share the
+-        parent's environment object: without it a child's ``export HERMES_KANBAN_DB=...`` landed
+-        in the shared snapshot and every later parent command sourced it. [daveey] Outside the fork's
+-        delegate scope, upstream's per-task alias chain (``shell_state_scope``) does the same by task id."""
++        Inside a delegate_task child the script reads and writes that child's own snapshot, because
++        children share the parent's environment object: without it a child's ``export HERMES_KANBAN_DB=...``
++        landed in the shared snapshot and every later parent command sourced it. Upstream's per-task alias
++        chain (``shell_state_scope``, set by terminal_tool) keys it by task id, seeded from the ancestors.
++        [daveey] A child command outside that scope uses the fork's per-delegation overlay instead
++        (falling back to the enclosing child's, then the parent's)."""
+         kwargs = self._snapshot_script_kwargs(cwd)
+         fallbacks: list[str] = []
+         seeds: list[str] = []
+         from agent.delegation_context import delegated_child_scope_chain
+-        chain = delegated_child_scope_chain()
+-        if chain:
++        if task_chain := [self._task_snapshot_path(t) for t in _shell_state_chain.get()]:
++            seeds = [self._quote_shell_path(p) for p in (*task_chain[1:], self._snapshot_path)]
++            kwargs = self._snapshot_script_kwargs(cwd, task_chain[0])
++        elif chain := delegated_child_scope_chain():
+             paths = [self._child_snapshot_path(scope) for scope in chain]
+             own = paths[-1]
+             fallbacks = [self._quote_shell_path(p) for p in reversed(paths[:-1])]
+             fallbacks.append(kwargs["quoted_snap"])
+             kwargs["quoted_snap"] = self._quote_shell_path(own)
+             kwargs["snap_tmp_template"] = self._quote_shell_path(own + _SNAP_TMP_SUFFIX)
+-        elif task_chain := [self._task_snapshot_path(t) for t in _shell_state_chain.get()]:
+-            seeds = [self._quote_shell_path(p) for p in (*task_chain[1:], self._snapshot_path)]
+-            kwargs = self._snapshot_script_kwargs(cwd, task_chain[0])
+         return _wrap_command_script(
+             command,
+             passthrough_names=self._snapshot_excluded_passthrough_names(),
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index 5521fce2537e06f5d2c362e6198c5a10cf929ec6..ebb3fa073a44d81ea4f9e2e82b14637c8a40a96c 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -996,7 +996,8 @@ def _(rid, params: dict) -> dict:
+             busy_transport = t or session.get("transport")
+         if not busy:
+             err, survivor_fields = _claim_submit_turn(
+-                rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind)
++                rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind,
++                internal_hosted_submit)
+             if err is None:
+                 break
+             if (err.get("error", {}).get("data") or {}).get("reason") == "turn_claim_busy":
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index 941fc84145c19f075cd5c8f52b4a437ad9e98d10..a4414c6df46157961a9ea746caea5be3e54b35d7 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -931,7 +931,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
+         queue_generation = int(session.get("_queued_prompt_generation", 0))
+         _ac_set_queue(session, session.get("queued_prompts") or [])
+         session["running"] = True
+-        session["_notif_turn_claim"] = claim = object()  # the exception release below frees only this claim
++        session["_notif_turn_claim"] = object()  # [daveey] _dispatch_claimed_queue reads it back: its release frees only this claim
+         queued_transport = queued.get("transport")
+         # The queuer's transport is pinned so the drained turn reaches the client that sent it — but
+         # ATTACHED, not rebound: a mid-turn prompt from a second client used to silence the first for the
+@@ -945,6 +945,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
+ 
+ 
+ def _dispatch_claimed_queue(rid, sid, session, queued, queue_generation):
++    claim = session.get("_notif_turn_claim")  # set by _drain_queued_prompt's claim just before
+     use_compute_host = _session_uses_compute_host(session)
+     with session["history_lock"]:
+         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index bef213377100e65c007dd3faeae1f799d01f7e39..2cc7cd6605606df5a2dcfc5397be65f7b40b8c6c 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -499,14 +499,6 @@ def _maybe_fire_tui_heartbeat_tick(sid: str, session: dict) -> None:
+             mgr.abandon_fire()
+ 
+ 
+-def _loop_route_is_gateway_chat(state) -> bool:
+-    """A /loop set from a messaging chat carries the gateway's ``route`` (platform + chat_id); its wakeup scanner
+-    (``gateway/run_goals.py::_loop_wakeup_fire_one``) fires those and skips route-less CLI/TUI loops. Mirror it here
+-    so a Desktop viewer of the same session never consumes the tick and strands the reply off the chat."""
+-    route = getattr(state, "route", None) or {}
+-    return bool(route.get("platform") and route.get("chat_id"))
+-
+-
+ def _session_owns_live_wakeup_schedule(session: dict) -> bool:
+     """True while THIS process's notification poller is the only driver of an active /loop or /heartbeat for
+     ``session`` — the reapers must then keep the detached session (and with it the poller) alive, or the schedule
+diff --git a/tui_gateway/session_notifications_surface.py b/tui_gateway/session_notifications_surface.py
+index 6b983cb292521e4fa926ec24038bdf8181c24042..1ffdeca992b196110c1889df19fc281aa10ef756 100644
+--- a/tui_gateway/session_notifications_surface.py
++++ b/tui_gateway/session_notifications_surface.py
+@@ -37,6 +37,14 @@ def _prepend_note(run_message: Any, note: str) -> Any:
+     return run_message
+ 
+ 
++def _loop_route_is_gateway_chat(state) -> bool:
++    """A /loop set from a messaging chat carries the gateway's ``route`` (platform + chat_id); its wakeup scanner
++    (``gateway/run_goals.py::_loop_wakeup_fire_one``) fires those and skips route-less CLI/TUI loops. Mirror it in
++    session_notifications so a Desktop viewer of the same session never consumes the tick and strands the reply."""
++    route = getattr(state, "route", None) or {}
++    return bool(route.get("platform") and route.get("chat_id"))
++
++
+ def register(server) -> None:
+     """Publish this module's helpers onto ``server``, rebound to its globals."""
+     bind_module(globals(), server, skip=("_",))
+-- 
+2.43.0
+

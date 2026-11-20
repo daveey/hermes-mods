@@ -1,0 +1,206 @@
+From db0049e59385d26014ea34f713830ff1a297cc8b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 21:36:35 +0000
+Subject: [PATCH] test(kanban): pin containment resume and replica guard
+ boundaries [daveey]
+
+---
+ .../hermes_cli/test_kanban_cli_exit_status.py | 15 +++
+ .../test_kanban_containment_lifecycle.py      | 12 +++
+ .../test_kanban_containment_remote.py         | 21 +++++
+ .../test_kanban_containment_replica.py        | 92 +++++++++++++++++++
+ tools/kanban_containment_tools.py             |  3 +-
+ 5 files changed, 142 insertions(+), 1 deletion(-)
+
+diff --git a/tests/hermes_cli/test_kanban_cli_exit_status.py b/tests/hermes_cli/test_kanban_cli_exit_status.py
+index 70d732aeb6ca12941f205ddebf9b2e7d7c0d2a1e..55b85fbf7f72a8caa7018fd209430365cc7d2891 100644
+--- a/tests/hermes_cli/test_kanban_cli_exit_status.py
++++ b/tests/hermes_cli/test_kanban_cli_exit_status.py
+@@ -58,3 +58,18 @@ def test_delegated_child_kanban_cli_refusal_returns_nonzero_exit_status(tmp_path
+ 
+     assert refused.returncode == 1
+     assert "delegate_task" in refused.stderr
++
++
++def test_delegated_child_cli_refuses_contain_and_resume_contained(tmp_path):
++    home = tmp_path / "hermes"
++    home.mkdir()
++    created = _run_hermes(home, "kanban", "create", "containment adapter probe", "--json")
++    assert created.returncode == 0, created.stderr
++    task_id = json.loads(created.stdout)["id"]
++    for extra in (
++        ("contain", "--authority", task_id, "--summary", "fixture"),
++        ("resume-contained", task_id, "--episode", "01234567-89ab-7def-8123-456789abcdef"),
++    ):
++        refused = _run_hermes(home, "kanban", *extra, marker=True)
++        assert refused.returncode == 1, refused.stderr + refused.stdout
++        assert "delegate_task" in refused.stderr
+diff --git a/tests/hermes_cli/test_kanban_containment_lifecycle.py b/tests/hermes_cli/test_kanban_containment_lifecycle.py
+index 83c0754756d615b45d9e66499cab2c24c9e56701..43ce006c64b5de2e889fea709a8a8127ddcce18d 100644
+--- a/tests/hermes_cli/test_kanban_containment_lifecycle.py
++++ b/tests/hermes_cli/test_kanban_containment_lifecycle.py
+@@ -190,3 +190,15 @@ def test_failed_release_transaction_does_not_leave_a_durable_permission(board, m
+     assert board.execute("SELECT COUNT(*) FROM containment_attestations").fetchone()[0] == 0
+     assert guard.pending(board, relay, verify_release=lifecycle_verifier(board))
+     assert kb.get_task(board, relay).status == "triage"
++
++
++def test_resume_refuses_authority_that_became_a_transitive_descendant(board):
++    from hermes_cli import kanban_containment_lifecycle as lifecycle
++    relay, consumer, authority, target, spec = setup(board)
++    episode = contain(board, relay, target, spec)["episode"]
++    board.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (consumer, authority))
++    assert lifecycle._reachable(board, relay, authority)
++    with pytest.raises(lifecycle.ContainmentRefused, match="independently"):
++        release(board, target, episode, authority)
++    assert kb.get_task(board, relay).status == "triage"
++    assert kb.get_task(board, consumer).status == "todo"
+diff --git a/tests/hermes_cli/test_kanban_containment_remote.py b/tests/hermes_cli/test_kanban_containment_remote.py
+index ed9aa01402727b62156ff5091b7e72e52d28a09e..108a99791524aba7e8ce45a738989e4280b2cb86 100644
+--- a/tests/hermes_cli/test_kanban_containment_remote.py
++++ b/tests/hermes_cli/test_kanban_containment_remote.py
+@@ -193,6 +193,27 @@ def test_confirmed_request_never_answers_new_contain_or_release(board, monkeypat
+     assert len(hub.posts) == 4
+ 
+ 
++def test_recover_stop_does_not_run_for_a_live_non_authority(board, monkeypatch):
++    from hermes_cli.kanban_containment_actor import Actor
++
++    target, authority, session, hub = setup(board, monkeypatch)
++    hub.drop_reply = True
++    with scoped_current_session_id(session), pytest.raises(DeliveryUnknown):
++        service.contain(board, authority=authority, summary="Fixture")
++    original = copy.deepcopy(hub.posts[0])
++    assert original[0]["op"] == "contain"
++    assert original[0]["actor_task"] == target
++    assert original[0]["payload"]["policy"]["authority"]["task_id"] == authority
++    hub.drop_reply = False
++    remote._recover_stop(
++        board, hub, "fixture",
++        Actor(original[0]["actor_task"], original[0]["actor_run_uid"]),
++        target, original[0]["event_uid"],
++    )
++    assert hub.posts == [original]
++    assert kb.get_task(board, target).status == "running"
++
++
+ 
+ def test_cli_and_tool_unknown_receipts_expose_same_recovery_identity(board, monkeypatch, capsys):
+     import argparse
+diff --git a/tests/hermes_cli/test_kanban_containment_replica.py b/tests/hermes_cli/test_kanban_containment_replica.py
+index 97920e24e1d602a9fecdb3cbae57a61ffc8516ec..e29d5ba83da9a40df780083a45d8a37fe478b4c1 100644
+--- a/tests/hermes_cli/test_kanban_containment_replica.py
++++ b/tests/hermes_cli/test_kanban_containment_replica.py
+@@ -159,3 +159,95 @@ def test_receipt_cache_immutable_and_foreign_board_not_authority(synced_conn):
+     conn.execute("UPDATE kanban_sync_state SET board_id='other'")
+     with pytest.raises(ContainmentRefused, match="different board"):
+         replica.remember(conn, proof, board="fixture", task=target, uid=stop["event_uid"])
++
++
++def _released_unheld(conn):
++    target, child, stop, release, hub = scenario(conn)
++    marker = sync.RemoteChange(1, "tasks", target, "upsert",
++                               {"status": "triage", "containment_episode": stop["event_uid"]}, 100, "", "home")
++    apply(conn, hub, [marker, event(stop, hub, 2), event(release, hub, 3)])
++    assert not connections.held(conn, target)
++    return target, child, stop, release, hub
++
++
++@pytest.mark.parametrize("column,value", [
++    ("current_run_id", 1),
++    ("human_request", "{}"),
++    ("block_kind", "needs_input"),
++])
++def test_restore_released_does_not_ready_claimed_or_human_held_replica(synced_conn, column, value):
++    conn = synced_conn
++    target, *_ = _released_unheld(conn)
++    conn.execute(f"UPDATE tasks SET status='triage',{column}=? WHERE id=?", (value, target))
++    replica._restore_released(conn, target)
++    row = conn.execute("SELECT status,current_run_id,human_request,block_kind FROM tasks WHERE id=?",
++                       (target,)).fetchone()
++    assert row[0] == "triage"
++    kept = {"current_run_id": row[1], "human_request": row[2], "block_kind": row[3]}
++    assert kept[column] == value
++
++
++def test_stale_non_upsert_outbox_is_deleted_even_when_nonlifecycle_fields_remain(synced_conn):
++    conn = synced_conn
++    target, *_ = scenario(conn)
++    capture._clear_outbox(conn)
++    conn.execute(
++        "INSERT INTO kanban_sync_outbox (op_id,table_name,row_uid,op,fields,hlc,created_at) VALUES (?,?,?,?,?,?,1)",
++        ("dead-delete", "tasks", target, "delete", json.dumps({"title": "stale-delete"}), "0"),
++    )
++    conn.execute(
++        "INSERT INTO kanban_sync_outbox (op_id,table_name,row_uid,op,fields,hlc,created_at) VALUES (?,?,?,?,?,?,1)",
++        ("keep-upsert", "tasks", target, "upsert", json.dumps({"title": "keep"}), "0"),
++    )
++    from hermes_cli.kanban_containment_outbox import strip_lifecycle
++    strip_lifecycle(conn, target)
++    remaining = {row[0]: row[1] for row in conn.execute(
++        "SELECT op_id,op FROM kanban_sync_outbox WHERE row_uid=?", (target,))}
++    assert "dead-delete" not in remaining
++    assert remaining.get("keep-upsert") == "upsert"
++
++
++def test_corrupt_containment_delivery_json_holds(synced_conn):
++    from hermes_cli import kanban_containment_canonical as canonical
++    from hermes_cli import kanban_containment_requests as requests
++    conn = synced_conn
++    target, *_ = scenario(conn)
++    canonical._schema(conn)
++    conn.execute(
++        "INSERT INTO containment_delivery(request_uid,board,gateway,op_json,confirmed) VALUES (?,?,?,?,0)",
++        ("corrupt-req", "fixture", "worker", "{not-json",),
++    )
++    assert requests.pending(conn, target, set()) is True
++    assert connections.held(conn, target)
++
++
++def test_task_permit_does_not_authorize_a_different_held_uid(synced_conn):
++    conn = synced_conn
++    target, child, stop, _, hub = scenario(conn)
++    marker = sync.RemoteChange(1, "tasks", target, "upsert",
++                               {"status": "triage", "containment_episode": stop["event_uid"]}, 100, "", "home")
++    apply(conn, hub, [marker])
++    assert connections.held(conn, target)
++    other = sync.RemoteChange(2, "tasks", child, "upsert", {"status": "todo"}, 101, "", "home")
++    from hermes_cli.kanban_db_connect import write_txn
++    with write_txn(conn):
++        with replica.projection(conn, other):
++            with pytest.raises(sqlite3.IntegrityError, match="containment_pending"):
++                conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (target,))
++    assert kb.get_task(conn, target).status == "triage"
++
++
++def test_replica_restore_keeps_spend_hold_in_triage(synced_conn):
++    conn = synced_conn
++    target, child, stop, release, hub = scenario(conn)
++    marker = sync.RemoteChange(1, "tasks", target, "upsert",
++                               {"status": "triage", "containment_episode": stop["event_uid"]}, 100, "", "home")
++    apply(conn, hub, [marker, event(stop, hub, 2)])
++    with kb.write_txn(conn):
++        kb._append_event(conn, target, "spend_budget_triaged", {"fixture": True})
++    apply(conn, hub, [event(release, hub, 3)])
++    assert not connections.held(conn, target)
++    assert kb.get_task(conn, target).status == "triage"
++    assert kb.get_task(conn, child).status == "todo"
++    assert conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='spend_budget_triaged'",
++                        (target,)).fetchone()
+diff --git a/tools/kanban_containment_tools.py b/tools/kanban_containment_tools.py
+index 21b2d30611e3d3ad335455f136f94ad4e5a5e8da..8431a0b6d652ee2bd145443f118cb9adf07592da 100644
+--- a/tools/kanban_containment_tools.py
++++ b/tools/kanban_containment_tools.py
+@@ -21,7 +21,8 @@ CONTAIN_SCHEMA = _schema("kanban_contain",
+     "episode and a live scoped authority or genuinely new producer completion; generic unblock cannot release it. "
+     "Synced boards refuse until canonical containment capability is installed. After terminal_for_run=true, stop.",
+     {"task_id": {"type": "string"}, "authority": {"type": "string"},
+-     "producer": {"type": "string"}, "summary": {"type": "string", "minLength": 1, "maxLength": 2000}},
++     "producer": {"type": "string"}, "summary": {"type": "string", "minLength": 1,
++        "description": "Bounded handoff summary; runtime rejects more than 2000 characters."}},
+     ["authority", "summary"])
+ RESUME_SCHEMA = _schema("kanban_resume_contained",
+     "Resume an exact contained episode with authenticated evidence. Requires a live scoped authority "
+-- 
+2.43.0
+

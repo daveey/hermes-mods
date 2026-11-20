@@ -1,0 +1,173 @@
+From d34e7aff62e238bafebfb7d4909c5f1012ff30b0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 08:15:06 +0000
+Subject: [PATCH] [daveey] Invalidate model.options memo when asynchronous
+ pricing changes
+
+The post-#3411 controlled hub A/B reached 2.71 ms warm median but only 84/100
+byte-equal pairs: Nous pricing/pricing_pending changed after pricing warmers
+published, while the payload memo had no pricing stamp. Fixture visibility and
+credential-key mutation checks alone did not exercise this input.
+
+Stamp pricing publication generation, provider endpoint-cache selection,
+expired pricing deadlines and cached Nous entitlement. Preserve normal pricing
+cleanup and keep the existing memo TTL and read-only worker controls unchanged.
+
+Proof: five behavioral RED cases on main (publication/replacement/expiry/
+endpoint mapping/entitlement); GREEN after fix. Thirty pricing consumer files:
+792 passed, one skipped. Five pricing-stamp mutants killed by real payload
+parity assertions. Original 13-test J visibility suite also passes. Full
+scripts/check: 20 checks green. Hub acceptance must be rerun after deployment.
+---
+ hermes_cli/inventory.py                       |  8 ++-
+ hermes_cli/models_pricing.py                  | 15 +++++
+ tests/hermes_cli/test_model_options_memo.py   |  6 ++
+ ...test_model_options_pricing_invalidation.py | 62 +++++++++++++++++++
+ 4 files changed, 90 insertions(+), 1 deletion(-)
+ create mode 100644 tests/hermes_cli/test_model_options_pricing_invalidation.py
+
+diff --git a/hermes_cli/inventory.py b/hermes_cli/inventory.py
+index 329e441f401982410db406d75d75025d022bc2d9..e7e12cb34ea4d2e9008af2cef53eb21fd1a8eb63 100644
+--- a/hermes_cli/inventory.py
++++ b/hermes_cli/inventory.py
+@@ -371,10 +371,16 @@ def _stamp_usage():
+     return snapshot_generation()
+ 
+ 
++def _stamp_pricing():
++    from hermes_cli.models import get_cached_nous_free_tier
++    from hermes_cli.models_pricing import pricing_cache_version
++    return pricing_cache_version(), get_cached_nous_free_tier()
++
++
+ _STAMP_PARTS: dict[str, Any] = {
+     "home": _stamp_home, "config": _stamp_config, "dotenv": _stamp_dotenv, "auth": _stamp_auth,
+     "environ": _stamp_environ, "catalog_files": _stamp_catalog_files, "external_creds": _stamp_external_creds,
+-    "plugins": _stamp_plugins, "usage": _stamp_usage,
++    "plugins": _stamp_plugins, "usage": _stamp_usage, "pricing": _stamp_pricing,
+ }
+ 
+ 
+diff --git a/hermes_cli/models_pricing.py b/hermes_cli/models_pricing.py
+index 89d44555af6f0dc7c89a938ceff426659ae334b5..215756036ad30aa231154c98aef47d464c7e4f5a 100644
+--- a/hermes_cli/models_pricing.py
++++ b/hermes_cli/models_pricing.py
+@@ -33,6 +33,19 @@ _pricing_cache_retry_after: dict[str, float] = {}
+ # Guards a catalog and its deadline as one unit: expiring one key (reader or sweep) pops two tables, and a
+ # refresh landing between the pops would otherwise keep its catalog without its deadline, forever.
+ _pricing_cache_lock = threading.Lock()
++_pricing_cache_generation = 0
++
++
++def pricing_cache_version() -> tuple:
++    """Cheap memo stamp for publications, endpoint selection and pending TTL expiry.
++
++    Do not expire entries here: the next ordinary pricing read retains ownership of cleanup.
++    """
++    with _pricing_cache_lock:
++        expired = tuple(sorted(key for key, deadline in _pricing_cache_retry_after.items()
++                               if time.monotonic() >= deadline))
++        selected = tuple(sorted(_pricing_provider_cache_keys.copy().items()))
++        return _pricing_cache_generation, selected, expired
+ 
+ 
+ def _cached_catalog(cache_key: str) -> Optional[dict[str, dict[str, Any]]]:
+@@ -59,7 +72,9 @@ def _cache_catalog(
+     observe (an org's model policy can change while a long-lived process holds the entry).
+     Entries past their deadline are dropped here as the reader would: a rotated credential's
+     catalog is otherwise never read again and stays resident for the life of the process."""
++    global _pricing_cache_generation
+     with _pricing_cache_lock:
++        _pricing_cache_generation += 1
+         now = time.monotonic()
+         for key, deadline in list(_pricing_cache_retry_after.items()):
+             if now >= deadline:
+diff --git a/tests/hermes_cli/test_model_options_memo.py b/tests/hermes_cli/test_model_options_memo.py
+index 2b1ba1d5afaf139f8da7412d12ce0da14e8eeabc..f2662dc26cb4f898c7a22d26de7e7979f2c2c1f0 100644
+--- a/tests/hermes_cli/test_model_options_memo.py
++++ b/tests/hermes_cli/test_model_options_memo.py
+@@ -182,7 +182,13 @@ def _set_home(home, monkeypatch, tmp_path_factory=None):
+     monkeypatch.setenv("HERMES_HOME", str(other))
+ 
+ 
++def _set_pricing(home, monkeypatch):
++    from hermes_cli.models_pricing import _cache_catalog
++    _cache_catalog("fixture-pricing-key", {})
++
++
+ CASES = {
++    "pricing": _set_pricing,
+     "config": _set_config,
+     "dotenv": _set_dotenv,
+     "auth": _set_auth,
+diff --git a/tests/hermes_cli/test_model_options_pricing_invalidation.py b/tests/hermes_cli/test_model_options_pricing_invalidation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c0048a15c7616c96a8c26625e5751176292aa1c6
+--- /dev/null
++++ b/tests/hermes_cli/test_model_options_pricing_invalidation.py
+@@ -0,0 +1,62 @@
++"""Memo must follow asynchronous pricing publication and time-based expiry immediately."""
++import pytest
++
++from hermes_cli import inventory, models, models_pricing as pricing
++
++
++@pytest.fixture
++def picker(monkeypatch):
++    monkeypatch.setattr(pricing, "_pricing_cache", {})
++    monkeypatch.setattr(pricing, "_pricing_cache_retry_after", {})
++    monkeypatch.setattr(pricing, "_pricing_provider_cache_keys", {("fixture", "nous"): "first"})
++    clock = {"t": 100.0}
++    tier = {"value": False}
++    monkeypatch.setattr(pricing.time, "monotonic", lambda: clock["t"])
++    monkeypatch.setattr(inventory, "_memo_clock", lambda: 100.0)  # hold memo TTL while pricing expires
++    monkeypatch.setattr(models, "get_cached_nous_free_tier", lambda: tier["value"])
++    monkeypatch.setattr(inventory, "_attach_nous_plan_usage", lambda *a, **k: None)
++    monkeypatch.setattr(pricing, "get_pricing_for_provider", lambda *a, **k: pricing._cached_catalog(
++        pricing._pricing_provider_cache_keys[("fixture", "nous")]))
++
++    def build(ctx, **kwargs):
++        payload = {"providers": [{"slug": "nous", "models": ["fixture-model"]}],
++                   "model": ctx.current_model, "provider": ctx.current_provider}
++        inventory._apply_pricing(payload["providers"], cached_only=True)
++        return payload
++
++    monkeypatch.setattr(inventory, "build_models_payload", build)
++    monkeypatch.setattr(inventory, "_apply_limits", lambda rows: None)
++    monkeypatch.setattr(inventory, "_apply_usage", lambda rows: None)
++    monkeypatch.setattr(inventory, "_prewarm_pricing_async", lambda *a, **k: None)
++    monkeypatch.setattr(inventory, "_MEMO_ENABLED", True)
++    inventory.reset_model_options_memo()
++    ctx = inventory.ConfigContext("nous", "fixture-model", "", {}, [])
++    yield lambda: inventory.build_model_options_payload(ctx), clock, tier
++    inventory.reset_model_options_memo()
++
++
++CATALOG = {"fixture-model": {"prompt": "0.000001", "completion": "0.000002"}}
++
++
++@pytest.mark.parametrize("change", ["publish", "replace", "expire", "mapping", "entitlement"])
++def test_pricing_changes_invalidate_payload_memo(picker, monkeypatch, change):
++    call, clock, tier = picker
++    if change != "publish":
++        pricing._cache_catalog("first", CATALOG, ttl_seconds=1.0 if change == "expire" else None)
++    before = call()
++    assert call() == before
++    changes = {
++        "publish": lambda: pricing._cache_catalog("first", CATALOG),
++        "replace": lambda: pricing._cache_catalog("first", {
++            "fixture-model": {"prompt": "0.000003", "completion": "0.000004"}}),
++        "expire": lambda: clock.update(t=clock["t"] + 2),
++        # No catalog mutation: only the provider's selected endpoint cache changes.
++        "mapping": lambda: pricing._pricing_provider_cache_keys.update({("fixture", "nous"): "absent"}),
++        "entitlement": lambda: tier.update(value=None),
++    }
++    changes[change]()
++    got = call()
++    monkeypatch.setattr(inventory, "_MEMO_ENABLED", False)
++    fresh = call()
++    assert fresh != before  # positive control: this input changes real pricing decoration
++    assert got == fresh
+-- 
+2.43.0
+

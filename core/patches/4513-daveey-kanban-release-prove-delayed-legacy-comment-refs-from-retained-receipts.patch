@@ -1,0 +1,446 @@
+From 85f70c8494d18e8b01e6a21172492ab6cc92ded8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 19:38:49 +0000
+Subject: [PATCH] [daveey] kanban release: prove delayed legacy comment refs
+ from retained receipts
+
+Manual unblock/promote of long-lived cards (retention final owner
+t_5f0d878cd1c10371, source owner t_0b716b01a47db7f6) refused forever with
+"Comment data unavailable ... --seen cannot acknowledge missing data", even
+though every comment row was readable.
+
+Five whys:
+1. --seen checks every historical commented event, not just recent ones.
+2. Legacy events without comment_uid fall back to a +/-1 s row match.
+3. Observed rows were stamped 2-13 s before their event (e.g. hub event
+   1087059 -> comment 190729, +13 s), so the fallback finds nothing.
+4. The old producer omitted the portable comment_uid, and PR #3297 only
+   bridges delays for proven *local writer runs*; interactive/subagent
+   no-run comments have no such provenance.
+5. Tests covered near-time imports and delayed local runs, not no-run
+   delayed writers.
+
+Fix: when an event stays unresolved and lacks comment_uid, read the writer
+session's retained transcript read-only (local state.db, mode=ro) and accept
+one receiver row only when ALL hold:
+- exactly one successful top-level {ok, task_id, comment_id} receipt for
+  this task and source integer exists in the transcript (a second,
+  conflicting receipt refuses even when its body never reached the receiver);
+- its call ID is declared exactly once across every assistant message and
+  tool (checked before any task/body filtering) and replied to exactly once;
+- the declaration is a direct kanban_comment call for the same task, with no
+  board argument or the checking board's slug;
+- the event lies within floor(call)..floor(result); no lateness tolerance;
+- exactly one receiver row has that exact stripped body and author within
+  that interval.
+Anything else, including unreadable/pruned/over-cap transcripts, malformed
+declarations, wrapped tool_call batches, cross_task actions and redacted
+bodies, stays "data unavailable". Unseen-comment refusal, the injective
+coverage matching and every existing resolution path are unchanged; the
+proof never writes and never mutates board evidence.
+
+Tests: RED 16 failing (F1 duplicate-declaration borrowing, F2 conflicting
+receipts, board namespace, guard-level high-watermark acknowledgement on
+promote/unblock/tool); GREEN 159 passed across the transcript + release
+suites, 348 passed across 12 adjacent unblock/release consumer suites.
+---
+ hermes_cli/kanban_comment_transcript_proof.py | 126 ++++++++++++++++++
+ hermes_cli/kanban_release_comments.py         |   8 ++
+ ...est_kanban_comment_transcript_ambiguity.py |  94 +++++++++++++
+ ...test_kanban_comment_transcript_controls.py |  50 +++++++
+ .../test_kanban_release_transcript_proof.py   |  66 +++++++++
+ 5 files changed, 344 insertions(+)
+ create mode 100644 hermes_cli/kanban_comment_transcript_proof.py
+ create mode 100644 tests/hermes_cli/test_kanban_comment_transcript_ambiguity.py
+ create mode 100644 tests/hermes_cli/test_kanban_comment_transcript_controls.py
+ create mode 100644 tests/hermes_cli/test_kanban_release_transcript_proof.py
+
+diff --git a/hermes_cli/kanban_comment_transcript_proof.py b/hermes_cli/kanban_comment_transcript_proof.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9640190aea091f02a42a7fb1058ab8f57d9c8203
+--- /dev/null
++++ b/hermes_cli/kanban_comment_transcript_proof.py
+@@ -0,0 +1,126 @@
++"""Read-only corroboration of legacy comment references, never acknowledgement. [daveey]
++
++Old ``commented`` events carry only the writer's wire-local ``comment_id`` and
++no portable ``comment_uid``. When the receiver's row was stamped seconds
++before the event, the one-second legacy fallback finds nothing and the unread
++guard refuses with "data unavailable" forever. The writer's own retained
++session transcript can bridge that gap: its ``kanban_comment`` call holds the
++exact body and its paired successful result holds the source integer.
++
++Every step is fail-closed. Coverage is deliberately limited to direct
++``kanban_comment`` calls whose result is a top-level JSON object. Wrapped
++``tool_call`` batches, ``cross_task`` comment actions, shell calls and redacted
++bodies are not interpreted (no recursive search of arbitrary JSON); a direct
++receipt of the same source integer under any other tool name refuses.
++"""
++from __future__ import annotations
++
++import json
++import math
++import sqlite3
++from contextlib import closing
++
++from hermes_constants import get_hermes_home
++from hermes_cli.sqlite_safe_read import connect_tracked
++
++MAX_MESSAGES = 10000
++
++
++def messages(session):
++    """Missing, pruned or unavailable source evidence leaves the guard closed."""
++    path = get_hermes_home() / 'state.db'
++    try:
++        with closing(connect_tracked(path.as_uri() + '?mode=ro', tracking_path=path, uri=True, timeout=0.1)) as conn:
++            conn.row_factory = sqlite3.Row
++            rows = conn.execute(
++                'SELECT role,tool_call_id,tool_calls,content,timestamp FROM messages '
++                'WHERE session_id=? ORDER BY timestamp LIMIT ?', (session, MAX_MESSAGES + 1),
++            ).fetchall()
++        return rows if len(rows) <= MAX_MESSAGES else []
++    except (sqlite3.Error, OSError, ValueError):
++        return []
++
++
++class _Unprovable(Exception):
++    """Retained identity cannot be established; the event stays unresolved."""
++
++
++def _declarations(transcript):
++    """Every assistant call declaration by ID, across all messages and tools.
++
++    Uniqueness is established *before* any task/body filtering, so a conflicting
++    declaration for another task or tool cannot be filtered away and leave the
++    remaining one to borrow the single reply. Unparseable declarations make
++    uniqueness unknowable.
++    """
++    found = {}
++    for message in transcript:
++        if message['role'] != 'assistant' or not message['tool_calls']:
++            continue
++        calls = json.loads(message['tool_calls'])
++        if not isinstance(calls, list) or not all(isinstance(c, dict) for c in calls):
++            raise _Unprovable
++        for call in calls:
++            found.setdefault(call.get('id'), []).append((message, call))
++    return found
++
++
++def _is_receipt(reply, task_id, source_id):
++    """A successful top-level comment result for this task and source integer.
++
++    Tool output is often plain text, so a non-JSON reply is simply not a receipt.
++    """
++    try:
++        result = json.loads(reply['content'] or '')
++    except (ValueError, TypeError):
++        return False
++    return (isinstance(result, dict) and result.get('ok') is True and result.get('task_id') == task_id
++            and type(result.get('comment_id')) is int and result['comment_id'] == source_id)
++
++
++def resolve(rows, event, payload, transcript, *, board=None):
++    """Bridge source integer to exact body, never to a receiver integer.
++
++    Exactly one successful receipt for (task, source integer) may exist in the
++    retained transcript: a second one is conflicting source identity even when
++    its body is absent from the receiver, so it refuses before any row lookup.
++    Its call ID must be declared exactly once and replied to exactly once.
++    Integer timestamps are floors of the retained call/result interval; no
++    lateness window is added. Duplicate receiver bodies are refused. ``board``
++    is the checking board's slug; a call naming any other board never proves.
++    """
++    source_id = payload.get('comment_id')
++    author = payload.get('author')
++    if type(source_id) is not int or not isinstance(author, str) or not author.strip():
++        return []
++    try:
++        declared = _declarations(transcript)
++        replies = [r for r in transcript if r['role'] == 'tool']
++        receipts = [r for r in replies if _is_receipt(r, event['task_id'], source_id)]
++        if len(receipts) != 1:
++            return []
++        reply = receipts[0]
++        call_id = reply['tool_call_id']
++        if (not isinstance(call_id, str) or not call_id
++                or sum(1 for r in replies if r['tool_call_id'] == call_id) != 1
++                or len(declared.get(call_id, [])) != 1):
++            return []
++        message, call = declared[call_id][0]
++        function = call.get('function')
++        if not isinstance(function, dict) or function.get('name') != 'kanban_comment':
++            return []
++        args = function.get('arguments')
++        args = json.loads(args) if isinstance(args, str) else args
++        if (not isinstance(args, dict) or args.get('task_id') != event['task_id']
++                or not isinstance(args.get('body'), str)
++                or args.get('board') not in (None, '') and args['board'] != board):
++            return []
++        start, end = math.floor(message['timestamp']), math.floor(reply['timestamp'])
++        if not start <= event['created_at'] <= end:
++            return []
++        candidates = [r for r in rows if r['body'] == args['body'].strip()
++                      and r['author'] == author.strip()
++                      and start <= r['created_at'] <= event['created_at']]
++    except (_Unprovable, ValueError, TypeError, KeyError, AttributeError, OverflowError):
++        return []
++    return candidates if len(candidates) == 1 else []
+diff --git a/hermes_cli/kanban_release_comments.py b/hermes_cli/kanban_release_comments.py
+index e9424178289aea1e9a1340b7b8830d69bb3a4461..ad09e0ae2025fe1880b74c7e5a362854e130ea61 100644
+--- a/hermes_cli/kanban_release_comments.py
++++ b/hermes_cli/kanban_release_comments.py
+@@ -38,13 +38,21 @@ def check(conn, tid, *, session, seen=None, verb="unblock", board=None):
+     all_events = conn.execute(
+         "SELECT * FROM task_events WHERE task_id=? AND kind='commented'", (tid,),
+     ).fetchall()
++    from hermes_cli import kanban_comment_transcript_proof as proof
+     local_runs = _local_writer_runs(conn, tid)
++    transcripts = {}
+     resolved = {}
+     for event in all_events:
+         payload = json.loads(event["payload"] or "{}")
+         writer = (payload.get("writer_run_id"), payload.get("writer_run_uid"))
+         local_writer = all(isinstance(v, (int, str)) for v in writer) and writer in local_runs
+         resolved[event["id"]] = _resolve(rows, event, payload, local_writer=local_writer)
++        session_id = payload.get("writer_session")
++        if (not resolved[event["id"]] and not payload.get("comment_uid")
++                and isinstance(session_id, str) and session_id):
++            if session_id not in transcripts:
++                transcripts[session_id] = proof.messages(session_id)
++            resolved[event["id"]] = proof.resolve(rows, event, payload, transcripts[session_id], board=board)
+     missing = _missing_coverage(resolved)
+     comments = []
+     for event in events:
+diff --git a/tests/hermes_cli/test_kanban_comment_transcript_ambiguity.py b/tests/hermes_cli/test_kanban_comment_transcript_ambiguity.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c6db7b23d81ea29506c86681217b46760a5ba9df
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_comment_transcript_ambiguity.py
+@@ -0,0 +1,94 @@
++"""Conflicting or unsupported retained identity never proves a delayed reference. [daveey]"""
++import copy
++import json
++
++import pytest
++
++from hermes_cli.kanban_comment_transcript_proof import resolve
++from tests.hermes_cli.test_kanban_comment_transcript_controls import evidence
++
++
++def call(cid, task='target', body='keep the hold', name='kanban_comment', **extra):
++    return dict(id=cid, function=dict(name=name, arguments=json.dumps(dict(task_id=task, body=body, **extra))))
++
++
++def reply(cid, at, **result):
++    return dict(role='tool', tool_call_id=cid, content=json.dumps(dict(dict(ok=True, task_id='target'), **result)),
++                timestamp=at)
++
++
++def assistant(calls, at):
++    return dict(role='assistant', tool_calls=json.dumps(calls), timestamp=at)
++
++
++def test_same_array_duplicate_id_for_another_task_refuses():
++    rows, event, payload, transcript = evidence()
++    transcript[0]['tool_calls'] = json.dumps([call('call'), call('call', task='other-task')])
++    assert resolve(rows, event, payload, transcript) == []
++
++
++@pytest.mark.parametrize('name', ['kanban_comment', 'terminal'])
++def test_duplicate_id_in_another_message_refuses(name):
++    rows, event, payload, transcript = evidence()
++    transcript.insert(1, assistant([call('call', task='other-task', name=name)], 101))
++    assert resolve(rows, event, payload, transcript) == []
++
++
++def test_unrelated_distinct_calls_and_text_replies_still_prove():
++    rows, event, payload, transcript = evidence()
++    transcript.insert(1, assistant([call('other', name='terminal')], 101))
++    transcript.insert(2, dict(role='tool', tool_call_id='other', content='plain text output', timestamp=102))
++    assert resolve(rows, event, payload, transcript) == [rows[0]]
++
++
++@pytest.mark.parametrize('kept', [0, 1])
++def test_conflicting_successful_receipts_refuse_whichever_body_survives(kept):
++    rows, event, payload, _ = evidence()
++    bodies = ['keep the hold', 'conflicting absent body']
++    rows[0]['body'] = bodies[kept]
++    transcript = [assistant([call('call', body=bodies[0]), call('second-call', body=bodies[1])], 100.2),
++                  reply('call', 113.5, comment_id=900001), reply('second-call', 113.6, comment_id=900001)]
++    assert resolve(rows, event, payload, transcript) == []
++
++
++def test_competing_receipt_with_ambiguous_receiver_rows_is_not_discarded():
++    rows, event, payload, _ = evidence()
++    rows += [dict(rows[0], id=4, uid='a', body='other'), dict(rows[0], id=5, uid='b', body='other')]
++    transcript = [assistant([call('call'), call('second-call', body='other')], 100.2),
++                  reply('call', 113.5, comment_id=900001), reply('second-call', 113.6, comment_id=900001)]
++    assert resolve(rows, event, payload, transcript) == []
++
++
++@pytest.mark.parametrize('result', [dict(ok=False, comment_id=900001), dict(comment_id=900002),
++                                    dict(task_id='other-task', comment_id=900001)])
++def test_noncompeting_receipts_do_not_block_the_proof(result):
++    rows, event, payload, transcript = evidence()
++    transcript.insert(1, assistant([call('second-call', body='unrelated')], 101))
++    transcript.insert(2, reply('second-call', 102, **result))
++    assert resolve(rows, event, payload, transcript) == [rows[0]]
++
++
++def test_wrapped_tool_call_is_unsupported_and_stays_missing():
++    rows, event, payload, _ = evidence()
++    inner = dict(name='kanban_comment', arguments=dict(task_id='target', body='keep the hold'))
++    wrapped = dict(id='call', function=dict(name='tool_call', arguments=json.dumps(dict(calls=[inner]))))
++    content = json.dumps([dict(ok=True, task_id='target', comment_id=900001)])
++    transcript = [assistant([wrapped], 100.2), dict(role='tool', tool_call_id='call', content=content, timestamp=113.5)]
++    assert resolve(rows, event, payload, transcript) == []
++
++
++def test_direct_receipt_from_another_tool_refuses():
++    rows, event, payload, transcript = evidence()
++    transcript[0]['tool_calls'] = json.dumps([call('call', name='cross_task')])
++    assert resolve(rows, event, payload, transcript) == []
++
++
++@pytest.mark.parametrize('call_board,board,proved', [
++    (None, None, True), ('ops', 'ops', True), ('ops', None, False), ('ops', 'default', False)])
++def test_call_board_must_match_the_checking_board(call_board, board, proved):
++    rows, event, payload, transcript = evidence()
++    extra = {} if call_board is None else dict(board=call_board)
++    transcript[0]['tool_calls'] = json.dumps([call('call', **extra)])
++    before = copy.deepcopy(transcript)
++    assert resolve(rows, event, payload, transcript, board=board) == ([rows[0]] if proved else [])
++    assert transcript == before
+diff --git a/tests/hermes_cli/test_kanban_comment_transcript_controls.py b/tests/hermes_cli/test_kanban_comment_transcript_controls.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e61dc3aa57324cef4b16275f3f8204255ed29398
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_comment_transcript_controls.py
+@@ -0,0 +1,50 @@
++"""Fail-closed transcript corroboration controls. [daveey]"""
++import copy
++import json
++
++import pytest
++
++from hermes_cli.kanban_comment_transcript_proof import resolve
++
++
++def evidence():
++    row = dict(id=3, uid='receiver', body='keep the hold', author='default', created_at=100)
++    event = dict(id=9, task_id='target', created_at=113)
++    payload = dict(comment_id=900001, author='default', writer_session='writer')
++    call = dict(id='call', function=dict(name='kanban_comment', arguments=dict(task_id='target', body=row['body'])))
++    transcript = [dict(role='assistant', tool_calls=json.dumps([call]), timestamp=100.2),
++                  dict(role='tool', tool_call_id='call', content=json.dumps(dict(ok=True, task_id='target', comment_id=900001)), timestamp=113.5)]
++    return [row], event, payload, transcript
++
++
++@pytest.mark.parametrize('target,key,value', [
++    ('row', 'body', 'another body'), ('row', 'author', 'other'),
++    ('event', 'task_id', 'other'), ('payload', 'comment_id', 3),
++    ('payload', 'comment_id', True), ('reply', 'content', '{"ok":false}'),
++    ('reply', 'tool_call_id', 'other'), ('event', 'created_at', 99),
++    ('event', 'created_at', 114), ('row', 'created_at', 99),
++    ('row', 'created_at', 114), ('call', 'tool_calls', '{broken'),
++])
++def test_unproven_association_stays_missing(target, key, value):
++    rows, event, payload, transcript = evidence()
++    targets = dict(row=rows[0], event=event, payload=payload, reply=transcript[1], call=transcript[0])
++    targets[target][key] = value
++    assert resolve(rows, event, payload, transcript) == []
++
++
++@pytest.mark.parametrize('duplicate', ['row', 'reply', 'call'])
++def test_ambiguous_evidence_stays_missing(duplicate):
++    rows, event, payload, transcript = evidence()
++    target, value = dict(row=(rows, dict(rows[0], id=4, uid='second')),
++                         reply=(transcript, transcript[1]), call=(transcript, transcript[0]))[duplicate]
++    target.append(copy.deepcopy(value))
++    assert resolve(rows, event, payload, transcript) == []
++
++
++def test_receiver_integer_collision_does_not_choose_the_row():
++    rows, event, payload, transcript = evidence()
++    rows.append(dict(rows[0], id=900001, uid='collision', body='do not confuse me'))
++    before = copy.deepcopy((rows, event, payload, transcript))
++    assert resolve(rows, event, payload, transcript) == [rows[0]]
++    assert (rows, event, payload, transcript) == before
++    assert resolve(rows, event, payload, []) == []
+diff --git a/tests/hermes_cli/test_kanban_release_transcript_proof.py b/tests/hermes_cli/test_kanban_release_transcript_proof.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6c4e13e86e3151b2496a63e69012591f94a80ffb
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_release_transcript_proof.py
+@@ -0,0 +1,66 @@
++"""Retained source tool receipts can prove a delayed legacy reference. [daveey]"""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_constants import get_hermes_home
++from hermes_cli import kanban_db_connect as kbc
++from tests.hermes_cli.test_kanban_release_imported_comments import enable_sync, imported
++from tests.hermes_cli.test_kanban_release_unread_comments import board as _board, release
++
++board = _board
++
++
++def delayed(tid):
++    """A legacy imported comment whose event lands 13 s after its row, no UID."""
++    enable_sync(tid)
++    cid = imported(tid, 900001, portable=False)
++    with kbc.connect_closing() as conn:
++        row = dict(conn.execute("SELECT * FROM task_comments WHERE id=?", (cid,)).fetchone())
++        payload = dict(comment_id=900001, writer_session='peer-session', author='default', len=len(row['body']))
++        conn.execute("UPDATE task_events SET created_at=?,payload=? WHERE uid='remote-event-one'",
++                     (row['created_at'] + 13, json.dumps(payload)))
++        conn.commit()
++    return cid, row
++
++
++def retain(messages):
++    with sqlite3.connect(get_hermes_home() / 'state.db') as conn:
++        conn.execute('CREATE TABLE IF NOT EXISTS messages(session_id TEXT,role TEXT,tool_call_id TEXT,'
++                     'tool_calls TEXT,content TEXT,timestamp REAL)')
++        conn.executemany('INSERT INTO messages VALUES(?,?,?,?,?,?)', [('peer-session',) + m for m in messages])
++
++
++def call(cid, tid, body):
++    return dict(id=cid, function=dict(name='kanban_comment', arguments=json.dumps(dict(task_id=tid, body=body))))
++
++
++def receipt(tid, start, *calls):
++    out = [('assistant', None, json.dumps([call(*c) for c in calls]), None, start + .1)]
++    for i, c in enumerate(calls):
++        result = json.dumps(dict(ok=True, task_id=tid, comment_id=900001))
++        out.append(('tool', c[0], None, result, start + 13.8 + i / 10))
++    return out
++
++
++def test_delayed_source_receipt_keeps_local_watermark(board, capsys):
++    cid, row = delayed(board)
++    retain(receipt(board, row['created_at'], ('call-1', board, row['body'])))
++    ok, output = release(board, 'promote', capsys, cid - 1)
++    assert not ok and row['body'] in output and 'data unavailable' not in output
++    ok, output = release(board, 'promote', capsys, cid)
++    assert ok, output
++
++
++@pytest.mark.parametrize('shape', ['duplicate-id-other-task', 'conflicting-receipt', 'absent'])
++@pytest.mark.parametrize('entry', ['promote', 'unblock', 'tool'])
++def test_unproven_receipt_cannot_be_acknowledged_by_high_watermark(board, shape, entry, capsys):
++    cid, row = delayed(board)
++    start = row['created_at']
++    if shape == 'duplicate-id-other-task':
++        retain(receipt(board, start, ('call-1', board, row['body']), ('call-1', 'other-task', row['body']))[:2])
++    elif shape == 'conflicting-receipt':
++        retain(receipt(board, start, ('call-1', board, row['body']), ('call-2', board, 'conflicting absent body')))
++    ok, output = release(board, entry, capsys, cid + 1000)
++    assert not ok and 'data unavailable' in output, output
+-- 
+2.43.0
+

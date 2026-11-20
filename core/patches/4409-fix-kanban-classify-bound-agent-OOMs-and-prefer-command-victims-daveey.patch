@@ -1,0 +1,443 @@
+From dce5dba2ef014bc56673881e5e0df6f86f7de14d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 01:59:40 +0000
+Subject: [PATCH] fix(kanban): classify bound-agent OOMs and prefer command
+ victims [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+# Kanban OOM: the agent interpreter is the kernel's victim, and the run is booked as a plain crash
+
+Written 2026-11-15 ~01:45Z by chat 20261111_200009_edbe39. All files named below are in this directory.
+
+Problem: measurement card t_265e1af765122e62 counted 0 Kanban runs failed "OOM-killed at" across the hub and
+worker-1..8 for 2026-11-13 06:15 to 2026-11-15 00:29 UTC. In that window the kernel journals show 12 OOM kills inside 5
+Kanban run scopes (oom-victims.out). In 2 of those runs the victim was the agent's own interpreter, and the run died:
+- worker-5, t_06766cf6fff5d7ce, local run 16314 / board run 48611. Spawned launcher 2111911, bound interpreter 2112259.
+  Kernel victim: python3 2112259 at 2026-11-14T14:44:03Z, anon-rss 241.559 MiB, MemoryMax 8192 MiB. Booked `crashed`:
+  "pid 2111911 exited with code 1 [managed worker lost: EOFError]".
+- worker-7, t_ad3f795fa1bbb22f, local run 3383 / board run 44800. Spawned 4172657, bound 4172725. At
+  2026-11-14T00:57:40Z the kernel killed children 1898176 and 1669485, then the agent 4172725 (anon-rss 315.328 MiB).
+  A child, 2066038, was still alive and was killed at 01:00:21. Booked `crashed`: "managed worker lost: EOFError".
+The other 10 kills hit commands. Those runs went on: worker-4 completed, worker-6 blocked normally, and worker-8 ended
+rate-limited. So OOMPolicy=continue works when the victim is a command.
+
+Why 1: the measurement counts runs whose error contains "OOM-killed at". Both OOM-killed runs carry
+"managed worker lost: EOFError" instead. Evidence: run-histories.txt (shadow `task_runs` 48611 and 44800).
+
+Why 2: the dispatcher calls `read_failure(..., pid=pid)` with the spawned launcher's pid (`tasks.worker_pid`). The
+kernel's victim was the bound interpreter, so nothing matches and `read_failure` returns None. Evidence:
+`hermes_cli/kanban_db_dispatch.py` ~L1137 (`read_failure(task_id, run_id, log or "", pid=pid, ...)`), and
+replay-results.txt. On worker-5 core ac2a498bc2a and worker-7 core 6e5efc06c1c, the same code returns None for the
+spawned pid. For the bound pid it returns "Worker was OOM-killed at 8192 MiB (kernel victim: the worker itself, python3
+pid 2112259, anon-rss 241.559 MiB) ...".
+
+Why 3: `read_failure`'s docstring says "the run failed by OOM only when that victim is the worker ``pid`` itself (the
+agent was the largest process in its scope)". It treats the agent as the spawned pid. Managed workers run the agent in
+a separate bound interpreter: spawned ≠ bound in 5346 of 5346 hub runs over 3 days (spawned-vs-bound.txt).
+
+Why 4 (why the agent died at all): commands inherit the agent's oom_score_adj. The bound interpreters run at 200 on the
+hub and on worker-3 (adj-and-cgroup.txt). Under the run's MemoryMax the kernel therefore kills the largest process.
+When many smaller processes fill the cap, the 241–315 MiB agent is the largest. Nothing in core sets oom_score_adj: a
+grep of hermes_cli/, tools/, agent/, gateway/ and plugins/, plus hermes-mods and hermes-state/home/bin, finds no match.
+Evidence: kernel-journal-excerpts.txt (victim order), adj-and-cgroup.txt.
+
+Root (happened): the OOMPolicy=continue design (ecf720ae469 and follow-ups ebde9c724a8, a49a5ae38e9, afb3c812fe9) has two
+gaps. It identifies the agent by the spawned pid, and it leaves victim choice to RSS alone. When the agent is the
+largest process it dies, and its death is booked as a generic crash.
+
+Root (not caught): the OOM tests model the worker as the pid passed to `read_failure`
+(tests/hermes_cli/test_kanban_oom_policy_continue.py ~L183-227, `read_failure("t_x", 1, "", pid=999)`). No test has a
+spawned pid that differs from the bound pid. The measurement card also trusted the classifier's own string, with no
+cross-check against the kernel journal.
+
+Recurrence: first time. t_d394dabe374f50ef (an OOM in a process-registry scope) has no bound-pid or oom_score_adj content.
+
+Effect of the misbooking:
+- the retry gets the same MemoryMax instead of the doubled cap that `oom_killed` earns (kanban_worker_scope.py ~L498-522);
+- the crash counts toward the failure breaker;
+- the kill is missing from OOM counts (OOM_ALERT_THRESHOLD and the measurement).
+
+Countermeasures:
+- symptom/classifier: match the kernel victim against the spawned pid plus every `worker_bound` pid of the run.
+  Proof: a dispatcher-level test using these pids fails on main and passes on the fix.
+- root/victim choice: commands the terminal tool starts inside a Kanban run scope run at oom_score_adj 1000
+  (`choom -n 1000 --`). The kernel then kills commands before the agent. Proof: the A/B kernel probe on a pool worker,
+  where the parent is the first victim on main and children are the first victims on the fix.
+- detection: tests where the spawned pid differs from the bound pid, with fixtures copied verbatim from
+  kernel-journal-excerpts.txt. A correction comment on t_265e1af765122e62 gives the real count.
+
+## Proof on worker-8
+
+All 13 source evidence hashes verified. Fixture copied byte-for-byte from kernel-journal-excerpts.txt.
+Kernel A/B: 256 MiB scopes, OOMPolicy=continue, parent touches 160 MiB, six children touch 40 MiB each. A parent pid 425295 exited 137; B parent pid 425859 survived and exited 0. B children used choom -n 1000 --. Agent adjustment stayed 200.
+
+```text
+Memory cgroup stats for /user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-a.scope:
+oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=/,mems_allowed=0,oom_memcg=/user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-a.scope,task_memcg=/user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-a.scope,task=python3,pid=425295,uid=1000
+Memory cgroup out of memory: Killed process 425295 (python3) total-vm:206932kB, anon-rss:169680kB, file-rss:9152kB, shmem-rss:0kB, UID:1000 pgtables:432kB oom_score_adj:200
+Memory cgroup stats for /user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-a.scope:
+oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=/,mems_allowed=0,oom_memcg=/user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-a.scope,task_memcg=/user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-a.scope,task=python3,pid=425296,uid=1000
+Memory cgroup out of memory: Killed process 425296 (python3) total-vm:84052kB, anon-rss:46800kB, file-rss:9100kB, shmem-rss:0kB, UID:1000 pgtables:184kB oom_score_adj:200
+Memory cgroup stats for /user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-a.scope:
+oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=/,mems_allowed=0,oom_memcg=/user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-a.scope,task_memcg=/user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-a.scope,task=python3,pid=425302,uid=1000
+Memory cgroup out of memory: Killed process 425302 (python3) total-vm:84052kB, anon-rss:44704kB, file-rss:8928kB, shmem-rss:0kB, UID:1000 pgtables:188kB oom_score_adj:200
+Memory cgroup stats for /user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-b.scope:
+oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=/,mems_allowed=0,oom_memcg=/user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-b.scope,task_memcg=/user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-b.scope,task=python3,pid=425875,uid=1000
+Memory cgroup out of memory: Killed process 425875 (python3) total-vm:84052kB, anon-rss:46800kB, file-rss:9088kB, shmem-rss:0kB, UID:1000 pgtables:188kB oom_score_adj:1000
+Memory cgroup stats for /user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-b.scope:
+oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=/,mems_allowed=0,oom_memcg=/user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-b.scope,task_memcg=/user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-b.scope,task=python3,pid=425929,uid=1000
+Memory cgroup out of memory: Killed process 425929 (python3) total-vm:84052kB, anon-rss:44688kB, file-rss:8916kB, shmem-rss:0kB, UID:1000 pgtables:184kB oom_score_adj:1000
+Memory cgroup stats for /user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-b.scope:
+oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=/,mems_allowed=0,oom_memcg=/user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-b.scope,task_memcg=/user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-b.scope,task=python3,pid=426019,uid=1000
+Memory cgroup out of memory: Killed process 426019 (python3) total-vm:84052kB, anon-rss:46800kB, file-rss:9092kB, shmem-rss:0kB, UID:1000 pgtables:188kB oom_score_adj:1000
+Memory cgroup stats for /user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-b.scope:
+oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=/,mems_allowed=0,oom_memcg=/user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-b.scope,task_memcg=/user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-b.scope,task=python3,pid=426131,uid=1000
+Memory cgroup out of memory: Killed process 426131 (python3) total-vm:84052kB, anon-rss:44648kB, file-rss:8928kB, shmem-rss:0kB, UID:1000 pgtables:188kB oom_score_adj:1000
+Memory cgroup stats for /user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-b.scope:
+oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=/,mems_allowed=0,oom_memcg=/user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-b.scope,task_memcg=/user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-b.scope,task=python3,pid=426188,uid=1000
+Memory cgroup out of memory: Killed process 426188 (python3) total-vm:84052kB, anon-rss:46800kB, file-rss:9084kB, shmem-rss:0kB, UID:1000 pgtables:188kB oom_score_adj:1000
+Memory cgroup stats for /user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-b.scope:
+oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=/,mems_allowed=0,oom_memcg=/user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-b.scope,task_memcg=/user.slice/user-1000.slice/user@1000.service/app.slice/oomprobe-t_22c670598b1933a4-b.scope,task=python3,pid=426242,uid=1000
+Memory cgroup out of memory: Killed process 426242 (python3) total-vm:84052kB, anon-rss:44600kB, file-rss:8992kB, shmem-rss:0kB, UID:1000 pgtables:188kB oom_score_adj:1000
+
+```
+
+Tests: OOM policy 25 -> 29; new terminal adjustment 5; unchanged recovery 6, terminal OOM 16, scope failure 7, path completion 2. Consumer sweep: 165 files, 4278 passed, 66 skipped, 0 failed. scripts/check: 20 checks passed.
+RED: bound-interpreter and dispatcher regressions fail without process-set matching; real LocalEnvironment commands report 200 rather than 1000 without prefixing. Nine mutations killed: dropped bound IDs, dropped launcher, foreign task/run acceptance, invalid PIDs, outside-scope prefixing, missing choom, omitted foreground/long-lived prefixes.
+Existing test_classify_dead_worker_passes_the_run_start changes only to expect the additive worker_pids keyword. Stop-policy scope failure semantics remain intact; continue-policy command-only kills remain non-failures. Retry doubling remains bounded by the existing 12 GiB ceiling and admission; the dispatcher test uses a 2 GiB configured base to verify 4 -> 8 GiB without the ceiling.
+---
+ hermes_cli/kanban_db_dispatch.py              |  2 +-
+ hermes_cli/kanban_worker_scope.py             | 46 +++++++++++--
+ .../hermes_cli/fixtures/oom-agent-victim.txt  | 16 +++++
+ .../test_kanban_oom_policy_continue.py        | 67 ++++++++++++++++++-
+ tests/tools/test_terminal_oom_adj.py          | 41 ++++++++++++
+ tools/environments/local.py                   |  6 +-
+ tools/terminal_oom.py                         |  8 +++
+ 7 files changed, 175 insertions(+), 11 deletions(-)
+ create mode 100644 tests/hermes_cli/fixtures/oom-agent-victim.txt
+ create mode 100644 tests/tools/test_terminal_oom_adj.py
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 50473083eb022988c1f9ae19672787d131f5a590..065cc5c354ef5d4b2f2b84311b3510755932b118 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1134,7 +1134,7 @@ def _classify_dead_worker(
+     """
+     log = (_kb.read_worker_log(task_id, tail_bytes=None, board=board) or "") if task_id and run_id else None
+     exited = _classify_dead_worker_exit(pid, claimer, exit_code, task_id=task_id, board=board, run_id=run_id, log=log)
+-    failure = _worker_scope.read_failure(task_id, run_id, log or "", pid=pid, started_at=_worker_scope.run_started_at(conn, run_id),
++    failure = _worker_scope.read_run_failure(conn, task_id, run_id, log or "", pid=pid,
+                                          exit_code=0 if exited.kind == "clean_exit" else None) if task_id else None  # rc 0 skips the kernel log
+     if failure:
+         kind = "oom_killed" if failure["scope_result"] == "oom-kill" else "signaled"
+diff --git a/hermes_cli/kanban_worker_scope.py b/hermes_cli/kanban_worker_scope.py
+index f73f6c5f89e0976e5c2909dd103597c6b219aeaf..f82a79fc4d9f67f767627d17d23e9fceb5402397 100644
+--- a/hermes_cli/kanban_worker_scope.py
++++ b/hermes_cli/kanban_worker_scope.py
+@@ -85,13 +85,14 @@ def _systemctl(*args: str) -> subprocess.CompletedProcess | None:
+ 
+ 
+ def read_failure(task_id: str, run_id: int | None, log: str = "", *, pid: int | None = None,
+-                 started_at: float | None = None, exit_code: int | None = None) -> dict | None:
++                 started_at: float | None = None, exit_code: int | None = None,
++                 worker_pids: set[int] | None = None) -> dict | None:
+     """The run scope's failure, or None when the scope did not fail.
+ 
+     Under ``OOMPolicy=continue`` a child's OOM kill leaves the scope running, so the
+     worker's own ``oom_kill`` count no longer means the worker died of it. The kernel's
+     record names the victim instead: the run failed by OOM only when that victim is the
+-    worker ``pid`` itself (the agent was the largest process in its scope). That lookup
++    spawned ``pid`` or any bound interpreter in ``worker_pids``. That lookup
+     runs whenever ``pid`` is known, not only when this process probed the policy: a
+     dispatcher restarted after the spawn has no probe verdict, and the agent's own SIGKILL
+     leaves no snapshot. ``started_at`` (the run's start, epoch seconds) bounds the
+@@ -112,12 +113,15 @@ def read_failure(task_id: str, run_id: int | None, log: str = "", *, pid: int |
+     result = props.get("Result") if loaded else None
+     if snapshot.get("oom_kill", 0) > 0 and not continued:
+         result = "oom-kill"
++    identities = set(worker_pids or ())
++    if pid:
++        identities.add(pid)
+     victim = None
+     since = journal_since(started_at)
+     if result == "oom-kill":
+         victim = kernel_oom_victim(unit, since=since)
+-    elif result != "signal" and pid and exit_code != 0:  # rc 0: the worker outlived any kill
+-        victim = kernel_oom_victim(unit, pid=pid, since=since)
++    elif result != "signal" and identities and exit_code != 0:  # rc 0: the worker outlived any kill
++        victim = kernel_oom_victim(unit, pid=pid, since=since, worker_pids=identities)
+         result = "oom-kill" if victim else result
+     if result not in {"oom-kill", "signal"}:
+         return None
+@@ -127,7 +131,7 @@ def read_failure(task_id: str, run_id: int | None, log: str = "", *, pid: int |
+         "memory_peak_bytes": snapshot.get("memory_peak_bytes", _bytes(props.get("MemoryPeak", ""))),
+     }
+     if victim:
+-        failure["oom_victim"] = {**victim, "is_worker": bool(pid) and victim["pid"] == pid}
++        failure["oom_victim"] = {**victim, "is_worker": victim["pid"] in identities}
+         if failure["memory_max_bytes"] is None:
+             failure["memory_max_bytes"] = victim.get("limit_bytes")
+     return failure
+@@ -138,6 +142,33 @@ _KILLED_LINE = re.compile(r"Killed process (\d+) \(.*?\).*?anon-rss:(\d+)kB")
+ _USAGE_LINE = re.compile(r"memory: usage \d+kB, limit (\d+)kB")
+ 
+ 
++def read_run_failure(conn, task_id, run_id, log, *, pid, exit_code=None):
++    """Read scope failure with the run's durable worker identities and time boundary."""
++    return read_failure(task_id, run_id, log, pid=pid, worker_pids=run_worker_pids(conn, task_id, run_id, pid),
++                        started_at=run_started_at(conn, run_id), exit_code=exit_code)
++
++
++def run_worker_pids(conn: sqlite3.Connection | None, task_id: str, run_id: int | None, pid: int) -> set[int]:
++    """Launcher plus every bound interpreter in this run, including before rebinds."""
++    pids = {pid}
++    if conn is None or run_id is None:
++        return pids
++    try:
++        rows = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='worker_bound'",
++                            (task_id, run_id)).fetchall()
++    except sqlite3.Error:
++        return pids
++    for row in rows:
++        try:
++            payload = json.loads(row[0])
++        except (TypeError, ValueError):
++            continue
++        bound = payload.get("pid") if isinstance(payload, dict) else None
++        if type(bound) is int and bound > 0:
++            pids.add(bound)
++    return pids
++
++
+ def run_started_at(conn: sqlite3.Connection | None, run_id: int | None) -> int | None:
+     """The run's start (epoch): it bounds the kernel-log read under the reclaim write txn."""
+     if conn is None or run_id is None:
+@@ -157,7 +188,8 @@ def journal_since(started_at: float | None) -> str:
+         return "-24h"
+ 
+ 
+-def kernel_oom_victim(unit: str, *, pid: int | None = None, since: str = "-24h") -> dict | None:
++def kernel_oom_victim(unit: str, *, pid: int | None = None, since: str = "-24h",
++                      worker_pids: set[int] | None = None) -> dict | None:
+     """The kernel's last OOM victim in ``unit`` (``pid`` restricts it to that process).
+ 
+     ``{"pid", "task", "anon_rss_bytes", "limit_bytes"}`` from ``journalctl -k``, or None
+@@ -182,7 +214,7 @@ def kernel_oom_victim(unit: str, *, pid: int | None = None, since: str = "-24h")
+             pending = ({"pid": int(m.group(3)), "task": m.group(2), "limit_bytes": limit}
+                        if m.group(1).endswith("/" + unit) else None)
+         elif pending and (m := _KILLED_LINE.search(line)) and int(m.group(1)) == pending["pid"]:
+-            if pid is None or pending["pid"] == pid:
++            if (pending["pid"] in worker_pids if worker_pids is not None else pid is None or pending["pid"] == pid):
+                 found = {**pending, "anon_rss_bytes": int(m.group(2)) * 1024}
+             pending = None
+     return found
+diff --git a/tests/hermes_cli/fixtures/oom-agent-victim.txt b/tests/hermes_cli/fixtures/oom-agent-victim.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..91e2307f2774634ea428389055a73a11c1cd39b9
+--- /dev/null
++++ b/tests/hermes_cli/fixtures/oom-agent-victim.txt
+@@ -0,0 +1,16 @@
++### worker-5 t_06766cf6fff5d7ce local run 16314: journalctl -k -o cat -S '2026-11-14 14:38:49' -U '2026-11-14 14:44:12' -g 'oom-kill:|Killed process|memory: usage' (the filter kernel_oom_victim uses)
++memory: usage 8388608kB, limit 8388608kB, failcnt 475
++oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=/,mems_allowed=0,oom_memcg=/user.slice/user-1000.slice/user@1000.service/hermes.slice/hermes-kanban.slice/hermes-worker-kanban-t_06766cf6fff5d7ce-run-16314.scope,task_memcg=/user.slice/user-1000.slice/user@1000.service/hermes.slice/hermes-kanban.slice/hermes-worker-kanban-t_06766cf6fff5d7ce-run-16314.scope,task=python3,pid=2112259,uid=1000
++Memory cgroup out of memory: Killed process 2112259 (python3) total-vm:2623364kB, anon-rss:247356kB, file-rss:35064kB, shmem-rss:0kB, UID:1000 pgtables:928kB oom_score_adj:200
++memory: usage 3669660kB, limit 8388608kB, failcnt 494
++oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=/,mems_allowed=0,oom_memcg=/user.slice/user-1000.slice/user@1000.service/hermes.slice/hermes-kanban.slice/hermes-worker-kanban-t_06766cf6fff5d7ce-run-16314.scope,task_memcg=/user.slice/user-1000.slice/user@1000.service/hermes.slice/hermes-kanban.slice/hermes-worker-kanban-t_06766cf6fff5d7ce-run-16314.scope,task=node-MainThread,pid=2178260,uid=1000
++### worker-7 t_ad3f795fa1bbb22f local run 3383: journalctl -k -o cat -S '2026-11-14 00:15:55' -U '2026-11-14 00:57:58' -g 'oom-kill:|Killed process|memory: usage' (the filter kernel_oom_victim uses)
++memory: usage 8388608kB, limit 8388608kB, failcnt 2395
++oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=/,mems_allowed=0,oom_memcg=/user.slice/user-1000.slice/user@1000.service/hermes.slice/hermes-kanban.slice/hermes-worker-kanban-t_ad3f795fa1bbb22f-run-3383.scope,task_memcg=/user.slice/user-1000.slice/user@1000.service/hermes.slice/hermes-kanban.slice/hermes-worker-kanban-t_ad3f795fa1bbb22f-run-3383.scope,task=python,pid=1898176,uid=1000
++Memory cgroup out of memory: Killed process 1898176 (python) total-vm:4188252kB, anon-rss:4146572kB, file-rss:16028kB, shmem-rss:0kB, UID:1000 pgtables:8236kB oom_score_adj:200
++memory: usage 8388608kB, limit 8388608kB, failcnt 2434
++oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=/,mems_allowed=0,oom_memcg=/user.slice/user-1000.slice/user@1000.service/hermes.slice/hermes-kanban.slice/hermes-worker-kanban-t_ad3f795fa1bbb22f-run-3383.scope,task_memcg=/user.slice/user-1000.slice/user@1000.service/hermes.slice/hermes-kanban.slice/hermes-worker-kanban-t_ad3f795fa1bbb22f-run-3383.scope,task=python,pid=1669485,uid=1000
++Memory cgroup out of memory: Killed process 1669485 (python) total-vm:3096168kB, anon-rss:2965116kB, file-rss:16008kB, shmem-rss:0kB, UID:1000 pgtables:5924kB oom_score_adj:200
++memory: usage 8388608kB, limit 8388608kB, failcnt 2599
++oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=/,mems_allowed=0,oom_memcg=/user.slice/user-1000.slice/user@1000.service/hermes.slice/hermes-kanban.slice/hermes-worker-kanban-t_ad3f795fa1bbb22f-run-3383.scope,task_memcg=/user.slice/user-1000.slice/user@1000.service/hermes.slice/hermes-kanban.slice/hermes-worker-kanban-t_ad3f795fa1bbb22f-run-3383.scope,task=python3,pid=4172725,uid=1000
++Memory cgroup out of memory: Killed process 4172725 (python3) total-vm:3333404kB, anon-rss:322896kB, file-rss:35400kB, shmem-rss:0kB, UID:1000 pgtables:1164kB oom_score_adj:200
+diff --git a/tests/hermes_cli/test_kanban_oom_policy_continue.py b/tests/hermes_cli/test_kanban_oom_policy_continue.py
+index 4318c5743174f7ba7568e50f9defc4eae7219079..499225e47fa145893cd41850ac5f7fb74d9912c1 100644
+--- a/tests/hermes_cli/test_kanban_oom_policy_continue.py
++++ b/tests/hermes_cli/test_kanban_oom_policy_continue.py
+@@ -236,6 +236,71 @@ def test_kernel_log_read_is_bounded_by_the_run_start(monkeypatch):
+     assert seen[0][seen[0].index("-S") + 1] == "-24h"
+ 
+ 
++def _worker5_journal():
++    from pathlib import Path
++    return (Path(__file__).parent / "fixtures/oom-agent-victim.txt").read_text().split("### worker-7")[0]
++
++
++def test_bound_interpreter_victim_differs_from_launcher(monkeypatch):
++    _journal_argv(monkeypatch, text=_worker5_journal())
++    failure = scope.read_failure("t_06766cf6fff5d7ce", 16314, pid=2111911, worker_pids={2112259})
++    assert failure is not None
++    assert "Worker was OOM-killed at 8192 MiB" in scope.describe(failure)
++    assert failure["oom_victim"]["is_worker"]
++
++
++def test_command_victim_outside_run_process_set_is_not_failure(monkeypatch):
++    _journal_argv(monkeypatch, text=_worker5_journal())
++    assert scope.read_failure("t_06766cf6fff5d7ce", 16314, pid=2111911, worker_pids={42, 43}) is None
++
++
++def test_dispatch_books_bound_victim_and_uplifts_retry(tmp_path, monkeypatch):
++    from pathlib import Path
++    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_dispatch as kbd
++    from tests.hermes_cli.test_kanban_worker_exit_trailer import _dead_worker_with_log
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
++    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
++    monkeypatch.setattr(scope, "mem_available_bytes", lambda: 40 * 1024 ** 3)
++    kbd._recent_worker_exits.clear()
++    kb.init_db()
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="bound interpreter OOM", assignee="a")
++        _dead_worker_with_log(conn, tid, 2111911, 1)
++        rid = kb.get_task(conn, tid).current_run_id
++        for bound in (2112259, 2112260, 2112261):
++            conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?,?,?,?,?)",
++                         (tid, rid, "worker_bound", json.dumps({"pid": bound}), 1))
++        conn.commit()
++        journal = _worker5_journal().replace("t_06766cf6fff5d7ce-run-16314", f"{tid}-run-{rid}")
++        _journal_argv(monkeypatch, text=journal)
++        monkeypatch.setattr(kbd, "crash_worker_output", lambda *a, **kw: "managed worker lost: EOFError")
++        kbd.detect_crashed_workers(conn)
++        run = conn.execute("SELECT * FROM task_runs WHERE id=?", (rid,)).fetchone()
++        assert run["outcome"] == "oom_killed"
++        assert "OOM-killed at 8192 MiB" in kb.get_task(conn, tid).last_failure_error
++    # A small base avoids the independent 12-GiB ceiling; OOM doubles the normal first-run uplift.
++    argv = ["systemd-run", "--scope", "--property", f"MemoryMax={2 * 1024 ** 3}", "--", "hermes"]
++    assert f"MemoryMax={8 * 1024 ** 3}" in scope.apply_oom_recovery(argv, tid)
++
++
++def test_run_worker_pids_is_run_scoped_and_tolerates_bad_events():
++    import sqlite3
++    with sqlite3.connect(":memory:") as conn:
++        conn.execute("CREATE TABLE task_events (task_id TEXT, run_id INTEGER, kind TEXT, payload TEXT)")
++        events = [("t_x", 1, "worker_bound", json.dumps({"pid": p})) for p in (2, 3, 4, 0, -1, True, "5")]
++        events += [("t_other", 1, "worker_bound", '{"pid":6}'), ("t_x", 2, "worker_bound", '{"pid":7}'),
++                   ("t_x", 1, "spawned", '{"pid":8}')]
++        events += [("t_x", 1, "worker_bound", raw) for raw in (None, "{", "[]", "null", "{}")]
++        conn.executemany("INSERT INTO task_events VALUES (?,?,?,?)", events)
++        assert scope.run_worker_pids(conn, "t_x", 1, 9) == {2, 3, 4, 9}
++        assert scope.run_worker_pids(conn, "t_x", None, 9) == {9}
++    assert scope.run_worker_pids(None, "t_x", 1, 9) == {9}
++
++
+ def test_classify_dead_worker_passes_the_run_start(monkeypatch):
+     import sqlite3
+     from hermes_cli import kanban_db_dispatch as kbd
+@@ -251,7 +316,7 @@ def test_classify_dead_worker_passes_the_run_start(monkeypatch):
+                                                              "memory_max_bytes": None, "memory_peak_bytes": None})
+     monkeypatch.setattr(kbd, "crash_worker_output", lambda *a, **kw: "")
+     kbd._classify_dead_worker(4242, "h:1", None, task_id="t_x", run_id=5, conn=conn)
+-    assert seen == {"pid": 4242, "started_at": 1794550650, "exit_code": None}
++    assert seen == {"pid": 4242, "worker_pids": {4242}, "started_at": 1794550650, "exit_code": None}
+ 
+ 
+ def test_failure_path_reads_the_worker_log_once(monkeypatch):
+diff --git a/tests/tools/test_terminal_oom_adj.py b/tests/tools/test_terminal_oom_adj.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..50ea8078d8088cad44c3573c786f4ffe6e78e84d
+--- /dev/null
++++ b/tests/tools/test_terminal_oom_adj.py
+@@ -0,0 +1,41 @@
++"""Terminal commands, not the agent, are preferred victims inside run scopes."""
++import shutil
++import sys
++from pathlib import Path
++
++import pytest
++
++from tools import terminal_oom
++from tools.environments.local import LocalEnvironment
++
++pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux OOM adjustment")
++
++
++@pytest.mark.parametrize("inside", [True, False])
++@pytest.mark.parametrize("long_lived", [True, False])
++def test_command_adjustment(tmp_path, monkeypatch, inside, long_lived):
++    if not shutil.which("choom"):
++        pytest.skip("choom unavailable")
++    monkeypatch.setattr(terminal_oom, "run_scope_cgroup", lambda: tmp_path if inside else None)
++    parent = Path("/proc/self/oom_score_adj").read_text().strip()
++    env = LocalEnvironment(cwd=str(tmp_path))
++    if long_lived:
++        proc = env._spawn_long_lived(["cat", "/proc/self/oom_score_adj"], None)
++    else:
++        proc = env._run_bash("cat /proc/self/oom_score_adj")
++    try:
++        out, _ = proc.communicate(timeout=10)
++        assert proc.returncode == 0
++        if isinstance(out, bytes):
++            out = out.decode()
++        assert out.strip() == ("1000" if inside else parent)
++        assert Path("/proc/self/oom_score_adj").read_text().strip() == parent
++    finally:
++        env._reap_long_lived(proc)
++
++
++def test_no_choom_preserves_argv(tmp_path, monkeypatch):
++    monkeypatch.setattr(terminal_oom, "run_scope_cgroup", lambda: tmp_path)
++    monkeypatch.setattr(shutil, "which", lambda name: None)
++    argv = ["bash", "-c", "true"]
++    assert terminal_oom.prefer_command_victim(argv) == argv
+diff --git a/tools/environments/local.py b/tools/environments/local.py
+index c6bde2708768a8873835a99cb0b76c4a1a0c5106..fca5b8cbffccb6965f74fc721c87aa4132bce8b8 100644
+--- a/tools/environments/local.py
++++ b/tools/environments/local.py
+@@ -1240,7 +1240,8 @@ class LocalEnvironment(BaseEnvironment):
+         if login:
+             cmd_string = _append_dropped_path_entries(cmd_string, run_env.get("PATH", ""))
+             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
+-        args = [bash, *(["-l"] if login else []), "-c", cmd_string]
++        from tools.terminal_oom import prefer_command_victim
++        args = prefer_command_victim([bash, *(["-l"] if login else []), "-c", cmd_string])
+         self._recover_cwd()
+         # [daveey] terminal.update_survivable_processes: own scope, not owned by this process.
+         if survivable is not None and (proc := survivable.spawn(args, run_env, self.cwd, stdin_data,
+@@ -1291,8 +1292,9 @@ class LocalEnvironment(BaseEnvironment):
+         its group die with Hermes however Hermes dies (``spawn_owned``), stdin/stdout as byte pipes.
+         ``_stop_long_lived`` kills the group and releases it."""
+         from hermes_cli.process_identity import spawn_owned
++        from tools.terminal_oom import prefer_command_victim
+         proc = spawn_owned(  # windows-footgun: ok — argv list, no shell; group kill gated on _IS_WINDOWS
+-            list(argv), purpose="long-lived environment process",
++            prefer_command_victim(list(argv)), purpose="long-lived environment process",
+             env=_make_run_env({**self.env, **(child_env or {})}), cwd=self.cwd,
+             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+             **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
+diff --git a/tools/terminal_oom.py b/tools/terminal_oom.py
+index d458537656ae94b20eb458b9374b94411b7c72a9..1c63a77ccaf3ecada0f2d462da4ee6af6765ad5c 100644
+--- a/tools/terminal_oom.py
++++ b/tools/terminal_oom.py
+@@ -10,6 +10,7 @@ whose process died, so a concurrent job's kill is not pinned on the command.
+ """
+ from __future__ import annotations
+ 
++import shutil
+ import time
+ from pathlib import Path
+ from typing import Optional
+@@ -38,6 +39,13 @@ def run_scope_cgroup() -> Optional[Path]:
+     return None
+ 
+ 
++def prefer_command_victim(argv: list[str]) -> list[str]:
++    """Raise only the child's OOM priority, without preexec_fn in our threaded host."""
++    if run_scope_cgroup() is not None and (choom := shutil.which("choom")):
++        return [choom, "-n", "1000", "--", *argv]
++    return argv
++
++
+ def oom_kills(cgroup: Optional[Path]) -> Optional[int]:
+     """The scope's ``memory.events`` ``oom_kill`` count, or None when unreadable."""
+     if cgroup is None:
+-- 
+2.43.0
+

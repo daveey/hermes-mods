@@ -1,0 +1,191 @@
+From f12432799320330299003bd3192f1fb7c7a0e7f2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 09:16:47 +0000
+Subject: [PATCH] [daveey] Refresh remote notice display before claim
+ announcement
+
+Independent review reproduced stale persisted display_text after model-text refresh. Refresh both projections with the same bound, and stamp execution custody immediately while refreshing off-loop before message.start. RED: persisted display fixture fails; after projection fix message.start fixture fails. GREEN: five display/native/local/ingress cases pass.
+---
+ gateway/kanban_wake_fold.py                   |   3 +
+ gateway/session_authority.py                  |   9 +-
+ gateway/session_claim_publication.py          |   8 +-
+ .../test_kanban_remote_notice_display.py      | 106 ++++++++++++++++++
+ 4 files changed, 121 insertions(+), 5 deletions(-)
+ create mode 100644 tests/gateway/test_kanban_remote_notice_display.py
+
+diff --git a/gateway/kanban_wake_fold.py b/gateway/kanban_wake_fold.py
+index 132a26799b8c2388756b6fec349629b9b6431ae8..997ac464df2ba07362a71e22e81dc1ca14af79c6 100644
+--- a/gateway/kanban_wake_fold.py
++++ b/gateway/kanban_wake_fold.py
+@@ -332,6 +332,9 @@ def refresh_claimed(payload):
+             # Strict: an unreadable card would fall back to its as-delivered text and undo the
+             # relabel the fold already made, so any unreadable card leaves the whole text as it was.
+             payload['text'] = _compose(cards, guidance, strict=True)
++            from gateway.session_automation import _DISPLAY_TEXT_LIMIT
++            text = payload['text']
++            descriptor['display_text'] = text if len(text) <= _DISPLAY_TEXT_LIMIT else text[:_DISPLAY_TEXT_LIMIT - 1] + '…'
+     except Exception:  # health: allow BLE001 -- a refresh must never cost the wake itself
+         logger.warning('kanban wake: claim-time relabel skipped; delivering the wake unchanged', exc_info=True)
+ 
+diff --git a/gateway/session_authority.py b/gateway/session_authority.py
+index 6f77ddee116097874d10a4d3fdd97d6e02089c66..c7e43df48e66c5a1ac1ea0ae70eb81e91e10a99b 100644
+--- a/gateway/session_authority.py
++++ b/gateway/session_authority.py
+@@ -1245,7 +1245,7 @@ class SessionAuthority:
+         # instead of letting the drain exit idle over a committed admission.
+         return (False if row is None and live.rescan else row), first
+ 
+-    def _stamp_claim(self, ref, live, row, *, publish_pending=True):
++    def _stamp_claim(self, ref, live, row, *, publish_pending=True, announce=True):
+         """The claim's execution stamp, in the same tracked task as its commit: no observer (or
+         retirement's join) ever sees a committed claim that no execution stamp names."""
+         if row:  # None or False (the head changed under the write) claimed nothing
+@@ -1256,9 +1256,10 @@ class SessionAuthority:
+                     'authority_epoch': self.epoch, 'execution_generation': row['generation'],
+                     'admission_id': row['admission_id']}
+                 self.executing[ref.session_id] = row['generation']
+-                from gateway.session_automation import admission_display
+-                live.event_stream.publish(ref.session_id, admission_display(row.get('payload') or {}),
+-                                          event_type='message.start')
++                if announce:
++                    from gateway.session_automation import admission_display
++                    live.event_stream.publish(ref.session_id, admission_display(row.get('payload') or {}),
++                                              event_type='message.start')
+                 if publish_pending:
+                     self._publish_pending(ref)
+         return row
+diff --git a/gateway/session_claim_publication.py b/gateway/session_claim_publication.py
+index 56c45e28915a25f0e035f138bcd2b4df7814fbe8..6a441331f1bd20f458ffe838483ae18ee8998403 100644
+--- a/gateway/session_claim_publication.py
++++ b/gateway/session_claim_publication.py
+@@ -45,8 +45,14 @@ def _prepare(authority, ref, token):
+ async def stamp_claim(authority, ref, live, row):
+     # Stamp immediately after the commit, even if the subsequent storage read fails.
+     # The encompassing tracked_write shields BOTH phases from observer cancellation.
+-    authority._stamp_claim(ref, live, row, publish_pending=False)
++    authority._stamp_claim(ref, live, row, publish_pending=False, announce=False)
+     if row:
++        from gateway.kanban_wake_fold import refresh_claimed
++        from gateway.session_automation import admission_display
++        # Execution custody is stamped before this off-loop read; presentation follows the refresh.
++        await asyncio.to_thread(refresh_claimed, row['payload'])
++        with live.event_stream.lock:
++            live.event_stream.publish(ref.session_id, admission_display(row['payload']), event_type='message.start')
+         while True:
+             with live.event_stream.lock:
+                 token = _view_token(authority, ref, live)
+diff --git a/tests/gateway/test_kanban_remote_notice_display.py b/tests/gateway/test_kanban_remote_notice_display.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..519298be22856bee84bddbb6fb3ed4f00d1a2456
+--- /dev/null
++++ b/tests/gateway/test_kanban_remote_notice_display.py
+@@ -0,0 +1,106 @@
++import json
++import sqlite3
++import pytest
++from gateway import kanban_remote_owner as kro, session_automation, kanban_wake_fold
++from tests.gateway.test_kanban_wake_fold import _local_chat, _automation
++
++
++@pytest.mark.parametrize('envelope', ['local_automation_v1', 'native_text_v1'])
++@pytest.mark.parametrize('extra', ['', 'x' * 20000])
++def test_refreshed_display_matches_bounded_model_text(monkeypatch, envelope, extra):
++    tid = 't_remote'
++    text = 'Blocked\nNext action for the user: choose\nContext' + extra
++    descriptor = {'identity': json.dumps(['kanban-wake', 'fixture']),
++                  'display_kind': 'kanban_notice', 'display_text': text,
++                  'kanban_cards': [{'task_id': tid, 'board': 'default',
++                                    'kinds': ['blocked'], 'text': text}]}
++    payload = {'text': text, envelope: descriptor if envelope == 'local_automation_v1'
++               else {'automation': descriptor}}
++    monkeypatch.setattr(kanban_wake_fold, '_live_task', lambda *a, **kw: ('archived', ''))
++    kanban_wake_fold.refresh_claimed(payload)
++    limit = session_automation._DISPLAY_TEXT_LIMIT
++    expected = payload['text'] if len(payload['text']) <= limit else payload['text'][:limit - 1] + '…'
++    assert descriptor['display_text'] == expected
++    assert 'Live status: archived' in expected
++    assert 'Next action for the user:' not in expected
++    assert session_automation.admission_display(payload)['display_text'] == expected
++
++@pytest.mark.asyncio
++async def test_standalone_archived_replica_display(tmp_path, monkeypatch):
++    from hermes_cli import kanban_db_connect as kbc, kanban_db as kb, kanban_replica_freshness as fresh
++    from hermes_cli.kanban_block_notice import block_notice
++    from gateway.session_ingress import execute_admission
++    from gateway.session_contract import SessionRef
++    from tests.gateway.session_claims import claim
++    monkeypatch.setenv('HERMES_KANBAN_DB', str(tmp_path / 'board.db'))
++    tid = 't_ac1c95cd2bba5c3a'
++    with kbc.connect() as conn:
++        from hermes_cli import kanban_db_sync as sync
++        sync.apply_sync_schema_steps(conn)
++        assert kb.get_task(conn, tid) is None
++    replica = tmp_path / 'replica.db'
++    with sqlite3.connect(replica) as conn:
++        conn.execute('CREATE TABLE tasks(id TEXT, status TEXT, ready_since INTEGER, sync_version INTEGER, result TEXT)')
++        conn.execute('CREATE TABLE task_runs(id INTEGER, task_id TEXT, summary TEXT, ended_at INTEGER, started_at INTEGER)')
++        conn.execute('INSERT INTO tasks VALUES (?, ?, NULL, 12, ?)', (tid, 'archived', 'withdrawn'))
++    monkeypatch.setattr(fresh, '_replica', lambda _: (replica, 0))
++    text = block_notice({'status':'blocked','block_kind':'needs_input','title':'Fixture',
++        'human_request': {'action':'Choose A; unblock to proceed; archive to drop', 'why_human':'decision',
++                         'scope':'fixture','interaction':'reply','evidence':'fixture'}}, tid, 'default')
++    item = {'ref':f'hub/default/default/{tid}', 'state':'blocked@1', 'event_key':'remote:fixture:1', 'text':text}
++    metadata = kro._metadata(item)
++    authority, adapter, source, queued, _ = await _local_chat(tmp_path, monkeypatch)
++    seen = []
++    async def turn(event):
++        from gateway.response_filters import persisted_user_metadata_for_event, display_kind_for_event
++        display = persisted_user_metadata_for_event(event)
++        authority.db.append_message(source.chat_id, 'user', content=event.text,
++                                    display_kind=display_kind_for_event(event), display_metadata=display)
++        seen.append((event.text, display))
++        return 'ok'
++    monkeypatch.setattr(authority.runner, '_handle_message', turn)
++    try:
++        assert await session_automation.admit_route_wake(authority.runner, adapter, source, text, kro.PRODUCER, metadata)
++        [row] = _automation(queued())
++        descriptor = kanban_wake_fold._descriptor(row['payload'])
++        ref = SessionRef(authority.profile_id, descriptor['owner'])
++        from gateway.session_claim_publication import stamp_claim
++        live = authority.sessions[ref.session_id]
++        starts = []
++        publish = live.event_stream.publish
++        def capture(session_id, payload, **kwargs):
++            if kwargs.get('event_type') == 'message.start':
++                starts.append(payload)
++            return publish(session_id, payload, **kwargs)
++        monkeypatch.setattr(live.event_stream, 'publish', capture)
++        claimed = claim(authority, ref, row)
++        import threading
++        loop_thread = threading.get_ident()
++        refresh = kanban_wake_fold.refresh_claimed
++        refresh_calls = []
++        def observed_refresh(payload):
++            assert threading.get_ident() != loop_thread
++            assert authority.executing[ref.session_id] == claimed['generation']
++            assert live.event_stream.execution['admission_id'] == claimed['admission_id']
++            if not refresh_calls:
++                assert starts == []
++            refresh_calls.append(True)
++            return refresh(payload)
++        monkeypatch.setattr(kanban_wake_fold, 'refresh_claimed', observed_refresh)
++        await stamp_claim(authority, ref, live, claimed)
++        assert refresh_calls
++        assert len(starts) == 1
++        assert 'Next action for the user:' not in starts[0]['display_text']
++        assert 'Live status: archived' in starts[0]['display_text']
++        await execute_admission(authority, ref, claimed)
++        assert len(seen) == 1
++        model_text, meta = seen[0]
++        assert 'Live status: archived' in model_text
++        assert 'Next action for the user:' not in model_text
++        rows = authority.db.get_messages(source.chat_id)
++        stored = rows[-1]['display_metadata']
++        stored = json.loads(stored) if isinstance(stored, str) else stored
++        assert stored['display_text'] == meta['display_text']
++        assert 'Next action for the user:' not in stored['display_text'], stored['display_text']
++    finally:
++        authority.db.close()
+-- 
+2.43.0
+

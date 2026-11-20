@@ -1,0 +1,202 @@
+From 5fe782fdaa236950c3f6db4b2307637e381eaced Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 07:35:35 +0000
+Subject: [PATCH] perf(kanban-sync): account chat-link reconciliation substeps
+ [daveey]
+
+Why: the idle kanban-sync-links family used 3.121% of one core in the
+original read-only Mac window, entirely outside named loop scopes.
+The existing unchanged-board skip still evaluates shared sources first,
+so source inspection alone cannot identify the dominant cost.
+
+Add nested accounting for the complete pass, shared source inventory,
+configuration signature, board/input gates, backfill, planning, local and
+ledger links, owner releases, existing rows, machine releases, chat
+classification, owner links, and writes. Record unchanged board skips.
+No cache, freshness, scheduling, release or write policy changes.
+
+Proof: accounting tests fail behaviorally without scopes; the initial
+instrumentation and all 22 links files passed (246 tests). Expanded
+local/ledger/classification test fails on the initial instrumentation
+with AssertionError: sync.links.local. Expanded GREEN: all 22 files,
+246 tests passed, 0 failed (accounting-expanded-green.log; exit 0).
+Full scripts/check --base origin/main passes on the expanded change.
+
+This is the measurement stage, not a CPU reduction claim. The owning
+card retains structural skip/invalidation tests and a read-only idle
+Mac family measurement below 0.5% after the optimization.
+---
+ hermes_cli/kanban_chat_links.py               | 37 +++++++++++--------
+ hermes_cli/kanban_sync_client.py              | 13 +++++--
+ .../test_kanban_sync_links_accounting.py      | 31 ++++++++++++++++
+ 3 files changed, 61 insertions(+), 20 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_links_accounting.py
+
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index 897deddce055899145cb711872ab6c9e3449211a..8d20c15abf48d6667faa28712206b3b469204908 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -385,12 +385,14 @@ def ledger_boards(gateway: str) -> set[str]:
+ 
+ def _plan(conn: sqlite3.Connection, board: str, gateway: str, ledger: bool) -> tuple[dict, list]:
+     """``(want, rows)``: the links this gateway wants in ``conn`` and the rows it has (read-only)."""
+-    want = _local_links(conn, gateway)
++    from hermes_cli import loop_accounting as la
++    want = la.timed("sync.links.local", _local_links, conn, gateway)
+     if ledger:
+-        want.update(_ledger_links(board, gateway))
+-    want.update(_owner_written_releases(board, gateway, want))
+-    rows = conn.execute("SELECT uid, released, chat_session, kind, task_id, chat_profile FROM task_chat_links "
+-                        "WHERE chat_gateway = ?", (gateway,)).fetchall()
++        want.update(la.timed("sync.links.ledger", _ledger_links, board, gateway))
++    want.update(la.timed("sync.links.owner_releases", _owner_written_releases, board, gateway, want))
++    with la.pass_("sync.links.existing"):
++        rows = conn.execute("SELECT uid, released, chat_session, kind, task_id, chat_profile FROM task_chat_links "
++                            "WHERE chat_gateway = ?", (gateway,)).fetchall()
+     return want, rows
+ 
+ 
+@@ -438,9 +440,10 @@ def reconcile(conn: sqlite3.Connection, board: str, gateway: str, *, ledger: boo
+     the same captured writes; each pass that releases any writes a receipt (``_write_release_receipt``). [daveey]"""
+     from hermes_cli.kanban_db_connect import write_txn
+     from hermes_cli.kanban_creator_chats import backfill
+-    backfill(conn)
+-    want, rows = _plan(conn, board, gateway, ledger)
+-    machine = _machine_releases(want, rows, gateway)
++    from hermes_cli import loop_accounting as la
++    la.timed("sync.links.backfill", backfill, conn)
++    want, rows = la.timed("sync.links.plan", _plan, conn, board, gateway, ledger)
++    machine = la.timed("sync.links.machine_releases", _machine_releases, want, rows, gateway)
+     from hermes_cli.kanban_placement import is_placeholder_session
+     have = {r[0]: r[1] for r in rows}
+     # A placement attribution id is not a chat: its link is deleted (captured, so the Board drops it too), never
+@@ -448,15 +451,17 @@ def reconcile(conn: sqlite3.Connection, board: str, gateway: str, *, ledger: boo
+     # shepherd link is no chat either (its wakes are refused). [daveey]
+     # A released ``created`` row to a worker hash is the release record of an owner-written link
+     # (``_owner_written_releases``): deleting it would hand the owner's unreleased copy back. [daveey]
+-    shepherd_rows: dict[tuple, tuple[Any, list[Any]]] = {}  # exact chat profile -> (profile, sessions)
+-    for r in rows:
+-        shepherd_rows.setdefault((type(r[5]), r[5]), (r[5], []))[1].append(r[2])
+-    headless = {key: _worker_shepherds(sessions, gateway, profile) for key, (profile, sessions) in shepherd_rows.items()}
+-    placeholders = {r[0] for r in rows if is_placeholder_session(r[2]) or (
+-        str(r[2] or "") in headless[(type(r[5]), r[5])] and not (r[1] and r[3] == "created"))}
++    with la.pass_("sync.links.classify"):
++        shepherd_rows: dict[tuple, tuple[Any, list[Any]]] = {}  # exact chat profile -> (profile, sessions)
++        for r in rows:
++            shepherd_rows.setdefault((type(r[5]), r[5]), (r[5], []))[1].append(r[2])
++        headless = {key: _worker_shepherds(sessions, gateway, profile)
++                    for key, (profile, sessions) in shepherd_rows.items()}
++        placeholders = {r[0] for r in rows if is_placeholder_session(r[2]) or (
++            str(r[2] or "") in headless[(type(r[5]), r[5])] and not (r[1] and r[3] == "created"))}
+     added = changed = released = retired = 0
+-    owner_links = _owner_hub_links(conn, board, gateway)  # read before the write lock, like ``_plan``
+-    with write_txn(conn):
++    owner_links = la.timed("sync.links.owner_links", _owner_hub_links, conn, board, gateway)
++    with la.pass_("sync.links.write"), write_txn(conn):
+         for link in owner_links:
+             # Insert-only, and only while no row for this card and chat exists (a concurrent write, or a pull that
+             # brought the chat gateway's own row in, wins). See ``_owner_hub_links``.
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 83d6dd1947b08bdc9c03282a44e9ad2085d66ab9..f9e5f050b2b8193a749d220cb2e028b4a2bd5614 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -23,6 +23,7 @@ gateway's hub enrollment (``~/.config/hermes-mail/{config.json,gateway.key}``),
+ from __future__ import annotations
+ 
+ import json
++from hermes_cli import loop_accounting as la
+ import logging
+ import os
+ import re
+@@ -1295,6 +1296,7 @@ def _links_unchanged(key: str, inputs: Optional[tuple], slug: str, began: float)
+     return True, started
+ 
+ 
++@la.accounted("sync.links.inputs")
+ def _links_inputs(conn: sqlite3.Connection, path: Path, slug: str, gateway: str, mode: str,
+                   ledger: Optional[dict[str, frozenset]], signature: Optional[tuple]) -> Optional[tuple]:
+     """Everything one board's links pass (``kanban_chat_links.reconcile`` with its creator-chats backfill) reads,
+@@ -1324,6 +1326,7 @@ def _links_inputs(conn: sqlite3.Connection, path: Path, slug: str, gateway: str,
+     return (st.st_dev, st.st_ino), revision, replica, ledger.get(slug, frozenset()), mode, signature
+ 
+ 
++@la.accounted("sync.links")
+ def reconcile_links(boards: list[tuple[str, Path]], gateway: str, *, skip_unchanged: bool = False) -> None:
+     """Bring this gateway's chat links up to date in every synced board (kanban_chat_links.reconcile), creating a
+     link-only board for each board this gateway's chats have cards on but this host does not have.
+@@ -1339,22 +1342,23 @@ def reconcile_links(boards: list[tuple[str, Path]], gateway: str, *, skip_unchan
+         ledger: Optional[dict[str, frozenset]] = None
+         try:
+             from hermes_cli.kanban_session_activity import _remote_links
+-            ledger = ledger_slices(_remote_links(), gateway)
++            with la.pass_("sync.links.sources"):
++                ledger = ledger_slices(_remote_links(), gateway)
+             local = {slug for slug, _path in boards}
+             if not skip_unchanged or set(ledger) - local:
+-                created = ensure_link_boards(set(ledger), gateway)
++                created = la.timed("sync.links.ensure_boards", ensure_link_boards, set(ledger), gateway)
+                 if created:
+                     _log.info("kanban sync: link-only boards %s", created)
+                     boards = board_paths()
+         except Exception as exc:  # health: allow BLE001 -- link-only boards are best effort; local links still reconcile
+             _log.warning("kanban sync: link-only boards failed (%s: %s)", type(exc).__name__, exc)
+-        signature = links_signature(gateway, placement) if skip_unchanged else None
++        signature = la.timed("sync.links.signature", links_signature, gateway, placement) if skip_unchanged else None
+         for slug, path in boards:
+             key = str(path)
+             counts: dict = {}
+             began = _links_pass_clock()
+             try:
+-                with connection(path, lambda: _connect(path)) as conn:
++                with la.pass_("sync.links.board") as accounting, connection(path, lambda: _connect(path)) as conn:
+                     mode = sync.board_mode(conn)
+                     if mode == "off":
+                         continue
+@@ -1363,6 +1367,7 @@ def reconcile_links(boards: list[tuple[str, Path]], gateway: str, *, skip_unchan
+                         inputs = _links_inputs(conn, path, slug, gateway, mode, ledger, signature)
+                         skip, started = _links_unchanged(key, inputs, slug, began)
+                         if skip:
++                            accounting.skip()
+                             continue
+                     counts = kanban_chat_links.reconcile(conn, slug, gateway)
+                     if inputs is not None:
+diff --git a/tests/hermes_cli/test_kanban_sync_links_accounting.py b/tests/hermes_cli/test_kanban_sync_links_accounting.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..59f30f6c22cc07bf84a895796186b0c634a037c5
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_links_accounting.py
+@@ -0,0 +1,31 @@
++"""The links lane must explain CPU even on its unchanged-board path. [daveey]"""
++from hermes_cli import loop_accounting as la
++from tests.hermes_cli import test_kanban_sync_steady_links as helpers
++
++kanban_home = helpers.kanban_home
++ledger = helpers.ledger
++live = helpers.live
++scope = helpers.scope
++spies = helpers.spies
++
++
++def test_links_substeps_account_work_and_unchanged_pass(live, ledger, kanban_home, spies, scope):
++    helpers._settled(live, ledger, kanban_home, spies)
++    before = la.snapshot()["loops"]
++    helpers._pass(kanban_home)
++    after = la.snapshot()["loops"]
++    for name in ("sync.links", "sync.links.sources", "sync.links.signature", "sync.links.inputs"):
++        assert after.get(name, {}).get("runs", 0) == before.get(name, {}).get("runs", 0) + 1, name
++    assert after["sync.links.board"]["skips"] == before["sync.links.board"]["skips"] + 1
++    assert spies == {"reconcile": 0, "backfill": 0}
++
++
++def test_links_reconcile_substeps_are_accounted(live, ledger, kanban_home, scope):
++    before = la.snapshot()["loops"]
++    helpers._seed(live, ledger)
++    helpers._pass(kanban_home)
++    after = la.snapshot()["loops"]
++    for step in ("backfill", "plan", "local", "ledger", "owner_releases", "existing", "classify",
++                 "machine_releases", "owner_links", "write"):
++        name = f"sync.links.{step}"
++        assert after.get(name, {}).get("runs", 0) > before.get(name, {}).get("runs", 0), name
+-- 
+2.43.0
+

@@ -1,0 +1,284 @@
+From 78ffb79ebe4c61e703bde691915fa4e8ab18b07c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 18:24:07 +0000
+Subject: [PATCH] [daveey] lifecycle guard: resolve stdin variables into nested
+ login shells from assignments and env
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Corpus replay of #3099 (12,617 terminal commands) showed its fail-closed rule refusing real,
+resolvable shapes: `P=/x/probe.sh; ssh host 'bash -s' < $P`, `< $S/au_probe.sh`,
+`< "$TMPDIR/deploy.sh"`, `< $HERMES_KANBAN_WORKSPACE/live_probe.py`. Refusing them is safe, but it
+blocks legitimate work, and the walk can name these files.
+
+A `$NAME`/`${NAME}` in a stdin target fed to a nested login/interactive shell now expands from:
+- the command's own standalone assignments (`S=f`, `export S=f`; every value counts, since order
+  and scope are not tracked), else
+- the guard's environment (the local terminal inherits `$TMPDIR` and `$HERMES_KANBAN_WORKSPACE`).
+
+Each expanded file is then walked like a literal one. These still fail closed, refused by name:
+- an unknown variable, `$1`, `$(…)`, a backtick or a glob
+- a prefix assignment (`S=f su -l bob < $S`, where the redirection does not see it)
+- a loop variable
+- more than 16 expansions
+
+Tests: 7 positives that are walked, and 5 fail-closed shapes. Plus an environment test: set, it is
+walked; unset, it is refused. RED 8, GREEN 344 in test_lifecycle_guard_session_aliases.py.
+---
+ cron/lifecycle_guard_nested_shells.py         | 102 ++++++++++++++----
+ .../test_lifecycle_guard_session_aliases.py   |  34 +++++-
+ 2 files changed, 115 insertions(+), 21 deletions(-)
+
+diff --git a/cron/lifecycle_guard_nested_shells.py b/cron/lifecycle_guard_nested_shells.py
+index 965127c4608fa4a2924fc96102d437d58725e1eb..4219fd40dcb22431377b96d21e917c714df0dfd9 100644
+--- a/cron/lifecycle_guard_nested_shells.py
++++ b/cron/lifecycle_guard_nested_shells.py
+@@ -8,11 +8,12 @@ from __future__ import annotations
+ 
+ import contextlib
+ import itertools
++import os
+ import re
+ import shlex
+ from collections.abc import Callable, Iterator, Sequence
+ from pathlib import Path
+-from typing import TYPE_CHECKING, Optional
++from typing import TYPE_CHECKING, NamedTuple, Optional
+ 
+ from cron.lifecycle_guard import (
+     _REDIRECTION,
+@@ -813,7 +814,9 @@ def _iter_nested_shell_inputs(
+     # redirection overrides it: with a stdin-reading one anywhere, every compound command's
+     # redirections count, failing closed.
+     grouped = any(found == ("stdin", None) for _view, found in classified)
+-    fds = _descriptor_sources(view for view, _found in classified) if grouped else {}
++    sources = _StdinSources(
++        _descriptor_sources(view for view, _found in classified),
++        _assigned_variables(view for view, _found in classified)) if grouped else None
+     # So does a function body's (`f() { su -l bob; }; f < f`): a call to any function the
+     # command defines counts, whichever body holds the shell (`g() { f; }; g < f`).
+     functions = _defined_functions(walk_command) if grouped else frozenset()
+@@ -824,7 +827,7 @@ def _iter_nested_shell_inputs(
+         yield from _fed_shell_inputs(walk_command, cwd=cwd)
+     for view, found in classified:
+         if grouped and (_compound_redirections(view) or _calls_function(view, functions)):
+-            yield from _redirected_shell_inputs(view, cwd=cwd, fds=fds)
++            yield from _redirected_shell_inputs(view, cwd=cwd, sources=sources)
+         if found is None:
+             continue
+         kind, value = found
+@@ -834,7 +837,15 @@ def _iter_nested_shell_inputs(
+             for path in _resolved_or_nothing(value, cwd):
+                 yield None, path
+         elif kind == "stdin":
+-            yield from _redirected_shell_inputs(view, cwd=cwd, fds=fds)
++            yield from _redirected_shell_inputs(view, cwd=cwd, sources=sources)
++
++
++class _StdinSources(NamedTuple):
++    """What the command itself says about its stdin targets: each descriptor's input
++    redirections (``_descriptor_sources``) and each variable's values (``_assigned_variables``)."""
++
++    fds: dict[str, list[tuple[str, str]]]
++    variables: dict[str, list[str]]
+ 
+ 
+ def _fed_shell_inputs(walk_command: str, *, cwd: Optional[str]) -> Iterator[tuple[None, Path]]:
+@@ -876,15 +887,65 @@ def _descriptor_sources(views: Iterator[list[str]]) -> dict[str, list[tuple[str,
+     return sources
+ 
+ 
++_ASSIGNMENT_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", re.DOTALL)
++_DECLARATION_WORDS = frozenset({"export", "readonly", "declare", "typeset", "local"})
++
++
++def _assigned_variables(views: Iterator[list[str]]) -> dict[str, list[str]]:
++    """``{name: [value, …]}`` for every standalone assignment in the command (``S=f``,
++    ``export S=f``; not a prefix assignment, ``S=f cmd``, which no redirection expands). Which
++    value a later expansion sees depends on order and scope the walk does not track, so each
++    counts."""
++    variables: dict[str, list[str]] = {}
++    for view in views:
++        words = view[1:] if view and view[0] in _DECLARATION_WORDS else view
++        matches = [_ASSIGNMENT_RE.fullmatch(word) for word in words if not word.startswith("-")]
++        if matches and all(matches):
++            for match in filter(None, matches):
++                variables.setdefault(match.group(1), []).append(match.group(2))
++    return variables
++
++
++_VARIABLE_RE = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
++_MAX_EXPANSIONS = 16  # words and substitutions per target: past it, fail closed
++
++
++def _expanded_targets(target: str, variables: dict[str, list[str]]) -> Optional[list[str]]:
++    """Each word *target* may expand to, its ``$NAME``/``${NAME}`` taken from the command's own
++    assignments, else from this process's environment (the local terminal inherits ``$TMPDIR``,
++    ``$HERMES_KANBAN_WORKSPACE``). ``None`` when any part cannot be named (an unknown variable,
++    ``$1``, a substitution, a glob, a self-referencing value)."""
++    words: list[str] = []
++    pending = [target]
++    steps = 0
++    while pending:
++        word = pending.pop()
++        match = _VARIABLE_RE.search(word)
++        if match is None:
++            if _unresolvable(word):
++                return None
++            words.append(word)
++            continue
++        name = match.group(1) or match.group(2)
++        values = variables.get(name) or ([os.environ[name]] if name in os.environ else [])
++        steps += len(values)
++        if not values or steps > _MAX_EXPANSIONS:
++            return None
++        pending.extend(word[:match.start()] + value + word[match.end():] for value in values)
++    return words
++
++
+ _FD_PATH_RE = re.compile(r"/(?:dev|proc/self)/fd/(\d+)")
+ 
+ 
+ def _redirected_shell_inputs(
+-    view: list[str], *, cwd: Optional[str], fds: Optional[dict[str, list[tuple[str, str]]]] = None,
++    view: list[str], *, cwd: Optional[str], sources: Optional[_StdinSources] = None,
+ ) -> Iterator[tuple[Optional[str], Optional[Path]]]:
+     """Keep stdin redirections in the consuming shell's scope, not the session's. ``/dev/null``
+     feeds the shell nothing (and is no regular file to walk). A stdin duplicated from another
+-    descriptor (``0<&3``, ``< /dev/fd/3``) reads that descriptor's sources (*fds*)."""
++    descriptor (``0<&3``, ``< /dev/fd/3``) reads that descriptor's sources; a ``$NAME`` target
++    expands from the command's assignments or the environment (*sources*)."""
++    fds, variables = sources or _StdinSources({}, {})
+     for fd, operator, target in _redirections(view):
+         if fd not in ("", "0"):
+             continue
+@@ -893,28 +954,33 @@ def _redirected_shell_inputs(
+             continue  # stdin closed, or left as it is
+         if operator == "<&" or (duplicated and duplicated.group(1) != "0"):
+             source = duplicated.group(1) if duplicated else target
+-            sources = (fds or {}).get(source, ())
+-            if not sources or any(dup_operator not in ("<", "<>", "<<<")
+-                                  for dup_operator, _dup_target in sources):
++            dups = fds.get(source, ())
++            if not dups or any(dup_operator not in ("<", "<>", "<<<")
++                               for dup_operator, _dup_target in dups):
+                 yield Unresolved(f"{operator}{target}"), None
+-            for dup_operator, dup_target in sources:
+-                yield from _stdin_source(dup_operator, dup_target, cwd)
++            for dup_operator, dup_target in dups:
++                yield from _stdin_source(dup_operator, dup_target, cwd, variables)
+         else:
+-            yield from _stdin_source(operator, target, cwd)
++            yield from _stdin_source(operator, target, cwd, variables)
+ 
+ 
+ def _stdin_source(
+-    operator: str, target: str, cwd: Optional[str],
++    operator: str, target: str, cwd: Optional[str], variables: dict[str, list[str]],
+ ) -> Iterator[tuple[Optional[str], Optional[Path]]]:
+     """What one input redirection (``< f``, ``<> f``, ``<<< T``) hands the shell reading it; an
+-    ``Unresolved`` text when the walk cannot name it (see ``_unresolvable``)."""
++    ``Unresolved`` text when the walk cannot name it (see ``_expanded_targets``)."""
+     if operator == "<<<":
+         yield target, None
+-    elif operator in ("<", "<>") and _unresolvable(target):
++        return
++    if operator not in ("<", "<>"):
++        return
++    expanded = _expanded_targets(target, variables)
++    if expanded is None:
+         yield Unresolved(target), None
+-    elif operator in ("<", "<>") and target != "/dev/null":
+-        for path in _resolved_or_nothing(target, cwd):
+-            yield None, path
++    for word in expanded or ():
++        if word != "/dev/null":
++            for path in _resolved_or_nothing(word, cwd):
++                yield None, path
+ 
+ 
+ class Unresolved(str):
+diff --git a/tests/cron/test_lifecycle_guard_session_aliases.py b/tests/cron/test_lifecycle_guard_session_aliases.py
+index 31c89b0f592bc68e33beea147df150c28fee642a..1eea25fd7caa0a1736ed625dd0cff503e3996c90 100644
+--- a/tests/cron/test_lifecycle_guard_session_aliases.py
++++ b/tests/cron/test_lifecycle_guard_session_aliases.py
+@@ -400,6 +400,14 @@ _NESTED_FOREIGN_SHELLS = [
+     "f() {{ su -l bob; }}; g() {{ f; }}; g < {script}",
+     "f() {{ su -l bob; }}; f 0<&3 3< {script}",
+     "f() ( su -l bob ); f < {script}",
++    # A variable target resolved from the command's own assignments (t_f7fd81411e70a5a2).
++    "S={script}; su -l bob < $S",
++    "P={script}; ssh -o BatchMode=yes host 'bash -s' < $P",
++    "D={tmp}; su -l bob < \"$D/inner.sh\"",
++    "export S={script}; su -l bob < ${{S}}",
++    "D={tmp}; P=$D/inner.sh; su -l bob < $P",
++    "S={script}; exec 3< $S; su -l bob <&3",
++    "S={script}\nfor h in a b; do ssh $h sh -s < $S; done",
+ ]
+ 
+ 
+@@ -465,7 +473,7 @@ def test_nested_login_shell_body_treats_names_as_unknown(tmp_path, live_kanban_d
+     assert "alias" not in str(tmp_path).lower()
+     script = tmp_path / "inner.sh"
+     script.write_text(f"t ( bash {live_kanban_db} )\n")
+-    text = shape.format(db=live_kanban_db, script=script)
++    text = shape.format(db=live_kanban_db, script=script, tmp=tmp_path)
+     for names in (frozenset({"zz"}), frozenset(), None):
+         unsafe, refusal = scan_gateway_lifecycle(text, cwd=str(tmp_path), session_aliases=names)
+         assert unsafe is True and refusal is not None and "SQLite" in refusal, (shape, names)
+@@ -622,11 +630,14 @@ def test_multiline_group_without_a_fed_shell_stays_allowed(tmp_path, live_kanban
+ @pytest.mark.parametrize("shape", [
+     "su -l bob < <(cat {script})",
+     "while read l; do su -l bob; done < <(cat {script})",
+-    "S={script}; su -l bob < $S",
+     "su -l bob < $S",
+     "su -l bob < \"$S\"",
+     "su -l bob < ${{S}}",
+     "su -l bob < $(echo {script})",
++    "S=$(echo {script}); su -l bob < $S",  # an assigned value the walk cannot name
++    "S={script} su -l bob < $S",  # a prefix assignment does not reach the redirection
++    "su -l bob < \"$1\"",
++    "for f in {script}; do su -l bob < $f; done",
+     "su -l bob <$(echo {script})",
+     "su -l bob < `echo {script}`",
+     "su -l bob < {tmp}/*.sh",
+@@ -636,10 +647,11 @@ def test_multiline_group_without_a_fed_shell_stays_allowed(tmp_path, live_kanban
+     "su -l bob 0<&3 3< $S",
+     "su -l bob 0<&3 3<<'EOF'\nt ( bash {db} )\nEOF",
+ ])
+-def test_nested_login_shell_unresolvable_stdin_fails_closed(tmp_path, live_kanban_db, shape):
++def test_nested_login_shell_unresolvable_stdin_fails_closed(tmp_path, live_kanban_db, shape, monkeypatch):
+     """t_f7fd81411e70a5a2: a stdin whose content the walk cannot name (a variable, a command or
+     process substitution, a glob, an unknown descriptor) fed to a login shell is refused, not
+     skipped as if it held nothing."""
++    monkeypatch.delenv("S", raising=False)
+     assert "alias" not in str(tmp_path).lower()
+     script = tmp_path / "inner.sh"
+     script.write_text(f"t ( bash {live_kanban_db} )\n")
+@@ -661,6 +673,22 @@ def test_unresolvable_login_shell_stdin_in_a_mentioned_file_is_not_refused(tmp_p
+     assert unsafe is True and refusal is not None and "cannot resolve `$S`" in refusal
+ 
+ 
++def test_nested_login_shell_stdin_variable_from_the_environment(tmp_path, live_kanban_db,
++                                                                 monkeypatch):
++    """A variable the command does not assign expands as the guard's own environment holds it
++    (`$TMPDIR`, `$HERMES_KANBAN_WORKSPACE`: the local terminal inherits them)."""
++    (tmp_path / "inner.sh").write_text(f"t ( bash {live_kanban_db} )\n")
++    monkeypatch.setenv("T01A1DAF4_DIR", str(tmp_path))
++    for text in ("ssh host 'bash -s' < \"$T01A1DAF4_DIR/inner.sh\"",
++                 "su -l bob < ${T01A1DAF4_DIR}/inner.sh"):
++        unsafe, refusal = scan_gateway_lifecycle(text, cwd="/", session_aliases=frozenset({"zz"}))
++        assert unsafe is True and refusal is not None and "SQLite" in refusal, text
++    monkeypatch.delenv("T01A1DAF4_DIR")
++    unsafe, refusal = scan_gateway_lifecycle("su -l bob < $T01A1DAF4_DIR/inner.sh", cwd="/",
++                                             session_aliases=frozenset({"zz"}))
++    assert unsafe is True and refusal is not None and "cannot resolve" in refusal
++
++
+ @pytest.mark.parametrize("option", [
+     "--group root", "--group=root", "-g root", "-groot",
+     "--supp-group root", "--supp-group=root", "-G root", "-Groot",
+-- 
+2.43.0
+

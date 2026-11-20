@@ -1,0 +1,205 @@
+From 38270651f61b7ebb819e0fdd3094ceb78c96379e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 11:00:15 +0000
+Subject: [PATCH] [daveey] Exercise native worker custody through real tool
+ executors
+
+---
+ .../test_origin_worker_executor_custody.py    | 185 ++++++++++++++++++
+ 1 file changed, 185 insertions(+)
+ create mode 100644 tests/hermes_cli/test_origin_worker_executor_custody.py
+
+diff --git a/tests/hermes_cli/test_origin_worker_executor_custody.py b/tests/hermes_cli/test_origin_worker_executor_custody.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6226d2862569ed3103bb52f071707e34b382a30f
+--- /dev/null
++++ b/tests/hermes_cli/test_origin_worker_executor_custody.py
+@@ -0,0 +1,185 @@
++"""Native worker custody crosses the actual sequential/concurrent tool pools.
++
++The conversation loop and leaf tool dispatch are deterministic seams; facade
++admission, executor middleware/pools, owner RPC/store, capture and record are real.
++"""
++from contextlib import nullcontext
++from contextvars import Context
++import json
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from agent import origin_turn_custody, tool_executor
++from agent.delegation_context import delegated_child_context
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_origin_native as native
++from tests.hermes_cli import test_origin_worker_custody as custody_fixtures
++from tests.tools.test_kanban_worker_created_chats import CHAT
++
++worker = custody_fixtures.worker
++
++
++@pytest.fixture
++def executor_worker(worker, tmp_path, monkeypatch):
++    from tests.agent.test_tool_call_incremental_persistence import _make_agent
++
++    agent, _store, _db, context, _frame = worker
++    # Supply ordinary executor/UI defaults without replacing the admitted agent,
++    # its bound one-shot capability, or its real RPC-backed persistence store.
++    bootstrap = tmp_path / 'bootstrap'
++    bootstrap.mkdir()
++    with monkeypatch.context() as patch:
++        patch.setattr('tempfile.mkdtemp', lambda **kwargs: str(bootstrap))
++        defaults = _make_agent()
++    for key, value in vars(defaults).items():
++        agent.__dict__.setdefault(key, value)
++    # Transcript flushing is outside this custody test and would require a full
++    # model conversation; the fixture's store/owner lease remains unmodified.
++    monkeypatch.setattr(agent, '_flush_messages_to_session_db', lambda *a, **k: None)
++    return agent, context
++
++
++def _execute(agent, mode, calls, task):
++    message = SimpleNamespace(tool_calls=[
++        SimpleNamespace(id=f'custody-{index}', type='function', function=SimpleNamespace(
++            name='custody_probe', arguments=json.dumps({'index': index})))
++        for index in range(calls)
++    ])
++    messages = []
++    execute = (agent._execute_tool_calls_sequential if mode == 'sequential'
++               else agent._execute_tool_calls_concurrent)
++    execute(message, messages, task)
++    assert len(messages) == calls
++    assert [m['tool_call_id'] for m in messages] == [f'custody-{i}' for i in range(calls)]
++    return [json.loads(m['content']) for m in messages]
++
++
++def _install_leaf(agent, monkeypatch, leaf):
++    # These are the two real executor leaf APIs, not substitutes for the pool,
++    # middleware, submission, context propagation or native attestation code.
++    monkeypatch.setattr('model_tools.handle_function_call',
++                        lambda name, args, task, **kwargs: leaf(args))
++    monkeypatch.setattr(agent, '_invoke_tool',
++                        lambda name, args, task, call_id, **kwargs: leaf(args))
++
++
++def _create(snapshot, label):
++    with kbc.connect_closing() as conn:
++        task = kb.create_task(conn, title=label, assignee='default', native_origin=snapshot)
++        receipt = native._receipt(conn, task)
++        inherited = conn.execute('SELECT inherited_from FROM origin_native_receipts WHERE task_id=?',
++                                 (task,)).fetchone()
++    return task, receipt, inherited[0] if inherited else None
++
++
++@pytest.mark.parametrize('mode', ['sequential', 'parallel'])
++@pytest.mark.parametrize('scope', ['live', 'nested', 'delegated', 'released'])
++def test_actual_executor_revalidates_worker_custody(executor_worker, monkeypatch, mode, scope):
++    agent, context = executor_worker
++    captured = []
++    main_tid = threading.get_ident()
++    facade_scope = []
++    overlap = threading.Barrier(2) if mode == 'parallel' and scope != 'released' else None
++
++    def leaf(args):
++        assert threading.get_ident() != main_tid, 'probe must run in the actual executor worker'
++        if overlap is not None:
++            overlap.wait(timeout=30)
++        assert origin_turn_custody._current.get() is facade_scope[0]
++        snapshot = native.capture(context['task_id'])
++        assert snapshot is not None, 'actual executor lost admitted facade custody'
++        captured.append(snapshot)
++        # Delegated contexts independently forbid create_task; pre-create an
++        # unattested row so record's own custody refusal is tested directly.
++        delegated_task = _create(None, 'delegated-record-target')[0] if scope == 'delegated' else None
++        guard = (origin_turn_custody.scope(None) if scope == 'nested' else
++                 delegated_child_context('nested-delegate') if scope == 'delegated' else nullcontext())
++        if scope == 'released':
++            facade_scope[0][0].stop_refresher()
++        with guard:
++            fresh = native.capture(context['task_id'])
++            assert (fresh is not None) == (scope == 'live')
++            # Pass the pre-mask/pre-release snapshot to record: absence of a new
++            # capture alone does not prove stale captured authority is refused.
++            if delegated_task is not None:
++                task = delegated_task
++                with kbc.connect_closing() as conn:
++                    native.record(conn, task, snapshot, 1)
++                    receipt = native._receipt(conn, task)
++                    assert conn.execute('SELECT 1 FROM origin_native_receipts WHERE task_id=?', (task,)).fetchone() is None
++                inherited = None
++            else:
++                task, receipt, inherited = _create(snapshot, f'{mode}-{scope}-{args["index"]}')
++            if scope == 'live':
++                assert receipt is not None
++                assert receipt['origin'] == {'gateway': 'here', 'profile': 'default', 'session': CHAT}
++                assert inherited == context['task_id']
++            else:
++                assert receipt is None
++                assert inherited is None
++        return json.dumps({'task': task, 'native': receipt is not None})
++
++    _install_leaf(agent, monkeypatch, leaf)
++
++    def loop(*args, **kwargs):
++        facade_scope.append(origin_turn_custody._current.get())
++        assert facade_scope[0] is not None
++        # Two runnable slots exercise the real multi-slot pool, not a helper
++        # submitted to a hand-built ThreadPoolExecutor. Release uses one slot
++        # because revocation intentionally affects every copied scope.
++        count = 1 if scope == 'released' else 2
++        results = _execute(agent, mode, count, context['task_id'])
++        assert all(item['native'] == (scope == 'live') for item in results)
++        assert len(captured) == count
++        return dict(final_response='ok', messages=[], failed=False)
++
++    monkeypatch.setattr('agent.conversation_loop.run_conversation', loop)
++    assert agent.run_conversation('probe executor custody')['final_response'] == 'ok'
++    assert native.capture(context['task_id']) is None
++    for snapshot in captured:
++        assert snapshot.validated() is None
++        _, receipt, inherited = _create(snapshot, 'after-facade-release')
++        assert receipt is None
++        assert inherited is None
++
++
++@pytest.mark.parametrize('mode', ['sequential', 'parallel'])
++def test_actual_executor_without_context_propagation_has_no_authority(executor_worker, monkeypatch, mode):
++    """Safe in-process propagation control: never mutate shared product files."""
++    agent, context = executor_worker
++    main_tid = threading.get_ident()
++    seen = []
++    parent_snapshot = []
++    # DaemonThreadPoolExecutor.submit ALSO copies ContextVars, so removing
++    # tool_executor's wrapper alone is not a context-loss mutant. Explicitly
++    # enter an empty context inside both copies, without patching either pool.
++    def without_context(fn):
++        return lambda *args, **kwargs: Context().run(fn, *args, **kwargs)
++
++    monkeypatch.setattr(tool_executor, 'propagate_context_to_thread', without_context)
++
++    def leaf(args):
++        assert threading.get_ident() != main_tid
++        assert origin_turn_custody._current.get() is None
++        assert native.capture(context['task_id']) is None
++        assert parent_snapshot[0].validated() is None
++        task, receipt, inherited = _create(parent_snapshot[0], f'no-context-{args["index"]}')
++        assert receipt is None
++        assert inherited is None
++        seen.append(task)
++        return json.dumps({'task': task, 'native': False})
++
++    _install_leaf(agent, monkeypatch, leaf)
++
++    def loop(*args, **kwargs):
++        parent_snapshot.append(native.capture(context['task_id']))
++        assert parent_snapshot[0] is not None
++        results = _execute(agent, mode, 2, context['task_id'])
++        assert all(item['native'] is False for item in results)
++        assert len(seen) == 2
++        return dict(final_response='ok', messages=[], failed=False)
++
++    monkeypatch.setattr('agent.conversation_loop.run_conversation', loop)
++    assert agent.run_conversation('propagation control')['final_response'] == 'ok'
+-- 
+2.43.0
+

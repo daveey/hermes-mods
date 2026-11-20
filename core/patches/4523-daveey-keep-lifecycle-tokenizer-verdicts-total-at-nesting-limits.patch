@@ -1,0 +1,177 @@
+From 208402a5bd62a6ec1fe7065b1b5481a078e64582 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 14:18:03 +0000
+Subject: [PATCH] [daveey] keep lifecycle tokenizer verdicts total at nesting
+ limits
+
+Catch SubstitutionNestingLimit at boolean guard boundaries as a conservative match and at the background-chat boundary as a structured refusal. Keep low-level iterators raising and internal data-exempt scans typed so scan_gateway_lifecycle preserves the nesting refusal reason.
+
+Proof: all 8 new regression cases fail on baseline and pass patched, including approval detection, terminal prescan, execute_code and fallback scan. 67 lifecycle/direct-consumer files completed across two serial batches: 10608 passed. scripts/check: 20 checks OK. Parallel performance threshold failed under contention; identical test passes serially on base and patch.
+---
+ cron/lifecycle_guard.py                       | 29 +++++++-
+ ...est_lifecycle_guard_nesting_entrypoints.py | 68 +++++++++++++++++++
+ tools/terminal_tool_guards.py                 | 10 +++
+ 3 files changed, 105 insertions(+), 2 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_nesting_entrypoints.py
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index 3a1ccdbc39933a0f010b3b294cd294b82d2b3dd5..d952f7700724375826dd52d7293eb394418cb274 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -216,6 +216,14 @@ def _segment_names_host_interpreter(tokens: list[str], killers: frozenset[str])
+ 
+ 
+ def contains_host_interpreter_kill(text: str) -> bool:
++    """Conservatively match when substitution nesting prevents a complete scan."""
++    try:
++        return _contains_host_interpreter_kill(text)
++    except SubstitutionNestingLimit:
++        return True
++
++
++def _contains_host_interpreter_kill(text: str) -> bool:
+     """Branch E entrypoint: a process killer aimed at the interpreter image hosting the gateway, or a
+     name-derived PID feed into one (`pgrep python | xargs kill`, `kill $(pidof python3)`,
+     `Get-Process python | Stop-Process`). Segment-tokenized, so quoted/spliced spellings and Python
+@@ -416,6 +424,14 @@ def _contains_launchctl_gateway_lifecycle(normalized_text: str) -> bool:
+ 
+ 
+ def contains_gateway_lifecycle_command(text: str, *, mask_heredocs: bool = True) -> bool:
++    """Return a conservative match if substitution nesting prevents a complete scan."""
++    try:
++        return _contains_gateway_lifecycle_command(text, mask_heredocs=mask_heredocs)
++    except SubstitutionNestingLimit:
++        return True
++
++
++def _contains_gateway_lifecycle_command(text: str, *, mask_heredocs: bool = True) -> bool:
+     """Return True if *text* contains a gateway lifecycle command pattern. ``mask_heredocs=False``
+     scans inert-looking heredoc bodies too (a session alias may shadow their consumer).
+ 
+@@ -927,6 +943,14 @@ def _cat_relays_stdin(segment: list[str]) -> bool:
+ 
+ 
+ def contains_launchctl_submit_command(command: str) -> bool:
++    """Return a conservative match if substitution nesting prevents a complete scan."""
++    try:
++        return _contains_launchctl_submit_command(command)
++    except SubstitutionNestingLimit:
++        return True
++
++
++def _contains_launchctl_submit_command(command: str) -> bool:
+     """Detect an executed ``launchctl submit``/``bootstrap``, not quoted text.
+ 
+     Label-independent by design: a NEW job's label is attacker-chosen, so a neutral name defeats any
+@@ -1159,10 +1183,11 @@ def _mask_data_sink_arguments(text: str) -> str:
+ def _lifecycle_command_scan_with_data_exemption(text: str, *, mask_heredocs: bool = True) -> bool:
+     """Lifecycle scan exempting matches inside data arguments: cheap regex first (no-match pays
+     nothing), then re-scan with data-sink arguments masked; only a surviving match blocks."""
+-    if not contains_gateway_lifecycle_command(text, mask_heredocs=mask_heredocs):
++    # Keep exhaustion typed inside the walk so scan_gateway_lifecycle retains its reason.
++    if not _contains_gateway_lifecycle_command(text, mask_heredocs=mask_heredocs):
+         return False
+     normalized = join_line_continuations(text)
+-    return contains_gateway_lifecycle_command(
++    return _contains_gateway_lifecycle_command(
+         _mask_data_sink_arguments(normalized), mask_heredocs=mask_heredocs)
+ 
+ 
+diff --git a/tests/cron/test_lifecycle_guard_nesting_entrypoints.py b/tests/cron/test_lifecycle_guard_nesting_entrypoints.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..cfc212c38ec08380af8696c136d708e186f1cd5c
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_nesting_entrypoints.py
+@@ -0,0 +1,68 @@
++"""Nesting exhaustion must produce conservative verdicts, not guard crashes."""
++import json
++
++import pytest
++
++from cron import lifecycle_guard as guard
++from tools.approval_detection import detect_dangerous_command
++from tools.terminal_tool_guards import background_user_chat_block, gateway_lifecycle_block
++
++
++DEEP = "echo " + "$(echo " * 40 + "true" + ")" * 40
++
++
++@pytest.mark.parametrize("predicate", [
++    guard.contains_gateway_lifecycle_command,
++    guard.contains_launchctl_submit_command,
++    guard.contains_host_interpreter_kill,
++])
++def test_predicates_fail_closed_on_nesting_limit(predicate):
++    assert predicate(DEEP) is True
++    assert predicate("echo harmless") is False
++
++
++def test_approval_detection_requires_approval_on_nesting_limit():
++    dangerous, pattern, description = detect_dangerous_command(DEEP)
++    assert dangerous is True
++    assert pattern and description
++
++
++def test_background_guard_refuses_nesting_limit():
++    result = json.loads(background_user_chat_block(DEEP, background=True))
++    assert "substitution nesting limit" in result["error"]
++    assert background_user_chat_block(DEEP, background=False) is None
++    assert background_user_chat_block("echo harmless", background=True) is None
++
++
++def test_gateway_prescan_returns_refusal(monkeypatch, tmp_path):
++    from tools import process_registry
++
++    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
++    result = gateway_lifecycle_block(
++        command=DEEP, env=None, env_type="local", cwd=str(tmp_path),
++        workdir=None, session_key="nesting-limit",
++    )
++    assert "Blocked:" in json.loads(result)["error"]
++
++
++def test_execute_code_refuses_before_backend_acquisition(monkeypatch):
++    from tools import code_execution_tool, process_registry, terminal_tool
++
++    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
++    monkeypatch.setattr(code_execution_tool, "SANDBOX_AVAILABLE", True)
++
++    def unexpected_backend():
++        pytest.fail("nesting exhaustion must refuse before acquiring a backend")
++
++    monkeypatch.setattr(terminal_tool, "_get_env_config", unexpected_backend)
++    result = json.loads(code_execution_tool.execute_code(DEEP))
++    assert "Blocked:" in result["error"]
++
++
++def test_last_resort_scan_remains_total(monkeypatch):
++    def broken(*args, **kwargs):
++        raise OSError("unavailable scanner")
++
++    monkeypatch.setattr(guard, "_contains_unsafe_gateway_action", broken)
++    monkeypatch.setattr(guard, "_direct_lifecycle_scan", broken)
++    assert guard.scan_gateway_lifecycle(DEEP)[0] is True
+diff --git a/tools/terminal_tool_guards.py b/tools/terminal_tool_guards.py
+index eca447efa129cb698bc298ad87906a83deb59fc8..72c752d05658d9de6e8697450f23f44e81d67e5e 100644
+--- a/tools/terminal_tool_guards.py
++++ b/tools/terminal_tool_guards.py
+@@ -764,6 +764,16 @@ def background_user_chat_block(command: str, *, background: bool) -> Optional[st
+     """
+     if not background:
+         return None
++    from cron.lifecycle_guard_substitutions import SubstitutionNestingLimit
++
++    try:
++        return _background_user_chat_block(command)
++    except SubstitutionNestingLimit:
++        return _blocked_json("Blocked: the substitution nesting limit was reached.", "blocked")
++
++
++def _background_user_chat_block(command: str) -> Optional[str]:
++    """Walk background commands; the public boundary converts parser exhaustion to refusal."""
+     from cron.lifecycle_guard import (
+         _executed_command_index, _iter_command_segments, _iter_shell_command_payloads,
+     )
+-- 
+2.43.0
+

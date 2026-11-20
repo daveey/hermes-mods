@@ -1,0 +1,285 @@
+From ec8fc6c603ccb3220599c26342cebfde26e3896f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 18:58:56 +0000
+Subject: [PATCH] fix(kanban): refuse unreasoned priority raise on an
+ llm_pacing-held card [daveey]
+
+hermes kanban edit raised t_eddbf5d5189531ec 900->1000 while the dispatcher
+held it for llm_pacing, against the notice, a coach hint and the session's
+own memory (self-heal agent-6f3c6009b5). The edit path only guarded
+lowering. Now the CLI path (require_lower_reason) refuses a raise on a
+ready card whose every candidate pool is paced/held (paced_pools, the
+stall notice's read-only view) unless --reason is given; fails open.
+---
+ hermes_cli/kanban.py                          |   6 +-
+ hermes_cli/kanban_db.py                       |   2 +-
+ hermes_cli/kanban_db_edit.py                  |  57 ++++++++--
+ .../test_kanban_edit_priority_paced.py        | 102 ++++++++++++++++++
+ tests/hermes_cli/test_kanban_llm_pacing.py    |   6 +-
+ 5 files changed, 163 insertions(+), 10 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_edit_priority_paced.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 7db6b03b0716f746585153389a697f25ff766ce5..8b4718471427f749d65580668d23746cef17a889 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1355,6 +1355,10 @@ def _cmd_edit(args: argparse.Namespace) -> int:
+             requested = priority if priority is not None else bounded(int(row[0] or 0) + priority_bump) if row else None
+             if row is not None and requested < int(row[0] or 0):
+                 return _err(f"kanban edit: {kb.PriorityLowerRefused(args.task_id, int(row[0] or 0), requested)}")
++            refused = (kb.paced_raise_refusal(conn, args.task_id, int(row[0] or 0), requested)
++                       if row is not None and requested is not None else None)
++            if refused is not None:
++                return _err(f"kanban edit: {refused}")
+         if has_operator:
+             # Operator columns first: a refusal (e.g. a session_id overwrite) must leave the
+             # whole edit unapplied rather than half of it. [daveey]
+@@ -1373,7 +1377,7 @@ def _cmd_edit(args: argparse.Namespace) -> int:
+                     result=result, summary=summary, metadata=metadata, **admission,
+                     priority_reason=reason, require_lower_reason=True, priority_bump=priority_bump,
+                 )
+-            except (kb.PriorityLowerRefused, AdmissionMetadataError, ReceiptEditRefused) as exc:
++            except (kb.PriorityLowerRefused, kb.PriorityRaisePacedRefused, AdmissionMetadataError, ReceiptEditRefused) as exc:
+                 return _err(f"kanban edit: {exc}")
+             if not ok:
+                 return _err(f"cannot edit {args.task_id} (unknown id, or --result used on a task that is not done)")
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index baf0c452e435c574b8f41a2cd27ef6f65b71e381..a38b7ec3f5a293827116ed67108f18796667bf9d 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3882,7 +3882,7 @@ from hermes_cli.kanban_db_archive import archive_task
+ from hermes_cli.kanban_db_list import list_task_rows, list_tasks
+ from hermes_cli.kanban_db_schedule import schedule_task
+ from hermes_cli.kanban_db_review_reopen import reopen_review_task
+-from hermes_cli.kanban_db_edit import PriorityLowerRefused, edit_task
++from hermes_cli.kanban_db_edit import PriorityLowerRefused, PriorityRaisePacedRefused, edit_task, paced_raise_refusal
+ from hermes_cli.kanban_reason_comment import _awaiting_human_answer
+ from hermes_cli.kanban_db_notify import _inherit_notify_subs, _owning_sub_clause
+ from hermes_cli.kanban_db_boards import (
+diff --git a/hermes_cli/kanban_db_edit.py b/hermes_cli/kanban_db_edit.py
+index 550090c4e1f38932444d2e5a4a4aaa1103d799c6..3ae9085cbbb7edd9f1b081b2f499a9e3d215b9d1 100644
+--- a/hermes_cli/kanban_db_edit.py
++++ b/hermes_cli/kanban_db_edit.py
+@@ -1,6 +1,6 @@
+ """``edit_task``: title/body/priority edits and result backfill on a done card, plus the
+-``hermes kanban edit`` guard that refuses to lower a priority without a reason. Split from
+-``kanban_db`` (re-exported there). [daveey]"""
++``hermes kanban edit`` guards that refuse, without a reason, to lower a priority or to raise the
++priority of a card the LLM pacing governor holds. Split from ``kanban_db`` (re-exported there). [daveey]"""
+ 
+ from __future__ import annotations
+ 
+@@ -20,6 +20,51 @@ class PriorityLowerRefused(ValueError):
+         )
+ 
+ 
++class PriorityRaisePacedRefused(ValueError):
++    """An edit would raise the priority of a ready card the LLM pacing governor holds, without a reason
++    (``require_lower_reason``): priority does not lift a pacing hold (defect agent-6f3c6009b5). [daveey]"""
++
++    def __init__(self, task_id: str, current: int, requested: int, pools: str):
++        self.task_id, self.current, self.requested, self.pools = task_id, current, requested, pools
++        super().__init__(
++            f"{task_id} is held by llm_pacing ({pools}); raising its priority {current} -> {requested} does not "
++            f"lift a pacing hold, the dispatcher starts it when the pool admits it. Pass --reason to raise it anyway "
++            f"(recorded on the reprioritized event)"
++        )
++
++
++def paced_raise_refusal(conn: sqlite3.Connection, task_id: str, current: int,
++                        requested: int) -> Optional[PriorityRaisePacedRefused]:
++    """The refusal for raising ready card ``task_id`` from ``current`` to ``requested`` while every candidate pool
++    is paced or held (``kanban_llm_pacing_dispatch.paced_pools``, the read the stall notice uses); None for a
++    non-raise, a card that is not ready, no positive read, or a failing read (fails open). [daveey]"""
++    if requested <= current:
++        return None
++    try:
++        if _kb._task_status(conn, task_id) != "ready":
++            return None
++        from hermes_cli import kanban_llm_pacing_dispatch as pacing
++        paces = pacing.paced_pools(conn, task_id)
++    except Exception:  # health: allow BLE001 -- the governor read is advisory; the edit proceeds as before
++        return None
++    if not paces:
++        return None
++    pools = ", ".join(f"{p.provider} {p.state}" for p in paces)
++    return PriorityRaisePacedRefused(task_id, current, requested, pools)
++
++
++def _refuse_unreasoned_priority(conn: sqlite3.Connection, task_id: str, priority: int) -> None:
++    """Raise the refusal for an unreasoned ``priority`` edit: below the stored value, or a raise on a ready card
++    the LLM pacing governor holds (:func:`paced_raise_refusal`). Runs inside ``edit_task``'s write txn. [daveey]"""
++    row = conn.execute("SELECT priority FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    current = int(row[0] or 0) if row else 0
++    if priority < current:
++        raise PriorityLowerRefused(task_id, current, priority)
++    refused = paced_raise_refusal(conn, task_id, current, priority)
++    if refused is not None:
++        raise refused
++
++
+ def edit_task(
+     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
+     body: Optional[str] = None, priority: Optional[int] = None,
+@@ -33,7 +78,8 @@ def edit_task(
+ 
+     ``require_lower_reason`` (the ``hermes kanban edit`` CLI path) raises
+     :class:`PriorityLowerRefused` when ``priority`` is below the stored value and no
+-    ``priority_reason`` is given; the check runs inside the write transaction, so a
++    ``priority_reason`` is given, and :class:`PriorityRaisePacedRefused` when it is above the stored
++    value of a ready card the LLM pacing governor holds; the check runs inside the write transaction, so a
+     stale read can't slip past it. ``priority_reason`` lands in the ``reprioritized``
+     event payload. [daveey]
+     """
+@@ -55,10 +101,7 @@ def edit_task(
+             priority = bounded(previous_priority + priority_bump)
+             changed_fields.append("priority")
+         if priority is not None and require_lower_reason and not (priority_reason or "").strip():
+-            row = conn.execute("SELECT priority FROM tasks WHERE id = ?", (task_id,)).fetchone()
+-            current = int(row[0] or 0) if row else 0
+-            if priority < current:
+-                raise PriorityLowerRefused(task_id, current, priority)
++            _refuse_unreasoned_priority(conn, task_id, priority)
+         assignments = []
+         params = []
+         from hermes_cli.kanban_admission_class import edit_fields
+diff --git a/tests/hermes_cli/test_kanban_edit_priority_paced.py b/tests/hermes_cli/test_kanban_edit_priority_paced.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4fd078f68d4f7090d347918f56c4b320bbe6dd66
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_edit_priority_paced.py
+@@ -0,0 +1,102 @@
++"""``hermes kanban edit``: raising the priority of a card the LLM pacing governor holds needs ``--reason``.
++
++Defect agent-6f3c6009b5 (hub, 2026-11-15): a chat ran ``kanban edit <id> --priority 1000`` on a ready card the
++dispatcher was holding for ``llm_pacing``, although the stall notice it had just read said "priority changes do not
++lift a pacing hold" and a coach hint said not to bump. Nothing at the edit refused it, so the prose was the only
++guard. The CLI now refuses a raise (``--priority`` above the stored value, or ``--priority-bump``) while every
++candidate pool of the card is paced or held (``kanban_llm_pacing_dispatch.paced_pools``, the read the stall notice
++uses), unless ``--reason`` is given; the reason lands on the ``reprioritized`` event. A card the governor does not
++hold, an unreadable governor and lowering/same-value edits behave as before. [daveey]
++"""
++from __future__ import annotations
++
++import argparse
++
++import pytest
++
++from hermes_cli import kanban as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_llm_pacing as lp
++from hermes_cli import kanban_llm_pacing_dispatch as pd
++from hermes_cli.kanban_parser import build_parser
++from tests.hermes_cli import test_kanban_model_tier as model_tier
++from tests.hermes_cli.test_kanban_notice_pacing_admission import OPUS, _store
++
++board = model_tier.board  # one unsynced gateway: every card is its own to lease
++
++
++def _main(argv: list[str]) -> int:
++    root = argparse.ArgumentParser(prog="hermes")
++    build_parser(root.add_subparsers(dest="command"))
++    return kc.kanban_command(root.parse_args(["kanban", *argv]))
++
++
++@pytest.fixture
++def paced_card(board):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="paced", assignee="default", priority=900, model_override=OPUS,
++                             provider_override="anthropic")
++    _store(("anthropic", lp.PACED))
++    with kbc.connect_closing() as conn:
++        assert pd.paced_pools(conn, tid), "precondition: the governor holds the card"
++    return tid
++
++
++def _state(tid):
++    with kbc.connect_closing() as conn:
++        prio = int(conn.execute("SELECT priority FROM tasks WHERE id = ?", (tid,)).fetchone()[0])
++        events = [e.payload or {} for e in kb.list_events(conn, tid) if e.kind == "reprioritized"]
++    return prio, events
++
++
++@pytest.mark.parametrize("flags", [["--priority", "1000"], ["--priority-bump", "100"]], ids=["absolute", "bump"])
++def test_raise_on_paced_card_without_reason_is_refused(paced_card, capsys, flags):
++    rc = _main(["edit", paced_card, *flags])
++    err = capsys.readouterr().err
++    print(f"rc={rc} state={_state(paced_card)} stderr={err.strip()!r}")
++    assert rc == 1
++    assert "llm_pacing" in err and "--reason" in err and "anthropic" in err
++    assert _state(paced_card) == (900, [])
++
++
++def test_refused_raise_leaves_operator_fields_unapplied(paced_card, capsys):
++    assert _main(["edit", paced_card, "--priority", "1000", "--max-retries", "5"]) == 1
++    with kbc.connect_closing() as conn:
++        assert conn.execute("SELECT max_retries FROM tasks WHERE id = ?", (paced_card,)).fetchone()[0] is None
++
++
++def test_raise_on_paced_card_with_reason_applies_and_records_it(paced_card, capsys):
++    rc = _main(["edit", paced_card, "--priority", "1000", "--reason", "David asked to run it next"])
++    assert rc == 0, capsys.readouterr().err
++    assert _state(paced_card) == (1000, [{"priority": 1000, "previous_priority": 900,
++                                          "reason": "David asked to run it next"}])
++
++
++def test_lowering_and_same_value_on_paced_card_unchanged(paced_card, capsys):
++    assert _main(["edit", paced_card, "--priority", "900"]) == 0
++    assert _main(["edit", paced_card, "--priority", "10", "--reason", "superseded"]) == 0
++    assert _state(paced_card)[0] == 10
++
++
++def test_raise_on_unpaced_card_needs_no_reason(board, capsys):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="open", assignee="default", priority=900, model_override=OPUS,
++                             provider_override="anthropic")
++    _store(("anthropic", lp.OPEN))
++    assert _main(["edit", tid, "--priority", "1000"]) == 0, capsys.readouterr().err
++    assert _state(tid)[0] == 1000
++
++
++def test_governor_read_failure_fails_open(paced_card, capsys, monkeypatch):
++    def boom(*_a, **_k):
++        raise RuntimeError("governor read failed")
++    monkeypatch.setattr(pd, "paced_pools", boom)
++    assert _main(["edit", paced_card, "--priority", "1000"]) == 0, capsys.readouterr().err
++    assert _state(paced_card)[0] == 1000
++
++
++def test_library_default_unchanged_for_dashboard_and_rest(paced_card):
++    with kbc.connect_closing() as conn:
++        assert kb.edit_task(conn, paced_card, priority=1000)
++    assert _state(paced_card)[0] == 1000
+diff --git a/tests/hermes_cli/test_kanban_llm_pacing.py b/tests/hermes_cli/test_kanban_llm_pacing.py
+index 52239253c88da71a034307fd8a222d08c0250779..c6c665143c36920d2715c8defe98090bbf1815fc 100644
+--- a/tests/hermes_cli/test_kanban_llm_pacing.py
++++ b/tests/hermes_cli/test_kanban_llm_pacing.py
+@@ -274,19 +274,23 @@ def test_only_kanban_dispatch_consults_the_governor():
+     users = sorted(str(p.relative_to(root)) for top in ("agent", "gateway", "cron", "hermes_cli", "tui_gateway")
+                    if (root / top).is_dir() for p in (root / top).rglob("*.py")
+                    if "kanban_llm_pacing" in p.read_text(encoding="utf-8", errors="ignore"))
+-    assert users == ["hermes_cli/kanban_db_dispatch.py", "hermes_cli/kanban_dispatch_maintenance.py",
++    assert users == ["hermes_cli/kanban_db_dispatch.py", "hermes_cli/kanban_db_edit.py",
++                     "hermes_cli/kanban_dispatch_maintenance.py",
+                      "hermes_cli/kanban_llm_pacing.py", "hermes_cli/kanban_llm_pacing_dispatch.py",
+                      "hermes_cli/kanban_paced_reroute.py",
+                      "hermes_cli/kanban_parent_unclaimed.py", "hermes_cli/kanban_worker_node.py"]
+     assert _governor_names(root / "hermes_cli/kanban_dispatch_maintenance.py") == {
+         "kanban_llm_pacing_dispatch": {"refresh_pools"}}
+     assert _governor_names(root / "hermes_cli/kanban_parent_unclaimed.py") == NOTICE_VIEW
++    # ``hermes kanban edit`` refuses an unreasoned raise on a held card (agent-6f3c6009b5): the same read-only view.
++    assert _governor_names(root / "hermes_cli/kanban_db_edit.py") == EDIT_VIEW
+     assert _governor_names(root / "hermes_cli/kanban_worker_node.py") == PICKUP_VIEW
+     assert _governor_names(root / "hermes_cli/kanban_paced_reroute.py") == REROUTE_VIEW
+ 
+ 
+ # What the stall notice may take from the governor: no hold(), no usage read, no state write.
+ NOTICE_VIEW = {"kanban_llm_pacing_dispatch": {"admission", "admission_skip", "paced_pools"}}
++EDIT_VIEW = {"kanban_llm_pacing_dispatch": {"paced_pools"}}
+ # Worker pickup (t_ce15faa434176d77) predicts the claim-time hold on the replica's copy, so a card dispatch would
+ # hold takes no pickup budget: its one entry point holds nothing, records no card event and fails open.
+ PICKUP_VIEW = {"kanban_llm_pacing_dispatch": {"pickup_hold"}}
+-- 
+2.43.0
+

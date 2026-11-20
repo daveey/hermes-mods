@@ -1,0 +1,431 @@
+From 1ec0dcce5fc40e1ab35a407ec4fc7988733b858c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 06:37:22 +0000
+Subject: [PATCH] [daveey] kanban chat waits: continue asks too, the answer
+ wakes the card, reachable chats only
+
+Second review and adversarial pass of #3647:
+- kanban_continue recorded the chat wait but posted no decision_requested
+  (the incident again under a new label). It posts it now.
+- A chat wait with no probe (clock_only) slept to its clock although the
+  notice says the answering comment wakes it. park_probe gives every chat
+  wait a `wait-comment --after-id <newest comment>` probe (the park's own
+  comment is older, so it never fires it); the park is then not clock-only.
+- has_chat_subscriber counted tui rows whose chat the sweeper drops (archived,
+  moved, worker transcript, deleted) and hub rows in notify+wake mode (legacy
+  backfill). Now: never hub; tui only when tui_chat_reachable (same rules as
+  tui_gateway.notice_fanout, read-only; an orphan-reaped Desktop chat stays
+  reachable, as the live orchestrator was); messaging rows only in wake modes.
+- Tighter ORCHESTRATOR_WAIT: qualified orchestrator/chat nouns or the
+  orchestrator's decision words; citations and negations ("per the
+  orchestrator's decision", "no orchestrator decision") and product names
+  ("Airflow orchestrator release") do not match; adds "orchestrator to
+  decide", "creator chat's answer", "origin session's call".
+
+Tests: continue and CLI block --kind time with the live payload; a clock-only
+chat wait gets the probe, which ignores the park comment and fires on the
+answer (wait-comment CLI); archived/moved/worker/kanban-source/missing chats
+and a hub notify+wake row are refused; an orphan-reaped Desktop chat counts;
+12 matcher cases. 16 of 42 fail on the previous head; 33 neighbouring files,
+571 tests pass.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_awaiting.py                | 107 +++++++++++--
+ hermes_cli/kanban_continuation.py            |   4 +-
+ hermes_cli/kanban_db_schedule.py             |   2 +-
+ hermes_cli/kanban_timed_park.py              |   2 +-
+ tests/hermes_cli/test_kanban_decision_ask.py | 157 +++++++++++++++++--
+ 5 files changed, 243 insertions(+), 29 deletions(-)
+
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index c92d86f57b73eafd1960292ee9e6881c0cf287b7..83566ae7920e3c032bee967106e5a3f3c0f33e95 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -55,6 +55,7 @@ on the same opaque probe counts as the same premise however its reason is worded
+ from __future__ import annotations
+ 
+ from hermes_cli import kanban_lockguard as _kanban_lockguard
++import contextlib
+ import hashlib
+ import json
+ import os
+@@ -82,16 +83,23 @@ SOAK_WAIT = "soak_wait"
+ NO_CHAT_SUBSCRIBER = "no_chat_subscriber"
+ CODES = (AGENT_ACTION_WAIT, HUMAN_WAIT, INVALID_AWAITING, OPAQUE_PROBE_WAIT, PRODUCER_DONE, CI_RUN_UNSTARTABLE,
+          SOAK_WAIT, NO_CHAT_SUBSCRIBER)
+-# A wait on the card's own orchestrator chat: a waiting verb within a clause of "owning/origin/creating
+-# orchestrator" (or "orchestrator's decision/answer"), or a ref that starts by naming it. Past citations of a
+-# decision already given ("per the orchestrator's decision") carry no waiting verb and are not matched.
++# A wait on the card's own orchestrator chat: a waiting verb, then within the clause either a qualified
++# orchestrator/chat ("owning orchestrator", "origin chat", "creator chat") or the orchestrator's decision words
++# ("orchestrator's three decisions", "orchestrator to decide"). Product names ("Airflow orchestrator release",
++# "k8s orchestrator call") carry neither. A citation or negation just before the noun ("per the orchestrator's
++# decision", "no orchestrator decision") is skipped by :func:`orchestrator_wait`.
+ ORCHESTRATOR_WAIT = re.compile(
+-    r"\b(?:await(?:s|ing)?|wait(?:s|ing)?\s+(?:on|for)|pending|until|needs?|blocked\s+on)\b[^.;\n]{0,80}?"
+-    r"\b(?:(?:owning|origin(?:ating)?|creating|parent|managing)\s+(?:orchestrator|chat)|"
+-    r"orchestrator['\u2019]?s?\s+(?:\w+\s+){0,3}?(?:decisions?|answers?|reply|release|go-?ahead|disposition|call))\b",
++    r"\b(?:await(?:s|ing)?|wait(?:s|ing)?\s+(?:on|for)|pending|until|needs?|blocked\s+on|parked\s+(?:on|for))\b"
++    r"(?P<gap>[^.;\n]{0,80}?)"
++    r"\b(?P<noun>(?:owning|origin(?:ating)?|creating|creator|parent|managing|shepherd(?:ing)?)\s+"
++    r"(?:orchestrator|chat|session)|"
++    r"orchestrator['\u2019]s\s+(?:\w+\s+){0,3}?(?:decisions?|answers?|reply|go-?ahead|disposition|approval)|"
++    r"orchestrator\s+to\s+(?:decide|answer|reply|approve|confirm))\b",
+     re.IGNORECASE)
+-_ORCHESTRATOR_REF = re.compile(r"^\s*(?:the\s+)?(?:owning|origin(?:ating)?|creating|parent|managing)\s+"
+-                               r"(?:orchestrator|chat)\b", re.IGNORECASE)
++_ORCHESTRATOR_REF = re.compile(r"^\s*(?:the\s+)?(?:owning|origin(?:ating)?|creating|creator|parent|managing|"
++                               r"shepherd(?:ing)?)\s+(?:orchestrator|chat|session)\b", re.IGNORECASE)
++_CITED_OR_NEGATED = re.compile(r"\b(?:per|following|given|after|no|not|never|without)\s+(?:the\s+|an?\s+|its\s+)?$",
++                               re.IGNORECASE)
+ # Parks in a row on one premise before the next one escalates instead (the 3rd park = 2nd re-park).
+ REPARK_LIMIT = 2
+ # Fires of one opaque probe, each followed by a re-park on it, before the next park escalates: a probe
+@@ -487,22 +495,89 @@ def _check_external(conn, task_id, awaiting, text) -> None:
+ 
+ def orchestrator_wait(text: Optional[str], ref: Optional[str] = None) -> bool:
+     """True when a park's text waits on the card's own orchestrator chat (see :data:`ORCHESTRATOR_WAIT`)."""
+-    return bool(ORCHESTRATOR_WAIT.search(text or "") or _ORCHESTRATOR_REF.search(ref or ""))
++    if _ORCHESTRATOR_REF.search(ref or ""):
++        return True
++    for m in ORCHESTRATOR_WAIT.finditer(text or ""):
++        if not _CITED_OR_NEGATED.search(m.group("gap")):
++            return True
++    return False
++
++
++def park_probe(conn: sqlite3.Connection, task_id: str, record: Optional[dict], wake_check: Optional[str],
++               clock_only: bool) -> tuple[Optional[str], bool]:
++    """``(wake_check, clock_only)`` for a park: the caller's probe, else :func:`wake_probe`'s. A chat wait that
++    now has its comment probe is not a pure clock wait."""
++    wake_check = wake_check or wake_probe(conn, task_id, record)
++    return wake_check, bool(clock_only and not (record and record.get("kind") == CHAT and wake_check))
++
++
++def wake_probe(conn: sqlite3.Connection, task_id: str, record: Optional[dict]) -> Optional[str]:
++    """The probe a park adds when it brought none: a card wait waits on that card (:func:`card_probe`); a chat
++    wait wakes on the next comment, the answer its ``decision_requested`` notice asks for. ``--after-id`` is
++    the newest comment now, so the worker's own park comment (written earlier in the txn) never fires it."""
++    if not record or record.get("kind") != CHAT:
++        return card_probe(record)
++    row = conn.execute("SELECT MAX(id) FROM task_comments WHERE task_id = ?", (task_id,)).fetchone()
++    return shlex.join(["hermes", "kanban", "wait-comment", task_id, "--after-id", str(int(row[0] or 0))])
++
++
++_MOVED_PREFIX = "moved_to_gateway:"  # tui_gateway.notice_fanout.MOVED_PREFIX
++
++
++def _session_stores() -> list[Path]:
++    """The launch store, then each named profile's: where the unloaded sweeper looks for a chat."""
++    from hermes_constants import get_hermes_home
++    home = get_hermes_home()
++    return [p for p in (home / "state.db", *sorted((home / "profiles").glob("*/state.db"))) if p.is_file()]
++
++
++def tui_chat_reachable(chat_id: str) -> bool:
++    """A ``tui`` chat the unloaded sweeper would wake: present in a session store, not archived, not moved away,
++    and not a worker transcript (``tui_gateway.notice_fanout``'s rules, read-only here). A chat whose
++    ``end_reason`` is an orphan reap is still reachable: the sweeper resumes it. Unreadable = unreachable."""
++    from hermes_cli.kanban_session_provenance import (
++        _HEADLESS_SESSION, _INTERACTIVE_SOURCES, MACHINE_SESSION_SOURCES, session_creation_source)
++    for path in _session_stores():
++        try:
++            with contextlib.closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=1)) as db:
++                db.row_factory = sqlite3.Row
++                row = db.execute("SELECT * FROM sessions WHERE id = ?", (chat_id,)).fetchone()
++        except (sqlite3.Error, OSError, ValueError):
++            continue
++        if row is None:
++            continue
++        info = dict(row)
++        if info.get("archived") or str(info.get("end_reason") or "").startswith(_MOVED_PREFIX):
++            return False
++        source = session_creation_source(info)
++        return not (source in MACHINE_SESSION_SOURCES
++                    or (_HEADLESS_SESSION.fullmatch(chat_id) and source not in _INTERACTIVE_SOURCES))
++    return False
+ 
+ 
+ def has_chat_subscriber(conn: sqlite3.Connection, task_id: str) -> bool:
+     """A subscribed chat that ``decision_requested`` can wake.
+ 
+-    A ``tui`` row: the live poller queues it and the unloaded sweeper starts a turn in a dormant chat. A
+-    ``notify+wake`` / ``wake`` row: the gateway notifier wakes the agent. Not a plain ``notify`` messaging row
+-    (a passive ping, possibly to a person rather than the orchestrator) and not a ``hub`` relay row, which
+-    carries only cards that turned terminal, never a parked card's events."""
++    A ``tui`` row whose chat is reachable (:func:`tui_chat_reachable`): the live poller queues the notice and
++    the unloaded sweeper starts a turn in a dormant chat. A messaging row in ``notify+wake`` / ``wake`` mode:
++    the gateway notifier wakes the agent. Never a ``hub`` relay row, whatever its mode (legacy rows were
++    backfilled to ``notify+wake``): it carries only cards that turned terminal. Not a plain ``notify``
++    messaging row either: a passive ping, possibly to a person rather than the orchestrator."""
+     try:
+-        return conn.execute(
+-            "SELECT 1 FROM kanban_notify_subs WHERE task_id = ? AND (platform = 'tui' "
+-            "OR delivery_mode IN ('notify+wake', 'wake')) LIMIT 1", (task_id,)).fetchone() is not None
++        rows = conn.execute("SELECT platform, chat_id, delivery_mode FROM kanban_notify_subs WHERE task_id = ?",
++                            (task_id,)).fetchall()
+     except sqlite3.OperationalError:
+         return False
++    for platform, chat_id, mode in rows:
++        platform = (platform or "").lower()
++        if platform == "hub":
++            continue
++        if platform == "tui":
++            if chat_id and tui_chat_reachable(chat_id):
++                return True
++        elif mode in ("notify+wake", "wake"):
++            return True
++    return False
+ 
+ 
+ def _check_chat(conn, task_id, awaiting, text) -> None:
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index deab126df8c306e2cac4d7d215f48f7b17f211f9..ee07beae829fc8173aac4310b323cc8598fd99f5 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -170,7 +170,7 @@ def continue_task(
+             checkpoint = noted or checkpoint
+             noted, check_every = kaw.resource_apply(record, checkpoint, check_every)
+             checkpoint = noted or checkpoint
+-            wake_check = wake_check or kaw.card_probe(record)
++            wake_check, clock_only = kaw.park_probe(conn, task_id, record, wake_check, clock_only)
+             why = kaw.park_cycle_error(conn, task_id, record, wake_check)
+             if why:
+                 return {"ok": False, "error": why, "reason_code": kaw.INVALID_AWAITING}
+@@ -223,6 +223,8 @@ def continue_task(
+             payload.update(kwc.park_fields(wake_check, check_every, clock_only, conn=conn, probe_host=host))
+             payload["awaiting"] = record
+         kb._append_event(conn, task_id, CONTINUED_OUTCOME, payload, run_id=run_id)
++        from hermes_cli import kanban_decision_ask  # record is None for a continue that does not park
++        kanban_decision_ask.post_notice(conn, task_id, reason=checkpoint, awaiting=record, run_id=run_id)
+         kwc.set_check(conn, task_id, wake_check if wake_at is not None else None, check_every, now=now,
+                       register_here=kwc.probe_here(conn, host))
+         if in_txn is not None:
+diff --git a/hermes_cli/kanban_db_schedule.py b/hermes_cli/kanban_db_schedule.py
+index d05197a0f4dd563d267a48b3e98f219fda7485d2..8dbddb8a8925f24e02fa6ec279f2eb784b2f26a5 100644
+--- a/hermes_cli/kanban_db_schedule.py
++++ b/hermes_cli/kanban_db_schedule.py
+@@ -49,7 +49,7 @@ def schedule_task(
+         except kaw.RepeatedPark as rp:
+             return noted.keep(kaw.escalate(conn, task_id, record=rp.record, reason=reason,
+                                            expected_run_id=expected_run_id) is not None)
+-        wake_check = wake_check or kaw.card_probe(record)
++        wake_check, clock_only = kaw.park_probe(conn, task_id, record, wake_check, clock_only)
+         why = kaw.park_cycle_error(conn, task_id, record, wake_check)
+         if why:
+             raise kaw.AwaitingError(kaw.INVALID_AWAITING, why)
+diff --git a/hermes_cli/kanban_timed_park.py b/hermes_cli/kanban_timed_park.py
+index 82cf7a91f581869d579a912c39cd46e0fb2eb385..aee99c0c8cd3e8628aade7a09bed00ace9bd17d8 100644
+--- a/hermes_cli/kanban_timed_park.py
++++ b/hermes_cli/kanban_timed_park.py
+@@ -178,7 +178,7 @@ def park(
+         from hermes_cli import kanban_deploy_window as kdw
+         wake_at, reason = kdw.apply(record, wake_at, reason, now=now)
+         reason, check_every = kaw.resource_apply(record, reason, check_every)
+-    wake_check = wake_check or kaw.card_probe(record)
++    wake_check, clock_only = kaw.park_probe(conn, task_id, record, wake_check, clock_only)
+     wake_check, check_every = kwc.validate_park(
+         wake_at=wake_at, wake_check=wake_check, check_every=check_every, clock_only=clock_only)
+     from hermes_cli.kanban_wake_check_hub_relay import relay_host
+diff --git a/tests/hermes_cli/test_kanban_decision_ask.py b/tests/hermes_cli/test_kanban_decision_ask.py
+index db464de4af33a5eaf739051a47c78a12962f3dfd..f9fa0cd385c2ffcb0061a9a96fd9638ea87c18be 100644
+--- a/tests/hermes_cli/test_kanban_decision_ask.py
++++ b/tests/hermes_cli/test_kanban_decision_ask.py
+@@ -10,6 +10,7 @@ from __future__ import annotations
+ 
+ import argparse
+ import json
++import time
+ 
+ import pytest
+ 
+@@ -32,9 +33,35 @@ LIVE_AWAITING = {"kind": "external", "ref": "Owning orchestrator of comments 216
+ LIVE_PROBE = "hermes kanban wait-comment {tid} --after-id 3414 --from-gateway hub"
+ 
+ 
+-def _subscribe(conn, tid) -> None:
+-    kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id="local-orchestrator", notifier_profile="default",
+-                       delivery_metadata={"reason": "shepherd"})
++ORCHESTRATOR = "20261114_223808_7fed0a"
++
++
++def _session(chat_id: str = ORCHESTRATOR, *, source: str = "desktop", archived: bool = False,
++             end_reason: str | None = None) -> str:
++    """A real session row in the launch store, as the sweeper finds the chat."""
++    from hermes_constants import get_hermes_home
++    from hermes_state import SessionDB
++    db = SessionDB(get_hermes_home() / "state.db")
++    try:
++        if db.get_session(chat_id) is None:
++            db.create_session(chat_id, source=source)
++        db._conn.execute("UPDATE sessions SET archived = ?, end_reason = ? WHERE id = ?",
++                         (1 if archived else 0, end_reason, chat_id))
++        db._conn.commit()
++    finally:
++        db.close()
++    return chat_id
++
++
++def _subscribe(conn, tid, chat_id: str | None = None) -> None:
++    chat_id = chat_id or _session()
++    # Written directly: add_notify_sub refuses headless-looking ids, and the worker-transcript case must be
++    # refused by the chat-wait check, not by a missing row.
++    with kb.write_txn(conn):
++        conn.execute("INSERT INTO kanban_notify_subs (task_id, platform, chat_id, thread_id, notifier_profile, "
++                     "delivery_mode, delivery_metadata, created_at, last_event_id) VALUES (?,?,?,?,?,?,?,?,?)",
++                     (tid, "tui", chat_id, "", "default", "notify", json.dumps({"reason": "shepherd"}),
++                      int(time.time()), 0))
+ 
+ 
+ def _asks(conn, tid) -> list:
+@@ -156,12 +183,23 @@ def test_decision_requested_reaches_live_and_dormant_chats() -> None:
+     assert "premise A/B/C?" in render(None, {"why": "premise A/B/C?"}, "t")
+ 
+ 
+-def test_orchestrator_wait_matcher() -> None:
+-    assert kaw.orchestrator_wait(LIVE_REASON)
+-    assert kaw.orchestrator_wait("", "Owning orchestrator of comments 216055 and 3389 (hub)")
+-    assert kaw.orchestrator_wait("Parked pending the orchestrator's go-ahead on phase B.")
+-    assert not kaw.orchestrator_wait("Per the orchestrator's decision, waiting for CI run 40443505012.")
+-    assert not kaw.orchestrator_wait("Orchestrator decision recorded; waiting for the release build.")
++@pytest.mark.parametrize("text,ref,expected", [
++    (LIVE_REASON, None, True),
++    ("", "Owning orchestrator of comments 216055 and 3389 (hub)", True),
++    ("Parked pending the orchestrator's go-ahead on phase B.", None, True),
++    ("Waiting on the orchestrator to decide between A and B.", None, True),
++    ("Need the creator chat's answer on the scope.", None, True),
++    ("Awaiting the origin session's call on the window.", None, True),
++    # citations, negations and product names are not waits on the card's orchestrator (review of #3647)
++    ("Per the orchestrator's decision, waiting for CI run 40443505012.", None, False),
++    ("Orchestrator decision recorded; waiting for the release build.", None, False),
++    ("Waiting for vendor ticket 4411 per the orchestrator's decision in comment 3392.", None, False),
++    ("This card needs no orchestrator decision; waiting for CI run 40443505012.", None, False),
++    ("Waiting for the Airflow orchestrator release 2.9 from the vendor.", None, False),
++    ("Blocked on the k8s orchestrator call timing out; vendor ticket 4411.", None, False),
++])
++def test_orchestrator_wait_matcher(text, ref, expected) -> None:
++    assert kaw.orchestrator_wait(text, ref) is expected
+ 
+ 
+ WHY_DAVID = "David's approval of the $400 GPU spend is pending"
+@@ -195,12 +233,14 @@ def test_chat_wait_never_launders_a_david_ask_or_an_agent_wall(kanban_home, monk
+     ("telegram", "notify+wake", True),
+     ("telegram", None, False),  # a passive ping, maybe to a person: no orchestrator is woken
+     ("hub", None, False),       # the hub relay carries only cards that turned terminal
++    ("hub", "notify+wake", False),  # legacy hub rows were backfilled to notify+wake: still only terminal cards
+ ])
+ def test_only_a_subscription_the_notice_can_wake_counts(kanban_home, monkeypatch, platform, mode, parks) -> None:
+     with kbc.connect_closing() as conn:
+         tid = _running(conn)
++        chat = _session() if platform == "tui" else "chat-1"
+         kbn.add_notify_sub(conn, task_id=tid, platform=platform,
+-                           chat_id="macbook/default/20261026_235722_bef6c6" if platform == "hub" else "chat-1",
++                           chat_id="macbook/default/20261026_235722_bef6c6" if platform == "hub" else chat,
+                            notifier_profile="default", delivery_mode=mode,
+                            delivery_metadata={"reason": "shepherd"})
+         _as_worker(monkeypatch, conn, tid)
+@@ -211,3 +251,100 @@ def test_only_a_subscription_the_notice_can_wake_counts(kanban_home, monkeypatch
+         else:
+             assert kaw.NO_CHAT_SUBSCRIBER in (out.get("code") or "") + out.get("error", ""), out
+             assert kb.get_task(conn, tid).status == "running"
++
++
++def test_continue_on_the_orchestrator_asks_too(kanban_home, monkeypatch) -> None:
++    """Review of #3647: kanban_continue recorded the chat wait but posted no decision_requested."""
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _subscribe(conn, tid)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("continue", {"checkpoint": LIVE_REASON, "resume_after_seconds": 86400,
++                                 "wake_check": LIVE_PROBE.format(tid=tid), "awaiting": LIVE_AWAITING})
++        assert out.get("ok") is not False and "error" not in out, out
++        assert _park_payload(conn, tid)["awaiting"]["kind"] == "chat"
++        assert len(_asks(conn, tid)) == 1
++        assert "wait-comment" in (kwc.get_state(conn, tid) or {}).get("cmd", "")
++
++
++def test_cli_block_time_records_the_chat_wait(kanban_home, capsys) -> None:
++    from hermes_cli import kanban as kcli
++
++    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
++    kcli.build_parser(parser.add_subparsers(dest="command"))
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _subscribe(conn, tid)
++    rc = kcli.kanban_command(parser.parse_args([
++        "kanban", "block", tid, LIVE_REASON, "--kind", "time", "--wake-check", LIVE_PROBE.format(tid=tid),
++        "--awaiting", json.dumps(LIVE_AWAITING)]))
++    assert rc == 0, capsys.readouterr().err
++    with kbc.connect_closing() as conn:
++        _assert_chat_park(conn, tid)
++
++
++@pytest.mark.parametrize("op", ["schedule", "block"])
++def test_clock_only_chat_wait_wakes_on_the_answering_comment(kanban_home, monkeypatch, capsys, op) -> None:
++    """Review of #3647: a chat wait with no probe slept to its clock. Its auto probe ignores the park's own
++    comment and fires on the next one."""
++    from hermes_cli import kanban as kcli
++
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _subscribe(conn, tid)
++        _as_worker(monkeypatch, conn, tid)
++        args = {"reason": LIVE_REASON, "clock_only": True, "awaiting": LIVE_AWAITING}
++        if op == "block":
++            args["kind"] = "time"
++        out = _tool(op, args)
++        assert out.get("ok") is not False and "error" not in out, out
++        cmd = (kwc.get_state(conn, tid) or {}).get("cmd", "")
++        assert cmd.startswith(f"hermes kanban wait-comment {tid} --after-id "), cmd
++        after = int(cmd.rsplit(" ", 1)[1])
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
++    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
++    kcli.build_parser(parser.add_subparsers(dest="command"))
++
++    def probe() -> int:
++        return kcli.kanban_command(parser.parse_args(["kanban", "wait-comment", tid, "--after-id", str(after)]))
++
++    assert probe() != 0  # the park's own comment and notice do not count as the answer
++    with kbc.connect_closing() as conn:
++        kb.add_comment(conn, tid, "default", "Decisions: B, authorize, Phase A alone.")
++    assert probe() == 0
++    capsys.readouterr()
++
++
++@pytest.mark.parametrize("shape", ["archived", "moved", "worker_transcript", "kanban_source", "missing"])
++def test_unreachable_tui_chat_does_not_count(kanban_home, monkeypatch, shape) -> None:
++    """Adversarial review of #3647: the sweeper drops a notice to an archived/moved chat, a worker transcript or
++    a chat no store holds, so such a tui row cannot carry the ask."""
++    chat = {"archived": lambda: _session("20261101_010101_aaaaaa", archived=True),
++            "moved": lambda: _session("20261101_010101_bbbbbb", end_reason="moved_to_gateway:hub"),
++            "worker_transcript": lambda: _session("local-" + "ab" * 32, source="local"),
++            "kanban_source": lambda: _session("20261101_010101_cccccc", source="kanban"),
++            "missing": lambda: "20261101_010101_dddddd"}[shape]()
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _subscribe(conn, tid, chat)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": LIVE_REASON, "clock_only": True, "awaiting": LIVE_AWAITING})
++        assert kaw.NO_CHAT_SUBSCRIBER in (out.get("code") or "") + out.get("error", ""), out
++        assert kb.get_task(conn, tid).status == "running" and not _asks(conn, tid)
++
++
++def test_orphan_reaped_desktop_chat_still_counts(kanban_home, monkeypatch) -> None:
++    """The live incident's orchestrator: a Desktop chat ended by ws_orphan_reap, which the sweeper resumes."""
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        chat = _session("20261114_010101_eeeeee", source="local", end_reason="ws_orphan_reap")
++        from hermes_constants import get_hermes_home
++        import sqlite3
++        with sqlite3.connect(get_hermes_home() / "state.db") as sdb:
++            sdb.execute("UPDATE sessions SET created_source = 'cli' WHERE id = ?", (chat,))
++        _subscribe(conn, tid, chat)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": LIVE_REASON, "clock_only": True, "awaiting": LIVE_AWAITING})
++        assert out.get("ok") is not False and "error" not in out, out
++        assert len(_asks(conn, tid)) == 1
+-- 
+2.43.0
+

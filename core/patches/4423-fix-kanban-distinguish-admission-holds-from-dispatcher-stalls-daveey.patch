@@ -1,0 +1,403 @@
+From 56a00e03acc22f2aefac44930ec4e706d354503f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 06:09:20 +0000
+Subject: [PATCH] fix(kanban): distinguish admission holds from dispatcher
+ stalls [daveey]
+
+---
+ gateway/kanban_watchers.py                    |   7 +-
+ hermes_cli/kanban_db_dispatch_clock.py        |   4 +-
+ hermes_cli/kanban_dispatch_expected_holds.py  | 103 ++++++++++
+ hermes_cli/kanban_ops.py                      |   7 +-
+ .../test_dispatch_expected_holds.py           | 193 ++++++++++++++++++
+ website/docs/user-guide/features/kanban.md    |   2 +
+ 6 files changed, 312 insertions(+), 4 deletions(-)
+ create mode 100644 hermes_cli/kanban_dispatch_expected_holds.py
+ create mode 100644 tests/hermes_cli/test_dispatch_expected_holds.py
+
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index f71f0d6d890a98525648658b8fab5dc93baad9b3..c5d72faea1cd9c4f4871c1f19a0dbe6ff27f4cd6 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -375,6 +375,8 @@ class GatewayKanbanWatchersMixin:
+             # broken PATH, missing venv, or credential loss.
+             bad_ticks = 0
+             last_warn_at = 0
++            from hermes_cli.kanban_dispatch_expected_holds import ExpectedHoldMonitor
++            hold_monitor = ExpectedHoldMonitor()
+             external_hold: Optional[tuple[str, str]] = None  # (principal, since) while an external drain holds
+             results: Optional[list] = None
+             dispatcher = _KanbanDispatcher(_kb, settings)
+@@ -445,8 +447,9 @@ class GatewayKanbanWatchersMixin:
+                         # Intentional claim-quiet defer of every local candidate: explains zero spawns, only
+                         # while nothing else (guards, ownership, caps, ineligibility) holds work back.
+                         clocked = clocked or _kbd.all_quiet_deferred(res for _slug, res in (results or []))
+-                        bad_ticks = (bad_ticks + 1 if ready_pending and not any_spawned and not capped and not clocked
+-                                     else 0)
++                        expected = hold_monitor.observe(results or [], time.time(), logger.log)
++                        bad_ticks = (bad_ticks + 1 if ready_pending and not any_spawned and
++                                     not capped and not clocked and not expected else 0)
+                     from hermes_cli import kanban_hub_cpu_alert  # one card per stale-advisory incident [daveey]
+                     await _to_thread_process_service(kanban_hub_cpu_alert.check)
+                     from hermes_cli import kanban_sync_outbox_age  # one card per stalled-outbox incident [daveey]
+diff --git a/hermes_cli/kanban_db_dispatch_clock.py b/hermes_cli/kanban_db_dispatch_clock.py
+index eadecd586bafebc70f7bd381e5bafc9ff41074df..2f7accfc6f10207b793bc5de44ffcb903fff5fe7 100644
+--- a/hermes_cli/kanban_db_dispatch_clock.py
++++ b/hermes_cli/kanban_db_dispatch_clock.py
+@@ -117,4 +117,6 @@ def all_clock_held(results: Iterable[Any]) -> bool:
+     ran = [res for res in results if res is not None and not res.skipped_locked and not res.skipped_owned]
+     if not ran or not any(res.clock_held for res in ran):
+         return False
+-    return all(not res.spawned and len(res.clock_held) == res.lane_candidates for res in ran)
++    # Pacing also records refresh deadlines here; only its typed verdict can prove a real hold.
++    # The expected-hold monitor handles pacing separately, including bounded starvation diagnostics.
++    return all(not res.spawned and not res.llm_paced and len(res.clock_held) == res.lane_candidates for res in ran)
+diff --git a/hermes_cli/kanban_dispatch_expected_holds.py b/hermes_cli/kanban_dispatch_expected_holds.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6dde5cd7675b71523e38a6619d947bc498baa30d
+--- /dev/null
++++ b/hermes_cli/kanban_dispatch_expected_holds.py
+@@ -0,0 +1,103 @@
++"""Diagnostic-only classification of intentional pacing and host-pressure waits. [daveey]"""
++from __future__ import annotations
++
++import dataclasses
++import logging
++from datetime import UTC, datetime
++
++from hermes_cli.kanban_db_dispatch_clock import CLOCK_REASONS
++from hermes_cli.kanban_db_dispatch_stuck import QUIET_COMPATIBLE_FIELDS
++
++# Positive allowlist: a new outcome must not silently mask a failure. Quiet is handled separately.
++_COMPATIBLE = (QUIET_COMPATIBLE_FIELDS - {"quiet_deferred", "quiet_deadlines"}) | {
++    "llm_paced", "clock_held", "respawn_guarded", "claim_deferred", "skipped_ineligible"}
++
++
++def _pacing_hold(row, now):
++    """Validate a typed pacing skip; never mistake its clock_held refresh for a release."""
++    if not isinstance(row, (tuple, list)) or len(row) != 4 or not isinstance(row[3], dict):
++        return None
++    tid, _, until, extra = row
++    providers = extra.get("providers")
++    if not isinstance(providers, list) or not providers or not all(isinstance(v, dict) for v in providers):
++        return None
++    full = all(v.get("state") == "paced" and type(v.get("limit")) is int and v["limit"] > 0 and
++               type(v.get("running")) is int and v["running"] >= v["limit"] for v in providers)
++    timed = (all(v.get("state") in ("held", "paced") for v in providers) and
++             type(until) in (int, float) and now < until < 253402300799)
++    if not (full or timed):
++        return None
++    pools = ", ".join(f"{v.get('provider')} {v.get('state')} running={v.get('running')} "
++                      f"limit={v.get('limit')}" for v in providers)
++    deadline = until if timed else None
++    detail = (f"next reset {datetime.fromtimestamp(deadline, UTC).isoformat()}" if deadline else
++              "release when pool has room; recheck next tick")
++    return tid, (f"llm_pacing ({pools}); {detail}", deadline)
++
++
++def expected_holds(results, now):
++    """Return per-card (explanation, reset) and whether every local candidate is explained.
++
++    Foreign label rows are not local candidates. Unknown outcomes, incomplete census and
++    failures retain ordinary stuck accounting. This does not assert that running work progresses.
++    """
++    holds = {}
++    covered_all = True
++    for board, res in results:
++        if res is None or res.skipped_locked or res.skipped_owned:
++            continue
++        local = dict(hold for row in res.llm_paced if (hold := _pacing_hold(row, now)))
++        for tid, (reason, until) in res.clock_held.items():
++            if reason in CLOCK_REASONS and now < until < 253402300799:
++                local[tid] = (f"{reason}; until {datetime.fromtimestamp(until, UTC).isoformat()}", until)
++        for tid, reason in res.claim_deferred:
++            if reason == "worker_load_pressure":
++                local[tid] = ("worker_load_pressure; release when host pressure clears; recheck next tick", None)
++        holds.update({(board, tid): detail for tid, detail in local.items()})
++        foreign = {tid for tid, reason in res.skipped_ineligible if reason == "labels_mismatch"}
++        unexpected = (not dataclasses.is_dataclass(res) or any(
++            getattr(res, field.name) for field in dataclasses.fields(res) if field.name not in _COMPATIBLE) or
++            any(tid not in local for tid, _ in res.respawn_guarded) or
++            any(reason != "worker_load_pressure" for _, reason in res.claim_deferred) or
++            any(tid not in foreign for tid, _ in res.skipped_ineligible))
++        if unexpected or len(set(local) | foreign) != res.lane_candidates:
++            covered_all = False
++    return holds, bool(holds) and covered_all
++
++
++class ExpectedHoldMonitor:
++    """One monitor per dispatcher tenure; bounded observation, not an admission-state writer.
++
++    A wait with no reset is reported after 15 minutes; a timed wait after its first reset
++    plus 15 minutes. Other cards spawning cannot clear a still-waiting card's age.
++    """
++
++    def __init__(self):
++        self.last_report = None
++        self.waits = {}
++
++    def observe(self, results, now, emit):
++        results = list(results)
++        holds, covered = expected_holds(results, now)
++        observed = {board for board, res in results if res is not None and
++                    not res.skipped_locked and not res.skipped_owned}
++        self.waits = {key: value for key, value in self.waits.items() if key in holds or key[0] not in observed}
++        warnings = []
++        for key, (detail, deadline) in holds.items():
++            start, first_reset, warned = self.waits.get(key, (now, None, None))
++            # Permit the first real reset, but never let rolling refreshes extend it forever.
++            first_reset = first_reset if first_reset is not None else deadline
++            due = max(start, first_reset or start) + 900
++            if now >= due and (warned is None or now - warned >= 300):
++                warnings.append(f"{key[0]}/{key[1]} still waiting after {int(now - start)}s; {detail}")
++                warned = now
++            self.waits[key] = (start, first_reset, warned)
++        if warnings:
++            emit(logging.WARNING, "kanban admission prolonged: " + "; ".join(warnings) +
++                 ". No admission for these cards; running work may still be progressing. "
++                 "Inspect pool turnover / host load and these cards' dispatch skips.")
++        if holds and (self.last_report is None or now - self.last_report >= 300):
++            emit(logging.INFO, "kanban dispatch held: " + "; ".join(
++                f"{board}/{tid}: {detail}" for (board, tid), (detail, _) in sorted(holds.items())))
++            self.last_report = now
++        return covered
+diff --git a/hermes_cli/kanban_ops.py b/hermes_cli/kanban_ops.py
+index d77008af3365b0a9443b68d231761689d2dddc79..d3cb5cb3da2b1613bf756b4b6d6ec401fa7868fc 100644
+--- a/hermes_cli/kanban_ops.py
++++ b/hermes_cli/kanban_ops.py
+@@ -244,6 +244,8 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
+     # the per-task breaker auto-blocks quietly, so the operator needs a signal.
+     HEALTH_WINDOW = 6  # ticks (default 30s at interval=5)
+     health_state = {"bad_ticks": 0, "last_warn_at": 0}
++    from hermes_cli.kanban_dispatch_expected_holds import ExpectedHoldMonitor
++    hold_monitor = ExpectedHoldMonitor()
+ 
+     def _ready_queue_nonempty() -> bool:
+         """Is there a ready+assigned+unclaimed task the dispatcher would spawn for?
+@@ -257,7 +259,10 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
+     def _on_tick(res):
+         ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
+         # A full cap, or every ready card waiting on a known clock (quota reset, cooldown), is idle, not stuck [daveey]
+-        if ready_pending and not res.spawned and not res.at_capacity and not kbd.all_clock_held([res]):
++        expected = hold_monitor.observe([("default", res)], time.time(),
++            lambda level, message: print(f"[{_fmt_ts(int(time.time()))}] {logging.getLevelName(level)} {message}",
++                                         file=sys.stderr, flush=True))
++        if ready_pending and not res.spawned and not res.at_capacity and not kbd.all_clock_held([res]) and not expected:
+             health_state["bad_ticks"] += 1
+         else:
+             health_state["bad_ticks"] = 0
+diff --git a/tests/hermes_cli/test_dispatch_expected_holds.py b/tests/hermes_cli/test_dispatch_expected_holds.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6005c1c7be86a906a76088ae585296faf1b94b5e
+--- /dev/null
++++ b/tests/hermes_cli/test_dispatch_expected_holds.py
+@@ -0,0 +1,193 @@
++"""Intentional admission holds are not a broken dispatcher. [daveey]"""
++import argparse
++
++import pytest
++
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_ops
++
++
++def paced(*, until=None, limit=1, running=1):
++    result = kbd.DispatchResult(lane_candidates=2)
++    result.skipped_ineligible.append(("t_elsewhere", "labels_mismatch"))
++    result.respawn_guarded.append(("t_wait", "llm_pacing"))
++    result.clock_held["t_wait"] = ("llm_pacing", until or 2000)
++    result.llm_paced.append(("t_wait", "openai-codex paced", until, {"providers": [
++        {"provider": "openai-codex", "state": "held" if until else "paced",
++         "limit": limit, "running": running}]}))
++    return result
++
++
++def daemon(monkeypatch, capsys, result):
++    monkeypatch.setattr(kanban_ops.kbc, "connect_closing", lambda: None)
++    # Avoid database reads: the observed ready queue is deliberately nonempty.
++    result.skipped_unassigned = []
++    class Connection:
++        def __enter__(self):
++            return self
++        def __exit__(self, *args):
++            pass
++    monkeypatch.setattr(kanban_ops.kbc, "connect_closing", Connection)
++    monkeypatch.setattr(kbd, "has_spawnable_ready", lambda conn: True)
++    def run(*, on_tick, **kwargs):
++        for _ in range(8):
++            on_tick(result)
++    monkeypatch.setattr(kbd, "run_daemon", run)
++    kanban_ops._cmd_daemon(argparse.Namespace(force=True, interval=1, max=None, pidfile=None))
++    return capsys.readouterr().err
++
++
++@pytest.mark.parametrize("kind", ["full", "timed", "pressure"])
++def test_daemon_expected_hold_not_stuck(monkeypatch, capsys, kind):
++    monkeypatch.setattr(kanban_ops.time, "time", lambda: 1000)
++    result = paced(until=1600 if kind == "timed" else None)
++    if kind == "pressure":
++        result = kbd.DispatchResult(lane_candidates=1, claim_deferred=[("t_wait", "worker_load_pressure")])
++    output = daemon(monkeypatch, capsys, result)
++    assert "kanban dispatcher stuck" not in output
++    assert "kanban dispatch held" in output
++    assert ("worker_load_pressure" if kind == "pressure" else "llm_pacing") in output
++
++
++def test_long_deferral_warns_despite_unrelated_spawns():
++    from hermes_cli.kanban_dispatch_expected_holds import ExpectedHoldMonitor
++    monitor = ExpectedHoldMonitor()
++    messages = []
++    result = paced()
++    emit = lambda level, text: messages.append((level, text))
++    assert monitor.observe([("a", result)], 1000, emit)
++    result.spawned.append(("t_other", "default", ""))
++    monitor.observe([("a", result)], 1900, emit)
++    assert any(level == 30 and "t_wait" in text and "900s" in text for level, text in messages)
++    assert all("dispatcher stuck" not in text for _, text in messages)
++
++
++@pytest.mark.parametrize("until,limit,running", [(None, 0, 0), (999, 0, 0)])
++def test_invalid_pacing_clock_does_not_hide_starvation(monkeypatch, capsys, until, limit, running):
++    monkeypatch.setattr(kanban_ops.time, "time", lambda: 1000)
++    result = paced(until=until, limit=limit, running=running)
++    result.skipped_ineligible.clear()
++    result.lane_candidates = 1
++    assert "kanban dispatcher stuck" in daemon(monkeypatch, capsys, result)
++
++
++def test_deadline_is_real_reset_not_refresh():
++    from hermes_cli.kanban_dispatch_expected_holds import ExpectedHoldMonitor
++    monitor = ExpectedHoldMonitor()
++    messages = []
++    emit = lambda level, text: messages.append((level, text))
++    monitor.observe([("a", paced(until=4000, limit=0, running=0))], 1000, emit)
++    monitor.observe([("a", paced(until=4000, limit=0, running=0))], 1900, emit)
++    assert not any(level == 30 for level, _ in messages)
++    # Repeatedly extending an advertised reset must not erase the original wait.
++    monitor.observe([("a", paced(until=8000, limit=0, running=0))], 4900, emit)
++    assert any(level == 30 for level, _ in messages)
++
++
++def test_unknown_claim_reason_is_not_hidden(monkeypatch, capsys):
++    monkeypatch.setattr(kanban_ops.time, "time", lambda: 1000)
++    result = paced()
++    result.claim_deferred.append(("t_broken", "offline"))
++    result.lane_candidates += 1
++    assert "kanban dispatcher stuck" in daemon(monkeypatch, capsys, result)
++
++
++@pytest.mark.parametrize("kind", ["full", "timed", "pressure"])
++def test_gateway_expected_hold_not_stuck(monkeypatch, caplog, tmp_path, kind):
++    import logging
++    from gateway import kanban_watchers as watchers
++    from tests.hermes_cli.test_kanban_stuck_clock_holds import _run_gateway_ticks
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    monkeypatch.setattr(watchers.time, "time", lambda: 1000)
++    result = paced(until=1600 if kind == "timed" else None)
++    if kind == "pressure":
++        result = kbd.DispatchResult(lane_candidates=1, claim_deferred=[("t_wait", "worker_load_pressure")])
++    monkeypatch.setattr(watchers._KanbanDispatcher, "tick_once", lambda self, **kw: [("default", result)])
++    monkeypatch.setattr(watchers._KanbanDispatcher, "ready_nonempty", lambda self: True)
++    caplog.set_level(logging.INFO, logger="gateway")
++    _run_gateway_ticks(monkeypatch, watchers._HEALTH_WINDOW + 4)
++    text = "\n".join(r.getMessage() for r in caplog.records)
++    assert "kanban dispatcher stuck" not in text
++    assert "kanban dispatch held" in text
++
++
++@pytest.mark.parametrize("split", [False, True])
++def test_mixed_clock_and_pacing_are_expected(split):
++    from hermes_cli.kanban_dispatch_expected_holds import expected_holds
++    result = paced()
++    clock = kbd.DispatchResult(lane_candidates=1)
++    clock.clock_held["t_clock"] = ("subscription_quota_reset", 4000)
++    clock.respawn_guarded.append(("t_clock", "subscription_quota_reset"))
++    if split:
++        rows = [("a", result), ("b", clock)]
++    else:
++        result.clock_held.update(clock.clock_held)
++        result.respawn_guarded += clock.respawn_guarded
++        result.lane_candidates += 1
++        rows = [("a", result)]
++    assert expected_holds(rows, 1000)[1]
++    result.admission_deferred.append("t_unknown")
++    assert not expected_holds(rows, 1000)[1]
++
++
++@pytest.mark.parametrize("value", [None, {"providers": [None]}, {"providers": []}])
++def test_malformed_pacing_is_unexplained_not_exception(value):
++    from hermes_cli.kanban_dispatch_expected_holds import expected_holds
++    result = paced()
++    result.llm_paced = [("t_wait", "detail", None, value)]
++    assert not expected_holds([("a", result)], 1000)[1]
++
++
++def test_full_to_timed_hold_respects_first_real_reset():
++    from hermes_cli.kanban_dispatch_expected_holds import ExpectedHoldMonitor
++    monitor = ExpectedHoldMonitor()
++    messages = []
++    emit = lambda level, text: messages.append((level, text))
++    monitor.observe([("a", paced())], 1000, emit)
++    monitor.observe([("a", paced(until=4000, limit=0, running=0))], 1500, emit)
++    monitor.observe([("a", paced(until=4000, limit=0, running=0))], 1900, emit)
++    assert not any(level == 30 for level, _ in messages)
++    monitor.observe([("a", paced(until=8000, limit=0, running=0))], 4900, emit)
++    assert any(level == 30 for level, _ in messages)
++
++
++def test_pressure_warning_is_bounded_and_resets_after_card_leaves():
++    from hermes_cli.kanban_dispatch_expected_holds import ExpectedHoldMonitor
++    monitor = ExpectedHoldMonitor()
++    result = kbd.DispatchResult(lane_candidates=1, claim_deferred=[("t_wait", "worker_load_pressure")])
++    messages = []
++    emit = lambda level, text: messages.append((level, text))
++    for now in (1000, 1899):
++        assert monitor.observe([("a", result)], now, emit)
++    assert not any(level == 30 for level, _ in messages)
++    for now in (1900, 1901, 2199, 2200):
++        monitor.observe([("a", result)], now, emit)
++    assert sum(level == 30 for level, _ in messages) == 2
++    monitor.observe([("a", kbd.DispatchResult())], 2201, emit)
++    messages.clear()
++    monitor.observe([("a", result)], 3000, emit)
++    assert not any(level == 30 for level, _ in messages)
++
++
++@pytest.mark.parametrize("field,value", [("admission_deferred", ["t_x"]), ("memory_pressure", "critical"),
++    ("ownership_error", "broken"), ("quiet_deferred", [("t_x", "episode")]), ("reclaimed", ["t_x"])])
++def test_other_outcome_never_masked(field, value):
++    from hermes_cli.kanban_dispatch_expected_holds import expected_holds
++    result = paced()
++    setattr(result, field, value)
++    assert not expected_holds([("a", result)], 1000)[1]
++
++
++def test_real_pacing_record_is_classified_without_writing(monkeypatch):
++    from hermes_cli import kanban_llm_pacing as lp
++    from hermes_cli import kanban_llm_pacing_dispatch as dispatch
++    from hermes_cli.kanban_dispatch_expected_holds import expected_holds
++    monkeypatch.setattr(dispatch.time, "time", lambda: 1000)
++    result = kbd.DispatchResult(lane_candidates=2, skipped_ineligible=[("t_elsewhere", "labels_mismatch")])
++    dispatch._record(None, "t_wait", [{"provider": "openai-codex", "state": "paced", "until": None,
++                     "limit": 1, "running": 1}], result, dry_run=True, cfg=lp.PacingConfig())
++    holds, covered = expected_holds([("a", result)], 1000)
++    assert covered
++    assert "release when pool has room" in holds[("a", "t_wait")][0]
++    assert holds[("a", "t_wait")][1] is None
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index c8259877906b428b2b655b1157c811b8f5041abf..15c56830a7d45e60c224e8d6f2bd474edd3a5a5e 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -1549,6 +1549,8 @@ hermes kanban create "nightly backup audit" \
+ 
+ The dispatcher refuses to re-spawn a ready task when it hit an auth error (401, invalid API key, unauthorized, billing) on the previous run (`blocker_auth`), or completed a run successfully within the guard window (`recent_success`), or a recent task comment links to a GitHub PR (`active_pr`). Two cooldowns hold a card without ever counting against it: `rate_limit_cooldown` after a quota-wall requeue and `infrastructure_cooldown` after the host refused to place the worker (no restart-safe systemd scope — see [Workers and systemd cgroups](#workers-and-systemd-cgroups)); both share the `HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS` window (default 300 s). Quota / rate-limit / 429 text in `last_failure_error` always takes the `rate_limit_cooldown` path, even when a later non-failure run superseded the `rate_limited` one; once the cooldown elapses the stamp is cleared and the card retries. A quota wall is never `blocker_auth` and never escalates to a human block kind, and a legacy guard-hold block on a quota error is released automatically once another card completes after it. This prevents repeat worker storms on the same bug or task while a human catches up. See the `respawn_guarded` row in the [event reference](#event-reference).
+ 
++The stuck detector distinguishes intentional `llm_pacing` waits and `worker_load_pressure` from unexplained zero-spawn ticks. Expected waits log `kanban dispatch held` at INFO, with provider running/limit and the next real reset (or the condition rechecked next tick); foreign `labels_mismatch` rows do not turn a fully explained local wait into a stall. A refresh deadline alone cannot justify a pacing hold: an idle zero-limit pool without a future reset remains actionable. Within one dispatcher tenure, a continuously observed card waiting for 15 minutes (or 15 minutes beyond its first real reset) emits `kanban admission prolonged` at WARNING, even if other cards start. This reports lack of admission for that card, not lack of progress by running workers. Warnings repeat at most every five minutes; a new dispatcher tenure starts a new observation window.
++
+ To see why a ready card is not spawning, run `hermes kanban dispatch --dry-run` — the output lists `Guarded (<reason>): <task id>` per held card (and `respawn_guarded`, `rate_limited`, `skipped_locked`, `memory_pressure` with `--json`). The gateway's and the standalone daemon's "dispatcher stuck" warning also names what the last tick held back, e.g. `Last tick held back: active_pr=1`.
+ 
+ `recent_success` and `active_pr` hold the **ready** lane only — they are the inputs to a review handoff, not signals against one. To have a reviewer, closer or other recovery profile pick up a card whose PR is already open, either move it to the review lane with `hermes kanban request-review <id>` (accepted from `ready` as well as `running`; the review-lane spawn is not subject to either guard) or hand the ready card to that profile with `hermes kanban assign <id> <profile>`: a handoff recorded *after* the PR comment — an operator reassign, a reviewer's changes-requested verdict, or a review reopen — lifts `active_pr` for the profile now named on the card, because that PR is exactly what it must work on. Only a change to a *different* profile counts: re-assigning the same profile, unassigning, or the dispatcher's own `kanban.default_assignee` fill-in does not lift the guard, so the assignee that opened the PR is still not re-spawned against it after a crash, reclaim or no-op reassign, and a newer PR comment posted after the handoff guards again. A deliberate re-queue after a success (drag `done→ready`, `unblock`, re-promotion) also lifts `recent_success`, so a manual re-run is never silently held for the whole window.
+-- 
+2.43.0
+

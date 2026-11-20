@@ -1,0 +1,259 @@
+From d2a8c5cbf25f66623ff9cb0e7daa85f30ae2db39 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 07:45:38 +0000
+Subject: [PATCH] fix(kanban): refresh pacing before local admission [daveey]
+
+Remote-pool notices reject stale usage correctly, but admission-only reads leave capped or ineligible hubs without a natural producer. Refresh configured pools during pre-cap maintenance through the existing shared/memory usage budget. Preserve disabled/dry-run behavior, failure UNKNOWN, and read-only stale rejection. No warning classifier, admission math or rollout configuration changes.
+
+Recovered producer scope from 9d980300045d; excluded classifier scope owned by PR3268. RED: three idle/remote-only/failure assertions fail on main. GREEN: 131 focused tests across seven consumers. Whole scripts/check: 20 checks green. Detection gap closed with remote-only ready work and zero-admission cadence tests, failed-read persisted/memory budgets, disable/dry-run and 900s stale control. Live acceptance remains gated on authorized rollout and installed real-card proof.
+---
+ hermes_cli/kanban_dispatch_maintenance.py     |   2 +
+ hermes_cli/kanban_llm_pacing_dispatch.py      |  25 +++-
+ tests/hermes_cli/test_kanban_llm_pacing.py    |  11 +-
+ .../test_kanban_pacing_idle_tick.py           | 128 ++++++++++++++++++
+ .../hermes_cli/test_kanban_pacing_recovery.py |   2 +
+ 5 files changed, 159 insertions(+), 9 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_pacing_idle_tick.py
+
+diff --git a/hermes_cli/kanban_dispatch_maintenance.py b/hermes_cli/kanban_dispatch_maintenance.py
+index 244598c1956647ad5c556e8f48f76ae1642efaa4..80d071c8ceb7d261be2e1dc75ad8edaa58b9019e 100644
+--- a/hermes_cli/kanban_dispatch_maintenance.py
++++ b/hermes_cli/kanban_dispatch_maintenance.py
+@@ -4,6 +4,8 @@
+ def sweep(conn, result, guard_notice, parent_unclaimed):
+     from hermes_cli.kanban_block_policy import sweep_blocked_cards
+     from hermes_cli.kanban_quota_detector import drain_owner
++    from hermes_cli.kanban_llm_pacing_dispatch import refresh_pools
++    refresh_pools(conn)
+     sweep_blocked_cards(conn, result)
+     guard_notice.sweep_remote_guard_holds(conn, result)
+     drain_owner(conn)
+diff --git a/hermes_cli/kanban_llm_pacing_dispatch.py b/hermes_cli/kanban_llm_pacing_dispatch.py
+index 1a12b46a20d711254b5f2cfa7ae2b73e214968e0..88fb6de4fe47224ceb65ca2c5ee99186c75625a3 100644
+--- a/hermes_cli/kanban_llm_pacing_dispatch.py
++++ b/hermes_cli/kanban_llm_pacing_dispatch.py
+@@ -9,9 +9,8 @@ before any claim (:func:`hold`). Pool math and the incident are in ``kanban_llm_
+ * Each governed provider's OAuth pool is read (``/api/oauth/usage``, read-only) at most every
+   ``read_interval`` seconds per Hermes home; samples and this host's running count on the provider are kept in
+   ``<kanban home>/llm_pacing.json`` for burn rates and average concurrency.
+-* Only Kanban dispatch consults this module: chats, cron and notice delivery never do. The one reader outside the
+-  claim path is :func:`paced_pools`, the stall notices' view of the pace this home stored: it reads usage never,
+-  writes nothing and holds nothing.
++* Dispatcher maintenance refreshes configured pools even with zero admissions; the claim path shares its interval.
++* The read-only notice reader :func:`paced_pools` reads usage never, writes nothing and holds nothing.
+ * Any read or resolve fault starts the card (fail open, warned once per interval).
+ * ``kanban.llm_pacing.enabled: false`` restores the ungoverned behaviour.
+ """
+@@ -33,8 +32,8 @@ READ_DEADLINE_SECONDS = 10.0
+ EVENT_KIND = "llm_paced"
+ ADMISSION_REASON = "llm_pacing"  # the ``admission.reason`` of a stall notice for a pool the governor holds
+ EVENT_REPEAT_SECONDS = 3600
+-# A stored pace older than this many read intervals is no read: a dispatcher on this home replaces it every interval
+-# while any governed card passes it, so a gap this long means nothing has judged the pool since.
++# A stored pace older than this many read intervals is no read: maintenance replaces it each interval,
++# even without admissions, so a gap this long means this home has stopped observing the pool.
+ STALE_READ_INTERVALS = 3
+ _STATE_FILE = "llm_pacing.json"
+ _CACHE: dict[str, tuple[float, lp.PoolPace]] = {}
+@@ -211,6 +210,22 @@ def pace_for(conn: sqlite3.Connection, provider: str, cfg: lp.PacingConfig, now:
+     return pace
+ 
+ 
++def refresh_pools(conn: sqlite3.Connection) -> None:
++    """Refresh configured pools before admission, even on an idle/capped home.
++
++    Reuse the admission reader's memory/shared usage budget, including failures.
++    """
++    try:
++        cfg = load_config()
++        if not cfg.enabled:
++            return
++        now = time.time()
++        for provider in cfg.providers:
++            pace_for(conn, provider, cfg, now)
++    except Exception as exc:  # health: allow BLE001 -- observation failure must never stop dispatch
++        _warn("refresh", "kanban pacing: periodic refresh failed (%s); continuing dispatch", exc)
++
++
+ def avg_running(provider: str, now: float, cfg: lp.PacingConfig) -> float:
+     """This host's average concurrency on ``provider`` over ``rate_window`` (the samples the burn was measured on)."""
+     entry = _load_state(state_path()).get(provider) or {}
+diff --git a/tests/hermes_cli/test_kanban_llm_pacing.py b/tests/hermes_cli/test_kanban_llm_pacing.py
+index 688ef3af1a204caf10b614a2703e63be9bb8dffd..d68868348f24efe9bbc8f2d670aaf0cb5de23872 100644
+--- a/tests/hermes_cli/test_kanban_llm_pacing.py
++++ b/tests/hermes_cli/test_kanban_llm_pacing.py
+@@ -192,7 +192,8 @@ def test_dispatch_reuses_usage_until_read_interval_expires(paced_board, monkeypa
+     monkeypatch.setattr(pd, "_CLASS_CACHE", {})
+     monkeypatch.setattr(pd, "_WARNED", {})
+     interval = 60
+-    _write_cfg(paced_board, llm_pacing={"enabled": True, "read_interval_seconds": interval})
++    _write_cfg(paced_board, llm_pacing={"enabled": True, "read_interval_seconds": interval,
++                                      "providers": ["anthropic"]})
+     assert pd.load_config().read_interval == interval
+     start = time.time()
+     clock = SimpleNamespace(now=start)
+@@ -273,9 +274,11 @@ def test_only_kanban_dispatch_consults_the_governor():
+     users = sorted(str(p.relative_to(root)) for top in ("agent", "gateway", "cron", "hermes_cli", "tui_gateway")
+                    if (root / top).is_dir() for p in (root / top).rglob("*.py")
+                    if "kanban_llm_pacing" in p.read_text(encoding="utf-8", errors="ignore"))
+-    assert users == ["hermes_cli/kanban_db_dispatch.py", "hermes_cli/kanban_llm_pacing.py",
+-                     "hermes_cli/kanban_llm_pacing_dispatch.py", "hermes_cli/kanban_parent_unclaimed.py",
+-                     "hermes_cli/kanban_worker_node.py"]
++    assert users == ["hermes_cli/kanban_db_dispatch.py", "hermes_cli/kanban_dispatch_maintenance.py",
++                     "hermes_cli/kanban_llm_pacing.py", "hermes_cli/kanban_llm_pacing_dispatch.py",
++                     "hermes_cli/kanban_parent_unclaimed.py", "hermes_cli/kanban_worker_node.py"]
++    assert _governor_names(root / "hermes_cli/kanban_dispatch_maintenance.py") == {
++        "kanban_llm_pacing_dispatch": {"refresh_pools"}}
+     assert _governor_names(root / "hermes_cli/kanban_parent_unclaimed.py") == NOTICE_VIEW
+     assert _governor_names(root / "hermes_cli/kanban_worker_node.py") == PICKUP_VIEW
+ 
+diff --git a/tests/hermes_cli/test_kanban_pacing_idle_tick.py b/tests/hermes_cli/test_kanban_pacing_idle_tick.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..40fe8b56ecfc22fcb2715b288b17fe5e5dfe0d62
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pacing_idle_tick.py
+@@ -0,0 +1,128 @@
++"""Dispatcher maintenance observes pools without local admissions."""
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_llm_pacing as lp
++from hermes_cli import kanban_llm_pacing_dispatch as pd
++from tests.hermes_cli import test_kanban_stuck_clock_holds as helpers
++from tests.hermes_cli import test_kanban_notice_pacing_admission as notices
++
++home = helpers.home
++hub = notices.hub
++
++
++@pytest.fixture(autouse=True)
++def pacing_cache(monkeypatch):
++    monkeypatch.setattr(pd, '_CACHE', {})
++    monkeypatch.setattr(pd, '_WARNED', {})
++
++
++def test_zero_admission_ticks_refresh_all_pools(home, monkeypatch):
++    clock = [time.time()]
++    monkeypatch.setattr(pd.time, 'time', lambda: clock[0])
++    monkeypatch.setattr(pd, 'load_config', lp.PacingConfig)
++    reads = []
++
++    def read(provider, now):
++        reads.append((provider, now))
++        return [lp.Reading(now, 'account', lp.SEVEN_DAY, 50, now + 86400)]
++
++    monkeypatch.setattr(pd, 'read_pool', read)
++    with kbc.connect() as conn:
++        for offset in (0, 60, 300, 600, 900, 1200, 1800):
++            clock[0] = 1800000000 + offset
++            result = dispatch.dispatch_once(conn, max_spawn=0)
++            assert not result.spawned
++            assert not result.scheduling_admitted
++            assert pd.state_path().exists(), 'idle tick never sampled the pools'
++            state = json.loads(pd.state_path().read_text())
++            for provider in lp.PacingConfig().providers:
++                assert 0 <= clock[0] - state[provider]['read_at'] < 900
++        assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == 0
++    assert len(reads) == 6 * len(lp.PacingConfig().providers)
++
++
++@pytest.mark.parametrize('disabled,dry_run', [(True, False), (False, True)])
++def test_idle_refresh_respects_disable_and_dry_run(home, monkeypatch, disabled, dry_run):
++    monkeypatch.setattr(pd, 'load_config', lambda: lp.PacingConfig(enabled=not disabled))
++    monkeypatch.setattr(pd, 'read_pool', lambda *a: pytest.fail('unexpected usage read'))
++    with kbc.connect() as conn:
++        dispatch.dispatch_once(conn, max_spawn=0, dry_run=dry_run)
++    assert not pd.state_path().exists()
++
++
++def test_periodic_usage_failure_is_unknown_not_stale_pacing(home, monkeypatch):
++    now = time.time()
++    pd._save_state(pd.state_path(), {'anthropic': {'read_at': now - 1000,
++        'pace': lp.PoolPace('anthropic', lp.PACED, 0.2).as_dict()}})
++    monkeypatch.setattr(pd, 'load_config', lambda: lp.PacingConfig(providers=('anthropic',)))
++
++    def failed(*args):
++        raise OSError('usage unavailable')
++
++    monkeypatch.setattr(pd, 'read_pool', failed)
++    with kbc.connect() as conn:
++        result = dispatch.dispatch_once(conn, max_spawn=0)
++    assert not result.spawned
++    stored = pd._load_state(pd.state_path())['anthropic']
++    pace = pd._stored_pace(stored, time.time(), lp.PacingConfig())
++    assert pace is not None and pace.state == lp.UNKNOWN
++
++
++def test_remote_only_ready_work_gets_fresh_read_only_notice(hub, monkeypatch):
++    clock = [1800000000.0]
++    monkeypatch.setattr(pd.time, 'time', lambda: clock[0])
++    monkeypatch.setattr(pd, 'load_config', lambda: lp.PacingConfig(providers=('anthropic',)))
++    reads = []
++
++    def read(provider, now):
++        reads.append(now)
++        return [lp.Reading(now, 'account', lp.SEVEN_DAY, 100, now + 86400)]
++
++    monkeypatch.setattr(pd, 'read_pool', read)
++    with kbc.connect() as conn:
++        tid = notices._pool_card(conn)
++        for offset in (0, 300, 600, 900, 1200):
++            clock[0] = 1800000000.0 + offset
++            result = dispatch.dispatch_once(conn, max_spawn=0)
++            assert not result.spawned and not result.scheduling_admitted
++            before = pd.state_path().read_bytes()
++            paces = pd.paced_pools(conn, tid)
++            assert paces and paces[0].state == lp.HELD
++            assert pd.state_path().read_bytes() == before
++            assert conn.execute('SELECT status FROM tasks WHERE id = ?', (tid,)).fetchone()[0] == 'ready'
++        assert len(reads) == 5
++        # No producer ticks: the unchanged read-only reader must reject the old data.
++        clock[0] += 900
++        assert pd.paced_pools(conn, tid) is None
++        assert pd.state_path().read_bytes() == before
++        assert len(reads) == 5
++
++
++@pytest.mark.parametrize('persist', [True, False])
++def test_failed_reads_share_bounded_budget(home, monkeypatch, persist):
++    clock = [1800000000.0]
++    monkeypatch.setattr(pd.time, 'time', lambda: clock[0])
++    cfg = lp.PacingConfig(providers=('anthropic',))
++    monkeypatch.setattr(pd, 'load_config', lambda: cfg)
++    reads = []
++
++    def failed(provider, now):
++        reads.append(now)
++        raise OSError('usage unavailable')
++
++    monkeypatch.setattr(pd, 'read_pool', failed)
++    if not persist:
++        monkeypatch.setattr(pd, '_save_state', lambda *a: None)
++    with kbc.connect() as conn:
++        for offset in (0, 60, 299, 300, 301):
++            clock[0] = 1800000000.0 + offset
++            if persist:
++                pd._CACHE.clear()  # another dispatcher uses the persisted usage budget
++            dispatch.dispatch_once(conn, max_spawn=0)
++            assert pd.pace_for(conn, 'anthropic', cfg, clock[0]).state == lp.UNKNOWN
++    assert reads == [1800000000.0, 1800000300.0]
+diff --git a/tests/hermes_cli/test_kanban_pacing_recovery.py b/tests/hermes_cli/test_kanban_pacing_recovery.py
+index f0fc5edeef1a179ab830218ea70c1ca67f3c3e6d..8bf40f5cda1ef6ca96cf807e87ca744dfec28021 100644
+--- a/tests/hermes_cli/test_kanban_pacing_recovery.py
++++ b/tests/hermes_cli/test_kanban_pacing_recovery.py
+@@ -47,6 +47,8 @@ def test_far_wall_reroutes_before_pacing_and_destination_limits_claims(
+         return lp.PoolPace(provider, destination if provider == 'anthropic' else lp.HELD, 0.15)
+ 
+     monkeypatch.setattr(pd, 'pace_for', pace_for)
++    # Observe claim routing, not the independent all-provider maintenance read.
++    monkeypatch.setattr(pd, 'refresh_pools', lambda conn: None)
+     with kbc.connect() as conn:
+         ids = [kb.create_task(conn, title=f'fresh default {i}', assignee='a') for i in range(2)]
+         seen = []
+-- 
+2.43.0
+

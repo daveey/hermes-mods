@@ -1,0 +1,85 @@
+From 23606a5ed11a83fa64ff9f5345e530a778c5c1e1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 23:51:13 +0000
+Subject: [PATCH] [daveey] test(serve-proof-home): isolate parser test from the
+ detached default-plugin installer
+
+test_abbreviated_token_file_flag_is_rejected_by_parser flaked (CI run 44120720139, job
+134171742909, slice 5/8): its parser assertions passed, then the after-snapshot's
+home.rglob saw cache/plugin-catalog.json.tmp-*.tmp as a file and FileNotFoundError'd
+reading it.
+
+Five whys:
+1. The snapshot enumerated every file in the sentinel home, then read each one.
+2. A temp file vanished between is_file and read_bytes: utils.atomic_write_text's
+   rename of the live plugin catalog into the sentinel's cache.
+3. That writer is the detached default-plugins child (spawn_install): unlike the other
+   tests in this file, which stop at the config-import tripwire, this one runs main's
+   real boot, whose step_install_default_plugins forks the installer.
+4. subprocess.run waits for the CLI only, so the child keeps fetching the live catalog
+   (network) and publishing into the sentinel after the test reads it.
+5. The fixture never opted out of lazy installs, and the recovery-state check read the
+   whole home instead of the files it asserts on.
+
+Fix (test-only; no production change, no retry, no timeout):
+- The parser test sets HERMES_DISABLE_LAZY_INSTALLS=1 (the existing fetch_policy
+  opt-out), so no detached installer is started.
+- Tripwire: assert cache/default-plugins.rerun is absent (spawn_install marks it before
+  forking), so dropping the isolation fails deterministically.
+- The recovery-state assertion reads exactly the pre-existing files; a missing one
+  reads as None and fails (nothing is swallowed).
+
+Proof:
+- Controlled race (pytest -p plugin): after the parser subprocess returns, a thread runs
+  the real atomic_write_text for cache/plugin-catalog.json, held before os.replace; the
+  replace is released when the snapshot's is_file sees the temp file. Old test: 2/2
+  FAIL with FileNotFoundError on plugin-catalog.json.tmp-*.tmp (the CI traceback); new
+  test: 2/2 pass. Writer released and joined on both.
+- Uncontrolled probe: old env leaves a live `hermes_cli.default_plugins` child that
+  writes cache/plugin-catalog.json ~0.25 s after the CLI exits; with the opt-out no
+  child and no late writes.
+- Mutants, each fails the new test: allow_abbrev=True (PARSED_TOKEN_FILE, rc 87);
+  boot rewrites processes.json; boot deletes desktop/interrupted_turns.json; removing
+  the lazy-install opt-out (tripwire).
+- HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/hermes_cli/test_serve_proof_home.py:
+  48 passed, 3/3 runs.
+---
+ tests/hermes_cli/test_serve_proof_home.py | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/tests/hermes_cli/test_serve_proof_home.py b/tests/hermes_cli/test_serve_proof_home.py
+index 3d525e936cbe594a3f750e5509835e92a50f9839..5be4722dcf23f9c60a38a09ee68a7b8db499d9ae 100644
+--- a/tests/hermes_cli/test_serve_proof_home.py
++++ b/tests/hermes_cli/test_serve_proof_home.py
+@@ -158,15 +158,25 @@ def test_abbreviated_token_file_flag_is_rejected_by_parser(sentinel, args):
+     (``hermes_cli.main`` imports config at module level, so the parser rejects it after that import;
+     the tripwire here is the first parse that yields a token file, before ``cmd_dashboard``.)"""
+     before = _snapshot(sentinel)
+-    env = _clean_env(sentinel, 'HERMES_AGENT_TOOL_CALL', {'HERMES_DESKTOP': '1'})
++    # Unlike the config-tripwire launches above, this one runs main's real boot. Its default-plugin
++    # step would start a detached installer that fetches the live catalog and publishes it into the
++    # sentinel's cache AFTER this subprocess returns (an atomic temp + rename that outlives the test).
++    # That install is unrelated to the parser contract, so the fixture opts out of lazy installs.
++    env = _clean_env(sentinel, 'HERMES_AGENT_TOOL_CALL',
++                     {'HERMES_DESKTOP': '1', 'HERMES_DISABLE_LAZY_INSTALLS': '1'})
+     result = subprocess.run([sys.executable, '-c', _PARSE_BOUNDARY, *args], env=env, cwd=ROOT,
+                             capture_output=True, text=True, encoding='utf-8', timeout=30, check=False)
+     assert result.returncode == 2, (result.stdout, result.stderr)
+     assert 'PARSED_TOKEN_FILE=' not in result.stdout
+     assert 'unrecognized arguments' in result.stderr
++    # Tripwire: spawn_install marks its request before it forks, so a detached installer is visible.
++    assert not (sentinel / 'cache' / 'default-plugins.rerun').exists()
+     # main's startup seeds default home files for every command; the recovery state is untouched.
+-    after = _snapshot(sentinel)
+-    assert {name: after.get(name) for name in before} == before
++    # Read exactly the recovery files (a missing one reads as None and fails): enumerating the whole
++    # home would also read other writers' transient files, which the contract says nothing about.
++    after = {name: (sentinel / name).read_bytes() if (sentinel / name).exists() else None
++             for name in before}
++    assert after == before
+ 
+ 
+ @pytest.mark.parametrize('args', [['dashboard', '--port', '0', '--no-open'], ['serve', '--port', '0']])
+-- 
+2.43.0
+

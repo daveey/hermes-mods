@@ -1,0 +1,134 @@
+From 370e649b66c63163ae1935e8093fd213d0443f8e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 18:23:04 +0000
+Subject: [PATCH] fix(cron): never guess $'...' / $"..." heredoc delimiters
+ [daveey]
+
+Review 5911289059 on PR #2925 (exact head 4ffed53b90) found a fail-open:
+_heredoc_delimiter read `<<$'E'` and `<<$"E"` as delimiter `$E` (bash's is `E`;
+`<<$'E\x41'` is `EA`). A later line equal to the guess made body skipping
+swallow the substitution's real closer and the following command; an outer
+subshell then supplied a false `)`, so the EOF-only fallback never ran:
+
+    (
+    echo "${x:-$(cat <<$'E'
+    case x in
+    E
+    )}"; bash ./r.sh
+    $E
+    )
+
+Real bash runs r.sh (exit 0, empty stderr); base 7d3c419cbb refused, the
+reviewed head allowed.
+
+Five whys: the guard skipped a body using a delimiter it had guessed, not one
+it had decoded; the earlier fallback only covered a guess that never matched;
+no test combined a decoded delimiter with a matching later line and an outer
+subshell.
+
+Fix: an unquoted `$'` or `$"` in the delimiter word makes it undecodable;
+_heredoc_bodies_end treats that like an unterminated body (skip nothing,
+unbounded), the same conservative path an unmatched guess already took.
+
+Tests: test_misread_delimiter_with_matching_later_line_hides_no_command, real
+bash RUN/clean pairs over ANSI-C, escaped ANSI-C, localized and mixed
+(`<<A <<$'E'`) delimiters x 4 frames x root/subshell. RED at 4ffed53b90: the
+16 RUN-subshell rows fail (guard allows a command bash runs); GREEN: 128 passed.
+---
+ cron/lifecycle_guard_lines.py                 | 17 ++++++++---
+ ..._lifecycle_guard_heredoc_frame_fallback.py | 28 +++++++++++++++++++
+ 2 files changed, 41 insertions(+), 4 deletions(-)
+
+diff --git a/cron/lifecycle_guard_lines.py b/cron/lifecycle_guard_lines.py
+index 7dbcfe8d795c96d698eeb90191492eb67a107315..110186fd89b7c23b83ca4a3f4d25f82eca01c87f 100644
+--- a/cron/lifecycle_guard_lines.py
++++ b/cron/lifecycle_guard_lines.py
+@@ -108,8 +108,12 @@ class _CaseClauses:
+         return True
+ 
+ 
+-def _heredoc_delimiter(text: str, pos: int) -> tuple[str, bool] | None:
+-    """The delimiter of a ``<<`` / ``<<-`` operator at *pos* (quotes removed), else None."""
++def _heredoc_delimiter(text: str, pos: int) -> tuple[str | None, bool] | None:
++    """The delimiter of a ``<<`` / ``<<-`` operator at *pos* (quotes removed), else None.
++
++    A delimiter this reader cannot decode the way bash does (``$'E'`` -> ``E``, ``$"E"`` -> ``E``)
++    comes back as ``(None, strip_tabs)``: guessing it could let a later line equal to the guess
++    end a skipped "body" past the frame's real closer."""
+     if not text.startswith("<<", pos) or text.startswith("<<<", pos):
+         return None
+     pos += 2
+@@ -120,6 +124,8 @@ def _heredoc_delimiter(text: str, pos: int) -> tuple[str, bool] | None:
+     word: list[str] = []
+     while pos < len(text) and text[pos] not in _WORD_BREAKS:
+         char = text[pos]
++        if char == "$" and text[pos + 1:pos + 2] in ("'", '"'):
++            return None, strip_tabs
+         if char in "'\"":
+             end = _quoted_end(text, pos + 1, char, escapes=char == '"')
+             word.append(text[pos + 1:end - 1])
+@@ -134,12 +140,15 @@ def _heredoc_delimiter(text: str, pos: int) -> tuple[str, bool] | None:
+     return ("".join(word), strip_tabs) if word else None
+ 
+ 
+-def _heredoc_bodies_end(text: str, pos: int, delimiters: list[tuple[str, bool]]) -> int:
++def _heredoc_bodies_end(text: str, pos: int,
++                        delimiters: list[tuple[str | None, bool]]) -> int:
+     """End of the here-document bodies starting at *pos* (just after their command's newline).
+ 
+     Inside ``$(...)`` bash also ends a body at a line that starts with the delimiter and has a
+     ``)`` after it (``E)``, ``E )``); the rest of that line is shell again, so stop before it."""
+     for delimiter, strip_tabs in delimiters:
++        if delimiter is None:
++            return -1  # undecodable: like an unterminated body, skip nothing
+         while pos < len(text):
+             end = text.find("\n", pos)
+             end = len(text) if end < 0 else end
+@@ -159,7 +168,7 @@ class _HereDocs:
+     comment or ``case`` word in it moves the frame. Arithmetic (``$((1<<2))``) opens none."""
+ 
+     def __init__(self) -> None:
+-        self._pending: list[tuple[str, bool]] = []
++        self._pending: list[tuple[str | None, bool]] = []
+         self.unbounded = False
+         self.skipped = False
+ 
+diff --git a/tests/cron/test_lifecycle_guard_heredoc_frame_fallback.py b/tests/cron/test_lifecycle_guard_heredoc_frame_fallback.py
+index ff3d60ed2c430ffad3583c478080993428cbffed..78ef1bcae9d8e05c6f774dc071a3e8986c9962af 100644
+--- a/tests/cron/test_lifecycle_guard_heredoc_frame_fallback.py
++++ b/tests/cron/test_lifecycle_guard_heredoc_frame_fallback.py
+@@ -51,3 +51,31 @@ def test_unrecognized_heredoc_does_not_open_phantom_case(
+     assert helpers._bash_runs(tmp_path, command) is dangerous
+     refused, reason = scan_gateway_lifecycle(command, cwd=str(tmp_path))
+     assert refused is dangerous, reason
++
++
++# Bash decodes these delimiters ($'E' -> E); a naive reading guesses the second column. A later
++# line equal to that guess must not end a skipped "body" past the real closer, and an outer
++# subshell's `)` must not stand in for the substitution's lost closer.
++GUESSED = [
++    ("cat <<$'E'\ncase x in\nE\n", "$E"),
++    ('cat <<$"E"\ncase x in\nE\n', "$E"),
++    ("cat <<$'E\\x41'\ncase x in\nEA\n", "$E\\x41"),
++    # Undecodable after a decodable delimiter on one command.
++    ("cat <<A <<$'E'\nA\ncase x in\nE\n", "$E"),
++]
++
++
++@pytest.mark.parametrize("body,guess", GUESSED)
++@pytest.mark.parametrize("frame", FRAMES)
++@pytest.mark.parametrize("outer", [False, True], ids=["root", "subshell"])
++@pytest.mark.parametrize("dangerous", [True, False], ids=["RUN", "clean"])
++def test_misread_delimiter_with_matching_later_line_hides_no_command(
++        tmp_path, body, guess, frame, outer, dangerous):
++    helpers._tree(tmp_path)
++    cmd = "bash ./r.sh" if dangerous else "python3 ./clean.py"
++    command = frame.replace("BODY", body) + '; ' + cmd + '\n' + guess
++    if outer:
++        command = '(\n' + command + '\n)'
++    assert helpers._bash_runs(tmp_path, command) is dangerous
++    refused, reason = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert refused is dangerous, reason
+-- 
+2.43.0
+

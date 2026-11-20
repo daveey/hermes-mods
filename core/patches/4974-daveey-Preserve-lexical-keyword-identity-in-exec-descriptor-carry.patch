@@ -1,0 +1,189 @@
+From 029ef4cf0755f5e82d901d733ae187fc9580f981 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 02:27:18 +0000
+Subject: [PATCH] [daveey] Preserve lexical keyword identity in exec descriptor
+ carry
+
+Why: quote removal turned ordinary fi/done/} commands into scope closers.
+A conditional close then incorrectly discarded the parent descriptor's
+reachable script. Preserve quoted/escaped provenance on ShellWord and
+stop reserved-word peeling at literal commands. Remove the redundant
+quote-unaware peel that could reinterpret a quoted opener's exec argument.
+
+Proof: review-head closer regressions fail 6 cases; the initial repair
+fails four quoted opener cases. Fixed tests exercise harmless real Bash
+markers for quoted closers/openers and pipeline/background closes.
+Full cron before the last three added pipeline tests: 10971 passed,
+0 failed, 9 skipped; latest focused carry/keyword set 114 passed.
+External lifecycle consumers: 380 passed. Eleven targeted safety mutants
+killed; pipeline successor mutant initially survived and was killed by
+three added real-Bash controls.
+
+Nonblocking scope-restoration overblocking belongs to t_b24e8be58433ed41;
+implicit stdin/variable descriptors/eval to t_85a717e32585c741.
+Final-head real-row replay and independent review/CI remain landing gates.
+---
+ cron/lifecycle_guard.py                       |  2 +-
+ cron/lifecycle_guard_fds.py                   | 10 +--
+ cron/lifecycle_guard_words.py                 |  3 +
+ ...est_lifecycle_guard_descriptor_keywords.py | 68 +++++++++++++++++++
+ 4 files changed, 77 insertions(+), 6 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_descriptor_keywords.py
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index 3306d78e461e45595aa76a22f6f31fc45776dfcf..1cbb34b56b66f8c9e3d6095897515b7156e7291b 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -796,7 +796,7 @@ def _iter_segment_contexts(
+         yield from iter_script_segment_contexts(
+             carry_exec_descriptors(
+                 join_continued_lines(_iter_command_token_lists(script)), pattern=_REDIRECTION,
+-                peel_reserved_words=_peel_reserved_words, control_chars=_CONTROL_CHARS),
++                control_chars=_CONTROL_CHARS),
+             cat_operands=_cat_operands, cat_relays_stdin=_cat_relays_stdin,
+             opens_call_arguments=opens_call, peel_reserved_words=_peel_reserved_words,
+             stdin_redirections=lambda words: _split_redirections(words)[1])
+diff --git a/cron/lifecycle_guard_fds.py b/cron/lifecycle_guard_fds.py
+index 23674694c48e474824b7912718729a3cffbda352..040ddc9061b79b716109b415019ba012d5449efc 100644
+--- a/cron/lifecycle_guard_fds.py
++++ b/cron/lifecycle_guard_fds.py
+@@ -12,7 +12,7 @@ product), so growth is linear in the candidate count. Never discard reachable ta
+ """
+ from __future__ import annotations
+ 
+-from collections.abc import Callable, Iterable, Iterator
++from collections.abc import Iterable, Iterator
+ import re
+ 
+ from cron.lifecycle_guard_words import ShellWord, redirection_parts
+@@ -71,7 +71,6 @@ def _merge(old: _Table, new: _Table) -> None:
+     """Make *old* the union of itself and *new* (the result of a maybe-run ``exec``)."""
+     for fd in set(old) | set(new):
+         values = tuple(dict.fromkeys(old.get(fd, ()) + new.get(fd, ())))
+-
+         if values:
+             old[fd] = values
+         else:
+@@ -106,6 +105,8 @@ def _command_start(segment: list[str], nesting: list[str], pattern: re.Pattern[s
+     start = 0
+     while start < len(segment):
+         word = segment[start]
++        if getattr(word, "quoted", False):
++            break  # Quoted/escaped words are commands, never reserved syntax.
+         if word in _CLOSERS:
+             if nesting:
+                 nesting.pop()
+@@ -139,7 +140,7 @@ def _command_start(segment: list[str], nesting: list[str], pattern: re.Pattern[s
+ 
+ def carry_exec_descriptors(
+     lines: Iterable[list[str]], *, pattern: re.Pattern[str],
+-    peel_reserved_words: Callable[[list[str]], int], control_chars: frozenset[str],
++    control_chars: frozenset[str],
+ ) -> Iterator[list[str]]:
+     """Resolve inherited fd copies in script order, without changing pipeline boundaries.
+ 
+@@ -161,8 +162,7 @@ def carry_exec_descriptors(
+         variants: list[list[list[str]]] = []
+         for segment, before, after in pieces:
+             start = _command_start(segment, nesting, pattern)
+-            command = start + peel_reserved_words(segment[start:])
+-            redirects = _exec_redirections(segment[command:], pattern)
++            redirects = _exec_redirections(segment[start:], pattern)
+             if redirects is not None:
+                 new = dict(table)
+                 for parts in redirects:
+diff --git a/cron/lifecycle_guard_words.py b/cron/lifecycle_guard_words.py
+index 508a60976172fc27a51ba325c8a8df80982e39b8..3ed4804e190674c5cd748d7f5d884bd71173749f 100644
+--- a/cron/lifecycle_guard_words.py
++++ b/cron/lifecycle_guard_words.py
+@@ -71,10 +71,13 @@ def tokenize_redirections(line: str, tokenize: Callable[[str], list[str]],
+         if escaped:
+             escaped = False
+         elif ch == "\\" and not single:
++            protected.append(quote_marker)
+             escaped = True
+         elif ch == "'" and not double:
++            protected.append(quote_marker)
+             single = not single
+         elif ch == '"' and not single:
++            protected.append(quote_marker)
+             double = not double
+         protected.append(replacements.get(ch, ch) if literal or ch == marker else ch)
+ 
+diff --git a/tests/cron/test_lifecycle_guard_descriptor_keywords.py b/tests/cron/test_lifecycle_guard_descriptor_keywords.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3f2a111446451827720e5b3aa2978341107df9e4
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_descriptor_keywords.py
+@@ -0,0 +1,68 @@
++"""Quoted reserved words must not close inherited-descriptor scopes."""
++from __future__ import annotations
++
++import shlex
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++
++
++@pytest.mark.parametrize("closer", ['"fi"', "'fi'", r"\fi", "fi''", '"done"', '"}"'])
++@pytest.mark.parametrize("clean", [False, True])
++def test_literal_closer_preserves_conditional_descriptor(tmp_path, closer, clean):
++    script = tmp_path / "r.sh"
++    # Fake the executable, never restart a service in a test.
++    script.write_text("hermes gateway " + "restart\n" if not clean else "printf CLEAN\n")
++    if "done" in closer:
++        scope = f"while false; do {closer}; exec 3<&-; done"
++    elif "}" in closer:
++        scope = f"true || {{ {closer}; exec 3<&-; }}"
++    else:
++        scope = f"if false; then {closer}; exec 3<&-; fi"
++    command = f"exec 3<{shlex.quote(str(script))}; {scope}; bash <&3"
++    assert scan_gateway_lifecycle(command) == (not clean, None)
++    fake = tmp_path / "hermes"
++    fake.write_text("#!/bin/sh\nprintf MARKER\n")
++    fake.chmod(0o700)
++    result = subprocess.run(
++        ["bash", "--noprofile", "--norc", "-c", f"PATH={shlex.quote(str(tmp_path))}:$PATH; " + command],
++        capture_output=True, text=True, encoding="utf-8", check=False,
++    )
++    assert result.returncode == 0, result.stderr
++    assert result.stdout == ("CLEAN" if clean else "MARKER")
++
++
++@pytest.mark.parametrize("opener", ['"if"', "'while'", r"\until", '"{"', '"in"'])
++def test_literal_opener_does_not_run_exec(tmp_path, opener):
++    script = tmp_path / "r.sh"
++    script.write_text("hermes gateway " + "restart\n")
++    command = f"exec 3<{shlex.quote(str(script))}; {opener} exec 3<&-; bash <&3"
++    assert scan_gateway_lifecycle(command) == (True, None)
++    fake = tmp_path / "hermes"
++    fake.write_text("#!/bin/sh\nprintf MARKER\n")
++    fake.chmod(0o700)
++    result = subprocess.run(
++        ["bash", "--noprofile", "--norc", "-c", f"PATH={shlex.quote(str(tmp_path))}:$PATH; " + command],
++        capture_output=True, text=True, encoding="utf-8", check=False,
++    )
++    assert result.returncode == 0, result.stderr
++    assert result.stdout == "MARKER"
++
++
++@pytest.mark.parametrize("close", ["exec 3<&- | cat;", "exec 3<&- |& cat;", "exec 3<&- & wait;"])
++def test_child_close_keeps_parent_descriptor(tmp_path, close):
++    script = tmp_path / "r.sh"
++    script.write_text("hermes gateway " + "restart\n")
++    command = f"exec 3<{shlex.quote(str(script))}; {close} bash <&3"
++    assert scan_gateway_lifecycle(command) == (True, None)
++    fake = tmp_path / "hermes"
++    fake.write_text("#!/bin/sh\nprintf MARKER\n")
++    fake.chmod(0o700)
++    result = subprocess.run(
++        ["bash", "--noprofile", "--norc", "-c", f"PATH={shlex.quote(str(tmp_path))}:$PATH; " + command],
++        capture_output=True, text=True, encoding="utf-8", check=False,
++    )
++    assert result.returncode == 0, result.stderr
++    assert result.stdout == "MARKER"
+-- 
+2.43.0
+

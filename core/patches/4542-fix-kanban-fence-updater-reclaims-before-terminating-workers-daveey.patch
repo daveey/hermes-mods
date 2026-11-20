@@ -1,0 +1,605 @@
+From 7fe6849c3cea2c4ef0a5eeb4018d39aaa2ad7745 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 14:54:05 +0000
+Subject: [PATCH] fix(kanban): fence updater reclaims before terminating
+ workers [daveey]
+
+Problem: six core-update reclaims in 289 fleet requeues also booked a crash
+failure (reported 24h to 2026-11-15 12:47Z).
+
+Why 1: failure observers can close/account a worker killed by the updater.
+Why 2: reclaim_task signals and settles process custody before its closing
+transaction; the concurrent sweep sees a dead worker and no pause decision.
+Why 3: the updater's reason only becomes durable in the post-kill reclaimed
+receipt. An EOFError loss is not independently evidence of owner restart.
+Root (happened): termination precedes durable ownership of neutral closure.
+Root (not caught): handoff regressions test completed reclaimed receipts,
+not a second connection observing death inside the terminate/close interval.
+Recurrence: the earlier core-update requeue/handoff fixes (2602, 3088 and
+preserve review handoffs across updater TERM receipts) recognize completed
+pauses; they cannot prevent failure_finalized already emitted before reclaim.
+
+Commit an exact-run/claim/PID/start local reclaim command before signalling.
+Crash, expiry and runtime reapers respect that decision. If its executor dies
+or unwinds, a subsequent observer resumes the same authorized reclaim,
+including process custody, outside the observer write transaction. The intent
+never silently expires into a charge. It is an authorized pause decision, not
+a retrospective signal/EOF classifier. Retain normal Board lease authority;
+no replica writes or retroactive accounting repair. Preserve unrelated strikes
+on automatic requeues; ordinary operator reclaim retains its reset behavior.
+
+Affected historical cards (not repaired): t_423c32555af40d11,
+t_78b5b9d1c01809c8, t_60e1b62eed385db5, t_ced6e6c9cab0f714,
+t_78b1ff930ed8af7c, t_f374b9910f0eb237.
+
+Proof:
+- Base d2a8c5cbf25f, new two-order regression: 2 failed; crash-first charged
+  1 -> 2, requeue-first cleared existing strike 1 -> 0.
+- Local and primary-board ordering, identity, custody exception, abandoned
+  reclaimer, expiry/runtime competitor and ordinary SIGTERM controls pass.
+- Initial seven focused files: 126 passed; subsequent expanded modern-loss
+  coverage plus every owner_recovery importing suite: 352 passed, 15 skipped
+  (platform/opt-in real Board integration), 23 files, 108.2s.
+- Eight targeted mutants killed, including each identity field, observer hold,
+  expiry hold, abandoned recovery and prior-strike preservation.
+- scripts/check: 20 checks passed before publication.
+- Read-only replica census: 17,242 tasks, zero preexisting intent tables;
+  historical rows acquire no exemption. New intents are host-local commands.
+
+Rebased onto main ca1802c8a8 (optional explicit-operator reclaim attribution):
+kanban_db.reclaim_task still validates the attribution before any signal or claim
+change, then passes it to the extracted reclaim, which adds it to the reclaimed payload.
+
+Task: t_b0780784b2b4dad6. Update cadence/pauses unchanged. Post-deploy replica
+query and independent exact-head review remain required before card completion.
+---
+ hermes_cli/kanban_db.py                       |  35 +---
+ hermes_cli/kanban_db_dispatch.py              |   8 +-
+ hermes_cli/kanban_manual_reclaim.py           |  52 ++++++
+ hermes_cli/kanban_owner_recovery.py           |   3 +
+ hermes_cli/kanban_update_reclaim_intent.py    | 109 +++++++++++
+ ...test_kanban_update_reclaim_primary_race.py |  19 ++
+ .../test_kanban_update_reclaim_race.py        | 169 ++++++++++++++++++
+ .../test_kanban_update_reclaim_recovery.py    |  66 +++++++
+ 8 files changed, 428 insertions(+), 33 deletions(-)
+ create mode 100644 hermes_cli/kanban_manual_reclaim.py
+ create mode 100644 hermes_cli/kanban_update_reclaim_intent.py
+ create mode 100644 tests/hermes_cli/test_kanban_update_reclaim_primary_race.py
+ create mode 100644 tests/hermes_cli/test_kanban_update_reclaim_race.py
+ create mode 100644 tests/hermes_cli/test_kanban_update_reclaim_recovery.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 6be3b4f6db92f89ab230614aed16f65101b837fe..baf0c452e435c574b8f41a2cd27ef6f65b71e381 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2304,36 +2304,13 @@ def reclaim_task(
+     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None, signal_fn=None,
+     urgency_source: Optional[str] = None, interrupt_target: Optional[str] = None,
+ ) -> bool:
+-    """Operator reclaim regardless of TTL: release the claim, restore the source
+-    phase, reset the failure counter. False when not running. Bad attribution raises first."""
++    """Release a claim and restore its phase; updater pauses preserve prior failures.
++
++    Other operator reclaims reset the failure counter. False when not running.
++    Bad attribution raises first, before any signal or claim change."""
+     attribution = _cu_requeue.reclaim_attribution(reason, urgency_source, interrupt_target)
+-    row = conn.execute(
+-        "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?", (task_id,),
+-    ).fetchone()
+-    if not row or (row["status"] != "running" and row["claim_lock"] is None) or _sync.refuse_foreign_reclaim(conn, task_id):
+-        return False
+-    prev_lock = row["claim_lock"]
+-    termination = _terminate_reclaimed_worker(
+-        row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"])
+-    custody = {**_requeue_custody.for_requeue(conn, task_id, reason), **attribution}  # core update: end plain processes, pin persisted
+-    with write_txn(conn):
+-        retry_status = _retry_status_for_run(conn, task_id)
+-        cur = conn.execute(
+-            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
+-            "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
+-            "AND claim_lock IS ?", (retry_status, task_id, prev_lock),
+-        )
+-        if cur.rowcount != 1:
+-            return False
+-        run_id = _record_reclaim(
+-            conn, task_id, termination,
+-            error=f"manual_reclaim: {reason}" if reason else f"manual_reclaim lock={prev_lock}",
+-            payload={"manual": True, "reason": reason, "prev_lock": prev_lock, "retry_status": retry_status, **custody},
+-        )
+-    _sync.release_lease(conn, task_id, _sync.run_uid(conn, run_id))
+-    # Operator intervention = fresh retry budget (own txn, runs after commit).
+-    _clear_failure_counter(conn, task_id)
+-    return True
++    from hermes_cli.kanban_manual_reclaim import reclaim_task as reclaim
++    return reclaim(conn, task_id, reason=reason, signal_fn=signal_fn, attribution=attribution)
+ 
+ 
+ def reassign_task(
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 065cc5c354ef5d4b2f2b84311b3510755932b118..35080aff1978fd768f11ab344408866e6c47b279 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1256,8 +1256,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None,
+                           *, failed_results_only: bool = False) -> _CrashSweep:
+     """Release every host-local ``running`` task whose worker PID is dead."""
+     sweep = _CrashSweep()
+-    from hermes_cli.kanban_neutral_release import drain
+-    sweep.exited_hook_payloads.extend(drain(conn))
++    from hermes_cli.kanban_update_reclaim_intent import recover_and_drain
++    sweep.exited_hook_payloads.extend(recover_and_drain(conn))
+     for hook in sweep.exited_hook_payloads:
+         target = {"rate_limited": sweep.rate_limited, "reclaimed": sweep.owner_restarted, "host_reboot": sweep.host_rebooted,
+                   "owner_down": sweep.owner_unavailable, "owner_unavailable": sweep.owner_unavailable}
+@@ -1276,8 +1276,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None,
+             lock = row["claim_lock"] or ""
+             if not _kb._claim_is_local(lock, host_prefix):
+                 continue
+-            from hermes_cli.kanban_failure_release import queued
+-            if queued(conn, row["current_run_id"]):
++            from hermes_cli.kanban_update_reclaim_intent import observer_held
++            if observer_held(conn, row):
+                 continue
+             # Launch-window grace so a freshly-spawned worker isn't reclaimed
+             # before its PID is visible on /proc.
+diff --git a/hermes_cli/kanban_manual_reclaim.py b/hermes_cli/kanban_manual_reclaim.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c79203cb10f80b8a97e3e14f0aea283d060e006e
+--- /dev/null
++++ b/hermes_cli/kanban_manual_reclaim.py
+@@ -0,0 +1,52 @@
++"""Manual reclaims, including the updater's failure-neutral pause."""
++from __future__ import annotations
++
++from hermes_cli.kanban_core_update_requeue import CORE_UPDATE_REQUEUE_REASON
++from hermes_cli.kanban_update_reclaim_intent import fence
++
++
++def reclaim_task(conn, task_id, *, reason=None, signal_fn=None, attribution=None):
++    from hermes_cli import kanban_db as kb
++
++    row = conn.execute(
++        "SELECT status, current_run_id, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id=?",
++        (task_id,),
++    ).fetchone()
++    if row is None or (row["status"] != "running" and row["claim_lock"] is None):
++        return False
++    if kb._sync.refuse_foreign_reclaim(conn, task_id):
++        return False
++    with fence(conn, task_id, row, reason) as admitted:
++        if not admitted:
++            return False
++        return _reclaim(conn, task_id, row, reason, signal_fn, attribution or {})
++
++
++def _reclaim(conn, task_id, row, reason, signal_fn, attribution):
++    from hermes_cli import kanban_db as kb
++
++    prev_lock = row["claim_lock"]
++    termination = kb._terminate_reclaimed_worker(
++        row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"])
++    # Validated explicit-operator attribution (kanban_db.reclaim_task), absent on legacy reclaims.
++    custody = {**kb._requeue_custody.for_requeue(conn, task_id, reason), **attribution}
++    with kb.write_txn(conn):
++        retry_status = kb._retry_status_for_run(conn, task_id)
++        cur = conn.execute(
++            "UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, worker_started_at=NULL "
++            "WHERE id=? AND status IN ('running', 'ready', 'blocked') "
++            "AND claim_lock IS ? AND current_run_id IS ? AND worker_pid IS ? AND worker_started_at IS ?",
++            (retry_status, task_id, prev_lock, row["current_run_id"], row["worker_pid"], row["worker_started_at"]),
++        )
++        if cur.rowcount != 1:
++            return False
++        run_id = kb._record_reclaim(
++            conn, task_id, termination,
++            error=f"manual_reclaim: {reason}" if reason else f"manual_reclaim lock={prev_lock}",
++            payload={"manual": True, "reason": reason, "prev_lock": prev_lock, "retry_status": retry_status, **custody},
++        )
++    kb._sync.release_lease(conn, task_id, kb._sync.run_uid(conn, run_id))
++    # Automatic pauses are not operator forgiveness of earlier, unrelated failures.
++    if reason != CORE_UPDATE_REQUEUE_REASON:
++        kb._clear_failure_counter(conn, task_id)
++    return True
+diff --git a/hermes_cli/kanban_owner_recovery.py b/hermes_cli/kanban_owner_recovery.py
+index 95549b130b6ea521971023f084898dd31035aa47..501331b82a368cf441be34c5ab041413dc549c22 100644
+--- a/hermes_cli/kanban_owner_recovery.py
++++ b/hermes_cli/kanban_owner_recovery.py
+@@ -255,6 +255,9 @@ def owner_reclaim_blocked(conn, task_id, *, crash_sweep=False, for_termination=F
+     the shape that used to be unreclaimable forever, because ``bound_interpreter_gone`` was the
+     only override and it needs the ``worker_bound`` event that run never wrote.
+     """
++    from hermes_cli.kanban_update_reclaim_intent import task_pending
++    if task_pending(conn, task_id):
++        return True
+     from hermes_cli.kanban_failed_result import expiry_identity_matches, modern_result_recorded
+     if selected is not None and not expiry_identity_matches(conn, selected):
+         return True
+diff --git a/hermes_cli/kanban_update_reclaim_intent.py b/hermes_cli/kanban_update_reclaim_intent.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3b733f264e2c70ab389759006919e6e9f86e8cc7
+--- /dev/null
++++ b/hermes_cli/kanban_update_reclaim_intent.py
+@@ -0,0 +1,109 @@
++"""Durable, exact-run updater reclaim commands, committed before termination.
++
++The intent is the linearization point of an authorized pause, not an inference
++from EOF/SIGTERM. Observers finish an abandoned command (including process custody)
++instead of turning its termination into a failure. No database lock spans polling.
++This local table is deliberately not replicated as Board authority.
++"""
++from __future__ import annotations
++
++import os
++from contextlib import contextmanager
++from uuid import uuid4
++
++from hermes_cli.kanban_core_update_requeue import CORE_UPDATE_REQUEUE_REASON
++
++TABLE = "kanban_update_reclaim_intents"
++FIELDS = ("current_run_id", "claim_lock", "worker_pid", "worker_started_at")
++
++
++def _exists(conn):
++    return conn.execute("SELECT 1 FROM sqlite_master WHERE name=?", (TABLE,)).fetchone() is not None
++
++
++def _matching(intent, row):
++    return intent is not None and row is not None and all(intent[key] == row[key] for key in FIELDS)
++
++
++def _owner_alive(intent):
++    from hermes_cli import kanban_db_dispatch as dispatch
++    return dispatch._worker_alive(intent["owner_pid"], intent["owner_started_at"])
++
++
++def observer_held(conn, row) -> bool:
++    """Keep charged releases and updater-owned reclaims out of the crash sweep."""
++    from hermes_cli.kanban_failure_release import queued
++    return queued(conn, row["current_run_id"]) or pending(conn, row)
++
++
++def pending(conn, row) -> bool:
++    """An abandoned command still owns its exact run until recovered, never expires."""
++    if not _exists(conn):
++        return False
++    return _matching(conn.execute(f"SELECT * FROM {TABLE} WHERE task_id=?", (row["id"],)).fetchone(), row)
++
++
++def task_pending(conn, task_id) -> bool:
++    row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
++    return row is not None and pending(conn, row)
++
++
++def recover_and_drain(conn):
++    """Before the observer's transaction, resume abandoned pauses then drain neutral results."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_neutral_release import drain
++
++    if _exists(conn):
++        for intent in conn.execute(f"SELECT * FROM {TABLE}").fetchall():
++            if _owner_alive(intent):
++                continue
++            row = conn.execute("SELECT * FROM tasks WHERE id=?", (intent["task_id"],)).fetchone()
++            if _matching(intent, row) and row["status"] == "running":
++                kb.reclaim_task(conn, intent["task_id"], reason=CORE_UPDATE_REQUEUE_REASON)
++            else:
++                with kb.write_txn(conn):
++                    conn.execute(f"DELETE FROM {TABLE} WHERE task_id=? AND token=?",
++                                 (intent["task_id"], intent["token"]))
++    return drain(conn)
++
++
++@contextmanager
++def fence(conn, task_id, selected, reason):
++    """Publish before signalling; stale selection or concurrent reclaim sends no signal."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_dispatch as dispatch
++
++    if reason != CORE_UPDATE_REQUEUE_REASON:
++        yield True
++        return
++    token = uuid4().hex
++    owner_pid = os.getpid()
++    owner_started_at = dispatch._process_fingerprint(owner_pid)
++    with kb.write_txn(conn):
++        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
++        valid = (owner_started_at is not None and row is not None and row["status"] == "running"
++                 and _matching(selected, row))
++        if valid:
++            conn.execute(f"CREATE TABLE IF NOT EXISTS {TABLE} (task_id TEXT PRIMARY KEY "
++                         "REFERENCES tasks(id) ON DELETE CASCADE, current_run_id INTEGER, claim_lock TEXT, "
++                         "worker_pid INTEGER, worker_started_at TEXT, token TEXT NOT NULL, "
++                         "owner_pid INTEGER NOT NULL, owner_started_at TEXT NOT NULL)")
++            previous = conn.execute(f"SELECT * FROM {TABLE} WHERE task_id=?", (task_id,)).fetchone()
++            valid = not (_matching(previous, row) and _owner_alive(previous))
++        if valid:
++            conn.execute(f"INSERT OR REPLACE INTO {TABLE} VALUES (?,?,?,?,?,?,?,?)",
++                         (task_id, *(row[key] for key in FIELDS), token, owner_pid, owner_started_at))
++    if not valid:
++        yield False
++        return
++    try:
++        yield True
++    finally:
++        with kb.write_txn(conn):
++            row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
++            if not _matching(selected, row) or row["status"] != "running":
++                conn.execute(f"DELETE FROM {TABLE} WHERE task_id=? AND token=?", (task_id, token))
++            else:
++                # This call unwound without closing its run. Relinquish execution,
++                # not the durable pause decision, so the next observer resumes it.
++                conn.execute(f"UPDATE {TABLE} SET owner_pid=0 WHERE task_id=? AND token=?", (task_id, token))
+diff --git a/tests/hermes_cli/test_kanban_update_reclaim_primary_race.py b/tests/hermes_cli/test_kanban_update_reclaim_primary_race.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..72ce6949adef491a92c19efaecbe6eb3fb451b63
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_update_reclaim_primary_race.py
+@@ -0,0 +1,19 @@
++"""Primary-board observer must not enqueue an updater death for charged release."""
++import pytest
++
++from tests.hermes_cli import test_kanban_sync_leases as leases
++from tests.hermes_cli import test_kanban_update_reclaim_race as race
++
++kanban_home = leases.kanban_home
++lease_client = leases.lease_client
++synced_conn = leases.synced_conn
++primary = leases.primary
++
++
++@pytest.mark.parametrize("modern", [False, True])
++@pytest.mark.parametrize("observer_first", [True, False])
++def test_primary_update_race(primary, lease_client, monkeypatch, observer_first, modern):
++    race.test_update_reclaim_never_charges_or_clears_strikes(primary, monkeypatch, observer_first, modern)
++    rows = primary.execute("SELECT name FROM sqlite_master WHERE name='kanban_failure_commands'").fetchall()
++    if rows:
++        assert primary.execute("SELECT COUNT(*) FROM kanban_failure_commands").fetchone()[0] == 0
+diff --git a/tests/hermes_cli/test_kanban_update_reclaim_race.py b/tests/hermes_cli/test_kanban_update_reclaim_race.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..abcf324755ba1a3774914d3059f76ed213d24b9b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_update_reclaim_race.py
+@@ -0,0 +1,169 @@
++"""Updater termination and the failure observer must not compete to close one run."""
++import os
++import signal
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli.kanban_core_update_requeue import CORE_UPDATE_REQUEUE_REASON
++from tests.hermes_cli import test_kanban_worker_pid_fingerprint as helpers
++
++board = helpers.board
++PID = 987654321
++
++
++def running(board, monkeypatch):
++    alive = {PID: True, os.getpid(): True}
++    monkeypatch.setattr(dispatch._host_reboot, "current_boot", lambda: "boot")
++    monkeypatch.setattr(kb, "_pid_alive", lambda pid: alive.get(pid, False))
++    monkeypatch.setattr(dispatch, "_pid_recycled", lambda *_: False)
++    monkeypatch.setattr(dispatch, "_process_fingerprint", lambda *_: "boot|123")
++    monkeypatch.setattr(dispatch, "_poll_worker_exit", lambda *_: not alive[PID])
++    monkeypatch.setattr(dispatch, "_kill_fn", lambda hook: hook or (lambda pid, _: alive.update({pid: False})))
++    monkeypatch.setattr(kb._requeue_custody, "for_requeue", lambda *_: {})
++    tid = helpers._claimed_running(board, pid=PID, started_at="boot|123")
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET consecutive_failures=1, claim_expires=9999999999 WHERE id=?", (tid,))
++    return tid, alive
++
++
++@pytest.mark.parametrize("modern", [False, True], ids=["legacy", "modern-loss"])
++@pytest.mark.parametrize("observer_first", [True, False], ids=["crash-first", "requeue-first"])
++def test_update_reclaim_never_charges_or_clears_strikes(board, monkeypatch, observer_first, modern):
++    tid, alive = running(board, monkeypatch)
++    if modern:
++        from hermes_cli import kanban_failed_result as results
++        monkeypatch.setattr(results, "reclaim_proof", lambda *_a, **_k: (
++            {"result": {"loss_receipt": True, "reason": "EOFError"}}, None))
++        monkeypatch.setattr(results, "result_exit_code", lambda *_: None)
++    db_path = board.execute("PRAGMA database_list").fetchone()[2]
++    observer = kbc.connect(Path(db_path))
++    run_id = kb.get_task(board, tid).current_run_id
++
++    def terminate(pid, sig):
++        assert (pid, sig) == (PID, signal.SIGTERM)
++        alive[pid] = False
++        dispatch._record_worker_exit(pid, signal.SIGTERM)
++        # Model the owner's EOF diagnostic without exempting ordinary EOFs.
++        with kb.write_txn(observer):
++            kb._append_event(observer, tid, "worker_lost", {"reason": "EOFError", "pid": pid}, run_id=run_id)
++        if observer_first:
++            dispatch.detect_crashed_workers(observer)
++            assert kb.get_task(observer, tid).consecutive_failures == 1
++
++    try:
++        assert kb.reclaim_task(board, tid, reason=CORE_UPDATE_REQUEUE_REASON, signal_fn=terminate)
++        dispatch.detect_crashed_workers(observer)
++        task = kb.get_task(board, tid)
++        assert task.status == "ready"
++        assert task.consecutive_failures == 1
++        assert not {"crashed", "failure_finalized"} & {e.kind for e in kb.list_events(board, tid)}
++        run = board.execute("SELECT * FROM task_runs WHERE id=?", (run_id,)).fetchone()
++        assert run["outcome"] == "reclaimed"
++    finally:
++        dispatch._recent_worker_exits.pop(PID, None)
++        observer.close()
++
++
++@pytest.mark.parametrize("reason", [None, "operator", CORE_UPDATE_REQUEUE_REASON + " other"])
++def test_other_reclaims_do_not_hold_observer(board, monkeypatch, reason):
++    from hermes_cli.kanban_update_reclaim_intent import fence, pending
++
++    tid, _ = running(board, monkeypatch)
++    row = board.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
++    with fence(board, tid, row, reason) as admitted:
++        assert admitted
++        assert not pending(board, row)
++
++
++@pytest.mark.parametrize("field,value", [("current_run_id", -1), ("claim_lock", "other:12"),
++                                        ("worker_pid", PID + 1), ("worker_started_at", "other|456")])
++def test_intent_never_covers_replacement_identity(board, monkeypatch, field, value):
++    from hermes_cli.kanban_update_reclaim_intent import fence, pending
++
++    tid, _ = running(board, monkeypatch)
++    row = board.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
++    with fence(board, tid, row, CORE_UPDATE_REQUEUE_REASON) as admitted:
++        assert admitted and pending(board, row)
++        changed = dict(row)
++        changed[field] = value
++        assert not pending(board, changed)
++        with fence(board, tid, changed, CORE_UPDATE_REQUEUE_REASON) as stale:
++            assert not stale
++    assert pending(board, row)  # an unfinished command remains recoverable
++
++
++def test_concurrent_reclaimer_cannot_steal_intent(board, monkeypatch):
++    from hermes_cli.kanban_update_reclaim_intent import fence, pending
++
++    tid, _ = running(board, monkeypatch)
++    row = board.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
++    with fence(board, tid, row, CORE_UPDATE_REQUEUE_REASON) as admitted:
++        assert admitted
++        with fence(board, tid, row, CORE_UPDATE_REQUEUE_REASON) as duplicate:
++            assert not duplicate
++        assert pending(board, row)
++
++
++def test_exception_keeps_durable_pause_recoverable(board, monkeypatch):
++    from hermes_cli.kanban_update_reclaim_intent import fence, pending
++
++    tid, alive = running(board, monkeypatch)
++    row = board.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
++    with pytest.raises(RuntimeError, match="before termination"):
++        with fence(board, tid, row, CORE_UPDATE_REQUEUE_REASON):
++            raise RuntimeError("before termination")
++    assert pending(board, row)
++    alive[PID] = False
++    dispatch._record_worker_exit(PID, signal.SIGTERM)
++    try:
++        dispatch.detect_crashed_workers(board)
++        assert "failure_finalized" not in {e.kind for e in kb.list_events(board, tid)}
++        assert kb.get_task(board, tid).consecutive_failures == 1
++        assert kb.get_task(board, tid).status == "ready"
++        assert not pending(board, row)
++    finally:
++        dispatch._recent_worker_exits.pop(PID, None)
++
++
++def test_dead_reclaimer_does_not_leave_permanent_hold(board, monkeypatch):
++    from hermes_cli.kanban_update_reclaim_intent import fence, pending
++
++    tid, alive = running(board, monkeypatch)
++    row = board.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
++    with fence(board, tid, row, CORE_UPDATE_REQUEUE_REASON) as admitted:
++        assert admitted and pending(board, row)
++        alive[os.getpid()] = False
++        assert pending(board, row)
++        dispatch.detect_crashed_workers(board)
++        assert kb.get_task(board, tid).status == "ready"
++        assert kb.get_task(board, tid).consecutive_failures == 1
++
++
++def test_unreadable_reclaimer_identity_refuses_before_signal(board, monkeypatch):
++    tid, _ = running(board, monkeypatch)
++    monkeypatch.setattr(dispatch, "_process_fingerprint", lambda *_: None)
++    assert not kb.reclaim_task(board, tid, reason=CORE_UPDATE_REQUEUE_REASON,
++                               signal_fn=lambda *_: pytest.fail("must not signal"))
++
++
++def test_sweep_before_intent_preparation_prevents_signal(board, monkeypatch):
++    tid, alive = running(board, monkeypatch)
++    original = kb._sync.refuse_foreign_reclaim
++
++    def sweep_first(conn, task_id):
++        alive[PID] = False
++        dispatch._record_worker_exit(PID, signal.SIGTERM)
++        dispatch.detect_crashed_workers(conn)
++        return original(conn, task_id)
++
++    monkeypatch.setattr(kb._sync, "refuse_foreign_reclaim", sweep_first)
++    try:
++        assert not kb.reclaim_task(board, tid, reason=CORE_UPDATE_REQUEUE_REASON,
++                                   signal_fn=lambda *_: pytest.fail("stale selection must not signal"))
++        assert "failure_finalized" in {e.kind for e in kb.list_events(board, tid)}
++    finally:
++        dispatch._recent_worker_exits.pop(PID, None)
+diff --git a/tests/hermes_cli/test_kanban_update_reclaim_recovery.py b/tests/hermes_cli/test_kanban_update_reclaim_recovery.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..33141cf18839098ca88bfbdc93d3fb1fac5b2a48
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_update_reclaim_recovery.py
+@@ -0,0 +1,66 @@
++"""An accepted update pause survives the terminating CLI and competing reclaim writers."""
++import signal
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli.kanban_core_update_requeue import CORE_UPDATE_REQUEUE_REASON
++from hermes_cli import kanban_update_reclaim_intent as intent
++from tests.hermes_cli import test_kanban_update_reclaim_race as race
++
++board = race.board
++
++
++def test_post_signal_custody_exception_is_resumed_neutrally(board, monkeypatch):
++    tid, alive = race.running(board, monkeypatch)
++    settled = []
++
++    def custody(*_):
++        settled.append(True)
++        if len(settled) == 1:
++            raise RuntimeError("custody interrupted")
++        return {}
++
++    monkeypatch.setattr(kb._requeue_custody, "for_requeue", custody)
++    with pytest.raises(RuntimeError, match="custody interrupted"):
++        kb.reclaim_task(board, tid, reason=CORE_UPDATE_REQUEUE_REASON)
++    assert not alive[race.PID]
++    assert intent.task_pending(board, tid)
++    dispatch.detect_crashed_workers(board)
++    assert len(settled) == 2
++    assert kb.get_task(board, tid).status == "ready"
++    assert kb.get_task(board, tid).consecutive_failures == 1
++    assert "failure_finalized" not in {e.kind for e in kb.list_events(board, tid)}
++    assert not intent.task_pending(board, tid)
++
++
++@pytest.mark.parametrize("writer", ["lease", "timeout"])
++def test_competing_reclaim_cannot_charge_updater_termination(board, monkeypatch, writer):
++    tid, alive = race.running(board, monkeypatch)
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET claim_expires=1, max_runtime_seconds=1 WHERE id=?", (tid,))
++
++    def terminate(pid, sig):
++        assert sig == signal.SIGTERM
++        alive[pid] = False
++        if writer == "lease":
++            assert kb.release_stale_claims(board) == 0
++        else:
++            assert dispatch.enforce_max_runtime(board) == []
++
++    assert kb.reclaim_task(board, tid, reason=CORE_UPDATE_REQUEUE_REASON, signal_fn=terminate)
++    assert kb.get_task(board, tid).consecutive_failures == 1
++    assert "failure_finalized" not in {e.kind for e in kb.list_events(board, tid)}
++
++
++def test_no_intent_does_not_exempt_real_sigterm(board, monkeypatch):
++    tid, alive = race.running(board, monkeypatch)
++    alive[race.PID] = False
++    dispatch._record_worker_exit(race.PID, signal.SIGTERM)
++    try:
++        dispatch.detect_crashed_workers(board)
++        assert kb.get_task(board, tid).consecutive_failures == 2
++        assert "failure_finalized" in {e.kind for e in kb.list_events(board, tid)}
++    finally:
++        dispatch._recent_worker_exits.pop(race.PID, None)
+-- 
+2.43.0
+

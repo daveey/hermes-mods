@@ -1,0 +1,605 @@
+From 2859c749f1a21b137887cdb82f995390fceab2b3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 16:26:06 +0000
+Subject: [PATCH] feat(kanban): draft bounded urgency read receipts [daveey]
+
+---
+ hermes_cli/config_defaults.py                 |   2 +
+ hermes_cli/kanban_fairness_config.py          |  45 +++++
+ hermes_cli/kanban_fairness_runtime.py         | 179 ++++++++++++++++++
+ hermes_cli/kanban_fairness_urgency.py         |  46 +++++
+ hermes_cli/kanban_turn_urgency.py             |  42 ++--
+ .../hermes_cli/test_kanban_fairness_config.py |  45 +++++
+ .../test_kanban_fairness_runtime.py           |  71 +++++++
+ .../test_kanban_urgency_receipts.py           |  66 +++++++
+ 8 files changed, 485 insertions(+), 11 deletions(-)
+ create mode 100644 hermes_cli/kanban_fairness_config.py
+ create mode 100644 hermes_cli/kanban_fairness_runtime.py
+ create mode 100644 hermes_cli/kanban_fairness_urgency.py
+ create mode 100644 tests/hermes_cli/test_kanban_fairness_config.py
+ create mode 100644 tests/hermes_cli/test_kanban_fairness_runtime.py
+ create mode 100644 tests/hermes_cli/test_kanban_urgency_receipts.py
+
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index cd65f5a3a394517bacced7cb365fab822c7758fd..28519f4a8631bda76cc6239a4943ea9c4507e04b 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1881,6 +1881,8 @@ DEFAULT_CONFIG = {
+         "failure_repeat_alert_hours": 6,
+     },
+     "kanban": {
++        # Evidence only; never changes urgency or starts capture without explicit activation.
++        "fairness_capture": {"enabled": False, "capture_id": None, "directory": None, "max_bytes": 536870912},
+         "self_work": {"sample_rate": 0.2},  # Reversible spot checks; risky/unknown diffs always selected. [daveey]
+         "wake_check_stale_hours": 48,  # Reconsider a never-passing probe; same-probe re-parks retain age.
+         "passive_intake": {},  # Exact task ID -> exact wake_check for standing external listeners.
+diff --git a/hermes_cli/kanban_fairness_config.py b/hermes_cli/kanban_fairness_config.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8eebe4c33a11e1ab447f6369b2ebdfee728a12da
+--- /dev/null
++++ b/hermes_cli/kanban_fairness_config.py
+@@ -0,0 +1,45 @@
++"""Opt-in, profile-scoped fairness evidence settings; parsing performs no IO."""
++from dataclasses import dataclass
++from pathlib import Path
++import re
++from collections.abc import Mapping
++
++DEFAULTS = {"enabled": False, "capture_id": None, "directory": None, "max_bytes": 536870912}
++
++
++@dataclass(frozen=True)
++class CaptureConfig:
++    capture_id: str
++    directory: Path
++    max_bytes: int
++
++
++def resolve(config: Mapping, *, home: Path | None = None) -> CaptureConfig | None:
++    """Validate explicit activation; disabled capture creates neither files nor threads."""
++    kanban = config.get("kanban", {})
++    if not isinstance(kanban, Mapping):
++        raise ValueError("kanban must be a mapping")
++    raw = kanban.get("fairness_capture", {})
++    if not isinstance(raw, Mapping) or set(raw) - DEFAULTS.keys():
++        raise ValueError("kanban.fairness_capture must contain only registered settings")
++    options = {**DEFAULTS, **raw}
++    if type(options["enabled"]) is not bool:
++        raise ValueError("fairness_capture.enabled must be a boolean")
++    maximum = options["max_bytes"]
++    if type(maximum) is not int or not 0 < maximum <= DEFAULTS["max_bytes"]:
++        raise ValueError("fairness_capture.max_bytes must be between 1 and 536870912")
++    if not options["enabled"]:
++        return None
++    capture_id = options["capture_id"]
++    if not isinstance(capture_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", capture_id):
++        raise ValueError("fairness_capture.capture_id must be a bounded safe path component")
++    directory = options["directory"]
++    if directory is None:
++        if home is None:
++            from hermes_constants import get_hermes_home
++
++            home = get_hermes_home()
++        directory = home / "kanban" / "evidence" / capture_id
++    elif not isinstance(directory, str) or not Path(directory).is_absolute():
++        raise ValueError("fairness_capture.directory must be an absolute path or null")
++    return CaptureConfig(capture_id, Path(directory), maximum)
+diff --git a/hermes_cli/kanban_fairness_runtime.py b/hermes_cli/kanban_fairness_runtime.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2f9522940a5d2265fb5dc1046917045f6c78e6ce
+--- /dev/null
++++ b/hermes_cli/kanban_fairness_runtime.py
+@@ -0,0 +1,179 @@
++"""Opt-in per-process evidence consumers. Submit performs no filesystem/network IO.
++
++Call activate outside scheduler/DB locks. Each process owns a distinct epoch directory.
++An absent final seal (including shutdown timeout or writer failure) is incomplete evidence.
++"""
++from __future__ import annotations
++
++import atexit
++from collections import Counter, deque
++import json
++import os
++from pathlib import Path
++import threading
++import time
++import uuid
++
++from hermes_cli.kanban_fairness_config import resolve
++from hermes_cli.kanban_fairness_schema import make_record
++
++
++MAX_RECORDS = 1024
++MAX_QUEUE_BYTES = 8 * 1024 * 1024
++MAX_PAYLOAD_BYTES = 256 * 1024
++_SESSIONS = {}
++
++
++def append_records(*args, **kwargs):
++    from hermes_cli.kanban_fairness_store import append_records as append
++
++    return append(*args, **kwargs)
++
++
++def seal_records(*args, **kwargs):
++    from hermes_cli.kanban_fairness_store import seal_records as seal
++
++    return seal(*args, **kwargs)
++
++
++def _key(board, home=None):
++    if home is None:
++        from hermes_constants import get_hermes_home
++
++        home = get_hermes_home()
++    return (os.getpid(), str(home), board)
++
++
++def enabled(*, board) -> bool:
++    if not _SESSIONS:
++        return False
++    session = _SESSIONS.get(_key(board))
++    return session is not None and not session.stopping.is_set()
++
++
++def submit(*, board, kind, payload) -> bool:
++    """Observe only: callers must not describe an uncommitted write as committed."""
++    if not _SESSIONS:
++        return False
++    session = _SESSIONS.get(_key(board))
++    return session.enqueue(kind, payload) if session is not None else False
++
++
++class Session:
++    def __init__(self, settings, *, board, source_gateway, board_uid, clock_error_ns):
++        self.epoch = uuid.uuid4().hex
++        self.out = settings.directory / "runtime" / self.epoch
++        self.maximum = settings.max_bytes
++        self.identity = dict(capture_id=settings.capture_id, source_gateway=source_gateway,
++                             board_uid=board_uid, source_epoch=self.epoch, clock_error_ns=clock_error_ns)
++        self.board = board
++        self.queue = deque()
++        self.bytes = 0
++        self.loss = Counter()
++        self.lock = threading.Lock()
++        self.wake = threading.Event()
++        self.stopping = threading.Event()
++        self.abandoned = threading.Event()
++        self.failed = False
++        self.sealed = False
++        self.seq = 0
++        # Validate supplied identities before starting any thread or making directories.
++        self.record("loss", self.loss_payload("clock_gap", 1), 1)
++        self.out.mkdir(parents=True, exist_ok=False)
++        self.thread = threading.Thread(target=self.run, name="fairness-evidence", daemon=True)
++        self.thread.start()
++
++    @staticmethod
++    def loss_payload(reason, count):
++        return dict(reason=reason, count=count, first_seq=None, last_seq=None,
++                    start_wall_ns=None, end_wall_ns=None)
++
++    def record(self, kind, payload, seq, *, wall=None, mono=None):
++        return make_record(**self.identity, seq=seq, kind=kind, payload=payload,
++                           wall_ns=time.time_ns() if wall is None else wall,
++                           mono_ns=time.monotonic_ns() if mono is None else mono)
++
++    def enqueue(self, kind, payload):
++        if self.stopping.is_set() or self.failed:
++            return False
++        try:
++            # Snapshot caller-owned data; at most one bounded record is handed to writer.
++            raw = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8")
++            if len(raw) > MAX_PAYLOAD_BYTES:
++                self.loss["oversize"] += 1
++                return False
++            payload = json.loads(raw)
++            self.record(kind, payload, 1)
++        except (TypeError, ValueError, OverflowError, RecursionError):
++            self.loss["unsupported"] += 1
++            return False
++        if not self.lock.acquire(blocking=False):
++            self.loss["dropped"] += 1
++            return False
++        try:
++            if self.stopping.is_set():
++                return False
++            if len(self.queue) >= MAX_RECORDS or self.bytes + len(raw) > MAX_QUEUE_BYTES:
++                self.loss["dropped"] += 1
++                return False
++            self.queue.append((kind, raw, len(raw), time.time_ns(), time.monotonic_ns()))
++            self.bytes += len(raw)
++        finally:
++            self.lock.release()
++        self.wake.set()
++        return True
++
++    def write(self, kind, payload, wall=None, mono=None):
++        record = self.record(kind, payload, self.seq + 1, wall=wall, mono=mono)
++        append_records(self.out, [record], max_bytes=self.maximum)
++        self.seq += 1
++
++    def run(self):
++        try:
++            while True:
++                self.wake.wait()
++                self.wake.clear()
++                while True:
++                    with self.lock:
++                        item = self.queue.popleft() if self.queue else None
++                        if item is not None:
++                            self.bytes -= item[2]
++                    if item is None:
++                        break
++                    kind, payload, _, wall, mono = item
++                    self.write(kind, json.loads(payload), wall, mono)
++                if self.stopping.is_set():
++                    break
++            for reason, count in self.loss.items():
++                self.write("loss", self.loss_payload(reason, count))
++            if self.seq and not self.abandoned.is_set():
++                seal_records(self.out, expected_sources=[dict(source_gateway=self.identity["source_gateway"],
++                             source_epoch=self.epoch, last_seq=self.seq)])
++                self.sealed = True
++        except Exception:
++            # Evidence failure cannot change scheduler behavior; unsealed epoch is a gap.
++            self.failed = True
++            self.loss["writer_error"] += 1
++
++    def close(self, timeout=2.0):
++        self.stopping.set()
++        self.wake.set()
++        self.thread.join(min(2.0, max(0.0, timeout)))
++        if self.thread.is_alive():
++            self.abandoned.set()
++        return self.sealed and not self.thread.is_alive()
++
++
++def activate(config, *, home: Path, board: str, source_gateway: str, board_uid: str,
++             clock_error_ns=None):
++    settings = resolve(config, home=home)
++    if settings is None:
++        return None
++    key = _key(board, home)
++    if key in _SESSIONS:
++        raise ValueError("capture already active for this profile/board/process")
++    session = Session(settings, board=board, source_gateway=source_gateway, board_uid=board_uid,
++                      clock_error_ns=clock_error_ns)
++    _SESSIONS[key] = session
++    atexit.register(session.close)
++    return session
+diff --git a/hermes_cli/kanban_fairness_urgency.py b/hermes_cli/kanban_fairness_urgency.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bb49be6b630a4b68e7cce3964a2919f61a7c5614
+--- /dev/null
++++ b/hermes_cli/kanban_fairness_urgency.py
+@@ -0,0 +1,46 @@
++"""Sanitize urgency observations without changing the urgency reader's policy."""
++import base64
++import hashlib
++import json
++
++from hermes_cli.kanban_fairness_payloads import MAX_SOURCE_BYTES, _validate_source_document
++from hermes_cli.kanban_fairness_schema import BadRecord
++
++
++def receipt(*, board, now_s, raw, outcome, owners):
++    safe = False
++    value = {}
++    if raw is not None and len(raw) <= MAX_SOURCE_BYTES:
++        try:
++            _validate_source_document(raw)
++            safe = True
++            value = json.loads(raw)
++        except BadRecord:
++            pass
++    # Reader accepts some source documents the evidence privacy allowlist forbids.
++    # Preserve actual owner_ids, but never pretend the exact-byte gate was met.
++    reason = None
++    if outcome == "valid" and not safe:
++        outcome, reason = "invalid", "source_not_allowlisted"
++    retain = safe and outcome != "invalid"
++    return dict(receipt_type="urgency_read", board=board, read_at_s=now_s, outcome=outcome,
++                raw_b64=base64.b64encode(raw).decode("ascii") if retain else None,
++                raw_sha256=hashlib.sha256(raw).hexdigest() if raw is not None else None,
++                raw_size=len(raw) if raw is not None else None,
++                raw_complete=raw is not None and len(raw) <= MAX_SOURCE_BYTES,
++                redacted=raw is not None and not retain,
++                observed_at=value.get("observed_at"), valid_until=value.get("valid_until"),
++                source_revision=value.get("source_revision"), owner_ids=sorted(owners), reason=reason)
++
++
++def emit(**observation):
++    from hermes_cli import kanban_fairness_runtime as runtime
++
++    try:
++        payload = receipt(**observation)
++        runtime.submit(board=observation["board"], kind="owner_generation", payload=payload)
++    except Exception:
++        # Observation must never change an existing read result.
++        runtime.submit(board=observation["board"], kind="loss", payload=dict(
++            reason="unsupported", count=1, first_seq=None, last_seq=None,
++            start_wall_ns=None, end_wall_ns=None))
+diff --git a/hermes_cli/kanban_turn_urgency.py b/hermes_cli/kanban_turn_urgency.py
+index cfe43c6d76f16c96c8230a33c638c483f2ad4df4..41d58c83479225836d680cb64b229d80bf0be47c 100644
+--- a/hermes_cli/kanban_turn_urgency.py
++++ b/hermes_cli/kanban_turn_urgency.py
+@@ -21,25 +21,43 @@ def _nonempty(value) -> bool:
+ 
+ def read_owners(*, board: str, now_s: float, path=None) -> set[str]:
+     """Return cached owner IDs, or no urgency when observation is invalid."""
++    from hermes_cli import kanban_fairness_runtime as runtime
++
++    capture = runtime.enabled(board=board) if isinstance(board, str) else False
++    raw = None
++
++    def result(owners=None, outcome="invalid"):
++        owners = set() if owners is None else owners
++        if capture:
++            from hermes_cli.kanban_fairness_urgency import emit
++
++            emit(board=board, now_s=now_s if _finite_clock(now_s) else None,
++                 raw=raw, outcome=outcome, owners=owners)
++        return owners
++
+     if not _nonempty(board) or not _finite_clock(now_s):
+-        return set()
++        return result(outcome="invalid_request")
+     if path is None:
+         from hermes_constants import get_hermes_home
+ 
+         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", board):
+-            return set()
++            return result(outcome="invalid_request")
+         filename = "kanban-turn-urgency.json" if board == "default" else f"kanban-turn-urgency-{board}.json"
+         path = get_hermes_home() / "cache" / filename
+     try:
+         with Path(path).open("rb") as stream:
+             raw = stream.read(128 * 1024 + 1)
+         if len(raw) > 128 * 1024:
+-            return set()
++            return result(outcome="oversize")
+         value = json.loads(raw)
+-    except (OSError, ValueError, UnicodeError, RecursionError):
+-        return set()
++    except FileNotFoundError:
++        return result(outcome="missing")
++    except OSError:
++        return result(outcome="io_error")
++    except (ValueError, UnicodeError, RecursionError):
++        return result()
+     if not isinstance(value, dict):
+-        return set()
++        return result()
+     observed = value.get("observed_at")
+     valid_until = value.get("valid_until")
+     if (
+@@ -52,17 +70,19 @@ def read_owners(*, board: str, now_s: float, path=None) -> set[str]:
+         or not observed <= now_s < valid_until <= observed + 120
+         or not isinstance(value.get("owners"), list)
+     ):
+-        return set()
++        expired = _finite_clock(valid_until) and valid_until <= now_s
++        return result(outcome="expired" if expired else "invalid")
+     if len(value["owners"]) > 4096:
+-        return set()
++        return result()
+     owners = set()
+     for owner in value["owners"]:
+         if not isinstance(owner, dict):
+-            return set()
++            return result()
+         if (not all(_nonempty(owner.get(key)) for key in ("task_id", "source", "ref", "head"))
+                 or owner["source"] not in ("core-lane", "state-turn")
+                 or not _finite_clock(owner.get("expires_at"))
+                 or owner["expires_at"] <= now_s):
+-            return set()
++            expired = _finite_clock(owner.get("expires_at")) and owner["expires_at"] <= now_s
++            return result(outcome="expired" if expired else "invalid")
+         owners.add(owner["task_id"])
+-    return owners
++    return result(owners, "valid")
+diff --git a/tests/hermes_cli/test_kanban_fairness_config.py b/tests/hermes_cli/test_kanban_fairness_config.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..cce52aecd23b4b941d3f70b377e6096c1131af55
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_fairness_config.py
+@@ -0,0 +1,45 @@
++"""Disabled-by-default fairness evidence configuration contract."""
++import pytest
++
++from hermes_cli.config_defaults import DEFAULT_CONFIG
++from hermes_cli.kanban_fairness_config import resolve
++
++
++def test_default_disabled_creates_nothing(tmp_path):
++    defaults = DEFAULT_CONFIG["kanban"]["fairness_capture"]
++    assert defaults == {"enabled": False, "capture_id": None, "directory": None,
++                        "max_bytes": 536870912}
++    assert resolve({}, home=tmp_path) is None
++    assert resolve({"kanban": {"fairness_capture": defaults}}, home=tmp_path) is None
++    assert not (tmp_path / "kanban").exists()
++    assert not (tmp_path / "custom").exists()
++
++
++def test_explicit_capture_uses_profile_durable_path(tmp_path):
++    config = {"kanban": {"fairness_capture": {"enabled": True, "capture_id": "run-1"}}}
++    result = resolve(config, home=tmp_path)
++    assert result.capture_id == "run-1"
++    assert result.directory == tmp_path / "kanban" / "evidence" / "run-1"
++    assert result.max_bytes == 536870912
++    config["kanban"]["fairness_capture"].update(directory=str(tmp_path / "custom"), max_bytes=4096)
++    assert resolve(config, home=tmp_path).directory == tmp_path / "custom"
++    assert resolve(config, home=tmp_path).max_bytes == 4096
++    assert not (tmp_path / "kanban").exists()
++    assert not (tmp_path / "custom").exists()
++
++
++@pytest.mark.parametrize("options", [
++    True, [], {"enabled": "false"}, {"enabled": True},
++    {"enabled": True, "capture_id": ".."},
++    {"enabled": True, "capture_id": "../escape"},
++    {"enabled": True, "capture_id": "x", "directory": "relative"},
++    {"enabled": True, "capture_id": "x", "max_bytes": True},
++    {"enabled": True, "capture_id": "x", "max_bytes": 0},
++    {"enabled": True, "capture_id": "x", "max_bytes": 536870913},
++    {"enabled": True, "capture_id": "x", "typo": 1},
++])
++def test_invalid_capture_is_rejected_without_io(tmp_path, options):
++    with pytest.raises(ValueError):
++        resolve({"kanban": {"fairness_capture": options}}, home=tmp_path)
++    assert not (tmp_path / "kanban").exists()
++    assert not (tmp_path / "custom").exists()
+diff --git a/tests/hermes_cli/test_kanban_fairness_runtime.py b/tests/hermes_cli/test_kanban_fairness_runtime.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..79047c57f9dfcc8ce4c2a2d9ac4043e971092cc3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_fairness_runtime.py
+@@ -0,0 +1,71 @@
++"""Exercise actual bounded consumer and durable envelope writer."""
++import json
++import threading
++
++from hermes_cli import kanban_fairness_runtime as runtime
++from hermes_cli.kanban_fairness_store import load
++from hermes_cli.kanban_turn_urgency import read_owners
++
++
++def activate(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    return runtime.activate({"kanban": {"fairness_capture": {"enabled": True, "capture_id": "test"}}},
++                            home=tmp_path, board="default", source_gateway="gateway", board_uid="board",
++                            clock_error_ns=0)
++
++
++def test_real_reader_writer_and_seal(tmp_path, monkeypatch):
++    session = activate(tmp_path, monkeypatch)
++    try:
++        assert runtime.enabled(board="default")
++        assert not runtime.enabled(board="other")
++        path = tmp_path / "owners.json"
++        path.write_text(json.dumps(dict(version=1, board="default", source_revision="rev",
++                                      observed_at=100, valid_until=200, owners=[])))
++        assert read_owners(board="default", now_s=150, path=path) == set()
++    finally:
++        assert session.close()
++    loaded = load(session.out)
++    assert len(loaded["records"]) == 1
++    assert loaded["records"][0]["payload"]["outcome"] == "valid"
++    assert loaded["manifest"]["final_seal"]
++
++
++def test_writer_failure_stays_unsealed(tmp_path, monkeypatch):
++    session = activate(tmp_path, monkeypatch)
++    def fail(*args, **kwargs):
++        raise OSError("disk full")
++    monkeypatch.setattr(runtime, "append_records", fail)
++    assert runtime.submit(board="default", kind="loss", payload=session.loss_payload("redaction", 1))
++    assert not session.close()
++    assert session.failed
++    assert not (session.out / "manifest.json").exists()
++
++
++def test_overflow_and_tail_are_bounded(tmp_path, monkeypatch):
++    entered, release = threading.Event(), threading.Event()
++    actual = runtime.append_records
++    def held(*args, **kwargs):
++        entered.set()
++        assert release.wait(5)
++        return actual(*args, **kwargs)
++    monkeypatch.setattr(runtime, "append_records", held)
++    session = activate(tmp_path, monkeypatch)
++    payload = session.loss_payload("redaction", 1)
++    try:
++        assert runtime.submit(board="default", kind="loss", payload=payload)
++        assert entered.wait(2)
++        monkeypatch.setattr(runtime, "MAX_RECORDS", 2)
++        assert runtime.submit(board="default", kind="loss", payload=payload)
++        assert runtime.submit(board="default", kind="loss", payload=payload)
++        assert not runtime.submit(board="default", kind="loss", payload=payload)
++        assert session.loss["dropped"] == 1
++        assert session.bytes <= runtime.MAX_QUEUE_BYTES
++        assert not session.close(timeout=0)
++    finally:
++        release.set()
++        session.thread.join(3)
++    assert not session.sealed
++    assert not (session.out / "manifest.json").exists()
++    records = [json.loads(line) for path in session.out.glob("*.jsonl") for line in path.read_text().splitlines()]
++    assert any(r["kind"] == "loss" and r["payload"]["reason"] == "dropped" for r in records)
+diff --git a/tests/hermes_cli/test_kanban_urgency_receipts.py b/tests/hermes_cli/test_kanban_urgency_receipts.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..60af444cf571f08e2bc47a008fea4b2ea4d62bb8
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_urgency_receipts.py
+@@ -0,0 +1,66 @@
++"""Real urgency reads retain their decisions while recording sanitized observations."""
++import base64
++import hashlib
++import json
++
++import pytest
++
++from hermes_cli import kanban_turn_urgency as urgency
++from hermes_cli.kanban_fairness_payloads import urgency_payload
++
++
++def document():
++    return {"version": 1, "board": "default", "source_revision": "rev",
++            "observed_at": 100, "valid_until": 200,
++            "owners": [{"task_id": "task", "source": "core-lane", "ref": "ref",
++                        "head": "head", "expires_at": 200}]}
++
++
++@pytest.mark.parametrize("case,outcome,owners", [
++    ("valid", "valid", {"task"}), ("expired", "expired", set()),
++    ("missing", "missing", set()), ("malformed", "invalid", set()),
++    ("extra", "invalid", {"task"}), ("oversize", "oversize", set()),
++])
++def test_real_read_receipt(tmp_path, monkeypatch, case, outcome, owners):
++    from hermes_cli import kanban_fairness_runtime as runtime
++
++    receipts = []
++    monkeypatch.setattr(runtime, "enabled", lambda **kw: True)
++    monkeypatch.setattr(runtime, "submit", lambda **kw: receipts.append(kw) or True)
++    path = tmp_path / "owners.json"
++    value = document()
++    if case == "extra":
++        value["secret"] = "never persist this"
++    raw = json.dumps(value).encode()
++    if case == "malformed":
++        raw = b'{"secret":"never persist this"'
++    if case == "oversize":
++        raw = b"x" * (128 * 1024 + 10)
++    if case != "missing":
++        path.write_bytes(raw)
++    result = urgency.read_owners(board="default", now_s=201 if case == "expired" else 150, path=path)
++    assert result == owners
++    assert len(receipts) == 1
++    receipt = urgency_payload(receipts[0]["payload"])
++    assert receipt["outcome"] == outcome
++    assert receipt["owner_ids"] == sorted(result)
++    if case in ("valid", "expired"):
++        assert base64.b64decode(receipt["raw_b64"]) == raw
++        assert receipt["raw_complete"]
++    elif case != "missing":
++        assert receipt["raw_b64"] is None and receipt["redacted"]
++        assert "never persist this" not in json.dumps(receipt)
++    if case != "missing":
++        observed = raw[:128 * 1024 + 1]
++        assert receipt["raw_size"] == len(observed)
++        assert receipt["raw_sha256"] == hashlib.sha256(observed).hexdigest()
++
++
++def test_disabled_does_not_build_receipt(tmp_path, monkeypatch):
++    from hermes_cli import kanban_fairness_runtime as runtime
++
++    monkeypatch.setattr(runtime, "enabled", lambda **kw: False)
++    monkeypatch.setattr(runtime, "submit", lambda **kw: pytest.fail("disabled submit"))
++    path = tmp_path / "owners.json"
++    path.write_text(json.dumps(document()))
++    assert urgency.read_owners(board="default", now_s=150, path=path) == {"task"}
+-- 
+2.43.0
+

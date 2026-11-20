@@ -1,0 +1,93 @@
+From 63f6b1dc4e9745b1002a842de7fa354a20bcc766 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 15:00:28 +0000
+Subject: [PATCH] [daveey] Serialize relay heartbeat fixture mutation with
+ settlement
+
+Problem: PR #3301 run 43795564971 / job 133063677163 printed one
+passing parametrization then killed this file at 600.1s. The first 50
+quiet scoped repetitions passed; 10 recent main CI logs had 0 hangs.
+
+Why 1: the changed-connector fixture mutates the raw shared SQLite
+connection concurrently with the terminal settlement writer.
+Why 2: its readiness predicate observes the committed terminal row,
+not completion of settle_session_input's _execute_write. The writer
+still owns the Python writer mutex while detaching its authorizer.
+Why 3: raw UPDATE bypasses that mutex. Its Python authorizer callback
+can hold SQLite's connection mutex while the settlement worker enters
+set_authorizer (which waits for SQLite while retaining the GIL).
+The callback cannot reacquire the GIL; neither thread can progress.
+Why 4: this fixture used a connection context manager as if it were a
+concurrency guard; it manages transactions, not SessionDB ownership.
+Root (not caught): quiet repeats rarely land in the commit-to-detach
+window, and there was no assertion enforcing the fixture's writer API.
+Recurrence: no existing exact-test PR found; the same SQLite/GIL class
+is documented in test_quarantine_connection_mutex.py.
+
+Use SessionDB._execute_write's existing bounded writer mutex and
+transaction protocol. Preserve both real relay/restart assertions and
+the changed-connector rejection. Add a regression forbidding raw
+connection access and checking the mutation payload. No skips,
+longer timeouts, retries, or production behavior changes.
+
+Proof: controlled scheduling of the REAL settle_session_input worker
+at hermes_pop_scope_recorder after terminal commit reproduces a hang
+on the old fixture (outer timeout exit124). Faulthandler captures that
+worker in set_authorizer and the main thread in _replace_connector's
+SQL callback. Identical scheduling passes after the fix (exit0).
+A first synthetic competing-writer probe reproduced the same stacks.
+The historical CI has no stacks, so its exact interleaving cannot be
+proven retrospectively; this is a demonstrated reachable deadlock
+matching its one-dot/changed-connector phase, not a network hypothesis.
+The new regression fails before the change and passes afterward.
+---
+ ...test_relay_multiplex_heartbeat_recovery.py | 33 +++++++++++++++++--
+ 1 file changed, 31 insertions(+), 2 deletions(-)
+
+diff --git a/tests/gateway/relay/test_relay_multiplex_heartbeat_recovery.py b/tests/gateway/relay/test_relay_multiplex_heartbeat_recovery.py
+index f7890c2985816c911a5d6b5879b14aa3c6720146..a6b4862a5cc92ee679316b7da867dc296a19a79c 100644
+--- a/tests/gateway/relay/test_relay_multiplex_heartbeat_recovery.py
++++ b/tests/gateway/relay/test_relay_multiplex_heartbeat_recovery.py
+@@ -13,8 +13,37 @@ from tests.waiting import async_wait_until
+ def _replace_connector(authority) -> None:
+     payload = _rows(authority)[0]['payload']
+     payload['native_text_v1']['provenance']['connector'] = 'replaced-connector'
+-    with authority.db._conn:
+-        authority.db._conn.execute('UPDATE session_admissions SET payload_json=?', (json.dumps(payload),))
++    # Settlement commits before its worker detaches the authorizer. The raw connection
++    # can race that detach and invert SQLite's mutex against the GIL. Use the existing
++    # bounded writer mutex, including commit and authorizer teardown, just like production.
++    authority.db._execute_write(lambda conn: conn.execute(
++        'UPDATE session_admissions SET payload_json=?', (json.dumps(payload),)))
++
++
++def test_connector_replacement_uses_serialized_writer(monkeypatch):
++    """A terminal row is visible before its writer removes the SQLite authorizer."""
++    import sys
++    from types import SimpleNamespace
++    from unittest.mock import Mock
++
++    module = sys.modules[__name__]
++
++    payload = {'native_text_v1': {'provenance': {'connector': 'original'}}}
++    monkeypatch.setattr(module, '_rows', lambda _: [{'payload': payload}])
++    connection = Mock()
++
++    class Writer:
++        @property
++        def _conn(self):
++            pytest.fail('connector mutation bypassed the bounded SessionDB writer mutex')
++
++        def _execute_write(self, write):
++            return write(connection)
++
++    module._replace_connector(SimpleNamespace(db=Writer()))
++    connection.execute.assert_called_once_with(
++        'UPDATE session_admissions SET payload_json=?', (json.dumps(payload),))
++    assert payload['native_text_v1']['provenance']['connector'] == 'replaced-connector'
+ 
+ 
+ @pytest.mark.asyncio
+-- 
+2.43.0
+

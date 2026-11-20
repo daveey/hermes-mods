@@ -1,0 +1,79 @@
+From eddc9e40f90c8b8d0700c9a317f160ded4303b7b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 11:07:51 +0000
+Subject: [PATCH] fix(kanban): prioritize failed custodian uploads [daveey]
+
+Failed uploads have no blob key, so the keyed-failure priority arm let overdue verified rows consume the bounded transfer batch. Include nonempty local custody paths in that arm without changing eligibility, metadata priority or backoff. stored_path is TEXT NOT NULL; sync metadata insertion uses the empty string.
+
+Proof: real upload regression RED on old ordering (22 passed, 1 failed); final attachment and both importing consumer suites 50 passed. Four exact-anchor mutants killed: drop upload arm, allow empty paths, drop error requirement, replace OR with AND. Full scripts/check: 20 checks OK. Read-only hub replay across current boards, profiles and sync-shadow inspected 10627 attachment rows; exactly 3 changed, all failed keyless local-custody rows (ValueError), zero other shapes. Added ValueError upload control alongside OSError, 30s retry/600s verification, limit=2 and limit=0. Existing metadata-only controls retained.
+---
+ hermes_cli/kanban_sync_attachments.py         |  2 +-
+ .../test_kanban_sync_attachments.py           | 39 +++++++++++++++++++
+ 2 files changed, 40 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/kanban_sync_attachments.py b/hermes_cli/kanban_sync_attachments.py
+index a393c70f5db190e2933c07cb7fe9d2efe6ed6845..9ab295db3d29f36903456c962b39c6233ea87279 100644
+--- a/hermes_cli/kanban_sync_attachments.py
++++ b/hermes_cli/kanban_sync_attachments.py
+@@ -146,7 +146,7 @@ def transfer_pending(conn, hub, board, *, limit=2):
+         "AND (r.uid IS NULL OR r.blob_key IS NOT a.blob_key OR r.retry_at<=?) "
+         # First transfers and newly available/retryable bytes precede maintenance.
+         "ORDER BY CASE WHEN r.uid IS NULL OR r.blob_key IS NOT a.blob_key "
+-        "OR (r.error IS NOT NULL AND a.blob_key IS NOT NULL) THEN 0 ELSE 1 END, "
++        "OR (r.error IS NOT NULL AND (a.blob_key IS NOT NULL OR a.stored_path <> '')) THEN 0 ELSE 1 END, "
+         "coalesce(r.retry_at,0),a.id LIMIT ?", (now, limit)).fetchall()
+     transferred = 0
+     for raw in rows:
+diff --git a/tests/hermes_cli/test_kanban_sync_attachments.py b/tests/hermes_cli/test_kanban_sync_attachments.py
+index ace5a8ff9d0b54c4cabf9c44b8ae53245e2b93a4..a974ee07510cd4abdbe09d2b6c0d740462e173df 100644
+--- a/tests/hermes_cli/test_kanban_sync_attachments.py
++++ b/tests/hermes_cli/test_kanban_sync_attachments.py
+@@ -304,6 +304,45 @@ def test_needed_bytes_precede_due_verification_backlog(stores, monkeypatch, urge
+     assert attempts == [2, 1, 1]  # stable retry_at/id order, and exactly two candidates
+ 
+ 
++@pytest.mark.parametrize("failure", ["OSError", "ValueError"])
++def test_failed_upload_precedes_due_verification_backlog(stores, monkeypatch, failure):
++    from hermes_cli import kanban_sync_attachments as attachments
++    home, _, conn, _, service, tid, _ = stores
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    clock = [100.0]
++    monkeypatch.setattr(attachments, "_now", lambda: clock[0])
++    backlog = [_queued_attachment(conn, tid, f"verified-{i}", retry_at=1000)[0]
++               for i in range(3)]
++    row, data = _queued_attachment(conn, tid, "upload", keyed=False)
++    client.push(conn, service.hub("hub"), "default", "hub", primary=True)
++    service.blobs_offline = failure == "OSError"
++    with monkeypatch.context() as failed:
++        if failure == "ValueError":
++            failed.setattr(BlobHub, "put_attachment", lambda *args: {})
++        assert attachments.transfer_pending(conn, service.hub("hub"), "default", limit=2) == 0
++    receipt = conn.execute("SELECT * FROM kanban_attachment_retry WHERE uid=?", (row["uid"],)).fetchone()
++    assert (receipt["error"], receipt["retry_at"], receipt["attempts"]) == (failure, 130, 1)
++    service.blobs_offline = False
++    clock[0] = 129
++    assert attachments.transfer_pending(conn, service.hub("hub"), "default", limit=2) == 0
++    assert row["uid"] not in service.blobs
++    with kbc.write_txn(conn):
++        for old in backlog:
++            conn.execute("UPDATE kanban_attachment_retry SET retry_at=-100 WHERE uid=?", (old["uid"],))
++    clock[0] = 130
++    assert attachments.transfer_pending(conn, service.hub("hub"), "default", limit=0) == 0
++    assert attachments.transfer_pending(conn, service.hub("hub"), "default", limit=2) == 2
++    assert service.blobs.get(row["uid"]) == data, "failed custodian upload must precede maintenance"
++    published = conn.execute("SELECT blob_key,stored_path FROM task_attachments WHERE uid=?", (row["uid"],)).fetchone()
++    assert published["blob_key"] == "sha256:" + hashlib.sha256(data).hexdigest()
++    assert Path(published["stored_path"]).read_bytes() == data
++    receipt = conn.execute("SELECT * FROM kanban_attachment_retry WHERE uid=?", (row["uid"],)).fetchone()
++    assert (receipt["error"], receipt["retry_at"], receipt["attempts"]) == (None, 730, 2)
++    attempts = [conn.execute("SELECT attempts FROM kanban_attachment_retry WHERE uid=?", (old["uid"],)).fetchone()[0]
++                for old in backlog]
++    assert attempts == [2, 1, 1]
++
++
+ def test_first_metadata_attempt_precedes_due_verification(stores, monkeypatch):
+     from hermes_cli import kanban_sync_attachments as attachments
+     home, _, conn, _, service, tid, _ = stores
+-- 
+2.43.0
+

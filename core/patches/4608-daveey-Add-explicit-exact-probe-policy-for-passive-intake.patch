@@ -1,0 +1,524 @@
+From 8752511f0d645acaf6270279edd499ba532af6be Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 14:39:36 +0000
+Subject: [PATCH] [daveey] Add explicit exact-probe policy for passive intake
+
+Healthy indefinite listeners were repeatedly awakened by finite-wait age and timer backstops, then escalated by same-premise accounting. Opt in only exact task/probe pairs with an explicit external producer and no blocker. Retain age, counts, errors, lost-probe recovery and repeated-fire checks. Policy removal restores ordinary guards and invalidates timer memoization.
+
+Proof: canonical runner passed 212 tests across eight owning suites; scripts/check passed all 20 checks. Pre-publication mutation and split-custody audit still pending; no live opt-in deployed.
+---
+ hermes_cli/config_defaults.py                 |   4 +-
+ hermes_cli/kanban_awaiting.py                 |   6 +-
+ hermes_cli/kanban_continuation.py             |  15 +-
+ hermes_cli/kanban_db_schedule.py              |   2 +-
+ hermes_cli/kanban_passive_intake.py           |  55 ++++++
+ hermes_cli/kanban_timed_park.py               |  12 +-
+ hermes_cli/kanban_wake_check.py               |  12 +-
+ hermes_cli/kanban_wake_episode.py             |   6 +-
+ .../hermes_cli/test_kanban_passive_intake.py  | 182 ++++++++++++++++++
+ website/docs/user-guide/configuration.md      |  25 +++
+ 10 files changed, 298 insertions(+), 21 deletions(-)
+ create mode 100644 hermes_cli/kanban_passive_intake.py
+ create mode 100644 tests/hermes_cli/test_kanban_passive_intake.py
+
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 42995f380fab8cf72e03ee8fdc669c5168c29383..589ca9325a2a86f4fac589ad1bb60165c9f71214 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1883,8 +1883,8 @@ DEFAULT_CONFIG = {
+     "kanban": {
+         "self_work": {"sample_rate": 0.2},  # Reversible spot checks; risky/unknown diffs always selected. [daveey]
+         "wake_check_stale_hours": 48,  # Reconsider a never-passing probe; same-probe re-parks retain age.
+-        # Central sync (core patch 0193): true = boards opened afterwards get sync tables + outbox triggers. [daveey]
+-        "sync": {"enabled": False},
++        "passive_intake": {},  # Exact task ID -> exact wake_check for standing external listeners.
++        "sync": {"enabled": False},  # New boards get sync tables + outbox triggers when enabled. [daveey]
+         "create_overlap_check": True,  # kanban_create refuses work open cards already own (kanban_overlap) [daveey]
+         # A board whose TABLE b-trees fail integrity_check (REINDEX can't fix it) pauses dispatch; true = the
+         # gateway dispatcher also starts `hermes kanban recover` for it (salvage in a child process, fill from
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index 1a9586bb575d19bc8d764d310f7c70f86ae3b35b..2befd3e47b672723b9097f4247f196dc90218757 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -798,7 +798,7 @@ def probe_fire_reparks(conn: sqlite3.Connection, task_id: str, premise: str, pro
+ 
+ def gate(conn: sqlite3.Connection, task_id: str, *, awaiting: Any, reason: Optional[str],
+          wake_check: Optional[str] = None, clock_only: bool = False, op: str = "schedule",
+-         wake_in: Optional[int] = None) -> dict:
++         wake_in: Optional[int] = None, blocker_id: Optional[str] = None) -> dict:
+     """``resolve`` plus re-park escalation: the record to store on the parking event.
+ 
+     Raises ``RepeatedPark`` on the third park in a row on one premise. Card waits (their producer
+@@ -832,7 +832,9 @@ def gate(conn: sqlite3.Connection, task_id: str, *, awaiting: Any, reason: Optio
+     kdw.annotate(conn, task_id, record, now=int(time.time()))
+     if kdw.is_healthy(record):
+         return record
+-    if prior_same_premise(conn, task_id, record["premise"], probe=probe) >= REPARK_LIMIT:
++    from hermes_cli import kanban_passive_intake as passive
++    if (not passive.eligible(task_id, wake_check, record, blocker_id)
++            and prior_same_premise(conn, task_id, record["premise"], probe=probe) >= REPARK_LIMIT):
+         raise RepeatedPark(record)
+     fired = probe_fire_reparks(conn, task_id, record["premise"], probe)
+     if fired >= PROBE_FIRE_REPARK_LIMIT:
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index 25cc705da9a8ebdaa01badc789ba5f38cb2db330..4361bead38c5c3a4a1bcd84145fce4b3341b7e00 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -153,7 +153,8 @@ def continue_task(
+             from hermes_cli import kanban_awaiting as kaw
+             try:
+                 record = kaw.gate(conn, task_id, awaiting=awaiting, reason=checkpoint, wake_check=wake_check,
+-                                  clock_only=clock_only, op="continue", wake_in=resume_after)
++                                  clock_only=clock_only, op="continue", wake_in=resume_after,
++                                  blocker_id=blocker_id or (metadata or {}).get("blocker_id"))
+             except kaw.AwaitingError as exc:
+                 return {"ok": False, "error": str(exc), "reason_code": exc.code}
+             except kaw.RepeatedPark as rp:
+@@ -318,11 +319,14 @@ def wake_due_continuations(conn: sqlite3.Connection, *, now: Optional[int] = Non
+     from hermes_cli.kanban_sweep_gate import gated
+     # [daveey] G2: the park scan reads only content rows (the parking events, statuses), so it reruns when they
+     # move or when the earliest wake it found arrives; condition probes above keep their own next_at clock.
+-    return gated("dispatch.continuation_parks", conn, _wake_parks, conn, now, skipped=([], None), now=now,
+-                 extra=own_gateway, run_due=lambda out: out[1])[0]
++    from hermes_cli import kanban_passive_intake as passive
++    policy = passive.snapshot()
++    return gated("dispatch.continuation_parks", conn, _wake_parks, conn, now, policy,
++                 skipped=([], None), now=now,
++                 extra=lambda db: (own_gateway(db), tuple(sorted(policy.items()))), run_due=lambda out: out[1])[0]
+ 
+ 
+-def _wake_parks(conn: sqlite3.Connection, now: Optional[int]) -> tuple[list[str], Optional[int]]:
++def _wake_parks(conn: sqlite3.Connection, now: Optional[int], passive_policy=None) -> tuple[list[str], Optional[int]]:
+     """Wake the due parks; returns ``(woken, earliest wake still pending)`` (None when no park can come due)."""
+     from hermes_cli import kanban_db as kb
+ 
+@@ -343,6 +347,9 @@ def _wake_parks(conn: sqlite3.Connection, now: Optional[int]) -> tuple[list[str]
+                 info = missing_wake(conn, tid)
+                 pending.append(int(info["wake_at"]) if info and info.get("wake_at") is not None else now)
+             continue
++        from hermes_cli import kanban_passive_intake as passive
++        if passive.current(conn, tid, payload.get("wake_check"), policy=passive_policy, park=park):
++            continue  # no renewed timestamp or exempt timer in the memo deadline
+         wake_at = payload["wake_at"]
+         pending.append(int(wake_at))  # a skipped or stale wake stays due: the next tick retries it
+         if wake_at > now:
+diff --git a/hermes_cli/kanban_db_schedule.py b/hermes_cli/kanban_db_schedule.py
+index 6ad7cd2480aa42af9a4dae9f596a93ab5d8c5465..cc63726411e1faec8d89209501d6eabe8bbeffb6 100644
+--- a/hermes_cli/kanban_db_schedule.py
++++ b/hermes_cli/kanban_db_schedule.py
+@@ -45,7 +45,7 @@ def schedule_task(
+         from hermes_cli import kanban_wake_check as kwc
+         try:
+             record = kaw.gate(conn, task_id, awaiting=awaiting, reason=reason, wake_check=wake_check,
+-                              clock_only=clock_only, op="schedule")
++                              clock_only=clock_only, op="schedule", blocker_id=blocker_id)
+         except kaw.RepeatedPark as rp:
+             return noted.keep(kaw.escalate(conn, task_id, record=rp.record, reason=reason,
+                                            expected_run_id=expected_run_id) is not None)
+diff --git a/hermes_cli/kanban_passive_intake.py b/hermes_cli/kanban_passive_intake.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ea214a8a160a1d9fba52fc5fa3d05129d7aa6066
+--- /dev/null
++++ b/hermes_cli/kanban_passive_intake.py
+@@ -0,0 +1,55 @@
++"""Explicit, exact-probe standing listeners; no persisted exemption or schema."""
++from __future__ import annotations
++
++import re
++
++
++def snapshot() -> dict[str, str]:
++    """Resolve on the scoped caller, then carry this value into probe workers."""
++    from hermes_cli.config import load_config_readonly
++    from hermes_cli.config_backend import ConfigBackendUnavailable
++
++    try:
++        cfg = load_config_readonly()
++    except (ConfigBackendUnavailable, OSError, ValueError):
++        return {}
++    section = cfg.get("kanban") if isinstance(cfg, dict) else None
++    value = section.get("passive_intake") if isinstance(section, dict) else None
++    if not isinstance(value, dict):
++        return {}
++    # A malformed mapping disables the policy, rather than partially granting it.
++    for tid, cmd in value.items():
++        if (not isinstance(tid, str) or not re.fullmatch(r"t_[0-9a-f]+", tid)
++                or not isinstance(cmd, str) or not cmd.strip()):
++            return {}
++    return dict(value)
++
++
++def eligible(task_id, cmd, awaiting, blocker_id=None, *, policy=None) -> bool:
++    """One permissive exit, only an explicitly declared external producer."""
++    from hermes_cli.kanban_wait_info import producer_from_wake_check
++
++    policy = snapshot() if policy is None else policy
++    if not isinstance(policy, dict) or not isinstance(cmd, str) or not cmd.strip():
++        return False
++    if policy.get(task_id) != cmd or blocker_id is not None:
++        return False
++    if not isinstance(awaiting, dict) or awaiting.get("kind") != "external" or awaiting.get("inferred"):
++        return False
++    for key in ("ref", "why"):
++        if not isinstance(awaiting.get(key), str) or not awaiting[key].strip():
++            return False
++    producer = producer_from_wake_check(cmd)
++    if not producer or producer[0] != "probe":
++        return False
++    return True
++
++
++def current(conn, task_id, cmd, *, policy=None, park=None) -> bool:
++    from hermes_cli.kanban_continuation import park_state
++
++    park = park_state(conn, task_id) if park is None else park
++    payload = park["payload"]
++    if not park["timed"] or payload.get("wake_check") != cmd:
++        return False
++    return eligible(task_id, cmd, payload.get("awaiting"), payload.get("blocker_id"), policy=policy)
+diff --git a/hermes_cli/kanban_timed_park.py b/hermes_cli/kanban_timed_park.py
+index 3d20ecd972a05bd95f7129028a0e26b8c338b302..cd10fb09015084ffb260e94d10626faf2d4e38ed 100644
+--- a/hermes_cli/kanban_timed_park.py
++++ b/hermes_cli/kanban_timed_park.py
+@@ -154,6 +154,11 @@ def park(
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_wake_check as kwc
+ 
++    from hermes_cli.kanban_blocker_metadata import blocker_metadata, FIELDS
++    meta = blocker_metadata(conn, task_id, reason=reason, metadata=run_metadata,
++                            blocker_id=blocker_id, blocker_provider=blocker_provider,
++                            blocker_model=blocker_model, blocker_lane=blocker_lane)
++    blocker_id = meta.get("blocker_id")
+     now = int(time.time())
+     if blocker_wake:
+         wake_at = now + blocker_wake_seconds()
+@@ -166,7 +171,7 @@ def park(
+     else:
+         try:
+             record = kaw.gate(conn, task_id, awaiting=awaiting, reason=reason, wake_check=wake_check,
+-                              clock_only=clock_only, op="block")
++                              clock_only=clock_only, op="block", blocker_id=blocker_id)
+         except kaw.RepeatedPark as rp:
+             return kaw.escalate(conn, task_id, record=rp.record, reason=reason,
+                                 expected_run_id=expected_run_id) is not None
+@@ -189,11 +194,6 @@ def park(
+     from hermes_cli.kanban_source_receipt import with_source_receipt
+     if with_source_receipt(conn, task_id, lambda: conn.execute(sql, params).rowcount) != 1:
+         return False
+-    from hermes_cli.kanban_blocker_metadata import blocker_metadata, FIELDS
+-    meta = blocker_metadata(conn, task_id, reason=reason, metadata=run_metadata,
+-                            blocker_id=blocker_id, blocker_provider=blocker_provider,
+-                            blocker_model=blocker_model, blocker_lane=blocker_lane)
+-    blocker_id = meta.get("blocker_id")
+     run_id = kb._end_or_synthesize_run(
+         conn, task_id, outcome="scheduled", status="scheduled", summary=reason, metadata=meta or None,
+         synthesize=bool(reason or meta),
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 51214339e8090b9821231305d509d9af388752e0..06fd02e495c09c8af6bc9af3cf18095b366213e8 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -808,7 +808,7 @@ def producer_note(hit: dict) -> str:
+ 
+ 
+ def _probe_and_apply(db_path: str, task_id: str, cmd: str, cwd: str, env: dict, now: Optional[int], generation: str,
+-                     purpose: str = "wake", stale_interval: Optional[float] = None) -> Any:
++                     purpose: str = "wake", stale_interval: Optional[float] = None, passive_policy=None) -> Any:
+     key = (db_path, task_id)
+     try:
+         rc, out = _run_probe(key, cmd, cwd, env)
+@@ -843,7 +843,7 @@ def _probe_and_apply(db_path: str, task_id: str, cmd: str, cwd: str, env: dict,
+                 dead_ancestry = detect(cmd, cwd)
+             apply_result(conn, task_id, cmd, rc, out, now=now, generation=generation, diagnostics=diag,
+                          answered=answered, producer=producer, dead_ancestry=dead_ancestry,
+-                         stale_interval=stale_interval)
++                         stale_interval=stale_interval, passive_policy=passive_policy)
+         finally:
+             conn.close()
+         return rc
+@@ -856,7 +856,7 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+                  *, generation: str, now: Optional[int] = None,
+                  diagnostics: Optional[dict] = None, answered: Optional[dict] = None,
+                  producer: Optional[dict] = None, dead_ancestry: Optional[list[dict]] = None,
+-                 stale_interval: Optional[float] = None) -> Optional[str]:
++                 stale_interval: Optional[float] = None, passive_policy=None) -> Optional[str]:
+     """Record one probe result; wake the card on success or a broken probe. Returns the event
+     kind appended (``condition_met`` / ``wake_check_broken``) or None. A result for a probe
+     that is no longer the card's (re-parked, unblocked) is dropped."""
+@@ -908,7 +908,7 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+                 woke = wake_once(conn, task_id, cmd, dead_ancestry)
+                 if woke:
+                     return woke
+-            stale = episode.not_yet(conn, task_id, cmd, now, interval)
++            stale = episode.not_yet(conn, task_id, cmd, now, interval, passive_policy=passive_policy)
+             if stale:
+                 woke = _wake(conn, task_id, episode.STALE_EVENT, stale)
+                 if woke:
+@@ -1044,6 +1044,8 @@ def run_due_wake_checks(conn: sqlite3.Connection, *, now: Optional[int] = None,
+                 (ts,)).fetchall()
+         # Resolve policy only for a real probe batch, still on the scoped dispatcher thread.
+         stale_interval = episode.stale_seconds() if due else None
++        from hermes_cli import kanban_passive_intake as passive
++        passive_policy = passive.snapshot() if due else {}
+         for task_id, cmd, every, generation, purpose in due:
+             key = (db_path, task_id)
+             sweeping = kanban_ci_progress.running_sweeps()  # [daveey] a CI sweep holds a pool worker too
+@@ -1070,7 +1072,7 @@ def run_due_wake_checks(conn: sqlite3.Connection, *, now: Optional[int] = None,
+                     continue
+             cwd = probe_cwd(task.workspace_path)
+             fut = _pool().submit(_probe_and_apply, db_path, task_id, cmd, cwd, _probe_env(task, db_path), now, claim,
+-                                 purpose, stale_interval)
++                                 purpose, stale_interval, passive_policy)
+             with _LOCK:
+                 _IN_FLIGHT[key] = fut
+             submitted.append(task_id)
+diff --git a/hermes_cli/kanban_wake_episode.py b/hermes_cli/kanban_wake_episode.py
+index 2fef162718d132a97a644ca3d9ee2dcd03a8f9ff..67b672e7abce6e312328a94ea2b23abfbbe7f942 100644
+--- a/hermes_cli/kanban_wake_episode.py
++++ b/hermes_cli/kanban_wake_episode.py
+@@ -262,7 +262,8 @@ def stamp(timestamp: int) -> str:
+     return datetime.fromtimestamp(timestamp, ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M PT")
+ 
+ 
+-def not_yet(conn: sqlite3.Connection, task_id: str, cmd: str, now: int, interval: float) -> dict | None:
++def not_yet(conn: sqlite3.Connection, task_id: str, cmd: str, now: int, interval: float,
++            *, passive_policy=None) -> dict | None:
+     """Count a validated clean exit 1 and return a due stale-wake payload."""
+     repark(conn, task_id, cmd)
+     conn.execute(
+@@ -274,6 +275,9 @@ def not_yet(conn: sqlite3.Connection, task_id: str, cmd: str, now: int, interval
+     if checks == 1:
+         from hermes_cli import kanban_db as kb
+         kb._append_event(conn, task_id, "wake_episode_started")
++    from hermes_cli import kanban_passive_intake as passive
++    if passive.current(conn, task_id, cmd, policy=passive_policy):
++        return None  # keep age/count, not a renewed stale-wake lease
+     if now - first < interval or (last is not None and now - last < interval):
+         return None
+     conn.execute("UPDATE task_wake_episodes SET last_stale_at = ? WHERE task_id = ?", (now, task_id))
+diff --git a/tests/hermes_cli/test_kanban_passive_intake.py b/tests/hermes_cli/test_kanban_passive_intake.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bc1ceb4dd5be20e58b34c22a556210a401cd0179
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_passive_intake.py
+@@ -0,0 +1,182 @@
++"""Standing listeners exempt only healthy quiet waiting, never probe failures."""
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_wake_check as wc
++from hermes_cli import kanban_continuation as kc
++from tests.hermes_cli import test_kanban_wake_check as helpers
++
++kanban_home = helpers.kanban_home
++AWAITING = {"kind": "external", "ref": "inbox senders", "why": "new messages arrive here"}
++
++
++@pytest.fixture
++def listener(kanban_home, monkeypatch):
++    from hermes_cli import config
++    policy = {}
++    monkeypatch.setattr(config, "load_config_readonly", lambda: {"kanban": {"passive_intake": policy}})
++    with kbc.connect_closing() as conn:
++        tid = helpers._running(conn)
++        policy[tid] = "exit 1"
++        assert kb.schedule_task(conn, tid, reason="waiting", wake_check="exit 1", awaiting=AWAITING)
++        yield conn, tid, policy
++
++
++def apply(listener, now, rc=1, out=""):
++    conn, tid, _ = listener
++    state = wc.get_state(conn, tid)
++    return wc.apply_result(conn, tid, state["cmd"], rc, out, generation=state["generation"], now=now)
++
++
++def test_quiet_episode_and_expired_timer(listener):
++    conn, tid, _ = listener
++    now = int(time.time())
++    park = kc.park_state(conn, tid)
++    assert apply(listener, now) is None
++    assert apply(listener, now + 49 * 3600) is None
++    state = wc.get_state(conn, tid)
++    assert state["episode_first_at"] == now
++    assert state["episode_checks"] == 2
++    assert kc._wake_parks(conn, now + 49 * 3600) == ([], None)
++    assert kc.park_state(conn, tid) == park
++
++
++@pytest.mark.parametrize("change", ["inferred", "kind", "ref", "why", "blocker", "command", "untimed"])
++def test_changed_park_fails_closed(listener, change):
++    from hermes_cli import kanban_passive_intake as passive
++    conn, tid, _ = listener
++    park = kc.park_state(conn, tid)
++    assert passive.current(conn, tid, "exit 1", park=park)
++    payload = park["payload"]
++    if change == "blocker":
++        payload["blocker_id"] = "quota"
++    elif change == "command":
++        payload["wake_check"] = "exit 1 "
++    elif change == "untimed":
++        park["timed"] = False
++    else:
++        payload["awaiting"][change] = {"inferred": True, "kind": "ci", "ref": [], "why": ""}[change]
++    assert not passive.current(conn, tid, "exit 1", park=park)
++
++
++def test_repeated_fire_still_escalates(listener, monkeypatch):
++    from hermes_cli import kanban_awaiting as kaw
++    conn, tid, _ = listener
++    monkeypatch.setattr(kaw, "prior_same_premise", lambda *a, **kw: kaw.REPARK_LIMIT)
++    monkeypatch.setattr(kaw, "probe_fire_reparks", lambda *a, **kw: 0)
++    assert kaw.gate(conn, tid, awaiting=AWAITING, reason="waiting", wake_check="exit 1")
++    with pytest.raises(kaw.RepeatedPark):
++        kaw.gate(conn, tid, awaiting=AWAITING, reason="waiting", wake_check="exit 1", blocker_id="quota")
++    monkeypatch.setattr(kaw, "probe_fire_reparks", lambda *a, **kw: kaw.PROBE_FIRE_REPARK_LIMIT)
++    with pytest.raises(kaw.RepeatedPark):
++        kaw.gate(conn, tid, awaiting=AWAITING, reason="waiting", wake_check="exit 1")
++
++
++def test_removal_invalidates_quiet_sweep_memo(listener, monkeypatch):
++    from hermes_cli import kanban_capability_registry as registry
++    conn, tid, policy = listener
++    monkeypatch.setattr(wc, "run_due_wake_checks", lambda *a, **kw: None)
++    monkeypatch.setattr(registry, "maybe_refresh_async", lambda: None)
++    now = int(time.time()) + 49 * 3600
++    assert kc.wake_due_continuations(conn, now=now) == []
++    assert kc.wake_due_continuations(conn, now=now) == []
++    policy.clear()
++    assert kc.wake_due_continuations(conn, now=now) == [tid]
++
++
++def test_async_policy_snapshot_and_cadence(listener, monkeypatch):
++    from contextvars import ContextVar
++    from threading import Event
++    from hermes_cli import config
++
++    conn, tid, policy = listener
++    scope = ContextVar("passive_test_policy", default={})
++    token = scope.set(policy)
++    monkeypatch.setattr(config, "load_config_readonly",
++                        lambda: {"kanban": {"passive_intake": scope.get()}})
++    entered, release = Event(), Event()
++
++    def probe(*args):
++        entered.set()
++        assert release.wait(5)
++        return 1, ""
++
++    monkeypatch.setattr(wc, "_run_probe", probe)
++    now = int(time.time())
++    apply(listener, now)
++    later = now + 49 * 3600
++    try:
++        assert wc.run_due_wake_checks(conn, now=later)["submitted"] == [tid]
++        assert entered.wait(5)
++        policy.clear()  # Already submitted workers retain an independent scoped snapshot.
++        release.set()
++        wc._shutdown_for_tests()
++        state = wc.get_state(conn, tid)
++        assert state is not None and state["last_rc"] == 1
++        assert kb.get_task(conn, tid).status == "scheduled"
++        assert state["next_at"] == later + state["every"]
++        assert wc.run_due_wake_checks(conn, now=later + 1, wait=True)["submitted"] == []
++        assert wc.run_due_wake_checks(conn, now=state["next_at"], wait=True)["submitted"] == [tid]
++        assert helpers._events(conn, tid, "wake_check_stale")
++    finally:
++        release.set()
++        wc._shutdown_for_tests()
++        scope.reset(token)
++
++
++def test_metadata_blocker_disables_repark_exemption(listener, monkeypatch):
++    from hermes_cli import kanban_awaiting as kaw
++    from hermes_cli import kanban_timed_park as ktp
++
++    conn, tid, _ = listener
++    monkeypatch.setattr(kaw, "prior_same_premise", lambda *a, **kw: kaw.REPARK_LIMIT)
++    monkeypatch.setattr(kaw, "probe_fire_reparks", lambda *a, **kw: 0)
++    escalated = []
++    monkeypatch.setattr(kaw, "escalate", lambda *a, **kw: escalated.append(kw["record"]))
++    with kb.write_txn(conn):
++        assert not ktp.park(conn, tid, reason="waiting", requested_kind="time",
++                            wake_check="exit 1", awaiting=AWAITING,
++                            run_metadata={"blocker_id": "quota"})
++    assert len(escalated) == 1
++
++
++def test_old_generation_cannot_mutate_episode(listener):
++    conn, tid, _ = listener
++    now = int(time.time())
++    apply(listener, now)
++    state = wc.get_state(conn, tid)
++    assert wc.apply_result(conn, tid, "exit 1", 0, "", generation="old", now=now) is None
++    assert wc.get_state(conn, tid) == state
++
++
++def test_removal_reactivates_stale(listener):
++    _conn, _tid, policy = listener
++    now = int(time.time())
++    apply(listener, now)
++    assert apply(listener, now + 49 * 3600) is None
++    policy.clear()
++    assert apply(listener, now + 50 * 3600) == "wake_check_stale"
++
++
++@pytest.mark.parametrize("rc,out", [(0, ""), (2, "bad"), (1, "Traceback (most recent call last):")])
++def test_success_and_errors_remain_active(listener, rc, out):
++    for _ in range(3):
++        result = apply(listener, int(time.time()), rc, out)
++        if result:
++            break
++    assert result == ("condition_met" if rc == 0 else "wake_check_broken")
++
++
++@pytest.mark.parametrize("policy", [None, [], True, {"other": "exit 1"}, {"SELF": 1}, {"SELF": "exit 1 "}])
++def test_malformed_or_changed_config_fails_closed(listener, monkeypatch, policy):
++    from hermes_cli import config
++    _conn, tid, _ = listener
++    if isinstance(policy, dict) and "SELF" in policy:
++        policy = {tid: policy["SELF"]}
++    monkeypatch.setattr(config, "load_config_readonly", lambda: {"kanban": {"passive_intake": policy}})
++    now = int(time.time())
++    apply(listener, now)
++    assert apply(listener, now + 49 * 3600) == "wake_check_stale"
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index 139849f5b1f0a454e7f8f914e96398bdfc509c03..0f325c7dffb51f3e125a54affec56fcf28896dd5 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -16,6 +16,31 @@ All settings are stored in the `~/.hermes/` directory for easy access.
+ Run `hermes setup --portal` — one OAuth gets you a model provider and all four Tool Gateway tools without hand-editing YAML. Portal subscribers also get 10% off token-billed providers. See [Nous Portal](../integrations/nous-portal.md).
+ :::
+ 
++## Standing Kanban intake listeners
++
++`kanban.passive_intake` defaults to `{}`. It maps exact task IDs to exact stored
++`wake_check` command strings (no whitespace normalization or pattern matching):
++
++```yaml
++kanban:
++  passive_intake:
++    t_da066fc02a25c3b2: "python scripts/check_inbox.py"
++```
++
++Use this only for standing external intake. The current timed park must explicitly
++declare `awaiting: {kind: external, ref: "inbox senders", why: "new messages arrive here"}`,
++with no inferred producer or effective shared `blocker_id`. Card/CI probes do not qualify.
++Malformed configuration fails closed to ordinary wake/re-park guards.
++
++Eligible clean exit-1 probes retain their episode age and check counts but do not
++wake merely for age; their timer backstop is suppressed without renewing its timestamp.
++Only same-premise re-park escalation is exempt: repeated successful-probe/re-park
++cycles still escalate. Exit 0, broken probes, lost/silent probe recovery and normal
++probe cadence remain unchanged. Removing the entry reactivates ordinary guards,
++including an already-overdue timer on an otherwise quiet board. Policy is scoped
++to the dispatcher configuration and captured for its asynchronous probe batch;
++it is not a synced exemption on the card.
++
+ ## Directory Structure
+ 
+ ```text
+-- 
+2.43.0
+

@@ -1,0 +1,315 @@
+From d1feb9cb7850b0dcf5b5a514a3fda357ebbec520 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 07:53:39 +0000
+Subject: [PATCH] [daveey] Fence native CLI admission against launch retirement
+
+---
+ hermes_cli/kanban_origin_admission.py         |   9 +-
+ hermes_cli/kanban_origin_cli_gate.py          |  64 ++++++++++
+ tests/hermes_cli/test_origin_cli_gate.py      | 111 ++++++++++++++++++
+ .../test_origin_native_admission.py           |  50 ++++++++
+ 4 files changed, 232 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/kanban_origin_cli_gate.py
+ create mode 100644 tests/hermes_cli/test_origin_cli_gate.py
+
+diff --git a/hermes_cli/kanban_origin_admission.py b/hermes_cli/kanban_origin_admission.py
+index c0d1135fa6207ad2022fbef0be01f086ef711112..02e8dd9d6e3747e36a17c4428a94425c3cd453ed 100644
+--- a/hermes_cli/kanban_origin_admission.py
++++ b/hermes_cli/kanban_origin_admission.py
+@@ -9,12 +9,14 @@ from contextvars import ContextVar
+ from dataclasses import dataclass, field
+ from functools import wraps
+ import json
++import os
+ 
+ from hermes_cli import kanban_origin_native as native
+ 
+ @dataclass
+ class _Admission:
+     captured: object
++    gate: object = None
+     admitted: set = field(default_factory=set)
+ 
+ 
+@@ -26,11 +28,11 @@ class AdmissionRefused(ValueError):
+ 
+ 
+ @contextmanager
+-def strict_local_creation():
++def strict_local_creation(*, gate=None):
+     captured = native.capture(None)
+     if captured is None:
+         raise AdmissionRefused("strict native creation requires a live interactive turn")
+-    token = _current.set(_Admission(captured))
++    token = _current.set(_Admission(captured, gate=gate))
+     try:
+         yield
+     finally:
+@@ -43,6 +45,7 @@ def active():
+ 
+ def check_tool(args, kw):
+     if active() and (args.get("placement") != "local" or args.get("origin_session")
++                     or os.environ.get("HERMES_ORIGIN_SESSION")
+                      or args.get("requires") or args.get("runs_on") or args.get("placement_policy")
+                      or args.get("self_work") is not None or kw.get("origin_intent") is not None
+                      or kw.get("selfwork_intent") is not None):
+@@ -84,6 +87,8 @@ def require_receipt(conn, task_id):
+     owner = {"gateway": gateway, "profile": profile, "board": board, "task_id": task_id}
+     if binding["origin"] != context["origin"] or binding["owner"] != owner:
+         raise AdmissionRefused("strict native creation receipt belongs to another origin or board")
++    if state.gate is not None:
++        state.gate.admit(task_id)
+     state.admitted.add(task_id)
+ 
+ 
+diff --git a/hermes_cli/kanban_origin_cli_gate.py b/hermes_cli/kanban_origin_cli_gate.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..04db2cdce008dfdb68e23f7b0527657cba343092
+--- /dev/null
++++ b/hermes_cli/kanban_origin_cli_gate.py
+@@ -0,0 +1,64 @@
++"""Parent-owned admission/retirement ordering for a foreground CLI launch.
++
++Retirement prevents NEW admissions, not completion of already admitted writes.
++No IO or user callbacks run under this lock. An admitted request with no verified
++successful reply has unknown outcome, including exceptions after COMMIT.
++"""
++from threading import Lock
++
++from hermes_cli.kanban_origin_admission import AdmissionRefused
++
++
++class LaunchGate:
++    def __init__(self):
++        self._lock = Lock()
++        self._accepting = True
++        self._requests = []
++
++    def dispatch(self):
++        with self._lock:
++            if not self._accepting:
++                raise AdmissionRefused("CLI launch retired before dispatch")
++            request = RequestGate(self)
++            self._requests.append(request)
++            return request
++
++    def retire(self):
++        """Bounded state transition; never joins a handler or promises cancellation."""
++        with self._lock:
++            self._accepting = False
++            return [request._report() for request in self._requests]
++
++
++class RequestGate:
++    def __init__(self, launch):
++        self._launch = launch
++        self._admitted = None
++        self._finished = False
++        self._verified = False
++
++    def admit(self, task_id):
++        with self._launch._lock:
++            if not self._launch._accepting or self._admitted is not None or self._finished:
++                raise AdmissionRefused("CLI launch retired or request already admitted/finished")
++            self._admitted = task_id
++
++    def finish(self, result=None):
++        """A failed/absent reply cannot undo an admission or establish rollback."""
++        with self._launch._lock:
++            if self._finished:
++                raise AdmissionRefused("CLI request already finished")
++            self._finished = True
++            self._verified = (self._admitted is not None and isinstance(result, dict)
++                              and result.get("ok") is True and result.get("task_id") == self._admitted)
++            return self._report()
++
++    def _report(self):
++        # Called only under the launch lock.
++        if self._verified:
++            outcome = "created"
++        elif self._admitted is not None:
++            outcome = "outcome_unknown"
++        else:
++            outcome = "no_board_commit"
++        return {"outcome": outcome, "task_id": self._admitted, "finished": self._finished}
+diff --git a/tests/hermes_cli/test_origin_cli_gate.py b/tests/hermes_cli/test_origin_cli_gate.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..204c472ba75728a57aa45770003f9ae96689aa1c
+--- /dev/null
++++ b/tests/hermes_cli/test_origin_cli_gate.py
+@@ -0,0 +1,111 @@
++"""Admission is ordered against retirement, not confused with COMMIT."""
++from contextlib import contextmanager
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_origin_admission as admission, kanban_origin_native as native
++from hermes_cli.kanban_origin_cli_gate import LaunchGate
++from tests.hermes_cli import test_origin_native_admission as fixtures
++
++turn = fixtures.turn
++
++
++@pytest.mark.parametrize("when", ["before", "after"])
++def test_retirement_at_final_admission(turn, monkeypatch, when):
++    launch = LaunchGate()
++    request = launch.dispatch()
++    admit = request.admit
++    def interleaving(task_id):
++        if when == "before":
++            report = launch.retire()
++            assert report[0]["outcome"] == "no_board_commit"
++        admit(task_id)
++        if when == "after":
++            report = launch.retire()
++            assert report[0]["outcome"] == "outcome_unknown"
++            assert not report[0]["finished"]
++    monkeypatch.setattr(request, "admit", interleaving)
++    with kbc.connect_closing() as conn:
++        before = fixtures.snapshot(conn)
++        with admission.strict_local_creation(gate=request):
++            if when == "before":
++                with pytest.raises(admission.AdmissionRefused):
++                    kb.create_task(conn, title="retirement", native_origin=native.capture(None))
++                assert fixtures.snapshot(conn) == before
++            else:
++                task = kb.create_task(conn, title="retirement", native_origin=native.capture(None))
++                assert kb.get_task(conn, task) is not None
++                assert request.finish({"ok": True, "task_id": task})["outcome"] == "created"
++
++
++def test_retired_idempotent_replay_refused(turn):
++    with kbc.connect_closing() as conn:
++        captured = native.capture(None)
++        kb.create_task(conn, title="existing", idempotency_key="gate-key", native_origin=captured)
++        launch = LaunchGate()
++        request = launch.dispatch()
++        launch.retire()
++        with admission.strict_local_creation(gate=request), pytest.raises(admission.AdmissionRefused):
++            kb.create_task(conn, title="replay", idempotency_key="gate-key", native_origin=captured)
++
++
++@pytest.mark.parametrize("error", [RuntimeError, sqlite3.IntegrityError])
++def test_postcommit_exception_is_unknown_and_never_readmitted(turn, monkeypatch, error):
++    launch = LaunchGate()
++    request = launch.dispatch()
++    original = kb.write_txn
++    @contextmanager
++    def postcommit(*args, **kwargs):
++        with original(*args, **kwargs):
++            yield
++        raise error("injected after COMMIT")
++    monkeypatch.setattr(kb, "write_txn", postcommit)
++    with kbc.connect_closing() as conn:
++        with admission.strict_local_creation(gate=request), pytest.raises((error, admission.AdmissionRefused)):
++            kb.create_task(conn, title="postcommit", native_origin=native.capture(None))
++        report = request.finish()
++        assert report["outcome"] == "outcome_unknown"
++        assert kb.get_task(conn, report["task_id"]) is not None
++        assert conn.execute("SELECT count(*) FROM tasks WHERE title='postcommit'").fetchone()[0] == 1
++
++
++def test_gate_refuses_dispatch_after_retire():
++    launch = LaunchGate()
++    assert launch.retire() == []
++    with pytest.raises(admission.AdmissionRefused):
++        launch.dispatch()
++
++
++@pytest.mark.parametrize("state", ["admitted", "finished", "retired"])
++def test_gate_single_admission(state):
++    launch = LaunchGate()
++    request = launch.dispatch()
++    if state == "admitted":
++        request.admit("first")
++    elif state == "finished":
++        request.finish()
++    else:
++        launch.retire()
++    with pytest.raises(admission.AdmissionRefused):
++        request.admit("second")
++
++
++@pytest.mark.parametrize("reply", [None, [], {}, {"ok": True, "task_id": "wrong"},
++                                   {"ok": False, "task_id": "task"}, {"ok": 1, "task_id": "task"}])
++def test_admitted_unverified_reply_is_unknown(reply):
++    launch = LaunchGate()
++    request = launch.dispatch()
++    request.admit("task")
++    assert request.finish(reply)["outcome"] == "outcome_unknown"
++    assert launch.retire()[0]["outcome"] == "outcome_unknown"
++
++
++@pytest.mark.parametrize("task_id", ["task", None])
++def test_success_without_admission_is_not_created(task_id):
++    launch = LaunchGate()
++    request = launch.dispatch()
++    assert request.finish({"ok": True, "task_id": task_id})["outcome"] == "no_board_commit"
++    with pytest.raises(admission.AdmissionRefused):
++        request.finish()
+diff --git a/tests/hermes_cli/test_origin_native_admission.py b/tests/hermes_cli/test_origin_native_admission.py
+index 910b5af9d21cd4dbd758d343c560fe38bdbd3b5c..3af1ccc26b2774f2db91cad196098d3f661b6592 100644
+--- a/tests/hermes_cli/test_origin_native_admission.py
++++ b/tests/hermes_cli/test_origin_native_admission.py
+@@ -188,6 +188,56 @@ def test_valid_receipt_with_wrong_owner_is_refused(turn):
+             kb.create_task(conn, title="replay", idempotency_key="owner-key", native_origin=captured)
+ 
+ 
++def test_ambient_origin_refused_before_resolution(turn, monkeypatch):
++    monkeypatch.setenv("HERMES_ORIGIN_SESSION", "@session:default@here/ambient")
++    def forbidden(*args, **kwargs):
++        pytest.fail("ambient origin reached resolution")
++    monkeypatch.setattr(kanban_origin, "resolve", forbidden)
++    with admission.strict_local_creation():
++        result = create()
++    assert not result.get("ok"), result
++
++
++@pytest.mark.parametrize("revocation", ["turn", "receipt"])
++def test_idempotent_replay_revalidates_custody(turn, revocation):
++    with kbc.connect_closing() as conn:
++        captured = native.capture(None)
++        task = kb.create_task(conn, title="first", idempotency_key="revoke-key", native_origin=captured)
++        with admission.strict_local_creation():
++            if revocation == "turn":
++                turn.release()
++            else:
++                conn.execute("DELETE FROM origin_native_receipts WHERE task_id=?", (task,))
++                conn.commit()
++            before = snapshot(conn)
++            with pytest.raises(admission.AdmissionRefused):
++                kb.create_task(conn, title="replay", idempotency_key="revoke-key", native_origin=captured)
++            assert snapshot(conn) == before
++
++
++def test_copied_thread_context_preserves_live_turn(turn):
++    from contextvars import copy_context
++    from concurrent.futures import ThreadPoolExecutor
++    context = copy_context()
++    def in_thread():
++        with admission.strict_local_creation():
++            return create()
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        result = pool.submit(context.run, in_thread).result(timeout=20)
++    assert result.get("ok"), result
++    with kbc.connect_closing() as conn:
++        assert native._receipt(conn, result["task_id"])["origin"]["session"] == fixtures.CHAT
++
++
++def test_uncopied_thread_has_no_authority(turn):
++    from concurrent.futures import ThreadPoolExecutor
++    def in_thread():
++        with pytest.raises(admission.AdmissionRefused), admission.strict_local_creation():
++            pytest.fail("thread acquired ambient authority")
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        pool.submit(in_thread).result(timeout=20)
++
++
+ def test_db_origin_intent_refused(turn):
+     with kbc.connect_closing() as conn:
+         with admission.strict_local_creation(), pytest.raises(admission.AdmissionRefused):
+-- 
+2.43.0
+

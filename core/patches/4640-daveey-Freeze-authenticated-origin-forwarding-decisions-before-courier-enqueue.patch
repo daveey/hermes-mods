@@ -1,0 +1,517 @@
+From 9c9f6fd9ebde7f1a30071b3a72ba1cc2f0544cbb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:24:54 +0000
+Subject: [PATCH] [daveey] Freeze authenticated origin forwarding decisions
+ before courier enqueue
+
+---
+ hermes_cli/kanban.py                          |  10 +-
+ hermes_cli/kanban_origin_forward_adapter.py   |  61 +++++++++
+ hermes_cli/kanban_origin_forward_decision.py  | 128 ++++++++++++++++++
+ hermes_cli/kanban_parser.py                   |   4 +
+ tests/hermes_cli/test_origin_forward_abuse.py |  55 ++++++++
+ .../hermes_cli/test_origin_forward_adapter.py |  70 ++++++++++
+ .../test_origin_forward_decision.py           |  98 ++++++++++++++
+ 7 files changed, 423 insertions(+), 3 deletions(-)
+ create mode 100644 hermes_cli/kanban_origin_forward_adapter.py
+ create mode 100644 hermes_cli/kanban_origin_forward_decision.py
+ create mode 100644 tests/hermes_cli/test_origin_forward_abuse.py
+ create mode 100644 tests/hermes_cli/test_origin_forward_adapter.py
+ create mode 100644 tests/hermes_cli/test_origin_forward_decision.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 835ffd9aa9c989956f8e3996b3033bc84b3c827f..bba2eeadd4481c89e5876236d5699490b9e3dbe1 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -167,6 +167,9 @@ def kanban_command(args: argparse.Namespace) -> int:
+     if action == "chat-tasks":
+         from hermes_cli.kanban_chat_tasks import command
+         return command(args)
++    if action == "origin-forward":
++        from hermes_cli.kanban_origin_forward_adapter import command
++        return command(args)
+     if action == "origin-bind":
+         from hermes_cli.kanban_origin_adapter import command
+         return command(args)
+@@ -263,7 +266,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
+     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair", "recover",
+     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
+     "request-review", "request-changes", "reopen-review", "reopen", "resume", "quota-release", "source-release",
+-    "gc", "origin-bind", "origin-create", "origin-adopt", "sync", "supervisor-requests", "spend-budget", "lanes",
++    "gc", "origin-bind", "origin-forward", "origin-create", "origin-adopt", "sync", "supervisor-requests", "spend-budget", "lanes",
+ })
+ 
+ _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
+@@ -281,9 +284,10 @@ def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
+         return False
+     from agent.delegation_context import kanban_path_is_fenced
+ 
+-    if action == "origin-bind":
++    if action in {"origin-bind", "origin-forward"}:
+         from hermes_constants import get_hermes_home
+-        return kanban_path_is_fenced(get_hermes_home() / "kanban/origin-ledger.db")
++        ledger = "origin-forward.db" if action == "origin-forward" else "origin-ledger.db"
++        return kanban_path_is_fenced(get_hermes_home() / "kanban" / ledger)
+     return kanban_path_is_fenced(kb.kanban_home()) or kanban_path_is_fenced(kb.kanban_db_path())
+ 
+ 
+diff --git a/hermes_cli/kanban_origin_forward_adapter.py b/hermes_cli/kanban_origin_forward_adapter.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9938f31b602d00651272511c5a197661b605cfdc
+--- /dev/null
++++ b/hermes_cli/kanban_origin_forward_adapter.py
+@@ -0,0 +1,61 @@
++"""Trusted local courier adapter for origin-gateway forwarding admission.
++
++The courier must queue the returned frozen envelope as itself and wait for the
++owner's completed origin receipt. Preparing an envelope is NOT a handoff.
++"""
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++import re
++import sqlite3
++import sys
++import time
++
++from hermes_cli.kanban_origin_adapter import _gateway, _resolve_session
++from hermes_cli.kanban_origin_forward import read_lease
++from hermes_cli.kanban_origin_forward_decision import prepare
++
++
++def receive(request):
++    from hermes_constants import get_hermes_home
++    from hermes_cli.profiles import get_active_profile_name
++    from hermes_cli.kanban_sync_client import Hub, load_identity
++
++    home = get_hermes_home()
++    profile = get_active_profile_name()
++    if profile == "custom":
++        raise ValueError("origin_profile_unknown")
++    replica = Path(os.environ.get("HERMES_HUB_STATE") or Path.home() / ".local/state/hermes-hub") / "hub.db"
++    gateway = _gateway(replica)
++
++    def lookup(board, task):
++        # Construct lazily: durable replay needs neither a live lease nor network.
++        return read_lease(Hub(load_identity()), board, task)
++
++    outbound = prepare(request, path=home / "kanban/origin-forward.db",
++                       ledger=home / "kanban/origin-ledger.db", gateway=gateway, profile=profile,
++                       lease_lookup=lookup, now_ms=lambda: int(time.time() * 1000),
++                       session_exists=lambda sid: bool(_resolve_session(home / "state.db", sid)))
++    return {"status": "prepared", "handoff_complete": False, "outbound": outbound}
++
++
++def command(args):
++    from hermes_cli.kanban_sync_client import HubError
++    try:
++        raw = sys.stdin.read(262145) if args.request_file == "-" else Path(args.request_file).read_text(encoding="utf-8-sig")
++        if len(raw.encode("utf-8")) > 262144:
++            raise ValueError("origin_forward_request_invalid")
++        result = receive(json.loads(raw))
++    except (OSError, sqlite3.Error, HubError):
++        result = {"status": "pending", "code": "origin_forward_evidence_unavailable", "handoff_complete": False}
++    except (KeyError, TypeError, ValueError, RecursionError) as exc:
++        code = str(exc)
++        if not re.fullmatch(r"origin_[a-z_]+", code):
++            code = "origin_forward_request_invalid"
++        # Incomplete snapshots are absence of evidence, not a terminal decision.
++        status = "pending" if code == "origin_forward_lease_unavailable" else "rejected"
++        result = {"status": status, "code": code, "handoff_complete": False}
++    print(json.dumps(result))
++    return 0
+diff --git a/hermes_cli/kanban_origin_forward_decision.py b/hermes_cli/kanban_origin_forward_decision.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f06af1a5d691820b1f431bb413e54f54f36a4798
+--- /dev/null
++++ b/hermes_cli/kanban_origin_forward_decision.py
+@@ -0,0 +1,128 @@
++"""Freeze origin-local authorization before the courier can enqueue a create.
++
++The server-stamped input is supplied by a trusted local courier adapter. A retry
++reuses the exact durable envelope; a fresh decision needs live execution custody.
++No network writes, task creation, or completion claims happen in this module.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import re
++import sqlite3
++from contextlib import closing
++from pathlib import Path
++
++from hermes_cli.kanban_origin_forward import authorize
++
++_COMPONENT = r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}"
++
++
++def _matches(pattern, value):
++    return isinstance(value, str) and re.fullmatch(pattern, value) is not None
++
++
++def _canonical(value):
++    try:
++        raw = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
++    except (TypeError, ValueError, RecursionError) as exc:
++        raise ValueError("origin_forward_request_invalid") from exc
++    if len(raw.encode("utf-8")) > 262144:
++        raise ValueError("origin_forward_request_invalid")
++    return raw
++
++
++def _validate_create(create):
++    # Match the placement courier's surface, not arbitrary owner-tool parameters.
++    strings = {"title", "body", "assignee", "session_id", "admission_class", "admission_frees",
++               "model", "provider", "completion_contract", "idempotency_key", "distinct_reason"}
++    lists = {"skills", "requires", "distinct_from"}
++    integers = {"max_runtime_seconds", "priority", "goal_max_turns"}
++    booleans = {"goal_mode", "review_required", "triage"}
++    allowed = strings | lists | integers | booleans
++    if (not set(create) <= allowed
++            or not all(isinstance(create.get(key), str) and create[key].strip()
++                       for key in ("title", "assignee", "session_id"))
++            or not _matches(_COMPONENT, create["session_id"])):
++        raise ValueError("origin_forward_create_invalid")
++    for key, value in create.items():
++        if ((key in strings and not isinstance(value, str))
++                or (key in lists and (not isinstance(value, list) or not all(isinstance(v, str) for v in value)))
++                or (key in integers and type(value) is not int)
++                or (key in booleans and type(value) is not bool)):
++            raise ValueError("origin_forward_create_invalid")
++
++
++def _validated(request, gateway, profile):
++    if not isinstance(request, dict) or not isinstance(request.get("args"), dict):
++        raise ValueError("origin_forward_request_invalid")
++    args = request["args"]
++    origin = args.get("origin")
++    destination = args.get("destination")
++    if (not isinstance(origin, dict) or set(origin) != {"gateway", "profile", "session"}
++            or not all(_matches(_COMPONENT, value) for value in origin.values())
++            or origin["gateway"] != gateway or origin["profile"] != profile
++            or request.get("to_gw") != gateway or request.get("coll") != "sessions"
++            or request.get("action") != "origin-forward"
++            or request.get("key") != f"{profile}/{origin['session']}"
++            or not _matches("gw:" + _COMPONENT, request.get("from"))
++            or not _matches(r"[A-Za-z0-9._:-]{8,128}", request.get("id"))):
++        raise ValueError("origin_forward_route_invalid")
++    if (not isinstance(destination, dict) or set(destination) != {"gateway", "profile", "board"}
++            or not all(_matches(_COMPONENT, value) for value in destination.values())
++            or not isinstance(args.get("creator"), dict) or not isinstance(args.get("create"), dict)
++            or not isinstance(args.get("run_uid"), str) or not args["run_uid"]):
++        raise ValueError("origin_forward_request_invalid")
++    # Transport timestamps/claim counters are not part of the immutable request.
++    return {key: request[key] for key in ("id", "from", "to_gw", "coll", "key", "action", "args")}
++
++
++def _existing(db, identity, canonical):
++    row = db.execute("SELECT request_json,envelope_json FROM decisions WHERE identity=?", (identity,)).fetchone()
++    if row is None:
++        return None
++    if row[0] != canonical:
++        raise ValueError("origin_forward_conflict")
++    return json.loads(row[1])
++
++
++def prepare(request: dict, *, path: Path, ledger: Path, gateway: str, profile: str,
++            lease_lookup, now_ms, session_exists) -> dict:
++    canonical = _canonical(_validated(request, gateway, profile))
++    # Work only with a detached JSON snapshot, including across network I/O.
++    request = json.loads(canonical)
++    args = request["args"]
++    identity = _canonical([gateway, profile, request["from"], request["id"]])
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with closing(sqlite3.connect(path)) as db:
++        db.execute("PRAGMA synchronous=FULL")
++        db.execute("CREATE TABLE IF NOT EXISTS decisions (identity TEXT PRIMARY KEY, "
++                   "request_json TEXT NOT NULL, envelope_json TEXT NOT NULL)")
++        replay = _existing(db, identity, canonical)
++        if replay is not None:
++            return replay
++        _validate_create(args["create"])
++        creator = args["creator"]
++        from hermes_cli.kanban_origin_ledger import validate_binding
++        validate_binding({"binding_id": "validation", "version": 1, "publication_version": 1,
++                          "origin": args["origin"], "owner": creator,
++                          "task_record_key": "/".join(str(creator.get(k, ""))
++                                                     for k in ("profile", "board", "task_id"))})
++        lease = lease_lookup(creator["board"], creator["task_id"])
++        authorize(ledger=ledger, origin=args["origin"], creator=creator, gateway=gateway,
++                  profile=profile, sender=request["from"], run_uid=args["run_uid"],
++                  lease=lease, now_ms=now_ms(), session_exists=session_exists)
++        destination = args["destination"]
++        envelope = {"id": "origin-forward-" + hashlib.sha256(identity.encode()).hexdigest(),
++                    "to_gw": destination["gateway"], "coll": "tasks", "action": "create",
++                    "key": f"{destination['profile']}/{destination['board']}",
++                    "args": {"origin": args["origin"], "create": args["create"]}}
++        # Concurrent admissions may have raced the network read. Recheck while
++        # holding write custody, and return only after durable commit.
++        with db:
++            db.execute("BEGIN IMMEDIATE")
++            replay = _existing(db, identity, canonical)
++            if replay is not None:
++                return replay
++            db.execute("INSERT INTO decisions VALUES (?,?,?)", (identity, canonical, _canonical(envelope)))
++        return envelope
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 773e84319d8a684e0186b2251d3e96665d9c9326..01d96687734db1af4075adca09d04dda22286b74 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -224,6 +224,10 @@ _SPECS = [
+         _arg("--request-file", required=True, help="Trusted courier envelope file ('-' = stdin)"),
+         _arg("--json", action="store_true", help="Return the owner reading (always JSON)"),
+     ], help="Read-only owner continuation evidence for an origin binding (never writes)"),
++    _cmd("origin-forward", [
++        _arg("--request-file", required=True, help="Trusted courier envelope file ('-' = stdin)"),
++        _arg("--json", action="store_true", help="Return frozen outbound envelope (always JSON)"),
++    ], help="Authorize worker placement forwarding at the origin gateway; never a completion receipt"),
+     _cmd("origin-bind", [
+         _arg("--request-file", required=True, help="Trusted courier envelope file ('-' = stdin)"),
+         _arg("--json", action="store_true", help="Return structured receipt (always JSON)"),
+diff --git a/tests/hermes_cli/test_origin_forward_abuse.py b/tests/hermes_cli/test_origin_forward_abuse.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..18bd75ffd697e963fc78c62c3a574dbbea3f3572
+--- /dev/null
++++ b/tests/hermes_cli/test_origin_forward_abuse.py
+@@ -0,0 +1,55 @@
++"""Abuse and concurrent admission controls for the immutable decision store."""
++import copy
++from concurrent.futures import ThreadPoolExecutor
++from threading import Barrier
++
++import pytest
++
++from tests.hermes_cli import test_origin_forward_decision as helpers
++
++forwarding = helpers.forwarding
++authority = helpers.authority
++decide = helpers.decide
++
++
++@pytest.mark.parametrize("key,value", [("origin", {}), ("owner", {}), ("title", ""),
++    ("session_id", "../chat"), ("body", 3), ("skills", "git"), ("requires", [3]),
++    ("priority", True), ("triage", 1)])
++def test_create_surface_is_not_arbitrary_tool_dispatch(forwarding, key, value):
++    changed = copy.deepcopy(forwarding[0])
++    changed["args"]["create"][key] = value
++    with pytest.raises(ValueError, match="origin_forward_create_invalid"):
++        decide(forwarding, changed)
++    assert not forwarding[2]
++
++
++def test_oversized_payload_refused_before_storage(forwarding):
++    changed = copy.deepcopy(forwarding[0])
++    changed["args"]["create"]["body"] = "x" * 262145
++    with pytest.raises(ValueError, match="origin_forward_request_invalid"):
++        decide(forwarding, changed)
++    assert not forwarding[1]["path"].exists()
++
++
++def test_concurrent_conflicting_admissions_only_freeze_one(forwarding):
++    # Initialize an empty store before the racing network reads.
++    with pytest.raises(ValueError):
++        decide(forwarding, lease_lookup=lambda *args: None)
++    gate = Barrier(2)
++    changed = copy.deepcopy(forwarding[0])
++    changed["args"]["create"]["title"] = "different"
++
++    def lookup(*args):
++        gate.wait(timeout=10)
++        return {"task_id": "task-1", "holder": "worker-7", "run_uid": "run-1", "expires": 2000}
++
++    def run(req):
++        try:
++            return decide(forwarding, req, lease_lookup=lookup)
++        except ValueError as exc:
++            return str(exc)
++
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        outcomes = list(pool.map(run, [forwarding[0], changed]))
++    assert sum(isinstance(item, dict) for item in outcomes) == 1
++    assert "origin_forward_conflict" in outcomes
+diff --git a/tests/hermes_cli/test_origin_forward_adapter.py b/tests/hermes_cli/test_origin_forward_adapter.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5e26c55b179c2c1f41b665060907b434beb35b86
+--- /dev/null
++++ b/tests/hermes_cli/test_origin_forward_adapter.py
+@@ -0,0 +1,70 @@
++"""Execute registered forwarding argv with real session and accepted-ledger stores."""
++import argparse
++import io
++import json
++
++import pytest
++
++from hermes_cli import kanban, kanban_sync_client
++from hermes_cli.kanban_parser import build_parser
++from tests.hermes_cli import test_kanban_origin_adapter as helpers
++
++world = helpers.world
++
++
++def invoke(world, monkeypatch, capsys, envelope):
++    parser = build_parser(argparse.ArgumentParser().add_subparsers())
++    args = parser.parse_args(["origin-forward", "--request-file", "-", "--json"])
++    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(envelope)))
++    monkeypatch.setattr(kanban.kb, "init_db", lambda: pytest.fail("must not initialize a board"))
++    assert kanban.kanban_command(args) == 0
++    return json.loads(capsys.readouterr().out)
++
++
++@pytest.fixture
++def envelope(world, monkeypatch, capsys):
++    assert helpers.invoke(world, monkeypatch, capsys)["status"] == "accepted"
++    binding = world[3]["args"]["binding"]
++    monkeypatch.setattr(kanban_sync_client, "load_identity", lambda: None)
++    monkeypatch.setattr(kanban_sync_client.Hub, "snapshot_page", lambda *a, **k: {
++        "table": "leases", "rows": [{"task_id": "t_one", "holder": "worker-7", "run_uid": "run-1",
++                                    "expires": 9999999999999}], "more": False})
++    return {"id": "placement:worker-7:test", "from": "gw:worker-7", "to_gw": "origin",
++            "coll": "sessions", "key": "default/s_old", "action": "origin-forward",
++            "args": {"origin": binding["origin"], "creator": binding["owner"], "run_uid": "run-1",
++                     "destination": {"gateway": "owner", "profile": "work", "board": "build"},
++                     "create": {"title": "child", "assignee": "work", "session_id": "creator-1"}}}
++
++
++def test_actual_parser_adapter_persists_then_replays_offline(world, monkeypatch, capsys, envelope):
++    first = invoke(world, monkeypatch, capsys, envelope)
++    assert first["status"] == "prepared" and first["handoff_complete"] is False
++    assert first["outbound"]["args"]["origin"]["gateway"] == "origin"
++    assert "from" not in first["outbound"]
++    assert (world[0] / "kanban/origin-forward.db").exists()
++    monkeypatch.setattr(kanban_sync_client, "load_identity", lambda: pytest.fail("replay must not read network identity"))
++    assert invoke(world, monkeypatch, capsys, envelope) == first
++
++
++@pytest.mark.parametrize("mode", ["offline", "malformed", "missing", "wrong-holder"])
++def test_authority_failure_no_outbound(world, monkeypatch, capsys, envelope, mode):
++    def snapshot(*args, **kwargs):
++        if mode == "offline":
++            raise OSError("offline")
++        if mode == "malformed":
++            return {}
++        return {"table": "leases", "rows": [] if mode == "missing" else [
++            {"task_id": "t_one", "holder": "worker-8", "run_uid": "run-1", "expires": 9999999999999}], "more": False}
++    monkeypatch.setattr(kanban_sync_client.Hub, "snapshot_page", snapshot)
++    result = invoke(world, monkeypatch, capsys, envelope)
++    assert result["status"] == ("pending" if mode in {"offline", "malformed"} else "rejected")
++    assert result["handoff_complete"] is False and "outbound" not in result
++
++
++def test_delegated_fence_uses_forward_store(world, monkeypatch, capsys):
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(world[0].parent / "other-board"))
++    monkeypatch.setattr("agent.delegation_context.kanban_path_is_fenced",
++                        lambda path: path == world[0] / "kanban/origin-forward.db")
++    args = argparse.Namespace(kanban_action="origin-forward", request_file="-")
++    assert kanban.kanban_command(args) != 0
++    assert not (world[0] / "kanban/origin-forward.db").exists()
+diff --git a/tests/hermes_cli/test_origin_forward_decision.py b/tests/hermes_cli/test_origin_forward_decision.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5e3e9f58f7b966254c9693c376a3da0d3a55704d
+--- /dev/null
++++ b/tests/hermes_cli/test_origin_forward_decision.py
+@@ -0,0 +1,98 @@
++"""Immutable forwarding authorization survives retries, never payload changes."""
++import copy
++import sqlite3
++
++import pytest
++
++from tests.hermes_cli import test_origin_forward_authority as helpers
++
++authority = helpers.authority
++
++
++@pytest.fixture
++def forwarding(authority, tmp_path):
++    path, binding, lease = authority
++    request = {"id": "placement:worker-7:request-1", "from": "gw:worker-7", "to_gw": "macbook",
++               "coll": "sessions", "key": "default/chat-1", "action": "origin-forward",
++               "args": {"origin": binding["origin"], "creator": binding["owner"], "run_uid": "run-1",
++                        "destination": {"gateway": "hub", "profile": "default", "board": "default"},
++                        "create": {"title": "child", "assignee": "default", "session_id": "owner-session"}}}
++    calls = []
++
++    def lookup(board, task):
++        calls.append((board, task))
++        return lease
++
++    options = dict(path=tmp_path / "forward.db", ledger=path, gateway="macbook", profile="default",
++                   lease_lookup=lookup, now_ms=lambda: 1000, session_exists=lambda sid: sid == "chat-1")
++    return request, options, calls
++
++
++def decide(forwarding, request=None, **overrides):
++    from hermes_cli.kanban_origin_forward_decision import prepare
++    original, options, _ = forwarding
++    return prepare(original if request is None else request, **(options | overrides))
++
++
++def test_forward_envelope_frozen_before_queue_and_survives_lease_end(forwarding):
++    first = decide(forwarding)
++    assert first["to_gw"] == "hub"
++    assert first["coll"] == "tasks" and first["action"] == "create"
++    assert first["key"] == "default/default"
++    assert first["args"]["origin"]["gateway"] == "macbook"
++    assert "from" not in first  # courier authenticates the actual MacBook, never copied worker identity
++    assert first["args"]["create"] == forwarding[0]["args"]["create"]
++    assert decide(forwarding, now_ms=lambda: 99999) == first
++    assert forwarding[2] == [("default", "task-1")]
++    with sqlite3.connect(forwarding[1]["path"]) as db:
++        assert db.execute("SELECT count(*) FROM decisions").fetchone()[0] == 1
++
++
++@pytest.mark.parametrize("field", ["create", "destination", "run_uid", "creator"])
++def test_same_id_changed_payload_conflicts(forwarding, field):
++    decide(forwarding)
++    changed = copy.deepcopy(forwarding[0])
++    values = {"create": {"title": "changed"}, "destination": {"gateway": "other", "profile": "default", "board": "default"},
++              "run_uid": "run-2", "creator": {"gateway": "hub", "profile": "default", "board": "default", "task_id": "other"}}
++    changed["args"][field] = values[field]
++    with pytest.raises(ValueError, match="origin_forward_conflict"):
++        decide(forwarding, changed)
++
++
++@pytest.mark.parametrize("field,value", [("to_gw", "worker-7"), ("key", "default/other"),
++    ("action", "create"), ("coll", "tasks"), ("from", "worker-7"), ("id", "bad id")])
++def test_wrong_route_never_authorizes(forwarding, field, value):
++    with pytest.raises(ValueError, match="origin_forward_"):
++        decide(forwarding, forwarding[0] | {field: value})
++    assert not forwarding[2]
++
++
++def test_unavailable_evidence_never_freezes_authorization(forwarding):
++    def offline(*args):
++        raise OSError("offline")
++    with pytest.raises(OSError):
++        decide(forwarding, lease_lookup=offline)
++    with sqlite3.connect(forwarding[1]["path"]) as db:
++        assert db.execute("SELECT count(*) FROM decisions").fetchone()[0] == 0
++    assert decide(forwarding)["args"]["origin"]["gateway"] == "macbook"
++
++
++def test_sender_cannot_replay_other_workers_decision(forwarding):
++    decide(forwarding)
++    with pytest.raises(ValueError, match="origin_forward_lease_invalid"):
++        decide(forwarding, forwarding[0] | {"from": "gw:worker-8"})
++
++
++def test_new_request_after_lease_expiry_refused(forwarding):
++    decide(forwarding)
++    with pytest.raises(ValueError, match="origin_forward_lease_invalid"):
++        decide(forwarding, forwarding[0] | {"id": "placement:worker-7:request-2"}, now_ms=lambda: 2000)
++
++
++@pytest.mark.parametrize("destination", [{}, {"gateway": "hub", "profile": "default", "board": "../other"}, None])
++def test_bad_destination_refused_without_authority_read(forwarding, destination):
++    changed = copy.deepcopy(forwarding[0])
++    changed["args"]["destination"] = destination
++    with pytest.raises(ValueError, match="origin_forward_"):
++        decide(forwarding, changed)
++    assert not forwarding[2]
+-- 
+2.43.0
+

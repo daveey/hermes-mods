@@ -1,0 +1,1001 @@
+From 330affe3a6ef204435876934cd2f3c9b33b97315 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 16:39:55 +0000
+Subject: [PATCH] [daveey] Detect compound-array and builtin quoted-subscript
+ arithmetic sinks
+
+Squash of the five reviewed commits of PR #2788 plus the linear-time fix for review
+5905734191, rebased onto main 854519ff5a (after #2981, which also edits
+tools/shell_arith_sink.py). Original commit messages follow in order.
+
+----
+
+[daveey] Detect compound array and quoted builtin subscript sinks
+
+Proof: baseline d9e85d65 has 22 failing must-sink cases; targeted suites pass 159 tests with the fix. Preserve numeric date exemption policy and ordinary quoted data controls.
+
+[daveey] Keep arithmetic expansion dispatch within complexity budget
+
+[daveey] Resolve builtin command position before quoted subscript sinks
+
+Address PR #2788 R1: share reserved-word peeling with lifecycle command scans; recognize assignments, command/builtin options, redirections and continuations before quoted variable names. Keep echo data and command introspection non-sinks.
+
+Proof: 52 new failures on 56dfe1b01c, 148 targeted tests pass after fix including 10 actual Bash recursive marker executions. Nine exact-anchor classifier mutants killed. Broad pre-redirection selection: 2784 passed; 2400-case corpus: zero violations and false refusals. Canonical ship rebases stale base before final static gate and exact-head review.
+
+fix(guard): scope quoted subscript sinks to command frames [daveey]
+
+Review R1/R2: raw character adjacency rejected quote-concatenated names, while full-prefix tokenization inherited outer substitution quotes. Use command-frame source offsets and independent backtick scopes; let builtin target recognition handle quote boundaries.
+
+Proof: 26 RED regressions at 86d7baf, GREEN 1713 guard tests. Generated 140 real-Bash sink executions and 70 inert controls; baseline misses all 140, fixed code misses none. Adjacency/full-prefix/backtick mutants killed. Shape corpus and all static checks green.
+
+fix(guard): preserve expansion words and fail closed on unknown consumers [daveey]
+
+R1: prefix re-tokenization treated completed expansion punctuation as outer command boundaries. Mask nested expansion frames before tokenization and default unresolved consumers to arithmetic; exempt only proven data/introspection/redirection positions. Unsupported case grammar fails closed.
+
+Proof: prior-head RED 25 failures; generated prior/builtin/name/wrapper Bash oracle and guard regression green. Includes review and shepherd expansion variants, inert controls, and date watcher preservation.
+
+[daveey] Keep quoted-subscript classification linear and command-scoped
+
+Review 5905734191 (t_8794b5573bc87df3) found substitution_in_arithmetic
+re-tokenized the whole frame prefix for every double-quoted '[', making the
+lifecycle scan quadratic (1500 echo "[..]" lines: 26.8 s vs 0.72 s base).
+
+- Command frames now track the start of their current simple command: unquoted
+  ';', '&', '|' and newline (and the end of a heredoc body) reset it, so
+  quoted_name_is_arithmetic only sees its own command. Redirection '&'/'|'
+  (>&, <&, &>, >|) do not reset.
+- A quoted '[' is classified only when the character before it (past quote
+  concatenation) can end a name or an expansion; whitespace, '=', ':', '.', '/'
+  and similar never form a subscript (real bash 5: inert), which also drops the
+  curl -d "[$(..)]" / git commit -m "fix [$(..)]" false positives (nit 3).
+- The classification is cached per quoted word, so a long python -c "..." word
+  is read once.
+- The compound-assignment check walks back over the name instead of searching
+  command[:start] for every '('.
+
+Linear-time accounting tests (deterministic call/length counts) are RED at
+2d42734f9f (file times out at 300 s; python word and 4 inert-name controls
+fail) and GREEN here. Sinks across ;/&&/||/|/&/newline/heredoc and quote/
+expansion concatenation stay sinks under a real-bash marker oracle.
+
+Bench (scan_gateway_lifecycle), this head vs 2d42734f9f: deploy 1500 lines
+1.38 s vs 43.8 s; echo "[INFO]" x1000 0.70 s vs 12.6 s; 8 KB python -c
+0.12 s vs 1.21 s. Guard suites: 39 files, 8639 passed, 0 failed.
+---
+ cron/lifecycle_guard.py                       |  38 +----
+ .../test_lifecycle_guard_subscript_linear.py  | 115 ++++++++++++++
+ .../test_lifecycle_guard_subscript_prefix.py  |  78 +++++++++
+ .../test_lifecycle_guard_subscript_quotes.py  |  60 +++++++
+ .../test_lifecycle_guard_subscript_sink.py    | 148 ++++++++++++++++++
+ tools/shell_arith_sink.py                     | 124 +++++++++++----
+ tools/shell_command_position.py               | 105 +++++++++++++
+ tools/shell_prefix_expansions.py              |  91 +++++++++++
+ 8 files changed, 697 insertions(+), 62 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_subscript_linear.py
+ create mode 100644 tests/cron/test_lifecycle_guard_subscript_prefix.py
+ create mode 100644 tests/cron/test_lifecycle_guard_subscript_quotes.py
+ create mode 100644 tests/cron/test_lifecycle_guard_subscript_sink.py
+ create mode 100644 tools/shell_command_position.py
+ create mode 100644 tools/shell_prefix_expansions.py
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index dc6d0e63c8b458105f3772f4c663ac5a78bc2dcc..443c9409d49f29b8178e36fa053e5ad5d1c06c5b 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -761,43 +761,11 @@ def _iter_command_segments(command: str) -> Iterator[list[str]]:
+         yield from _split_segments(tokens)
+ 
+ 
+-# Reserved words that may lead a segment before the command it runs or the `(` that opens a
+-# command list: `if (cd x && ./y)`, `then x`, `! x`, `time -p x`, `{ x; }`, `coproc NAME { x; }`,
+-# `function NAME ( … )`. `fi`/`done`/`}` close a list and run nothing.
+-_RESERVED_PREFIX_WORDS = frozenset({
+-    "if", "then", "else", "elif", "do", "while", "until", "!", "time", "coproc", "in", "{",
+-    "function",
+-})
+-_SHELL_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+-
+-
+ def _peel_reserved_words(segment: list[str]) -> int:
+-    """Index of the first word of *segment* past its leading reserved words and their operands
+-    (bash's ``time [-p] [--]``, ``coproc NAME`` before a compound command, ``function NAME``).
++    """Shared keyword walk for command lists, printers and arithmetic name consumers."""
++    from tools.shell_command_position import peel_reserved_words
+ 
+-    The one keyword walk shared by the ``(`` classifier and the executed-command scan, so the two
+-    cannot disagree about what a leading keyword hides. An ordinary command's argument named
+-    ``time`` is not a keyword: only words before the first non-keyword are peeled."""
+-    index = 0
+-    while index < len(segment) and segment[index] in _RESERVED_PREFIX_WORDS:
+-        word = segment[index]
+-        index += 1
+-        if index >= len(segment):
+-            break
+-        if word == "time":
+-            if segment[index] == "-p":
+-                index += 1
+-            if index < len(segment) and segment[index] == "--":
+-                index += 1
+-        elif word == "function":
+-            # `function NAME ( … )` defines (does not run) NAME; its body is a command list.
+-            index += 1
+-        elif word == "coproc" and _SHELL_NAME.fullmatch(segment[index]) and (
+-            index + 1 == len(segment) or segment[index + 1] == "{"
+-        ):
+-            # `coproc NAME ( … )` / `coproc NAME { …; }`; `coproc cmd args` runs cmd itself.
+-            index += 1
+-    return index
++    return peel_reserved_words(segment)
+ 
+ 
+ def _opens_call_arguments(segment: list[str]) -> bool:
+diff --git a/tests/cron/test_lifecycle_guard_subscript_linear.py b/tests/cron/test_lifecycle_guard_subscript_linear.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8bd04e7143483f7137d747ded63cfb44f067e351
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_subscript_linear.py
+@@ -0,0 +1,115 @@
++"""Quoted-subscript classification stays linear and scoped to its simple command."""
++
++import shutil
++import subprocess
++
++import pytest
++
++import tools.shell_arith_sink as arith_sink
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from tools.shell_heredoc import output_reaches_shell
++
++PRODUCER = "$(echo 'b[$(bash ./big.sh)]')"
++
++
++@pytest.fixture
++def prefix_lengths(monkeypatch):
++    lengths = []
++    real = arith_sink.quoted_name_is_arithmetic
++
++    def counting(prefix):
++        lengths.append(len(prefix))
++        return real(prefix)
++
++    monkeypatch.setattr(arith_sink, "quoted_name_is_arithmetic", counting)
++    return lengths
++
++
++@pytest.mark.parametrize("script", [
++    "".join(f'echo "[deploy] step {i}: $(hostname)"\n' for i in range(1500)),
++    "bash deploy.sh <<'EOF'\n" + "".join(
++        f'echo "[INFO] line {i}: $(hostname)"\n' for i in range(1000)) + "EOF\n",
++    "".join(f'git commit -m "fix [{i}]"; curl -d "[$(cat f{i})]"\n' for i in range(1000)),
++])
++def test_unnamed_quoted_brackets_are_never_classified(prefix_lengths, script):
++    assert not arith_sink.substitution_in_arithmetic(script, date_exempt=True)
++    assert prefix_lengths == []
++
++
++def test_classification_reads_each_simple_command_once(prefix_lengths):
++    lines = [f'printf -v "a[{i}]" %s "x[0] y[1] z[$(date +%s)]"' for i in range(1500)]
++    script = "\n".join(lines) + "; " + "; ".join(f'jq "x{i}[0] y[1]"' for i in range(1500))
++    assert not arith_sink.substitution_in_arithmetic(script, date_exempt=True)
++    # One call per quoted word that can name a subscript, each from its own command start.
++    assert len(prefix_lengths) == 3 * 1500
++    assert sum(prefix_lengths) < 2 * len(script)
++
++
++def test_python_program_word_is_classified_once(prefix_lengths):
++    body = "\n".join(f"x{i} = d['k{i}'][0] + v[{i}]" for i in range(400))
++    command = f'python3 -c "{body}"'
++    arith_sink.substitution_in_arithmetic(command, date_exempt=True)
++    assert len(prefix_lengths) <= 1
++
++
++SINKS = [
++    'echo hi; unset "a[{p}]"',
++    'echo hi && unset "a[{p}]"',
++    'false || unset "a[{p}]"',
++    'echo hi | unset "a[{p}]"',
++    'echo hi & unset "a[{p}]"; wait',
++    'echo hi\nunset "a[{p}]"',
++    "cat <<EOF\nbody\nEOF\nunset \"a[{p}]\"",
++    "cat <<'EOF'\nbody\nEOF\nprintf -v \"a[{p}]\" %s 1",
++    'v=a; unset "$v[{p}]"',
++    'unset $(echo a)"[{p}]"',
++    'set -- a; unset $@"[{p}]"',
++    'unset "a""[{p}]"',
++    "unset 'a'\"[{p}]\"",
++    'declare -a "x=([{p}]=1)"',
++]
++DATA = [
++    'unset x; echo "a[{p}]"',
++    'unset x && grep "a[{p}]" /dev/null',
++    'echo 2>&1 "a[{p}]"',
++    'echo >| /dev/null "a[{p}]"',
++    'unset "a [{p}]"',
++    'declare "x=[{p}]"',
++    'unset "a.[{p}]"',
++    'unset "a:[{p}]"',
++]
++
++
++def _run(tmp_path, command):
++    bash = shutil.which("bash")
++    if bash is None:
++        pytest.skip("Bash is required for recursive index execution proof")
++    payload = tmp_path / "big.sh"
++    payload.write_text("# padding\n" * 140000 + "printf ran > marker\n", encoding="utf-8")
++    subprocess.run(
++        [bash, "--noprofile", "--norc"], input="a=(1)\n" + command + "\n", text=True,
++        encoding="utf-8", capture_output=True, timeout=20, check=False,
++        cwd=tmp_path, env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
++    )
++    return (tmp_path / "marker").exists()
++
++
++@pytest.mark.parametrize("shape", SINKS)
++def test_separated_and_concatenated_subscripts_stay_sinks(tmp_path, shape):
++    command = shape.format(p=PRODUCER)
++    bash = shutil.which("bash") or "bash"
++    if "printf -v" not in shape or "version 3." not in subprocess.run(
++            [bash, "--version"], capture_output=True, text=True, timeout=10,
++            check=False).stdout:
++        assert _run(tmp_path, command)
++    assert output_reaches_shell(command)
++    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert unsafe and refusal and "larger than the scan cap" in refusal
++
++
++@pytest.mark.parametrize("shape", DATA)
++def test_non_subscript_words_stay_data(tmp_path, shape):
++    command = shape.format(p=PRODUCER)
++    assert not _run(tmp_path, command)
++    assert not arith_sink.substitution_in_arithmetic(
++        shape.format(p="$(value)"), date_exempt=True)
+diff --git a/tests/cron/test_lifecycle_guard_subscript_prefix.py b/tests/cron/test_lifecycle_guard_subscript_prefix.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2b3dfcc5f69bb86412350e286d08b30e3b647377
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_subscript_prefix.py
+@@ -0,0 +1,78 @@
++"""Prior expansions cannot erase the builtin owning a later arithmetic name."""
++
++import shutil
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from tests.cron.test_lifecycle_guard_subscript_quotes import NAMES, WRAPPERS
++from tools.shell_arith_sink import substitution_in_arithmetic
++from tools.shell_heredoc import output_reaches_shell
++
++PRIOR = [
++    "x", "$(echo x)", "$(echo x; echo y)", "$((1))", "<(echo x)",
++    "${z:-$(echo y)}", "`echo x`", '"$(echo x)"', '"$((1))"',
++    '"${z:-$(echo y)}"', '"`echo x`"', '"<(echo x)"',
++    "$(echo \"$(echo x)\")", '2>$(echo /dev/null)', '2>"$(echo /dev/null)"',
++    '"$(echo x; echo y)"',
++]
++BUILTINS = [
++    'unset {prior} "a[{producer}]"',
++    'X={prior} printf -v "a[{producer}]" %s 1',
++    'X={prior} read "a[{producer}]" <<< 1',
++    'X={prior} declare "a[{producer}]=1"',
++    'X={prior} test -v "a[{producer}]"',
++]
++
++
++@pytest.fixture(scope="module")
++def marker_payload(tmp_path_factory):
++    payload = tmp_path_factory.mktemp("prefix-payload") / "big.sh"
++    payload.write_text("#" + "padding" * 200000 + "\nprintf ran > marker\n")
++    return payload
++
++
++@pytest.mark.parametrize("name", NAMES)
++@pytest.mark.parametrize("prior", PRIOR)
++@pytest.mark.parametrize("builtin", BUILTINS)
++@pytest.mark.parametrize("wrapper", WRAPPERS)
++def test_prior_expansion_cross_product(tmp_path, marker_payload, name, prior, builtin, wrapper):
++    bash = shutil.which("bash")
++    if bash is None:
++        pytest.skip("Bash required for execution evidence")
++    (tmp_path / "big.sh").symlink_to(marker_payload)
++    builtin = builtin.replace('"a[', name + '"[')
++    if prior.startswith("2>"):
++        builtin = builtin.replace("X={prior}", "{prior}")
++    inner = builtin.format(prior=prior, producer="$(echo 'b[$(bash ./big.sh)]')")
++    if "`" in wrapper:
++        inner = inner.replace("`", "\\`")  # Bash requires escaped nested backticks.
++    command = "a=(1); " + wrapper.format(inner)
++    subprocess.run(
++        [bash, "--noprofile", "--norc"], input=command + "\n", text=True,
++        capture_output=True, timeout=10, check=False, cwd=tmp_path,
++        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
++    )
++    # Older Bash, or a backtick wrapper around a backtick prior, can reject a
++    # command. Every actual execution must be refused; static policy is stronger.
++    if (tmp_path / "marker").exists():
++        unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++        assert unsafe and refusal and "larger than the scan cap" in refusal
++    assert output_reaches_shell(command)
++
++
++@pytest.mark.parametrize("prior", PRIOR)
++@pytest.mark.parametrize("command", ['echo {prior}', 'printf %s {prior}', 'cat {prior}', 'grep x {prior}'])
++def test_proven_data_commands_with_prior_expansions(prior, command):
++    assert not output_reaches_shell(command.format(prior=prior) + ' "a[$(value)]"')
++
++
++@pytest.mark.parametrize("command", [
++    'unknown x "a[$(value)]"',
++    '$(echo unset) "a[$(value)]"',
++    '$consumer "a[$(value)]"',
++    'command "a[$(value)]"',
++])
++def test_unknown_command_fails_closed(command):
++    assert substitution_in_arithmetic(command, date_exempt=True)
+diff --git a/tests/cron/test_lifecycle_guard_subscript_quotes.py b/tests/cron/test_lifecycle_guard_subscript_quotes.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e19c034d92cf5030c4f9997f3a3f8df0fa64cb5e
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_subscript_quotes.py
+@@ -0,0 +1,60 @@
++"""Cross-product proof of quote removal and independent substitution scopes."""
++
++import shutil
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from tools.shell_arith_sink import substitution_in_arithmetic
++from tools.shell_heredoc import output_reaches_shell
++
++
++NAMES = ["a", '"a"', "'a'", "$'a'", '""a""']
++WRAPPERS = [
++    "{}", "if {}; then :; fi", "! {}", "time {}", "X=1 {}",
++    "command -p {}", "{{ {}; }}", "( {} )", "echo $({})",
++    'echo "$({})"', "echo `{}`", "for i in 1; do {}; done",
++    'x="$({})"', 'echo "$(echo "$({})")"',
++]
++BUILTINS = ['unset {name}"[{producer}]"', 'printf -v {name}"[{producer}]" %s 1']
++
++
++def _command(name, wrapper, builtin, producer):
++    return "a=(1); " + wrapper.format(builtin.format(name=name, producer=producer))
++
++
++@pytest.mark.parametrize("name", NAMES)
++@pytest.mark.parametrize("wrapper", WRAPPERS)
++@pytest.mark.parametrize("builtin", BUILTINS)
++def test_quoted_name_scope_cross_product(tmp_path, name, wrapper, builtin):
++    bash = shutil.which("bash")
++    if bash is None:
++        pytest.skip("Bash is required for recursive index execution proof")
++    payload = tmp_path / "big.sh"
++    payload.write_text("# padding\n" * 140000 + "printf ran > marker\n", encoding="utf-8")
++    command = _command(name, wrapper, builtin, "$(echo 'b[$(bash ./big.sh)]')")
++    result = subprocess.run(
++        [bash, "--noprofile", "--norc"], input=command + "\n", text=True,
++        encoding="utf-8", capture_output=True, timeout=10, check=False,
++        cwd=tmp_path, env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
++    )
++    # Bash 3 lacks printf array destinations. The scanner must still classify it.
++    if not ("printf" in builtin and "version 3." in subprocess.run(
++        [bash, "--version"], capture_output=True, text=True, encoding="utf-8",
++        timeout=10, check=False,
++    ).stdout):
++        assert (tmp_path / "marker").read_text(encoding="utf-8") == "ran", result.stderr
++    assert output_reaches_shell(command)
++    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert unsafe and refusal and "larger than the scan cap" in refusal
++    date_command = _command(name, wrapper, builtin, "$(date +%s)")
++    assert not substitution_in_arithmetic(date_command, date_exempt=True)
++    assert substitution_in_arithmetic(date_command, date_exempt=False)
++
++
++@pytest.mark.parametrize("name", NAMES)
++@pytest.mark.parametrize("wrapper", WRAPPERS)
++def test_nested_echo_names_remain_data(name, wrapper):
++    command = _command(name, wrapper, 'echo unset {name}"[{producer}]"', "$(value)")
++    assert not output_reaches_shell(command)
+diff --git a/tests/cron/test_lifecycle_guard_subscript_sink.py b/tests/cron/test_lifecycle_guard_subscript_sink.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..493342e011fc567a96496c9eb319099b09f38d71
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_subscript_sink.py
+@@ -0,0 +1,148 @@
++"""Arithmetic re-evaluation of compound indices and builtin variable names."""
++
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from tests.cron.test_lifecycle_guard_arith_sink import _big_log
++from tools.shell_arith_sink import substitution_in_arithmetic
++from tools.shell_heredoc import output_reaches_shell
++
++
++PRIOR_EXPANSION_SHAPES = [
++    'a=(1); unset $(case x in x) echo x;; esac) "a[{producer}]"',
++    'a=(1); unset $(case x in (x) echo x;; esac) "a[{producer}]"',
++    'a=(1); unset $(echo x) "a[{producer}]"',
++    'a=(1); unset "$(echo x)" "a[{producer}]"',
++    'a=(1); X=$(echo x) unset "a[{producer}]"',
++    'a=(1); unset `echo x` "a[{producer}]"',
++    'a=(1); unset $(echo "$(echo x)") "a[{producer}]"',
++    'a=(1); unset $(echo "; ) unset") "a[{producer}]"',
++    'a=(1); unset $((1 + 2)) "a[{producer}]"',
++    'a=(1); X=$(echo x) printf -v "a[{producer}]" %s 1',
++    'a=(1); unset $(echo x; echo y) "a[{producer}]"',
++    'a=(1); unset <(echo x) "a[{producer}]"',
++    'a=(1); unset ${z:-$(echo y)} "a[{producer}]"',
++    'a=(1); unset 2>$(echo /dev/null) "a[{producer}]"',
++    'a=(1); unset >$(echo /dev/null) "a[{producer}]"',
++]
++
++
++QUOTE_SCOPE_SHAPES = [
++    'a=(1); unset "a""[{producer}]"',
++    'a=(1); unset a"[{producer}]"',
++    'a=(1); printf -v "a""[{producer}]" %s 1',
++    'a=(1); echo "$(unset "a[{producer}]")"',
++    'a=(1); echo "$(printf -v "a[{producer}]" %s 1)"',
++    'a=(1); echo "$(echo "$(unset "a""[{producer}]")")"',
++]
++
++
++SHAPES = [
++    "a=([{producer}]=1)",
++    "declare -a a=([{producer}]=1)",
++    "a+=([{producer}]=2)",
++    'a=(1 2 3); unset "a[{producer}]"',
++    'a=(1); printf -v "a[{producer}]" %s 1',
++    'read "a[{producer}]" <<< 1',
++    'declare "a[{producer}]=1"',
++    'f() { local "a[{producer}]=1"; }; f',
++    'typeset "a[{producer}]=1"',
++    '[[ -v "a[{producer}]" ]]',
++    'test -v "a[{producer}]"',
++    '[ -v "a[{producer}]" ]',
++    'a=(1); if unset "a[{producer}]"; then :; fi',
++    'a=(1); ! unset "a[{producer}]"',
++    'a=(1); X=1 unset "a[{producer}]"',
++    'a=(1); command -p unset "a[{producer}]"',
++    'a=(1); time unset "a[{producer}]"',
++    'a=(1); for i in 1; do unset "a[{producer}]"; done',
++    'a=(1); if printf -v "a[{producer}]" 1; then :; fi',
++    'a=(1); time -p -- command -p builtin unset "a[{producer}]"',
++    'a=(1); while unset "a[{producer}]"; do break; done',
++    'a=(1); until unset "a[{producer}]"; do break; done',
++    'a=(1); if :; then unset "a[{producer}]"; fi',
++    'a=(1); if false; then :; elif unset "a[{producer}]"; then :; fi',
++    'a=(1); if false; then :; else unset "a[{producer}]"; fi',
++    'a=(1); unset 2>&1 "a[{producer}]"',
++    'a=(1); >/dev/null unset "a[{producer}]"',
++    'a=(1); command -p 2>/dev/null unset "a[{producer}]"',
++    'a=(1); unset \\\n "a[{producer}]"',
++    'a=(1); printf -v"a[{producer}]" %s 1',
++] + QUOTE_SCOPE_SHAPES + PRIOR_EXPANSION_SHAPES
++
++
++@pytest.mark.parametrize("shape", SHAPES)
++@pytest.mark.parametrize("producer", ["$(echo 'b[$(bash BIG)]')", "`echo 'b[$(bash BIG)]'`"])
++def test_subscript_producer_is_sink(tmp_path, shape, producer):
++    command = shape.replace("{producer}", producer).replace("BIG", str(_big_log(tmp_path)))
++    assert output_reaches_shell(command)
++    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert unsafe
++    assert refusal and "larger than the scan cap" in refusal
++
++
++@pytest.mark.parametrize("shape", SHAPES)
++def test_numeric_date_subscript_is_not_sink(shape):
++    # output_reaches_shell conservatively disables the date exemption for any
++    # declare/typeset command (possible imported function); preserve that policy.
++    command = shape.replace("{producer}", "$(date +%s)")
++    assert not substitution_in_arithmetic(command, date_exempt=True)
++    assert substitution_in_arithmetic(command, date_exempt=False)
++
++
++@pytest.mark.parametrize("shape", SHAPES)
++def test_backtick_without_dollar_substitution_is_sink(shape):
++    assert substitution_in_arithmetic(shape.replace("{producer}", "`value`"), date_exempt=True)
++
++
++@pytest.mark.parametrize("command", [
++    'echo "<("; echo "a[$(value)]"',
++    '# $(\necho "a[$(value)]"',
++    'echo $(echo x) "a[$(value)]"',
++    'printf %s "$(echo x)" "a[$(value)]"',
++    'command -v unset "$(echo x)" "a[$(value)]"',
++    'unset $(echo x) >"a[$(value)]"',
++    'echo "a""[$(value)]"',
++    'echo "$(echo unset "a[$(value)]")"',
++    'echo "$(echo "$(echo unset "a[$(value)]")")"',
++    'echo "$(unset x)"; echo "a[$(value)]"',
++    'echo "a[$(value)]"',
++    'echo unset "a[$(value)]"',
++    'if echo unset "a[$(value)]"; then :; fi',
++    'X=1 command -p echo unset "a[$(value)]"',
++    'echo ";" unset "a[$(value)]"',
++    'echo "|" unset "a[$(value)]"',
++    'command -v unset "a[$(value)]"',
++    'command -V unset "a[$(value)]"',
++    'printf -v x %s "a[$(value)]"',
++    'unset x > "a[$(value)]"',
++    '>out echo unset "a[$(value)]"',
++    'echo 2>&1 unset "a[$(value)]"',
++    'unset a; echo "a[$(value)]"',
++    'a=(1 2); echo "a[$(value)]"',
++    'printf %s "a[$(value)]"',
++    'echo "a=([$(value)]=1)"',
++    "echo 'unset a[$(value)]'",
++    'x=$(( $(date +%s) + 2700 ))',
++])
++def test_data_and_watchers_remain_non_sinks(command):
++    assert not output_reaches_shell(command)
++
++
++@pytest.mark.parametrize("shape", SHAPES[:3] + SHAPES[12:19] + QUOTE_SCOPE_SHAPES + PRIOR_EXPANSION_SHAPES)
++def test_real_bash_runs_recursive_index_payload(tmp_path, shape):
++    # Execute only an isolated marker, never the user's lifecycle commands.
++    payload = tmp_path / "big.sh"
++    payload.write_text("# padding\n" * 140000 + "printf ran > marker\n", encoding="utf-8")
++    producer = "$(echo 'b[$(bash ./big.sh)]')"
++    command = shape.replace("{producer}", producer)
++    result = subprocess.run(
++        ["/bin/bash", "--noprofile", "--norc"], input=command + "\n", text=True,
++        encoding="utf-8", capture_output=True, timeout=10, check=False,
++        cwd=tmp_path, env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
++    )
++    assert (tmp_path / "marker").read_text(encoding="utf-8") == "ran", result.stderr
++    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert unsafe and refusal and "larger than the scan cap" in refusal
+diff --git a/tools/shell_arith_sink.py b/tools/shell_arith_sink.py
+index 323625c448d248f36b775684c2ab8b49fdb35909..7c31e7bb037c0717d108eb0a465ee4892ebb2a16 100644
+--- a/tools/shell_arith_sink.py
++++ b/tools/shell_arith_sink.py
+@@ -5,7 +5,9 @@ substitutions, so a substitution's OUTPUT inside arithmetic is shell code wherev
+ substitution sits: ``x=$(( 1 + $(echo 'a[$(bash F)]') ))`` runs ``bash F``
+ (t_01a1d6ae05c19594). Arithmetic contexts covered: ``$(( ))``, ``(( ))`` (``for ((``
+ too), ``$[ ]``, ``let``, ``[[ … -eq … ]]`` (any of the six integer operators), an array
+-subscript (``a[…]=``, ``${a[…]}``), a ``${x:offset:length}`` substring, and any
++subscript (``a[…]=``, ``a=([…]=value)``, ``${a[…]}``, and quoted variable names
++passed to builtins such as ``unset``/``printf -v``/``test -v``), a ``${x:offset:length}``
++substring, and any
+ ``declare/local/typeset/readonly/export -i`` integer assignment (coarse: any substitution
+ then counts). ``[ … -eq … ]``/``test`` are not arithmetic and stay out.
+ 
+@@ -20,6 +22,8 @@ from __future__ import annotations
+ import bisect
+ import re
+ 
++from tools.shell_command_position import quoted_name_is_arithmetic
++
+ # `$(date +%s)` prints only digits: the one producer whose output arithmetic may hold.
+ DATE_PRODUCER_BODY = r"""[ \t]*date[ \t]+(?:\+%s|'\+%s'|"\+%s")[ \t]*\)"""
+ _DATE_PRODUCER_RE = re.compile(DATE_PRODUCER_BODY)
+@@ -32,6 +36,9 @@ _PATTERN_TOKEN_RE = re.compile(_TOKENS + r"|/", re.DOTALL)
+ # Inside `let` the list operators end the arithmetic too; elsewhere skipping them keeps the scan
+ # of a long script fast.
+ _LET_TOKEN_RE = re.compile(_TOKENS + r"|[;&|\n]", re.DOTALL)
++# Unquoted command frames also see list operators: each starts a new simple command,
++# so a quoted builtin target is classified from its own command, not the frame start.
++_SEPARATOR_TOKEN_RE = _LET_TOKEN_RE
+ _INT_OPERATOR_RE = re.compile(r"(?<![\w-])-(?:eq|ne|lt|le|gt|ge)(?![\w-])")
+ _INTEGER_DECLARATION_RE = re.compile(
+     r"(?<![\w.-])(?:declare|typeset|local|readonly|export)(?:[ \t]+[-+][A-Za-z]+)*"
+@@ -39,7 +46,13 @@ _INTEGER_DECLARATION_RE = re.compile(
+ _PARAM_NAME_RE = re.compile(r"[#!]?(?:[A-Za-z_]\w*|\d+|[@*#?$!-])")
+ _COMMENT_PRECEDERS = frozenset(" \t\n;&|(")
+ 
+-# Frame kinds. A frame is [kind, closer, depth, in_double_quotes].
++# Characters that cannot end a variable name or an expansion: a quoted `[` after one
++# (or after a quote concatenation ending in one) never names an array subscript.
++_NOT_NAME_END = frozenset(" \t\n[],:=./+%^~")
++
++# Frames are [kind, closer, depth, in_double_quotes]; command frames also carry the
++# source start of their current simple command (so outer quotes cannot change nested
++# command position) and the cached classification of the open double-quoted word.
+ _CMD, _ARITH, _PARAM = "cmd", "arith", "param"
+ _PARAM_ARITH = "param_arith"  # parameter word feeding an arithmetic evaluator
+ _PARAM_PATTERN = "param_pattern"  # only its replacement feeds the evaluator
+@@ -60,12 +73,15 @@ def substitution_in_arithmetic(command: str, *, date_exempt: bool, _depth: int =
+     operators = [m.start() for m in _INT_OPERATOR_RE.finditer(command)]
+     pending = []
+     backtick_open = False
+-    stack: list[list] = [[_CMD, None, 0, False]]
++    stack: list[list] = [[_CMD, None, 0, False, 0, None]]
+     pos, end = 0, len(command)
+     command_tokens = _TOKEN_RE if "<<" in command else _NO_HEREDOC_TOKEN_RE
+     while pos < end:
+-        tokens = _LET_TOKEN_RE if stack[-1][1] == "let" else command_tokens
+-        tokens = {_PARAM_PATTERN: _PATTERN_TOKEN_RE}.get(stack[-1][0], tokens)
++        top = stack[-1]
++        if top[1] == "let" or (top[0] == _CMD and not top[3]):
++            tokens = _SEPARATOR_TOKEN_RE
++        else:
++            tokens = _PATTERN_TOKEN_RE if top[0] == _PARAM_PATTERN else command_tokens
+         match = tokens.search(command, pos)
+         if match is None:
+             break
+@@ -73,42 +89,36 @@ def substitution_in_arithmetic(command: str, *, date_exempt: bool, _depth: int =
+         pos = match.end()
+         top = stack[-1]
+         kind, quoted = top[0], top[3]
+-        if token == "`":
+-            if kind in (_ARITH, _PARAM_ARITH):
+-                return True  # legacy command substitution feeds arithmetic too
+-            backtick_open = not backtick_open
+-            continue
+         if token[0] == "\\":
+             if _escaped_opener(command, token, start) and _subscript_word_before(command, stack, pos):
+                 return True
+             continue
++        if token in ("`", "$(", "$((", "$[", "${"):
++            pos, sink = _expansion_token(command, token, pos, stack, date_exempt)
++            if sink:
++                return True
++            backtick_open ^= token == "`"
++            continue
+         if token == '"':
+             if quoted and command[start - 1] == "$" and _subscript_word_before(command, stack, pos):
+                 return True  # `"$"(…)`: the `$` joins a later `(` after quote removal
+             top[3] = not quoted
++            if kind == _CMD:
++                top[5] = None  # a new quoted word: classify its subscripts afresh
+             continue
+         skipped = _skip_data(command, token, start, pos, quoted, stack, pending,
+                              date_exempt, _depth)
+         if skipped is not None:
+             if skipped < 0:
+                 return True
++            if token == "\n" and kind == _CMD:
++                top[4] = skipped  # heredoc bodies end their command line too
+             pos = skipped
+             continue
+-        if token == "$((":
+-            stack.append([_ARITH, "))", 0, False])
+-            continue
+-        if token == "$(":
+-            if kind in (_ARITH, _PARAM_ARITH) and not (
+-                    date_exempt and _DATE_PRODUCER_RE.match(command, pos)):
+-                return True
+-            stack.append([_CMD, ")", 0, False])
+-            continue
+-        if token == "$[":
++
++        if token == "[" and quoted and kind == _CMD and _quoted_subscript_sink(command, start, top):
+             stack.append([_ARITH, "]", 0, False])
+             continue
+-        if token == "${":
+-            pos = _open_parameter(command, pos, stack)
+-            continue
+         if quoted:
+             continue  # inside "…" only expansions (handled above) matter
+         if kind == _CMD:
+@@ -121,6 +131,37 @@ def substitution_in_arithmetic(command: str, *, date_exempt: bool, _depth: int =
+     return backtick_open or any(frame[3] for frame in stack)
+ 
+ 
++def _quoted_subscript_sink(command: str, start: int, top: list) -> bool:
++    """Whether the double-quoted ``[`` at *start* opens a builtin's array subscript.
++
++    Linear overall: only a ``[`` that can follow a name is classified, at most once per
++    quoted word (later brackets in it share the command and word), and only from the
++    start of its own simple command.
++    """
++    index = start - 1
++    while index >= top[4] and command[index] in "\"'":
++        index -= 1
++    if index < top[4] or command[index] in _NOT_NAME_END:
++        return False
++    if top[5] is None:
++        top[5] = quoted_name_is_arithmetic(command[top[4]:start])
++    return top[5]
++
++
++def _compound_assignment_before(command: str, start: int) -> bool:
++    """Whether ``name=`` or ``name+=`` (a word of its own) ends just before *start*."""
++    index = start - 1
++    if index < 0 or command[index] != "=":
++        return False
++    index -= 1
++    if index >= 0 and command[index] == "+":
++        index -= 1
++    name_end = index
++    while index >= 0 and (command[index].isalnum() or command[index] == "_"):
++        index -= 1
++    return index < name_end and (index < 0 or command[index] in " \t\n\r\f\v;({")
++
++
+ def _quick_result(command: str, depth: int) -> bool | None:
+     if depth >= 32:
+         return True
+@@ -131,7 +172,7 @@ def _quick_result(command: str, depth: int) -> bool | None:
+         return False
+     if "$(" not in command and not any(mark in command for mark in ("'", '"', "`", "\\")):
+         return False
+-    if "$(" in command and _INTEGER_DECLARATION_RE.search(command):
++    if ("$(" in command or "`" in command) and _INTEGER_DECLARATION_RE.search(command):
+         return True
+     return None
+ 
+@@ -276,7 +317,6 @@ def _quote_close(command: str, pos: int, *, ansi: bool) -> int | None:
+     return None
+ 
+ 
+-
+ def _parameter_token(token, start, pos, stack) -> int:
+     if stack[-1][0] == _PARAM_PATTERN and token == "/":
+         stack[-1][0] = _PARAM_ARITH
+@@ -287,6 +327,28 @@ def _parameter_token(token, start, pos, stack) -> int:
+     return pos
+ 
+ 
++def _expansion_token(command, token, pos, stack, date_exempt) -> tuple[int, bool]:
++    """Open an expansion frame, or flag a producer whose output is arithmetic."""
++    if token == "`":
++        if stack[-1][0] in (_ARITH, _PARAM_ARITH):
++            return pos, True
++        if stack[-1][1] == "`":
++            stack.pop()
++        else:
++            stack.append([_CMD, "`", 0, False, pos, None])
++        return pos, False
++    if token == "$(":
++        if stack[-1][0] in (_ARITH, _PARAM_ARITH) and not (
++                date_exempt and _DATE_PRODUCER_RE.match(command, pos)):
++            return pos, True
++        stack.append([_CMD, ")", 0, False, pos, None])
++    elif token == "${":
++        pos = _open_parameter(command, pos, stack)
++    else:  # $(( or $[
++        stack.append([_ARITH, "))" if token == "$((" else "]", 0, False])
++    return pos, False
++
++
+ def _open_parameter(command: str, pos: int, stack: list[list]) -> int:
+     """Push the frame for a ``${`` opened before *pos*; return where scanning resumes."""
+     name = _PARAM_NAME_RE.match(command, pos)
+@@ -329,8 +391,15 @@ def _cmd_token(command, token, start, pos, stack, closes, operators) -> int:
+     if token == "((":
+         stack.append([_ARITH, "))", 0, False])
+         return pos
++    if token in (";", "&", "|", "\n"):
++        # `>&`, `<&`, `&>` and `>|` are redirections, not list operators.
++        if not ((token in "&|" and command[start - 1:start] in ("<", ">"))
++                or (token == "&" and command[pos:pos + 1] == ">")):
++            stack[-1][4] = pos
++        return pos
+     if token == "(":
+-        stack.append([_CMD, ")", 0, False])
++        closer = "array" if _compound_assignment_before(command, start) else ")"
++        stack.append([_CMD, closer, 0, False, pos, None])
+         return pos
+     if token == ")":
+         if len(stack) > 1:
+@@ -343,7 +412,8 @@ def _cmd_token(command, token, start, pos, stack, closes, operators) -> int:
+         if operator < len(operators) and operators[operator] < close:
+             stack.append([_ARITH, "]]", 0, False, pos])
+         return pos
+-    if token == "[" and start > 0 and (command[start - 1].isalnum() or command[start - 1] == "_"):
++    if token == "[" and (stack[-1][1] == "array" or (
++            start > 0 and (command[start - 1].isalnum() or command[start - 1] == "_"))):
+         stack.append([_ARITH, "]", 0, False])  # `a[…]=` subscript
+     return pos
+ 
+diff --git a/tools/shell_command_position.py b/tools/shell_command_position.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..db71dd075a4d6d724cb8875b1e28abbed17f61f0
+--- /dev/null
++++ b/tools/shell_command_position.py
+@@ -0,0 +1,105 @@
++"""Command-position helpers shared by lifecycle and arithmetic sink scans."""
++
++from __future__ import annotations
++
++import re
++import shlex
++
++from tools.shell_prefix_expansions import mask_prefix_expansions
++
++_RESERVED_PREFIX_WORDS = frozenset({
++    "if", "then", "else", "elif", "do", "while", "until", "!", "time", "coproc", "in", "{",
++    "function",
++})
++_SHELL_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
++_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=")
++# Keep quoted separators inside their word; shlex alone loses that distinction.
++_REDIRECTION = r"(?:[0-9]+|\{[A-Za-z_]\w*\})?(?:<<<|<<-?|>>|<>|>\||[<>]&|&>>?|[<>])"
++_REDIRECTION_RE = re.compile(_REDIRECTION)
++_PREFIX_TOKEN = re.compile(_REDIRECTION + r'''|[;\n&|()]|(?:[^\s;\n&|()<>'"\\]+|\\.|'[^']*'|"(?:\\.|[^"\\])*")+''')
++_NAME_CONSUMERS = frozenset({"unset", "read", "declare", "local", "typeset", "readonly", "export"})
++
++
++def peel_reserved_words(segment: list[str]) -> int:
++    """Skip leading shell keywords and their operands, never ordinary arguments."""
++    index = 0
++    while index < len(segment) and segment[index] in _RESERVED_PREFIX_WORDS:
++        word = segment[index]
++        index += 1
++        if index >= len(segment):
++            break
++        if word == "time":
++            if segment[index] == "-p":
++                index += 1
++            if index < len(segment) and segment[index] == "--":
++                index += 1
++        elif word == "function" or (word == "coproc" and _SHELL_NAME.fullmatch(segment[index]) and (
++            index + 1 == len(segment) or segment[index + 1] == "{"
++        )):
++            index += 1
++    return index
++
++
++def _builtin_index(words: list[str]) -> int:
++    index = peel_reserved_words(words)
++    while index < len(words) and _ASSIGNMENT.match(words[index]):
++        index += 1
++    while index < len(words) and words[index] in ("command", "builtin"):
++        wrapper = words[index]
++        index += 1
++        while index < len(words) and words[index].startswith("-"):
++            option = words[index]
++            index += 1
++            if option == "--":
++                break
++            if wrapper == "command" and any(flag in option for flag in "vV"):
++                return -1  # command -v/-V prints a name; it does not execute it.
++    return index
++
++
++def _prefix_words(prefix: str) -> list[str] | None:
++    words: list[str] = []
++    redirect_target = False
++    was_target = False
++    for match in _PREFIX_TOKEN.finditer(mask_prefix_expansions(prefix.replace("\\\n", "")) + '"'):
++        raw = match.group()
++        was_target = redirect_target
++        redirect_target = False
++        if was_target:
++            continue
++        if _REDIRECTION_RE.fullmatch(raw):
++            redirect_target = True
++        elif raw in (";", "\n", "&", "|", "(", ")"):
++            words.clear()
++        else:
++            words.append("".join(shlex.split(raw)))
++    return None if was_target else words
++
++
++def quoted_name_is_arithmetic(prefix: str) -> bool:
++    """Whether the open double-quoted name at *prefix* is a builtin's target.
++
++    The caller stops just before its subscript opener, inside double quotes. Close
++    that quote for tokenization; literal separators remain data, not command starts.
++    """
++    try:
++        words = _prefix_words(prefix)
++    except (ValueError, RecursionError):
++        return True  # An unrecognized word must not hide an arithmetic sink.
++    if words is None:
++        return False  # The current word is a redirection destination.
++    index = _builtin_index(words)
++    if index < 0:
++        return False  # Proven command introspection, not an unknown command.
++    if index >= len(words):
++        return True
++    name, arguments = words[index], words[index + 1:]
++    if name in _NAME_CONSUMERS:
++        return bool(arguments)
++    if name == "printf" and len(arguments) == 1:
++        return arguments[0].startswith("-v")
++    if name in ("printf", "test", "[", "[["):
++        return len(arguments) >= 2 and arguments[-2] == "-v"
++    # Unknown commands may be functions or builtins with arithmetic operands.
++    # Only positively identified data consumers may exempt a quoted subscript.
++    return name not in ("echo", "cat", "grep")
+diff --git a/tools/shell_prefix_expansions.py b/tools/shell_prefix_expansions.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..414e18ab298138fa5fe718c98274a62edb5fd46a
+--- /dev/null
++++ b/tools/shell_prefix_expansions.py
+@@ -0,0 +1,91 @@
++"""Hide completed expansion words from command-position tokenization.
++
++Expansion punctuation belongs to its own shell frame, not the enclosing command.
++This is lexical masking only: the arithmetic scanner still inspects the original
++source. Unsupported or incomplete expansion syntax raises ValueError so its caller
++can conservatively classify the target as arithmetic.
++"""
++
++from __future__ import annotations
++
++import re
++
++_CASE_WORD = re.compile(r"(?<![\w])case(?![\w])")
++
++
++def _comment_end(text: str, pos: int, quoted: str) -> int | None:
++    if quoted or text[pos] != "#" or (pos and text[pos - 1] not in " \t\n;&|("):
++        return None
++    newline = text.find("\n", pos)
++    return len(text) if newline < 0 else newline
++
++
++def _expansion_end(text: str, start: int, closer: str) -> int:
++    """Return just past an expansion, respecting nested frames and quote scopes."""
++    pos, quote = start, ""
++    while pos < len(text):
++        char = text[pos]
++        if char == "\\" and quote != "'":
++            pos += 2
++            continue
++        if quote == "'":
++            if char == quote:
++                quote = ""
++            pos += 1
++            continue
++        if char == closer and not quote:
++            return pos + 1
++        if not quote and _CASE_WORD.match(text, pos):
++            # A case-pattern ')' is not a frame closer; fail closed on grammar
++            # this lexical masker cannot classify rather than lose the builtin.
++            raise ValueError("case grammar in expansion")
++        comment_end = _comment_end(text, pos, quote)
++        if comment_end is not None:
++            pos = comment_end
++            continue
++        nested = _opener(text, pos, quote)
++        if nested is not None:
++            width, end = nested
++            pos = _expansion_end(text, pos + width, end)
++            continue
++        if char in "\"'" and (not quote or char == quote):
++            quote = "" if quote else char
++        elif not quote and char == "(" and closer == ")":
++            pos = _expansion_end(text, pos + 1, ")")
++            continue
++        pos += 1
++    raise ValueError("unterminated expansion")
++
++
++def _opener(text: str, pos: int, quote: str) -> tuple[int, str] | None:
++    pair = text[pos:pos + 2]
++    if pair in ("$(", "${", "$[") or (not quote and pair in ("<(", ">(")):
++        return 2, {"${": "}", "$[": "]"}.get(pair, ")")
++    return (1, "`") if text[pos] == "`" else None
++
++
++def mask_prefix_expansions(text: str) -> str:
++    """Replace expansion bodies with one opaque word fragment, retaining quotes."""
++    pieces: list[str] = []
++    pos, quote = 0, ""
++    while pos < len(text):
++        char = text[pos]
++        if char == "\\" and quote != "'":
++            pieces.append(text[pos:pos + 2])
++            pos += 2
++            continue
++        comment_end = _comment_end(text, pos, quote)
++        if comment_end is not None:
++            pos = comment_end
++            continue
++        nested = _opener(text, pos, quote) if quote != "'" else None
++        if nested is not None:
++            width, closer = nested
++            pos = _expansion_end(text, pos + width, closer)
++            pieces.append("__expansion__")
++            continue
++        if char in "\"'" and (not quote or char == quote):
++            quote = "" if quote else char
++        pieces.append(char)
++        pos += 1
++    return "".join(pieces)
+-- 
+2.43.0
+

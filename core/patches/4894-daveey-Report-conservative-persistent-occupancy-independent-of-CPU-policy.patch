@@ -1,0 +1,212 @@
+From 718c1d3afba5cdc3466352a70bf7e9ba618ef5d3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 23:55:05 +0000
+Subject: [PATCH] [daveey] Report conservative persistent occupancy independent
+ of CPU policy
+
+Proof: canonical runner 65 tests pass in persistent jobs, machine metrics and tokens-by-model; RED before implementation reproduced missing policy-off occupancy. Empty/unscoped coverage remains UNKNOWN, never zero. Stamp before census and discard old pairs at send; preserve older Board downgrade chain.
+---
+ hermes_cli/machine_drain_metrics.py           |  2 +
+ hermes_cli/machine_metrics.py                 |  2 +
+ hermes_cli/machine_persistent_jobs.py         | 39 ++++++++
+ tests/hermes_cli/test_machine_metrics.py      |  3 +-
+ .../test_machine_persistent_jobs.py           | 91 ++++++++++++++++++-
+ 5 files changed, 135 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/machine_persistent_jobs.py
+
+diff --git a/hermes_cli/machine_drain_metrics.py b/hermes_cli/machine_drain_metrics.py
+index 67e912e9d5dc4bfd6ffe848843a7d7f8f4bac7bf..671702b6c57a75073fcf84d8d793fef2d3d4daca 100644
+--- a/hermes_cli/machine_drain_metrics.py
++++ b/hermes_cli/machine_drain_metrics.py
+@@ -52,6 +52,8 @@ def send_compatible(send, sample, on_counters_rejected=None):
+     from hermes_cli.kanban_sync_client import HubError
+     from hermes_cli.machine_throughput_metrics import FIELDS as COUNTERS
+ 
++    from hermes_cli.machine_persistent_jobs import fresh
++    sample = fresh(sample)
+     try:
+         return send(sample)
+     except HubError as exc:
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index 493769c0060d6823be93ea3f20a550727aedb627..9de9ab19be66a6eee3b6a5a2c8e1c1def646f35d 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -232,6 +232,8 @@ def collect(disk_path: Optional[Path] = None) -> dict[str, Any]:
+             out = {"active_card_runs": None}
+     else:
+         out = machine_admission_metrics.collect(active_card_runs)
++    from hermes_cli import machine_persistent_jobs
++    out.update(machine_persistent_jobs.collect())
+     out.update(machine_drain_metrics.collect())
+     out.update(machine_throughput_metrics.cached_counters())
+     try:
+diff --git a/hermes_cli/machine_persistent_jobs.py b/hermes_cli/machine_persistent_jobs.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..25246dafaabef6452b0d4bdc898373214adc5d5a
+--- /dev/null
++++ b/hermes_cli/machine_persistent_jobs.py
+@@ -0,0 +1,39 @@
++"""Conservative persistent-work observations, independent of CPU admission.
++
++A populated worker scope is positive evidence of occupied work (a lower bound).
++An empty pool is NOT a complete census: unscoped jobs, app.slice descendants and
++in-process baseline work are not accounted for. Until that census is available,
++this producer deliberately never emits zero. Missing means UNKNOWN, not idle.
++No process registry is opened and no service is stopped to make an observation.
++"""
++from __future__ import annotations
++
++import sys
++import time
++
++FIELDS = ('persistent_jobs', 'persistent_jobs_at_ms')
++MAX_AGE_MS = 2000
++
++
++def collect() -> dict:
++    """Stamp before reading; a slow census must not rejuvenate old evidence."""
++    from hermes_cli import worker_compute_capacity as capacity
++    if not sys.platform.startswith('linux'):
++        return {}
++    at_ms = int(time.time() * 1000)
++    try:
++        occupied = capacity.occupied_owners(capacity.pool_path(), {}, set())
++    except (OSError, ValueError):
++        return {}
++    if not occupied:
++        return {}  # baseline/unscoped coverage remains UNKNOWN even after a job exits
++    return fresh({'persistent_jobs': len(occupied), 'persistent_jobs_at_ms': at_ms})
++
++
++def fresh(sample: dict) -> dict:
++    """Drop incomplete, invalid or aged pairs at the send boundary; never re-stamp."""
++    count, at_ms = (sample.get(key) for key in FIELDS)
++    if (type(count) is int and 0 <= count <= 100000 and type(at_ms) is int
++            and at_ms > 0 and 0 <= time.time() * 1000 - at_ms <= MAX_AGE_MS):
++        return sample
++    return {key: value for key, value in sample.items() if key not in FIELDS}
+diff --git a/tests/hermes_cli/test_machine_metrics.py b/tests/hermes_cli/test_machine_metrics.py
+index 106ed7286da7436638b582fab7ae9d8db938f21c..60f46a73f151f1d115aa30a685c3de2b127ee27a 100644
+--- a/tests/hermes_cli/test_machine_metrics.py
++++ b/tests/hermes_cli/test_machine_metrics.py
+@@ -33,7 +33,8 @@ def test_collect_reads_this_machine(tmp_path: Path):
+     assert 0 < out["disk_free_gb"] <= out["disk_total_gb"]
+     assert 0 <= out["mem_used_pct"] <= 100  # this platform's reader (linux or macos)
+     assert set(out) <= {"cpu_load1", "cpus", "mem_used_pct", "disk_free_gb", "disk_total_gb", "active_card_runs",
+-                        "drain_active", "drain_until_ms", "tokens_by_model", *mt.FIELDS}
++                        "drain_active", "drain_until_ms", "tokens_by_model",
++                        "persistent_jobs", "persistent_jobs_at_ms", *mt.FIELDS}
+     assert out["active_card_runs"] is None or out["active_card_runs"] >= 0
+     assert out.get("drain_active") in (None, 0, 1)  # omitted when the hold marker cannot be read
+     assert "drain_until_ms" not in out or out.get("drain_active") == 1
+diff --git a/tests/hermes_cli/test_machine_persistent_jobs.py b/tests/hermes_cli/test_machine_persistent_jobs.py
+index c67f38c44eb9c5f23e13d8063a03cc25b9820e0d..010ee10ee85c70b391cc8037a5caf223e3321a60 100644
+--- a/tests/hermes_cli/test_machine_persistent_jobs.py
++++ b/tests/hermes_cli/test_machine_persistent_jobs.py
+@@ -1,9 +1,60 @@
+ """Persistent-work safety observations must fail closed across Board downgrades."""
++import pytest
++
+ from hermes_cli import machine_drain_metrics as drain
+ from hermes_cli.kanban_sync_client import HubError
+ 
+ 
+-def test_persistent_pair_rejection_preserves_counters_without_replaying_safety():
++@pytest.mark.platforms('linux')
++def test_policy_off_still_observes_populated_detached_scope(tmp_path, monkeypatch):
++    from hermes_cli import machine_metrics as metrics, worker_compute_capacity as capacity
++    pool = tmp_path / 'pool'
++    pool.mkdir()
++    scope = pool / 'parked.scope'
++    scope.mkdir()
++    (scope / 'cgroup.events').write_text('populated 1\nfrozen 0\n')
++    monkeypatch.setattr(capacity, 'pool_path', lambda: pool)
++    monkeypatch.setattr(capacity, 'worker_enabled', lambda: False)
++    monkeypatch.setattr(metrics, 'active_card_runs', lambda **kw: 0)
++    result = metrics.collect(tmp_path)
++    assert result['active_card_runs'] == 0
++    assert result['persistent_jobs'] == 1
++    assert result['persistent_jobs_at_ms'] > 0
++
++
++@pytest.mark.parametrize('events', ['populated 0\n', 'populated bad\n', 'frozen 0\n', None])
++def test_empty_or_unreadable_pool_never_proves_unscoped_work_absent(tmp_path, monkeypatch, events):
++    from hermes_cli import machine_persistent_jobs as jobs, worker_compute_capacity as capacity
++    scope = tmp_path / 'parked.scope'
++    scope.mkdir()
++    if events is not None:
++        (scope / 'cgroup.events').write_text(events)
++    monkeypatch.setattr(capacity, 'pool_path', lambda: tmp_path)
++    assert jobs.collect() == {}
++
++
++@pytest.mark.parametrize('stamp', [None, True, 0, -1, 10001, 7999])
++def test_sender_drops_invalid_or_old_observation_without_restamping(monkeypatch, stamp):
++    from hermes_cli import machine_persistent_jobs as jobs
++    monkeypatch.setattr(jobs.time, 'time', lambda: 10)
++    sample = {'active_card_runs': 0, 'persistent_jobs': 0, 'persistent_jobs_at_ms': stamp}
++    seen = []
++    drain.send_compatible(seen.append, sample)
++    assert seen == [{'active_card_runs': 0}]
++
++
++def test_sender_keeps_fresh_observation_stamp(monkeypatch):
++    from hermes_cli import machine_persistent_jobs as jobs
++    monkeypatch.setattr(jobs.time, 'time', lambda: 10)
++    sample = {'persistent_jobs': 0, 'persistent_jobs_at_ms': 9000}
++    seen = []
++    drain.send_compatible(seen.append, sample)
++    assert seen == [sample]
++
++
++def test_persistent_pair_rejection_preserves_counters_without_replaying_safety(monkeypatch):
++    from hermes_cli import machine_persistent_jobs as jobs
++    monkeypatch.setattr(jobs.time, 'time', lambda: 1)
+     calls, rejected = [], []
+     sample = {"active_card_runs": 0, "persistent_jobs": 0, "persistent_jobs_at_ms": 1000,
+               "tokens_io_total": 42, "tokens_by_model": {"model": [42, 0]},
+@@ -21,3 +72,41 @@ def test_persistent_pair_rejection_preserves_counters_without_replaying_safety()
+                          "tokens_by_model": {"model": [42, 0]}}
+     assert rejected == []
+     assert sample["persistent_jobs"] == 0
++
++
++@pytest.mark.parametrize('count', [None, True, -1, 100001, 0.0, '0'])
++def test_bad_count_drops_whole_pair(monkeypatch, count):
++    from hermes_cli import machine_persistent_jobs as jobs
++    monkeypatch.setattr(jobs.time, 'time', lambda: 1)
++    assert jobs.fresh({'persistent_jobs': count, 'persistent_jobs_at_ms': 1000}) == {}
++
++
++@pytest.mark.platforms('linux')
++def test_slow_census_drops_observation(tmp_path, monkeypatch):
++    from hermes_cli import machine_persistent_jobs as jobs, worker_compute_capacity as capacity
++    monkeypatch.setattr(capacity, 'pool_path', lambda: tmp_path)
++    monkeypatch.setattr(capacity, 'occupied_owners', lambda *args: {('board', 'job')})
++    times = iter([1, 3.001])
++    monkeypatch.setattr(jobs.time, 'time', lambda: next(times))
++    assert jobs.collect() == {}
++
++
++@pytest.mark.parametrize('generation', [0, 1, 2, 3])
++def test_all_old_board_generations_keep_safety_unknown(monkeypatch, generation):
++    from hermes_cli import machine_persistent_jobs as jobs
++    monkeypatch.setattr(jobs.time, 'time', lambda: 1)
++    calls, rejected = [], []
++    fields = ['drain_active', 'tokens_io_total', 'tokens_by_model', 'persistent_jobs']
++    sample = {'active_card_runs': 0, 'drain_active': 0, 'tokens_io_total': 42,
++              'tokens_by_model': {}, 'persistent_jobs': 0, 'persistent_jobs_at_ms': 1000}
++
++    def send(payload):
++        calls.append(dict(payload))
++        if any(key in payload for key in fields[generation:]):
++            raise HubError(400, 'unknown field')
++        return 'ok'
++
++    assert drain.send_compatible(send, sample, lambda: rejected.append(True)) == 'ok'
++    assert 'persistent_jobs' not in calls[-1]
++    assert 'persistent_jobs_at_ms' not in calls[-1]
++    assert rejected == ([True] if generation < 2 else [])
+-- 
+2.43.0
+

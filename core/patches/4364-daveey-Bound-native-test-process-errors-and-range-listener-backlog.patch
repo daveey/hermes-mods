@@ -1,0 +1,237 @@
+From e6b275790b6fd2e6d1f35b540f25670aa5714a17 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:15:17 +0000
+Subject: [PATCH] [daveey] Bound native test process errors and range listener
+ backlog
+
+Session cleanup encountered psutil 7.2.2 upstream #2854: proc_environ returns success with AccessDenied set, so CPython wraps it in SystemError. Recognize only that signature and access-denial cause while preserving unknown errors and later owned-process discovery. Extract discovery to a topical sibling to respect conftest line cap.
+
+The range fixture threads handlers but retains backlog five for eight concurrent range connections. Reserve sixteen pending connections so a descheduled acceptor accommodates the full fanout without SYN retries. Keep original observer, resume, integrity and platform assertions.
+
+Proof: canonical session regression RED 2 failed/5 passed; GREEN 8 passed including unknown-error controls and real owned/foreign process cleanup. Held-acceptor real TCP regression RED timeout; GREEN connects all eight. Whole pm consumer suite and both original incident files passed; scripts/check 20 checks passed. Darwin errno22 causation and native containing-main CI remain to verify before task acceptance.
+---
+ tests/conftest.py                   | 40 ++---------------------
+ tests/pm/_range_server.py           |  9 +++++-
+ tests/pm/test_worker_observers.py   | 19 +++++++++++
+ tests/session_processes.py          | 49 +++++++++++++++++++++++++++++
+ tests/test_session_daemon_reaper.py | 32 +++++++++++++++++++
+ 5 files changed, 111 insertions(+), 38 deletions(-)
+ create mode 100644 tests/session_processes.py
+
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 51be2fec4fe4dae54104643037b8b43283a7d730..b085fbbafd678502c7782e9af656c5f96c50174e 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -1368,44 +1368,10 @@ def _remove_relocated_basetemp(config) -> None:
+ 
+ 
+ def _processes_with_hermes_home_under(roots) -> list[int]:
+-    """PIDs (never this process) whose environment names a ``HERMES_HOME`` inside one of *roots*.
++    """PIDs belonging to this session; retain the conftest seam for callers."""
++    from tests.session_processes import processes_with_hermes_home_under
+ 
+-    POSIX (psutil's exec-time environment; another user's processes are unreadable and skipped).
+-    Windows is out of scope: no leak observed there, and SIGTERM there is TerminateProcess.
+-
+-    Membership is decided lexically: another process's ``HERMES_HOME`` is never resolved, because
+-    the host's live gateways (the hub's ``~/.hermes/profiles/<p>``) name the real Hermes home and
+-    ``realpath`` would ``lstat`` it, which the real-home I/O guard refuses. Only this session's own
+-    roots are resolved, and both their given and resolved spellings are matched, so a child that
+-    got either spelling of a root is still found.
+-
+-    """
+-    if os.name != "posix":
+-        return []
+-    import psutil
+-
+-    resolved = {Path(os.path.abspath(r)) for r in roots if r} | {Path(r).resolve() for r in roots if r}
+-    me = os.getpid()
+-    found = []
+-    for proc in psutil.process_iter():
+-        if proc.pid == me:
+-            continue
+-        try:
+-            home = proc.environ().get("HERMES_HOME")
+-        except (psutil.Error, OSError):
+-            continue
+-        if not home:
+-            continue
+-        try:
+-            text = os.fsdecode(home)
+-        except (OSError, ValueError):
+-            continue
+-        if not os.path.isabs(text):  # relative to that process's cwd, not ours
+-            continue
+-        path = Path(os.path.normpath(text))
+-        if any(path == root or path.is_relative_to(root) for root in resolved):
+-            found.append(proc.pid)
+-    return found
++    return processes_with_hermes_home_under(roots)
+ 
+ 
+ def _reap_session_hermes_processes(config) -> list[int]:
+diff --git a/tests/pm/_range_server.py b/tests/pm/_range_server.py
+index 901061f9aa0c0ac0916326b66e1e17b184eccd1f..c5091b0f7939c6f0fbb76ea20c73d57a4af3a2da 100644
+--- a/tests/pm/_range_server.py
++++ b/tests/pm/_range_server.py
+@@ -109,6 +109,13 @@ class RangeHandler(BaseHTTPRequestHandler):
+         self.wfile.flush()
+ 
+ 
++class RangeHTTPServer(ThreadingHTTPServer):
++    # The downloader fans out eight connections before any need be accepted.
++    # Threading handlers do not enlarge TCPServer's default backlog of five;
++    # a descheduled acceptor can otherwise overflow it on Darwin (EINVAL).
++    request_queue_size = 16
++
++
+ @pytest.fixture
+ def dl_server():
+     RangeHandler.payloads = {}
+@@ -126,7 +133,7 @@ def dl_server():
+     # queued connection to be drained in turn (plus SYN-retry backoff for
+     # the overflow one) — ~3.7 s idle, and past the pause tests' 15 s poll
+     # deadline on a loaded CI runner.
+-    server = ThreadingHTTPServer(("127.0.0.1", 0), RangeHandler)
++    server = RangeHTTPServer(("127.0.0.1", 0), RangeHandler)
+     server.daemon_threads = True
+     server.block_on_close = False
+     thread = threading.Thread(target=server.serve_forever, daemon=True)
+diff --git a/tests/pm/test_worker_observers.py b/tests/pm/test_worker_observers.py
+index cc33cc7afab9ce8fc71979868a9b36df745b8f61..2cf865266d616abd9087ee3848355b66347c6b5f 100644
+--- a/tests/pm/test_worker_observers.py
++++ b/tests/pm/test_worker_observers.py
+@@ -2,6 +2,7 @@
+ from __future__ import annotations
+ 
+ import json
++import socket
+ import threading
+ import time
+ 
+@@ -14,6 +15,24 @@ from tests.pm._range_server import dl_server as dl_server  # noqa: PLC0414 -- th
+ from tests.pm.test_worker import _node_archive
+ 
+ 
++@pytest.mark.platforms("posix")
++def test_range_listener_queues_all_eight_writers_before_accept(dl_server):
++    # Deliberately do not start serve_forever: a descheduled acceptor must
++    # accommodate the downloader's complete fanout without a SYN retry.
++    pending = []
++    with type(dl_server)(("127.0.0.1", 0), dl_server.RequestHandlerClass) as listener:
++        try:
++            for _ in range(8):
++                connection = socket.socket()
++                pending.append(connection)
++                connection.settimeout(1)
++                connection.connect(listener.server_address)
++            assert len(pending) == 8
++        finally:
++            for connection in pending:
++                connection.close()
++
++
+ @pytest.mark.platforms("posix")
+ def test_slow_worker_observer_does_not_hold_range_writers(client, dl_server):
+     # Every range contains several chunks: one write per range could otherwise
+diff --git a/tests/session_processes.py b/tests/session_processes.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5034a57f79825195bd5c00e4e21c92d0cc109607
+--- /dev/null
++++ b/tests/session_processes.py
+@@ -0,0 +1,49 @@
++"""Session-owned process discovery, without resolving foreign Hermes homes."""
++from __future__ import annotations
++
++import os
++from pathlib import Path
++
++
++def processes_with_hermes_home_under(roots) -> list[int]:
++    """Find POSIX processes whose exec-time home is lexically under a session root.
++
++    Resolve only our roots: resolving a foreign home touches the live profile.
++    Retain both root spellings for children launched through a symlink.
++    """
++    if os.name != "posix":
++        return []
++    import psutil
++
++    resolved = {Path(os.path.abspath(r)) for r in roots if r} | {Path(r).resolve() for r in roots if r}
++    me = os.getpid()
++    found = []
++    for proc in psutil.process_iter():
++        if proc.pid == me:
++            continue
++        try:
++            home = proc.environ().get("HERMES_HOME")
++        except (psutil.Error, OSError):
++            continue
++        except SystemError as exc:
++            # psutil 7.2.2's Darwin procargs branch returns success with an
++            # exception set (upstream #2854). Only normalize that exact fault.
++            cause = exc.__cause__
++            if not (str(exc) == "<built-in function proc_environ> returned a result with an exception set"
++                    and (isinstance(cause, psutil.AccessDenied)
++                         or (isinstance(cause, PermissionError)
++                             and "sysctl(KERN_PROCARGS2) -> errno 0" in str(cause)))):
++                raise
++            continue
++        if not home:
++            continue
++        try:
++            text = os.fsdecode(home)
++        except (OSError, ValueError):
++            continue
++        if not os.path.isabs(text):
++            continue
++        path = Path(os.path.normpath(text))
++        if any(path == root or path.is_relative_to(root) for root in resolved):
++            found.append(proc.pid)
++    return found
+diff --git a/tests/test_session_daemon_reaper.py b/tests/test_session_daemon_reaper.py
+index 755e4d1d9d6c49597ff6fdd7fc1ff6159734ceaf..9b2aff665157ac276fbaadb049ad7c5d68e7775a 100644
+--- a/tests/test_session_daemon_reaper.py
++++ b/tests/test_session_daemon_reaper.py
+@@ -71,6 +71,38 @@ def test_session_teardown_skips_a_live_gateway_on_the_real_hermes_home_without_t
+         live.wait(timeout=5)
+ 
+ 
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("denied", [PermissionError(13, "force permission denied (originated from sysctl(KERN_PROCARGS2) -> errno 0)"), psutil.AccessDenied(123)])
++def test_session_scan_continues_after_psutil_wrapped_access_denied(monkeypatch, tmp_path, denied):
++    def inaccessible():
++        raise SystemError("<built-in function proc_environ> returned a result with an exception set") from denied
++
++    processes = [SimpleNamespace(pid=-1, environ=inaccessible),
++                 SimpleNamespace(pid=-2, environ=lambda: {"HERMES_HOME": str(tmp_path / "owned")}),
++                 SimpleNamespace(pid=-3, environ=lambda: {"HERMES_HOME": str(tmp_path.parent / "foreign")})]
++    monkeypatch.setattr(psutil, "process_iter", lambda: iter(processes))
++    assert suite_conftest._processes_with_hermes_home_under([tmp_path]) == [-2]
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("cause,message", [
++    (None, "<built-in function proc_environ> returned a result with an exception set"),
++    (ValueError("bad buffer"), "<built-in function proc_environ> returned a result with an exception set"),
++    (PermissionError(13, "unrelated"), "<built-in function proc_environ> returned a result with an exception set"),
++    (psutil.AccessDenied(123), "different C extension failure"),
++])
++def test_session_scan_does_not_hide_other_system_errors(monkeypatch, tmp_path, cause, message):
++    error = SystemError(message)
++
++    def broken():
++        raise error from cause
++
++    monkeypatch.setattr(psutil, "process_iter", lambda: iter([SimpleNamespace(pid=-1, environ=broken)]))
++    with pytest.raises(SystemError) as caught:
++        suite_conftest._processes_with_hermes_home_under([tmp_path])
++    assert caught.value is error
++
++
+ def _environ_home(pid):
+     try:
+         return psutil.Process(pid).environ().get("HERMES_HOME")
+-- 
+2.43.0
+

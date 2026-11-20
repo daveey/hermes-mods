@@ -1,0 +1,124 @@
+From 9475b043b52776d46672c222931cafd182ea2e84 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 13:19:58 +0000
+Subject: [PATCH] fix(tests): retain refused-port custody during proxy hold
+ [daveey]
+
+The rollover hold test published a bind-and-close free port. Another listener
+could acquire it before Proxy._upstream connected; a successful connection
+correctly splices indefinitely instead of applying the refused-backend hold.
+The test then timed out reading EOF rather than failing its lower hold bound.
+Keep a non-listening socket bound for the complete scenario and explicitly
+close clients, cancel/join handlers and await server closure with a bound.
+
+Add uncontended and real silent-listener takeover cases. The takeover case
+reproduces the original 5s reader.read TimeoutError on the old fixture; keeping
+the port bound makes both pass. A reservation-removal mutant still fails with
+cleanup present. Omitting production client_writer.close also fails, proving
+cleanup cannot supply the asserted EOF. No production code, hold_s=0.5, EOF
+wait=5, elapsed>=0.4, runner retry or cadence changes.
+
+Incident 43708041029 / job 132793464607 head 3e5d8794 and source f9109ada:
+relevant source/test bytes identical to main. Historical logs do not establish
+the actual competing listener; the deterministic proof establishes the defect
+and matching mechanism, not historical ownership or CPU starvation.
+
+Validation: baseline isolated 1 passed and full file 30 passed; controlled RED
+1 failed/1 passed including retry; GREEN full file 31 passed; related rollover,
+dashboard, drain, token routes and skew-exit suites 76 passed across 5 files;
+scripts/check --base origin/main: 20 checks OK, zero health findings.
+
+Task: t_b4ff397bae28c195
+---
+ tests/hermes_cli/test_always_on_rollover.py | 65 +++++++++++++++++----
+ 1 file changed, 54 insertions(+), 11 deletions(-)
+
+diff --git a/tests/hermes_cli/test_always_on_rollover.py b/tests/hermes_cli/test_always_on_rollover.py
+index 4ba4eb2d5d5ddd8b9ff21f7f48d4dc952f52f6e6..4af13a1237a7566bfb984e38ca3ee807c9d26ca5 100644
+--- a/tests/hermes_cli/test_always_on_rollover.py
++++ b/tests/hermes_cli/test_always_on_rollover.py
+@@ -9,8 +9,10 @@ only once it is idle.
+ from __future__ import annotations
+ 
+ import asyncio
++import errno
+ import json
+ import os
++import socket
+ import subprocess
+ import time
+ import types
+@@ -125,18 +127,59 @@ def test_proxy_holds_a_client_while_no_backend_answers_then_splices_it(home):
+     assert asyncio.run(scenario()) == b"pong:ping"
+ 
+ 
+-def test_proxy_closes_a_client_only_after_the_hold(home):
+-    async def scenario():
+-        ro.write_active(socket_free_port())
++@pytest.fixture(params=[False, True], ids=["uncontended", "port-takeover"])
++def backend_port_contender(request, monkeypatch):
++    """Try a real silent listener in the gap after the active port is published."""
++    real_write_active = ro.write_active
++    with socket.socket() as contender:
++        def publish(port):
++            real_write_active(port)
++            if request.param:
++                try:
++                    contender.bind(("127.0.0.1", port))
++                except OSError as exc:
++                    assert exc.errno == errno.EADDRINUSE
++                else:
++                    contender.listen(1)  # A successful TCP connect must not be mistaken for refusal.
++
++        monkeypatch.setattr(ro, "write_active", publish)
++        yield
++
++
++def test_proxy_closes_a_client_only_after_the_hold(home, backend_port_contender):
++    async def scenario(dead_port):
++        ro.write_active(dead_port)
+         proxy = ro.Proxy(hold_s=0.5)
+-        front = await asyncio.start_server(proxy.handle, "127.0.0.1", 0)
+-        reader, _writer = await asyncio.open_connection("127.0.0.1", front.sockets[0].getsockname()[1])
+-        started = time.monotonic()
+-        data = await asyncio.wait_for(reader.read(10), 5)
+-        front.close()
+-        return data, time.monotonic() - started
+-
+-    data, elapsed = asyncio.run(scenario())
++        handlers = []
++        clients = []
++
++        def handle(reader, writer):
++            clients.append(writer)
++            handlers.append(asyncio.create_task(proxy.handle(reader, writer)))
++
++        front = await asyncio.start_server(handle, "127.0.0.1", 0)
++        writer = None
++        try:
++            reader, writer = await asyncio.open_connection("127.0.0.1", front.sockets[0].getsockname()[1])
++            started = time.monotonic()
++            data = await asyncio.wait_for(reader.read(10), 5)
++            return data, time.monotonic() - started
++        finally:
++            front.close()
++            closing = [front.wait_closed()]
++            if writer is not None:
++                clients.append(writer)
++            for client in clients:
++                client.close()
++                closing.append(client.wait_closed())
++            for task in handlers:
++                task.cancel()
++            await asyncio.wait_for(asyncio.gather(*handlers, *closing, return_exceptions=True), 5)
++
++    # Bind without listening: connections refuse, but nobody (including the frontend) can take the port.
++    with socket.socket() as dead:
++        dead.bind(("127.0.0.1", 0))
++        data, elapsed = asyncio.run(scenario(dead.getsockname()[1]))
+     assert data == b"" and elapsed >= 0.4
+ 
+ 
+-- 
+2.43.0
+

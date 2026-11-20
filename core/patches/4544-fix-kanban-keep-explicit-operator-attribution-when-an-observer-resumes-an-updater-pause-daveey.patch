@@ -1,0 +1,127 @@
+From c18ae8256fa9055b1017949b6a835399954954e7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 20:31:37 +0000
+Subject: [PATCH] fix(kanban): keep explicit-operator attribution when an
+ observer resumes an updater pause [daveey]
+
+Rebasing this PR onto main ca1802c8a8 left one gap between the two changes:
+the reclaim intent recorded the exact run but not the operator attribution, so
+an observer resuming an abandoned explicit-operator interruption wrote a
+reclaimed event without urgency_source/interrupt_target (unknown attribution
+in the containment query).
+
+The intent row now stores both validated fields and recover_and_drain passes
+them back to reclaim_task, which validates them again. Legacy and plain updater
+pauses store NULLs and resume exactly as before. No intent table exists outside
+tests yet (replica census in the parent commit), so the schema needs no migration.
+
+Proof: new test_resumed_pause_keeps_explicit_operator_attribution failed on
+46550b1456 (resumed reclaimed payload had no urgency_source) and passes here.
+Reclaim-related suites (100 files): === Summary: 100 files, 1953 tests passed, 0 failed, 16 skipped (100% complete) in 200.3s (16 workers) ===
+
+Task: t_b0780784b2b4dad6.
+---
+ hermes_cli/kanban_manual_reclaim.py           |  2 +-
+ hermes_cli/kanban_update_reclaim_intent.py    | 15 +++++++----
+ .../test_kanban_update_reclaim_recovery.py    | 25 +++++++++++++++++++
+ 3 files changed, 36 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_manual_reclaim.py b/hermes_cli/kanban_manual_reclaim.py
+index c79203cb10f80b8a97e3e14f0aea283d060e006e..97a7014aa7ec2a4d8db6072bac621786cb941c0f 100644
+--- a/hermes_cli/kanban_manual_reclaim.py
++++ b/hermes_cli/kanban_manual_reclaim.py
+@@ -16,7 +16,7 @@ def reclaim_task(conn, task_id, *, reason=None, signal_fn=None, attribution=None
+         return False
+     if kb._sync.refuse_foreign_reclaim(conn, task_id):
+         return False
+-    with fence(conn, task_id, row, reason) as admitted:
++    with fence(conn, task_id, row, reason, attribution) as admitted:
+         if not admitted:
+             return False
+         return _reclaim(conn, task_id, row, reason, signal_fn, attribution or {})
+diff --git a/hermes_cli/kanban_update_reclaim_intent.py b/hermes_cli/kanban_update_reclaim_intent.py
+index 3b733f264e2c70ab389759006919e6e9f86e8cc7..24b499e41f92a19334941ad822628f6bb8c09eae 100644
+--- a/hermes_cli/kanban_update_reclaim_intent.py
++++ b/hermes_cli/kanban_update_reclaim_intent.py
+@@ -15,6 +15,8 @@ from hermes_cli.kanban_core_update_requeue import CORE_UPDATE_REQUEUE_REASON
+ 
+ TABLE = "kanban_update_reclaim_intents"
+ FIELDS = ("current_run_id", "claim_lock", "worker_pid", "worker_started_at")
++# Validated explicit-operator reclaim attribution; NULL on legacy and plain updater pauses.
++ATTRIBUTION = ("urgency_source", "interrupt_target")
+ 
+ 
+ def _exists(conn):
+@@ -59,7 +61,8 @@ def recover_and_drain(conn):
+                 continue
+             row = conn.execute("SELECT * FROM tasks WHERE id=?", (intent["task_id"],)).fetchone()
+             if _matching(intent, row) and row["status"] == "running":
+-                kb.reclaim_task(conn, intent["task_id"], reason=CORE_UPDATE_REQUEUE_REASON)
++                kb.reclaim_task(conn, intent["task_id"], reason=CORE_UPDATE_REQUEUE_REASON,
++                                **{key: intent[key] for key in ATTRIBUTION})
+             else:
+                 with kb.write_txn(conn):
+                     conn.execute(f"DELETE FROM {TABLE} WHERE task_id=? AND token=?",
+@@ -68,7 +71,7 @@ def recover_and_drain(conn):
+ 
+ 
+ @contextmanager
+-def fence(conn, task_id, selected, reason):
++def fence(conn, task_id, selected, reason, attribution=None):
+     """Publish before signalling; stale selection or concurrent reclaim sends no signal."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_db_dispatch as dispatch
+@@ -87,12 +90,14 @@ def fence(conn, task_id, selected, reason):
+             conn.execute(f"CREATE TABLE IF NOT EXISTS {TABLE} (task_id TEXT PRIMARY KEY "
+                          "REFERENCES tasks(id) ON DELETE CASCADE, current_run_id INTEGER, claim_lock TEXT, "
+                          "worker_pid INTEGER, worker_started_at TEXT, token TEXT NOT NULL, "
+-                         "owner_pid INTEGER NOT NULL, owner_started_at TEXT NOT NULL)")
++                         "owner_pid INTEGER NOT NULL, owner_started_at TEXT NOT NULL, "
++                         "urgency_source TEXT, interrupt_target TEXT)")
+             previous = conn.execute(f"SELECT * FROM {TABLE} WHERE task_id=?", (task_id,)).fetchone()
+             valid = not (_matching(previous, row) and _owner_alive(previous))
+         if valid:
+-            conn.execute(f"INSERT OR REPLACE INTO {TABLE} VALUES (?,?,?,?,?,?,?,?)",
+-                         (task_id, *(row[key] for key in FIELDS), token, owner_pid, owner_started_at))
++            conn.execute(f"INSERT OR REPLACE INTO {TABLE} VALUES (?,?,?,?,?,?,?,?,?,?)",
++                         (task_id, *(row[key] for key in FIELDS), token, owner_pid, owner_started_at,
++                          *((attribution or {}).get(key) for key in ATTRIBUTION)))
+     if not valid:
+         yield False
+         return
+diff --git a/tests/hermes_cli/test_kanban_update_reclaim_recovery.py b/tests/hermes_cli/test_kanban_update_reclaim_recovery.py
+index 33141cf18839098ca88bfbdc93d3fb1fac5b2a48..d7a5bffdbf08fd5c79859efb959546516154b363 100644
+--- a/tests/hermes_cli/test_kanban_update_reclaim_recovery.py
++++ b/tests/hermes_cli/test_kanban_update_reclaim_recovery.py
+@@ -64,3 +64,28 @@ def test_no_intent_does_not_exempt_real_sigterm(board, monkeypatch):
+         assert "failure_finalized" in {e.kind for e in kb.list_events(board, tid)}
+     finally:
+         dispatch._recent_worker_exits.pop(race.PID, None)
++
++
++def test_resumed_pause_keeps_explicit_operator_attribution(board, monkeypatch):
++    tid, _alive = race.running(board, monkeypatch)
++    target = "0123456789abcdef0123456789abcdef01234567"
++    settled = []
++
++    def custody(*_):
++        settled.append(True)
++        if len(settled) == 1:
++            raise RuntimeError("custody interrupted")
++        return {}
++
++    monkeypatch.setattr(kb._requeue_custody, "for_requeue", custody)
++    with pytest.raises(RuntimeError, match="custody interrupted"):
++        kb.reclaim_task(board, tid, reason=CORE_UPDATE_REQUEUE_REASON,
++                        urgency_source="explicit_operator", interrupt_target=target)
++    assert intent.task_pending(board, tid)
++    dispatch.detect_crashed_workers(board)
++    reclaimed = [e.payload for e in kb.list_events(board, tid) if e.kind == "reclaimed"]
++    assert len(reclaimed) == 1
++    assert reclaimed[0].get("urgency_source") == "explicit_operator"
++    assert reclaimed[0].get("interrupt_target") == target
++    assert kb.get_task(board, tid).status == "ready"
++    assert not intent.task_pending(board, tid)
+-- 
+2.43.0
+

@@ -1,0 +1,145 @@
+From ebe7dccc8d6f8c8a81753a09c07c55daf9acc867 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 01:46:14 +0000
+Subject: [PATCH] fix(lifecycle-guard): a quoted data-sink pattern's | bash is
+ no output sink [daveey]
+
+A hub chat's read-only `grep -E "...|\[bash, ?\"-[lc]|..." local.py ...` was refused with
+"the scan depth limit was reached (depth 8)": the quote-blind sink regex read `|\[bash` in the
+pattern as a pipe into bash, so every adjacent quote pair was walked as printed shell code. The
+escaped `\"` shifted pairing and put local.py in command position (local.py -> ~/.bashrc ->
+bash_completion, past depth 8).
+
+iter_printed_shell_payloads now also requires a sink after _mask_data_sink_arguments
+(fail-closed: lines piping into a shell and arguments carrying `$(`, backticks, `<(`, `>(`, `\!`
+or dot-commands are never masked). shell_sink=True callers are unchanged. Nit 3's `| grep bash`
+false-sink rows move to no-sink; real sinks (`grep ... | bash`, `| awk bash`) stay fail-closed.
+
+Self-heal lifecycleguard-f82a8e8dd311 (t_f59ff0fb76b5e065).
+---
+ cron/lifecycle_guard_output.py                |  7 ++
+ .../test_lifecycle_guard_data_sink_pipe.py    | 65 +++++++++++++++++++
+ .../cron/test_lifecycle_guard_output_sink.py  | 10 ++-
+ 3 files changed, 79 insertions(+), 3 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_data_sink_pipe.py
+
+diff --git a/cron/lifecycle_guard_output.py b/cron/lifecycle_guard_output.py
+index c101faf2e9c1899633a28ef0265bbb8675514852..3d3740bc31041dfcbfa91d382a0a3b52b372e997 100644
+--- a/cron/lifecycle_guard_output.py
++++ b/cron/lifecycle_guard_output.py
+@@ -53,6 +53,13 @@ def iter_printed_shell_payloads(
+ 
+     if not shell_sink and not output_reaches_shell(command):
+         return
++    # The sink regex is quote-blind: `|\[bash` inside a grep/rg/sqlite3 pattern reads as a pipe
++    # into bash. Re-check with data-sink arguments masked (fail-closed: lines piping into a shell
++    # or arguments carrying `$(`, backticks, `<(`… are never masked), so a real sink survives
++    # (self-heal lifecycleguard-f82a8e8dd311).
++    if not shell_sink and not output_reaches_shell(
++            guard._mask_data_sink_arguments(guard.join_line_continuations(command))):
++        return
+     seen: set[str] = set()
+ 
+     def unseen(text: str, raw_quote: bool) -> Iterator[tuple[str, bool]]:
+diff --git a/tests/cron/test_lifecycle_guard_data_sink_pipe.py b/tests/cron/test_lifecycle_guard_data_sink_pipe.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..491ac7873a3c97107c1113239f21ecd5a4f9b746
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_data_sink_pipe.py
+@@ -0,0 +1,65 @@
++"""A `|` + shell name inside a data sink's quoted pattern is not a pipe into a shell
++(self-heal lifecycleguard-f82a8e8dd311).
++
++A hub chat's read-only ``grep -n -E "...|\\[bash, ?\\"-[lc]|..." tools/environments/local.py ...``
++was refused with "the scan depth limit was reached (depth 8)": the quote-blind sink regex took
++``|\\[bash`` inside the grep pattern for a pipe, so every adjacent quote pair was walked as printed
++shell code. The escaped ``\\"`` shifted pairing, an unquoted span put ``local.py`` in command
++position, and the walk recursed local.py -> ~/.bashrc -> bash_completion past depth 8.
++"""
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from cron.lifecycle_guard_output import iter_printed_shell_payloads
++
++# The incident command verbatim, except the script paths (moved under tmp_path).
++_INCIDENT = (
++    'grep -rn "oom_score_adj\\|OOMScoreAdjust\\|choom" --include=*.py tools 2>/dev/null'
++    ' | grep -v "/tests/" | head -6 | cut -c1-200;'
++    ' echo "=== where local terminal commands get wrapped";'
++    ' grep -n -E "def (_wrap|_build|_prepare|_compose)[a-z_]*command|def _run_bash|def execute\\(|'
++    '\\[bash, ?\\"-[lc]|_find_bash\\(\\)" {s0} {s0b} 2>/dev/null | head -10 | cut -c1-200;'
++    ' grep -rn "HERMES_KANBAN_TASK" tools/environments/*.py 2>/dev/null | head -5 | cut -c1-200'
++)
++
++
++def _chain(tmp_path, depth=12):
++    """s0.sh sources s1.sh ... : executing s0 walks past the depth limit (as local.py did)."""
++    for i in range(depth):
++        (tmp_path / f"s{i}.sh").write_text(f". {tmp_path}/s{i + 1}.sh\n", encoding="utf-8")
++    (tmp_path / f"s{depth}.sh").write_text("true\n", encoding="utf-8")
++    (tmp_path / "s0b.sh").write_text("true\n", encoding="utf-8")
++    return _INCIDENT.replace("{s0}", str(tmp_path / "s0.sh")).replace("{s0b}", str(tmp_path / "s0b.sh"))
++
++
++def test_quoted_grep_pattern_pipe_is_no_sink(tmp_path):
++    command = _chain(tmp_path)
++    assert list(iter_printed_shell_payloads(command)) == []
++
++
++def test_quoted_grep_pattern_pipe_is_allowed(tmp_path):
++    command = _chain(tmp_path)
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
++
++
++# Real sinks around the same pattern keep the full (fail-closed) walk.
++_REAL_SINKS = {
++    "pipe-to-bash-after": 'echo "bash {s0}" | grep -E "a|\\[bash" | bash',
++    "grep-output-to-bash": 'grep -h "bash" {s0b} | bash; echo "bash {s0}"',
++    "subst-in-pattern": 'grep -E "$(echo x)|\\[bash" {s0b}; echo "bash {s0}" | bash',
++    "unquoted-pipe-bash": 'echo "bash {s0}" | bash',
++}
++
++
++def test_real_sinks_still_fail_closed(tmp_path):
++    _chain(tmp_path)
++    for name, shape in _REAL_SINKS.items():
++        command = shape.replace("{s0}", str(tmp_path / "s0.sh")).replace(
++            "{s0b}", str(tmp_path / "s0b.sh"))
++        unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++        assert unsafe is True and refusal is not None, (name, refusal)
++
++
++def test_shell_sink_callers_unchanged():
++    command = 'grep -E "a|\\[bash" f; echo "bash x"'
++    assert "bash x" in [payload for payload, _ in
++                        iter_printed_shell_payloads(command, shell_sink=True)]
+diff --git a/tests/cron/test_lifecycle_guard_output_sink.py b/tests/cron/test_lifecycle_guard_output_sink.py
+index 8a401abf83323daa41802eb29da4dd44616d5521..4e0767be33156dfd0e1bd692c84111f51e896f0b 100644
+--- a/tests/cron/test_lifecycle_guard_output_sink.py
++++ b/tests/cron/test_lifecycle_guard_output_sink.py
+@@ -94,9 +94,9 @@ _SINK_SHAPES = {
+     "printf-long-precision": f"printf '%.{_LONG_ZEROS}4s %s' bashrc {{big}} | bash\n",  # `bash`
+     # Kept from the old opener peel (fails closed): a leading `in` is not read as the command.
+     "echo-after-in": "for w\nin echo bash {big}; do :; done | bash\n",
+-    # Nit 3 (intended, fails closed): any later pipe word counts as the shell, a grep pattern too.
+-    "pipe-grep-bash": "python3 - <<'PY' | grep bash\n" + _PRINT + "PY\n",
+-    "pipe-grep-c-bash": "echo bash {big} | grep -c bash\n",
++    # A data sink's pattern masked away must not hide a real pipe into a shell after it.
++    "pipe-grep-then-bash": "python3 - <<'PY' | grep bash | bash\n" + _PRINT + "PY\n",
++    "pipe-awk-bash": "echo bash {big} | awk bash\n",  # awk is not a data sink: fails closed
+ }
+ 
+ 
+@@ -172,6 +172,10 @@ _NO_SINK_SHAPES = {
+     "printf-format-no-sink": "printf '%s %s' bash {big}\n",
+     "printf-star-width-no-sink": "printf '%*s %s' 5 bash {big}\n",
+     "printf-b-hex-no-sink": "printf '%b %s' 'ba\\x73h' {big}\n",
++    # Was nit 3's deliberate false sink: `| grep bash` reads `bash` as a pattern, which grep only
++    # prints (self-heal lifecycleguard-f82a8e8dd311; the regex alone still says sink, see below).
++    "pipe-grep-bash": "python3 - <<'PY' | grep bash\n" + _PRINT + "PY\n",
++    "pipe-grep-c-bash": "echo bash {big} | grep -c bash\n",
+ }
+ 
+ 
+-- 
+2.43.0
+

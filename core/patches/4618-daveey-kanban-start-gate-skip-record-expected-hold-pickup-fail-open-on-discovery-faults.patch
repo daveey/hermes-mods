@@ -1,0 +1,300 @@
+From 4314129f20565899f186949d9df71b912838e6d5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 23:00:56 +0000
+Subject: [PATCH] [daveey] kanban start gate: skip record, expected hold,
+ pickup, fail open on discovery faults
+
+Review of 73aeb3f0: a gated card left no record, so pickup re-imported it
+every tick, the dispatcher-stuck detector counted it as unexplained and
+diagnostics called it stranded; and a plugin-discovery fault outside the
+caught classes could escape into the tick.
+
+A gated start now records a dispatch_skipped skip (reason start_gate), is an
+expected hold for the stuck detector, is named by held_in_ready diagnostics,
+and is skipped at pickup like a governor hold. The gate catches every fault
+and warns once per process. Still not a respawn-guard hold: no cap, no
+auto-block, nothing counted against the card.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_diagnostics.py             |   5 +
+ hermes_cli/kanban_dispatch_expected_holds.py |   3 +
+ hermes_cli/kanban_dispatch_skip.py           |   4 +
+ hermes_cli/kanban_start_gate.py              |  31 ++++--
+ hermes_cli/kanban_worker_node.py             |   6 +-
+ tests/hermes_cli/test_kanban_start_gate.py   | 104 ++++++++++++++++++-
+ website/docs/user-guide/features/kanban.md   |   2 +-
+ 7 files changed, 143 insertions(+), 12 deletions(-)
+
+diff --git a/hermes_cli/kanban_diagnostics.py b/hermes_cli/kanban_diagnostics.py
+index c754b46d82b0f2aec7965f31b1123b17ed988f5b..b44bcbb0246387cc543969ecce6e87f4b978483a 100644
+--- a/hermes_cli/kanban_diagnostics.py
++++ b/hermes_cli/kanban_diagnostics.py
+@@ -853,6 +853,8 @@ def _ready_hold_reason(task, events, cfg, now=None) -> Optional[str]:
+         return "pinned_quota_wall"  # a fresh pin held on its live quota wall (kanban-dd62aef001)
+     if _llm_paced_hold(events, now):
+         return "llm_paced"  # the quota-pace governor holds it until its provider pool is back on pace
++    if _episode_skip(events).get("reason") == "start_gate":
++        return "start_gate"  # a plugin start gate (kanban_start_gate) held its last claim; asked again every tick
+     return None
+ 
+ 
+@@ -992,6 +994,9 @@ def _rule_held_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
+                 "is the last recorded verdict, not a live one." if reason == "llm_paced" else
+                 "Its explicit model pin is quota-walled and no same-class reroute applies; it starts when "
+                 "the wall resets." if reason == "pinned_quota_wall" else
++                "A plugin start gate (kanban_start_gate hook, e.g. the token throttle while the fleet is over its "
++                "cap) held its last claim. The dispatcher asks again every tick and starts it when the plugin stops "
++                "holding; this is the last recorded verdict, not a live one." if reason == "start_gate" else
+                 "A foreign machine:* pin waits for that machine (or a re-file)."),
+         actions=[_cli_hint("Check dispatcher status", "hermes kanban diagnostics")],
+         first_seen_at=since, last_seen_at=since, count=1,
+diff --git a/hermes_cli/kanban_dispatch_expected_holds.py b/hermes_cli/kanban_dispatch_expected_holds.py
+index 6dde5cd7675b71523e38a6619d947bc498baa30d..aed2ccc8ecd768e5e20a1a925908cdaa829368b2 100644
+--- a/hermes_cli/kanban_dispatch_expected_holds.py
++++ b/hermes_cli/kanban_dispatch_expected_holds.py
+@@ -50,6 +50,9 @@ def expected_holds(results, now):
+         for tid, (reason, until) in res.clock_held.items():
+             if reason in CLOCK_REASONS and now < until < 253402300799:
+                 local[tid] = (f"{reason}; until {datetime.fromtimestamp(until, UTC).isoformat()}", until)
++        for tid, reason in res.respawn_guarded:
++            if str(reason).startswith("start_gate:"):  # a plugin start gate (kanban_start_gate): asked every tick
++                local[tid] = (f"{reason}; release when the plugin stops holding starts; recheck next tick", None)
+         for tid, reason in res.claim_deferred:
+             if reason == "worker_load_pressure":
+                 local[tid] = ("worker_load_pressure; release when host pressure clears; recheck next tick", None)
+diff --git a/hermes_cli/kanban_dispatch_skip.py b/hermes_cli/kanban_dispatch_skip.py
+index 99a7f675bb3a280ea93058ad1a101a4ffc2e3524..39c4a236152464c8e68158002adb5d644d8e5e08 100644
+--- a/hermes_cli/kanban_dispatch_skip.py
++++ b/hermes_cli/kanban_dispatch_skip.py
+@@ -228,6 +228,9 @@ def _tick_skips(result: Any) -> list[tuple[str, str, Any, Optional[float], dict[
+     out += [(tid, PINNED_QUOTA_WALL, f"{model} ({provider})", until, {"model": model, "provider": provider})
+             for tid, model, provider, until in getattr(result, "pinned_quota_held", ())]
+     out += [(tid, LLM_PACED, detail, until, extra) for tid, detail, until, extra in getattr(result, LLM_PACED, ())]
++    from hermes_cli.kanban_start_gate import SKIP_REASON, word  # a plugin held the start (kanban_start_gate)
++    out += [(tid, SKIP_REASON, word(reason), None, {}) for tid, reason in getattr(result, "respawn_guarded", ())
++            if word(reason)]
+     return out
+ 
+ 
+@@ -303,6 +306,7 @@ def _stamp(epoch: Any, now: Optional[float] = None) -> str:
+ _WORDS = {
+     PINNED_QUOTA_WALL: "held: pinned model {detail} quota-walled",
+     LLM_PACED: "held: LLM quota pacing ({detail} pool)",
++    "start_gate": "held: a plugin start gate holds card starts ({detail})",
+     "per_profile_capped": "skipped: assignee {detail} is at its per-profile worker cap",
+     "skipped_ineligible": "skipped: this machine cannot lease it ({detail})",
+     "capsule_refused": "skipped: capsule admission refused it ({detail})",
+diff --git a/hermes_cli/kanban_start_gate.py b/hermes_cli/kanban_start_gate.py
+index 9d4738d4cdb6874d3c91aceb98333d9f37f49d81..3dfc345b6d9a2ee8bd807b7e45325983728e134d 100644
+--- a/hermes_cli/kanban_start_gate.py
++++ b/hermes_cli/kanban_start_gate.py
+@@ -6,10 +6,16 @@ there while the dispatcher keeps starting cards only fills worker slots with run
+ claim the dispatcher asks the ``kanban_start_gate`` hook. A callback answers ``{"hold": True, "reason": "<word>"}``
+ to keep the card ready and unclaimed this tick; anything else lets it start.
+ 
+-* The card is recorded like any other guard hold: ``respawn_guarded`` with reason ``start_gate:<word>`` and a
+-  clock hold. It is asked again every tick; nothing is persisted, so the hold ends when the plugin stops saying so.
+-* Fail open: no subscriber, a raising callback, a malformed answer or a ``hold`` that is not exactly ``True``
+-  starts the card.
++* The tick reports the card under ``respawn_guarded`` with reason ``start_gate:<word>`` and records a
++  ``dispatch_skipped`` skip (reason ``start_gate``, detail ``<word>``; ``kanban_dispatch_skip``), so wait notices
++  and diagnostics name the gate instead of "skip reason unrecorded" or a stranded card. The dispatcher-stuck
++  detector counts it as an expected hold (``kanban_dispatch_expected_holds``). It is not a respawn-guard hold: no
++  guard-hold cap, no auto-block, nothing counted against the card. The card is asked again every tick and starts
++  when no callback holds it.
++* Pickup asks too (``kanban_worker_node._paced``): a machine whose gate holds imports no new foreign cards it would
++  only hold, the same way it skips cards its quota governor would hold.
++* Fail open: no subscriber, a raising callback, a plugin-discovery fault, a malformed answer or a ``hold`` that
++  is not exactly ``True`` starts the card. A fault is logged once per process, not once per card.
+ * Callbacks run inline in the dispatcher tick for every candidate card: they must answer from a cached read.
+ """
+ from __future__ import annotations
+@@ -21,7 +27,9 @@ from typing import Any, Optional
+ logger = logging.getLogger(__name__)
+ 
+ HOOK = "kanban_start_gate"
+-REASON_PREFIX = "start_gate:"
++SKIP_REASON = "start_gate"  # the ``dispatch_skipped`` reason; the word is its detail
++REASON_PREFIX = SKIP_REASON + ":"
++_warned = False
+ _WORD = re.compile(r"[^a-z0-9_]+")
+ 
+ 
+@@ -40,11 +48,20 @@ def hold(*, task_id: str, lane: str, assignee: Optional[str], board: Optional[st
+         for answer in invoke_hook(HOOK, task_id=task_id, lane=lane, assignee=assignee, board=board):
+             if isinstance(answer, dict) and answer.get("hold") is True:
+                 return _reason(answer.get("reason"))
+-    except (RuntimeError, ValueError, TypeError, LookupError, AttributeError, OSError) as exc:  # fail open
+-        logger.warning("kanban start gate: hook failed (%s: %s); starting ungated", type(exc).__name__, exc)
++    except Exception as exc:  # health: allow BLE001 -- a plugin or discovery fault never holds a card (fail open)
++        global _warned
++        if not _warned:
++            _warned = True
++            logger.warning("kanban start gate: hook failed (%s: %s); starting ungated", type(exc).__name__, exc)
+     return None
+ 
+ 
++def word(reason: Any) -> Optional[str]:
++    """``<word>`` of a ``start_gate:<word>`` guard reason, else None."""
++    text = str(reason or "")
++    return text[len(REASON_PREFIX):] if text.startswith(REASON_PREFIX) and len(text) > len(REASON_PREFIX) else None
++
++
+ def pre_claim_hold(conn: Any, row: Any, lane: str, result: Any, *, assignee: Optional[str], board: Optional[str],
+                    dry_run: bool = False) -> bool:
+     """The dispatcher's last two waits before a claim: the quota governor (``kanban_llm_pacing_dispatch.hold``, which
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index 1ceb511e53bae1bd393681be8b28323fc73877c4..f97d72cd70ceef2ced4652dbf8ba45d435586a68 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -632,7 +632,11 @@ def _paced(conn: sqlite3.Connection, replica: sqlite3.Connection, card: sqlite3.
+     (t_ce15faa434176d77: 9 paced codex cards hid a runnable anthropic card)."""
+     from hermes_cli.kanban_llm_pacing_dispatch import pickup_hold
+     held = pickup_hold(conn, replica, card)
+-    return None if held is None else ("other", f"llm_paced: {held} (local dispatch would hold it)")
++    if held is not None:
++        return "other", f"llm_paced: {held} (local dispatch would hold it)"
++    from hermes_cli.kanban_start_gate import hold as start_gate_hold  # a plugin holds this machine's card starts
++    gated = start_gate_hold(task_id=card["id"], lane=card["status"], assignee=card["assignee"], board=None)
++    return None if gated is None else ("other", f"{gated} (local dispatch would hold it)")
+ 
+ 
+ def _quota_held(replica: sqlite3.Connection, card: sqlite3.Row) -> Optional[tuple[str, Optional[str]]]:
+diff --git a/tests/hermes_cli/test_kanban_start_gate.py b/tests/hermes_cli/test_kanban_start_gate.py
+index d8fa2827d4f33f4807926edf8de2686bfd8cd9c2..3b17f948410ac261853519f942e26b5a278ed987 100644
+--- a/tests/hermes_cli/test_kanban_start_gate.py
++++ b/tests/hermes_cli/test_kanban_start_gate.py
+@@ -57,11 +57,39 @@ def test_anything_but_an_exact_hold_starts_the_card(monkeypatch, answers):
+     assert gate.hold(**ASK) is None
+ 
+ 
+-def test_a_failing_hook_starts_the_card(monkeypatch):
++@pytest.mark.parametrize("fault", [RuntimeError("plugin fault"), ImportError("discovery"), AssertionError("x"),
++                                   KeyError("k")])
++def test_a_failing_hook_or_discovery_starts_the_card_and_warns_once(monkeypatch, caplog, fault):
+     def boom(**kwargs):
+-        raise RuntimeError("plugin fault")
++        raise fault
+     _hook(monkeypatch, boom)
+-    assert gate.hold(**ASK) is None
++    monkeypatch.setattr(gate, "_warned", False)
++    with caplog.at_level("WARNING", logger=gate.logger.name):
++        assert gate.hold(**ASK) is None and gate.hold(**ASK) is None and gate.hold(**ASK) is None
++    assert len([r for r in caplog.records if "start gate" in r.getMessage()]) == 1  # not once per card
++    monkeypatch.setattr(lifecycle, "has_hook", lambda name: (_ for _ in ()).throw(ImportError("plugin tree")))
++    assert gate.hold(**ASK) is None  # a discovery fault before any callback ran
++
++
++def test_the_real_hook_dispatch_swallows_a_raising_plugin_callback(monkeypatch):
++    """Not through a patched ``invoke_hook``: core's own dispatch catches the callback's exception."""
++    manager = plugins._delivery_manager()
++
++    def raising(**kwargs):
++        raise RuntimeError("plugin fault")
++
++    def holding(**kwargs):
++        return {"hold": True, "reason": "token_throttle"}
++    monkeypatch.setattr(manager, "_hooks", {**getattr(manager, "_hooks", {}), gate.HOOK: [raising, holding]})
++    if not lifecycle.has_hook(gate.HOOK):
++        pytest.skip("this plugin manager keeps its callbacks elsewhere; the patched-hook tests cover the gate")
++    assert gate.hold(**ASK) == "start_gate:token_throttle"  # the raising callback is skipped, the next one answers
++
++
++def test_word_reads_only_start_gate_reasons():
++    assert gate.word("start_gate:token_throttle") == "token_throttle"
++    for other in ("start_gate:", "start_gate", "active_pr", "llm_pacing", "", None, 7):
++        assert gate.word(other) is None
+ 
+ 
+ def test_the_hook_is_a_registered_hook_name():
+@@ -90,3 +118,73 @@ def test_dispatch_dry_run_reports_the_gate_without_claiming(paced_board, monkeyp
+         tid = _opus_card(conn)
+         result = kdd.dispatch_once(conn, dry_run=True)
+         assert (tid, "start_gate:token_throttle") in result.respawn_guarded and kb.get_task(conn, tid).status == "ready"
++
++
++def test_a_gated_card_gets_a_skip_record_and_no_guard_hold_bookkeeping(paced_board, monkeypatch):
++    from hermes_cli import kanban_dispatch_skip as skips
++    _write_cfg(paced_board)
++    _hook(monkeypatch, [{"hold": True, "reason": "token_throttle"}])
++    with kbc.connect() as conn:
++        tid = _opus_card(conn)
++        for _ in range(3):
++            seen, _result = _dispatch(conn)
++            assert seen == []
++        kinds = [e.kind for e in kb.list_events(conn, tid)]
++        skip = skips.latest(conn, tid)
++        task = kb.get_task(conn, tid)
++    assert skip["reason"] == "start_gate" and skip["detail"] == "token_throttle"
++    assert skips.words(skip) == "held: a plugin start gate holds card starts (token_throttle)"
++    assert kinds.count(skips.EVENT) == 1  # one record for the episode, not one per tick
++    assert "respawn_guarded" not in kinds and "blocked" not in kinds and task.status == "ready"  # not a guard hold
++
++
++def test_tick_skips_lists_only_start_gate_guards():
++    from types import SimpleNamespace
++    from hermes_cli import kanban_dispatch_skip as skips
++    result = SimpleNamespace(respawn_guarded=[("t_1", "start_gate:token_throttle"), ("t_2", "active_pr"),
++                                              ("t_3", "llm_pacing")])
++    assert skips._tick_skips(result) == [("t_1", "start_gate", "token_throttle", None, {})]
++
++
++def test_a_fully_gated_queue_is_an_expected_hold_not_a_stuck_dispatcher(paced_board, monkeypatch):
++    import time
++    from hermes_cli import kanban_dispatch_expected_holds as expected
++    _write_cfg(paced_board)
++    _hook(monkeypatch, [{"hold": True, "reason": "token_throttle"}])
++    with kbc.connect() as conn:
++        a, b = _opus_card(conn, "a"), _opus_card(conn, "b")
++        _, result = _dispatch(conn)
++    holds, covered = expected.expected_holds([("default", result)], time.time())
++    assert covered is True and set(holds) == {("default", a), ("default", b)}
++    assert all("start_gate:token_throttle" in detail and until is None for detail, until in holds.values())
++    result.respawn_guarded.append(("t_other", "active_pr"))  # an ordinary guard hold is still not "expected"
++    assert expected.expected_holds([("default", result)], time.time())[1] is False
++
++
++def test_diagnostics_name_the_gate_instead_of_a_stranded_card(paced_board, monkeypatch):
++    from hermes_cli import kanban_diagnostics as kd
++    _write_cfg(paced_board)
++    _hook(monkeypatch, [{"hold": True, "reason": "token_throttle"}])
++    with kbc.connect() as conn:
++        tid = _opus_card(conn)
++        _dispatch(conn)
++        task, events = kb.get_task(conn, tid), kb.list_events(conn, tid)
++    assert kd._ready_hold_reason(task, events, {}) == "start_gate"
++    with kbc.connect() as conn:
++        other = _opus_card(conn, "never asked")
++        assert kd._ready_hold_reason(kb.get_task(conn, other), kb.list_events(conn, other), {}) is None
++
++
++def test_pickup_skips_a_foreign_card_this_machines_gate_would_hold(monkeypatch):
++    from hermes_cli import kanban_llm_pacing_dispatch as pd
++    from hermes_cli import kanban_worker_node as wn
++    monkeypatch.setattr(pd, "pickup_hold", lambda *a, **k: None)
++    card = {"id": "t_1", "status": "ready", "assignee": "default"}
++    monkeypatch.setattr(lifecycle, "has_hook", lambda name: False)
++    assert wn._paced(None, None, card) is None  # no gate: offered as before
++    asked = []
++    _hook(monkeypatch, [{"hold": True, "reason": "token_throttle"}], asked)
++    assert wn._paced(None, None, card) == ("other", "start_gate:token_throttle (local dispatch would hold it)")
++    assert asked == [dict(task_id="t_1", lane="ready", assignee="default", board=None)]
++    monkeypatch.setattr(pd, "pickup_hold", lambda *a, **k: "anthropic held")
++    assert wn._paced(None, None, card) == ("other", "llm_paced: anthropic held (local dispatch would hold it)")
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index d6269977275649fd4bbc8ea3a20ad4bad4978809..6b91c3f1b92e13561683f304c466e5f5c27f4354 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -1557,7 +1557,7 @@ To see why a ready card is not spawning, run `hermes kanban dispatch --dry-run`
+ 
+ ### Plugin start gate (`kanban_start_gate` hook)
+ 
+-Right before claiming a card the dispatcher asks the `kanban_start_gate` plugin hook (kwargs `task_id`, `lane`, `assignee`, `board`). A callback that returns `{"hold": True, "reason": "<word>"}` keeps the card `ready` and unclaimed for that tick; the tick records it under `respawn_guarded` with reason `start_gate:<word>`, and `hermes kanban dispatch --dry-run` lists it as `Guarded (start_gate:<word>)`. Nothing is stored: the card is asked again on the next tick and starts as soon as no callback holds it. No subscriber, a failing callback or any other return starts the card. The hermes-mods throughput plugin uses it to stop starting cards while the fleet's token rate is over the token throttle's cap, so worker slots are not filled with runs that only wait for model calls.
++Right before claiming a card the dispatcher asks the `kanban_start_gate` plugin hook (kwargs `task_id`, `lane`, `assignee`, `board`). A callback that returns `{"hold": True, "reason": "<word>"}` keeps the card `ready` and unclaimed for that tick; the tick records it under `respawn_guarded` with reason `start_gate:<word>`, and `hermes kanban dispatch --dry-run` lists it as `Guarded (start_gate:<word>)`. The card is asked again on the next tick and starts as soon as no callback holds it. The hold is recorded as a `dispatch_skipped` skip (reason `start_gate`), so wait notices and `hermes kanban diagnostics` (`held_in_ready`) name it; it is not a respawn-guard hold, so nothing is counted against the card and it is never auto-blocked. The dispatcher-stuck detector treats a gated queue as an expected hold, and a machine whose gate holds imports no new foreign cards at pickup. No subscriber, a failing callback, a plugin-discovery fault or any other return starts the card. Callbacks run inline in the tick for every candidate card and must answer from a cached read. The hermes-mods throughput plugin uses it to stop starting cards while the fleet's token rate is over the token throttle's cap, so worker slots are not filled with runs that only wait for model calls.
+ 
+ ### LLM quota pacing (`kanban.llm_pacing`)
+ 
+-- 
+2.43.0
+

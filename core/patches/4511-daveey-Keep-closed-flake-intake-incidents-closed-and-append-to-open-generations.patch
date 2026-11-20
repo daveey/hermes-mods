@@ -1,0 +1,279 @@
+From d6009167a44d35957fdae3ec2cc8214b2b4b2e22 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 12:51:36 +0000
+Subject: [PATCH] [daveey] Keep closed flake intake incidents closed and append
+ to open generations
+
+---
+ docs/ci-flaky-intake.md                  |  9 +--
+ scripts/ci/flaky_intake.py               | 49 +++++++++++-----
+ tests/ci/test_flaky_intake.py            | 21 +++----
+ tests/ci/test_flaky_intake_incidents.py  | 72 ++++++++++++++++++++++++
+ tests/ci/test_flaky_intake_real_board.py | 15 +++--
+ 5 files changed, 129 insertions(+), 37 deletions(-)
+ create mode 100644 tests/ci/test_flaky_intake_incidents.py
+
+diff --git a/docs/ci-flaky-intake.md b/docs/ci-flaky-intake.md
+index be6dc088147c4702ab3840339541d652d0c263ae..11974d0a9f06905f73fee59cfd48803a417eef17 100644
+--- a/docs/ci-flaky-intake.md
++++ b/docs/ci-flaky-intake.md
+@@ -115,10 +115,11 @@ responses fail closed rather than advancing the cursor.
+ Run descriptors retain branch/workflow identity for supersession, with bounded metadata
+ validation. Malformed report input fails with a fixed diagnostic, not raw payload output.
+ 
+-A done intake is reopened through the supported Board command. An archived intake is not
+-reopened or replaced on the same day: undelivered occurrences retain their original observed
+-day and move to the next day's intake. Until then they remain visible as pending. No retry
+-threshold, cadence, red-main handling or self-heal policy changes are part of batching.
++A done or archived intake stays closed. Fresh undelivered occurrences use the same daily
++subject with the first unused `#<generation>` suffix, reusing an open generation when present.
++A lost acknowledgment is reconciled against the previous card's exact payload before any
++replacement, so closure does not duplicate delivered evidence. No retry threshold, cadence,
++red-main handling or self-heal policy changes are part of batching.
+ 
+ Run attempts are replayed from the journal, so a run whose artifact is permanently
+ unavailable (expired, invalid, missing) would otherwise log `FAILED` on every poll. Once a
+diff --git a/scripts/ci/flaky_intake.py b/scripts/ci/flaky_intake.py
+index 1aed7880aa3010e9073cfd98a7bd276bbf6bf42a..ea1a115faf12d65fcfb78052167ccb0ab80e0f19 100644
+--- a/scripts/ci/flaky_intake.py
++++ b/scripts/ci/flaky_intake.py
+@@ -90,6 +90,33 @@ def run_metadata(run: dict) -> dict:
+     return data
+ 
+ 
++def _incident_destination(board, key, cached_id, payload):
++    """Resolve one daily subject, retaining exact-write recovery after closure."""
++    cards = [c for c in board.list_cards() if c.get("idempotency_key") == key or
++             (str(c.get("idempotency_key", "")).startswith(key + "#") and
++              str(c["idempotency_key"])[len(key) + 1:].isdigit())]
++    cached = board.card(cached_id) if cached_id else None
++    if cached_id:
++        if not cached or cached.get("idempotency_key") not in {c["idempotency_key"] for c in cards}:
++            raise RuntimeError("intake cached identity unavailable")
++        if payload in board.comments(cached_id):
++            return cached_id, cached["idempotency_key"], True
++    actionable = {"todo", "ready", "running", "scheduled", "blocked", "review", "triage"}
++    if any(c.get("status") not in actionable | {"done", "archived"} for c in cards):
++        raise RuntimeError("intake status unavailable")
++    opened = [c for c in cards if c.get("status") in actionable]
++    owner = cached if cached and cached.get("status") in actionable else (opened[0] if opened else None)
++    if owner:
++        return owner["id"], owner["idempotency_key"], False
++    used = {c["idempotency_key"] for c in cards}
++    base_key = key
++    generation = 0
++    while key in used:
++        generation += 1
++        key = f"{base_key}#{generation}"
++    return None, key, False
++
++
+ class Journal:
+     def __init__(self, path: Path, *, identity_path: Path | None = None, initialize: bool = False):
+         import fcntl
+@@ -342,8 +369,11 @@ class Journal:
+             self.rotate(repo, "page", str(page["id"]))
+             key = f"ci-flaky-intake:{repo}:{page['day']}"
+             try:
+-                cards = [c for c in board.list_cards() if c.get("idempotency_key") == key]
+-                card = page["card"] or (cards[0]["id"] if cards else None)
++                card, key, delivered = _incident_destination(board, key, page["card"], page["payload"])
++                if delivered:
++                    self.acknowledge_page(page["id"], card)
++                    log.append(f"intake delivered {card} page={page['id']}")
++                    continue
+                 # Fence before create as well as comment: either response can be lost.
+                 with self.db:
+                     self.db.execute("UPDATE pages SET attempted=1 WHERE id=?", (page["id"],))
+@@ -357,7 +387,7 @@ class Journal:
+                             "are not inventoried, and rows with owner_check or owner_check_ref had clipped closed-card "
+                             "history, so check those first. Read the full durable queue before closing; "
+                             "record each test's disposition and follow-up owner. No retry threshold changes.\n"
+-                            "Backlog/export: see docs/ci-flaky-intake.md. New arrivals reopen a done intake.")
++                            "Backlog/export: see docs/ci-flaky-intake.md. New arrivals after closure use a new intake generation.")
+                     title = f"CI flaky intake {repo} {page['day']}"
+                     card = create(title, body, key, page) if create else board.create(title, body, key)
+                     if card is None:
+@@ -374,17 +404,8 @@ class Journal:
+                     log.append(f"intake delivered {card} page={page['id']}")
+                     continue
+                 status = current.get("status")
+-                if status == "archived":
+-                    tomorrow = str(dt.date.fromisoformat(page["day"]) + dt.timedelta(days=1))
+-                    with self.db:
+-                        self.db.execute("UPDATE occurrences SET page=NULL,target_day=? WHERE page=? AND delivered=0",
+-                                        (tomorrow, page["id"]))
+-                        self.db.execute("DELETE FROM pages WHERE id=?", (page["id"],))
+-                    log.append(f"FAILED intake archived; durable carry-forward day={tomorrow}")
+-                    continue
+-                if status == "done":
+-                    board.reopen(card)
+-                    status = (board.card(card) or {}).get("status")
++                # Closure raced selection: leave the page pending; the next fire
++                # selects a fresh generation after reconciling any successful write.
+                 if status not in {"todo", "ready", "running", "scheduled", "blocked", "review", "triage"}:
+                     raise RuntimeError("intake not actionable")
+                 if page["payload"] not in board.comments(card):
+diff --git a/tests/ci/test_flaky_intake.py b/tests/ci/test_flaky_intake.py
+index a7fb0ca0d444794bea089b98b99c7912228dcb14..a9307125dd29eecbaf9807011fec83876065d212 100644
+--- a/tests/ci/test_flaky_intake.py
++++ b/tests/ci/test_flaky_intake.py
+@@ -490,7 +490,7 @@ def test_failure_restart_immutable_pages_and_ambiguous_comment(tmp_path):
+     j.close()
+ 
+ 
+-def test_done_reopens_and_archive_carries_forward_without_same_day_duplicate(tmp_path, monkeypatch):
++def test_closed_intakes_preserve_history_and_deliver_to_new_generation(tmp_path, monkeypatch):
+     monkeypatch.setattr(intake, "utc_day", lambda: "2026-11-13")
+     j = intake.Journal(tmp_path / "queue.sqlite3")
+     board = Board()
+@@ -499,23 +499,18 @@ def test_done_reopens_and_archive_carries_forward_without_same_day_duplicate(tmp
+     board.cards["card0"]["status"] = "done"
+     record(j, run=2, count=1)
+     j.deliver("o/r", board)
+-    assert board.cards["card0"]["status"] == "ready"
+-    assert len(board.cards) == 1
+-    board.cards["card0"]["status"] = "archived"
+-    record(j, run=3, count=1)
+-    assert j.deliver("o/r", board)[0].startswith("FAILED")
+-    j.plan_pages("o/r", j.pending("o/r"))
+-    assert j.deliver("o/r", board)[0].startswith("FAILED")
+-    assert len(board.cards) == 1
+-    monkeypatch.setattr(intake, "utc_day", lambda: "2026-11-14")
+-    j.deliver("o/r", board)
++    assert board.cards["card0"]["status"] == "done"
+     assert len(board.cards) == 2
++    board.cards["card1"]["status"] = "archived"
++    record(j, run=3, count=1)
++    assert not j.deliver("o/r", board)[0].startswith("FAILED")
++    assert len(board.cards) == 3
+     assert j.db.execute("SELECT sum(delivered) FROM occurrences").fetchone()[0] == 3
+     assert j.db.execute("SELECT day,target_day FROM occurrences WHERE id=3").fetchone()[:] == (
+-        "2026-11-13", "2026-11-14")
++        "2026-11-13", "2026-11-13")
+     record(j, run=4, count=1)
+     j.deliver("o/r", board)
+-    assert len(board.cards) == 2
++    assert len(board.cards) == 3
+     j.close()
+ 
+ 
+diff --git a/tests/ci/test_flaky_intake_incidents.py b/tests/ci/test_flaky_intake_incidents.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..605447c81ec14b923921c9f013af5f9e988bcb2a
+--- /dev/null
++++ b/tests/ci/test_flaky_intake_incidents.py
+@@ -0,0 +1,72 @@
++"""Closed daily intake generations never reopen or delay fresh evidence."""
++import pytest
++
++from scripts.ci import flaky_intake as intake
++from tests.ci.test_flaky_intake import Board, record
++
++
++@pytest.mark.parametrize('status', ['done', 'archived'])
++def test_closed_daily_incident_gets_new_generation(tmp_path, status):
++    board = Board()
++    journal = intake.Journal(tmp_path / 'queue.sqlite3')
++    try:
++        record(journal, run=1, count=1)
++        journal.deliver('o/r', board)
++        board.cards['card0']['status'] = status
++        record(journal, run=2, count=1)
++        journal.deliver('o/r', board)
++        assert len(board.cards) == 2
++        assert board.cards['card0']['status'] == status
++        assert len(board.notes['card1']) == 1
++        record(journal, run=3, count=1)
++        journal.deliver('o/r', board)
++        assert len(board.cards) == 2
++        assert len(board.notes['card1']) == 2
++        board.cards['card1']['status'] = status
++        record(journal, run=4, count=1)
++        journal.deliver('o/r', board)
++        assert len(board.cards) == 3
++        assert journal.db.execute('SELECT sum(delivered) FROM occurrences').fetchone()[0] == 4
++    finally:
++        journal.close()
++
++
++def test_destination_refuses_unknown_status_and_foreign_cache():
++    board = Board()
++    key = 'ci-flaky-intake:o/r:2026-11-15'
++    card = board.create('intake', '', key)
++    board.cards[card]['status'] = 'unknown'
++    with pytest.raises(RuntimeError, match='status unavailable'):
++        intake._incident_destination(board, key, None, 'payload')
++    foreign = board.create('foreign', '', key + ':other')
++    with pytest.raises(RuntimeError, match='cached identity'):
++        intake._incident_destination(board, key, foreign, 'payload')
++
++
++def test_destination_matches_exact_subject_and_generation():
++    board = Board()
++    key = 'ci-flaky-intake:o/r:2026-11-15'
++    board.create('other', '', key + '#other')
++    board.create('other repo', '', key.replace('o/r', 'o/r2'))
++    assert intake._incident_destination(board, key, None, 'payload') == (None, key, False)
++    old = board.create('closed', '', key)
++    board.cards[old]['status'] = 'done'
++    live = board.create('open generation', '', key + '#1')
++    assert intake._incident_destination(board, key, None, 'payload') == (live, key + '#1', False)
++
++
++def test_closed_cached_page_reconciles_lost_ack_before_replacement(tmp_path):
++    board = Board()
++    journal = intake.Journal(tmp_path / 'queue.sqlite3')
++    try:
++        record(journal, count=1)
++        journal.deliver('o/r', board)
++        with journal.db:
++            journal.db.execute('UPDATE pages SET delivered=0')
++            journal.db.execute('UPDATE occurrences SET delivered=0')
++        board.cards['card0']['status'] = 'done'
++        journal.deliver('o/r', board)
++        assert len(board.cards) == 1
++        assert journal.db.execute('SELECT sum(delivered) FROM occurrences').fetchone()[0] == 1
++    finally:
++        journal.close()
+diff --git a/tests/ci/test_flaky_intake_real_board.py b/tests/ci/test_flaky_intake_real_board.py
+index fed636b34969a1ae595b8602a63a287a868f2fd4..dfb2063cf25cb06d424af30363ea522bf958fe8c 100644
+--- a/tests/ci/test_flaky_intake_real_board.py
++++ b/tests/ci/test_flaky_intake_real_board.py
+@@ -51,7 +51,7 @@ def test_kanban_json_exposes_idempotency_key(cli):
+ 
+ 
+ @pytest.mark.platforms("posix")
+-def test_daily_intake_delivers_through_real_cli_and_reopens_done(cli, tmp_path):
++def test_daily_intake_delivers_through_real_cli_and_replaces_done(cli, tmp_path):
+     board = fk.CliBoard([sys.executable, "-m", "hermes_cli.main"])
+     journal = intake.Journal(tmp_path / "queue.sqlite3")
+     tests = [f"tests/a.py::test_{i}" for i in range(30)]
+@@ -69,16 +69,19 @@ def test_daily_intake_delivers_through_real_cli_and_reopens_done(cli, tmp_path):
+     assert comments == payloads
+     assert journal.deliver(REPO, board) == []  # replay: no duplicate card or comment
+ 
+-    # A triaged (done) intake must not swallow a later same-day occurrence: it is reopened and receives it.
++    # Closure preserves history; fresh same-day evidence gets a new generation.
+     cli("complete", card, "--summary", "triaged")
+     _record(journal, 2, ["tests/b.py::test_late"])
+     log = journal.deliver(REPO, board)
+     assert not any(line.startswith("FAILED") for line in log), log
+     assert tuple(journal.db.execute("SELECT count(*), sum(delivered) FROM occurrences").fetchone()) == (31, 31)
+-    assert len(json.loads(cli("list", "--archived", "--json"))) == 1
++    cards = json.loads(cli("list", "--archived", "--json"))
++    assert len(cards) == 2
+     shown = json.loads(cli("show", card, "--json"))
+-    assert shown["task"]["status"] != "done"
+-    bodies = [c["body"] for c in shown["comments"]]
++    assert shown["task"]["status"] == "done"
++    assert [c["body"] for c in shown["comments"]] == payloads
++    replacement = next(c["id"] for c in cards if c["id"] != card)
++    bodies = [c["body"] for c in json.loads(cli("show", replacement, "--json"))["comments"]]
+     late = journal.db.execute("SELECT payload FROM pages ORDER BY id DESC LIMIT 1").fetchone()[0]
+-    assert bodies[:len(payloads)] == payloads and bodies.count(late) == 1 and late not in payloads
++    assert bodies == [late] and late not in payloads
+     journal.close()
+-- 
+2.43.0
+

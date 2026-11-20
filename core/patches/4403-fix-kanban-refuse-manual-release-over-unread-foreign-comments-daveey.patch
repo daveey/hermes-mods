@@ -1,0 +1,620 @@
+From ef81efbfc7157caea6f67afa496899444cec3fc5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 22:58:45 +0000
+Subject: [PATCH] fix(kanban): refuse manual release over unread foreign
+ comments [daveey]
+
+Manual promote/unblock previously consulted only lifecycle state, so a decision retracted after the caller read the thread could still be released. Enforce an optional seen-comment watermark, or the last 60 minutes by default, at CLI/tool boundaries under the status writer lock. List foreign comment provenance and a rerun command; exit 4 / unread_comments without mutations. Autonomous DB and owner-wake callers remain unchanged. Preserve bulk result reporting; a seen watermark is per-card, not shared across bulk ids.
+
+Proof: requested baseline 29 tests passed; new suite RED on unchanged source (9 failed, 9 passed). GREEN: 222 tests across 11 files including all requested regressions and owner-wake, self-heal, missing-parent, CLI and tool consumers. No existing release fixture required a seen override. Session-context test verifies tool identity overrides process environment. Full scripts/check passed before main advanced; rerun after rebase required. Card t_9ef4956ed2ea24fe.
+---
+ hermes_cli/kanban.py                          |  49 +----
+ hermes_cli/kanban_cli_release.py              |  77 +++++++
+ hermes_cli/kanban_db.py                       |  49 +----
+ hermes_cli/kanban_db_promote.py               |  56 +++++
+ hermes_cli/kanban_parser.py                   |   2 +
+ hermes_cli/kanban_release_comments.py         |  63 ++++++
+ .../test_kanban_release_unread_comments.py    | 195 ++++++++++++++++++
+ tools/kanban_tools_schemas.py                 |   1 +
+ tools/kanban_tools_self_heal.py               |   7 +
+ 9 files changed, 404 insertions(+), 95 deletions(-)
+ create mode 100644 hermes_cli/kanban_cli_release.py
+ create mode 100644 hermes_cli/kanban_db_promote.py
+ create mode 100644 hermes_cli/kanban_release_comments.py
+ create mode 100644 tests/hermes_cli/test_kanban_release_unread_comments.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index f144809d4918f847c4bc36161b2354a74552aeec..53990d9bdf10ac5567e5d03448c27a153b199d37 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1487,24 +1487,7 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
+                                         or f"cannot schedule {tid}"), conn=conn)
+ 
+ 
+-def _cmd_unblock(args: argparse.Namespace) -> int:
+-    from hermes_cli.kanban_cli_actor import cli_actor
+-    if os.environ.get("HERMES_KANBAN_TASK"):
+-        return _err("kanban unblock is orchestrator-only; workers must hand off their assigned task")
+-    ids, rc = _require_ids(args, _REASON_FLAG_HINT)
+-    if rc:
+-        return rc
+-    reason = _stripped_or_none(getattr(args, "reason", None))
+-    author = _profile_author() if reason else None
+-    suffix = f": {reason}" if reason else ""
+-    with kbc.connect_closing() as conn:
+-        rc = _ids_error(ids, _REASON_FLAG_HINT, conn)
+-        if rc:
+-            return rc
+-        op = _commented(reason, author, "UNBLOCK", lambda tid, comment: kb.unblock_task(conn, tid, comment=comment, event_extra={"actor": cli_actor()}))
+-        from hermes_cli.kanban_shared_blockers import unblock_verdict
+-        return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}; {unblock_verdict(conn, tid)}",
+-                           lambda tid: kb.unblock_refusal(conn, tid) or f"cannot unblock {tid} (not blocked/scheduled?)", conn=conn)
++from hermes_cli.kanban_cli_release import cmd_unblock as _cmd_unblock
+ 
+ 
+ def _cmd_request_review(args: argparse.Namespace) -> int:
+@@ -1572,35 +1555,7 @@ def _cmd_reopen_review(args: argparse.Namespace) -> int:
+                            lambda tid: f"cannot reopen {tid} (not in review?)", conn=conn)
+ 
+ 
+-def _cmd_promote(args: argparse.Namespace) -> int:
+-    reason = _joined_words(args.reason)
+-    author = _profile_author()
+-    # Dedupe while preserving order; positional task_id always first.
+-    ids = list(dict.fromkeys(_bulk_ids(args)))
+-    dry_run = bool(args.dry_run)
+-
+-    results: list[dict[str, object]] = []
+-    with kbc.connect_closing() as conn:
+-        for tid in ids:
+-            ok, err = kb.promote_task(conn, tid, actor=author, reason=reason, dry_run=dry_run)
+-            results.append({"task_id": tid, "promoted": ok, "dry_run": dry_run,
+-                            "reason": reason, "error": err})
+-
+-    failed = [r for r in results if not r["promoted"]]
+-    if getattr(args, "json", False):
+-        # Single-id stays a flat object for back-compat; bulk emits a list.
+-        _print_json(results[0] if len(results) == 1 else results)
+-        return 0 if not failed else 1
+-
+-    tag = " (dry)" if dry_run else ""
+-    label = "Would promote" if dry_run else "Promoted"
+-    suffix = f": {reason}" if reason else ""
+-    for r in results:
+-        if r["promoted"]:
+-            print(f"{label} {r['task_id']} -> ready{tag}{suffix}")
+-        else:
+-            print(f"cannot promote {r['task_id']}: {r['error']}", file=sys.stderr)
+-    return 0 if not failed else 1
++from hermes_cli.kanban_cli_release import cmd_promote as _cmd_promote
+ 
+ 
+ def _cmd_archive(args: argparse.Namespace) -> int:
+diff --git a/hermes_cli/kanban_cli_release.py b/hermes_cli/kanban_cli_release.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8c71cf5d203eb1087013f7e46c5afc5bf9ace8e5
+--- /dev/null
++++ b/hermes_cli/kanban_cli_release.py
+@@ -0,0 +1,77 @@
++"""Manual release CLI handlers with per-card unread-thread refusals. [daveey]"""
++from __future__ import annotations
++
++import os
++import sys
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli.kanban_release_comments import UNREAD_EXIT, capture_refusal, cli_guard
++
++
++def _seen_bulk_error(args, ids):
++    return len(ids) > 1 and getattr(args, "seen_comment_id", None) is not None
++
++
++def cmd_unblock(args):
++    from hermes_cli.kanban_cli_actor import cli_actor
++    from hermes_cli.kanban_shared_blockers import unblock_verdict
++    if os.environ.get("HERMES_KANBAN_TASK"):
++        return cli._err("kanban unblock is orchestrator-only; workers must hand off their assigned task")
++    ids, rc = cli._require_ids(args, cli._REASON_FLAG_HINT)
++    if rc:
++        return rc
++    if _seen_bulk_error(args, ids):
++        return cli._err("--seen belongs to one card; release each card separately with its own newest read comment id")
++    reason = cli._stripped_or_none(getattr(args, "reason", None))
++    author = cli._profile_author() if reason else None
++    suffix = f": {reason}" if reason else ""
++    refused = {}
++    with kbc.connect_closing() as conn:
++        rc = cli._ids_error(ids, cli._REASON_FLAG_HINT, conn)
++        if rc:
++            return rc
++        op = cli._commented(reason, author, "UNBLOCK", lambda tid, comment: kb.unblock_task(
++            conn, tid, comment=comment, event_extra={"actor": cli_actor()},
++            precondition=cli_guard(args, tid, "unblock")))
++        rc = cli._bulk_apply(
++            ids, lambda tid: capture_refusal(lambda: op(tid), tid, refused),
++            lambda tid: f"Unblocked {tid}{suffix}; {unblock_verdict(conn, tid)}",
++            lambda tid: refused[tid]["error"] if tid in refused else (
++                kb.unblock_refusal(conn, tid) or f"cannot unblock {tid} (not blocked/scheduled?)"), conn=conn)
++        return UNREAD_EXIT if refused else rc
++
++
++def cmd_promote(args):
++    reason = cli._joined_words(args.reason)
++    author = cli._profile_author()
++    ids = list(dict.fromkeys(cli._bulk_ids(args)))
++    if _seen_bulk_error(args, ids):
++        return cli._err("--seen belongs to one card; release each card separately with its own newest read comment id")
++    dry_run = bool(args.dry_run)
++    results, refused = [], {}
++    with kbc.connect_closing() as conn:
++        for tid in ids:
++            outcome = capture_refusal(lambda: kb.promote_task(
++                conn, tid, actor=author, reason=reason, dry_run=dry_run,
++                precondition=cli_guard(args, tid, "promote")), tid, refused)
++            ok, err = outcome if outcome is not False else (False, refused[tid]["error"])
++            results.append({"task_id": tid, "promoted": ok, "dry_run": dry_run,
++                            "reason": reason, "error": err, **refused.get(tid, {})})
++    failed = any(not r["promoted"] for r in results)
++    rc = UNREAD_EXIT if refused else int(failed)
++    if getattr(args, "json", False):
++        cli._print_json(results[0] if len(results) == 1 else results)
++        return rc
++    tag = " (dry)" if dry_run else ""
++    label = "Would promote" if dry_run else "Promoted"
++    suffix = f": {reason}" if reason else ""
++    for r in results:
++        if r["promoted"]:
++            print(f"{label} {r['task_id']} -> ready{tag}{suffix}")
++        else:
++            print(f"cannot promote {r['task_id']}: {r['error']}", file=sys.stderr)
++    return rc
++
++
++from hermes_cli import kanban as cli
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 113b128f2572bc26e74039dad7e8aff96ab53077..d64fe0b3f3fec4fed00efdbbfa5d25933bb561d3 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3256,54 +3256,7 @@ def request_changes(
+ _PROMOTABLE_STATUSES = ("todo", "blocked", "triage")
+ 
+ 
+-def promote_task(
+-    conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
+-    dry_run: bool = False,
+-) -> tuple[bool, Optional[str]]:
+-    """Operator promotion ``todo``/``blocked``/``triage`` -> ``ready`` with an
+-    audit event. ``triage`` is the supported exit for a card a block loop
+-    escalated (or any triage card a human has already specified) without
+-    running the specifier/decomposer. [daveey]
+-    Refused while a parent is unfinished; ``dry_run`` only validates.
+-    Returns ``(ok, reason)``."""
+-    cur_status = _task_status(conn, task_id)
+-    if cur_status is None:
+-        return False, f"task {task_id} not found"
+-
+-    if cur_status not in _PROMOTABLE_STATUSES:
+-        return False, (
+-            f"task {task_id} is {cur_status!r}; promote only applies to "
+-            f"'todo', 'blocked' or 'triage'"
+-        )
+-
+-    # No override: claim_task demotes ready -> todo on an undone parent whichever
+-    # writer set 'ready', so a forced promotion would only report a success the
+-    # first claim silently reverts (#106195). The dependency itself is the knob.
+-    unsatisfied = [pid for pid, st in parent_states(conn, task_id) if st not in ("done", "archived")]
+-    if unsatisfied:
+-        return False, (
+-            f"unsatisfied parent dependencies: {', '.join(unsatisfied)} "
+-            f"(the ready -> running claim re-checks parents, so promotion cannot "
+-            f"bypass them; complete the parents or drop the link with "
+-            f"`hermes kanban unlink <parent_id> {task_id}`)"
+-        )
+-
+-    if dry_run:
+-        return True, None
+-
+-    with write_txn(conn):
+-        upd = conn.execute(
+-            "UPDATE tasks SET status = 'ready' "
+-            "WHERE id = ? AND status IN ('todo', 'blocked', 'triage')", (task_id,),
+-        )
+-        if upd.rowcount != 1:
+-            return False, f"task {task_id} status changed during promotion"
+-        _append_event(conn, task_id, "promoted_manual", {
+-            "actor": actor, "reason": reason,
+-            **({"from_status": cur_status} if cur_status != "todo" else {}),
+-        })
+-
+-    return True, None
++from hermes_cli.kanban_db_promote import promote_task
+ 
+ 
+ def _reclaim_dangling_run(
+diff --git a/hermes_cli/kanban_db_promote.py b/hermes_cli/kanban_db_promote.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..679e203e05f0077819010bb712525c01ac5ee8dc
+--- /dev/null
++++ b/hermes_cli/kanban_db_promote.py
+@@ -0,0 +1,56 @@
++"""Manual promotion primitive; surface policy arrives as an optional precondition. [daveey]"""
++from __future__ import annotations
++
++import sqlite3
++from typing import Callable, Optional
++
++
++def promote_task(
++    conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
++    dry_run: bool = False,
++    precondition: Optional[Callable[[sqlite3.Connection], Optional[str]]] = None,
++) -> tuple[bool, Optional[str]]:
++    """Promote todo/blocked/triage to ready after parent and caller preconditions.
++
++    System callers omit the precondition. Manual boundaries check unread comments
++    under the write lock; dry runs validate without writing anything.
++    """
++    cur_status = _kb._task_status(conn, task_id)
++    if cur_status is None:
++        return False, f"task {task_id} not found"
++    if cur_status not in _kb._PROMOTABLE_STATUSES:
++        return False, (
++            f"task {task_id} is {cur_status!r}; promote only applies to "
++            f"'todo', 'blocked' or 'triage'"
++        )
++    # No override: claim_task re-checks parents regardless of who promoted the card.
++    unsatisfied = [pid for pid, st in _kb.parent_states(conn, task_id) if st not in ("done", "archived")]
++    if unsatisfied:
++        return False, (
++            f"unsatisfied parent dependencies: {', '.join(unsatisfied)} "
++            f"(the ready -> running claim re-checks parents, so promotion cannot "
++            f"bypass them; complete the parents or drop the link with "
++            f"`hermes kanban unlink <parent_id> {task_id}`)"
++        )
++    if dry_run:
++        if precondition and (refusal := precondition(conn)):
++            return False, refusal
++        return True, None
++    with _kb.write_txn(conn):
++        if precondition and (refusal := precondition(conn)):
++            return False, refusal
++        upd = conn.execute(
++            "UPDATE tasks SET status = 'ready' "
++            "WHERE id = ? AND status IN ('todo', 'blocked', 'triage')", (task_id,),
++        )
++        if upd.rowcount != 1:
++            return False, f"task {task_id} status changed during promotion"
++        _kb._append_event(conn, task_id, "promoted_manual", {
++            "actor": actor, "reason": reason,
++            **({"from_status": cur_status} if cur_status != "todo" else {}),
++        })
++    return True, None
++
++
++# Late-bound facade keeps existing monkeypatch and direct-caller contracts.
++from hermes_cli import kanban_db as _kb
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index ad1136bc4adebd5261ecc106eef817878639d100..c49408bbda90922145912506125b0add65a620b6 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -562,6 +562,7 @@ _SPECS = [
+         *_WAKE_CHECK_ARGS(),
+     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
+     _cmd("unblock", [
++        _arg("--seen", dest="seen_comment_id", type=int, help="Newest comment id read; otherwise refuse foreign comments from the last 60 minutes."),
+         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
+         _TASK_IDS,
+     ], help="Return blocked/scheduled/triage tasks to ready, or todo while parents remain open"),
+@@ -598,6 +599,7 @@ _SPECS = [
+         _json_flag(),
+     ], help="Operator-only (hub, Board admin key): free workspace_source custody held by a dead or disabled holder"),
+     _cmd("promote", [
++        _arg("--seen", dest="seen_comment_id", type=int, help="Newest comment id read; otherwise refuse foreign comments from the last 60 minutes."),
+         _TASK_ID,
+         _arg("reason", nargs="*", help="Audit-trail reason (recorded on the task_events row)"),
+         _bulk_ids("promote"),
+diff --git a/hermes_cli/kanban_release_comments.py b/hermes_cli/kanban_release_comments.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe7d26bd42d52af69ad5a7387a837fe9942f519e
+--- /dev/null
++++ b/hermes_cli/kanban_release_comments.py
+@@ -0,0 +1,63 @@
++"""Unread-thread policy for manual release surfaces, never autonomous DB callers. [daveey]"""
++from __future__ import annotations
++
++import os
++import shlex
++import time
++from datetime import UTC, datetime
++
++UNREAD_EXIT = 4
++
++
++class UnreadComments(Exception):
++    """A read-only refusal; raised inside the release transaction to roll it back."""
++
++    def __init__(self, comments, rerun):
++        self.comments = comments
++        self.rerun = rerun
++        lines = ["unread_comments: read the newer comments before releasing this card."]
++        for row in comments:
++            lines.append(f"Comment {row['id']} | {row['writer_session']} | {row['time']}\n{row['body']}")
++        lines.append(f"Rerun after reading: {rerun}")
++        super().__init__("\n".join(lines))
++
++
++def check(conn, tid, *, session, seen=None, verb="unblock", board=None):
++    """Called under the status writer's lock; exceptions leave events/comments unchanged."""
++    rows = conn.execute(
++        "SELECT c.id, c.body, e.created_at, json_extract(e.payload, '$.writer_session') AS writer "
++        "FROM task_events e JOIN task_comments c ON c.task_id=e.task_id "
++        "AND c.id=json_extract(e.payload, '$.comment_id') "
++        "WHERE e.task_id=? AND e.kind='commented' "
++        "AND coalesce(json_extract(e.payload, '$.writer_session'), '') != '' "
++        "AND json_extract(e.payload, '$.writer_session') != ? "
++        "AND ((? IS NOT NULL AND c.id > ?) OR (? IS NULL AND e.created_at >= ?)) "
++        "ORDER BY c.id", (tid, session or "", seen, seen, seen, int(time.time()) - 3600),
++    ).fetchall()
++    if not rows:
++        return
++    comments = [{"id": r["id"], "writer_session": r["writer"],
++                 "time": datetime.fromtimestamp(r["created_at"], UTC).isoformat(),
++                 "body": r["body"][:300]} for r in rows]
++    command = ["hermes", "kanban"]
++    if board:
++        command += ["--board", board]
++    command += [verb, tid, "--seen", str(max(r["id"] for r in rows))]
++    raise UnreadComments(comments, shlex.join(command))
++
++
++def cli_guard(args, tid, verb):
++    """Build a transactional precondition using the CLI's inherited caller identity."""
++    return lambda conn: check(conn, tid, session=os.environ.get("HERMES_SESSION_ID"),
++                              seen=getattr(args, "seen_comment_id", None), verb=verb,
++                              board=getattr(args, "board", None))
++
++
++def capture_refusal(op, tid, refused):
++    """Keep bulk operations per-card: a refusal must not hide earlier successes."""
++    try:
++        return op()
++    except UnreadComments as exc:
++        refused[tid] = {"rejection": "unread_comments", "error": str(exc),
++                        "comments": exc.comments, "rerun": exc.rerun}
++        return False
+diff --git a/tests/hermes_cli/test_kanban_release_unread_comments.py b/tests/hermes_cli/test_kanban_release_unread_comments.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..037696426eafd83f225d622ac6f4aaf176740837
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_release_unread_comments.py
+@@ -0,0 +1,195 @@
++"""Manual releases must acknowledge another session's intervening comment. [daveey]"""
++import argparse
++import json
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban as cli
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK",
++                "HERMES_KANBAN_WORKER_TASK", "HERMES_KANBAN_HOME", "HERMES_DELEGATED_CHILD_CONTEXT"):
++        monkeypatch.delenv(key, raising=False)
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
++    monkeypatch.setenv("HERMES_SESSION_ID", "reader")
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="release fixture", triage=True)
++    return tid
++
++
++def comment(tid, *, session="other", age=180, body="Leave this card in triage\nRetracted pick"):
++    with kbc.connect_closing() as conn:
++        cid = kb.add_comment(conn, tid, "default", body, writer_kind="agent", writer_session=session)
++        at = int(time.time()) - age
++        conn.execute("UPDATE task_comments SET created_at=? WHERE id=?", (at, cid))
++        conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='commented' "
++                     "AND json_extract(payload, '$.comment_id')=?", (at, tid, cid))
++        conn.commit()
++    return cid
++
++
++def snapshot(tid):
++    with kbc.connect_closing() as conn:
++        return (kb.get_task(conn, tid).status,
++                list(conn.execute("SELECT id FROM task_events WHERE task_id=? ORDER BY id", (tid,))),
++                list(conn.execute("SELECT id FROM task_comments WHERE task_id=? ORDER BY id", (tid,))))
++
++
++def release(tid, entry, capsys, seen=None):
++    if entry == "tool":
++        from tools import kanban_tools as kt
++        args = {"task_id": tid}
++        if seen is not None:
++            args["seen_comment_id"] = seen
++        result = json.loads(kt._handle_unblock(args))
++        return result.get("ok", False), json.dumps(result)
++    args = argparse.Namespace(task_id=tid, task_ids=[tid], ids=None, reason=None,
++                              dry_run=False, json=False, seen_comment_id=seen)
++    rc = getattr(cli, "_cmd_" + entry)(args)
++    assert rc in (0, 4), f"Unexpected release exit {rc}"
++    output = capsys.readouterr()
++    return rc == 0, output.out + output.err
++
++
++@pytest.mark.parametrize("entry", ["promote", "unblock", "tool"])
++def test_foreign_recent_refused_then_acknowledged(board, entry, capsys):
++    cid = comment(board)
++    before = snapshot(board)
++    ok, output = release(board, entry, capsys)
++    assert not ok
++    assert "unread_comments" in output
++    assert str(cid) in output and "Leave this card in triage" in output
++    assert "other" in output and f"--seen {cid}" in output
++    assert snapshot(board) == before
++    ok, output = release(board, entry, capsys, cid)
++    assert ok, output
++    assert snapshot(board)[0] == "ready"
++
++
++@pytest.mark.parametrize("entry", ["promote", "unblock", "tool"])
++def test_seen_older_lists_only_newer(board, entry, capsys):
++    older = comment(board, body="Old already-read decision")
++    newer = comment(board, age=7200, body="Newer unread decision")
++    before = snapshot(board)
++    ok, output = release(board, entry, capsys, older)
++    assert not ok
++    assert "Newer unread decision" in output and str(newer) in output
++    assert "Old already-read decision" not in output
++    assert snapshot(board) == before
++
++
++@pytest.mark.parametrize("entry", ["promote", "unblock", "tool"])
++@pytest.mark.parametrize("session,age", [("reader", 180), ("other", 3660), (None, 180)])
++def test_allowed_comments(board, entry, session, age, capsys):
++    comment(board, session=session, age=age)
++    ok, output = release(board, entry, capsys)
++    assert ok, output
++    assert snapshot(board)[0] == "ready"
++
++
++@pytest.mark.parametrize("entry", ["promote", "unblock", "tool"])
++def test_no_caller_session_treats_recorded_writer_as_foreign(board, entry, monkeypatch, capsys):
++    monkeypatch.delenv("HERMES_SESSION_ID")
++    comment(board, session="reader")
++    ok, output = release(board, entry, capsys)
++    assert not ok and "unread_comments" in output
++
++
++@pytest.mark.parametrize("entry", ["promote", "unblock"])
++def test_parser_seen_and_refusal_rollback_reason(board, entry, capsys):
++    cid = comment(board)
++    parser = argparse.ArgumentParser()
++    cli.build_parser(parser.add_subparsers())
++    argv = ["kanban", entry, board]
++    argv += ["operator reason"] if entry == "promote" else ["--reason", "operator reason"]
++    args = parser.parse_args(argv)
++    before = snapshot(board)
++    assert getattr(cli, "_cmd_" + entry)(args) == 4
++    assert snapshot(board) == before
++    capsys.readouterr()
++    args = parser.parse_args([*argv, "--seen", str(cid)])
++    assert getattr(cli, "_cmd_" + entry)(args) == 0
++
++
++def test_tool_uses_bound_session_not_process_identity(board, monkeypatch, capsys):
++    from gateway.session_context import scoped_current_session_id
++    monkeypatch.setenv("HERMES_SESSION_ID", "other")
++    cid = comment(board, session="other")
++    with scoped_current_session_id("reader"):
++        ok, output = release(board, "tool", capsys)
++        assert not ok and "unread_comments" in output
++        ok, output = release(board, "tool", capsys, cid)
++        assert ok, output
++
++
++@pytest.mark.parametrize("entry", ["promote", "unblock", "tool"])
++def test_listing_truncates_each_comment_at_300(board, entry, capsys):
++    comment(board, body="x" * 300 + "MUST_NOT_APPEAR")
++    comment(board, body="Second unread comment")
++    ok, output = release(board, entry, capsys)
++    assert not ok
++    assert "x" * 300 in output and "MUST_NOT_APPEAR" not in output
++    assert "Second unread comment" in output
++
++
++@pytest.mark.parametrize("verb", ["promote", "unblock"])
++def test_direct_system_release_is_unchanged(board, verb):
++    comment(board)
++    with kbc.connect_closing() as conn:
++        if verb == "promote":
++            assert kb.promote_task(conn, board, actor="system")[0]
++        else:
++            assert kb.unblock_task(conn, board)
++        assert kb.get_task(conn, board).status == "ready"
++
++
++@pytest.mark.parametrize("verb", ["promote", "unblock"])
++def test_bulk_reports_successes_and_refusals_and_rejects_shared_seen(board, verb, capsys):
++    cid = comment(board)
++    with kbc.connect_closing() as conn:
++        first = kb.create_task(conn, title="first", triage=True)
++        last = kb.create_task(conn, title="last", triage=True)
++    parser = argparse.ArgumentParser()
++    cli.build_parser(parser.add_subparsers())
++    argv = ["kanban", verb, first]
++    argv += ["--ids", board, last, "--json"] if verb == "promote" else [board, last]
++    args = parser.parse_args([*argv, "--seen", str(cid)])
++    assert getattr(cli, "_cmd_" + verb)(args) == 1
++    assert all(snapshot(tid)[0] == "triage" for tid in (first, board, last))
++    capsys.readouterr()
++    args = parser.parse_args(argv)
++    assert getattr(cli, "_cmd_" + verb)(args) == 4
++    output = capsys.readouterr()
++    assert all(tid in output.out + output.err for tid in (first, board, last))
++    assert [snapshot(tid)[0] for tid in (first, board, last)] == ["ready", "triage", "ready"]
++    if verb == "promote":
++        result = json.loads(output.out)
++        assert [r["promoted"] for r in result] == [True, False, True]
++        assert result[1]["rejection"] == "unread_comments"
++
++
++@pytest.mark.parametrize("entry", ["promote", "unblock", "tool"])
++def test_guard_runs_under_write_lock(board, entry, monkeypatch, capsys):
++    from hermes_cli import kanban_release_comments as guard
++    original = guard.check
++    calls = []
++
++    def checked(conn, *args, **kwargs):
++        assert conn.in_transaction
++        calls.append(True)
++        return original(conn, *args, **kwargs)
++
++    monkeypatch.setattr(guard, "check", checked)
++    comment(board)
++    ok, output = release(board, entry, capsys)
++    assert not ok and "unread_comments" in output
++    assert calls == [True]
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 07e5b1dafeb84643f4951b1e7d4166e826eb029e..73bdc7300a68d5e1ddb0c095824d3c30fe6e8a78 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -1067,6 +1067,7 @@ KANBAN_UNBLOCK_SCHEMA = _schema(
+     ),
+     {
+         "task_id": _prop("string", "Blocked task id to move to ready or parent-gated todo."),
++        "seen_comment_id": _prop("integer", "Newest comment id read on this card. Without it, foreign-session comments in the last 60 minutes refuse manual release with unread_comments; read the listing before retrying."),
+     },
+     ["task_id"],
+ )
+diff --git a/tools/kanban_tools_self_heal.py b/tools/kanban_tools_self_heal.py
+index 3ccbf2401ddc22297d175ad94dbceb6bd0254728..7177e4f19db779c78dc41f57a476edd09b1fcc4c 100644
+--- a/tools/kanban_tools_self_heal.py
++++ b/tools/kanban_tools_self_heal.py
+@@ -190,6 +190,13 @@ def handle_unblock(args: dict, **kw) -> str:
+         asked: dict = {}
+ 
+         def note_request(current) -> None:
++            from gateway.session_context import get_session_env
++            from hermes_cli.kanban_release_comments import check, UnreadComments
++            try:
++                check(current, tid, session=get_session_env("HERMES_SESSION_ID", ""),
++                      seen=args.get("seen_comment_id"), board=args.get("board"))
++            except UnreadComments as exc:
++                raise kt._Reject(str(exc), "unread_comments") from exc
+             asked["human"] = cw.had_human_request(current, tid)  # unblock_task clears human_request
+ 
+         kt._check(kb.unblock_task(conn, tid, precondition=note_request),
+-- 
+2.43.0
+

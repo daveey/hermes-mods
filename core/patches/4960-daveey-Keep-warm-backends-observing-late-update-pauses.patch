@@ -1,0 +1,206 @@
+From 23fb0fd8c04a63e0f0f3ccfb872c527cdf6b6c64 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 09:06:45 +0000
+Subject: [PATCH] [daveey] Keep warm backends observing late update pauses
+
+A successor can finish its boot scan while a predecessor resumes its first pause in place. If that predecessor pauses again before exiting, the empty-scan exit (or the fixed 600-second deadline) leaves no observer to adopt its durable marker. The outcome classifier correctly reports an interrupted tool tail; it is not the cause.
+
+Keep paused-only recovery alive as passive infrastructure, backing off to 30 seconds with no eligible pauses and retaining the existing 5-second pending cadence. Normal crash recovery remains boot-only; writer, freshness, attempt, Stop and session.resume admission checks are unchanged. An optional stop event makes observer teardown explicit for fixtures.
+
+Proof: new late-pause cases failed on the old loop at both 60s and 720s. Canonical runner: 22 consumer files, 476 passing tests; final 12-case regression passes, including opted-out, capped, stopped, ordinary-crash and shutdown controls. scripts/check --base origin/main passed.
+---
+ .../test_session_outcome_restarts.py          | 11 ++-
+ .../test_startup_resume_late_pause.py         | 81 +++++++++++++++++++
+ .../tui_gateway/test_update_pause_recovery.py |  4 +-
+ tui_gateway/startup_resume.py                 | 23 +++---
+ 4 files changed, 104 insertions(+), 15 deletions(-)
+ create mode 100644 tests/tui_gateway/test_startup_resume_late_pause.py
+
+diff --git a/tests/tui_gateway/test_session_outcome_restarts.py b/tests/tui_gateway/test_session_outcome_restarts.py
+index 66ac9e44d13a26fc5f8c766de146f38ff8c72674..8c4c7964cbe1654a65135a193a9b41d02373b0a6 100644
+--- a/tests/tui_gateway/test_session_outcome_restarts.py
++++ b/tests/tui_gateway/test_session_outcome_restarts.py
+@@ -35,11 +35,16 @@ def test_boot_continues_a_fresh_unopened_chat_and_not_a_stale_one(monkeypatch):
+     # Default config apart from the settle delay: resume_on_startup is not set anywhere.
+     monkeypatch.setattr(config, "load_config", lambda: {"desktop": {"auto_continue": {
+         "resume_on_startup_delay_seconds": 0}}})
++    import threading
++    stop = threading.Event()
+     resumed = []
+-    monkeypatch.setitem(server._methods, "session.resume",
+-                        lambda rid, params: resumed.append(params["session_id"]) or {"result": {"auto_continue": {}}})
++    def resume(rid, params):
++        resumed.append(params["session_id"])
++        stop.set()
++        return {"result": {"auto_continue": {}}}
++    monkeypatch.setitem(server._methods, "session.resume", resume)
+ 
+-    thread = sr.start_startup_resume_sweep()
++    thread = sr.start_startup_resume_sweep(stop=stop)
+ 
+     assert thread is not None, "the boot sweep must run without resume_on_startup in config"
+     thread.join(10)
+diff --git a/tests/tui_gateway/test_startup_resume_late_pause.py b/tests/tui_gateway/test_startup_resume_late_pause.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..eb4ad6fa84a103c9bb432a6655af966971f27dc6
+--- /dev/null
++++ b/tests/tui_gateway/test_startup_resume_late_pause.py
+@@ -0,0 +1,81 @@
++"""A warm successor must observe pauses published after its boot scan empties."""
++import threading
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from tui_gateway import startup_resume as sr
++from tui_gateway.turn_marker import clear_turn_marker, mark_turn_paused, record_turn_start
++
++
++@pytest.mark.parametrize("late_at", [60, 720])
++@pytest.mark.parametrize("disposition", ["pause", "crash", "stopped", "opted_out", "capped", "shutdown"])
++def test_boot_observer_recovers_late_pause_after_writer_exit(tmp_path, monkeypatch, late_at, disposition):
++    from agent import memory_provider
++    from hermes_cli import config
++    from tui_gateway import server
++    import hermes_constants
++
++    clock = [1000.0]
++    alive = [True]
++    resumed = []
++    stop = threading.Event()
++    waits = []
++    cfg = {"desktop": {"auto_continue": {"freshness_minutes": 240,
++                                         "resume_on_startup_delay_seconds": 0}}}
++    record_turn_start(tmp_path, "chat", "original request")
++    mark_turn_paused(tmp_path, "chat", "core_update_pause")
++    monkeypatch.setattr(config, "load_config", lambda: cfg)
++    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
++    monkeypatch.setattr(sr, "marker_writer_state", lambda m: "alive" if alive[0] else "dead")
++
++    def sleep(seconds):
++        if not seconds:
++            return
++        waits.append(seconds)
++        clock[0] += seconds
++        elapsed = clock[0] - 1000
++        if elapsed < late_at:
++            # Old backend continues its first pause, clearing the pause reason.
++            record_turn_start(tmp_path, "chat", "original request", pauses=1)
++        elif elapsed < late_at + 30:
++            record_turn_start(tmp_path, "chat", "original request", pauses=1,
++                              auto_continue=disposition != "opted_out",
++                              attempts=2 if disposition == "capped" else 0)
++            if disposition != "crash":
++                mark_turn_paused(tmp_path, "chat", "core_update_pause")
++            if disposition == "stopped":
++                clear_turn_marker(tmp_path, "chat")
++        else:
++            alive[0] = False
++            if disposition == "shutdown":
++                stop.set()  # shutdown while asleep must not start new work
++        if elapsed >= late_at + 90:
++            stop.set()
++
++    def resume(rid, params):
++        assert not alive[0]
++        resumed.append(params["session_id"])
++        clear_turn_marker(tmp_path, params["session_id"])
++        return {"result": {"auto_continue": {"attempt": 0}}}
++
++    monkeypatch.setattr(sr, "time", SimpleNamespace(sleep=sleep, time=time.time,
++                                                   monotonic=lambda: clock[0]))
++    monkeypatch.setitem(server._methods, "session.resume", resume)
++
++    class Inline:
++        def __init__(self, target):
++            self.target = target
++
++        def start(self):
++            self.target()
++
++    def spawn(target, **kwargs):
++        assert kwargs["passive"] is True, "idle recovery must not retain an active-work reservation"
++        return Inline(target)
++
++    monkeypatch.setattr(memory_provider, "spawn_context_thread", spawn)
++    sr.start_startup_resume_sweep(stop=stop)
++    assert waits[:2] == [5.0, 30.0], "idle observation must back off without terminating"
++    assert resumed == (["chat"] if disposition == "pause" else [])
+diff --git a/tests/tui_gateway/test_update_pause_recovery.py b/tests/tui_gateway/test_update_pause_recovery.py
+index 135180285ecb4583d052676e981c3c3448468ac5..3cf3a0c098b56dd1b4d8c52fef565fc11eb968c3 100644
+--- a/tests/tui_gateway/test_update_pause_recovery.py
++++ b/tests/tui_gateway/test_update_pause_recovery.py
+@@ -113,7 +113,7 @@ def test_replaced_backend_notice_requeues_before_real_continuation(recovery, mon
+             self.target()
+     monkeypatch.setattr(memory_provider, "spawn_context_thread", lambda target, **kw: Inline(target))
+     # Drive the real startup worker + resume handler, not an explicit scheduling call.
+-    sr.start_startup_resume_sweep()
++    sr.start_startup_resume_sweep(stop=recovery.done)
+     assert_continued(recovery)
+     assert attempts == submitted == [5.0]
+     assert submitted[0] <= 120
+@@ -387,7 +387,7 @@ def test_boot_worker_retries_without_another_client_message(recovery, monkeypatc
+     def thread_factory(*args, **kwargs):
+         return spawn(kwargs["target"]) if kwargs.get("name") == "startup-resume-sweep" else real_thread(*args, **kwargs)
+     monkeypatch.setattr(sr.threading, "Thread", thread_factory)
+-    sr.start_startup_resume_sweep()
++    sr.start_startup_resume_sweep(stop=recovery.done)
+     assert_continued(recovery)
+ 
+ 
+diff --git a/tui_gateway/startup_resume.py b/tui_gateway/startup_resume.py
+index 6a6fbd3819b36920d16505c1509ed880d003eff6..beec9eed10a576775c944ff55d5e208a97664142 100644
+--- a/tui_gateway/startup_resume.py
++++ b/tui_gateway/startup_resume.py
+@@ -9,7 +9,9 @@ sessions run detached until a client attaches; opening one later reuses the live
+ 
+ All the existing auto-continue guards still apply inside ``session.resume`` (freshness window, ``max_attempts``
+ crash-loop breaker, live-writer ownership, hosted-room exclusion); this module only pre-filters to avoid resuming
+-sessions that would not continue anyway.
++sessions that would not continue anyway. After boot a passive observer keeps checking update-paused turns:
++blue/green predecessors can publish a new pause long after the initial marker scan becomes empty. Ordinary
++crash markers remain boot-only; recovery still enters the normal session.resume admission path.
+ """
+ 
+ from __future__ import annotations
+@@ -174,7 +176,7 @@ def _paused_markers_remain(home: Path, cfg: dict | None) -> bool:
+                if (entry := read_turn_marker(h, key)) is not None)
+ 
+ 
+-def start_startup_resume_sweep() -> threading.Thread | None:
++def start_startup_resume_sweep(*, stop: threading.Event | None = None) -> threading.Thread | None:
+     """Backend boot hook: run the sweep on a daemon thread after a short settle delay (no-op unless enabled)."""
+     from hermes_cli.proof_home import recovery_home_allowed
+     from hermes_constants import get_hermes_home
+@@ -204,18 +206,19 @@ def start_startup_resume_sweep() -> threading.Thread | None:
+             done = resume_interrupted_sessions(handler, home, cfg)
+             if done:
+                 logger.info("startup resume: %d interrupted session(s) processed", len(done))
+-            # Backend boot can precede hold release or the last old SSH writer's exit.
+-            # Retry PAUSES only: ordinary crash recovery keeps its one-shot semantics.
+-            deadline = time.monotonic() + 600.0
+-            while time.monotonic() < deadline and _paused_markers_remain(home, cfg):
+-                time.sleep(5.0)
++            # A warm successor may boot before the old writer continues and pauses again.
++            # An empty scan (or a fixed boot deadline) is not a completed handoff.
++            # Keep observing PAUSES only; ordinary crash recovery remains boot-only.
++            stopped = stop or threading.Event()
++            while not stopped.is_set():
++                time.sleep(5.0 if _paused_markers_remain(home, cfg) else 30.0)
++                if stopped.is_set():
++                    break
+                 resume_interrupted_sessions(handler, home, cfg, paused_only=True)
+-            if _paused_markers_remain(home, cfg):
+-                logger.warning("startup resume: paused turns still pending after the update recovery window")
+         except Exception:
+             logger.exception("startup resume sweep failed")
+ 
+     from agent.memory_provider import spawn_context_thread
+-    t = spawn_context_thread(_run, name="startup-resume-sweep")
++    t = spawn_context_thread(_run, name="startup-resume-sweep", passive=True)
+     t.start()
+     return t
+-- 
+2.43.0
+

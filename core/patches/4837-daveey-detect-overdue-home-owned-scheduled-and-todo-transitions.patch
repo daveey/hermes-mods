@@ -1,0 +1,317 @@
+From 356d8f3bfe02371741ca2e6bc9526a3596ccec55 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 09:22:30 +0000
+Subject: [PATCH] [daveey] detect overdue home-owned scheduled and todo
+ transitions
+
+WIP checkpoint: hub-owned grouped observer, canonical park deadlines, parents-done clocks, conservative checkpoint custody and existing alarm filing/provenance. Initial focused suites pass. Remaining before ship: bounded sweep/freshness validation, full killing coverage and historical/live replica proof, independent review and CI.
+---
+ hermes_cli/kanban_pickup_observation.py       |   1 +
+ hermes_cli/kanban_pickup_stall.py             |   2 +
+ hermes_cli/kanban_pickup_stall_home.py        | 120 +++++++++++++++
+ .../test_kanban_pickup_stall_home.py          | 141 ++++++++++++++++++
+ 4 files changed, 264 insertions(+)
+ create mode 100644 hermes_cli/kanban_pickup_stall_home.py
+ create mode 100644 tests/hermes_cli/test_kanban_pickup_stall_home.py
+
+diff --git a/hermes_cli/kanban_pickup_observation.py b/hermes_cli/kanban_pickup_observation.py
+index f7a01d35b781b3e8000aa40b64a552e6d96d9ff8..795b7705769bec4d434f992104e79d8b73c3907c 100644
+--- a/hermes_cli/kanban_pickup_observation.py
++++ b/hermes_cli/kanban_pickup_observation.py
+@@ -14,6 +14,7 @@ def evidence(body: str) -> str:
+         lambda m: f"{m[1]}{m[2]}{m[3]}{'at/over' if int(m[4]) >= int(m[2]) else 'under'}{m[5]}",
+         body, flags=re.MULTILINE,
+     )
++    body = re.sub(r"(, (?:scheduled|todo), )\d+( minutes overdue )", r"\1<elapsed>\2", body)
+     body = re.sub(r"(, ready )\d+( min,)", r"\1<elapsed>\2", body)
+     body = re.sub(r"(pinned to machine:[^,\n]+, for )\d+( min \(threshold )", r"\1<elapsed>\2", body)
+     body = re.sub(r", last " + _STAMP + r", \d+ pass\(es\)", ", last <tick>, <ticks> pass(es)", body)
+diff --git a/hermes_cli/kanban_pickup_stall.py b/hermes_cli/kanban_pickup_stall.py
+index fbec70c1b38c8a4432bff71466b18256e5acf13f..899fcb982f0bc65cf59b2b95faa31a7ecfcbde02 100644
+--- a/hermes_cli/kanban_pickup_stall.py
++++ b/hermes_cli/kanban_pickup_stall.py
+@@ -635,6 +635,8 @@ def sweep(conn, *, now: Optional[float] = None) -> list[str]:
+         return stranded
+     try:
+         resolve_sweep(conn, replica, own, now_ms=_now_ms(now))
++        from hermes_cli import kanban_pickup_stall_home as home_stalls
++        stranded += home_stalls.sweep(conn, replica, own, now_ms=_now_ms(now))
+         cards = stalled(conn, replica, own, now=now)
+     finally:
+         replica.close()
+diff --git a/hermes_cli/kanban_pickup_stall_home.py b/hermes_cli/kanban_pickup_stall_home.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e9944d42679db83fa81ef6a12002ab1c7e86faf2
+--- /dev/null
++++ b/hermes_cli/kanban_pickup_stall_home.py
+@@ -0,0 +1,120 @@
++"""Hub observer for overdue home-owned wake/readiness transitions. [daveey]
++
++The existing overdue_wake diagnostic is a per-card display, not an incident
++producer. This pass reads the full replica even when the target home is stopped.
++Only the hub files: alarm provenance names the observer, not the stopped home.
++"""
++from __future__ import annotations
++
++import re
++from types import SimpleNamespace
++from typing import Any
++
++GRACE_SECONDS = 30 * 60
++_HOME = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
++_LOCAL_WORK = re.compile(
++    r"unpublished|unpushed|uncommitted|machine.only|only (?:on|in)|local.only|"
++    r"(?:/home/|/Users/|~/|worktree|scratch|\.tar\.gz)", re.IGNORECASE)
++
++
++def _scheduled_since(replica, row) -> int | None:
++    from hermes_cli.kanban_continuation import park_state
++    from hermes_cli.kanban_wake_summary import wakes
++    park = park_state(replica, row["id"])
++    if park.get("event_id") is None or park.get("superseded"):
++        return None  # no unspent park in this replica: do not invent a deadline
++    summary = wakes(replica, SimpleNamespace(**dict(row)), check_loaded=True)
++    if not summary or summary["blocks_for_human"]:
++        return None
++    return summary["backstop_at"]
++
++
++def _parents_done_since(replica, task_id: str) -> int | None:
++    rows = replica.execute(
++        "SELECT p.id, p.status, p.completed_at FROM task_links l "
++        "LEFT JOIN tasks p ON p.id = l.parent_id WHERE l.child_id = ?", (task_id,)).fetchall()
++    if not rows or any(r["status"] != "done" or not r["completed_at"] for r in rows):
++        return None  # missing, incomplete or undated parents are not proven ready
++    return max(int(r["completed_at"]) for r in rows)
++
++
++def checkpoint_evidence(replica, task_id: str) -> str:
++    """Conservative report, never a portability authorization inferred from prose."""
++    row = replica.execute(
++        "SELECT summary FROM task_runs WHERE task_id = ? AND summary IS NOT NULL "
++        "AND outcome = 'continued' ORDER BY ended_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
++    if not row:
++        return "unknown (no continuation checkpoint); inspect history before moving"
++    text = row[0]
++    if _LOCAL_WORK.search(text):
++        return "possible machine-only WIP; verify publication/artifact custody: " + text[:1500]
++    return "not named in latest checkpoint (not proof of portability): " + text[:1500]
++
++
++def overdue(replica, machines: dict, *, now: float) -> dict[str, list[dict[str, Any]]]:
++    """Group open scheduled/todo rows by held, revoked, or event-silent home."""
++    last_events = dict(replica.execute(
++        "SELECT origin_gateway, MAX(created_at) FROM task_events GROUP BY origin_gateway").fetchall())
++    groups: dict[str, list[dict[str, Any]]] = {}
++    for row in replica.execute("SELECT * FROM tasks WHERE status IN ('scheduled', 'todo')"):
++        home = row["created_on"]
++        if not isinstance(home, str) or not _HOME.fullmatch(home):
++            continue
++        entry = machines.get(home) or {}
++        held = bool(entry.get("hold"))
++        revoked = entry.get("state") == "revoked"
++        seen = last_events.get(home)
++        silent = seen is None or now - seen > GRACE_SECONDS
++        if not (held or revoked or silent):
++            continue
++        since = (_scheduled_since(replica, row) if row["status"] == "scheduled"
++                 else _parents_done_since(replica, row["id"]))
++        if since is None or now - since <= GRACE_SECONDS:
++            continue
++        groups.setdefault(home, []).append({
++            "id": row["id"], "title": row["title"], "tenant": row["tenant"],
++            "status": row["status"], "since": since,
++            "home_evidence": f"held={held}, revoked={revoked}, last Board event={seen}",
++            "checkpoint": checkpoint_evidence(replica, row["id"]),
++        })
++    return {home: sorted(cards, key=lambda c: (c["since"], c["id"]))
++            for home, cards in sorted(groups.items())}
++
++
++HOWTO = (
++    "Inspect every listed card's latest checkpoint and artifact custody. Move every card without "
++    "machine-only WIP to a live home using the supported hub-admin batched rehome route "
++    "(hermes-hub PR #142), only when that route's eligibility checks permit it. Preserve status, "
++    "wake time, wake_check, parents, children and comments; verify readback and a subsequent wake "
++    "or promotion. List all remaining cards with reasons, including machine-only WIP, unknown "
++    "custody, human requests, superseding continuations, or transfer API refusals. PR #142 requires "
++    "revoked/dead origins and is not authorization to transfer active held origins. Never invent "
++    "death/portability evidence, revoke, restart, contact, or unhold a held machine to make a "
++    "transfer pass. Changing runs_on alone does not move home-owned readiness."
++)
++
++
++def sweep(conn, replica, own: str, *, now_ms: int) -> list[str]:
++    from hermes_cli import kanban_pickup_stall as kps
++    from hermes_cli import kanban_worker_node as wn
++    if own != kps.OPERATOR_LANE:
++        return []  # one observer; source-authenticated keys cannot impersonate a remote home
++    registry = wn.registry()
++    if registry is None:
++        return []  # cannot establish current held/revoked registry evidence
++    ids = []
++    for home, cards in overdue(replica, registry.get("machines") or {}, now=now_ms / 1000).items():
++        listed = "\n".join(
++            f"- {c['id']} ({c['title']}), {c['status']}, "
++            f"{kps._minutes(c['since'] * 1000, now_ms)} minutes overdue "
++            f"(since {kps._stamp(c['since'] * 1000)}); machine-only WIP: {c['checkpoint']}"
++            for c in cards)
++        body = (f"Home-owned transitions overdue on {home}: {len(cards)} card(s), threshold strictly "
++                f"greater than 30 minutes. {cards[0]['home_evidence']}. A todo clock starts when the "
++                "last parent completed; a scheduled clock uses its current wake/backstop.\n\n" + listed
++                + "\n\n" + HOWTO)
++        ids.append(kps._create(
++            conn, key=f"{kps.KEY_PREFIX}{own}:home-overdue-{home}:",
++            title=f"Home transitions overdue on {home} ({len(cards)} cards)", body=body,
++            tenant=cards[0]["tenant"], own=own, now_ms=now_ms, howto=HOWTO))
++    return ids
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall_home.py b/tests/hermes_cli/test_kanban_pickup_stall_home.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..dfe38755d270c387f5d81fdd085edc3f0500f57a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pickup_stall_home.py
+@@ -0,0 +1,141 @@
++"""Cross-home scheduled/todo alarms, including real incident filing. [daveey]"""
++from __future__ import annotations
++
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_pickup_stall as kps
++from hermes_cli import kanban_pickup_stall_home as subject
++from hermes_cli import kanban_worker_node as wn
++
++NOW = 2_000_000_000
++
++
++@pytest.fixture
++def replica():
++    conn = sqlite3.connect(":memory:")
++    conn.row_factory = sqlite3.Row
++    conn.executescript("""
++        CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, created_on TEXT,
++                            tenant TEXT, completed_at INTEGER, block_kind TEXT);
++        CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT,
++                                  payload TEXT, created_at INTEGER, origin_gateway TEXT, run_id INTEGER);
++        CREATE TABLE task_links (parent_id TEXT, child_id TEXT);
++        CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, outcome TEXT,
++                                summary TEXT, ended_at INTEGER);
++    """)
++    yield conn
++    conn.close()
++
++
++def card(replica, tid="one", *, minutes=31, home="worker-2", status="scheduled", wake=None):
++    replica.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, NULL, NULL, NULL)", (tid, tid + " title", status, home))
++    replica.execute("INSERT INTO task_events(task_id, kind, payload, created_at, origin_gateway) "
++                    "VALUES (?, 'scheduled', ?, ?, ?)",
++                    (tid, json.dumps(wake if wake is not None else {"wake_at": NOW - minutes * 60}),
++                     NOW - 86400, home))
++    return tid
++
++
++def parents(replica, tid="one", *, minutes=31, status="done"):
++    replica.execute("INSERT INTO tasks VALUES ('parent', 'parent', ?, 'hub', NULL, ?, NULL)",
++                    (status, NOW - minutes * 60))
++    replica.execute("INSERT INTO task_links VALUES ('parent', ?)", (tid,))
++
++
++@pytest.mark.parametrize("minutes,want", [(29, False), (30, False), (31, True)])
++def test_threshold(replica, minutes, want):
++    card(replica, minutes=minutes)
++    assert bool(subject.overdue(replica, {"worker-2": {"hold": True}}, now=NOW)) is want
++
++
++@pytest.mark.parametrize("status", ["scheduled", "todo"])
++def test_recent_home_event_suppresses_unheld_home(replica, status):
++    card(replica, status=status)
++    if status == "todo":
++        parents(replica)
++    replica.execute("INSERT INTO task_events(kind, created_at, origin_gateway) VALUES ('heartbeat', ?, 'worker-2')",
++                    (NOW - 29 * 60,))
++    assert not subject.overdue(replica, {"worker-2": {"hold": False}}, now=NOW)
++    assert subject.overdue(replica, {"worker-2": {"hold": True}}, now=NOW)
++    assert subject.overdue(replica, {"worker-2": {"state": "revoked"}}, now=NOW)
++
++
++def test_silent_home_and_missing_registry_entry(replica):
++    card(replica)
++    assert subject.overdue(replica, {}, now=NOW)
++
++
++@pytest.mark.parametrize("minutes,status,want", [(31, "done", True), (29, "done", False), (31, "todo", False)])
++def test_parent_completion_clock(replica, minutes, status, want):
++    card(replica, status="todo")
++    parents(replica, minutes=minutes, status=status)
++    assert bool(subject.overdue(replica, {"worker-2": {"hold": True}}, now=NOW)) is want
++
++
++def test_no_parents_or_missing_parent_is_not_proven_ready(replica):
++    card(replica, status="todo")
++    assert not subject.overdue(replica, {}, now=NOW)
++    replica.execute("INSERT INTO task_links VALUES ('missing', 'one')")
++    assert not subject.overdue(replica, {}, now=NOW)
++
++
++def test_latest_parent_clock_and_terminal_exclusion(replica):
++    card(replica, status="todo")
++    parents(replica)
++    replica.execute("INSERT INTO tasks VALUES ('new', 'new', 'done', 'hub', NULL, ?, NULL)", (NOW - 29 * 60,))
++    replica.execute("INSERT INTO task_links VALUES ('new', 'one')")
++    assert not subject.overdue(replica, {}, now=NOW)
++    replica.execute("UPDATE tasks SET status='done' WHERE id='one'")
++    assert not subject.overdue(replica, {}, now=NOW)
++
++
++def test_checkpoint_custody_is_conservative(replica):
++    card(replica)
++    assert subject.checkpoint_evidence(replica, "one").startswith("unknown")
++    replica.execute("INSERT INTO task_runs VALUES (1, 'one', 'continued', 'unpushed worktree ~/code/fix', ?)", (NOW,))
++    assert "possible machine-only WIP" in subject.checkpoint_evidence(replica, "one")
++    replica.execute("INSERT INTO task_runs VALUES (2, 'one', 'continued', 'Published PR123; no further edits', ?)", (NOW + 1,))
++    assert subject.checkpoint_evidence(replica, "one").startswith("not named")
++
++
++@pytest.fixture
++def local(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    (tmp_path / "config.yaml").write_text("toolsets: [all]\n", encoding="utf-8")
++    for name in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"):
++        monkeypatch.delenv(name, raising=False)
++    path = tmp_path / "alarms.db"
++    kb.init_db(path)
++    from hermes_cli.kanban_db_connect import connect
++    conn = connect(path)
++    conn.execute("ALTER TABLE tasks ADD COLUMN runs_on TEXT")
++    monkeypatch.setattr(wn, "registry", lambda: {"machines": {"worker-2": {"hold": True}}})
++    yield conn
++    conn.close()
++
++
++def test_one_incident_per_home_and_second_pass_comments(replica, local):
++    card(replica, "one")
++    card(replica, "two")
++    [tid] = subject.sweep(local, replica, "hub", now_ms=NOW * 1000)
++    task = kb.get_task(local, tid)
++    assert task.created_by == kps.DETECTOR
++    assert "one title" in task.body and "two title" in task.body
++    assert "31 minutes overdue" in task.body
++    assert "pool:worker" in local.execute("SELECT runs_on FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++    assert task.idempotency_key.startswith("pickup-stall:hub:home-overdue-worker-2:")
++    assert subject.sweep(local, replica, "hub", now_ms=(NOW + 60) * 1000) == [tid]
++    assert len(kb.list_comments(local, tid)) == 1
++    assert subject.sweep(local, replica, "hub", now_ms=(NOW + 120) * 1000) == [tid]
++    assert len(kb.list_comments(local, tid)) == 1  # elapsed minutes alone never churn
++    assert local.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
++
++
++def test_observer_is_hub_only(replica, local):
++    card(replica)
++    assert subject.sweep(local, replica, "worker-1", now_ms=NOW * 1000) == []
++    assert local.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+-- 
+2.43.0
+

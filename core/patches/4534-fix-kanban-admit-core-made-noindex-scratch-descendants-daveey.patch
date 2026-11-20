@@ -1,0 +1,177 @@
+From da4e09cf72218f7dce93a9d638e721f9e1ce1864 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 16:15:16 +0000
+Subject: [PATCH] fix(kanban): admit core-made noindex scratch descendants
+ [daveey]
+
+Keep the literal scratch exemption and add its .noindex sibling only when
+scratch is a symlink whose raw readlink is the sibling name or absolute
+path, matching ensure_spotlight_noindex_dir. Never resolve an arbitrary
+scratch link into permission. The directory itself and pinned DB, legacy
+marker and in-process delegate exclusions retain their existing fences.
+
+Five whys (happened):
+1. A legitimate Mac scratch board is refused because its resolved path is
+   classified under the fenced root but outside literal cache/scratch.
+2. Resolution changes scratch to scratch.noindex: get_scratch_dir invokes
+   ensure_spotlight_noindex_dir on Darwin.
+3. That helper intentionally uses a sibling symlink to suppress Spotlight
+   indexing while preserving existing TMPDIR spelling (c04d111c0ea).
+4. fdbee2941ab deliberately did not resolve the exemption, to avoid granting
+   arbitrary symlink targets under the root.
+5. That conservative rule conflated arbitrary redirection with the core's
+   own recognized alias; the two path contracts were not composed.
+
+Five whys (not caught):
+1. fdbee2941ab's proof reports 24/24 focused and 1960 consumer passes but
+   did not establish the Darwin alias shape.
+2. Its get_scratch_dir test follows the runner platform implicitly; on
+   Linux the helper does not create the noindex symlink.
+3. Its scratch_dir_layout builds a real directory directly.
+4. Its explicit symlink tests cover escapes to root/sub, not the permitted
+   core-created sibling. The blanket no-symlink policy looked intentional.
+5. No cross-platform fixture composed the creator's exact link contract
+   with the fence. New portable tests invoke the real helper with Darwin
+   selected explicitly, plus the accepted absolute raw-link variant.
+
+Proof on fresh main 7422102ade2d3ce2081e0519f43499e57bd43be1:
+- Canonical test_kanban_tools_scratch_home_fence.py RED: 2 failed/28 passed
+  (relative and absolute core sibling links). GREEN: 31 passed, no retry.
+- Eight exact-anchor mutants killed: sibling omitted, symlink check dropped,
+  arbitrary link accepted, relative-only, absolute-only, directory allowed,
+  containment dropped, readlink failure allowed. Each has relevant failures.
+- scripts/check --base origin/main: all 20 checks green, no health findings.
+- Existing pruner fixture intermittently rescued a touched directory on
+  initial runs; reported separately, unchanged, clean subsequent baseline.
+
+Canonical kanban-worker probe documentation published and read back on
+private state at 0233dac576 (home-only guarded publication). Native installed
+Mac create_board proof remains with parent t_d9215270a3f90328, not claimed here.
+---
+ agent/delegation_context.py                   | 14 +++-
+ .../test_kanban_tools_scratch_home_fence.py   | 83 +++++++++++++++++++
+ 2 files changed, 95 insertions(+), 2 deletions(-)
+
+diff --git a/agent/delegation_context.py b/agent/delegation_context.py
+index cc1220baf0c3f7831f5a530b0fc2bfcfa6fb5cd7..ef2f00c0fea956e969834ec62607ec6383adf843 100644
+--- a/agent/delegation_context.py
++++ b/agent/delegation_context.py
+@@ -414,9 +414,19 @@ def kanban_path_is_fenced(path: os.PathLike[str] | str) -> bool:
+         target.relative_to(root)
+     except ValueError:
+         return False
+-    # Not resolved: a scratch dir that is itself a symlink to elsewhere under the root exempts nothing there.
++    from hermes_constants import SPOTLIGHT_NOINDEX_SUFFIX
++
++    # Never resolve arbitrary scratch links into an exemption. Accept only the sibling link
++    # shape ensure_spotlight_noindex_dir creates/recognizes on Darwin, including its physical spelling.
+     scratch = root / "cache" / "scratch"
+-    return target == scratch or not target.is_relative_to(scratch)
++    candidates = [scratch]
++    sibling = scratch.with_name(scratch.name + SPOTLIGHT_NOINDEX_SUFFIX)
++    try:
++        if scratch.is_symlink() and os.readlink(scratch) in (sibling.name, str(sibling)):
++            candidates.append(sibling)
++    except OSError:
++        pass  # A changed/unreadable link establishes no additional exemption.
++    return not any(target != candidate and target.is_relative_to(candidate) for candidate in candidates)
+ 
+ 
+ @overload
+diff --git a/tests/tools/test_kanban_tools_scratch_home_fence.py b/tests/tools/test_kanban_tools_scratch_home_fence.py
+index e8e77c68e2eb0f3f6947e9eaece991ba7f45a801..de0483a2b0f4e62fee87142975f96eef663e3687 100644
+--- a/tests/tools/test_kanban_tools_scratch_home_fence.py
++++ b/tests/tools/test_kanban_tools_scratch_home_fence.py
+@@ -284,6 +284,89 @@ def test_exemption_is_the_scratch_dir_get_scratch_dir_gives_for_the_marker_root(
+     assert kanban_path_is_fenced(scratch / ".." / "other" / "kanban.db")
+ 
+ 
++@pytest.mark.parametrize("absolute", [False, True])
++def test_core_noindex_scratch_descendants_and_fences(monkeypatch, tmp_path, absolute):
++    from agent.delegation_context import delegated_child_context, kanban_path_is_fenced
++    from hermes_constants import SPOTLIGHT_NOINDEX_SUFFIX, ensure_spotlight_noindex_dir
++
++    root = tmp_path / "real-hermes"
++    scratch = root / "cache" / "scratch"
++    sibling = scratch.with_name(scratch.name + SPOTLIGHT_NOINDEX_SUFFIX)
++    monkeypatch.delenv("HERMES_SPOTLIGHT_INDEX_CACHE", raising=False)
++    ensure_spotlight_noindex_dir(scratch, platform="darwin")
++    if absolute:
++        scratch.unlink()
++        scratch.symlink_to(sibling, target_is_directory=True)
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", str(root))
++    for spelling in (scratch, sibling):
++        assert not kanban_path_is_fenced(spelling / "probe")
++        assert not kanban_path_is_fenced(spelling / "probe" / "kanban.db")
++        assert kanban_path_is_fenced(spelling)
++    escaped = sibling / "escape"
++    escaped.symlink_to(root / "sub", target_is_directory=True)
++    assert kanban_path_is_fenced(escaped / "kanban.db")
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(scratch / "probe" / "kanban.db"))
++    assert kanban_path_is_fenced(sibling / "probe" / "kanban.db")
++    monkeypatch.delenv("HERMES_KANBAN_DB")
++    with delegated_child_context("child-session"):
++        assert kanban_path_is_fenced(sibling / "probe")
++    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
++    assert kanban_path_is_fenced(sibling / "probe")
++
++
++@pytest.mark.parametrize("link", [None, "other", "./scratch.noindex", "../cache/scratch.noindex"])
++def test_noindex_sibling_requires_exact_core_link(monkeypatch, tmp_path, link):
++    from agent.delegation_context import kanban_path_is_fenced
++
++    root = tmp_path / "real-hermes"
++    scratch = root / "cache" / "scratch"
++    sibling = scratch.with_name("scratch.noindex")
++    sibling.mkdir(parents=True)
++    if link is None:
++        scratch.mkdir()
++    else:
++        scratch.symlink_to(link, target_is_directory=True)
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", str(root))
++    assert kanban_path_is_fenced(sibling / "probe")
++    if link is None:
++        assert not kanban_path_is_fenced(scratch / "probe")
++    else:
++        assert kanban_path_is_fenced(scratch / "probe")
++
++
++def test_noindex_sibling_requires_symlink_even_with_matching_readlink(monkeypatch, tmp_path):
++    from agent.delegation_context import kanban_path_is_fenced
++
++    root = tmp_path / "real-hermes"
++    scratch = root / "cache" / "scratch"
++    scratch.mkdir(parents=True)
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", str(root))
++    # Isolate the is_symlink condition from the readlink OSError fallback.
++    monkeypatch.setattr(os, "readlink", lambda path: "scratch.noindex")
++    assert kanban_path_is_fenced(scratch.with_name("scratch.noindex") / "probe")
++
++
++def test_noindex_scratch_readlink_failure_stays_fenced(monkeypatch, tmp_path):
++    from agent.delegation_context import kanban_path_is_fenced
++
++    root = tmp_path / "real-hermes"
++    scratch = root / "cache" / "scratch"
++    scratch.parent.mkdir(parents=True)
++    scratch.symlink_to("scratch.noindex", target_is_directory=True)
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", str(root))
++
++    def failed_readlink(path, *args, **kwargs):
++        raise OSError("link changed during inspection")
++
++    # Probe the physical spelling so target.resolve does not itself read this link.
++    monkeypatch.setattr(os, "readlink", failed_readlink)
++    assert kanban_path_is_fenced(scratch.with_name("scratch.noindex") / "probe")
++
++
+ @pytest.mark.parametrize("rel", ["sub", "cache/other", "cache"])
+ def test_homes_elsewhere_under_the_root_stay_refused(monkeypatch, tmp_path, rel):
+     real_root = tmp_path / "real-hermes"
+-- 
+2.43.0
+

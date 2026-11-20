@@ -1,0 +1,419 @@
+From 06a86c193f52cd54ae81010d79957b9b649f0310 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:56:26 +0000
+Subject: [PATCH] [daveey] shell_arith_sink: a `let` command word hidden by
+ quotes or escapes is still `let`
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Bash removes quotes before it looks the command word up, so `\let`, `'let'`, `l\et`,
+`l'e't`, `let''`, `"le"t`, `$'\x6cet'`, `$'\554et'` and `$"let"` all run the `let`
+builtin, whose operands are arithmetic: `\let 'a[$(f)]=1'` runs `f`. The scanner's let
+token needed the bare literal word, so every such spelling hid the sink
+(t_db248629e705196f, found reviewing #3062).
+
+Fix: at a quote or backslash-escape token in command context, `tools/shell_let_word.py`
+decodes the word it starts (letters, escapes, line continuations, '…', "…", $'…' with
+bash's ANSI-C escapes, $"…") and, when it spells `let` followed by a blank, the scanner
+opens the same `let` arithmetic frame as the bare token. Like the bare token this ignores
+command position, so `echo \let 'a[$(f)]'` also counts; that only widens the walk (fails
+closed), exactly as `echo let 'a[$(f)]'` already did.
+
+Scope decisions:
+- B (`unset`/`printf -v`/`[[ -v ]]`/`test -v`/`declare`/`typeset`/`local`/`read` name
+  operands) belongs to PR #2788, which adds builtin-target frames to this scanner.
+  Its current head catches the double-quoted forms; the apostrophe, ANSI-C and escaped
+  forms are reported there (PR comment) and tracked by follow-up card t_8e93020e33282e3d.
+- C (`b='['; let "a${b}"'$(f)]=1'`, `x='a[$(f)]'; let 'x'`, `"le$(echo t)"`) needs data
+  flow, which this static tokenizer does not model. Out of scope; recorded on the card.
+
+Proof:
+- New tests/cron/test_lifecycle_guard_arith_let_word.py (73 tests): 31 real-Bash marker
+  sinks (marker touched; scanner and output_reaches_shell must flag), 8 real-Bash data
+  controls (marker not touched; scanner must not flag), 3 double-quoted controls whose
+  substitution output bash prints rather than evaluates, lifecycle-guard scans of the
+  hidden-let payload, and word-decoding unit cases. RED on origin/main 2e2817ca: 33
+  failures (27 sinks + 6 lifecycle-guard scans). GREEN with the fix.
+- test_lifecycle_guard_arith_word_quotes.py unchanged and green (its DATA list does not
+  flip). All 43 test files that import the arith scanner, shell_heredoc or the lifecycle
+  guard: 2923 passed.
+- Mutants (sdlc-review mutants.py, 19 run): 15 killed. The 4 survivors are equivalent
+  bounds that only stop early (token filter, prefix stop, two span limits): a word that
+  is longer or holds other characters can never decode to `let`.
+- The escape / double-quote handling moved with the new check into `_word_token`, so
+  `substitution_in_arithmetic` keeps its complexity cap (scripts/check: 20 checks ok).
+- Linear: 40k repetitions of escape/quote-heavy units (≤320 KB) scan in ≤0.14 s, matching
+  the parent's timings.
+---
+ .../test_lifecycle_guard_arith_let_word.py    | 165 ++++++++++++++++++
+ tools/shell_arith_sink.py                     |  37 ++--
+ tools/shell_let_word.py                       | 116 ++++++++++++
+ 3 files changed, 307 insertions(+), 11 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_arith_let_word.py
+ create mode 100644 tools/shell_let_word.py
+
+diff --git a/tests/cron/test_lifecycle_guard_arith_let_word.py b/tests/cron/test_lifecycle_guard_arith_let_word.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..761cf9eaf3d5c7946136d7b9c03c078639ae7075
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_arith_let_word.py
+@@ -0,0 +1,165 @@
++"""Real Bash regressions: a ``let`` command word hidden by quotes or escapes.
++
++Bash removes quotes before it looks the command word up, so ``\\let``, ``'let'``,
++``l\\et``, ``$'\\x6cet'`` and friends all run the ``let`` builtin, whose operands are
++arithmetic; an array subscript in them runs its command substitutions
++(t_db248629e705196f). The scanner's bare ``let`` token needed the literal word.
++"""
++
++import shutil
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from tools.shell_arith_sink import substitution_in_arithmetic
++from tools.shell_heredoc import output_reaches_shell
++from tools.shell_let_word import hidden_let_end
++
++# SCRIPT is an executable payload that touches a marker and prints 0.
++SINKS = [
++    r"\let 'a[$(SCRIPT)]=1'",
++    r"'let' 'a[$(SCRIPT)]=1'",
++    r'"let" "a[$(SCRIPT)]=1"',
++    r"l\et 'a[$(SCRIPT)]=1'",
++    r"le\t 'a[$(SCRIPT)]=1'",
++    r"l'e't 'a[$(SCRIPT)]=1'",
++    r'l"et" a[\$\(SCRIPT\)]=1',
++    r"''let 'a[$(SCRIPT)]=1'",
++    r"let'' 'a[$(SCRIPT)]=1'",
++    r"$'let' 'a[$(SCRIPT)]=1'",
++    r"$'\x6cet' 'a[$(SCRIPT)]=1'",
++    r"$'\154et' 'a[$(SCRIPT)]=1'",
++    r"$'\u006cet' 'a[$(SCRIPT)]=1'",
++    r"$'\554et' 'a[$(SCRIPT)]=1'",
++    r"$'l\x65t' 'a[$(SCRIPT)]=1'",
++    r'$"let" "a[$(SCRIPT)]=1"',
++    "l\\\net 'a[$(SCRIPT)]=1'",
++    "\"l\\\net\" 'a[$(SCRIPT)]=1'",
++    r"\let x=1 'a[$(SCRIPT)]=1'",
++    r'\let "a[$(SCRIPT)]=1"',
++    r"x=1; \let 'a[$(SCRIPT)]=1'",
++    r"true && 'let' 'a[$(SCRIPT)]=1'",
++    r"if \let 'a[$(SCRIPT)]=1'; then :; fi",
++    r"( \let 'a[$(SCRIPT)]=1' )",
++    r"builtin 'let' 'a[$(SCRIPT)]=1'",
++    r"command \let 'a[$(SCRIPT)]=1'",
++    r"FOO=1 \let 'a[$(SCRIPT)]=1'",
++    "\\let\t'a[$(SCRIPT)]=1'",
++    # Inside `$(( ))` / `${a[ ]}` a `let`-spelling word is arithmetic text, not a `let`
++    # command: its later apostrophes keep the `$(( ))` rules, where `$(` runs.
++    r"x=$(( \let '$(SCRIPT)' )) 2>/dev/null",
++    r"x=$(( 'let' + '$(SCRIPT)' )) 2>/dev/null",
++    r"a=(1); echo ${a[ \let '$(SCRIPT)' ]} 2>/dev/null",
++]
++
++# The substitution runs as an ordinary one inside "…", so its output is printed, never
++# evaluated: a quoted `\let` there is text, not a command word.
++PRINTED = [
++    r"""echo "\let 'a[$(SCRIPT)]=1'" """,
++    r"""echo "x \let 'a[$(SCRIPT)]=1'" """,
++    r"""echo "x 'let' 'a[$(SCRIPT)]=1'" """,
++]
++
++# Bash runs none of these: no word is `let` after quote removal, or none of its operands
++# holds a subscript substitution.
++DATA = [
++    r"\letter 'a[$(SCRIPT)]=1' 2>/dev/null",
++    r"'let'x 'a[$(SCRIPT)]=1' 2>/dev/null",
++    r"'let x' 'a[$(SCRIPT)]=1' 2>/dev/null",
++    r"x='let' 'a[$(SCRIPT)]=1' 2>/dev/null",
++    r"\let 'a[1]=1'; echo 'a[$(SCRIPT)]'",
++    r"'let' 'a[1]=1' && echo '$(SCRIPT)'",
++    r"\let '$(SCRIPT)' 2>/dev/null",
++    r"\let 'a[$(date +%s)]=1'",
++]
++
++
++def _run(tmp_path, shape):
++    bash = shutil.which("bash")
++    if bash is None:
++        pytest.skip("Bash required for execution proof")
++    marker = tmp_path / "ran"
++    script = tmp_path / "payload.sh"
++    script.write_text(f"#!/bin/sh\ntouch '{marker}'\nprintf 0\n", encoding="utf-8")
++    script.chmod(0o755)
++    command = shape.replace("SCRIPT", str(script))
++    result = subprocess.run(
++        [bash, "--noprofile", "--norc", "-c", command], cwd=tmp_path,
++        env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True,
++        encoding="utf-8", timeout=10, check=False,
++    )
++    return command, marker.exists(), result
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("shape", SINKS)
++def test_hidden_let_subscripts_are_sinks(tmp_path, shape):
++    command, ran, result = _run(tmp_path, shape)
++    assert ran, (result.returncode, result.stderr)
++    assert substitution_in_arithmetic(command, date_exempt=True)
++    assert output_reaches_shell(command)
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("shape", DATA)
++def test_words_that_are_not_let_stay_data(tmp_path, shape):
++    command, ran, result = _run(tmp_path, shape)
++    assert not ran, (result.returncode, result.stderr)
++    assert not substitution_in_arithmetic(command, date_exempt=True)
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("shape", PRINTED)
++def test_double_quoted_let_text_is_printed_not_evaluated(tmp_path, shape):
++    command, ran, result = _run(tmp_path, shape)
++    assert ran and "a[0]=1" in result.stdout, (result.stdout, result.stderr)
++    assert not substitution_in_arithmetic(command, date_exempt=True)
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("shape", SINKS[:6])
++def test_lifecycle_guard_scans_the_hidden_let_payload(tmp_path, shape):
++    script = tmp_path / "payload.sh"
++    script.write_text("# padding\n" * 150000, encoding="utf-8")  # past the scan cap
++    script.chmod(0o755)
++    unsafe, refusal = scan_gateway_lifecycle(
++        shape.replace("SCRIPT", str(script)), cwd=str(tmp_path))
++    assert unsafe, refusal
++
++
++@pytest.mark.parametrize(("command", "token", "start", "end"), [
++    (r"\let x", "\\l", 0, 4),
++    (r"'let' x", "'", 0, 5),
++    (r"l\et x", "\\e", 1, 4),
++    (r"let'' x", "'", 3, 5),
++    ("$'\\x6c\\x65t' x", "$'", 0, 12),
++    ('$"let" x', '"', 1, 6),
++    ("l\\\net x", "\\\n", 1, 5),
++    (r"echo;\let x", "\\l", 5, 9),
++])
++def test_hidden_let_end_spans_the_whole_word(command, token, start, end):
++    assert hidden_let_end(command, token, start) == end
++
++
++@pytest.mark.parametrize(("command", "token", "start"), [
++    (r"\let", "\\l", 0),               # no operand follows
++    (r"\let;x", "\\l", 0),             # a metacharacter ends the word: no blank
++    (r"x\let y", "\\l", 1),            # inside another word
++    (r"='let' y", "'", 1),             # an assignment value
++    (r"\letx y", "\\l", 0),
++    (r"'lets' y", "'", 0),
++    ('"l$e"t y', '"', 0),              # an expansion is not a static command word
++    (r'"l\et" y', '"', 0),             # in "…" a backslash before a letter stays
++    (r'"\let" y', '"', 0),
++    (r"$'l\et' y", "$'", 0),           # \e is ESC
++    (r"$'\l'et y", "$'", 0),           # an unknown escape keeps its backslash
++    ("$'\\cl'et y", "$'", 0),          # a control character, not a letter
++    ("'" + "l" * 60 + "' y", "'", 0),  # overlong quoted spans stop early
++    ("$'\\U110000let' y", "$'", 0),    # out-of-range code point
++    ("$'\\", "$'", 0),                 # an unclosed ANSI-C string ending in a backslash
++    (r"\; x", "\\;", 0),
++    ("x y", "x", 0),                   # not a quote or escape token
++])
++def test_hidden_let_end_rejects_other_words(command, token, start):
++    assert hidden_let_end(command, token, start) is None
+diff --git a/tools/shell_arith_sink.py b/tools/shell_arith_sink.py
+index d11f0ab8616655c1a939fa1327ea685f37e966ae..5ec04ccd04d5350e6fc8a215557e94a0f4281ba4 100644
+--- a/tools/shell_arith_sink.py
++++ b/tools/shell_arith_sink.py
+@@ -23,6 +23,7 @@ import bisect
+ import re
+ 
+ from tools.shell_command_position import QuotedNameClassifier
++from tools.shell_let_word import hidden_let_end
+ 
+ # `$(date +%s)` prints only digits: the one producer whose output arithmetic may hold.
+ DATE_PRODUCER_BODY = r"""[ \t]*date[ \t]+(?:\+%s|'\+%s'|"\+%s")[ \t]*\)"""
+@@ -89,23 +90,16 @@ def substitution_in_arithmetic(command: str, *, date_exempt: bool, _depth: int =
+         pos = match.end()
+         top = stack[-1]
+         kind, quoted = top[0], top[3]
+-        if token[0] == "\\":
+-            if _escaped_opener(command, token, start) and _subscript_word_before(command, stack, pos):
+-                return True
+-            continue
+         if token in ("`", "$(", "$((", "$[", "${"):
+             pos, sink = _expansion_token(command, token, pos, stack, date_exempt)
+             if sink:
+                 return True
+             backtick_open ^= token == "`"
+             continue
+-        if token == '"':
+-            if quoted and command[start - 1] == "$" and _subscript_word_before(command, stack, pos):
+-                return True  # `"$"(…)`: the `$` joins a later `(` after quote removal
+-            top[3] = not quoted
+-            continue
+-        skipped = _skip_data(command, token, start, pos, quoted, stack, pending,
+-                             date_exempt, _depth)
++        skipped = _word_token(command, token, start, pos, stack)
++        if skipped is None:
++            skipped = _skip_data(command, token, start, pos, quoted, stack, pending,
++                                 date_exempt, _depth)
+         if skipped is not None:
+             if skipped < 0:
+                 return True
+@@ -246,6 +240,27 @@ def _span_substitutes(span: str, date_exempt: bool) -> bool:
+                for m in re.finditer(r"\$\(", span))  # `$((` too: it may be `$( (…)…)`
+ 
+ 
++def _word_token(command, token, start, pos, stack) -> int | None:
++    """Word-level tokens: a ``let`` spelled with quotes or escapes, a backslash escape, a
++    double quote. Return where scanning resumes, -1 for a sink, None for other tokens."""
++    top = stack[-1]
++    quoted = top[3]
++    hidden_let = top[0] == _CMD and not quoted and hidden_let_end(command, token, start)
++    if hidden_let:
++        stack.append([_ARITH, "let", 0, False, hidden_let])
++        return hidden_let
++    if token[0] == "\\":
++        if _escaped_opener(command, token, start) and _subscript_word_before(command, stack, pos):
++            return -1
++        return pos
++    if token == '"':
++        if quoted and command[start - 1] == "$" and _subscript_word_before(command, stack, pos):
++            return -1  # `"$"(…)`: the `$` joins a later `(` after quote removal
++        top[3] = not quoted
++        return pos
++    return None
++
++
+ def _skip_data(command, token, start, pos, quoted, stack, pending, date_exempt, depth) -> int | None:
+     """Skip literal spans; None means a normal token, -1 means fail closed."""
+     kind = stack[-1][0]
+diff --git a/tools/shell_let_word.py b/tools/shell_let_word.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0fe1e3425b0903dd2d92fee69f599009129e9efa
+--- /dev/null
++++ b/tools/shell_let_word.py
+@@ -0,0 +1,116 @@
++"""Find a command word that spells ``let`` only after quote removal.
++
++``shell_arith_sink`` recognizes a bare ``let`` token, but bash removes quotes before it
++looks the command word up, so ``\\let``, ``'let'``, ``l\\et``, ``"le"t``, ``$'\\x6cet'`` and
++``$"let"`` all run the ``let`` builtin, whose operands are arithmetic: ``\\let 'a[$(f)]=1'``
++runs ``f`` (t_db248629e705196f). Expansions (``$x``, ``$(…)``) are data flow and out of
++scope here; a substitution as the command word is already a shell sink of its own.
++"""
++
++from __future__ import annotations
++
++import re
++
++_WORD_BOUNDARY = frozenset(" \t\n;&|()<>`")
++_ANSI_SIMPLE = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n",
++                "r": "\r", "t": "\t", "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?"}
++_ANSI_NUMERIC_RE = re.compile(
++    r"x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|([0-7]{1,3})")
++# A quoted piece of a three-letter word is short; longer spans are never `let`.
++_SPAN_LIMIT = 40
++
++
++def hidden_let_end(command: str, token: str, start: int) -> int | None:
++    """Where a quoted or escaped word spelling ``let`` ends, when *token* (found at
++    *start*: an apostrophe, a double quote, ``$'`` or a backslash escape) belongs to such a
++    word; None otherwise.
++
++    Like the bare ``let`` token this ignores command position (``echo \\let …`` counts
++    too); that only fails closed. Each token backs up only over the letters right before it,
++    and a word that stops being a prefix of ``let`` ends the forward walk, so the scan stays
++    linear.
++    """
++    if token not in ("'", '"', "$'") and token[:1] != "\\":
++        return None
++    word = start
++    while word > 0 and command[word - 1] in "let":
++        word -= 1
++    if word == start and token == '"' and command[start - 1:start] == "$":
++        word -= 1  # `$"let"`: an untranslated locale string is the plain string
++    if word and command[word - 1] not in _WORD_BOUNDARY:
++        return None
++    text, pos = "", word
++    while pos < len(command) and command[pos] not in " \t" and "let".startswith(text):
++        piece, pos = _unquoted_piece(command, pos)
++        if piece is None:
++            return None
++        text += piece
++    if text == "let" and command[pos:pos + 1] in (" ", "\t"):
++        return pos
++    return None
++
++
++def _unquoted_piece(command: str, pos: int) -> tuple[str | None, int]:
++    """Decode the word piece at *pos* (a letter, an escape or one quoted span). None stops
++    the word: an expansion, a metacharacter, an unclosed or overlong quote."""
++    char = command[pos]
++    if char.isalnum() or char == "_":
++        return char, pos + 1
++    if char == "\\":
++        # A backslash-newline is a line continuation, not part of the word.
++        following = command[pos + 1:pos + 2]
++        return ("" if following == "\n" else following), pos + 2
++    if char == "'":
++        close = command.find("'", pos + 1, pos + _SPAN_LIMIT)
++        return (None, pos) if close < 0 else (command[pos + 1:close], close + 1)
++    if command.startswith("$'", pos):
++        return _ansi_c_piece(command, pos + 2)
++    if command.startswith('$"', pos):
++        return "", pos + 1
++    if char == '"':
++        return _double_quoted_piece(command, pos + 1)
++    return None, pos
++
++
++def _double_quoted_piece(command: str, pos: int) -> tuple[str | None, int]:
++    """Inside ``"…"`` a backslash quotes only ``" \\ $ ` newline``. An expansion stays in
++    the text as ``$``/backtick, which no ``let`` holds."""
++    text, index, limit = "", pos, min(len(command), pos + _SPAN_LIMIT)
++    while index < limit:
++        char = command[index]
++        if char == '"':
++            return text, index + 1
++        following = command[index + 1:index + 2]
++        if char == "\\" and following in ('"', "\\", "$", "`", "\n"):
++            text += "" if following == "\n" else following
++            index += 2
++            continue
++        text += char
++        index += 1
++    return None, index
++
++
++def _ansi_c_piece(command: str, pos: int) -> tuple[str | None, int]:
++    """Decode a ``$'…'`` body starting at *pos* the way bash does for escapes that can
++    spell a letter. Others (``\\cX``, unknown escapes) keep their backslash here, which no
++    ``let`` holds either."""
++    out, index, limit = [], pos, min(len(command), pos + _SPAN_LIMIT)
++    while index < limit:
++        char = command[index]
++        if char == "'":
++            return "".join(out), index + 1
++        if char != "\\" or index + 1 >= limit:
++            out.append(char)
++            index += 1
++            continue
++        numeric = _ANSI_NUMERIC_RE.match(command, index + 1, limit)
++        if numeric:
++            hexa = numeric.group(1) or numeric.group(2) or numeric.group(3)
++            value = int(hexa, 16) if hexa else int(numeric.group(4), 8) & 0xFF
++            out.append(chr(value) if value <= 0x10FFFF else "\ufffd")
++            index = numeric.end()
++            continue
++        escaped = command[index + 1]
++        out.append(_ANSI_SIMPLE.get(escaped, "\\" + escaped))
++        index += 2
++    return None, index
+-- 
+2.43.0
+

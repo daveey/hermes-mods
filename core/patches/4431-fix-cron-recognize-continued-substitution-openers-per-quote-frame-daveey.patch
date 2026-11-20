@@ -1,0 +1,133 @@
+From c6039724716ea7330f31e8d9d51f15886c80403b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 23:42:48 +0000
+Subject: [PATCH] fix(cron): recognize continued substitution openers per quote
+ frame [daveey]
+
+---
+ cron/lifecycle_guard_substitutions.py         | 31 +++++++++++++++----
+ ...t_lifecycle_guard_substitution_comments.py | 29 +++++++++++++++++
+ 2 files changed, 54 insertions(+), 6 deletions(-)
+
+diff --git a/cron/lifecycle_guard_substitutions.py b/cron/lifecycle_guard_substitutions.py
+index 3518885b210f376539dca55656987b374b48d3ed..a27c1803cd588b319d597f772df8a394c67422a1 100644
+--- a/cron/lifecycle_guard_substitutions.py
++++ b/cron/lifecycle_guard_substitutions.py
+@@ -131,6 +131,23 @@ def _backtick_end(text: str, start: int) -> int:
+     return len(text)
+ 
+ 
++# Recognize active continuations only at an expansion opener, in its own quote
++# frame. A global newline rewrite would change single quotes and comment ends.
++_PAREN_OPENER = re.compile(r'\$(?:\\\n)*\(')
++_ARITHMETIC_PAREN = re.compile(r'(?:\\\n)*\(')
++
++
++def _opener_end(text: str, start: int) -> int:
++    match = _PAREN_OPENER.match(text, start) if text[start:start + 1] == '$' else None
++    return match.end() if match else 0
++
++
++def _arithmetic_start(text: str, start: int) -> int:
++    end = _opener_end(text, start)
++    match = _ARITHMETIC_PAREN.match(text, end) if end else None
++    return match.end() if match else 0
++
++
+ _HEREDOC_OPERATOR = re.compile(r"<<(-?)[ \t]*((?:'[^']*'|\"[^\"]*\"|\\.|[^\s;&|()<>])+)")
+ _COMMAND_KEYWORDS = frozenset({'then', 'do', 'else', 'elif', 'if', 'while', 'until', '!'})
+ 
+@@ -140,7 +157,7 @@ class _ParenScan:
+ 
+     def __init__(self, text: str, start: int, nesting: int) -> None:
+         self.text, self.start, self.nesting = text, start, nesting
+-        self.index, self.depth = start + 2, 1
++        self.index, self.depth = _opener_end(text, start), 1
+         self.quote = ''
+         self.command_position = True
+         # (phase, parenthesis depth); phases: subject, in, pattern-start, pattern, body.
+@@ -152,7 +169,7 @@ class _ParenScan:
+ 
+     def step_heredoc_operator(self) -> bool:
+         text, index = self.text, self.index
+-        if (self.quote or text.startswith('$((', self.start)
++        if (self.quote or _arithmetic_start(text, self.start)
+                 or not text.startswith('<<', index) or text.startswith('<<<', index)):
+             return False
+         # A delimiter is a shell word, not executable expansion syntax. Queue
+@@ -214,7 +231,7 @@ class _ParenScan:
+             self.index += 2
+             self.command_position = False
+             return True
+-        if self.quote not in {"'", "$'"} and text.startswith('$(', index):
++        if self.quote not in {"'", "$'"} and _opener_end(text, index):
+             self.index = _paren_end(text, index, self.nesting + 1)
+             self.command_position = False
+             return True
+@@ -357,11 +374,13 @@ def separate_substitutions(text: str, *, _nesting: int = 0,
+             out.append("$'")
+             index += 2
+             continue
+-        if quote not in {"'", "$'"} and (text.startswith('$(', index) or ch == '`'):
++        if quote not in {"'", "$'"} and (_opener_end(text, index) or ch == '`'):
+             backtick = ch == '`'
+             end = _backtick_end(text, index) if backtick else _paren_end(text, index)
+-            arithmetic = text.startswith('$((', index) and text[index:end].endswith('))')
+-            lead = 1 if backtick else (3 if arithmetic else 2)
++            arithmetic_start = 0 if backtick else _arithmetic_start(text, index)
++            arithmetic = bool(arithmetic_start) and text[index:end].endswith('))')
++            lead = 1 if backtick else (
++                (arithmetic_start if arithmetic else _opener_end(text, index)) - index)
+             tail = 1 if backtick else (2 if arithmetic else 1)
+             closed = text[index:end].endswith('`' if backtick else ')' * tail)
+             body = text[index + lead:end - tail if closed else end]
+diff --git a/tests/cron/test_lifecycle_guard_substitution_comments.py b/tests/cron/test_lifecycle_guard_substitution_comments.py
+index c10118167098091bac6d83495dd2e82f17b02b7a..efbfa76cfe8b074caac5974dc6244d304e54905b 100644
+--- a/tests/cron/test_lifecycle_guard_substitution_comments.py
++++ b/tests/cron/test_lifecycle_guard_substitution_comments.py
+@@ -29,6 +29,32 @@ def test_nested_quote_comment_boundary(tmp_path, body, wrapper, script, dangerou
+     assert scan_gateway_lifecycle(command, cwd=str(tmp_path))[0] is dangerous
+ 
+ 
++@pytest.mark.parametrize('opener', ['$\\\n(', '$\\\n\\\n('])
++@pytest.mark.parametrize('wrapper', ['echo "OPENERBODY)"', 'echo "$(echo "OPENERBODY)")"'])
++@pytest.mark.parametrize('body', [
++    'echo " # "; bash ./r.sh',
++    'bash 2>$(echo /dev/null) < ./r.sh',
++])
++@pytest.mark.parametrize('dangerous', [True, False])
++def test_continued_substitution_openers(tmp_path, opener, wrapper, body, dangerous):
++    _tree(tmp_path)
++    if not dangerous:
++        body = body.replace('bash', 'python3').replace('./r.sh', './clean.py')
++    command = wrapper.replace('OPENER', opener).replace('BODY', body)
++    assert _bash_runs(tmp_path, command) is dangerous
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path))[0] is dangerous
++
++
++@pytest.mark.parametrize('opener', ['$\\\n((', '$(\\\n(', '$\\\n(\\\n('])
++@pytest.mark.parametrize('dangerous', [True, False])
++def test_continued_arithmetic_opener(tmp_path, opener, dangerous):
++    _tree(tmp_path)
++    script = 'bash ./r.sh' if dangerous else 'python3 ./clean.py'
++    command = 'echo "' + opener + '$( ' + script + '; echo 1) + 1))"'
++    assert _bash_runs(tmp_path, command) is dangerous
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path))[0] is dangerous
++
++
+ def test_separation_precedes_flat_comment_stripping():
+     command = 'echo "$(echo " # "; bash ./r.sh)"'
+     assert any('./r.sh' in words for words in _iter_command_token_lists(command))
+@@ -38,6 +64,9 @@ def test_separation_precedes_flat_comment_stripping():
+     '# $(bash ./r.sh)\npython3 ./clean.py',
+     'echo "$(echo ok # bash ./r.sh\n)"',
+     "echo '$(echo \" # \"; bash ./r.sh)'",
++    "echo '$\\\n(bash ./r.sh)'",
++    'echo "\\$\\\n(bash ./r.sh)"',
++    '# $\\\n(echo ignored)\npython3 ./clean.py',
+ ])
+ def test_inert_comment_and_single_quote_controls(tmp_path, command):
+     _tree(tmp_path)
+-- 
+2.43.0
+

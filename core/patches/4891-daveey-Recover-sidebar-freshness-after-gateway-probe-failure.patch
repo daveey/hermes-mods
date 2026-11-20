@@ -1,0 +1,180 @@
+From 8523c4ef91ded006843bc941384e7d4aa674f526 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 22:33:47 +0000
+Subject: [PATCH] [daveey] Recover sidebar freshness after gateway probe
+ failure
+
+Schedule the existing stale-owner backoff after gateway-unavailable invalidation.
+Only an authoritative successful list restores freshness; cached rows stay
+fail-closed. Replace the old no-retry expectation with real hook coverage of
+15/30/60/60-second retry timing, persistent failure, other-owner isolation,
+successful list restoration and stopping retries.
+
+Five whys (bounded by checked evidence):
+1. Why did an idle done session lose its stripe? Coordinator-read desktop.log
+   for 20261111_090650_1247e7 shows done->none, idle, source=cache,
+   outcome=done at 2026-11-18 13:29:29 -08:00, without task/background/
+   delegation work; list-refetch restored none->done at 13:33:53.
+2. Why could a cached row hide done? offline_cached intentionally suppresses
+   authoritative outcome presentation. Keep that fail-closed behavior.
+3. Why could freshness remain stale? A gateway-unavailable status observation
+   invalidates the owner; status success alone cannot validate session rows.
+   A later 13:40:55 log explicitly records gateway-unavailable freshness.
+4. Why was recovery delayed until an unrelated refresh? That producer excluded
+   probe failures from listStaleOwners, so the existing retry loop had no owner
+   eligible to re-list. Add the gateway wildcard to the set.
+5. Why was it not caught? Store tests checked invalidation and the hook suite
+   explicitly expected no probe-triggered retry, not eventual recovery.
+
+The reported 14.9-second main-process stall is not independently established
+as the historical cause of these transitions; no such causal claim is needed
+for the reproduced missing-retry defect.
+
+Validation on pool worker with separate dependency tree:
+- RED: recovered store regression and new real-hook regression fail on base
+  f8107900412daeae725492d4aa8661d0a8ef8404 (empty stale-owner eligibility).
+- GREEN: offline-sessions + use-session-list-actions: 105 tests pass.
+- Consumers including boot-snapshot, hub-sync, offline owners/actions,
+  sidebar fallback/actions and session actions: 13 files, 300 tests pass.
+- Desktop tsc --noEmit passes with 3 GiB heap (1.5 GiB trial exhausted heap).
+
+Live Desktop deployment and idle proof remain with parent t_0ac5797a398e994e.
+---
+ .../hooks/use-session-list-actions.test.tsx   | 52 +++++++++++++++----
+ .../src/store/offline-sessions.test.ts        | 17 ++++++
+ apps/desktop/src/store/offline-sessions.ts    |  7 ++-
+ 3 files changed, 63 insertions(+), 13 deletions(-)
+
+diff --git a/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx b/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx
+index 6aefb7ea4ec5d0a99b87b6e842ff9bc92471bc46..aa9c5478bcb233499e41b26702e6b43d0e3cce81 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx
+@@ -1634,25 +1634,55 @@ describe('re-lists while a failed list leaves owners stale', () => {
+     }
+   })
+ 
+-  it('does not re-list a gateway the status probe marked unreachable', async () => {
+-    const { _resetOfflineSessionsForTests, recordSessionGatewayUnavailable } = await import('@/store/offline-sessions')
++  it('re-lists after probe failure with bounded backoff, failing closed until the owner answers', async () => {
++    const { recordSessionGatewayUnavailable, sessionOwnerIsFresh, staleSessionOwners } = await import('@/store/offline-sessions')
+     _resetOfflineSessionsForTests()
+     vi.useFakeTimers()
+-    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [row('mine')] }))
++    setApiRequestConnection('conn-mini')
++    const owner = row('remote', { connection_id: 'conn-mini', outcome: { kind: 'done' } })
++    const local = row('mine', { connection_id: 'local' })
++    let failing = false
++    listSidebarSessions.mockImplementation(({ connectionId }: { connectionId?: string }) => {
++      if (connectionId === 'local') { return Promise.resolve(sidebar({ sessions: [local] })) }
++      return failing ? Promise.reject(new Error('unreachable')) : Promise.resolve(sidebar({ sessions: [owner] }))
++    })
++    const remoteCalls = () => listSidebarSessions.mock.calls.filter((args: unknown[]) =>
++      (args[0] as { connectionId?: string }).connectionId === undefined).length
++    const painted = () => mergeOfflineFallback([owner, local], []).find(s => s.id === 'remote')
+     const { result, unmount } = renderHook(() => useSessionListActions({ profileScope: 'all' }))
+ 
+     try {
+-      await act(async () => {
+-        await result.current.refreshSessions()
+-      })
+-      const calls = listSidebarSessions.mock.calls.length
++      await act(async () => { await result.current.refreshSessions() })
++      const calls = remoteCalls()
++      failing = true
+       act(() => recordSessionGatewayUnavailable('conn-mini'))
+-      await act(async () => {
+-        await vi.advanceTimersByTimeAsync(120_000)
+-      })
+-      expect(listSidebarSessions.mock.calls.length).toBe(calls)
++      expect(staleSessionOwners()).toContain('conn-mini/*')
++      expect(sessionOwnerIsFresh('local', 'default')).toBe(true)
++      expect(painted()?.offline_cached).toBe(true)
++
++      // Repeated failures keep the row non-authoritative and cap retries at 60 seconds.
++      for (const delay of [15_000, 30_000, 60_000, 60_000]) {
++        const before = remoteCalls()
++        await act(async () => { await vi.advanceTimersByTimeAsync(delay - 1) })
++        expect(remoteCalls()).toBe(before)
++        await act(async () => { await vi.advanceTimersByTimeAsync(1) })
++        expect(remoteCalls()).toBe(before + 1)
++        expect(sessionOwnerIsFresh('conn-mini', 'default')).toBe(false)
++        expect(sessionOwnerIsFresh('local', 'default')).toBe(true)
++        expect(painted()?.offline_cached).toBe(true)
++      }
++      expect(remoteCalls()).toBe(calls + 4)
++      failing = false
++      await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
++      expect(sessionOwnerIsFresh('conn-mini', 'default')).toBe(true)
++      expect(staleSessionOwners()).toEqual([])
++      expect(painted()?.offline_cached).not.toBe(true)
++      expect(painted()?.outcome?.kind).toBe('done')
++      await act(async () => { await vi.advanceTimersByTimeAsync(120_000) })
++      expect(remoteCalls()).toBe(calls + 5)
+     } finally {
+       unmount()
++      setApiRequestConnection(null)
+       vi.useRealTimers()
+       _resetOfflineSessionsForTests()
+     }
+diff --git a/apps/desktop/src/store/offline-sessions.test.ts b/apps/desktop/src/store/offline-sessions.test.ts
+index ae68c1763ba64ccace2c5b695dafa7204bceff02..1a4a476f133e63f23894e63c5437a85c9de264ae 100644
+--- a/apps/desktop/src/store/offline-sessions.test.ts
++++ b/apps/desktop/src/store/offline-sessions.test.ts
+@@ -14,8 +14,10 @@ import {
+   mergeOfflineFallback,
+   type OfflineReplicaRecord,
+   offlineSessionsFromReplica,
++  recordSessionGatewayUnavailable,
+   recordSessionListResult,
+   sessionOwnerIsFresh,
++  staleSessionOwners,
+   syncedAgoLabel
+ } from './offline-sessions'
+ import { $ownerRowStamps, _resetOwnerRowStampsForTests, refreshOwnerRowStamps, type StampFetcher } from './owner-row-stamps'
+@@ -531,3 +533,18 @@ it('freshness and retained-row archive hiding stay scoped to the full owner', ()
+   hideOfflineSession(cached[1])
+   expect(mergeOfflineFallback(previous, cached)).toEqual([previous[0], previous[2]])
+ })
++
++describe('gateway-unavailable probe', () => {
++  beforeEach(() => _resetOfflineSessionsForTests())
++
++  // [daveey] Probe invalidation must also make the owner eligible for a recovery list.
++  it('leaves the gateway a stale owner so the backoff re-list runs until a list succeeds', () => {
++    recordSessionGatewayUnavailable('hermes-hub')
++    expect(sessionOwnerIsFresh('hermes-hub', 'default')).toBe(false)
++    expect(staleSessionOwners()).toEqual(['hermes-hub/*'])
++
++    recordSessionListResult([], [{ id: 's1', profile: 'default', connection_id: 'hermes-hub' } as SessionInfo], 'hermes-hub', 'all')
++    expect(sessionOwnerIsFresh('hermes-hub', 'default')).toBe(true)
++    expect(staleSessionOwners()).toEqual([])
++  })
++})
+diff --git a/apps/desktop/src/store/offline-sessions.ts b/apps/desktop/src/store/offline-sessions.ts
+index 2440ffc4a45556be530baef682669ff605eb1372..65551f4e719a0f743cd6e244fb6fef72e48e358d 100644
+--- a/apps/desktop/src/store/offline-sessions.ts
++++ b/apps/desktop/src/store/offline-sessions.ts
+@@ -121,8 +121,8 @@ function publishFreshness(next: Record<string, boolean>, reason: string): void {
+   }
+ }
+ 
+-/** [daveey] Owner keys a sidebar LIST marked stale (failed request, or an error naming them). A gateway the hub-sync
+- *  status probe calls unreachable is not here: re-listing it would only flap against the probe. */
++/** [daveey] Owner keys a sidebar LIST marked stale (failed request, or an error naming them), plus the `<conn>/*` key of
++ *  a gateway the hub-sync status probe called unreachable: a re-list with backoff is the only thing that clears it. */
+ const listStaleOwners = new Set<string>()
+ 
+ /** [daveey] Owners whose last list failed (`connection/profile`) and are still stale. Only a successful list makes
+@@ -146,6 +146,9 @@ export function recordSessionGatewayUnavailable(connection: string): void {
+   )
+ 
+   next[ownerKey(connection, '*')] = false
++  // [daveey] Probe failure invalidates retained rows, but probe success cannot make them authoritative again.
++  // Schedule the existing backoff re-list; only a successful list restores freshness.
++  listStaleOwners.add(ownerKey(connection, '*'))
+   publishFreshness(next, `gateway-unavailable conn=${connection}`)
+ }
+ 
+-- 
+2.43.0
+

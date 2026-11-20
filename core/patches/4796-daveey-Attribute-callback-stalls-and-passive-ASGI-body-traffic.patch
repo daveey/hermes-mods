@@ -1,0 +1,1560 @@
+From 26343c4b5ff085ba96dea8644809becae4fcac89 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 07:33:17 +0000
+Subject: [PATCH] [daveey] Attribute callback stalls and passive ASGI body
+ traffic
+
+Why: control-beat misses coincide with local timeouts, but a post-delay stack and CPU-only scopes do not identify blocked callback wall time. The incident root remains unknown; this closes the attribution gap only.
+
+Keep bounded >=500ms wall/inclusive-CPU records without adding inclusive CPU to residual totals. Emit only on the existing snapshot cadence. Count passive ASGI bytes and lifecycle outcomes with fixed safe route keys; global observation counters remain cumulative while per-route classification is deferred until response headers. No body drain, extra polling, live database fixtures, deployment, or production load.
+
+Proof: callback suite RED (6 failures) before implementation; HTTP module RED and cumulative-delta regression RED (4 failures). GREEN: 312 tests across 18 files, 16 skips; final callback suite 8 tests. scripts/check all21 gates green. Isolated five-trial10000-operation fixture: no-op callback101ns plain/1725ns with existingCPU+wall; HTTP5byte streaming407ns plain/10635ns observed. Real controlled sleep snapshot wall0.5101s CPU0.000037s; consumed/sent5bytes. Schema, bounds, cadence and 30s-delta limitations documented in website/docs/developer-guide/stall-attribution.md. Incident owner retains live root correction and zero-local-timeout30min acceptance.
+---
+ hermes_cli/http_body_accounting.py            | 331 +++++++++
+ hermes_cli/loop_accounting.py                 |  12 +
+ hermes_cli/loop_callback_latency.py           | 116 +++
+ hermes_cli/web_server_transport.py            |   5 +
+ tests/hermes_cli/test_http_body_accounting.py | 702 ++++++++++++++++++
+ .../hermes_cli/test_loop_callback_latency.py  | 168 +++++
+ .../docs/developer-guide/stall-attribution.md | 118 +++
+ 7 files changed, 1452 insertions(+)
+ create mode 100644 hermes_cli/http_body_accounting.py
+ create mode 100644 hermes_cli/loop_callback_latency.py
+ create mode 100644 tests/hermes_cli/test_http_body_accounting.py
+ create mode 100644 tests/hermes_cli/test_loop_callback_latency.py
+ create mode 100644 website/docs/developer-guide/stall-attribution.md
+
+diff --git a/hermes_cli/http_body_accounting.py b/hermes_cli/http_body_accounting.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6fa5b22c45d76689eb8417d6a8f1a27160833af4
+--- /dev/null
++++ b/hermes_cli/http_body_accounting.py
+@@ -0,0 +1,331 @@
++"""Passive ASGI HTTP lifecycle and body-byte counters for stall attribution.
++
++Counts HTTP requests at the outer transport wrapper without opening a
++loop_accounting CPU scope, so existing per-route ``accounted`` passes stay
++the outermost CPU names. Keys are a fixed allowlist of literal templates
++(inspected Desktop poll / session / plugin paths); unmatched, auth
++early-exit, 404 and redirect stay under ``other``. Global ``totals`` book
++every request at entry; the per-route row is booked once, at
++``http.response.start`` (2xx on a matched template, else ``other``) or at a
++terminal before start (``other``). Cumulative counts are never subtracted.
++WebSocket and lifespan pass through.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import os
++import threading
++import time
++from typing import Any, Optional
++
++MAX_ROUTE_KEYS = 64
++OTHER = "other"
++UNIT = "ASGI body bytes"
++
++# Inspected from hermes_cli/web_routers and always_on_rollover.REPLAY_PATHS.
++# Placeholders are explicit one-segment ``{name}`` only; never raw ids.
++ROUTE_ALLOWLIST: tuple[tuple[str, str], ...] = (
++    ("GET", "/api/health"),
++    ("GET", "/api/health/idle"),
++    ("GET", "/api/status"),
++    ("GET", "/api/sessions"),
++    ("GET", "/api/sessions/search"),
++    ("GET", "/api/sessions/stats"),
++    ("GET", "/api/sessions/empty/count"),
++    ("GET", "/api/sessions/{session_id}"),
++    ("GET", "/api/sessions/{session_id}/messages"),
++    ("GET", "/api/sessions/{session_id}/timeline"),
++    ("GET", "/api/sessions/{session_id}/messages/around"),
++    ("GET", "/api/sessions/{session_id}/mutation-snapshot"),
++    ("GET", "/api/sessions/{session_id}/latest-descendant"),
++    ("GET", "/api/sessions/{session_id}/outcome"),
++    ("GET", "/api/sessions/{session_id}/export"),
++    ("GET", "/api/session-kanban-tasks"),
++    ("GET", "/api/profiles"),
++    ("GET", "/api/profiles/sessions"),
++    ("GET", "/api/profiles/sessions/stamps"),
++    ("GET", "/api/profiles/projects/tree"),
++    ("GET", "/api/cron/jobs"),
++    ("GET", "/api/cron/jobs/{job_id}"),
++    ("GET", "/api/cron/jobs/{job_id}/runs"),
++    ("GET", "/api/ui-preferences"),
++    ("GET", "/api/model/info"),
++    ("GET", "/api/model/options"),
++    ("GET", "/api/auth/me"),
++    ("GET", "/api/auth/providers"),
++    ("GET", "/api/plugins/kanban/board"),
++    ("GET", "/api/plugins/kanban/boards"),
++    ("GET", "/api/plugins/kanban/session-labels"),
++    ("GET", "/api/plugins/user-steps/session-cards"),
++    ("GET", "/api/plugins/user-steps/requests"),
++    ("GET", "/api/plugins/hub-sync/status"),
++    ("GET", "/api/plugins/runners/v1/fleet"),
++    ("GET", "/api/plugins/throughput/v1/series"),
++    ("GET", "/api/plugins/hermes-monitor/workers"),
++    ("GET", "/api/plugins/inbox/items"),
++    ("GET", "/api/plugins/core-update/status"),
++    ("GET", "/api/plugins/account-usage/last"),
++    ("GET", "/api/plugins/account-usage/selection"),
++    ("POST", "/api/sessions/import"),
++    ("POST", "/api/sessions/prune"),
++    ("POST", "/api/sessions/bulk-delete"),
++    ("POST", "/api/chat/file-upload"),
++    ("POST", "/api/cron/jobs"),
++    ("POST", "/api/health/retirement"),
++    ("PATCH", "/api/sessions/{session_id}"),
++    ("PATCH", "/api/ui-preferences"),
++    ("DELETE", "/api/sessions/{session_id}"),
++)
++
++_FIELDS = (
++    "requests_started",
++    "response_finished",
++    "failed",
++    "cancelled",
++    "inflight",
++    "request_body_bytes",
++    "response_body_bytes",
++)
++
++
++def _zero() -> dict[str, int]:
++    return {name: 0 for name in _FIELDS}
++
++
++def _parts(path: str) -> tuple[str, ...]:
++    return tuple(path.split("/")[1:])
++
++
++def _compile(
++    allowlist: tuple[tuple[str, str], ...],
++) -> tuple[tuple[str, str, tuple[str, ...]], ...]:
++    compiled = []
++    for method, template in allowlist[:MAX_ROUTE_KEYS]:
++        compiled.append((method, template, _parts(template)))
++    return tuple(compiled)
++
++
++_COMPILED = _compile(ROUTE_ALLOWLIST)
++
++_lock = threading.Lock()
++_routes: dict[str, dict[str, int]] = {OTHER: _zero()}
++_totals: dict[str, int] = _zero()
++_unclassified = 0
++
++
++def match_route(method: str, path: str) -> Optional[str]:
++    """Allowlisted ``METHOD /template`` or None. Never returns a raw path."""
++    # ``path`` is an ASGI ``scope["path"]`` (no query). One trailing slash is
++    # tolerated; empty interior segments (``//``) never match.
++    if not path.startswith("/"):
++        return None
++    if len(path) > 1 and path.endswith("/"):
++        path = path[:-1]
++    segs = _parts(path)
++    if any(not seg for seg in segs):
++        return None
++    best: Optional[str] = None
++    best_score = (-1, -1)
++    method = method.upper()
++    for tmpl_method, template, parts in _COMPILED:
++        if tmpl_method != method or len(parts) != len(segs):
++            continue
++        literals = 0
++        ok = True
++        for part, seg in zip(parts, segs):
++            if part.startswith("{") and part.endswith("}"):
++                continue
++            if part != seg:
++                ok = False
++                break
++            literals += 1
++        if not ok:
++            continue
++        score = (literals, len(parts))
++        if score > best_score:
++            best_score = score
++            best = f"{tmpl_method} {template}"
++    return best
++
++
++def _named_count() -> int:
++    return sum(1 for key in _routes if key != OTHER)
++
++
++def _row(key: str) -> dict[str, int]:
++    if key not in _routes:
++        if key != OTHER and _named_count() >= MAX_ROUTE_KEYS:
++            key = OTHER
++        if key not in _routes:
++            _routes[key] = _zero()
++    return _routes[key]
++
++
++class _State:
++    __slots__ = ("classified", "disconnect", "key", "matched", "outcome", "req_bytes")
++
++    def __init__(self, matched: Optional[str]) -> None:
++        self.matched = matched
++        self.key = OTHER
++        self.classified = False
++        self.outcome: Optional[str] = None
++        self.req_bytes = 0
++        self.disconnect = False
++
++
++def _start(state: _State) -> None:
++    global _unclassified
++    with _lock:
++        _totals["requests_started"] += 1
++        _totals["inflight"] += 1
++        _unclassified += 1
++
++
++def _classify_locked(state: _State, key: str) -> None:
++    """Book the route row once. Caller holds ``_lock``. Never subtracts."""
++    global _unclassified
++    if state.classified:
++        return
++    if key != OTHER and key not in _routes and _named_count() >= MAX_ROUTE_KEYS:
++        key = OTHER
++    state.classified = True
++    state.key = key
++    row = _row(key)
++    row["requests_started"] += 1
++    row["inflight"] += 1
++    row["request_body_bytes"] += state.req_bytes
++    _unclassified -= 1
++
++
++def _classify(state: _State, key: str) -> None:
++    with _lock:
++        _classify_locked(state, key)
++
++
++def _finish(state: _State, outcome: str) -> None:
++    if state.outcome is not None:
++        return
++    state.outcome = outcome
++    with _lock:
++        _classify_locked(state, OTHER)  # terminal before response.start
++        row = _row(state.key)
++        row["inflight"] -= 1
++        row[outcome] += 1
++        _totals["inflight"] -= 1
++        _totals[outcome] += 1
++
++
++def wrap_http_body_accounting(app):
++    """ASGI wrapper: HTTP lifecycle/body bytes only; WS/lifespan unchanged."""
++
++    async def wrapped(scope, receive, send):
++        if scope.get("type") != "http":
++            await app(scope, receive, send)
++            return
++        method = scope.get("method") or "GET"
++        path = scope.get("path") or ""
++        state = _State(match_route(method, path))
++        _start(state)
++
++        async def receive_wrap():
++            message = await receive()
++            typ = message.get("type")
++            if typ == "http.request":
++                n = len(message.get("body") or b"")
++                if n:
++                    with _lock:
++                        _totals["request_body_bytes"] += n
++                        state.req_bytes += n  # buffered until classified
++                        if state.classified:
++                            _row(state.key)["request_body_bytes"] += n
++            elif typ == "http.disconnect":
++                state.disconnect = True
++            return message
++
++        async def send_wrap(message):
++            typ = message.get("type")
++            if typ == "http.response.start":
++                await send(message)
++                if state.outcome is None and not state.classified:
++                    status = int(message.get("status") or 0)
++                    ok = state.matched is not None and 200 <= status < 300
++                    _classify(state, state.matched if ok else OTHER)
++                return
++            if typ == "http.response.body":
++                body = message.get("body") or b""
++                more = bool(message.get("more_body", False))
++                await send(message)
++                if body:
++                    with _lock:
++                        _classify_locked(state, OTHER)  # body without start
++                        _row(state.key)["response_body_bytes"] += len(body)
++                        _totals["response_body_bytes"] += len(body)
++                if not more:
++                    _finish(state, "response_finished")
++                return
++            await send(message)
++
++        try:
++            await app(scope, receive_wrap, send_wrap)
++        except asyncio.CancelledError:
++            _finish(state, "cancelled")
++            raise
++        except Exception:
++            _finish(state, "failed")
++            raise
++        else:
++            if state.outcome is None:
++                _finish(state, "cancelled" if state.disconnect else "failed")
++
++    return wrapped
++
++
++def _clear_locked() -> None:
++    global _unclassified
++    _routes.clear()
++    _routes[OTHER] = _zero()
++    _totals.clear()
++    _totals.update(_zero())
++    _unclassified = 0
++
++
++def snapshot() -> dict[str, Any]:
++    """Immutable copy. ``unit`` is ``ASGI body bytes``; keys never raw paths.
++
++    ``totals`` counts every request at entry (including unclassified);
++    ``routes`` only hold classified requests. Invariant:
++    ``totals.inflight == unclassified_inflight + sum(routes.inflight)``.
++    """
++    with _lock:
++        routes = {key: dict(row) for key, row in _routes.items()}
++        totals = dict(_totals)
++        unclassified = _unclassified
++        mono = time.monotonic_ns()
++        wall = time.time_ns()
++    if OTHER not in routes:
++        routes[OTHER] = _zero()
++    return {
++        "unit": UNIT,
++        "routes": routes,
++        "totals": totals,
++        "unclassified_inflight": unclassified,
++        "monotonic_ns": mono,
++        "time_ns": wall,
++    }
++
++
++def reset() -> None:
++    """Clear counters (tests). Does not replace the lock."""
++    with _lock:
++        _clear_locked()
++
++
++def _after_fork_child() -> None:
++    global _lock
++    _lock = threading.Lock()
++    _clear_locked()
++
++
++if hasattr(os, "register_at_fork"):
++    os.register_at_fork(after_in_child=_after_fork_child)
+diff --git a/hermes_cli/loop_accounting.py b/hermes_cli/loop_accounting.py
+index b672cf187a3fad532d00886eadd4ea87da917b28..102221540933a6f29aa5a3c8a1b98edfb95dc1a2 100644
+--- a/hermes_cli/loop_accounting.py
++++ b/hermes_cli/loop_accounting.py
+@@ -80,6 +80,8 @@ import time
+ from pathlib import Path
+ from typing import Any, Callable, Optional
+ 
++from hermes_cli import http_body_accounting, loop_callback_latency
++
+ logger = logging.getLogger(__name__)
+ 
+ SCHEMA_VERSION = 1
+@@ -534,6 +536,9 @@ def snapshot() -> dict[str, Any]:
+         "threads": threads,
+         "residual": _residual(threads, process_cpu, accounted_total, procfs),
+         "loops": counters(),
++        "slow_callbacks": loop_callback_latency.snapshot(),
++        "http": http_body_accounting.snapshot(),
++        "diagnostic_code": loop_callback_latency.code_provenance(),
+     }
+ 
+ 
+@@ -743,6 +748,8 @@ def _final_write() -> None:
+ 
+ def reset() -> None:
+     """Clear every counter (tests)."""
++    loop_callback_latency.reset()
++    http_body_accounting.reset()
+     with _lock:
+         _stats.clear()
+         _thread_accounted.clear()
+@@ -915,12 +922,17 @@ def instrument_callbacks() -> bool:
+     def _run(self):
+         tid = _native_id()
+         acc0 = _thread_accounted.get(tid, 0.0)
++        callback = self._callback  # cancellation may clear the handle during execution
++        w0 = _perf()
+         c0 = _thread_time()
+         try:
+             return orig(self)
+         finally:
+             cpu = _thread_time() - c0
++            wall = _perf() - w0
+             try:
++                if wall >= loop_callback_latency.THRESHOLD_S:
++                    loop_callback_latency.record(callback, wall, cpu, time.time())
+                 st = _callback_stat(self._callback)
+                 own = cpu - (_thread_accounted.get(tid, 0.0) - acc0)
+                 st.runs += 1
+diff --git a/hermes_cli/loop_callback_latency.py b/hermes_cli/loop_callback_latency.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bcd50741f1c3c6ebf1913c48eb33a577a8222fee
+--- /dev/null
++++ b/hermes_cli/loop_callback_latency.py
+@@ -0,0 +1,116 @@
++"""Bounded callback wall/inclusive CPU diagnostics; never added to residual CPU.
++
++Records are emitted only by the existing periodic snapshot writer, never by a
++callback logger. Every slow callback is counted; the latest 64 records survive
++between writes, with explicit eviction/identity-overflow counts. No new poller.
++"""
++from __future__ import annotations
++
++import asyncio
++import collections
++import functools
++import hashlib
++import os
++import re
++import threading
++import types
++from datetime import UTC, datetime
++from pathlib import Path
++
++from hermes_cli._startup_fast import project_root_str
++
++THRESHOLD_S = 0.5
++MAX_IDENTITIES = 64
++MAX_RECORDS = 64
++_ROOT = project_root_str() + os.sep
++_SAFE_NAME = re.compile(r"[A-Za-z0-9_<>.]+\Z")
++_lock = threading.Lock()
++_recent: collections.deque = collections.deque(maxlen=MAX_RECORDS)
++_identities: dict[str, int] = {}
++_totals = {"slow_callbacks": 0, "records_dropped": 0, "identity_overflow": 0}
++
++
++def identity(callback) -> str:
++    """Code metadata only: no repr, task name, request args or mutable function name.
++
++    Only source rooted in this checkout is named. Foreign/native/callable-object
++    callbacks become other. Function globals and coroutine frames are never read.
++    """
++    for _ in range(6):
++        if not isinstance(callback, functools.partial):
++            break
++        callback = callback.func
++    owner = getattr(callback, "__self__", None) if isinstance(
++        callback, (types.MethodType, types.BuiltinMethodType)
++    ) or type(callback).__name__ == "TaskStepMethWrapper" else None
++    if isinstance(owner, asyncio.Task):
++        coro = owner.get_coro()
++        code = coro.cr_code if isinstance(coro, types.CoroutineType) else None
++    else:
++        if isinstance(callback, types.MethodType):
++            callback = callback.__func__
++        code = callback.__code__ if isinstance(callback, types.FunctionType) else None
++    if code is None:
++        return "other"
++    filename, name = code.co_filename, code.co_qualname
++    if not filename.startswith(_ROOT) or len(name) > 160 or not _SAFE_NAME.fullmatch(name):
++        return "other"
++    relative = filename[len(_ROOT):]
++    if len(relative) > 200 or ".." in relative.split(os.sep):
++        return "other"
++    return f"{relative}:{code.co_firstlineno}:{name}"
++
++
++def record(callback, wall_s: float, cpu_s: float, ended_at: float) -> None:
++    if wall_s < THRESHOLD_S:
++        return
++    key = identity(callback)
++    occurred_at = datetime.fromtimestamp(ended_at - wall_s, UTC).isoformat()
++    with _lock:
++        if key not in _identities and key != "other" and len(_identities) - ("other" in _identities) >= MAX_IDENTITIES:
++            key = "other"
++            _totals["identity_overflow"] += 1
++        _identities[key] = _identities.get(key, 0) + 1
++        _totals["slow_callbacks"] += 1
++        if len(_recent) == MAX_RECORDS:
++            _totals["records_dropped"] += 1
++        _recent.append({"identity": key, "occurred_at": occurred_at,
++                        "wall_s": round(wall_s, 6), "inclusive_cpu_s": round(cpu_s, 6)})
++
++
++def snapshot() -> dict:
++    with _lock:
++        return {"threshold_s": THRESHOLD_S, "emission": "existing snapshot cadence only",
++                **_totals, "identities": dict(_identities), "recent": [dict(r) for r in _recent]}
++
++
++def reset() -> None:
++    with _lock:
++        _recent.clear()
++        _identities.clear()
++        for key in _totals:
++            _totals[key] = 0
++
++
++def _after_fork_child() -> None:
++    global _lock
++    _lock = threading.Lock()
++    reset()
++
++
++@functools.lru_cache(maxsize=1)
++def code_provenance() -> dict:
++    """Content digest of the diagnostic code, sampled once, not Git/host state."""
++    files = ("loop_accounting.py", "loop_callback_latency.py", "http_body_accounting.py", "web_server_transport.py")
++    digest = hashlib.sha256()
++    try:
++        for name in files:
++            digest.update(name.encode("ascii"))
++            digest.update(Path(__file__).with_name(name).read_bytes())
++    except OSError:
++        return {"files": list(files), "sha256": None}
++    return {"files": list(files), "sha256": digest.hexdigest()}
++
++
++if hasattr(os, "register_at_fork"):
++    os.register_at_fork(after_in_child=_after_fork_child)
+diff --git a/hermes_cli/web_server_transport.py b/hermes_cli/web_server_transport.py
+index 8df2bebeb0f23f80f04444b81975cef8edf5b641..8e54bd054703ad391d4f63c9e5c4c0495859cccd 100644
+--- a/hermes_cli/web_server_transport.py
++++ b/hermes_cli/web_server_transport.py
+@@ -20,6 +20,11 @@ def transport_observed_app(app, *, proxy_headers: bool, forwarded_allow_ips):
+     same interpreted client/scheme as before; only provenance reads the raw observation.
+     """
+     inner = ProxyHeadersMiddleware(app, trusted_hosts=forwarded_allow_ips) if proxy_headers else app
++    from hermes_cli.http_body_accounting import wrap_http_body_accounting
++
++    # Body-byte diagnostics wrap the interpreted app. No loop_accounting scope:
++    # inner ``accounted`` route passes remain the CPU names.
++    inner = wrap_http_body_accounting(inner)
+ 
+     async def observed(scope, receive, send):
+         if scope["type"] in ("http", "websocket"):
+diff --git a/tests/hermes_cli/test_http_body_accounting.py b/tests/hermes_cli/test_http_body_accounting.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bf4c9905cf61a104db4765b9bbbb7e80a7eda177
+--- /dev/null
++++ b/tests/hermes_cli/test_http_body_accounting.py
+@@ -0,0 +1,702 @@
++"""Passive ASGI HTTP lifecycle / body-byte diagnostics (http_body_accounting)."""
++
++from __future__ import annotations
++
++import asyncio
++import itertools
++import threading
++import time
++
++import pytest
++
++from hermes_cli import http_body_accounting as hba
++from hermes_cli import loop_accounting as la
++from hermes_cli.web_server_transport import transport_observed_app
++
++
++COUNTERS = (
++    "requests_started",
++    "response_finished",
++    "failed",
++    "cancelled",
++    "inflight",
++    "request_body_bytes",
++    "response_body_bytes",
++)
++
++
++@pytest.fixture(autouse=True)
++def _fresh():
++    hba.reset()
++    la.reset()
++    yield
++    hba.reset()
++    la.reset()
++
++
++def _scope(method: str, path: str, *, query: bytes = b"", headers=None):
++    return {
++        "type": "http",
++        "asgi": {"version": "3.0"},
++        "http_version": "1.1",
++        "method": method,
++        "path": path,
++        "raw_path": path.encode("ascii"),
++        "query_string": query,
++        "headers": headers or [],
++        "client": ("127.0.0.1", 9),
++        "server": ("127.0.0.1", 80),
++        "scheme": "http",
++    }
++
++
++def _receive_body(body: bytes = b"", *, disconnect: bool = False):
++    sent = {"n": 0}
++
++    async def receive():
++        sent["n"] += 1
++        if disconnect and sent["n"] == 1:
++            return {"type": "http.disconnect"}
++        return {"type": "http.request", "body": body, "more_body": False}
++
++    return receive
++
++
++async def _ok_app(scope, receive, send, *, body=b"ok", status=200, chunks=None):
++    await send({"type": "http.response.start", "status": status, "headers": []})
++    if chunks is None:
++        await send({"type": "http.response.body", "body": body, "more_body": False})
++        return
++    for i, chunk in enumerate(chunks):
++        last = i == len(chunks) - 1
++        await send(
++            {"type": "http.response.body", "body": chunk, "more_body": not last}
++        )
++
++
++def _run(app, scope, receive=None, send=None):
++    receive = receive or _receive_body()
++    sent = []
++
++    async def _send(message):
++        sent.append(message)
++        if send is not None:
++            await send(message)
++
++    async def main():
++        await app(scope, receive, _send)
++
++    asyncio.run(main())
++    return sent
++
++
++def _wrap(inner):
++    return hba.wrap_http_body_accounting(inner)
++
++
++def _route(snap, key):
++    return snap["routes"][key]
++
++
++def test_snapshot_shape_unit_and_other_zeros():
++    snap = hba.snapshot()
++    assert snap["unit"] == "ASGI body bytes"
++    assert set(snap["routes"]) == {hba.OTHER}
++    other = snap["routes"][hba.OTHER]
++    assert tuple(other[k] for k in COUNTERS) == (0, 0, 0, 0, 0, 0, 0)
++    assert isinstance(snap["monotonic_ns"], int) and snap["monotonic_ns"] > 0
++    assert isinstance(snap["time_ns"], int) and snap["time_ns"] > 0
++
++
++def test_match_route_uses_literal_and_placeholder_keys_not_raw_ids():
++    sid = "sess_user_9f3a"
++    assert hba.match_route("GET", "/api/sessions") == "GET /api/sessions"
++    assert hba.match_route("GET", f"/api/sessions/{sid}") == (
++        "GET /api/sessions/{session_id}"
++    )
++    assert hba.match_route("GET", "/api/sessions/stats") == "GET /api/sessions/stats"
++    assert hba.match_route("GET", "/nope") is None
++    # scope["path"] carries no query; '?' is an ordinary char, never split.
++    assert hba.match_route("GET", "/api/sessions?x=1") is None
++    assert sid not in (hba.match_route("GET", f"/api/sessions/{sid}") or "")
++
++
++def test_allowlist_is_bounded_and_has_inspected_desktop_poll_routes():
++    assert len(hba.ROUTE_ALLOWLIST) <= hba.MAX_ROUTE_KEYS
++    keys = {f"{m} {p}" for m, p in hba.ROUTE_ALLOWLIST}
++    for needed in (
++        "GET /api/status",
++        "GET /api/sessions",
++        "GET /api/sessions/{session_id}",
++        "GET /api/session-kanban-tasks",
++        "GET /api/plugins/kanban/board",
++        "GET /api/health",
++        "POST /api/sessions/import",
++    ):
++        assert needed in keys
++    for _method, path in hba.ROUTE_ALLOWLIST:
++        assert path.startswith("/")
++        assert "?" not in path
++        assert "{" not in path or "}" in path
++        assert ":path}" not in path  # catch-alls would emit unbounded keys
++        assert not any(ch in path for ch in "=&")
++    assert len(keys) == len(hba.ROUTE_ALLOWLIST) == len(set(hba.ROUTE_ALLOWLIST))
++    assert hba.OTHER not in keys
++    assert hba.MAX_ROUTE_KEYS == 64
++    assert hba.OTHER == "other"
++
++
++def test_successful_2xx_matched_route_migrates_off_other():
++    async def app(scope, receive, send):
++        await _ok_app(scope, receive, send, body=b"hello")
++
++    _run(_wrap(app), _scope("GET", "/api/status"))
++    snap = hba.snapshot()
++    status = _route(snap, "GET /api/status")
++    other = _route(snap, hba.OTHER)
++    assert status["requests_started"] == 1
++    assert status["response_finished"] == 1
++    assert status["inflight"] == 0
++    assert status["failed"] == 0
++    assert status["cancelled"] == 0
++    assert status["response_body_bytes"] == 5
++    assert other["requests_started"] == 0
++    assert other["inflight"] == 0
++    assert other["response_finished"] == 0
++
++
++def test_streaming_sums_response_bytes_across_chunks():
++    chunks = [b"aa", b"bbb", b"c"]
++
++    async def app(scope, receive, send):
++        await _ok_app(scope, receive, send, chunks=chunks)
++
++    _run(_wrap(app), _scope("GET", "/api/sessions"))
++    rec = _route(hba.snapshot(), "GET /api/sessions")
++    assert rec["response_finished"] == 1
++    assert rec["response_body_bytes"] == sum(len(c) for c in chunks)
++
++
++def test_concurrent_distinct_routes_do_not_share_counters():
++    async def inner(scope, receive, send):
++        await _ok_app(scope, receive, send, body=scope["path"].encode())
++
++    wrapped = _wrap(inner)
++
++    async def one(path):
++        sent = []
++
++        async def send(message):
++            sent.append(message)
++
++        await wrapped(_scope("GET", path), _receive_body(), send)
++
++    async def both():
++        await asyncio.gather(
++            one("/api/status"),
++            one("/api/sessions"),
++        )
++
++    asyncio.run(both())
++    snap = hba.snapshot()
++    a = _route(snap, "GET /api/status")
++    b = _route(snap, "GET /api/sessions")
++    assert a["requests_started"] == b["requests_started"] == 1
++    assert a["response_finished"] == b["response_finished"] == 1
++    assert a["response_body_bytes"] == len(b"/api/status")
++    assert b["response_body_bytes"] == len(b"/api/sessions")
++    assert _route(snap, hba.OTHER)["requests_started"] == 0
++
++
++def test_unread_request_body_is_not_counted():
++    body = b"x" * 17
++
++    async def app(scope, receive, send):
++        await _ok_app(scope, receive, send, body=b"y")
++
++    _run(_wrap(app), _scope("POST", "/api/sessions/import"), _receive_body(body))
++    rec = _route(hba.snapshot(), "POST /api/sessions/import")
++    assert rec["request_body_bytes"] == 0
++    assert rec["response_body_bytes"] == 1
++    assert rec["response_finished"] == 1
++
++
++def test_consumed_request_body_counts_only_received_http_request():
++    body = b"abcdef"
++
++    async def app(scope, receive, send):
++        msg = await receive()
++        assert msg["type"] == "http.request"
++        await _ok_app(scope, receive, send, body=b"z")
++
++    _run(_wrap(app), _scope("POST", "/api/sessions/import"), _receive_body(body))
++    rec = _route(hba.snapshot(), "POST /api/sessions/import")
++    assert rec["request_body_bytes"] == 6
++
++
++def test_disconnect_without_final_body_is_cancelled():
++    async def app(scope, receive, send):
++        await receive()
++
++    _run(
++        _wrap(app),
++        _scope("GET", "/api/status"),
++        _receive_body(disconnect=True),
++    )
++    other = _route(hba.snapshot(), hba.OTHER)
++    # No 2xx start, so attribution stays other.
++    assert other["cancelled"] == 1
++    assert other["failed"] == 0
++    assert other["response_finished"] == 0
++    assert other["inflight"] == 0
++    assert other["requests_started"] == 1
++
++
++def test_cancelled_error_is_distinct_from_failed():
++    async def app(scope, receive, send):
++        raise asyncio.CancelledError()
++
++    with pytest.raises(asyncio.CancelledError):
++        _run(_wrap(app), _scope("GET", "/api/status"))
++    rec = _route(hba.snapshot(), hba.OTHER)
++    assert rec["cancelled"] == 1
++    assert rec["failed"] == 0
++    assert rec["response_finished"] == 0
++    assert rec["inflight"] == 0
++
++
++def test_failed_send_does_not_count_unsent_bytes_or_finish():
++    async def inner(scope, receive, send):
++        await send({"type": "http.response.start", "status": 200, "headers": []})
++        await send({"type": "http.response.body", "body": b"partial", "more_body": True})
++        await send({"type": "http.response.body", "body": b"tail", "more_body": False})
++
++    n = {"body": 0}
++
++    async def send(message):
++        if message.get("type") == "http.response.body":
++            n["body"] += 1
++            if n["body"] == 2:
++                raise ConnectionError("peer reset")
++
++    with pytest.raises(ConnectionError):
++        _run(_wrap(inner), _scope("GET", "/api/health"), send=send)
++    rec = _route(hba.snapshot(), "GET /api/health")
++    assert rec["failed"] == 1
++    assert rec["response_finished"] == 0
++    assert rec["cancelled"] == 0
++    assert rec["inflight"] == 0
++    assert rec["response_body_bytes"] == len(b"partial")
++
++
++def test_aborted_return_without_final_body_is_failed():
++    async def app(scope, receive, send):
++        await send({"type": "http.response.start", "status": 200, "headers": []})
++        await send({"type": "http.response.body", "body": b"x", "more_body": True})
++
++    _run(_wrap(app), _scope("GET", "/api/status"))
++    rec = _route(hba.snapshot(), "GET /api/status")
++    assert rec["failed"] == 1
++    assert rec["response_finished"] == 0
++    assert rec["inflight"] == 0
++    assert rec["response_body_bytes"] == 1
++
++
++def test_terminal_finish_then_later_exception_does_not_double_count():
++    async def app(scope, receive, send):
++        await _ok_app(scope, receive, send, body=b"done")
++        raise RuntimeError("after send")
++
++    with pytest.raises(RuntimeError):
++        _run(_wrap(app), _scope("GET", "/api/status"))
++    rec = _route(hba.snapshot(), "GET /api/status")
++    assert rec["response_finished"] == 1
++    assert rec["failed"] == 0
++    assert rec["cancelled"] == 0
++    assert rec["inflight"] == 0
++
++
++async def _blackhole(message):
++    return None
++
++
++def test_long_lived_stream_stays_inflight_until_final_body():
++    started = asyncio.Event()
++    finish = asyncio.Event()
++
++    async def app(scope, receive, send):
++        await send({"type": "http.response.start", "status": 200, "headers": []})
++        await send({"type": "http.response.body", "body": b"ab", "more_body": True})
++        started.set()
++        await finish.wait()
++        await send({"type": "http.response.body", "body": b"cd", "more_body": False})
++
++    async def main():
++        task = asyncio.create_task(
++            _wrap(app)(_scope("GET", "/api/sessions"), _receive_body(), _blackhole)
++        )
++        await started.wait()
++        mid = _route(hba.snapshot(), "GET /api/sessions")
++        assert mid["inflight"] == 1
++        assert mid["response_finished"] == 0
++        assert mid["response_body_bytes"] == 2
++        finish.set()
++        await task
++
++    asyncio.run(main())
++    end = _route(hba.snapshot(), "GET /api/sessions")
++    assert end["inflight"] == 0
++    assert end["response_finished"] == 1
++    assert end["response_body_bytes"] == 4
++
++
++def test_unmatched_auth_404_and_redirect_normalize_to_other():
++    cases = [
++        ("GET", "/api/unknown/secret-user", 200, b"ok"),
++        ("GET", "/api/status", 401, b"nope"),
++        ("GET", "/api/sessions", 404, b"missing"),
++        ("GET", "/api/health", 302, b""),
++    ]
++
++    async def app(scope, receive, send):
++        status = {
++            "/api/unknown/secret-user": 200,
++            "/api/status": 401,
++            "/api/sessions": 404,
++            "/api/health": 302,
++        }[scope["path"]]
++        await _ok_app(scope, receive, send, status=status, body=b"x")
++
++    wrapped = _wrap(app)
++    for method, path, _status, _body in cases:
++        _run(wrapped, _scope(method, path))
++    snap = hba.snapshot()
++    other = _route(snap, hba.OTHER)
++    assert other["requests_started"] == 4
++    assert other["response_finished"] == 4
++    assert "GET /api/status" not in snap["routes"] or _route(
++        snap, "GET /api/status"
++    )["requests_started"] == 0
++    blob = repr(snap)
++    assert "secret-user" not in blob
++    assert "?" not in "".join(snap["routes"])
++
++
++def test_privacy_never_emits_raw_path_query_header_or_user_ids():
++    headers = [(b"authorization", b"Bearer user-99"), (b"x-user-id", b"u-42")]
++    path = "/api/sessions/session-abc-not-a-template"
++    query = b"token=sekrit&user_id=u-42"
++
++    async def app(scope, receive, send):
++        await _ok_app(scope, receive, send, body=b"ok")
++
++    _run(_wrap(app), _scope("GET", path, query=query, headers=headers))
++    snap = hba.snapshot()
++    keys = " ".join(snap["routes"])
++    blob = repr(snap)
++    assert "session-abc-not-a-template" not in keys
++    assert "sekrit" not in blob
++    assert "user-99" not in blob
++    assert "u-42" not in blob
++    assert "token=" not in blob
++    assert _route(snap, "GET /api/sessions/{session_id}")["requests_started"] == 1
++
++
++def test_websocket_and_lifespan_are_excluded():
++    seen = []
++
++    async def inner(scope, receive, send):
++        seen.append(scope["type"])
++        if scope["type"] == "websocket":
++            await send({"type": "websocket.accept"})
++            return
++        await send({"type": "lifespan.startup.complete"})
++
++    wrapped = _wrap(inner)
++
++    async def go():
++        async def receive():
++            return {"type": "lifespan.startup"}
++
++        async def send(_message):
++            return None
++
++        await wrapped({"type": "websocket", "path": "/api/ws"}, receive, send)
++        await wrapped({"type": "lifespan"}, receive, send)
++
++    asyncio.run(go())
++    assert seen == ["websocket", "lifespan"]
++    snap = hba.snapshot()
++    assert snap["routes"][hba.OTHER]["requests_started"] == 0
++    assert len(snap["routes"]) == 1
++
++
++def test_snapshot_is_an_immutable_copy():
++    async def app(scope, receive, send):
++        await _ok_app(scope, receive, send)
++
++    _run(_wrap(app), _scope("GET", "/api/status"))
++    snap = hba.snapshot()
++    snap["routes"]["GET /api/status"]["requests_started"] = 99
++    snap["routes"][hba.OTHER]["failed"] = 7
++    again = hba.snapshot()
++    assert again["routes"]["GET /api/status"]["requests_started"] == 1
++    assert again["routes"][hba.OTHER]["failed"] == 0
++
++
++def test_reset_and_after_fork_clear_counters_and_replace_lock():
++    async def app(scope, receive, send):
++        await _ok_app(scope, receive, send)
++
++    _run(_wrap(app), _scope("GET", "/api/status"))
++    old_lock = hba._lock
++    hba.reset()
++    assert hba.snapshot()["routes"][hba.OTHER]["requests_started"] == 0
++    assert "GET /api/status" not in hba.snapshot()["routes"]
++    _run(_wrap(app), _scope("GET", "/api/sessions"))
++    hba._after_fork_child()
++    assert hba._lock is not old_lock
++    snap = hba.snapshot()
++    assert snap["routes"][hba.OTHER]["requests_started"] == 0
++    assert "GET /api/sessions" not in snap["routes"]
++
++
++def test_streaming_backpressure_is_not_buffered_by_the_wrapper():
++    released = asyncio.Event()
++    in_first_send = asyncio.Event()
++    app_after_first = {"n": 0}
++
++    async def inner(scope, receive, send):
++        await send({"type": "http.response.start", "status": 200, "headers": []})
++        await send({"type": "http.response.body", "body": b"1", "more_body": True})
++        app_after_first["n"] += 1
++        await send({"type": "http.response.body", "body": b"2", "more_body": False})
++
++    async def send(message):
++        if message.get("type") == "http.response.body" and message.get("more_body"):
++            in_first_send.set()
++            await released.wait()
++
++    async def main():
++        task = asyncio.create_task(
++            _wrap(inner)(_scope("GET", "/api/status"), _receive_body(), send)
++        )
++        await in_first_send.wait()
++        assert app_after_first["n"] == 0
++        released.set()
++        await task
++
++    asyncio.run(main())
++    rec = _route(hba.snapshot(), "GET /api/status")
++    assert rec["response_finished"] == 1
++    assert rec["response_body_bytes"] == 2
++
++
++def test_outer_wrapper_does_not_open_a_loop_accounting_route_scope():
++    async def inner(scope, receive, send):
++        with la.pass_("route/sessions.kanban_tasks"):
++            await _ok_app(scope, receive, send, body=b"[]")
++
++    _run(_wrap(inner), _scope("GET", "/api/session-kanban-tasks"))
++    loops = la.counters()
++    assert loops["route/sessions.kanban_tasks"]["runs"] == 1
++    assert not any(
++        name.startswith("http") or "ASGI" in name or "/api/" in name
++        for name in loops
++    )
++
++
++def test_transport_observed_app_wraps_http_and_keeps_raw_transport():
++    seen = {}
++
++    async def inner(scope, receive, send):
++        seen["raw"] = scope.get("hermes.raw_transport")
++        await _ok_app(scope, receive, send, body=b"ok")
++
++    app = transport_observed_app(
++        inner, proxy_headers=False, forwarded_allow_ips="127.0.0.1"
++    )
++    _run(app, _scope("GET", "/api/status"))
++    assert seen["raw"] == (("127.0.0.1", 9), ("127.0.0.1", 80))
++    rec = _route(hba.snapshot(), "GET /api/status")
++    assert rec["requests_started"] == 1
++    assert rec["response_finished"] == 1
++
++
++def test_thread_safe_snapshot_during_concurrent_requests():
++    async def inner(scope, receive, send):
++        await _ok_app(scope, receive, send, body=b"z")
++
++    wrapped = _wrap(inner)
++    errors = []
++
++    def worker():
++        try:
++            for _ in range(20):
++                asyncio.run(
++                    wrapped(
++                        _scope("GET", "/api/health"),
++                        _receive_body(),
++                        _blackhole,
++                    )
++                )
++                hba.snapshot()
++        except Exception as exc:  # health: allow BLE001 -- collect for the parent thread
++            errors.append(exc)
++
++    threads = [threading.Thread(target=worker) for _ in range(4)]
++    for t in threads:
++        t.start()
++    for t in threads:
++        t.join()
++    assert errors == []
++    rec = _route(hba.snapshot(), "GET /api/health")
++    assert rec["requests_started"] == 80
++    assert rec["response_finished"] == 80
++    assert rec["inflight"] == 0
++
++
++def test_measured_wrap_overhead_fixture():
++    async def inner(scope, receive, send):
++        await _ok_app(scope, receive, send, body=b"ok")
++
++    wrapped = _wrap(inner)
++    scope = _scope("GET", "/api/status")
++    n = 2000
++    best = float("inf")
++    for _ in range(3):
++        t0 = time.perf_counter()
++        for _ in range(n):
++            asyncio.run(wrapped(scope, _receive_body(), _blackhole))
++        best = min(best, (time.perf_counter() - t0) / n)
++    # Pin "not milliseconds"; matching + two locked updates is cheap.
++    assert best < 5e-3, f"{best * 1e6:.1f} µs per wrapped request"
++
++
++def _assert_monotonic_and_conserved(prev, cur):
++    for key in COUNTERS:
++        if key == "inflight":
++            continue
++        assert cur["totals"][key] >= prev["totals"][key], key
++        for name, row in cur["routes"].items():
++            before = prev["routes"].get(name, hba._zero())
++            assert row[key] >= before[key], (name, key)
++    for snap in (prev, cur):
++        inflight = sum(r["inflight"] for r in snap["routes"].values())
++        assert snap["totals"]["inflight"] == (
++            snap["unclassified_inflight"] + inflight
++        )
++
++
++def test_snapshots_around_response_start_are_monotonic_and_conserved():
++    before_start = asyncio.Event()
++    go = asyncio.Event()
++    after_start = asyncio.Event()
++    finish = asyncio.Event()
++
++    async def app(scope, receive, send):
++        await receive()
++        before_start.set()
++        await go.wait()
++        await send({"type": "http.response.start", "status": 200, "headers": []})
++        await send({"type": "http.response.body", "body": b"ab", "more_body": True})
++        after_start.set()
++        await finish.wait()
++        await send({"type": "http.response.body", "body": b"c", "more_body": False})
++
++    snaps = []
++
++    async def main():
++        task = asyncio.create_task(
++            _wrap(app)(
++                _scope("POST", "/api/sessions/import"),
++                _receive_body(b"12345"),
++                _blackhole,
++            )
++        )
++        await before_start.wait()
++        snaps.append(hba.snapshot())
++        go.set()
++        await after_start.wait()
++        snaps.append(hba.snapshot())
++        finish.set()
++        await task
++        snaps.append(hba.snapshot())
++
++    asyncio.run(main())
++    s0, s1, s2 = snaps
++    assert s0["unclassified_inflight"] == 1
++    assert s0["totals"]["inflight"] == 1
++    assert s0["totals"]["requests_started"] == 1
++    assert s0["totals"]["request_body_bytes"] == 5
++    assert s0["routes"][hba.OTHER]["requests_started"] == 0
++    assert s0["routes"][hba.OTHER]["request_body_bytes"] == 0
++    key = "POST /api/sessions/import"
++    assert s1["unclassified_inflight"] == 0
++    assert s1["routes"][key]["inflight"] == 1
++    assert s1["routes"][key]["requests_started"] == 1
++    assert s1["routes"][key]["request_body_bytes"] == 5
++    assert s1["totals"]["request_body_bytes"] == 5  # not doubled
++    assert s1["totals"]["response_body_bytes"] == 2
++    assert s1["routes"][hba.OTHER]["requests_started"] == 0
++    assert s2["totals"]["response_finished"] == 1
++    assert s2["totals"]["inflight"] == 0
++    assert s2["totals"]["response_body_bytes"] == 3
++    assert s2["totals"]["request_body_bytes"] == 5
++    for a, b in itertools.pairwise(snaps):
++        _assert_monotonic_and_conserved(a, b)
++
++
++def test_terminal_before_start_books_other_once_and_totals_match():
++    async def app(scope, receive, send):
++        await receive()
++        raise RuntimeError("boom")
++
++    with pytest.raises(RuntimeError):
++        _run(_wrap(app), _scope("POST", "/api/sessions/import"), _receive_body(b"xyz"))
++    snap = hba.snapshot()
++    other = _route(snap, hba.OTHER)
++    assert other["requests_started"] == 1 and other["failed"] == 1
++    assert other["request_body_bytes"] == 3
++    assert snap["totals"]["request_body_bytes"] == 3
++    assert snap["totals"]["failed"] == 1
++    assert snap["unclassified_inflight"] == 0
++    assert "POST /api/sessions/import" not in snap["routes"]
++
++
++def test_non_2xx_start_classifies_other_without_negative_counts():
++    async def app(scope, receive, send):
++        await receive()
++        await _ok_app(scope, receive, send, status=404, body=b"no")
++
++    _run(_wrap(app), _scope("POST", "/api/sessions/import"), _receive_body(b"abc"))
++    snap = hba.snapshot()
++    other = _route(snap, hba.OTHER)
++    assert (other["requests_started"], other["request_body_bytes"]) == (1, 3)
++    assert snap["totals"]["requests_started"] == 1
++    assert all(v >= 0 for row in snap["routes"].values() for v in row.values())
++
++
++def test_route_cap_overflow_goes_to_other_and_totals_conserve():
++    with hba._lock:
++        for i in range(hba.MAX_ROUTE_KEYS):
++            hba._routes[f"GET /fake/{i}"] = hba._zero()
++
++    async def app(scope, receive, send):
++        await _ok_app(scope, receive, send, body=b"x")
++
++    _run(_wrap(app), _scope("GET", "/api/status"))
++    snap = hba.snapshot()
++    assert "GET /api/status" not in snap["routes"]
++    assert _route(snap, hba.OTHER)["requests_started"] == 1
++    assert snap["totals"]["requests_started"] == 1
++
++
++def test_match_route_path_only_semantics():
++    assert hba.match_route("GET", "/api/sessions/") == "GET /api/sessions"
++    assert hba.match_route("GET", "//api/sessions") is None
++    assert hba.match_route("GET", "/api//sessions") is None
++    assert hba.match_route("GET", "/api/sessions//stats") is None
++    assert hba.match_route("GET", "/api/sessions/abc//messages") is None
++    assert hba.match_route("GET", "/") is None
++    assert hba.match_route("GET", "") is None
+diff --git a/tests/hermes_cli/test_loop_callback_latency.py b/tests/hermes_cli/test_loop_callback_latency.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fefd69d9863942814d8b1b46ff0629020660cbdc
+--- /dev/null
++++ b/tests/hermes_cli/test_loop_callback_latency.py
+@@ -0,0 +1,168 @@
++"""Bounded wall attribution, not an inference from a post-delay stack."""
++import asyncio
++import datetime
++import functools
++import json
++
++import time
++
++import pytest
++
++from hermes_cli import loop_accounting as la
++
++
++@pytest.fixture(autouse=True)
++def fresh():
++    la.stop()
++    la.uninstrument()
++    la.reset()
++    yield
++    la.uninstrument()
++    la.reset()
++
++
++def blocked(secret=None):
++    # Controlled sleeping callback is the fault injection, not synchronization.
++    time.sleep(0.51)  # health: allow HX013 -- deliberately reproduce blocked event-loop wall time
++
++
++def test_sleep_records_wall_not_cpu_and_executor_wait_is_not_a_callback():
++    la.instrument_callbacks()
++    async def main():
++        loop = asyncio.get_running_loop()
++        done = loop.create_future()
++        def block_and_finish():
++            blocked("private-request-value")
++            done.set_result(None)
++        loop.call_soon(block_and_finish)
++        await done
++        await loop.run_in_executor(None, blocked)
++    asyncio.run(main())
++    snap = la.snapshot()
++    records = snap["slow_callbacks"]["recent"]
++    own = [r for r in records if "block_and_finish" in r["identity"]]
++    assert len(own) == 1
++    assert own[0]["wall_s"] >= 0.5
++    assert own[0]["inclusive_cpu_s"] < 0.2
++    assert datetime.datetime.fromisoformat(own[0]["occurred_at"]).tzinfo is not None
++    assert not any("main" == r["identity"].split(":")[-1] for r in records)
++    assert "private-request-value" not in json.dumps(snap["slow_callbacks"])
++
++
++def test_inclusive_cpu_does_not_double_book_nested_pass(monkeypatch):
++    from hermes_cli import loop_callback_latency as latency
++    monkeypatch.setattr(latency, "THRESHOLD_S", 0.0)
++    loop = asyncio.new_event_loop()
++    def work():
++        with la.pass_("nested"):
++            end = time.thread_time() + 0.02
++            while time.thread_time() < end:
++                pass
++    la.instrument_callbacks()
++    try:
++        asyncio.Handle(work, (), loop)._run()
++        record = latency.snapshot()["recent"][-1]
++        assert record["inclusive_cpu_s"] >= 0.02
++        assert la.snapshot()["process"]["accounted_cpu_s"] < 0.04
++    finally:
++        loop.close()
++
++
++def test_callback_exception_and_cancelled_handle_behavior(monkeypatch):
++    from hermes_cli import loop_callback_latency as latency
++    monkeypatch.setattr(latency, "THRESHOLD_S", 0.0)
++    loop = asyncio.new_event_loop()
++    errors = []
++    loop.set_exception_handler(lambda _loop, context: errors.append(context["exception"]))
++    error = ValueError("secret-error")
++    def fail():
++        raise error
++    la.instrument_callbacks()
++    try:
++        asyncio.Handle(fail, (), loop)._run()
++        assert errors == [error]
++        handle = loop.call_soon(fail)
++        handle.cancel()
++        loop.call_soon(loop.stop)
++        loop.run_forever()
++        assert errors == [error]
++        assert "secret-error" not in json.dumps(latency.snapshot())
++    finally:
++        loop.close()
++
++
++def test_bounds_overflow_safe_code_identity_and_snapshot_copy(monkeypatch):
++    from hermes_cli import loop_callback_latency as latency
++    monkeypatch.setattr(latency, "THRESHOLD_S", 0.0)
++    for i in range(100):
++        fn = type(blocked)(blocked.__code__.replace(co_firstlineno=i+1), globals())
++        latency.record(fn, 0.6, 0.01, 1000.0)
++    snap = latency.snapshot()
++    assert len(snap["identities"]) <= 65
++    assert len(snap["recent"]) == 64
++    assert snap["records_dropped"] == 36
++    assert snap["identity_overflow"] == 36
++    assert snap["recent"][-1]["identity"] == "other"
++    snap["recent"].clear()
++    assert len(latency.snapshot()["recent"]) == 64
++    latency.reset()
++    fn = type(blocked)(blocked.__code__.replace(co_filename="/private/secret-user/file.py"), globals())
++    latency.record(functools.partial(fn, "secret-arg"), 0.6, 0.01, 1000.0)
++    assert latency.snapshot()["recent"][0]["identity"] == "other"
++    assert "secret" not in json.dumps(latency.snapshot())
++
++
++def test_task_name_and_callable_repr_are_not_identity(monkeypatch):
++    from hermes_cli import loop_callback_latency as latency
++    monkeypatch.setattr(latency, "THRESHOLD_S", 0.0)
++    class Hostile:
++        def __repr__(self):
++            raise AssertionError("repr called")
++        def __call__(self):
++            pass
++    latency.record(Hostile(), 0.6, 0.01, 1000.0)
++    assert latency.snapshot()["recent"][0]["identity"] == "other"
++    la.instrument_callbacks()
++    async def coro():
++        pass
++    async def main():
++        await asyncio.create_task(coro(), name="secret-task-name")
++    asyncio.run(main())
++    text = json.dumps(latency.snapshot())
++    assert "secret-task-name" not in text
++    assert "coro" in text
++
++
++def test_snapshot_has_http_and_source_provenance():
++    snap = la.snapshot()
++    assert snap["http"]["unit"] == "ASGI body bytes"
++    assert snap["diagnostic_code"]["sha256"]
++    assert snap["diagnostic_code"]["files"]
++    assert snap["slow_callbacks"]["emission"] == "existing snapshot cadence only"
++
++
++def test_threshold_boundary_and_fork_reset():
++    from hermes_cli import loop_callback_latency as latency
++    latency.record(blocked, 0.499999, 0.01, 1000.0)
++    assert latency.snapshot()["slow_callbacks"] == 0
++    latency.record(blocked, 0.5, 0.01, 1000.0)
++    assert latency.snapshot()["slow_callbacks"] == 1
++    latency._after_fork_child()
++    assert latency.snapshot()["slow_callbacks"] == 0
++    assert latency.snapshot()["identities"] == {}
++
++
++def test_system_exit_callback_still_propagates(monkeypatch):
++    from hermes_cli import loop_callback_latency as latency
++    monkeypatch.setattr(latency, "THRESHOLD_S", 0.0)
++    loop = asyncio.new_event_loop()
++    def terminate():
++        raise SystemExit(17)
++    la.instrument_callbacks()
++    try:
++        with pytest.raises(SystemExit) as exc:
++            asyncio.Handle(terminate, (), loop)._run()
++        assert exc.value.code == 17
++        assert latency.snapshot()["slow_callbacks"] == 1
++    finally:
++        loop.close()
+diff --git a/website/docs/developer-guide/stall-attribution.md b/website/docs/developer-guide/stall-attribution.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..12f793d399d3cb19cede5fea5f154c98a25088c9
+--- /dev/null
++++ b/website/docs/developer-guide/stall-attribution.md
+@@ -0,0 +1,118 @@
++# Passive local-backend stall attribution
++
++`hermes_cli.loop_accounting` adds two bounded diagnostic sections to its existing
++version-1 process snapshot. They identify a measurement gap, not an incident fix.
++A stack captured after a control-beat delay, or a task awaiting an executor,
++does not identify the callback that blocked the loop.
++
++## Reading an existing backend
++
++Use the PID of the affected backend, not a new Python process. Its existing writer
++atomically replaces `<root Hermes home>/run/loop-accounting/<PID>.json` at
++`loop_accounting.interval_s` (default 60 seconds). No new polling thread is added.
++For example, with `ROOT_HOME` and `PID` set to that backend's root home and PID:
++
++```sh
++jq '{pid, process_start_time, started_at, written_at, diagnostic_code,
++     slow_callbacks, http}' "$ROOT_HOME/run/loop-accounting/$PID.json"
++```
++
++`pid`, `process_start_time`, and `started_at` identify the process. `diagnostic_code`
++contains `files` and `sha256`, a once-per-process SHA-256 over the diagnostic source
++filenames and bytes (not a Git revision). This permits a comparison with the
++installed source without assuming a later checkout update changed a running process.
++A source file unreadable at first sampling gives `sha256: null`.
++
++For a 30-second investigation the incident owner can set the existing
++`loop_accounting.interval_s` setting to 30 before backend startup. Do not treat two
++reads of the same file as a measurement interval. Copy two distinct snapshots;
++compare process identity and code digest, then subtract cumulative counters using
++`http.monotonic_ns` for the **actual** elapsed interval. Scheduler/writer delay may
++make this longer than 30 seconds: retain both timestamps, never label it exactly
++30 seconds merely because that was the requested cadence. No request generator is
++needed; synthetic fixture traffic is not ambient production evidence.
++
++## `slow_callbacks`
++
++- `threshold_s`: 0.5, inclusive threshold, measured by `perf_counter` around each
++  `asyncio.Handle._run` invocation (one coroutine step, not its awaited lifetime).
++- `slow_callbacks`: cumulative count above threshold.
++- `identities`: cumulative slow counts for at most 64 code identities plus `other`.
++- `identity_overflow`: observations whose new identity exceeded that bound.
++- `recent`: latest 64 records, each containing `identity`, timezone-aware UTC
++  `occurred_at` (callback start estimated from completion wall clock minus measured
++  duration), `wall_s`, and `inclusive_cpu_s` (`thread_time`, including nested scopes).
++- `records_dropped`: cumulative records evicted from the recent ring.
++- `emission`: `existing snapshot cadence only`. No per-callback logging or separate
++  emission loop: a burst cannot produce more writes than the existing writer.
++
++Code identity is `checkout-relative-file:first-line:code-qualname`. Partial
++functions are unwrapped without reading arguments. Task steps use coroutine code,
++never task names or frames. Foreign/native/callable-object code uses `other`.
++Names/paths have bounded lengths; no repr, locals, request arguments or exceptions
++are copied. The existing `loops["loop_cb/..."]` CPU counters remain **exclusive of
++nested accounted work**. Inclusive diagnostic CPU is never added to residual totals.
++A sleeping callback has large wall time and little CPU; time suspended awaiting
++an executor is not charged as callback wall time. OS scheduling delay can also
++increase wall time: a record is attribution evidence, not proof of why it blocked.
++
++## `http`
++
++`unit` is **ASGI body bytes**, not network wire bytes, compression on the other
++side of the wrapper, headers, TLS or framing. WebSockets and lifespan are excluded.
++
++`totals` and each row in `routes` have these integer fields:
++
++| Field | Meaning |
++|---|---|
++| `requests_started` | Global: wrapper entry. Route: request classification. |
++| `response_finished` | Final `http.response.body` successfully sent. |
++| `failed` | Exception or return without final body (unless disconnected/cancelled). |
++| `cancelled` | Cancellation, or disconnect followed by incomplete clean return. |
++| `inflight` | Started minus the three terminal outcomes (a gauge). |
++| `request_body_bytes` | Bytes returned by application-consumed `http.request` messages. |
++| `response_body_bytes` | Body bytes only after successful underlying `send`. |
++
++`unclassified_inflight` is a gauge. At every snapshot:
++`totals.inflight == unclassified_inflight + sum(routes[*].inflight)`.
++`monotonic_ns` and `time_ns` are captured with the counters under their lock.
++
++The outer wrapper has no resolved route. Its fixed allowlist matches literal paths
++and explicit one-segment placeholders; keys are constants such as
++`GET /api/sessions/{session_id}/messages`, never raw URL/path/query/header/user IDs.
++At most 64 named keys plus `other` exist. A matched request is classified only after
++successful 2xx `response.start`; auth failures, redirects, 404s, unmatched paths and
++termination before headers use `other`. Until classification, global counters count
++immediately and only an integer consumed-byte count is buffered for later route
++attribution. Route request bytes/starts can therefore fall in a later interval than
++their global observation. **No cumulative counter is decremented to reclassify.**
++Use global deltas for exact observation-time totals, classified route deltas with
++this boundary caveat for per-path attribution. Inflight gauges may decrease.
++
++Unread bodies are never drained. Chunk order, streaming, backpressure, errors and
++cancellation propagate unchanged. A failure after a successfully finished response
++does not count a second terminal outcome. An app that omits the required final body
++is not called finished, even for HEAD/204.
++
++## Fixture proof and bounds
++
++`tests/hermes_cli/test_loop_callback_latency.py` exercises controlled sleeping vs
++executor-await, inclusive vs residual CPU, exception behavior, code identity privacy,
++overflow and snapshots. `test_http_body_accounting.py` exercises actual ASGI message
++streams, failed sends, unread bodies, concurrency, long-lived streams, cancellation,
++status normalization and monotonic deltas across classification.
++
++Memory is bounded by 64 slow identities plus `other`, 64 recent records, and at most
++65 HTTP rows. Existing CPU-accounting caches retain their existing bounds. Each
++active HTTP invocation adds fixed-size state and integer byte counts, not bodies or
++an ever-growing request registry; live invocation memory scales with actual inflight
++requests. Counters are cumulative Python integers. Forked processes reset diagnostics.
++
++An isolated Linux/Python 3.14 fixture (five trials of 10,000 operations; median thread
++CPU, no server or database) measured a no-op callback at 101 ns uninstrumented versus
++1,725 ns with **both existing CPU and new wall instrumentation**, and a consumed
++5-byte/sent 5-byte two-chunk ASGI request at 407 ns plain versus 10,635 ns observed.
++These are fixture costs, not production load or incident-recovery proof. The controlled
++sleep sample recorded `wall_s: 0.5101`, `inclusive_cpu_s: 0.000037`; its request totals
++were started=1, finished=1, consumed=5, sent=5, inflight=0. Full machine-generated
++benchmark/snapshot evidence is carried by the implementation task.
+-- 
+2.43.0
+

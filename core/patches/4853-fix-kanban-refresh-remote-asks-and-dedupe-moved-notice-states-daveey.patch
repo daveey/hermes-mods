@@ -1,0 +1,368 @@
+From fd85ed49ada65d054fb10715e7eb9c09c1936264 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 10:19:25 +0000
+Subject: [PATCH] fix(kanban): refresh remote asks and dedupe moved notice
+ states [daveey]
+
+---
+ gateway/kanban_remote_owner.py                |  7 +-
+ gateway/kanban_wake_fold.py                   | 11 ++-
+ .../test_kanban_remote_owner_delivery.py      | 58 ++++++++++++
+ tests/gateway/test_kanban_wake_fold.py        | 29 ++++++
+ .../tui_gateway/test_kanban_remote_rehome.py  | 91 +++++++++++++++++++
+ tui_gateway/kanban_remote_identity.py         | 25 +++++
+ tui_gateway/kanban_remote_notices.py          |  5 +
+ tui_gateway/kanban_remote_observations.py     | 14 ++-
+ 8 files changed, 232 insertions(+), 8 deletions(-)
+ create mode 100644 tests/tui_gateway/test_kanban_remote_rehome.py
+ create mode 100644 tui_gateway/kanban_remote_identity.py
+
+diff --git a/gateway/kanban_remote_owner.py b/gateway/kanban_remote_owner.py
+index 726f1292c38fabd6187eb26ae26b029101624919..9443a74103f4f8f586622c23d1d3f1ca9f6e51b2 100644
+--- a/gateway/kanban_remote_owner.py
++++ b/gateway/kanban_remote_owner.py
+@@ -216,7 +216,12 @@ def _metadata(item: dict) -> dict:
+     shown = text if len(text) <= _DISPLAY_LIMIT else text[:_DISPLAY_LIMIT - 1] + "…"
+     keys = [child["event_key"] for child in _children(item)]
+     task_id = "" if item.get("children") else str(item.get("ref") or "").rsplit("/", 1)[-1]
+-    card = {"task_id": task_id, "board": "", "kinds": [], "text": text[:_CARD_TEXT_LIMIT]}
++    parts = str(item.get("ref") or "").split("/")
++    board = parts[2] if task_id and len(parts) == 4 else ""
++    kind = {"blocked": "blocked", "done": "completed", "request_withdrawn": "request_withdrawn"}.get(
++        str(item.get("state") or "").split("@", 1)[0])
++    card = {"task_id": task_id, "board": board, "kinds": [kind] if task_id and kind else [],
++            "text": text[:_CARD_TEXT_LIMIT]}
+     return {"display_kind": "kanban_notice", "display_text": shown, "kanban_event_keys": keys,
+             "kanban_cards": [card]}
+ 
+diff --git a/gateway/kanban_wake_fold.py b/gateway/kanban_wake_fold.py
+index e3636fc8a367778081cb6213e13a9aa6f6e5b9be..ad8d89dd884844da77cb224af70ab472c26d70cd 100644
+--- a/gateway/kanban_wake_fold.py
++++ b/gateway/kanban_wake_fold.py
+@@ -190,14 +190,14 @@ def _live_task(card):
+     from hermes_cli import kanban_replica_freshness as fresh
+     with kb.pin_first_board_resolution(), contextlib.closing(kbc.connect(board=card.get('board') or None)) as conn:
+         task = kb.get_task(conn, card['task_id'])
+-        if task is None:
+-            return None, ''
+         newer = fresh.newer_rows(conn, [card['task_id']]).get(card['task_id'])
+         if newer is not None and newer['status']:
+             if newer['status'] == 'running' and 'review_requested' in card.get('kinds', []):
+                 return None, ''  # no replica run lane: a running reviewer may still be deciding
+             summary = (newer.get('summary') or newer.get('result') or '') if newer['status'] == 'done' else ''
+             return newer['status'], summary.strip()
++        if task is None:
++            return None, ''
+         if (task.status == 'running' and 'review_requested' in card.get('kinds', [])
+                 and kb._retry_status_for_run(conn, card['task_id'], task.current_run_id) == 'review'):
+             return 'review', ''  # the handoff is still pending, not returned to implementation
+@@ -233,6 +233,8 @@ def refresh_card(card, *, strict=False):
+     out = [f"[kanban] Task {card['task_id']} {label}.",
+            f'Note: an earlier wake for this card said "{earlier}"; that no longer holds. Live status: {status}.']
+     rest = lines[1:] if _LEGACY_HEAD.match(head) else lines
++    rest = [line for line in rest if not line.startswith(
++        ('Next action for the user:', 'Why only the user:', 'Scope:', 'Open task:'))]
+     out.extend(rest)
+     if status == 'done' and result and not any(line.startswith('Result:') for line in rest):
+         out.insert(2, 'Result: ' + result.splitlines()[0][:400])
+@@ -275,6 +277,11 @@ def _guidance(text, cards):
+     tail = '\n'.join(rest).rstrip()
+     if tail:  # refresh_card keeps every line after the head, in order, at the end of the card
+         end = text.find(tail, pos)
++        if end < 0 and f"[kanban] Task {last.get('task_id')} " in text:
++            # A relabel removes the obsolete human ask, but retains the remaining tail verbatim.
++            tail = '\n'.join(line for line in rest if not line.startswith(
++                ('Next action for the user:', 'Why only the user:', 'Scope:', 'Open task:'))).rstrip()
++            end = text.find(tail, pos) if tail else -1
+         if end < 0:
+             return None
+         end += len(tail)
+diff --git a/tests/gateway/test_kanban_remote_owner_delivery.py b/tests/gateway/test_kanban_remote_owner_delivery.py
+index ab56d7a96d80b6798f9ad1ffcdf9ed408a064d55..b614998c35175b13a17943bdc2fe6608bbd6f398 100644
+--- a/tests/gateway/test_kanban_remote_owner_delivery.py
++++ b/tests/gateway/test_kanban_remote_owner_delivery.py
+@@ -43,6 +43,64 @@ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_connect as kbc
+ from tests.gateway.test_kanban_wake_fold import GUIDANCE, _automation, _claim, _drain, _local_chat, _wake
+ 
++@pytest.mark.parametrize('status', ['done', 'ready'])
++def test_remote_blocked_notice_refreshes_replica_only_card(monkeypatch, status):
++    from hermes_cli import kanban_replica_freshness as fresh
++    tid = 't_78d2b488ee11aa70'
++    item = {'ref': f'worker-6/default/default/{tid}', 'state': 'blocked@1794779059',
++            'event_key': 'remote:worker-6:default/default/' + tid + ':1',
++            'text': 'Remote card blocked\nNext action for the user: Reply A or B\n'
++                    'Why only the user: decision\nScope: example\nOpen task: example\nKeep this context'}
++    monkeypatch.setattr(fresh, 'newer_rows', lambda *_: {tid: {'status': status, 'summary': 'Waiver completed'}})
++    with contextlib.closing(kbc.connect()) as conn:
++        assert kb.get_task(conn, tid) is None
++    card = kro._metadata(item)['kanban_cards'][0]
++    text = kanban_wake_fold._compose([card], 'guidance', strict=True)
++    assert f"[kanban] Task {tid} {'completed' if status == 'done' else status}." in text
++    assert 'Note: an earlier wake' in text and f'Live status: {status}.' in text
++    assert 'Keep this context' in text
++    for prefix in ('Next action for the user:', 'Why only the user:', 'Scope:', 'Open task:'):
++        assert prefix not in text
++    if status == 'done':
++        assert 'Result: Waiver completed' in text
++
++
++def test_remote_blocked_metadata_preserves_premise_and_board():
++    item = {'ref': 'worker-6/default/research/t_78d2b488ee11aa70', 'state': 'blocked@1794779059',
++            'event_key': 'event', 'text': 'blocked'}
++    card = kro._metadata(item)['kanban_cards'][0]
++    assert card['kinds'] == ['blocked']
++    assert card['board'] == 'research'
++
++
++@pytest.mark.parametrize(('state', 'kind'), [('done@1', 'completed'),
++                                              ('request_withdrawn@1', 'request_withdrawn'), ('other@1', None)])
++def test_remote_outcome_metadata_never_relabels(monkeypatch, state, kind):
++    item = {'ref': 'worker-6/default/default/t_78d2b488ee11aa70', 'state': state,
++            'event_key': 'event', 'text': 'Outcome'}
++    card = kro._metadata(item)['kanban_cards'][0]
++    assert card['kinds'] == ([kind] if kind else [])
++    monkeypatch.setattr(kanban_wake_fold, '_live_task', lambda _: pytest.fail('Outcome must not read live state'))
++    assert kanban_wake_fold.refresh_card(card, strict=True) == card
++    grouped = kro._metadata({**item, 'children': [item]})['kanban_cards'][0]
++    assert grouped['task_id'] == grouped['board'] == '' and grouped['kinds'] == []
++
++
++def test_remote_relabel_preserves_guidance_at_claim(monkeypatch):
++    item = {'ref': 'worker-6/default/default/t_78d2b488ee11aa70', 'state': 'blocked@1',
++            'event_key': 'event', 'text': 'Remote blocked\nNext action for the user: choose\nContext'}
++    card = kro._metadata(item)['kanban_cards'][0]
++    monkeypatch.setattr(kanban_wake_fold, '_live_task', lambda _: ('ready', ''))
++    text = kanban_wake_fold._compose([card], GUIDANCE)
++    assert kanban_wake_fold._guidance(text, [card]) == GUIDANCE
++    payload = {'text': text, 'local_automation_v1': {
++        'identity': json.dumps(['kanban-wake', 'id']), 'kanban_cards': [card]}}
++    monkeypatch.setattr(kanban_wake_fold, '_live_task', lambda _: ('done', 'Finally completed'))
++    kanban_wake_fold.refresh_claimed(payload)
++    assert 'Result: Finally completed' in payload['text']
++    assert payload['text'].endswith(GUIDANCE)
++
++
+ CHAT = "20261026_235722_bef6c6"
+ GW_HOLDER = f"pid={os.getpid()}:turn={CHAT}:x:platform=local"
+ 
+diff --git a/tests/gateway/test_kanban_wake_fold.py b/tests/gateway/test_kanban_wake_fold.py
+index f3a485f70bffb86b4809bfc177fe111b0f95d903..800fefaa7bf65936cd9edfeb4df07f38041764ec 100644
+--- a/tests/gateway/test_kanban_wake_fold.py
++++ b/tests/gateway/test_kanban_wake_fold.py
+@@ -345,6 +345,35 @@ async def test_review_wake_uses_current_review_state_at_drain(tmp_path, monkeypa
+         authority.db.close()
+ 
+ 
++@pytest.mark.parametrize('status', ['done', 'ready', 'blocked', None, 'unreadable'])
++def test_replica_only_card_live_state(tmp_path, monkeypatch, board, status):
++    import sqlite3
++    from hermes_cli import kanban_replica_freshness as fresh
++    from hermes_cli import kanban_db_sync as sync
++    tid = 't_78d2b488ee11aa70'
++    path = tmp_path / 'replica.db'
++    conn = kbc.connect()
++    try:
++        sync.apply_sync_schema_steps(conn)
++        assert kb.get_task(conn, tid) is None
++    finally:
++        conn.close()
++    with sqlite3.connect(path) as replica:
++        if status != 'unreadable':
++            replica.execute('CREATE TABLE tasks(id TEXT, status TEXT, ready_since INTEGER, sync_version INTEGER, result TEXT)')
++            replica.execute('CREATE TABLE task_runs(id INTEGER, task_id TEXT, summary TEXT, ended_at INTEGER, started_at INTEGER)')
++            if status:
++                replica.execute('INSERT INTO tasks VALUES (?, ?, NULL, 12, ?)', (tid, status, 'Fallback result'))
++                replica.execute('INSERT INTO task_runs VALUES (1, ?, ?, 20, 10)', (tid, 'Replica handoff'))
++    monkeypatch.setattr(fresh, '_replica', lambda _: (path, 0))
++    card = {'task_id': tid, 'board': '', 'kinds': ['blocked'],
++            'text': 'Remote blocked\nNext action for the user: choose'}
++    expected = (None, '') if status in (None, 'unreadable') else (status, 'Replica handoff' if status == 'done' else '')
++    assert kanban_wake_fold._live_task(card) == expected
++    if status in ('blocked', None, 'unreadable'):
++        assert kanban_wake_fold.refresh_card(card, strict=True) == card
++
++
+ def test_review_wake_with_newer_running_replica_does_not_infer_run_lane(monkeypatch, board):
+     from hermes_cli import kanban_replica_freshness as fresh
+     tid = board('replica reviewer')
+diff --git a/tests/tui_gateway/test_kanban_remote_rehome.py b/tests/tui_gateway/test_kanban_remote_rehome.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..35bf48045955b32ca53e066d72569dd62f25d114
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_remote_rehome.py
+@@ -0,0 +1,91 @@
++"""Home changes must not grant a second delivery of the same terminal state."""
++import json
++import sqlite3
++import time
++
++import pytest
++
++from tests.tui_gateway import test_kanban_remote_notice_once as once
++from tui_gateway import kanban_remote_notices as krn
++
++
++def _move(path, gateway):
++    with sqlite3.connect(path) as conn:
++        conn.execute('UPDATE replica SET gw=?, seq=seq+1', (gateway,))
++    krn._reset_for_tests()
++
++
++@pytest.mark.parametrize('door', ['collect', 'sweep'])
++def test_delivered_state_is_settled_moved_without_another_turn(tmp_path, door):
++    now = time.time()
++    hub = once._hub(tmp_path, now)
++    ledger = tmp_path / 'ledger.db'
++    _move(hub, 'worker-6')
++    with once._chat(tmp_path) as (db, opener):
++        krn.sweep_remote_notices(replica_path=hub, gateway='macbook', session_db=opener,
++                                 ledger=ledger, now=now, waker=once._Waker('missing'))
++        assert len(db.get_messages(once.CHAT)) == 1
++        _move(hub, 'hub')
++        waker = once._Waker('started')
++        if door == 'collect':
++            assert krn.collect(once.CHAT, 'default', hub_db=hub, ledger=ledger, now=now + 10) == []
++        else:
++            assert krn.sweep_remote_notices(replica_path=hub, gateway='macbook', session_db=opener,
++                                            ledger=ledger, now=now + 10, waker=waker) == []
++        assert waker.calls == 0
++        assert len(db.get_messages(once.CHAT)) == 1
++    with sqlite3.connect(ledger) as conn:
++        assert conn.execute("SELECT delivered, settled FROM notices WHERE ref='hub/default/default/t_dup'").fetchone() == (krn.SETTLED, 'moved')
++
++
++def test_moved_observation_keeps_earliest_late_window(tmp_path, caplog):
++    from tests.tui_gateway import test_kanban_remote_late_observed as late
++    ledger = tmp_path / 'ledger.db'
++    hub = late._observed_then_starved(tmp_path, ledger)
++    _move(hub, 'worker-6')
++    now = late.T0 + 120 + 88 * 3600
++    assert krn.collect(late.CHAT, 'default', hub_db=hub, ledger=ledger, now=now) == []
++    assert 'age 88h00m' in caplog.text and 'dropped undelivered notice' in caplog.text
++    with sqlite3.connect(ledger) as conn:
++        row = conn.execute('SELECT delivered, settled FROM notices WHERE ref=?',
++                           (f'worker-6/default/default/{late.TID}',)).fetchone()
++        assert row == (krn.SETTLED, 'expired')
++
++
++def test_dead_holder_old_home_transcript_key_is_not_reoffered(tmp_path, monkeypatch):
++    now = time.time()
++    hub = once._hub(tmp_path, now)
++    ledger = tmp_path / 'ledger.db'
++    _move(hub, 'worker-6')
++    [old] = krn.collect(once.CHAT, 'default', hub_db=hub, ledger=ledger, now=now)
++    monkeypatch.setattr(krn, '_holder_alive', lambda *_: False)
++    _move(hub, 'hub')
++    seen = []
++
++    def transcript_has(key, task_id):
++        assert not task_id
++        seen.append(key)
++        return key == old['event_key']
++
++    assert krn.collect(once.CHAT, 'default', hub_db=hub, ledger=ledger, now=now + 10,
++                       transcript_has=transcript_has) == []
++    assert old['event_key'] in seen
++
++
++def test_new_terminal_state_after_move_still_delivers_once(tmp_path):
++    now = time.time()
++    hub = once._hub(tmp_path, now)
++    ledger = tmp_path / 'ledger.db'
++    _move(hub, 'worker-6')
++    [old] = krn.collect(once.CHAT, 'default', hub_db=hub, ledger=ledger, now=now)
++    assert krn.ack(old, ledger=ledger)
++    with sqlite3.connect(hub) as conn:
++        task = json.loads(conn.execute('SELECT data FROM replica').fetchone()[0])
++        task['completed_at'] = now + 10
++        task['completion_notice']['event_id'] += 1
++        conn.execute('UPDATE replica SET gw=?, data=?, seq=seq+1', ('hub', json.dumps(task)))
++    krn._reset_for_tests()
++    [new] = krn.collect(once.CHAT, 'default', hub_db=hub, ledger=ledger, now=now + 20)
++    assert new['state'] != old['state']
++    assert krn.ack(new, ledger=ledger)
++    assert krn.collect(once.CHAT, 'default', hub_db=hub, ledger=ledger, now=now + 21) == []
+diff --git a/tui_gateway/kanban_remote_identity.py b/tui_gateway/kanban_remote_identity.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4ca1240e26966b1a77c3cc33b05beddf66670013
+--- /dev/null
++++ b/tui_gateway/kanban_remote_identity.py
+@@ -0,0 +1,25 @@
++"""Logical remote-notice identity survives home moves; physical refs retain custody."""
++from __future__ import annotations
++
++
++def moved_claim(conn, *, session, ref, state, now, notice_key, swept_key, transcript_has):
++    """Settle an already delivered home alias, or leave its live custodian alone."""
++    from tui_gateway import kanban_remote_notices as notices
++
++    task_id = ref.rsplit('/', 1)[-1]
++    rows = conn.execute('SELECT ref, delivered, holder_pid, holder_start, notice_key FROM notices '
++                        'WHERE session=? AND state=? AND ref!=?', (session, state, ref)).fetchall()
++    aliases = [row for row in rows if row['ref'].rsplit('/', 1)[-1] == task_id]
++    written = any(row['notice_key'] and transcript_has(row['notice_key'], '')
++                  for row in aliases) if transcript_has is not None else False
++    if any(row['delivered'] for row in aliases) or written:
++        with conn:
++            conn.execute('INSERT OR IGNORE INTO notices '
++                         '(session, ref, state, at, delivered, notice_key, legacy_seen, settled) '
++                         'VALUES (?,?,?,?,?,?,1,?)',
++                         (session, ref, state, now, notices.SETTLED, notice_key, 'moved'))
++            notices._swept_row(conn, swept_key, 'moved')
++        return 'settled'
++    if any(notices._holder_alive(row['holder_pid'], row['holder_start']) for row in aliases):
++        return 'skip'
++    return None
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index f7d7b0913d741323cb89a90940e26afd07664b62..be8d28c4a4aae18fa73d052c886109cd0a52d5ac 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -575,6 +575,11 @@ def _claim_notice(conn, *, session, ref, state, now, fresh, notice_key, task_id,
+         (session, ref, state)).fetchone()
+     pid, start = _my_holder()
+     if row is None:
++        from tui_gateway.kanban_remote_identity import moved_claim
++        moved = moved_claim(conn, session=session, ref=ref, state=state, now=now,
++                            notice_key=notice_key, swept_key=swept_key, transcript_has=transcript_has)
++        if moved is not None:
++            return moved
+         if fresh and notice_key and transcript_has is not None and transcript_has(notice_key, ""):
+             # [daveey] Another writer already put this notice in the chat (a second sweeper, another ledger):
+             # offering it again woke a turn whose row duplicated the passive one (t_01a1db370b459fab).
+diff --git a/tui_gateway/kanban_remote_observations.py b/tui_gateway/kanban_remote_observations.py
+index 2ee9a7f43f0a1a9fc2920845bdf80fb08a63a1b8..6e91583f1cc1bd3f86714b822ae6c6daa798574c 100644
+--- a/tui_gateway/kanban_remote_observations.py
++++ b/tui_gateway/kanban_remote_observations.py
+@@ -157,6 +157,8 @@ def _persist(source: str, cards: list[tuple], ledger, now: float, extra=()) -> d
+         conn.execute("CREATE TABLE IF NOT EXISTS observation_sources (source TEXT PRIMARY KEY)")
+         conn.execute("CREATE TABLE IF NOT EXISTS observations (source TEXT, ref TEXT, state TEXT, "
+                      "first_seen REAL, PRIMARY KEY(source, ref, state))")
++        conn.execute("CREATE INDEX IF NOT EXISTS observations_card_state ON observations "
++                     "(source, substr(ref, instr(ref, '/') + 1), state)")
+         # Serialize baseline + snapshot: concurrent backends must agree which is first.
+         conn.execute("BEGIN IMMEDIATE")
+         try:
+@@ -166,12 +168,14 @@ def _persist(source: str, cards: list[tuple], ledger, now: float, extra=()) -> d
+             for key, state, ref, at, answer in missing:
+                 # Unknown ages and frozen legacy keys cannot establish local freshness.
+                 seen = now if at is not None and key.count('/') >= 2 and (not initial or now - at <= FRESH_S) else None
+-                row = conn.execute("SELECT first_seen FROM observations WHERE source=? AND ref=? AND state=?",
+-                                   (source, ref, state)).fetchone()
+-                if row is None:
+-                    conn.execute("INSERT INTO observations VALUES (?,?,?,?)", (source, ref, state, seen))
++                rows = conn.execute("SELECT first_seen FROM observations WHERE source=? AND state=? "
++                                    "AND substr(ref, instr(ref, '/') + 1)=?",
++                                    (source, state, key)).fetchall()
++                if rows:
++                    seen = None if any(row[0] is None for row in rows) else min(row[0] for row in rows)
++                conn.execute("INSERT OR IGNORE INTO observations VALUES (?,?,?,?)", (source, ref, state, seen))
+                 if answer:
+-                    added[(ref, state)] = row[0] if row is not None else seen
++                    added[(ref, state)] = seen
+             conn.commit()
+         except BaseException:
+             conn.rollback()
+-- 
+2.43.0
+

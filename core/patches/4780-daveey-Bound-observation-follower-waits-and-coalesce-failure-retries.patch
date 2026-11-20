@@ -1,0 +1,198 @@
+From ed3f963deebe376382bc0104c5173ec7b0fad007 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 06:34:27 +0000
+Subject: [PATCH] [daveey] Bound observation follower waits and coalesce
+ failure retries
+
+PR #1884 follow-up: keep observe public signature thin, retry failed flights through normal election, and fall back independently after 30 seconds. Preserve leader finally signalling and generation fencing. Replace handwritten test polling with wait_until.
+
+Proof: both regression tests failed before implementation (unbounded wait and six persists for five followers); 162 tests across all 14 importing test files pass afterward. scripts/check --base origin/main: 21 checks OK. Timeout test expires the real flight event deterministically; failed-leader test holds retry publication until all followers have chosen a path.
+---
+ .../test_kanban_observation_retry.py          | 98 +++++++++++++++++++
+ .../test_kanban_observation_singleflight.py   |  6 +-
+ tui_gateway/kanban_remote_observations.py     | 17 +++-
+ 3 files changed, 112 insertions(+), 9 deletions(-)
+ create mode 100644 tests/tui_gateway/test_kanban_observation_retry.py
+
+diff --git a/tests/tui_gateway/test_kanban_observation_retry.py b/tests/tui_gateway/test_kanban_observation_retry.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2b761ce1fdefe55925a6e440ee3cfa2877f7824a
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_observation_retry.py
+@@ -0,0 +1,98 @@
++"""Bound leader stalls and coalesce recovery without holding publication locks."""
++from concurrent.futures import ThreadPoolExecutor
++import threading
++
++import pytest
++
++from tests.tui_gateway.test_kanban_remote_observations_lock import NOW, _world
++from tests.waiting import wait_until
++from tui_gateway import kanban_remote_observations as obs
++
++
++def test_wait_timeout_persists_without_waiting_for_stalled_leader(tmp_path, monkeypatch):
++    replica, ledger, _ = _world(tmp_path)
++    entered, release = threading.Event(), threading.Event()
++    original = obs._persist
++    calls, waits = [], []
++    pending_init = obs._Pending.__init__
++
++    class ExpiredEvent(threading.Event):
++        def wait(self, timeout=None):
++            waits.append(timeout)
++            assert timeout is not None and 10 <= timeout <= 120
++            return False  # Deterministically expire the wait, leaving the leader running.
++
++    def init(self, token):
++        pending_init(self, token)
++        self.done = ExpiredEvent()
++
++    def persist(*args):
++        calls.append(args)
++        if len(calls) == 1:
++            entered.set()
++            assert release.wait(20)
++        return original(*args)
++
++    monkeypatch.setattr(obs._Pending, "__init__", init)
++    monkeypatch.setattr(obs, "_persist", persist)
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        leader = pool.submit(obs.observe, replica, ledger, NOW)
++        try:
++            assert entered.wait(20)
++            result = pool.submit(obs.observe, replica, ledger, NOW).result(20)
++            assert len(result) == 20
++            assert not leader.done()
++            assert len(calls) == 2 and len(waits) == 1
++        finally:
++            release.set()
++        assert leader.result(20) == result
++    assert not obs._pending
++
++
++def test_failed_leader_waiters_share_one_retry_pass(tmp_path, monkeypatch):
++    replica, ledger, _ = _world(tmp_path)
++    entered, fail, finish_retry = threading.Event(), threading.Event(), threading.Event()
++    original, pending_init = obs._persist, obs._Pending.__init__
++    calls, waiting = [], []
++    followers = 5
++
++    class CountedEvent(threading.Event):
++        def wait(self, timeout=None):
++            waiting.append(self)
++            return super().wait(timeout)
++
++    def init(self, token):
++        pending_init(self, token)
++        self.done = CountedEvent()
++
++    def persist(*args):
++        calls.append(args)
++        if len(calls) == 1:
++            entered.set()
++            assert fail.wait(20)
++            raise RuntimeError("leader failed")
++        assert finish_retry.wait(20)
++        return original(*args)
++
++    monkeypatch.setattr(obs._Pending, "__init__", init)
++    monkeypatch.setattr(obs, "_persist", persist)
++    with ThreadPoolExecutor(max_workers=followers + 1) as pool:
++        leader = pool.submit(obs.observe, replica, ledger, NOW)
++        try:
++            assert entered.wait(20)
++            futures = [pool.submit(obs.observe, replica, ledger, NOW) for _ in range(followers)]
++            wait_until(lambda: len(waiting) == followers, what="all initial followers")
++            fail.set()
++            with pytest.raises(RuntimeError, match="leader failed"):
++                leader.result(20)
++            # Each follower either became a writer or joined the retry flight.
++            wait_until(lambda: len(calls) + len(waiting) >= followers * 2 + 1,
++                       what="all followers joined retry or persisted")
++            assert len(calls) == 2
++            assert len(waiting) == followers * 2 - 1
++        finally:
++            fail.set()
++            finish_retry.set()
++        results = [future.result(20) for future in futures]
++        assert len(results[0]) == 20 and all(result == results[0] for result in results)
++    assert not obs._pending
+diff --git a/tests/tui_gateway/test_kanban_observation_singleflight.py b/tests/tui_gateway/test_kanban_observation_singleflight.py
+index 0287b9ebd64f013a4221b1bef6907c8d293aadce..e6d3a05af32101d1d2ddc3a4e2b64ffed71d0d0b 100644
+--- a/tests/tui_gateway/test_kanban_observation_singleflight.py
++++ b/tests/tui_gateway/test_kanban_observation_singleflight.py
+@@ -7,6 +7,7 @@ import sqlite3
+ import json
+ import pytest
+ 
++from tests.waiting import wait_until
+ from tests.tui_gateway.test_kanban_remote_arrival import CHAT, _card
+ from tests.tui_gateway.test_kanban_remote_observations_lock import NOW, _move, _world
+ from tui_gateway import kanban_remote_notices as krn
+@@ -70,10 +71,7 @@ def test_concurrent_snapshot_is_singleflight_outside_publication_lock(tmp_path,
+ 
+     def save(*args):
+         persisted.append(threading.get_ident())
+-        for _ in range(4000):
+-            if len(waiting) >= CALLERS - 1:
+-                break
+-            threading.Event().wait(0.005)
++        wait_until(lambda: len(waiting) >= CALLERS - 1, timeout=20, what="snapshot followers")
+         return real_persist(*args)
+ 
+     def poll(_):
+diff --git a/tui_gateway/kanban_remote_observations.py b/tui_gateway/kanban_remote_observations.py
+index 81cd4140ada9d15a24fbe1ddab645d3206181d6a..2ee9a7f43f0a1a9fc2920845bdf80fb08a63a1b8 100644
+--- a/tui_gateway/kanban_remote_observations.py
++++ b/tui_gateway/kanban_remote_observations.py
+@@ -295,7 +295,12 @@ class _Pending:
+ _pending: dict[tuple, _Pending] = {}
+ 
+ 
+-def observe(replica: Path, ledger, now: float, _follow: bool = True) -> dict[tuple, float | None]:
++def observe(replica: Path, ledger, now: float) -> dict[tuple, float | None]:
++    """Observe a replica, sharing persistence with callers of the same snapshot."""
++    return _observe(replica, ledger, now, follow=True)
++
++
++def _observe(replica: Path, ledger, now: float, *, follow: bool) -> dict[tuple, float | None]:
+     """Only changed replica snapshots decode cards and touch the observation ledger.
+ 
+     An unchanged replica change key (the observer's data_version) skips the replica read entirely; a key is kept
+@@ -307,7 +312,9 @@ def observe(replica: Path, ledger, now: float, _follow: bool = True) -> dict[tup
+     [daveey] A caller whose snapshot (same signature, replica file and ledger file) is already being persisted
+     waits for that answer: it is the one a memo hit would return. Each notice poller (5-7 per backend on
+     hermes-hub, 11-13) otherwise re-ran the whole pass over every terminal card while the first one still held
+-    the ledger (21 replica changes -> 79 passes). If the leader fails, the waiter persists once itself.
++    the ledger (21 replica changes -> 79 passes). Failed leaders retry through the same flight election.
++    A waiter gives a leader 30 seconds, then persists independently so a stalled leader cannot strand peers.
++    This bounds only the shared wait, not the fallback ledger write.
+     """
+     from tui_gateway.kanban_remote_notices import ledger_path
+     from tui_gateway.kanban_replica_observer import file_identity, fingerprint
+@@ -352,7 +359,7 @@ def observe(replica: Path, ledger, now: float, _follow: bool = True) -> dict[tup
+             waiting = _pending.get(key)
+             leading: _Pending | None = None
+             generation = 0
+-            if not (_follow and signature is not None and ident is not None and waiting is not None
++            if not (follow and signature is not None and ident is not None and waiting is not None
+                     and waiting.token == token and waiting.owner != threading.get_ident() and not extra):
+                 waiting = None
+                 flight.lane.pending = []  # this caller writes them; a failed write puts them back
+@@ -361,10 +368,10 @@ def observe(replica: Path, ledger, now: float, _follow: bool = True) -> dict[tup
+                 if leading is not None:
+                     _pending[key] = leading
+     if waiting is not None:
+-        waiting.done.wait()  # holds no lock; the leader sets it in ``finally``
++        completed = waiting.done.wait(timeout=30)  # no lock held; the leader signals in finally
+         if waiting.fresh is not None:
+             return waiting.fresh
+-        return observe(replica, ledger, now, _follow=False)  # the leader failed: persist this snapshot here
++        return _observe(replica, ledger, now, follow=completed)  # retry together unless the leader stalled
+     # [daveey] The ledger write runs without ``_lock``: holding it there kept every notice poller waiting on one
+     # poller's transaction. ``cards`` is this call's own snapshot, so the answer is the one it would have had under
+     # the lock; only the newest snapshot started for ``key`` publishes its memo, and only after its commit.
+-- 
+2.43.0
+

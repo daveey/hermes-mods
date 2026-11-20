@@ -1,0 +1,233 @@
+From ab626f4f2cd3f931fb4559c5a3927b150fb06430 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 21:37:35 +0000
+Subject: [PATCH] [daveey] Lifecycle guard: follow a pipe into a compound
+ command's shell
+
+`printf T | { echo x; bash; }` runs T in the group's shell, but the sink
+regex's pipe alternative stops at the first `;`/newline, so
+output_reaches_shell() said no sink and the printed text was never walked.
+Under unknown alias names (`$'..'` anywhere, `alias q=r`) the nested
+printed-pipeline walk is skipped on the premise that the session walk reads
+the text, so `printf 't ( bash DB )' | { echo x; bash -l; }; echo $'y'` was
+missed the same way. Heredoc producers (`python3 - <<'PY' | { :; bash; }`)
+and `| while read l; do bash; done` had the same gap.
+
+Five whys: the refusal is missing -> the printed literal is not walked ->
+output_reaches_shell() is false -> the pipe alternative is a flat regex that
+ends at list operators -> group structure was only modelled by the nested
+(login-shell) walk, which is skipped under unknown names.
+
+Fix: output_reaches_shell() also asks the printed-pipeline unit walk
+(cron.lifecycle_guard_nested_shells.pipe_feeds_consumer) whether any command
+reading a pipe -- including commands inside a compound command the pipe
+feeds -- matches the sink regex as if piped into directly. Untokenizable text
+fails closed. The nested walk's stdin predicate is now a parameter of the
+same unit walk (default unchanged).
+
+Proof: tests/cron/test_lifecycle_guard_grouped_pipe_shell.py -- 13 cases
+red on base 5d9e537979, all 26 green with the fix via scripts/run_tests.sh;
+clean twins (`printf ':' | { echo x; bash; }`, harmless `$'y'` variants,
+`| { echo x; cat; }`, `| (cat); echo bash`) stay allowed. All 73 test files
+importing shell_heredoc/lifecycle_guard/terminal_tool_guards pass (11008
+tests). Real Bash: `printf 'echo FED\n' | { echo x; bash --noprofile
+--norc; }; echo $'y'` prints x FED y.
+
+Task: t_326b169246d7306a
+---
+ cron/lifecycle_guard_nested_shells.py         | 29 ++++--
+ ...test_lifecycle_guard_grouped_pipe_shell.py | 90 +++++++++++++++++++
+ tools/shell_heredoc.py                        | 24 ++++-
+ 3 files changed, 135 insertions(+), 8 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_grouped_pipe_shell.py
+
+diff --git a/cron/lifecycle_guard_nested_shells.py b/cron/lifecycle_guard_nested_shells.py
+index 3600877ec2bc7ee1ee7e55dcb557c66225bc119f..9f8eaae7e0f9f4aeeb829ff5e972aac4ea63730c 100644
+--- a/cron/lifecycle_guard_nested_shells.py
++++ b/cron/lifecycle_guard_nested_shells.py
+@@ -10,7 +10,7 @@ import contextlib
+ import itertools
+ import re
+ import shlex
+-from collections.abc import Iterator, Sequence
++from collections.abc import Callable, Iterator, Sequence
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Optional
+ 
+@@ -446,12 +446,28 @@ def _printed_pipeline_units(command: str) -> list[_PrintedUnit]:
+     return [unit for unit in units if unit.events]
+ 
+ 
+-def _unit_feeds_nested_stdin(unit: _PrintedUnit) -> tuple[bool, bool]:
+-    """``(printed text, heredoc body output)``: whether a pipe in *unit* feeds a startup shell's
+-    stdin, and whether a heredoc-owning producer upstream of that pipe feeds it. A list operator
+-    or line break ends a pipe inside a group: what follows reads the group's stdin (nit 2)."""
++def _reads_nested_stdin(words: list[str]) -> bool:
++    """Whether the command *words* starts a shell holding its own aliases that reads stdin."""
+     from cron.lifecycle_guard import _command_segment_views
+ 
++    return any(_nested_shell_input(view) == ("stdin", None) for view in _command_segment_views(words))
++
++
++def pipe_feeds_consumer(command: str, reads: Callable[[list[str]], bool]) -> bool:
++    """Whether a pipe in *command* feeds a command whose words satisfy *reads*, including a
++    command inside a compound command the pipe feeds (``| { echo x; bash; }``, ``| ( :; bash )``,
++    ``| while read l; do bash; done``): every command there reads the compound's stdin."""
++    return "|" in command and any(_unit_feeds_nested_stdin(unit, reads)[0]
++                                  for unit in _printed_pipeline_units(command))
++
++
++def _unit_feeds_nested_stdin(
++    unit: _PrintedUnit, reads: Callable[[list[str]], bool] = _reads_nested_stdin,
++) -> tuple[bool, bool]:
++    """``(printed text, heredoc body output)``: whether a pipe in *unit* feeds a command *reads*
++    accepts (by default a startup shell reading stdin), and whether a heredoc-owning producer
++    upstream of that pipe feeds it. A list operator or line break ends a pipe inside a group:
++    what follows reads the group's stdin (nit 2)."""
+     feeds = feeds_body = False
+     piped = carried = own_body = False
+     frames: list[list[bool]] = []  # [piped, carried, holds a body] at each open group
+@@ -466,8 +482,7 @@ def _unit_feeds_nested_stdin(unit: _PrintedUnit) -> tuple[bool, bool]:
+                 for frame in frames:
+                     frame[2] = True
+             continue
+-        if words and piped and any(_nested_shell_input(view) == ("stdin", None)
+-                                   for view in _command_segment_views(words)):
++        if words and piped and reads(words):
+             feeds = True
+             feeds_body = feeds_body or carried
+         words = []
+diff --git a/tests/cron/test_lifecycle_guard_grouped_pipe_shell.py b/tests/cron/test_lifecycle_guard_grouped_pipe_shell.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4ad5c58411791397647073c632817be5cdc35f69
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_grouped_pipe_shell.py
+@@ -0,0 +1,90 @@
++"""A pipe into a compound command feeds every command inside it that reads stdin
++(t_326b169246d7306a): `printf T | { echo x; bash; }` runs T, yet the sink regex's pipe alternative
++stopped at the first `;`. Under unknown alias names the nested printed-pipeline walk is skipped
++(the session walk is trusted to read the text), so `… | { echo x; bash -l; }; echo $'y'` was
++missed too: the session walk never saw a sink."""
++
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from tools.shell_heredoc import output_reaches_shell
++
++
++@pytest.fixture
++def live_kanban_db(tmp_path, monkeypatch):
++    """`~/.hermes/kanban.db` held open (tracked) in this process, as the gateway holds its own."""
++    from hermes_cli.sqlite_safe_read import connect_tracked
++
++    home = tmp_path / "home"
++    (home / ".hermes").mkdir(parents=True)
++    monkeypatch.setenv("HOME", str(home))
++    conn = connect_tracked(home / ".hermes" / "kanban.db")
++    conn.execute("CREATE TABLE t (x)")
++    conn.commit()
++    try:
++        yield home / ".hermes" / "kanban.db"
++    finally:
++        conn.close()
++
++
++def _scan(text, tmp_path):
++    return scan_gateway_lifecycle(text, cwd=str(tmp_path), session_aliases=frozenset({"zz"}))
++
++
++@pytest.mark.parametrize("command", [
++    # controls (refused before the fix too)
++    "printf 'bash {db}' | bash",
++    "printf 't ( bash {db} )' | {{ echo x; bash -l; }}",
++    # card repros
++    "printf 'bash {db}' | {{ echo x; bash; }}",
++    "printf 't ( bash {db} )' | {{ echo x; bash -l; }}; echo $'y'",
++    "printf 't ( bash {db} )' | ( echo x; bash -l ); echo $'y'",
++    # same gap, other spellings
++    "printf 't ( bash {db} )' | {{ echo x; bash -l; }}; alias q=r",
++    "printf 'bash {db}' | {{ echo x; bash; }}; echo $'y'",
++    "printf 'bash {db}' | ( echo x; bash )",
++    "printf 'bash {db}' | {{ echo x\nbash\n}}",
++    "printf ':\\nbash {db}\\n' | while read -r l; do bash; done",
++    "python3 - <<'PY' | {{ echo x; bash; }}\nprint('bash {db}')\nPY\n",
++])
++def test_printed_text_piped_into_a_grouped_shell_is_walked(tmp_path, live_kanban_db, command):
++    unsafe, refusal = _scan(command.format(db=live_kanban_db), tmp_path)
++    assert unsafe is True and refusal is not None
++
++
++@pytest.mark.parametrize("command", [
++    "printf ':' | { echo x; bash; }",
++    "printf ':' | { echo x; bash -l; }; echo $'y'",
++    "printf ':' | ( echo x; bash -l ); echo $'y'",
++    "printf 't ( echo hi )' | { echo x; bash -l; }; echo $'y'",
++    "printf 'bash {db}' | {{ echo x; cat; }}",  # no shell reads the pipe
++    "printf 'bash {db}' | (cat); echo bash",  # the shell is past the group: not piped
++])
++def test_clean_twins_stay_allowed(tmp_path, live_kanban_db, command):
++    assert _scan(command.replace("{{", "{").replace("}}", "}").replace("{db}", str(live_kanban_db)),
++                 tmp_path) == (False, None)
++
++
++@pytest.mark.parametrize("command,reaches", [
++    ("printf T | { echo x; bash; }", True),
++    ("printf T | ( :; sh -l )", True),
++    ("printf T | while read -r l; do bash; done", True),
++    ("printf T | { echo x\nbash\n}", True),
++    ("printf T | { echo x; cat; }", False),
++    ("printf T | (cat); bash x.sh", False),
++    ("printf T | cat; { echo x; bash; }", False),
++    ("{ echo x; bash; }", False),
++])
++def test_output_reaches_shell_follows_the_pipe_into_the_group(command, reaches):
++    assert output_reaches_shell(command) is reaches
++
++
++def test_real_bash_runs_text_piped_into_a_grouped_shell():
++    """The premise: the group's shell does execute the piped text."""
++    out = subprocess.run(
++        ["/bin/bash", "--noprofile", "--norc", "-c",
++         "printf 'echo FED\\n' | { echo x; bash --noprofile --norc; }; echo $'y'"],
++        text=True, capture_output=True, timeout=10, check=True)
++    assert out.stdout.split() == ["x", "FED", "y"] and out.stderr == ""
+diff --git a/tools/shell_heredoc.py b/tools/shell_heredoc.py
+index c47b4f5e3f7fea159f3657a8fe0832039c75fcdd..ac7e13ee3ca26e18996466c2cc9d88fbff91f541 100644
+--- a/tools/shell_heredoc.py
++++ b/tools/shell_heredoc.py
+@@ -532,7 +532,29 @@ def output_reaches_shell(command: str) -> bool:
+     # The regex sees a substitution only in command position; inside arithmetic bash also runs
+     # code from its output wherever it sits (`$(( 1 + $(…) ))`, `a[$(…)]`; t_01a1d6ae05c19594).
+     return (sink.search(command) is not None
+-            or substitution_in_arithmetic(command, date_exempt=date_exempt))
++            or substitution_in_arithmetic(command, date_exempt=date_exempt)
++            or _grouped_pipe_reaches_shell(command, sink))
++
++
++# A shell word the pipe alternative of ``_SHELL_SINK_TEMPLATE`` looks for (cheap pre-filter).
++_SINK_SHELL_WORD_RE = re.compile(rf"{_WORD_START}{_SINK_SHELLS}{_WORD_END}")
++
++
++def _grouped_pipe_reaches_shell(command: str, sink: re.Pattern[str]) -> bool:
++    """Whether a pipe feeds a compound command holding a sink past a list operator or line
++    break: every command in ``| { echo x; bash; }``, ``| ( :; bash -l )`` or ``| while read l;
++    do bash; done`` reads the pipe, yet the pipe alternative stops at the first ``;``. Each
++    command reading the pipe is matched as if piped into directly (``| bash``). Text the
++    printed-unit walk cannot tokenize fails closed (t_326b169246d7306a)."""
++    if "|" not in command or not _SINK_SHELL_WORD_RE.search(command):
++        return False
++    from cron.lifecycle_guard_nested_shells import pipe_feeds_consumer
++
++    try:
++        return pipe_feeds_consumer(
++            command, lambda words: sink.search("| " + " ".join(words)) is not None)
++    except ValueError:
++        return True
+ 
+ 
+ def _nonreading_shell_unit(unit: str, functions: set[str]) -> bool:
+-- 
+2.43.0
+

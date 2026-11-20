@@ -1,0 +1,597 @@
+From 22f163bf973a67a0d91948607dd552bf46d0d016 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 18:01:06 +0000
+Subject: [PATCH] feat(kanban): inventory runtime epochs and bound root exports
+ [daveey]
+
+---
+ docs/kanban-fairness-runtime.md               |  29 ++-
+ hermes_cli/kanban_fairness_budget.py          |   5 +
+ hermes_cli/kanban_fairness_root.py            | 206 ++++++++++++++++++
+ hermes_cli/kanban_fairness_runtime.py         |   3 +
+ hermes_cli/kanban_fairness_store.py           |  13 ++
+ scripts/kanban_fairness.py                    |  21 +-
+ tests/hermes_cli/test_kanban_fairness_root.py | 206 ++++++++++++++++++
+ 7 files changed, 472 insertions(+), 11 deletions(-)
+ create mode 100644 hermes_cli/kanban_fairness_root.py
+ create mode 100644 tests/hermes_cli/test_kanban_fairness_root.py
+
+diff --git a/docs/kanban-fairness-runtime.md b/docs/kanban-fairness-runtime.md
+index a4b42b1cb891f6b3e76ca4f6bbba6d5e749d8803..51b87a62f0a7f39d9836d6d3c1fcdf68c3d0afc7 100644
+--- a/docs/kanban-fairness-runtime.md
++++ b/docs/kanban-fairness-runtime.md
+@@ -24,8 +24,8 @@ is the profile's durable `kanban/evidence/<capture_id>`, never scratch. A byte l
+ must be a positive integer no greater than 536870912; booleans are not integers here.
+ 
+ **Integration status:** draft explicit `runtime arm` / `runtime disarm` commands and
+-startup bindings now exist. Root export/expected-epoch inventory and full production
+-scope verification remain incomplete. Do not activate this draft on a live board.
++startup bindings, root export and expected-epoch inventory now exist. Full production
++scope verification remains incomplete. Do not activate this draft on a live board.
+ 
+ The descriptor pins profile home, board, capture directory/ID, supplied gateway/board
+ UIDs, byte limit and nullable clock error. It is not inferred from hostnames or a
+@@ -76,7 +76,30 @@ All runtime epochs beneath a capture share a locked byte budget, including exist
+ files and temporary replacement peaks. Evidence is never deleted to make room.
+ Budget failure can prevent even a gap receipt; an absent clean tail remains a gap.
+ The lock is advisory and does not prevent unrelated external writes. Unsupported
+-locking platforms reject activation. Assembled-export enforcement is separate work.
++locking platforms reject activation. Explicit DB arm initializes the configured byte
++ceiling and admits its plan file before activating the journal.
++
++Before serving, each runtime registers its identity in `runtime-epochs.json` under
++the root budget lock. Registration is capped at 4096 epochs / 1 MiB of metadata;
++exhaustion refuses another consumer, never recycles old evidence. Use a fresh capture
++after exhaustion. A retained `runtime-required.json` prevents lost inventory from
++being silently recreated. Registration precedes epoch-directory creation and thread
++start, so a crash in between leaves an expected missing epoch. Atomic metadata writes
++fsync both their contents and the containing directory.
++
++Root loading includes runtime records without modifying their frozen envelopes,
++and checks every expected epoch plus discovered orphan epochs. Missing inventories,
++missing epochs, mismatched identities and absent tails remain coverage gaps. Loading
++rejects special files, symlinks and over-bound trees before opening segment contents.
++These are local integrity checks, not independent proof that every fleet process
++participated; external deletion of all authority/evidence cannot be reconstructed.
++
++Export recursively retains temporary and orphan evidence. Disarm first: export
++refuses an armed runtime descriptor, then takes the root lock for a consistent view
++against cooperating writers. Input logical bytes and compressed output bytes are
++each capped at 2 GiB. Output must be new and outside the capture; failures never
++publish a partial archive or replace existing output. Exporting incomplete evidence
++is permitted and does not certify it: validation retains all inventory/tail gaps.
+ 
+ Process shutdown shares one two-second allowance across all active profile/board
+ consumers. The writer first drains and seals data, then waits for a positive in-memory
+diff --git a/hermes_cli/kanban_fairness_budget.py b/hermes_cli/kanban_fairness_budget.py
+index 57e56159d0c1f5bbe743b171e51463005b6ac46e..70b5b28344f9ee35d9fb164813758c9b6689f33b 100644
+--- a/hermes_cli/kanban_fairness_budget.py
++++ b/hermes_cli/kanban_fairness_budget.py
+@@ -101,6 +101,11 @@ def _write(path, data):
+         stream.flush()
+         os.fsync(stream.fileno())
+     os.replace(tmp, path)
++    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
++    try:
++        os.fsync(directory)
++    finally:
++        os.close(directory)
+ 
+ 
+ def write(path, data):
+diff --git a/hermes_cli/kanban_fairness_root.py b/hermes_cli/kanban_fairness_root.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..93522c7c24fdd5f6e57ed51bdeb62a132b8ee224
+--- /dev/null
++++ b/hermes_cli/kanban_fairness_root.py
+@@ -0,0 +1,206 @@
++"""Expected runtime epochs and bounded root assembly, outside scheduler locks.
++
++Inventory is registered before a consumer serves. A crash between registration
++and opening leaves a missing epoch, not an invisible producer. Event envelopes
++and individual segment manifests are never rewritten during assembly.
++"""
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++import re
++import stat
++import tarfile
++import uuid
++
++from hermes_cli import kanban_fairness_budget as budget
++from hermes_cli import kanban_fairness_segments as segments
++from hermes_cli.kanban_fairness_tail import IDENTITY, OPEN
++
++INVENTORY = "runtime-epochs.json"
++REQUIRED = "runtime-required.json"
++MAX_EPOCHS = 4096
++MAX_INVENTORY = 1024 * 1024
++MAX_ASSEMBLED = 2 * 1024 * 1024 * 1024
++
++
++def inventory(root):
++    value = json.loads(segments.read_bounded(root / INVENTORY, MAX_INVENTORY))
++    if (not isinstance(value, dict) or set(value) != {"version", "epochs"}
++            or type(value["version"]) is not int or value["version"] != 1
++            or not isinstance(value["epochs"], list) or len(value["epochs"]) > MAX_EPOCHS):
++        raise ValueError("invalid runtime inventory")
++    result = {}
++    for identity in value["epochs"]:
++        if not isinstance(identity, dict) or set(identity) != IDENTITY:
++            raise ValueError("invalid epoch identity")
++        epoch = identity["source_epoch"]
++        if not isinstance(epoch, str) or not re.fullmatch(r"[0-9a-f]{32}", epoch) or epoch in result:
++            raise ValueError("invalid or duplicate epoch")
++        result[epoch] = identity
++    return result
++
++
++def register(root, identity):
++    """Durably reserve an epoch before creating its directory or writer thread."""
++    with budget._locked(root):
++        if (root / REQUIRED).exists() and not (root / INVENTORY).exists():
++            raise ValueError("runtime inventory missing; refusing to replace lost evidence")
++        if not (root / REQUIRED).exists():
++            marker = segments.encoded({"version": 1})
++            if budget._used(root) + len(marker) > budget._limit(root):
++                raise budget.BudgetExceeded("runtime marker budget exceeded")
++            budget._write(root / REQUIRED, marker)
++        epochs = inventory(root) if (root / INVENTORY).exists() else {}
++        epoch = identity["source_epoch"]
++        if epoch in epochs or len(epochs) >= MAX_EPOCHS:
++            raise ValueError("runtime epoch inventory full or duplicate")
++        data = segments.encoded({"version": 1, "epochs": [*epochs.values(), identity]})
++        if len(data) > MAX_INVENTORY or budget._used(root) + len(data) > budget._limit(root):
++            raise budget.BudgetExceeded("runtime inventory budget exceeded")
++        budget._write(root / INVENTORY, data)
++
++
++def files(root):
++    """Bound all paths, including orphan and temporary bytes; reject special files."""
++    if root.is_symlink():
++        raise ValueError("capture root must not be a symlink")
++    paths, size, count = [], 0, 0
++
++    def walk(directory, depth=0):
++        nonlocal size, count
++        if depth > 4:
++            raise ValueError("capture directory nesting exceeded")
++        with os.scandir(directory) as entries:
++            for entry in entries:
++                count += 1
++                if count > 100000 or entry.is_symlink():
++                    raise ValueError("capture path bound or symlink")
++                if entry.is_dir(follow_symlinks=False):
++                    paths.append(Path(entry.path))
++                    walk(Path(entry.path), depth + 1)
++                elif entry.is_file(follow_symlinks=False):
++                    size += entry.stat(follow_symlinks=False).st_size
++                    if size > MAX_ASSEMBLED:
++                        raise ValueError("assembled capture byte bound exceeded")
++                    paths.append(Path(entry.path))
++                else:
++                    raise ValueError("capture requires regular files")
++    walk(root)
++    return sorted(paths), size
++
++
++def collect(root, capture, load_one):
++    """Keep discovered but unregistered epochs; missing expected epochs stay gaps."""
++    if not any((root / name).exists() for name in
++               ("runtime", INVENTORY, REQUIRED, "runtime-arm.json", "runtime-disarmed.json")):
++        return capture
++    gaps = capture["gaps"]
++    try:
++        expected = inventory(root)
++        if len(expected) == MAX_EPOCHS:
++            gaps.append({"code": "runtime_inventory", "detail": "epoch capacity exhausted"})
++    except (OSError, ValueError, TypeError, RecursionError):
++        expected = {}
++        gaps.append({"code": "runtime_inventory"})
++    try:
++        _, size = files(root)
++        if size > budget._limit(root):
++            gaps.append({"code": "capture_bound"})
++            return capture
++    except (OSError, ValueError, TypeError):
++        gaps.append({"code": "capture_bound"})
++    discovered = set()
++    if (root / "runtime").is_dir():
++        with os.scandir(root / "runtime") as entries:
++            for entry in entries:
++                if entry.is_dir(follow_symlinks=False):
++                    discovered.add(entry.name)
++                else:
++                    gaps.append({"code": "runtime_inventory"})
++    for epoch in sorted(set(expected) | discovered):
++        if not re.fullmatch(r"[0-9a-f]{32}", epoch):
++            gaps.append({"code": "runtime_inventory"})
++            continue
++        out = root / "runtime" / epoch
++        if epoch not in expected:
++            gaps.append({"code": "runtime_inventory"})
++        if not out.is_dir():
++            gaps.append({"code": "runtime_epoch_missing", "detail": epoch})
++            continue
++        child = load_one(out)
++        try:
++            opening = json.loads(segments.read_bounded(out / OPEN, 4096))
++            if opening != {"version": 1, **expected[epoch]}:
++                raise ValueError("epoch inventory identity mismatch")
++            for key in ("capture_id", "board_uid"):
++                if capture["manifest"].get(key) not in (None, opening[key]):
++                    raise ValueError("root capture identity mismatch")
++        except (OSError, ValueError, KeyError, TypeError, RecursionError):
++            gaps.append({"code": "runtime_inventory"})
++        capture["records"].extend(child["records"])
++        gaps.extend(child["gaps"])
++    capture["gaps"] = segments.dedupe_gaps(gaps)
++    return capture
++
++
++class _BoundedOutput:
++    def __init__(self, stream):
++        self.stream, self.size = stream, 0
++
++    def write(self, data):
++        if self.size + len(data) > MAX_ASSEMBLED:
++            raise ValueError("assembled archive byte bound exceeded")
++        self.size += len(data)
++        return self.stream.write(data)
++
++    def flush(self):
++        self.stream.flush()
++
++
++def _archive(source, paths, stream):
++    total = 0
++    with tarfile.open(fileobj=_BoundedOutput(stream), mode="w:gz") as bundle:
++        for path in paths:
++            if path.is_dir() and not path.is_symlink():
++                member = tarfile.TarInfo(str(Path(source.name) / path.relative_to(source)))
++                member.type, member.mode = tarfile.DIRTYPE, 0o700
++                bundle.addfile(member)
++                continue
++            # Read exactly the admitted size from a regular no-follow descriptor.
++            # Growth after fstat is not copied, shrinkage refuses publication.
++            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
++            with os.fdopen(fd, "rb") as data:
++                info = os.fstat(data.fileno())
++                if not stat.S_ISREG(info.st_mode):
++                    raise ValueError("export requires regular files")
++                total += info.st_size
++                if total > MAX_ASSEMBLED:
++                    raise ValueError("assembled capture byte bound exceeded")
++                member = tarfile.TarInfo(str(Path(source.name) / path.relative_to(source)))
++                member.size, member.mode = info.st_size, 0o600
++                bundle.addfile(member, data)
++
++
++def export(source, target):
++    if source.is_symlink() or target.is_symlink():
++        raise ValueError("export paths must not be symlinks")
++    source, target = source.resolve(), target.resolve()
++    if target == source or source in target.parents or target.exists():
++        raise ValueError("export requires a new output outside the capture")
++    temporary = target.with_name(target.name + "." + uuid.uuid4().hex + ".tmp")
++    try:
++        # Explicit export after disarm avoids holding active writers behind gzip.
++        # Missing tails may still be exported, but load() retains their gaps.
++        with budget._locked(source):
++            if (source / "runtime-arm.json").exists():
++                raise ValueError("disarm runtime capture before export")
++            paths, _ = files(source)
++            with temporary.open("xb") as stream:
++                _archive(source, paths, stream)
++                stream.flush()
++                os.fsync(stream.fileno())
++            os.link(temporary, target)  # refuses an output concurrently created by another caller
++    finally:
++        temporary.unlink(missing_ok=True)
+diff --git a/hermes_cli/kanban_fairness_runtime.py b/hermes_cli/kanban_fairness_runtime.py
+index 0da82814b0fa37a9b8268ec1774cee8c1e2cfb9f..ceddda91fa968f2b80a391745b7703cf4c1b0b36 100644
+--- a/hermes_cli/kanban_fairness_runtime.py
++++ b/hermes_cli/kanban_fairness_runtime.py
+@@ -184,6 +184,9 @@ class Session:
+         from hermes_cli.kanban_fairness_budget import initialize
+ 
+         initialize(settings.directory, settings.max_bytes)
++        from hermes_cli.kanban_fairness_root import register
++
++        register(settings.directory, self.identity)
+         self.out.mkdir(parents=True, exist_ok=False)
+         from hermes_cli.kanban_fairness_tail import open_epoch
+ 
+diff --git a/hermes_cli/kanban_fairness_store.py b/hermes_cli/kanban_fairness_store.py
+index df2771241d5669842958f3b5a2bb3b9e008f39e7..2f07ef82ce98c16a868d0d524e4c7377ca289e5c 100644
+--- a/hermes_cli/kanban_fairness_store.py
++++ b/hermes_cli/kanban_fairness_store.py
+@@ -147,6 +147,19 @@ def write_manifest(conn: sqlite3.Connection, out: Path, *, board: str, assumptio
+ 
+ 
+ def load(out: Path) -> dict:
++    from hermes_cli.kanban_fairness_root import collect, files
++
++    try:
++        paths, _ = files(out)
++    except (OSError, ValueError):
++        return {"manifest": {}, "records": [], "owners": None, "gaps": [{"code": "capture_bound"}]}
++    capture = collect(out, _load_one(out), _load_one)
++    if any(path.name.endswith(".tmp") for path in paths):
++        capture["gaps"].append({"code": "capture_orphan"})
++    return capture
++
++
++def _load_one(out: Path) -> dict:
+     from hermes_cli.kanban_fairness_tail import validate_tail
+ 
+     capture = segments.load_records(out)
+diff --git a/scripts/kanban_fairness.py b/scripts/kanban_fairness.py
+index 08b8e48d049540ba6a0fc2f6ac01c1432b223b0f..4fdd147cef0dd96547573c51dc1757a0ae9180c6 100644
+--- a/scripts/kanban_fairness.py
++++ b/scripts/kanban_fairness.py
+@@ -28,7 +28,7 @@ import hashlib
+ import json
+ import subprocess
+ import sys
+-import tarfile
++
+ from contextlib import closing
+ from pathlib import Path
+ 
+@@ -85,13 +85,20 @@ def _arm(args) -> int:
+     if (out / PLAN).exists() and not args.replace:
+         print(f"{out / PLAN} exists: this directory already holds a capture", file=sys.stderr)
+         return EXIT_ERROR
+-    out.mkdir(parents=True, exist_ok=True)
++    from hermes_cli.config import load_config
++    from hermes_cli.kanban_fairness_config import DEFAULTS, resolve
++    from hermes_cli import kanban_fairness_budget as budget
++
++    config = load_config()
++    resolve(config)  # Validate the configured ceiling even when runtime capture is off.
++    maximum = config.get("kanban", {}).get("fairness_capture", {}).get("max_bytes", DEFAULTS["max_bytes"])
++    budget.initialize(out, maximum)
+     plan = {"capture_id": args.capture_id, "db": db, "board": args.board, "replica": bool(args.replica),
+             "assumptions": {"clock_error_s": args.clock_error_s, "apply_lag_s": args.apply_lag_s,
+                             "unclaimed_exit": args.unclaimed_exit}}
++    budget.write(out / PLAN, json.dumps(plan, indent=1, sort_keys=True).encode("utf-8"))
+     with _connect(db) as conn:
+         state = journal.arm(conn, args.capture_id, replace=args.replace)
+-        (out / PLAN).write_text(json.dumps(plan, indent=1, sort_keys=True), encoding="utf-8")
+         store.drain(conn, out)
+     _emit({"armed": state, "plan": plan, "acceptance_ready": False})
+     return 0
+@@ -161,11 +168,9 @@ def _inventory(args) -> int:
+ 
+ 
+ def _export(args) -> int:
+-    source = Path(args.input)
+-    with tarfile.open(args.output, "w:gz") as bundle:
+-        for path in sorted(source.iterdir()):
+-            if path.is_file() and not path.name.endswith(".tmp"):
+-                bundle.add(path, arcname=f"{source.name}/{path.name}")
++    from hermes_cli.kanban_fairness_root import export
++
++    export(Path(args.input), Path(args.output))
+     _emit({"output": args.output, "acceptance_ready": False})
+     return 0
+ 
+diff --git a/tests/hermes_cli/test_kanban_fairness_root.py b/tests/hermes_cli/test_kanban_fairness_root.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..519319a90a941da2b4a9010990cad3436f0c980d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_fairness_root.py
+@@ -0,0 +1,206 @@
++"""Root loading must not silently omit runtime producers or their lost tails."""
++import json
++import shutil
++import tarfile
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_fairness_runtime as runtime
++from hermes_cli import kanban_fairness_store as store
++from scripts import kanban_fairness as cli
++
++
++def capture(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    session = runtime.activate(
++        {"kanban": {"fairness_capture": {"enabled": True, "capture_id": "root-test"}}},
++        home=tmp_path, board="default", source_gateway="gateway", board_uid="board", clock_error_ns=0)
++    assert session is not None
++    assert session.enqueue("loss", session.loss_payload("redaction", 1))
++    assert session.close()
++    return session, session.out.parent.parent
++
++
++def test_root_collects_runtime_and_preserves_envelopes(tmp_path, monkeypatch):
++    session, root = capture(tmp_path, monkeypatch)
++    result = store.load(root)
++    assert result["records"] == store.load(session.out)["records"]
++    inventory = json.loads((root / "runtime-epochs.json").read_text())
++    assert inventory["epochs"] == [session.identity]
++
++
++def test_deleted_epoch_remains_expected(tmp_path, monkeypatch):
++    session, root = capture(tmp_path, monkeypatch)
++    shutil.rmtree(session.out)
++    assert "runtime_epoch_missing" in {g["code"] for g in store.load(root)["gaps"]}
++
++
++def test_unregistered_epoch_is_not_ignored(tmp_path, monkeypatch):
++    session, root = capture(tmp_path, monkeypatch)
++    (root / "runtime-epochs.json").unlink(missing_ok=True)
++    result = store.load(root)
++    assert result["records"] == store.load(session.out)["records"]
++    assert "runtime_inventory" in {g["code"] for g in result["gaps"]}
++
++
++def test_export_retains_nested_orphan_and_temporary_evidence(tmp_path, monkeypatch):
++    session, root = capture(tmp_path, monkeypatch)
++    (session.out / "orphan.tmp").write_bytes(b"bounded orphan")
++    empty = root / "runtime" / ("c" * 32)
++    empty.mkdir()
++    assert "capture_orphan" in {g["code"] for g in store.load(root)["gaps"]}
++    target = tmp_path / "capture.tar.gz"
++    assert cli._export(SimpleNamespace(input=str(root), output=str(target))) == 0
++    with tarfile.open(target) as bundle:
++        names = bundle.getnames()
++    assert f"{root.name}/runtime/{session.epoch}/orphan.tmp" in names
++    assert f"{root.name}/runtime/{session.epoch}/manifest.json" in names
++    assert f"{root.name}/runtime/{empty.name}" in names
++
++
++def test_export_refuses_symlinks_and_self_output(tmp_path, monkeypatch):
++    _, root = capture(tmp_path, monkeypatch)
++    with pytest.raises(ValueError):
++        cli._export(SimpleNamespace(input=str(root), output=str(root / "bundle.tar.gz")))
++    (tmp_path / "elsewhere").write_bytes(b"must not export")
++    (root / "escape").symlink_to(tmp_path / "elsewhere")
++    with pytest.raises(ValueError):
++        cli._export(SimpleNamespace(input=str(root), output=str(tmp_path / "bundle.tar.gz")))
++
++
++def test_inventory_survives_deleted_epoch_and_missing_budget(tmp_path, monkeypatch):
++    session, root = capture(tmp_path, monkeypatch)
++    shutil.rmtree(session.out)
++    (root / "capture-budget.json").unlink()
++    assert "runtime_epoch_missing" in {g["code"] for g in store.load(root)["gaps"]}
++
++
++def test_deleted_runtime_tree_and_inventory_leave_gap(tmp_path, monkeypatch):
++    _, root = capture(tmp_path, monkeypatch)
++    shutil.rmtree(root / "runtime")
++    (root / "runtime-epochs.json").unlink()
++    assert "runtime_inventory" in {g["code"] for g in store.load(root)["gaps"]}
++
++
++def test_empty_unregistered_epoch_leaves_gap(tmp_path, monkeypatch):
++    _, root = capture(tmp_path, monkeypatch)
++    (root / "runtime" / ("a" * 32)).mkdir()
++    assert "runtime_inventory" in {g["code"] for g in store.load(root)["gaps"]}
++
++
++def test_scan_precedes_read_and_bounds_export(tmp_path, monkeypatch):
++    from hermes_cli import kanban_fairness_root as assembly
++
++    _, root = capture(tmp_path, monkeypatch)
++    monkeypatch.setattr(assembly, "MAX_ASSEMBLED", 10)
++    monkeypatch.setattr(store, "_load_one", lambda *a: pytest.fail("read before bound"))
++    assert store.load(root)["gaps"] == [{"code": "capture_bound"}]
++    target = tmp_path / "oversize.tar.gz"
++    with pytest.raises(ValueError):
++        assembly.export(root, target)
++    assert not target.exists()
++    assert not list(tmp_path.glob("oversize.tar.gz.*.tmp"))
++
++
++def test_registration_precedes_epoch_directory_and_thread(tmp_path, monkeypatch):
++    from hermes_cli import kanban_fairness_root as assembly
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    original = assembly.register
++    def fail_after_registration(root, identity):
++        original(root, identity)
++        raise OSError("simulated crash before directory")
++    monkeypatch.setattr(assembly, "register", fail_after_registration)
++    with pytest.raises(OSError):
++        runtime.activate({"kanban": {"fairness_capture": {"enabled": True, "capture_id": "crash"}}},
++                         home=tmp_path, board="default", source_gateway="gateway", board_uid="board")
++    root = tmp_path / "kanban/evidence/crash"
++    assert "runtime_epoch_missing" in {g["code"] for g in store.load(root)["gaps"]}
++
++
++def test_arm_ceiling_applies_before_database_activation(tmp_path, monkeypatch):
++    from hermes_cli import config
++    from hermes_cli import kanban_fairness_budget as budget
++
++    monkeypatch.setattr(config, "load_config", lambda: {"kanban": {"fairness_capture": {"max_bytes": 64}}})
++    monkeypatch.setattr(cli, "_connect", lambda *a: pytest.fail("database activated before plan budget"))
++    args = SimpleNamespace(out=str(tmp_path / "small"), db="unused", board="default", replica=False,
++                           replace=False, capture_id="small", clock_error_s=0, apply_lag_s=0,
++                           unclaimed_exit="unknown")
++    with pytest.raises(budget.BudgetExceeded):
++        cli._arm(args)
++    assert budget._limit(tmp_path / "small") == 64
++
++
++def test_export_failure_does_not_publish_or_replace(tmp_path, monkeypatch):
++    from hermes_cli import kanban_fairness_root as assembly
++
++    _, root = capture(tmp_path, monkeypatch)
++    target = tmp_path / "result.tar.gz"
++    def fail(source, paths, stream):
++        stream.write(b"partial")
++        raise OSError("disk failure")
++    monkeypatch.setattr(assembly, "_archive", fail)
++    with pytest.raises(OSError):
++        assembly.export(root, target)
++    assert not target.exists()
++    assert not list(tmp_path.glob("result.tar.gz.*.tmp"))
++    target.write_bytes(b"original")
++    with pytest.raises(ValueError):
++        assembly.export(root, target)
++    assert target.read_bytes() == b"original"
++
++
++def test_fifo_refused_before_loader(tmp_path, monkeypatch):
++    import os
++
++    _, root = capture(tmp_path, monkeypatch)
++    os.mkfifo(root / "manifest.json")
++    monkeypatch.setattr(store, "_load_one", lambda *a: pytest.fail("FIFO was read"))
++    assert store.load(root)["gaps"] == [{"code": "capture_bound"}]
++
++
++def test_missing_inventory_cannot_be_recreated(tmp_path, monkeypatch):
++    from hermes_cli import kanban_fairness_root as assembly
++
++    session, root = capture(tmp_path, monkeypatch)
++    (root / assembly.INVENTORY).unlink()
++    with pytest.raises(ValueError, match="inventory missing"):
++        assembly.register(root, {**session.identity, "source_epoch": "b" * 32})
++    assert not (root / assembly.INVENTORY).exists()
++
++
++def _register_process(root, epoch, barrier):
++    from hermes_cli import kanban_fairness_root as assembly
++
++    barrier.wait(timeout=15)
++    assembly.register(root, dict(capture_id="parallel", source_gateway="gateway", board_uid="board",
++                                 source_epoch=epoch, clock_error_ns=None))
++
++
++def test_concurrent_registration_keeps_every_expected_epoch(tmp_path):
++    import multiprocessing
++    from hermes_cli import kanban_fairness_budget as budget
++    from hermes_cli import kanban_fairness_root as assembly
++
++    root = tmp_path / "parallel"
++    budget.initialize(root)
++    context = multiprocessing.get_context("spawn")
++    barrier = context.Barrier(3)
++    epochs = ["a" * 32, "b" * 32]
++    processes = [context.Process(target=_register_process, args=(root, epoch, barrier)) for epoch in epochs]
++    try:
++        for process in processes:
++            process.start()
++        barrier.wait(timeout=15)
++        for process in processes:
++            process.join(15)
++            assert process.exitcode == 0
++        assert set(assembly.inventory(root)) == set(epochs)
++        assert "runtime_epoch_missing" in {g["code"] for g in store.load(root)["gaps"]}
++    finally:
++        for process in processes:
++            if process.is_alive():
++                process.terminate()
++                process.join(3)
+-- 
+2.43.0
+

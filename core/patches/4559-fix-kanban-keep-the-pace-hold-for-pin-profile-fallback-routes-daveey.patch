@@ -1,0 +1,91 @@
+From dcc514c1085c0e80565f13e99ffb97d4e4483bed Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 19:04:38 +0000
+Subject: [PATCH] fix(kanban): keep the pace hold for pin/profile fallback
+ routes [daveey]
+
+Review 5912306106 (t_425ddae2883cea22) on #3301 @34b16123cb: when the tier
+resolver chooses no route (tier off, or the assignee outside
+default_model_profiles), candidate_route judged the card on its profile
+fallback route and the governor offered a Grok move bound to that route.
+The applier consumes the offer with the resolver's own (None, None), so
+take() discarded it as a mismatch after hold() had already released the
+card: it launched on its paced profile route.
+
+candidate_route now returns no route when the tier resolver chose none,
+and _pace_alternate keeps the hold for such cards (base behaviour). The
+providers it judges are unchanged.
+
+RED->GREEN: test_profile_fallback_route_keeps_the_hold[tier-off,
+out-of-scope] (fail at 34b16123cb, pass here; assert no spawn, llm_pacing
+hold, fresh owner route (None, None)). 30 importer files / 772 tests pass.
+---
+ hermes_cli/kanban_llm_pacing_dispatch.py     | 11 ++++++++---
+ tests/hermes_cli/test_kanban_pace_reroute.py | 15 +++++++++++++++
+ 2 files changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_llm_pacing_dispatch.py b/hermes_cli/kanban_llm_pacing_dispatch.py
+index 420ddb216f2fd66fe8d7a50fbf2cc766d8c3545b..316ecd85ab1902f9ae9a2c8dd2a614f015007cc3 100644
+--- a/hermes_cli/kanban_llm_pacing_dispatch.py
++++ b/hermes_cli/kanban_llm_pacing_dispatch.py
+@@ -144,16 +144,19 @@ def _route_providers(model: Optional[str], provider: Optional[str]) -> list[str]
+     return [name] if name else []
+ 
+ 
+-def candidate_route(conn: sqlite3.Connection, task: Any, lane: str) -> tuple[tuple, list[str]]:
++def candidate_route(conn: sqlite3.Connection, task: Any, lane: str) -> tuple[Optional[tuple], list[str]]:
+     """``((model, provider, reason), providers)``: the card's next-run route and the providers it may land on
+-    (``[]`` = unknown, the card starts)."""
++    (``[]`` = unknown, the card starts). The route is None when the tier resolver chose none (tier off, a profile
++    outside its scope): the card then launches on its own pin or profile route, which the route applier never
++    rewrites, so no pace move can apply to it (review 5912306106). [daveey]"""
+     from hermes_cli.kanban_model_tier import profile_route, resolve_dispatch_tier
+     model, provider, reason = resolve_dispatch_tier(conn, task, lane=lane)
++    route = (model, provider, reason) if model else None
+     if not model:
+         model, provider = getattr(task, "model_override", None), getattr(task, "provider_override", None)
+     if not model:
+         model, provider = profile_route(getattr(task, "assignee", None))
+-    return (model, provider, reason), _route_providers(model, provider)
++    return route, _route_providers(model, provider)
+ 
+ 
+ def candidate_providers(conn: sqlite3.Connection, task: Any, lane: str) -> list[str]:
+@@ -327,6 +330,8 @@ def _pace_alternate(conn: sqlite3.Connection, task: Any, lane: str, cfg: lp.Paci
+     (t_d943a79dd2b3889f). Any fault keeps the hold (warned)."""
+     try:
+         route = candidate_route(conn, task, lane)[0]
++        if route is None:
++            return None  # a pin/profile fallback route is launched as is: holding is the only safe answer
+         return _pace_alternate_route(conn, task, route, lane, cfg, host, verdicts)
+     except Exception as exc:  # health: allow BLE001 -- a failed probe keeps today's hold, never starts a paced card
+         _warn("alternate", "kanban pacing: pace alternate probe failed (%s: %s); holding", type(exc).__name__, exc)
+diff --git a/tests/hermes_cli/test_kanban_pace_reroute.py b/tests/hermes_cli/test_kanban_pace_reroute.py
+index 4b6f9553b6a14aa74b33859663bb4c5f4b9250e5..95775c0e34ed38316a7c84d117e89d872031a183 100644
+--- a/tests/hermes_cli/test_kanban_pace_reroute.py
++++ b/tests/hermes_cli/test_kanban_pace_reroute.py
+@@ -227,6 +227,21 @@ def test_alternate_probe_fault_keeps_the_hold(pool, monkeypatch):
+     assert seen == [] and result.clock_held[tid][0] == lp.GUARD_REASON
+ 
+ 
++@pytest.mark.parametrize("config", [{}, {**POOL_CFG, "default_model_profiles": ["other"]}], ids=["tier-off", "out-of-scope"])
++def test_profile_fallback_route_keeps_the_hold(pool, monkeypatch, config):
++    """A route the tier resolver did not choose (tier off, or a profile outside its scope) falls back to the profile's
++    own route, which the route applier never persists: a pace move there would be dropped after releasing the hold and
++    the card would launch on the paced profile route (review 5912306106). It keeps the hold."""
++    monkeypatch.setattr(tier, "load_tier_config", lambda: config)
++    monkeypatch.setattr(tier, "profile_route", lambda *_: ("gpt-6-astra", "openai-codex"))
++    _pools(monkeypatch, {"anthropic": 99, "openai-codex": 99})
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="routine work", assignee="a")
++        seen, result = _dispatch(conn)
++        assert tier.owner_model_pin(conn, kb.get_task(conn, tid)) == (None, None)
++    assert seen == [] and result.clock_held[tid][0] == lp.GUARD_REASON
++
++
+ def test_offer_applies_only_to_the_route_it_judged():
+     reroute.clear()
+     reroute.offer("t1", ("gpt-6-astra", "openai-codex"), ("grok-4.7", "xai-oauth", "openai-codex"))
+-- 
+2.43.0
+

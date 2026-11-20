@@ -1,0 +1,361 @@
+From dc21a391884c6ef36ee42d8ce40266631a95aec8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 05:29:30 +0000
+Subject: [PATCH] [daveey] scratch GC: preserve unreadable nested Git repos as
+ complete filesystem bytes
+
+Problem: worker-2 retained seven terminal scratch trees (~2 GB) across repeated
+hourly passes because Git inspection failed before complete payload creation.
+
+Five whys (happened):
+1. Trees survive retention because archive_workspace raises ArchiveRefused.
+2. Git cannot inspect malformed/unsupported MIDX, missing blobs, broken repo
+   metadata or vanished alternate object paths (the latter is not ref normalization).
+3. archive_repo is mandatory and precedes _write_payload; omission planning can
+   decline optimization, but subsequent Git inspection aborts the whole archive.
+4. Optional Git summaries were treated as a prerequisite to preserving bytes,
+   despite the independently verified complete filesystem payload.
+5. Coverage encoded malformed repo shapes as permanent refusals instead of
+   checking that existing source bytes remain recoverable without Git.
+
+Root (not caught): keep reasons formerly stayed in rotating core logs; the
+scheduled wrapper returned success for completed sweeps and healthy free space,
+not zero retained trees. #3114/#3117 exposed the backlog, but changed reporting
+only. Existing partial-clone and shape fixes did not cover interpretation errors.
+Recurrence: follows 2567ea4e31 / 707cac9f6e; those repaired specific shapes, not
+this pre-payload prerequisite. The symlinked-home fix is independent.
+
+Countermeasure: distinguish read-only Git inspection failures from archive
+write/verification failures. Discard ALL optional output and omission plans on
+inspection failure, then preserve the entire workspace through the existing
+verified, fsynced, mutation-fenced filesystem payload. Record git-fallback.json.
+No source tree is deleted by fallback; existing GC custody/ownership/detach
+fences still authorize removal. Existing missing objects are not repaired.
+External gitdirs remain fail-closed (external_gitdir); unsafe discovery, payload,
+fsync, and bundle verification failures still refuse. Disabled scratch retention
+already logs reason=retention_disabled. Worker no-archive policy applies to its
+separate linked-worktree sweep, not this Kanban scratch path.
+
+worker-workspace-gc.last.json ok remains correctly defined as successful sweep
+execution plus >=25 GiB free capacity, not reclamation completeness. Detailed
+keeps are now relayed; no state change required.
+
+Proof:
+- Base 5ae5b5e9e5: 9/9 new regressions RED, five injected rc128 classes and four
+  real malformed-MIDX/missing-blob/broken-repo/vanished-alternate fixtures.
+- 12 archive consumer test files: 352 passed; focused final suite: 18 passed.
+- Payload/verify/fsync/detach failures, external gitdir, disabled retention and
+  partial-output/omission disposal covered. Every source file compared bytewise.
+- Removing external-gitdir guard: 1 failure; broadening classification to archive
+  writes/verification: 2 failures. Mutants restored; final suite green.
+- scripts/check --base origin/main: 20 checks passed.
+
+Live acceptance remains on t_08eee0f380afe546: merged revision installed on worker-2
+and a natural scheduled GC pass after refusal backoff, never a card-shell GC.
+---
+ hermes_cli/kanban_scratch_archive.py          |  30 ++--
+ hermes_cli/kanban_scratch_archive_fallback.py |  41 +++++
+ .../test_kanban_scratch_archive_shapes.py     |  10 +-
+ .../test_kanban_scratch_git_fallback.py       | 152 ++++++++++++++++++
+ 4 files changed, 218 insertions(+), 15 deletions(-)
+ create mode 100644 hermes_cli/kanban_scratch_archive_fallback.py
+ create mode 100644 tests/hermes_cli/test_kanban_scratch_git_fallback.py
+
+diff --git a/hermes_cli/kanban_scratch_archive.py b/hermes_cli/kanban_scratch_archive.py
+index cc874527ec4b30e71420f542ab85b7cab2a96986..d21492ee40c05a3dfba312db5892f5369a082474 100644
+--- a/hermes_cli/kanban_scratch_archive.py
++++ b/hermes_cli/kanban_scratch_archive.py
+@@ -56,6 +56,12 @@ Shapes that used to refuse forever archive too (``kanban_scratch_archive_shapes`
+   are no longer bundled, and a ref needing objects the promisor remote vouches
+   for is left to the payload (``promised_refs``).
+ 
++Git inspection errors (unsupported metadata, missing objects, or invalid alternate
++paths) fall back to the complete filesystem payload, with no omissions or Git-shaped
++summaries anywhere in that workspace. ``git-fallback.json`` records the cause.
++This preserves existing bytes; it does not repair objects already missing from the
++source. A workspace referencing an external gitdir cannot use that fallback.
++
+ Anything it cannot prove safe keeps the workspace: a ``.git`` symlink, a gitlink
+ whose gitdir is missing or empty, a device node, unpushed objects that are
+ missing locally and vouched for by no promisor remote (reason
+@@ -87,6 +93,10 @@ class ArchiveRefused(Exception):
+     """The tree must be kept; the message says why."""
+ 
+ 
++class GitInspectionFailed(ArchiveRefused):
++    """Git cannot interpret local metadata; a complete filesystem payload can retain it."""
++
++
+ def find_repos(root: Path) -> list[Path]:
+     """Standalone repos (a ``.git`` directory) below *root*, *root* included.
+ 
+@@ -234,7 +244,12 @@ def _git(repo: Path, env: dict[str, str], *args: str, ok=(0,), stdin: Optional[b
+     )
+     if proc.returncode not in ok:
+         err = proc.stderr.decode("utf-8", "replace").strip()[:500]
+-        raise ArchiveRefused(f"git {' '.join(args[:3])} failed in {repo} (rc {proc.returncode}): {err}")
++        # Failure to interpret a repo is distinct from a failed archive write/verification.
++        refusal = GitInspectionFailed if args[0] in {
++            "rev-parse", "symbolic-ref", "remote", "config", "for-each-ref", "rev-list",
++            "diff", "ls-files", "cat-file",
++        } else ArchiveRefused
++        raise refusal(f"git {' '.join(args[:3])} failed in {repo} (rc {proc.returncode}): {err}")
+     return proc
+ 
+ 
+@@ -900,16 +915,9 @@ def archive_workspace(workspace: Path, archive_dir: Path, *, task_id: str,
+         partial.mkdir(parents=True)
+         payload = partial / PAYLOAD_DIR
+         payload.mkdir()
+-        plans, records = _omission_plans(workspace, repos, payload)
+-        for repo in repos:
+-            rel = repo.relative_to(workspace)
+-            archive_repo(repo, partial / rel if rel.parts else partial,
+-                         task_id=task_id, completed_at=completed_at, omitted=records.get(repo))
+-        for repo, kwargs in ([(r, {"bare": True}) for r in layout.bare]
+-                             + [(w, {"gitdir": g}) for w, g in sorted(layout.linked.items())]):
+-            rel = repo.relative_to(workspace)
+-            archive_repo(repo, partial / rel if rel.parts else partial,
+-                         task_id=task_id, completed_at=completed_at, **kwargs)
++        from hermes_cli.kanban_scratch_archive_fallback import prepare
++        plans, records = prepare(workspace, partial, payload, layout,
++                                 task_id=task_id, completed_at=completed_at)
+         omitter = None
+         if plans:
+             from hermes_cli.kanban_scratch_archive_omit import Omitter
+diff --git a/hermes_cli/kanban_scratch_archive_fallback.py b/hermes_cli/kanban_scratch_archive_fallback.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..93023aac4bd5c8406d5ddfb82043a7fee023564b
+--- /dev/null
++++ b/hermes_cli/kanban_scratch_archive_fallback.py
+@@ -0,0 +1,41 @@
++"""Optional Git-shaped archive preparation; unreadable repositories remain plain bytes."""
++from __future__ import annotations
++
++import json
++import shutil
++
++
++def prepare(workspace, partial, payload, layout, *, task_id, completed_at):
++    """Return omission plans/records, or reset to a lossless filesystem-only archive.
++
++    A Git inspection failure says nothing about whether files can be preserved.
++    Throw away ALL optional output/plans before falling back: an earlier healthy
++    repo may have produced an omission plan, or the failing one a partial diff.
++    Do not catch payload, discovery, durability or archive-verification failures.
++    External gitdirs are not self-contained; retain their existing refusal path.
++    """
++    from hermes_cli import kanban_scratch_archive as sa
++
++    try:
++        plans, records = sa._omission_plans(workspace, layout.repos, payload)
++        shaped = ([(r, {"omitted": records.get(r)}) for r in layout.repos]
++                  + [(r, {"bare": True}) for r in layout.bare]
++                  + [(w, {"gitdir": g}) for w, g in sorted(layout.linked.items())])
++        for repo, kwargs in shaped:
++            rel = repo.relative_to(workspace)
++            sa.archive_repo(repo, partial / rel if rel.parts else partial,
++                            task_id=task_id, completed_at=completed_at, **kwargs)
++        return plans, records
++    except sa.GitInspectionFailed as exc:
++        if any(not inside for _, inside in layout.linked.values()):
++            raise sa.ArchiveRefused(f"external_gitdir: filesystem fallback not self-contained: {exc}") from exc
++        # Only the unpublished temporary archive is removed, never source bytes.
++        shutil.rmtree(partial)
++        payload.mkdir(parents=True)
++        (payload / "git-fallback.json").write_text(json.dumps({
++            "mode": "complete-filesystem", "reason": str(exc),
++            "note": "All workspace bytes retained without Git omissions. This preserves existing "
++                    "data, not objects already absent from the source; Git repair may still be needed.",
++        }, indent=2) + "\n", encoding="utf-8")
++        sa.log.warning("Scratch archive filesystem fallback: task=%s path=%s; %s", task_id, workspace, exc)
++        return [], {}
+diff --git a/tests/hermes_cli/test_kanban_scratch_archive_shapes.py b/tests/hermes_cli/test_kanban_scratch_archive_shapes.py
+index 3c3f2e4862eb783b19c6a3a338b9b0b071fa8108..b3682d78fa396a7d4fc41098b8d02f9163356cb0 100644
+--- a/tests/hermes_cli/test_kanban_scratch_archive_shapes.py
++++ b/tests/hermes_cli/test_kanban_scratch_archive_shapes.py
+@@ -215,7 +215,7 @@ def test_workspace_root_that_is_a_bare_repo(board, remote):
+     assert _meta(tid, ".")["bare"] is True
+ 
+ 
+-def test_directory_that_only_looks_bare_refuses(board):
++def test_directory_that_only_looks_bare_is_preserved_as_bytes(board):
+     from hermes_cli import kanban_scratch_archive as sa
+ 
+     def build(p):
+@@ -225,9 +225,11 @@ def test_directory_that_only_looks_bare_refuses(board):
+         (fake / "HEAD").write_text("not a ref\n")
+ 
+     tid, path = base._plain_task(build)
+-    with pytest.raises(sa.ArchiveRefused):
+-        sa.archive_workspace(path, _archive(tid), task_id=tid, completed_at=base.OLD)
+-    assert _gc() == 0 and (path / "fixture" / "HEAD").exists()
++    assert _gc() == 0 and not path.exists()
++    manifest = sa.verify_complete_archive(_archive(tid))
++    assert manifest["version"] == 1
++    with tarfile.open(_archive(tid) / sa.PAYLOAD_DIR / "tree.tar.gz", "r:gz") as tar:
++        assert tar.extractfile("fixture/HEAD").read() == b"not a ref\n"
+ 
+ 
+ # --- 3. linked worktrees and submodules ----------------------------------------------------
+diff --git a/tests/hermes_cli/test_kanban_scratch_git_fallback.py b/tests/hermes_cli/test_kanban_scratch_git_fallback.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..06d26c4ec92541af4bff27ec07775d3a25898e61
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_scratch_git_fallback.py
+@@ -0,0 +1,152 @@
++"""Unreadable nested Git metadata must not prevent byte-preserving scratch GC."""
++import json
++import subprocess
++import tarfile
++
++import pytest
++
++from hermes_cli import kanban_scratch_archive as sa
++from hermes_cli import kanban_worktree_gc as gc
++from hermes_cli import kanban_db_connect as kbc
++from tests.hermes_cli import test_kanban_scratch_gc_archive as helpers
++
++board = helpers.board
++remote = helpers.remote
++
++FAILURES = [
++    ("rev-parse", "fatal: multi-pack-index version 51 not recognized"),
++    ("diff", "fatal: unable to read c6d5e1cc43a100ce951cd81e1333c30068760ebd"),
++    ("ls-files", "warning: lazy fetching disabled; some objects may not be available\n"
++     "fatal: could not fetch 8b2b70395ecd6ebcedfaac2e744a2d27f893de7f from promisor remote"),
++    ("rev-parse", "fatal: not a git repository (or any of the parent directories): .git"),
++    ("for-each-ref", "error: unable to normalize alternate object path: /missing/objects"),
++]
++
++
++def inject_git_failure(monkeypatch, repo, command, error):
++    run = subprocess.run
++    hits = []
++
++    def fail(argv, *args, **kwargs):
++        if argv[:3] == ["git", "-C", str(repo)] and argv[3] == command:
++            hits.append(argv)
++            return subprocess.CompletedProcess(argv, 128, b"", error.encode())
++        return run(argv, *args, **kwargs)
++
++    monkeypatch.setattr(sa.subprocess, "run", fail)
++    return hits
++
++
++def assert_bytes_recovered(tid, before):
++    archive = helpers._archive(tid)
++    manifest = sa.verify_complete_archive(archive)
++    assert manifest["version"] == 1  # no objects or clean worktree files omitted
++    with tarfile.open(archive / sa.PAYLOAD_DIR / "tree.tar.gz", "r:gz") as tar:
++        actual = {m.name: tar.extractfile(m).read() for m in tar if m.isfile()}
++    assert actual == before
++    return json.loads((archive / sa.PAYLOAD_DIR / "git-fallback.json").read_text())
++
++
++@pytest.mark.parametrize("command,error", FAILURES)
++def test_git_128_archives_every_byte_then_gc_removes(board, remote, monkeypatch, command, error):
++    tid, path = helpers._task(remote=remote)
++    repo = path / "repo"
++    (repo / "tracked.txt").write_text("unpublished edit\n")
++    (repo / ".gitignore").write_text("ignored\n")
++    (repo / "ignored").write_bytes(b"ignored evidence\x00")
++    before = {str(p.relative_to(path)): p.read_bytes() for p in path.rglob("*") if p.is_file()}
++    hits = inject_git_failure(monkeypatch, repo, command, error)
++    with kbc.connect_closing() as conn:
++        assert gc.gc_task_scratch(conn, older_than_days=7) == 1
++    assert hits and not path.exists()
++    fallback = assert_bytes_recovered(tid, before)
++    assert error in fallback["reason"]
++    assert fallback["mode"] == "complete-filesystem"
++
++
++@pytest.mark.parametrize("kind", ["broken", "midx", "missing-blob", "alternate"])
++def test_real_unreadable_nested_repo(board, remote, kind):
++    tid, path = helpers._task(remote=remote)
++    repo = path / "repo"
++    gitdir = repo / ".git"
++    if kind == "broken":
++        (gitdir / "HEAD").unlink()
++    elif kind == "midx":
++        (gitdir / "objects" / "pack" / "multi-pack-index").write_bytes(b"MIDX\x33\x01\x00\x00" + b"\x00" * 24)
++    elif kind == "missing-blob":
++        oid = helpers._run("rev-parse", "HEAD:tracked.txt", cwd=repo)
++        (gitdir / "objects" / oid[:2] / oid[2:]).unlink()
++        (repo / "tracked.txt").write_text("unpublished change\n")
++    else:
++        helpers._run("clone", "-q", "--bare", "--shared", str(remote), str(path / "bare.git"))
++        (path / "bare.git" / "objects" / "info" / "alternates").write_text("/missing/objects\n")
++    before = {str(p.relative_to(path)): p.read_bytes() for p in path.rglob("*") if p.is_file()}
++    with kbc.connect_closing() as conn:
++        assert gc.gc_task_scratch(conn, older_than_days=7) == 1
++    assert not path.exists()
++    fallback = assert_bytes_recovered(tid, before)
++    assert "rc 128" in fallback["reason"]
++
++
++def test_discards_earlier_omissions_and_partial_git_outputs(board, remote, monkeypatch):
++    tid, path = helpers._task(remote=remote)
++    repo = path / "repo"
++    before = {str(p.relative_to(path)): p.read_bytes() for p in path.rglob("*") if p.is_file()}
++
++    def prepared(workspace, repos, payload):
++        (payload / "unused.pack").write_bytes(b"partial supplement")
++        return [{"invalid_if_used": True}], {repo: {"invalid_if_used": True}}
++
++    def fail_after_write(repo, dest, **kwargs):
++        dest.mkdir(parents=True, exist_ok=True)
++        (dest / "tracked.diff").write_bytes(b"incomplete diff")
++        raise sa.GitInspectionFailed("git diff failed (rc 128)")
++
++    monkeypatch.setattr(sa, "_omission_plans", prepared)
++    monkeypatch.setattr(sa, "archive_repo", fail_after_write)
++    with kbc.connect_closing() as conn:
++        assert gc.gc_task_scratch(conn, older_than_days=7) == 1
++    assert_bytes_recovered(tid, before)
++    assert not (helpers._archive(tid) / "repo").exists()
++    assert not (helpers._archive(tid) / sa.PAYLOAD_DIR / "unused.pack").exists()
++
++
++@pytest.mark.parametrize("seam", ["_write_payload", "verify_complete_archive", "_fsync_tree", "check_snapshot"])
++def test_fallback_keeps_all_payload_and_detach_guards(board, remote, monkeypatch, seam):
++    tid, path = helpers._task(remote=remote)
++    inject_git_failure(monkeypatch, path / "repo", "rev-parse", "broken repo")
++
++    def refuse(*args, **kwargs):
++        raise sa.ArchiveRefused("guard proof")
++
++    monkeypatch.setattr(sa, seam, refuse)
++    with kbc.connect_closing() as conn:
++        assert gc.gc_task_scratch(conn, older_than_days=7) == 0
++    assert (path / "repo" / "tracked.txt").read_text() == "one\n"
++    assert not [kind for kind, _ in helpers._events(tid) if kind == "workspace_archived"]
++
++
++def test_external_gitdir_remains_fail_closed(board, remote, monkeypatch, caplog):
++    _, path = helpers._task(remote=remote)
++    helpers._run("worktree", "add", "-q", "-b", "outside", str(path / "linked"), cwd=remote)
++    inject_git_failure(monkeypatch, path / "repo", "rev-parse", "broken repo")
++    with kbc.connect_closing() as conn:
++        assert gc.gc_task_scratch(conn, older_than_days=7) == 0
++    assert path.exists() and "external_gitdir" in caplog.text
++
++
++@pytest.mark.parametrize("command", ["bundle", "index-pack"])
++def test_archive_write_or_verification_errors_are_not_inspection_failures(board, remote, monkeypatch, command):
++    inject_git_failure(monkeypatch, remote, command, "archive failed")
++    with pytest.raises(sa.ArchiveRefused) as caught:
++        sa._git(remote, sa._env(remote), command, "verify")
++    assert not isinstance(caught.value, sa.GitInspectionFailed)
++
++
++def test_disabled_retention_is_logged_without_inspecting_git(board, remote, monkeypatch, caplog):
++    _, path = helpers._task(remote=remote)
++    hits = inject_git_failure(monkeypatch, path / "repo", "rev-parse", "broken repo")
++    with kbc.connect_closing() as conn:
++        assert gc.gc_task_scratch(conn, older_than_days=0) == 0
++    assert path.exists() and not hits
++    assert "reason=retention_disabled" in caplog.text
+-- 
+2.43.0
+

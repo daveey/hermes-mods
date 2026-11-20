@@ -1,0 +1,98 @@
+From ad30d197cbd1b806c347eca32761b28e23818027 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 15:56:05 +0000
+Subject: [PATCH] fix(kanban): retain audited notice governor boundary [daveey]
+
+---
+ hermes_cli/kanban_notice_verdict.py                 |  9 ++++-----
+ hermes_cli/kanban_parent_unclaimed.py               | 13 +++++++++----
+ .../test_kanban_notice_recorded_verdict.py          |  2 +-
+ 3 files changed, 14 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_cli/kanban_notice_verdict.py b/hermes_cli/kanban_notice_verdict.py
+index 205c8bd55f75d263462b4bc57737a38b14f165f8..3fa8a38813cc18715f71289bab7c3ab679f8da98 100644
+--- a/hermes_cli/kanban_notice_verdict.py
++++ b/hermes_cli/kanban_notice_verdict.py
+@@ -4,12 +4,11 @@ from __future__ import annotations
+ import logging
+ 
+ from hermes_cli import kanban_dispatch_skip as skips
+-from hermes_cli import kanban_llm_pacing_dispatch as pacing
+ 
+ _log = logging.getLogger(__name__)
+ 
+ 
+-def fields(conn, task_id, place, ready_seconds):
++def fields(conn, task_id, place, ready_seconds, read_pacing):
+     """Newest capable verdict in this ready episode, without replacing a queue-provided skip.
+ 
+     Ordering verdicts remain ordinary capacity advice. Recorder-only eligibility failures are not verdicts on the
+@@ -25,9 +24,9 @@ def fields(conn, task_id, place, ready_seconds):
+         return carried
+     admission = {"reason": skips.LLM_PACED, "status": "held", "providers": verdict.get("providers", [])}
+     try:
+-        paces = pacing.paced_pools(conn, task_id)
+-        if paces:
+-            admission = {**pacing.admission(paces), "reason": skips.LLM_PACED}
++        current = read_pacing(conn, task_id)
++        if current:
++            admission = {**current, "reason": skips.LLM_PACED}
+     except Exception:  # health: allow BLE001 -- keep the recorded verdict if the advisory governor read fails
+         _log.debug("notice: pacing read unavailable for %s", task_id, exc_info=True)
+     return {**carried, "admission": admission}
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index 377a8eee36b8df507785f4c1a2c37bb2a404fed2..2e5653b61f2c941465da4a4fd8bd7e9ed4d840cd 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -239,6 +239,13 @@ def _already_posted(conn, task_id: str, waiting_on: str, wait_key: Any, kind: st
+                                         (task_id, kind)))
+ 
+ 
++def _read_pacing(conn, task_id):
++    """Keep advisory governor access at the notice's audited read-only boundary."""
++    from hermes_cli import kanban_llm_pacing_dispatch as pacing
++    paces = pacing.paced_pools(conn, task_id)
++    return pacing.admission(paces) if paces else None
++
++
+ def _pacing_admission(conn, task_id: str, place: dict[str, Any], extra: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+     """The ``admission`` for a card that only other machines can lease while this gateway's own LLM pacing governor
+     holds every provider it may run on (t_01a1db9d9538716b); None otherwise, so the notice keeps its words.
+@@ -253,11 +260,9 @@ def _pacing_admission(conn, task_id: str, place: dict[str, Any], extra: Optional
+         return None  # every machine that could lease it is on hold or draining: that wait ends differently
+     try:
+         from hermes_cli import kanban_dispatch_skip as skips
+-        from hermes_cli import kanban_llm_pacing_dispatch as pacing
+         if not all(skips.recorder_cannot_lease(skip) for skip in skips.episode_skips(conn, task_id)):
+             return None  # a dispatcher able to lease it recorded a verdict: the notice does not talk over it
+-        paces = pacing.paced_pools(conn, task_id)
+-        return pacing.admission(paces) if paces else None
++        return _read_pacing(conn, task_id)
+     except Exception:  # health: allow BLE001 -- the governor read is advisory; the notice still goes out as before
+         _log.debug("parent-unclaimed: pacing read unavailable for %s", task_id, exc_info=True)
+         return None
+@@ -292,7 +297,7 @@ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_se
+     busy = klb.busy(place.get("backlog"))
+     from hermes_cli import kanban_notice_verdict
+     verdict = ({} if busy or (extra or {}).get("core_update_hold") else
+-               kanban_notice_verdict.fields(conn, waiting_on, place, ready_seconds))
++               kanban_notice_verdict.fields(conn, waiting_on, place, ready_seconds, _read_pacing))
+     observed = {"board": place.get("board") or khc.board_of(conn), "observed_at": place.get("observed_at") or int(time.time()),
+                 "admission": ({"reason": "core_update_hold", "status": "held"} if (extra or {}).get("core_update_hold")
+                               else {"reason": klb.REASON, "status": "queued"} if busy
+diff --git a/tests/hermes_cli/test_kanban_notice_recorded_verdict.py b/tests/hermes_cli/test_kanban_notice_recorded_verdict.py
+index 53e2b35e65fdd3adeb7ccdcfd60a85b22920979c..c6624d21d827a3da72b2990aabadbf928d7b9d9a 100644
+--- a/tests/hermes_cli/test_kanban_notice_recorded_verdict.py
++++ b/tests/hermes_cli/test_kanban_notice_recorded_verdict.py
+@@ -60,7 +60,7 @@ def test_verdict_carriage_boundaries(hub, case):
+         assert skips.record(hub.conn, tid, "claim_deferred", detail="capacity")
+     elif case == "recorder":
+         assert skips.record(hub.conn, tid, "skipped_ineligible", detail="labels_mismatch")
+-    assert nv.fields(hub.conn, tid, place, 2400) == {}
++    assert nv.fields(hub.conn, tid, place, 2400, pu._read_pacing) == {}
+ 
+ 
+ @pytest.mark.parametrize("precedence", ["busy", "core_update"])
+-- 
+2.43.0
+

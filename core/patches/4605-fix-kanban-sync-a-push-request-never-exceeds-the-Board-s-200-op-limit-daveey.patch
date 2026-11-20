@@ -1,0 +1,145 @@
+From ff729d1c405c821f7310b326b66efa10db8a4834 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 13:36:40 -0800
+Subject: [PATCH] fix(kanban-sync): a push request never exceeds the Board's
+ 200-op limit [daveey]
+
+push() sent the unacknowledged parent cards on top of a full PUSH_BATCH of
+rows, so one such card behind 200 pending rows made a 201-op request. The
+Board answered 400 'ops must be a list of <= 200', the same rows were
+selected again, and hermes-hub pushed nothing from 2026-11-17 14:38Z
+(80,641 pending ops, 39k attempts on the head rows). Trim the rows so
+parents + rows fit the limit; the rest go in the next batch.
+
+The fake Board now enforces the limit; the new test fails without the fix.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_sync_client.py              | 15 ++++-
+ tests/hermes_cli/kanban_sync_fake_board.py    |  2 +
+ .../test_kanban_sync_push_batch_cap.py        | 67 +++++++++++++++++++
+ 3 files changed, 83 insertions(+), 1 deletion(-)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_push_batch_cap.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 52eac024895ca8ba4209da20d5afe870f4471764..0e8f914041426338d1b5152a57ffc2ababe0996d 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -662,6 +662,19 @@ class PushResult:
+     deferred: int = 0
+ 
+ 
++def _within_batch(conn: sqlite3.Connection, rows: list[dict], wire: list[dict],
++                  gateway: str) -> tuple[list[dict], list[dict], list[tuple[dict, str]]]:
++    """``(rows, wire, parents)`` trimmed so parents + rows fit one request. The Board refuses more than PUSH_BATCH
++    ops (400), and the parents ride on top of a full batch: one unacknowledged card behind 200 pending rows failed
++    every round with 201 ops and nothing left the hub for 7 h (2026-11-17). The dropped rows go in the next batch."""
++    parents = _unacked_parents(conn, rows, gateway)
++    if len(parents) + len(rows) > PUSH_BATCH:
++        rows = rows[:max(1, PUSH_BATCH - len(parents))]
++        wire = wire[:len(rows)]
++        parents = _unacked_parents(conn, rows, gateway)
++    return rows, wire, parents
++
++
+ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primary: bool,
+          max_batches: int = MAX_BATCHES_PER_ROUND, before_head: bool = False,
+          seen: Optional[dict] = None) -> PushResult:
+@@ -689,7 +702,7 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+         with write_txn(conn):
+             from hermes_cli.kanban_terminal_guard import strip_stale_push  # no wake reopens a done card [daveey]
+             wire = [strip_stale_push(conn, translate(_full_row_if_unseen(conn, r), _next_hlc(conn, gateway))) for r in rows]
+-            parents = _unacked_parents(conn, rows, gateway)
++            rows, wire, parents = _within_batch(conn, rows, wire, gateway)
+             wire = [op for op, _tid in parents] + wire
+         try:
+             resp = hub.ops(board, wire)
+diff --git a/tests/hermes_cli/kanban_sync_fake_board.py b/tests/hermes_cli/kanban_sync_fake_board.py
+index 76463879d4f9025090d160445336ac720dd5e935..c997365d060d80091a803d01f2bfa64eab762496 100644
+--- a/tests/hermes_cli/kanban_sync_fake_board.py
++++ b/tests/hermes_cli/kanban_sync_fake_board.py
+@@ -451,6 +451,8 @@ class FakeHub:
+     def ops(self, board: str, ops: list[dict]) -> dict:
+         self._check()
+         self.svc.calls.append(("ops", board, ops))
++        if len(ops) > 200:  # the real Board's request limit
++            raise ksc.HubError(400, '{"error":"ops must be a list of <= 200"}')
+         b = self.svc.board(board)
+         results = []
+         for op in ops:
+diff --git a/tests/hermes_cli/test_kanban_sync_push_batch_cap.py b/tests/hermes_cli/test_kanban_sync_push_batch_cap.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8abfbaf4fbe94ef0ff872a3e10f62d759008fc26
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_push_batch_cap.py
+@@ -0,0 +1,67 @@
++"""A push request never exceeds the Board's 200-op limit (2026-11-17 incident).
++
++``push`` selects up to PUSH_BATCH pending rows and sends the unacknowledged cards those rows belong to ahead of
++them. With a full batch and one such card the request was 201 ops; the Board answered 400 "ops must be a list of
++<= 200", the same rows were selected again, and the hub's outbox grew to 80,000 ops over 7 hours. [daveey]"""
++
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++BOARD, ME = "default", "hub"
++
++
++@pytest.fixture
++def live(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    conn = kbc.connect(home / "kanban.db")
++    client.ensure_identity(conn, BOARD, ME)
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def _pending(conn):
++    return conn.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE state = 'pending'").fetchone()[0]
++
++
++def _full_batch_behind_an_unacked_card(conn, extra=0):
++    """PUSH_BATCH + ``extra`` pending comment rows on one card whose own upsert is not in the outbox and that the
++    Board has never acknowledged (sync_version NULL)."""
++    tid = kb.create_task(conn, title="card", assignee="worker")
++    for i in range(client.PUSH_BATCH + extra):
++        kb.add_comment(conn, tid, "default", f"comment {i}")
++    with kbc.write_txn(conn):
++        conn.execute("DELETE FROM kanban_sync_outbox WHERE table_name != 'task_comments'")
++        conn.execute("UPDATE tasks SET sync_version = NULL WHERE id = ?", (tid,))
++    assert _pending(conn) == client.PUSH_BATCH + extra
++    return tid
++
++
++def test_fake_board_refuses_more_than_200_ops(live):
++    svc = FakeService()
++    with pytest.raises(client.HubError) as err:
++        svc.hub(ME).ops(BOARD, [{"client_op_id": str(i)} for i in range(201)])
++    assert err.value.status == 400
++
++
++@pytest.mark.parametrize("extra", [0, 50])
++def test_full_batch_plus_unacked_parent_stays_within_the_limit_and_drains(live, extra):
++    tid = _full_batch_behind_an_unacked_card(live, extra)
++    svc = FakeService()
++    out = client.push(live, svc.hub(ME), BOARD, ME, primary=False)
++    sizes = [len(ops) for kind, _board, ops in svc.calls if kind == "ops"]
++    assert sizes and max(sizes) <= client.PUSH_BATCH
++    assert sizes[0] == client.PUSH_BATCH  # the parent plus 199 rows, not 201
++    assert svc.calls[0][2][0]["table"] == "tasks" and svc.calls[0][2][0]["uid"] == tid  # parent still goes first
++    assert out.sent == client.PUSH_BATCH + extra
++    assert _pending(live) == 0
++    assert tid in svc.board(BOARD)["rows"]["tasks"]
+-- 
+2.43.0
+

@@ -1,0 +1,217 @@
+From 1e608c843f2a29a1e3818815241a1dc51c72020f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 03:14:33 +0000
+Subject: [PATCH] =?UTF-8?q?[daveey]=20lifecycle=20guard:=20walk=20printed?=
+ =?UTF-8?q?=20text=20a=20`<=20<(=E2=80=A6)`=20feeds=20into=20nested=20logi?=
+ =?UTF-8?q?n=20shells?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`su -l bob < <(echo 't ( bash ~/.hermes/kanban.db )')` and the printf
+form passed scan_gateway_lifecycle under session aliases {zz} and {},
+and were refused only under None. Their pipe twins (`echo T | su -l bob`)
+were refused under all three (PR #3368 review 5912629938 follow-up;
+pre-existing on main 446752ce42 and on that PR's head).
+
+Why: _iter_nested_printed_payloads walked printed text only upstream of
+a pipe into a stdin-reading startup shell, and returned early for a
+command with no `|`. A process substitution read as that shell's stdin
+is the same feed, but its body was never walked in the nested scope.
+Under unknown names (None) the session walk caught the simple shape but
+not a compound command (`{ su -l bob; } < <(echo T)`, `while …; done <
+<(echo T)`) or a redirection-first one (`< <(echo T) su -l bob`).
+
+Fix: split each printed unit into simple commands, with every `<(…)` read
+as stdin (`<`, `0<`, `<>`) standing in as one placeholder word. When the
+command's views classify as `_nested_shell_input(view) == ("stdin",
+None)`, or it is a compound closer's redirections while the unit holds
+such a shell (fail closed, as for file redirections), the body's printed
+text is walked with unknown names, as the pipe path does; a heredoc body
+inside it is its producer's program and is walked too. The substitution
+walk also runs under unknown session names, deduped against session
+payloads; the pipe walk keeps its existing gating.
+
+Tests: 12 shapes added to _NESTED_FOREIGN_SHELLS (echo, printf, 0<,
+redirection-first, bash -l, sudo -i, ssh, multi-command body, brace
+group, subshell, while loop, heredoc producer), each refused under
+{zz}/{}/None. Controls kept in session scope: `bash < <(echo …)`,
+`bash -s`, `cat < <(echo …)`, `su -l bob -c true < <(…)`, a login shell
+in an earlier list command or beside a `cat < <(…)` in a group.
+RED on base 150cd2c35b: 12 failed / 399 passed with only the test file
+copied; GREEN: 411 passed.
+---
+ cron/lifecycle_guard_nested_shells.py         | 93 +++++++++++++++++--
+ .../test_lifecycle_guard_session_aliases.py   | 22 +++++
+ 2 files changed, 108 insertions(+), 7 deletions(-)
+
+diff --git a/cron/lifecycle_guard_nested_shells.py b/cron/lifecycle_guard_nested_shells.py
+index b2c237586a58a77f38aac51a396d2488b502cdb3..41bc88a4c5da021d0af6ec78a0046d2c467faa84 100644
+--- a/cron/lifecycle_guard_nested_shells.py
++++ b/cron/lifecycle_guard_nested_shells.py
+@@ -97,8 +97,10 @@ def collect_nested_shell_inputs(
+     texts: list[str] = []
+     scripts: set[Path] = set()
+     unknown_names = budget.alias_names is None
+-    if not unknown_names:
+-        texts.extend(_iter_nested_printed_payloads(walk_command))
++    # Under unknown names the session walk reads a printed pipe, but not text a `<(…)` feeds a
++    # compound command or a redirection-first command (`{ su -l bob; } < <(echo T)`).
++    texts.extend(text for text in _iter_nested_printed_payloads(walk_command, pipes=not unknown_names)
++                 if not (unknown_names and text in session_payloads))
+     for text, script in _iter_nested_shell_inputs(command, walk_command, cwd=cwd,
+                                                   heredocs=not unknown_names):
+         if script is not None:
+@@ -503,8 +505,9 @@ def _unit_feeds_nested_stdin(
+     return feeds, feeds_body
+ 
+ 
+-def _iter_nested_printed_payloads(command: str) -> Iterator[str]:
+-    """Walk printed text with unknown names only within a pipe feeding a startup shell.
++def _iter_nested_printed_payloads(command: str, *, pipes: bool = True) -> Iterator[str]:
++    """Walk printed text with unknown names only within a pipe feeding a startup shell, or a
++    process substitution read as its stdin (``su -l bob < <(echo T)``, as ``echo T | su -l bob``).
+ 
+     The ordinary printed-text approximation still scans each connected compound pipeline;
+     unrelated top-level pipelines retain their session scope. Keep the ordinary walk too.
+@@ -513,18 +516,94 @@ def _iter_nested_printed_payloads(command: str) -> Iterator[str]:
+     """
+     from cron.lifecycle_guard_output import iter_printed_shell_payloads
+ 
+-    if "|" not in command:
+-        return  # do not tokenize large no-pipe generators a second time
++    piped, substituted = pipes and "|" in command, "<(" in command
++    if not (piped or substituted):
++        return  # do not tokenize large generators with neither feed a second time
+     for unit in _printed_pipeline_units(command):
+-        feeds, feeds_body = _unit_feeds_nested_stdin(unit)
++        texts = _stdin_substitution_texts(unit) if substituted else []
++        feeds, feeds_body = _unit_feeds_nested_stdin(unit) if piped else (False, False)
+         if feeds:
+             text = unit.text()
+             if feeds_body and unit.bodies:
+                 text = "\n".join([text, *unit.bodies])
++            texts.append(text)
++        for text in texts:
+             for payload, _raw_quote in iter_printed_shell_payloads(text, shell_sink=True):
+                 yield payload
+ 
+ 
++_STDIN_OPERATORS = frozenset({"<", "0<", "<>", "0<>"})
++_SUBSTITUTION_WORD = "\x00<(…)"  # what a `<(…)` stands in for in a command's words
++
++
++def _syntax_word(word: str) -> bool:
++    return not getattr(word, "quoted", False)
++
++
++def _split_substituted_commands(
++    events: list[tuple[str, str]], commands: list[tuple[list[str], list[list[tuple[str, str]]]]],
++) -> None:
++    """Append ``(words, bodies)`` for each simple command in *events*: *bodies* are the events of
++    each ``<(…)`` read as its stdin (``< <(…)``, ``0< <(…)``), one placeholder word in *words*.
++    Commands inside those bodies are appended too."""
++    words: list[str] = []
++    bodies: list[list[tuple[str, str]]] = []
++    index = 0
++    while index < len(events):
++        role, word = events[index]
++        if (role == "word" and word == "<" and _syntax_word(word) and words
++                and words[-1] in _STDIN_OPERATORS and _syntax_word(words[-1])
++                and index + 1 < len(events) and events[index + 1] == ("open", "(")):
++            depth = 0
++            for end in range(index + 1, len(events)):
++                depth += {"open": 1, "close": -1}.get(events[end][0], 0)
++                if not depth:
++                    break
++            else:
++                end = len(events)  # unterminated: the rest is the body (fail closed)
++            body = events[index + 2:end]
++            bodies.append(body)
++            _split_substituted_commands(body, commands)
++            words.append(_SUBSTITUTION_WORD)
++            index = end + 1
++            continue
++        if role == "word":
++            words.append(word)
++        elif role != "data":
++            if words:
++                commands.append((words, bodies))
++            words, bodies = [], []
++        index += 1
++    if words:
++        commands.append((words, bodies))
++
++
++def _stdin_substitution_texts(unit: _PrintedUnit) -> list[str]:
++    """Printed text of each ``<(…)`` fed to a startup shell's stdin (``su -l bob < <(echo T)``),
++    as ``echo T | su -l bob`` is walked. A compound command's closer (``} < <(…)``) counts when any
++    command in *unit* is such a shell: its own redirections are not tracked (fail closed, as for
++    a file). A heredoc body in the substitution is its producer's program, so it is walked too."""
++    from cron.lifecycle_guard import _command_segment_views
++
++    commands: list[tuple[list[str], list[list[tuple[str, str]]]]] = []
++    _split_substituted_commands(unit.events, commands)
++    reads = [any(_nested_shell_input(view) == ("stdin", None)
++                 for view in _command_segment_views(words)) for words, _bodies in commands]
++    texts: list[str] = []
++    for (words, bodies), feeds in zip(commands, reads):
++        if not bodies or not (feeds or (any(reads) and _compound_redirections(words))):
++            continue
++        for body in bodies:
++            producer = _PrintedUnit()
++            producer.events = body
++            text = producer.text()
++            if unit.bodies and any(role == "word" and _is_heredoc_opener(word)
++                                   for role, word in body):
++                text = "\n".join([text, *unit.bodies])
++            texts.append(text)
++    return texts
++
++
+ def _feeds_nested_shell(owner: Optional[str]) -> bool:
+     """Whether a heredoc's *owner* text hands the body to such a nested shell as its script
+     (``None``: unknown owner, fail closed)."""
+diff --git a/tests/cron/test_lifecycle_guard_session_aliases.py b/tests/cron/test_lifecycle_guard_session_aliases.py
+index 6f0c7c1c5ca304df27bb3fc6cae680e613fe1c27..135b0d8cc934a3cd370e3a7c3434519ec8d58039 100644
+--- a/tests/cron/test_lifecycle_guard_session_aliases.py
++++ b/tests/cron/test_lifecycle_guard_session_aliases.py
+@@ -339,6 +339,20 @@ _NESTED_FOREIGN_SHELLS = [
+     "cat {script} | while read l; do\nsu -l bob\ndone",
+     "(\nsu -l bob\n) < {script}",
+     "while true; do\nsu -l bob\ndone < {script}",
++    # Printed text a process substitution feeds the login shell's stdin, as the pipe twins
++    # (`echo T | su -l bob`) are walked (PR #3368 review 5912629938; pre-existing on main).
++    "su -l bob < <(echo 't ( bash {db} )')",
++    "su -l bob < <(printf '%s\\n' 't ( bash {db} )')",
++    "su -l bob 0< <(echo 't ( bash {db} )')",
++    "< <(echo 't ( bash {db} )') su -l bob",
++    "bash -l < <(echo 't ( bash {db} )')",
++    "sudo -i < <(echo 't ( bash {db} )')",
++    "ssh host < <(echo 't ( bash {db} )')",
++    "su -l bob < <(echo ':'; echo 't ( bash {db} )')",
++    "{{ su -l bob; }} < <(echo 't ( bash {db} )')",
++    "( bash -l ) < <(printf '%s\\n' 't ( bash {db} )')",
++    "while read l; do su -l bob; done < <(echo 't ( bash {db} )')",
++    "su -l bob < <(python3 - <<'PY'\nprint('t ( bash {db} )')\nPY\n)",
+ ]
+ 
+ 
+@@ -416,6 +430,14 @@ def test_nested_login_shell_body_treats_names_as_unknown(tmp_path, live_kanban_d
+     "cat {script}; su -l bob",
+     "su -l bob | cat {script}",
+     "cat {script} | su -l bob -c true",
++    # Printed text in a `<(…)` read as stdin by no login shell keeps session scope.
++    "bash < <(echo 't ( bash {db} )')",
++    "bash -s < <(printf '%s\\n' 't ( bash {db} )')",
++    "cat < <(echo 't ( bash {db} )')",
++    "su -l bob -c true < <(echo 't ( bash {db} )')",
++    "su -l bob; cat < <(echo 't ( bash {db} )')",
++    "{{ su -l bob; cat < <(echo 't ( bash {db} )'); }}",
++    "su -l bob < <(echo ':'); echo 't ( bash {db} )'",
+ ])
+ def test_plain_child_shell_keeps_session_names(tmp_path, live_kanban_db, shape):
+     """Controls: no login/interactive shell, so the session's names still decide (#2358)."""
+-- 
+2.43.0
+

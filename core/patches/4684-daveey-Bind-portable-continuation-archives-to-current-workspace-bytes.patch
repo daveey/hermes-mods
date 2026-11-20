@@ -1,0 +1,591 @@
+From a1b06188e75447e10ea72a16e408472195480c95 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 10:33:48 +0000
+Subject: [PATCH] [daveey] Bind portable continuation archives to current
+ workspace bytes
+
+Require explicit portable-workspace declarations, task/run scoping, exact hub archive digest and full content/type/mode inventory equality before suppressing automatic pins. Recheck local state after the remote read; reject external trees, linked Git metadata and unsupported filesystem entries.
+
+Proof: rejected head reproduces diagnostic, stale, missing-file and external-tree fail-open cases (4 RED). Corrected archive suites: 48 GREEN. Complete inventory includes Git HEAD and dirty bytes; diagnostic-only tarballs cannot grant portability.
+---
+ docs/kanban-portable-workspace.md             |  36 ++++++
+ hermes_cli/kanban_archive_inventory.py        |  98 +++++++++++++++
+ hermes_cli/kanban_continue_archive.py         |  47 +++++--
+ .../hermes_cli/test_kanban_archive_content.py |  65 ++++++++++
+ .../test_kanban_archive_inventory.py          |  65 ++++++++++
+ .../test_kanban_continue_archive.py           | 119 ++++++++----------
+ 6 files changed, 348 insertions(+), 82 deletions(-)
+ create mode 100644 docs/kanban-portable-workspace.md
+ create mode 100644 hermes_cli/kanban_archive_inventory.py
+ create mode 100644 tests/hermes_cli/test_kanban_archive_content.py
+ create mode 100644 tests/hermes_cli/test_kanban_archive_inventory.py
+
+diff --git a/docs/kanban-portable-workspace.md b/docs/kanban-portable-workspace.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..d72f25fda707bc51c463ea88f6229a20a77266df
+--- /dev/null
++++ b/docs/kanban-portable-workspace.md
+@@ -0,0 +1,36 @@
++# Portable continuation workspace archives
++
++A continuation normally pins a pooled card when its workspace has unpushed or
++unchecked state. To keep its existing pool constraints, publish a full archive
++on the hub, then put this declaration on its own line in the checkpoint (or a
++comment posted strictly after both the current run started and the last move):
++
++```
++portable-workspace: hub-admin:/srv/archives/<task-id>/workspace.tar.gz SHA256 <64-hex-digest>
++```
++
++The archive path must contain the exact task ID as a path component. Create the
++archive **outside** the workspace using `tar -czf /outside/workspace.tar.gz -C
++/workspace .`, transfer it to the hub, and calculate its SHA256. Do not change the
++workspace after archiving; if it changes, publish a new archive and declaration.
++Diagnostic bundles or unmarked references do not release a machine pin. The first
++archive reference in the checkpoint, otherwise the newest eligible comment, wins;
++an invalid reference never falls back to older evidence.
++
++Verification hashes the archive on the hub and compares its complete inventory
++(relative paths, entry types, permission bits, and file content SHA256s) with the
++current workspace. All trees reported by the pin planner must lie inside that
++workspace. Local inventory is read again after the hub read to catch intervening
++edits. No files are extracted during verification. Each subprocess has a 20-second
++timeout and inventories have a 100,000-entry cap; failures keep the existing pin
++behavior. There is no exemption for schedule or block, and publication guards are
++unchanged.
++
++The initial format deliberately fails closed on symlinks, hardlinks in archives,
++special files, linked-worktree `.git` files and Git alternates. A standalone clone
++with its entire `.git` directory can be carried, but a linked worktree's external
++Git metadata cannot. Archive the entire scratch workspace with a standalone clone
++rather than declaring a partial worktree/evidence bundle portable. Roots and
++entries must have the same modes, and the tar root must be `.`. A digest match
++alone is never proof of workspace coverage. Concurrent writers must be stopped
++before publishing; this is a bounded observation, not a filesystem lock.
+diff --git a/hermes_cli/kanban_archive_inventory.py b/hermes_cli/kanban_archive_inventory.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ac562e2661777e06a07cc06362328feff395bad8
+--- /dev/null
++++ b/hermes_cli/kanban_archive_inventory.py
+@@ -0,0 +1,98 @@
++"""Stdlib-only inventory probe, also sent verbatim to the hub; never extracts tar files.
++
++Archives contain the workspace contents rooted at '.', including standalone .git
++metadata. Linked worktrees, alternates, links and special files fail closed: their
++external dependencies are not portable merely because their path was archived.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++from pathlib import Path, PurePosixPath
++import stat
++import sys
++import tarfile
++
++
++MAX_ENTRIES = 100000
++
++
++def file_hash(stream):
++    digest = hashlib.sha256()
++    while chunk := stream.read(1024 * 1024):
++        digest.update(chunk)
++    return digest.hexdigest()
++
++
++def entry(name, mode, directory, digest):
++    parts = PurePosixPath(name).parts
++    if (".git" in parts and not directory and parts[-1] == ".git") or name.endswith("/objects/info/alternates"):
++        raise ValueError("external Git metadata")
++    return [name, mode & 0o777, "dir" if directory else "file", digest]
++
++
++def inventory_hash(entries):
++    if len(entries) > MAX_ENTRIES:
++        raise ValueError("inventory too large")
++    return hashlib.sha256(json.dumps(sorted(entries), separators=(",", ":")).encode()).hexdigest()
++
++
++def tree_inventory(root):
++    root = Path(root)
++    if not root.is_dir() or root.is_symlink():
++        raise ValueError("not a plain directory")
++    entries = [entry(".", root.stat().st_mode, True, "")]
++
++    def failed(error):
++        raise error
++
++    for parent, dirs, files in os.walk(root, onerror=failed, followlinks=False):
++        for name in dirs + files:
++            path = Path(parent) / name
++            mode = path.lstat().st_mode
++            if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
++                raise ValueError("unsupported filesystem entry")
++            digest = ""
++            if stat.S_ISREG(mode):
++                with path.open("rb") as stream:
++                    digest = file_hash(stream)
++            entries.append(entry(path.relative_to(root).as_posix(), mode, stat.S_ISDIR(mode), digest))
++            if len(entries) > MAX_ENTRIES:
++                raise ValueError("inventory too large")
++    return inventory_hash(entries)
++
++
++def archive_inventory(path, expected):
++    entries, names = [], set()
++    with open(path, "rb") as stream:
++        before = os.fstat(stream.fileno())
++        if file_hash(stream) != expected:
++            raise ValueError("archive checksum mismatch")
++        stream.seek(0)
++        with tarfile.open(fileobj=stream, mode="r|*") as archive:
++            for member in archive:
++                name = PurePosixPath(member.name)
++                if name.is_absolute() or ".." in name.parts or not (member.isdir() or member.isfile()):
++                    raise ValueError("unsupported archive entry")
++                key = name.as_posix()
++                if key in names or len(names) >= MAX_ENTRIES:
++                    raise ValueError("duplicate or oversized inventory")
++                names.add(key)
++                digest = ""
++                if member.isfile():
++                    with archive.extractfile(member) as source:
++                        digest = file_hash(source)
++                entries.append(entry(key, member.mode, member.isdir(), digest))
++        after = os.fstat(stream.fileno())
++        if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
++            raise ValueError("archive changed while reading")
++    return inventory_hash(entries)
++
++
++if __name__ == "__main__":
++    try:
++        result = tree_inventory(sys.argv[2]) if sys.argv[1] == "tree" else archive_inventory(sys.argv[2], sys.argv[3])
++        print(result)
++    except (OSError, ValueError, tarfile.TarError):
++        sys.exit(1)
+diff --git a/hermes_cli/kanban_continue_archive.py b/hermes_cli/kanban_continue_archive.py
+index 1316b307269599350bde033c6813dd35d264bb40..21329810a1dc1c434e2b19b78120ccbc467a80c6 100644
+--- a/hermes_cli/kanban_continue_archive.py
++++ b/hermes_cli/kanban_continue_archive.py
+@@ -4,6 +4,8 @@ from __future__ import annotations
+ import re
+ import shlex
+ import subprocess
++import sys
++from pathlib import Path
+ 
+ 
+ # Accept the existing checkpoint prose, but pair the path with its adjacent digest.
+@@ -20,12 +22,12 @@ def plan(conn, task_id: str, checkpoint: str):
+     from hermes_cli import kanban_park_pin
+ 
+     pin = kanban_park_pin.plan(conn, task_id, checkpoint)
+-    if pin and pin["op"] == "pin" and portable(conn, task_id, checkpoint):
++    if pin and pin["op"] == "pin" and portable(conn, task_id, checkpoint, trees=pin["trees"]):
+         return None
+     return pin
+ 
+ 
+-def portable(conn, task_id: str, checkpoint: str) -> bool:
++def portable(conn, task_id: str, checkpoint: str, *, trees=()) -> bool:
+     """Only current checkpoint or newest post-move archive comment is eligible.
+ 
+     Never fall back to an older archive after a newer reference fails verification.
+@@ -50,20 +52,41 @@ def portable(conn, task_id: str, checkpoint: str) -> bool:
+         if match:
+             path = match['path']
+             parts = path.split('/')
+-            return task_id in parts and '..' not in parts and verify(path, match['sha'].lower())
++            declared = re.search(r"(?:^|\n)portable-workspace:\s*$", text[:match.start()], re.IGNORECASE)
++            if not declared or task_id not in parts or '..' in parts:
++                return False
++            row = conn.execute("SELECT workspace_path FROM tasks WHERE id = ?", (task_id,)).fetchone()
++            return bool(row and row[0] and verify(path, match['sha'].lower(), row[0], trees))
+     return False
+ 
+ 
+-def verify(path: str, digest: str) -> bool:
+-    """Hash on the hub, never on the worker with a coincidentally identical path."""
++def _probe(argv):
+     from tools.environments.local import build_subprocess_env
+ 
++    result = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", timeout=20,
++                            check=False, env=build_subprocess_env())
++    value = result.stdout.strip()
++    return value if result.returncode == 0 and re.fullmatch(r"[a-f0-9]{64}", value) else None
++
++
++def verify(path: str, digest: str, workspace: str, trees=()) -> bool:
++    """Compare actual hub archive bytes with the complete current local workspace.
++
++    All pin-planner trees must be within the archived root. Local inventory both
++    before and after the remote read fences edits made while the hub was hashing.
++    Each probe has a hard deadline; any uncertainty retains the machine pin.
++    """
+     try:
+-        result = subprocess.run(
+-            ["hub-admin", f"sha256sum -- {shlex.quote(path)}"],
+-            capture_output=True, text=True, encoding="utf-8", timeout=20, check=False,
+-            env=build_subprocess_env(),
+-        )
+-    except (OSError, subprocess.TimeoutExpired):
++        root = Path(workspace).resolve(strict=True)
++        if any(not Path(tree).resolve(strict=True).is_relative_to(root) for tree in trees):
++            return False
++        script = Path(__file__).with_name("kanban_archive_inventory.py")
++        local = [sys.executable, str(script), "tree", str(root)]
++        before = _probe(local)
++        if not before:
++            return False
++        remote = shlex.join(["python3", "-c", script.read_text(encoding="utf-8-sig"), "archive", path, digest])
++        actual = _probe(["hub-admin", remote])
++        return actual == before and _probe(local) == before
++    except (OSError, ValueError, subprocess.TimeoutExpired):
+         return False
+-    return result.returncode == 0 and result.stdout.strip() == f"{digest}  {path}"
+diff --git a/tests/hermes_cli/test_kanban_archive_content.py b/tests/hermes_cli/test_kanban_archive_content.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..edc1fc29b57f90f7e482fcb0f6160d129e174a70
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_archive_content.py
+@@ -0,0 +1,65 @@
++"""Actual archive bytes, rather than prose or a matching tarball hash, carry state."""
++import hashlib
++import json
++import subprocess
++import tarfile
++
++import pytest
++
++from hermes_cli import kanban_continue_archive as archive
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_move_pool as kmp
++from tests.hermes_cli import test_kanban_pool_queue as helpers
++
++svc = helpers.svc
++w2 = helpers.w2
++
++
++@pytest.mark.parametrize("case", ["valid", "diagnostic", "stale", "missing-file", "outside-tree",
++                                  "sha-mismatch", "linked-git", "symlink", "head-change", "mode-change"])
++def test_content_bound_continue(w2, monkeypatch, tmp_path, case):
++    from tools import kanban_tools as kt
++
++    root = tmp_path / "workspace"
++    root.mkdir()
++    (root / "source.py").write_text("current uncommitted work")
++    tid = kb.create_task(w2.conn, title="content archive", assignee="default", runs_on=[helpers.POOL])
++    helpers._run(w2, monkeypatch, tid)
++    with kb.write_txn(w2.conn):
++        w2.conn.execute("UPDATE tasks SET workspace_path = ? WHERE id = ?", (str(root), tid))
++    trees = [str(tmp_path / "external")] if case == "outside-tree" else [str(root)]
++    monkeypatch.setattr(kmp, "card_trees_state", lambda *a, **kw: (trees, f"dirty worktree {trees[0]}"))
++    target = tmp_path / tid / "full.tar.gz"
++    target.parent.mkdir()
++    if case == "linked-git":
++        (root / ".git").write_text("gitdir: /external/worktrees/example")
++    if case == "symlink":
++        (root / "link").symlink_to("source.py")
++    if case == "head-change":
++        (root / ".git").mkdir()
++        (root / ".git" / "HEAD").write_text("old HEAD")
++    with tarfile.open(target, "w:gz") as tar:
++        tar.add(root, arcname=".")
++    if case == "head-change":
++        (root / ".git" / "HEAD").write_text("new HEAD")
++    if case == "mode-change":
++        (root / "source.py").chmod(0o755)
++    if case == "stale":
++        (root / "source.py").write_text("newer uncommitted work")
++    if case == "missing-file":
++        (root / "new.py").write_text("not carried")
++    digest = '0' * 64 if case == "sha-mismatch" else hashlib.sha256(target.read_bytes()).hexdigest()
++    marker = "Raw diagnostic archive" if case == "diagnostic" else "portable-workspace:"
++    text = f"{marker} hub-admin:{target} SHA256 {digest}\nUNPUBLISHED_WORK_REASON=archive custody fixture"
++    real_run = subprocess.run
++
++    def hub(argv, **kwargs):
++        if argv[0] == "hub-admin":
++            return real_run(["bash", "-c", argv[1]], **kwargs)
++        return real_run(argv, **kwargs)
++
++    monkeypatch.setattr(archive.subprocess, "run", hub)
++    out = json.loads(kt._handle_continue({"checkpoint": text}))
++    assert out.get("ok"), out
++    assert helpers._runs_on(w2.conn, tid) == ([helpers.POOL] if case == "valid" else ["machine:worker-2"])
++    assert bool(helpers._placement_events(w2.conn, tid)) is (case != "valid")
+diff --git a/tests/hermes_cli/test_kanban_archive_inventory.py b/tests/hermes_cli/test_kanban_archive_inventory.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e6edd787d0d3b55d5d172b066a984019de7814c8
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_archive_inventory.py
+@@ -0,0 +1,65 @@
++"""Inventory rejects incomplete, ambiguous and externally dependent state."""
++import hashlib
++import io
++import tarfile
++
++import pytest
++
++from hermes_cli import kanban_archive_inventory as inventory
++
++
++@pytest.mark.parametrize("kind", ["valid", "traversal", "absolute", "duplicate", "symlink", "hardlink", "fifo",
++                                  "alternates", "gitfile", "limit", "bad-sha"])
++def test_archive_inventory(tmp_path, monkeypatch, kind):
++    path = tmp_path / "archive.tar.gz"
++    with tarfile.open(path, "w:gz") as tar:
++        root = tarfile.TarInfo(".")
++        root.type, root.mode = tarfile.DIRTYPE, 0o755
++        tar.addfile(root)
++        member = tarfile.TarInfo({"traversal": "../outside", "absolute": "/outside", "duplicate": ".",
++                                 "alternates": ".git/objects/info/alternates", "gitfile": ".git"}.get(kind, "file"))
++        member.type = {"symlink": tarfile.SYMTYPE, "hardlink": tarfile.LNKTYPE, "fifo": tarfile.FIFOTYPE}.get(kind, tarfile.REGTYPE)
++        member.mode = 0o644
++        member.size = 4 if member.isfile() else 0
++        member.linkname = "outside" if member.issym() or member.islnk() else ""
++        tar.addfile(member, io.BytesIO(b"data") if member.isfile() else None)
++    digest = hashlib.sha256(path.read_bytes()).hexdigest()
++    if kind == "limit":
++        monkeypatch.setattr(inventory, "MAX_ENTRIES", 1)
++    if kind == "bad-sha":
++        digest = "0" * 64
++    if kind != "valid":
++        with pytest.raises(ValueError):
++            inventory.archive_inventory(path, digest)
++    else:
++        root = tmp_path / "workspace"
++        root.mkdir(mode=0o755)
++        (root / "file").write_bytes(b"data")
++        (root / "file").chmod(0o644)
++        assert inventory.archive_inventory(path, digest) == inventory.tree_inventory(root)
++
++
++@pytest.mark.parametrize("kind", ["missing", "symlink", "gitfile", "alternates", "limit", "unreadable"])
++def test_local_inventory_fails_closed(tmp_path, monkeypatch, kind):
++    root = tmp_path / "workspace"
++    root.mkdir()
++    def alternates():
++        info = root / ".git" / "objects" / "info"
++        info.mkdir(parents=True)
++        (info / "alternates").write_text("/outside")
++
++    def limited():
++        (root / "file").write_text("data")
++        monkeypatch.setattr(inventory, "MAX_ENTRIES", 1)
++
++    def unreadable():
++        def walk(*args, **kwargs):
++            kwargs["onerror"](PermissionError("unreadable"))
++        monkeypatch.setattr(inventory.os, "walk", walk)
++
++    {"missing": root.rmdir,
++     "symlink": lambda: (root / "file").symlink_to("outside"),
++     "gitfile": lambda: (root / ".git").write_text("gitdir: /outside"),
++     "alternates": alternates, "limit": limited, "unreadable": unreadable}[kind]()
++    with pytest.raises((ValueError, OSError)):
++        inventory.tree_inventory(root)
+diff --git a/tests/hermes_cli/test_kanban_continue_archive.py b/tests/hermes_cli/test_kanban_continue_archive.py
+index f34bba0a7a4c3c8d2e57ea2bc37e4757b48cdd8a..c65af280dffd046a19834788af56ab15d51b6334 100644
+--- a/tests/hermes_cli/test_kanban_continue_archive.py
++++ b/tests/hermes_cli/test_kanban_continue_archive.py
+@@ -1,9 +1,10 @@
+-"""Portable continuation archives override only automatic pool pins."""
+-import hashlib
++"""Portable continuation references are scoped to the task and current run."""
+ import json
++import subprocess
+ 
+ import pytest
+ 
++from hermes_cli import kanban_continue_archive as archive
+ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_move_pool as kmp
+ from tests.hermes_cli import test_kanban_pool_queue as helpers
+@@ -12,23 +13,28 @@ svc = helpers.svc
+ w2 = helpers.w2
+ 
+ 
++def _task(w2, monkeypatch):
++    tid = kb.create_task(w2.conn, title="portable archive", assignee="default", runs_on=[helpers.POOL])
++    helpers._run(w2, monkeypatch, tid)
++    with kb.write_txn(w2.conn):
++        w2.conn.execute("UPDATE tasks SET workspace_path = '/work' WHERE id = ?", (tid,))
++    monkeypatch.setattr(kmp, "card_trees_state", lambda *a, **kw: (["/work"], "dirty worktree /work"))
++    return tid, f"portable-workspace: hub-admin:/srv/{tid}/full.tar.gz SHA256 {'a' * 64}"
++
++
++def _backdate_run(conn, tid, seconds):
++    with kb.write_txn(conn):
++        conn.execute("UPDATE task_runs SET started_at = started_at - ? WHERE id = "
++                     "(SELECT current_run_id FROM tasks WHERE id = ?)", (seconds, tid))
++
++
+ @pytest.mark.parametrize("source", ["checkpoint", "comment"])
+ @pytest.mark.parametrize("verified", [True, False])
+ def test_continue_archive(w2, monkeypatch, source, verified):
+     from tools import kanban_tools as kt
+-    from hermes_cli import kanban_continue_archive as archive
+-
+-    tid = kb.create_task(w2.conn, title="portable archive", assignee="default", runs_on=[helpers.POOL])
+-    helpers._run(w2, monkeypatch, tid)
++    tid, text = _task(w2, monkeypatch)
+     _backdate_run(w2.conn, tid, 5)
+-    monkeypatch.setattr(kmp, "card_trees_state", lambda *a, **kw: (["/work"], "unchecked worktree /work (timeout)"))
+-    digest = hashlib.sha256(b"workspace").hexdigest()
+-    text = f"Full workspace archive hub-admin:/srv/kanban/evidence/{tid}/run.tar.gz SHA256 {digest}"
+-    import subprocess
+-    path = f"/srv/kanban/evidence/{tid}/run.tar.gz"
+-    actual_digest = digest if verified else 'f' * 64
+-    monkeypatch.setattr(archive.subprocess, "run", lambda *a, **kw:
+-                        subprocess.CompletedProcess(a[0], 0, f"{actual_digest}  {path}\n"))
++    monkeypatch.setattr(archive, "verify", lambda *args: verified)
+     if source == "comment":
+         kb.add_comment(w2.conn, tid, author="default", body=text)
+         text = "Resume implementation"
+@@ -40,97 +46,73 @@ def test_continue_archive(w2, monkeypatch, source, verified):
+ 
+ def test_no_archive_still_pins(w2, monkeypatch):
+     from tools import kanban_tools as kt
+-    tid = kb.create_task(w2.conn, title="no archive", assignee="default", runs_on=[helpers.POOL])
+-    helpers._run(w2, monkeypatch, tid)
+-    monkeypatch.setattr(kmp, "card_trees_state", lambda *a, **kw: (["/work"], "dirty worktree /work"))
++    tid, _ = _task(w2, monkeypatch)
+     out = json.loads(kt._handle_continue({"checkpoint": "Work remains local"}))
+     assert out.get("ok"), out
+     assert helpers._runs_on(w2.conn, tid) == ["machine:worker-2"]
+ 
+ 
+-@pytest.mark.parametrize("mutation", ["valid", "foreign", "traversal", "short-sha", "non-hub"])
++@pytest.mark.parametrize("mutation", ["valid", "foreign", "traversal", "short-sha", "non-hub", "no-marker"])
+ def test_reference_scope(w2, monkeypatch, mutation):
+-    from hermes_cli import kanban_continue_archive as archive
+-    tid = kb.create_task(w2.conn, title="archive scope", assignee="default")
+-    text = f"hub-admin:/srv/{tid}/full.tar.gz SHA256 {'a' * 64}"
++    tid, text = _task(w2, monkeypatch)
+     text = {
+-        "valid": text,
+-        "foreign": text.replace(tid, "t_other"),
+-        "traversal": text.replace("full.tar", "../full.tar"),
+-        "short-sha": text[:-1],
++        "valid": text, "foreign": text.replace(tid, "t_other"),
++        "traversal": text.replace("full.tar", "../full.tar"), "short-sha": text[:-1],
+         "non-hub": text.replace("hub-admin:", "worker-2:"),
++        "no-marker": text.replace("portable-workspace:", "diagnostics"),
+     }[mutation]
+     monkeypatch.setattr(archive, "verify", lambda *args: True)
+     assert archive.portable(w2.conn, tid, text) is (mutation == "valid")
+ 
+ 
+ def test_comments_after_move_and_no_old_fallback(w2, monkeypatch):
+-    from hermes_cli import kanban_continue_archive as archive
+-    tid = kb.create_task(w2.conn, title="archive age", assignee="default")
+-    helpers._run(w2, monkeypatch, tid)
++    tid, text = _task(w2, monkeypatch)
+     _backdate_run(w2.conn, tid, 5)
+-    text = f"hub-admin:/srv/{tid}/full.tar.gz SHA256 {'a' * 64}"
+     kb.add_comment(w2.conn, tid, author="default", body=text)
+     with kb.write_txn(w2.conn):
+         kb._append_event(w2.conn, tid, "moved", {})
+     monkeypatch.setattr(archive, "verify", lambda *args: True)
+-    assert not archive.portable(w2.conn, tid, "resume")  # same-second is conservatively stale
++    assert not archive.portable(w2.conn, tid, "resume")
+     with kb.write_txn(w2.conn):
+         w2.conn.execute("UPDATE task_comments SET created_at = created_at + 1 WHERE task_id = ?", (tid,))
+     assert archive.portable(w2.conn, tid, "resume")
+-    monkeypatch.setattr(archive, "verify", lambda path, sha: sha == 'a' * 64)
++    monkeypatch.setattr(archive, "verify", lambda path, sha, *args: sha == 'a' * 64)
+     assert not archive.portable(w2.conn, tid, text.replace('a' * 64, 'b' * 64))
+ 
+ 
+-@pytest.mark.parametrize("mode", ["match", "mismatch", "missing", "timeout", "error", "extra-output"])
+-def test_hub_hash_verification(monkeypatch, mode):
+-    import subprocess
+-    from hermes_cli import kanban_continue_archive as archive
+-    digest = hashlib.sha256(b"workspace").hexdigest()
+-    path = "/srv/t_example/full.tar.gz"
+-
++@pytest.mark.parametrize("mode", ["match", "mismatch", "missing", "timeout", "error", "extra-output", "local-change"])
++def test_hub_inventory_verification(monkeypatch, tmp_path, mode):
++    calls = []
+     def run(argv, **kwargs):
+-        assert argv == ["hub-admin", f"sha256sum -- {path}"]
++        calls.append(argv)
+         assert kwargs["timeout"] == 20 and kwargs["encoding"] == "utf-8"
+         if mode == "timeout":
+             raise subprocess.TimeoutExpired(argv, 20)
+         if mode == "error":
+             raise OSError("no hub")
+-        sha = 'f' * 64 if mode == "mismatch" else digest
+-        output = f"{sha}  {path}\n" + ("noise" if mode == "extra-output" else "")
+-        return subprocess.CompletedProcess(argv, 1 if mode == "missing" else 0, output)
+-
++        sha = 'a' * 64
++        if (argv[0] == "hub-admin" and mode == "mismatch") or (len(calls) == 3 and mode == "local-change"):
++            sha = 'b' * 64
++        return subprocess.CompletedProcess(argv, 1 if mode == "missing" else 0,
++                                           sha + ("noise" if mode == "extra-output" else "\n"))
+     monkeypatch.setattr(archive.subprocess, "run", run)
+-    assert archive.verify(path, digest) is (mode == "match")
+-
+-
+-def _backdate_run(conn, tid, seconds):
+-    """Real runs start seconds before their worker comments; same-second stays stale."""
+-    with kb.write_txn(conn):
+-        conn.execute("UPDATE task_runs SET started_at = started_at - ? WHERE id = "
+-                     "(SELECT current_run_id FROM tasks WHERE id = ?)", (seconds, tid))
++    assert archive.verify("/srv/t_example/full.tar.gz", 'c' * 64, str(tmp_path)) is (mode == "match")
++    if mode == "match":
++        assert calls[1][0] == "hub-admin" and "archive" in calls[1][1]
++        assert len(calls) == 3
+ 
+ 
+ def test_earlier_run_archive_comment_does_not_carry_to_next_run(w2, monkeypatch):
+-    """An archive comment from run 1 must not release run 2's unpushed state to the pool."""
+     from tools import kanban_tools as kt
+-    from hermes_cli import kanban_continue_archive as archive
+-    import subprocess
+-
+-    tid = kb.create_task(w2.conn, title="two runs", assignee="default", runs_on=[helpers.POOL])
+-    monkeypatch.setattr(kmp, "card_trees_state", lambda *a, **kw: (["/work"], "unchecked worktree /work (timeout)"))
+-    digest = hashlib.sha256(b"workspace").hexdigest()
+-    path = f"/srv/kanban/evidence/{tid}/run.tar.gz"
+-    monkeypatch.setattr(archive.subprocess, "run", lambda *a, **kw:
+-                        subprocess.CompletedProcess(a[0], 0, f"{digest}  {path}\n"))
+-    helpers._run(w2, monkeypatch, tid)
++    tid, text = _task(w2, monkeypatch)
++    monkeypatch.setattr(archive, "verify", lambda *args: True)
+     _backdate_run(w2.conn, tid, 5)
+-    kb.add_comment(w2.conn, tid, author="default", body=f"archive hub-admin:{path} SHA256 {digest}")
+-    with kb.write_txn(w2.conn):  # run 1's comment predates run 2's claim
++    kb.add_comment(w2.conn, tid, author="default", body=text)
++    with kb.write_txn(w2.conn):
+         w2.conn.execute("UPDATE task_comments SET created_at = created_at - 2 WHERE task_id = ?", (tid,))
+     assert json.loads(kt._handle_continue({"checkpoint": "run 1 resume"})).get("ok")
+     assert helpers._runs_on(w2.conn, tid) == [helpers.POOL]
+-    helpers._run(w2, monkeypatch, tid)  # run 2: new unpushed commits, no new archive
++    helpers._run(w2, monkeypatch, tid)
+     out = json.loads(kt._handle_continue({"checkpoint": "run 2 resume"}))
+     assert out.get("ok"), out
+     assert helpers._runs_on(w2.conn, tid) == ["machine:worker-2"]
+@@ -138,12 +120,9 @@ def test_earlier_run_archive_comment_does_not_carry_to_next_run(w2, monkeypatch)
+ 
+ 
+ def test_comment_window_starts_at_current_run(w2, monkeypatch):
+-    from hermes_cli import kanban_continue_archive as archive
+-    tid = kb.create_task(w2.conn, title="run window", assignee="default", runs_on=[helpers.POOL])
++    tid, text = _task(w2, monkeypatch)
+     monkeypatch.setattr(archive, "verify", lambda *args: True)
+-    text = f"hub-admin:/srv/{tid}/full.tar.gz SHA256 {'a' * 64}"
+     kb.add_comment(w2.conn, tid, author="default", body=text)
+-    helpers._run(w2, monkeypatch, tid)
+-    assert not archive.portable(w2.conn, tid, "resume")  # comment not after this run's start
++    assert not archive.portable(w2.conn, tid, "resume")
+     _backdate_run(w2.conn, tid, 5)
+     assert archive.portable(w2.conn, tid, "resume")
+-- 
+2.43.0
+

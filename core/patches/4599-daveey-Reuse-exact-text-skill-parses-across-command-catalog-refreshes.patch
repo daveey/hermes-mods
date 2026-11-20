@@ -1,0 +1,257 @@
+From 7bcc06bfd07b7147e00ba2d176ea77aeb36ae1b9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 15:14:41 +0000
+Subject: [PATCH] [daveey] Reuse exact-text skill parses across command catalog
+ refreshes
+
+Proof: RED repeated catalog parse count on baseline; GREEN content edits, real TTL same-stat edits, custom parser identity, bounded retention, deep-copy isolation, malformed YAML/BOM/body parity. Both custom-parser guard mutants killed. Full 179-skill catalog replay, eight samples each: 123.733ms before vs 62.652ms after (49.365% less CPU), exact payload parity. Accelerated due clock, not whole-rpc live acceptance.
+---
+ tests/tools/test_skill_catalog_parse_reuse.py | 124 ++++++++++++++++++
+ tests/tui_gateway/test_catalog_cpu_replay.py  |  53 ++++++++
+ tools/skill_catalog_parse.py                  |  28 ++++
+ tools/skills_tool.py                          |   3 +-
+ 4 files changed, 207 insertions(+), 1 deletion(-)
+ create mode 100644 tests/tools/test_skill_catalog_parse_reuse.py
+ create mode 100644 tests/tui_gateway/test_catalog_cpu_replay.py
+ create mode 100644 tools/skill_catalog_parse.py
+
+diff --git a/tests/tools/test_skill_catalog_parse_reuse.py b/tests/tools/test_skill_catalog_parse_reuse.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7c0a0cc7efcd056c9a613f70468f88d75ae53a93
+--- /dev/null
++++ b/tests/tools/test_skill_catalog_parse_reuse.py
+@@ -0,0 +1,124 @@
++"""Catalog refresh rechecks policy and bytes without reparsing unchanged YAML."""
++from pathlib import Path
++from unittest.mock import Mock
++
++import pytest
++
++from agent import skill_utils
++from tools import skills_tool as st
++
++
++@pytest.fixture
++def inventory(tmp_path, monkeypatch):
++    root = tmp_path / "skills"
++    root.mkdir()
++    monkeypatch.setattr(st, "skill_search_dirs", lambda: ([(1, root)], root))
++    monkeypatch.setattr(st, "_get_category_from_path", lambda p: None)
++    monkeypatch.setattr(st, "_get_disabled_skill_names", lambda: set())
++    monkeypatch.setattr(st, "skill_matches_platform", lambda fm: True)
++    monkeypatch.setattr(st, "skill_matches_environment", lambda fm: True)
++    monkeypatch.setattr(st, "skill_matches_apps", lambda fm: True)
++    st.clear_skills_cache()
++    yield root
++    st.clear_skills_cache()
++
++
++def put(root: Path, name: str, description: str):
++    folder = root / name
++    folder.mkdir(exist_ok=True)
++    path = folder / "SKILL.md"
++    path.write_text(f"---\nname: {name}\ndescription: {description}\n---\nBody\n", encoding="utf-8")
++    return path
++
++
++def test_expired_catalog_reuses_only_unchanged_parse(inventory, monkeypatch):
++    path = put(inventory, "alpha", "first")
++    parser = Mock(wraps=skill_utils.yaml_load)
++    monkeypatch.setattr(skill_utils, "yaml_load", parser)
++    assert st.find_all_skills()[0]["description"] == "first"
++    assert parser.call_count == 1
++    st.clear_skills_cache()  # same parsing work as TTL expiry
++    assert st.find_all_skills()[0]["description"] == "first"
++    assert parser.call_count == 1
++    path.write_text(path.read_text().replace("first", "other"), encoding="utf-8")
++    st.clear_skills_cache()
++    assert st.find_all_skills()[0]["description"] == "other"
++    assert parser.call_count == 2
++    path.unlink()
++    st.clear_skills_cache()
++    assert st.find_all_skills() == []
++
++
++def test_due_refresh_rechecks_policy_and_parser(inventory, monkeypatch):
++    put(inventory, "alpha", "first")
++    assert st.find_all_skills()
++    monkeypatch.setattr(st, "skill_matches_environment", lambda fm: False)
++    st.clear_skills_cache()
++    assert st.find_all_skills() == []
++    monkeypatch.setattr(st, "skill_matches_environment", lambda fm: True)
++    monkeypatch.setattr(st, "_parse_frontmatter", lambda text: ({"name": "beta", "description": "new parser"}, ""))
++    st.clear_skills_cache()
++    assert st.find_all_skills()[0]["name"] == "beta"
++
++
++def test_body_fallback_and_nested_values_are_private(inventory, monkeypatch):
++    from tools.skill_catalog_parse import parse_catalog_text
++    text = "---\nname: sample\nmetadata:\n  tags: [original]\n---\n# Heading\nFallback body\n"
++    first, body = parse_catalog_text(text)
++    first["metadata"]["tags"].append("mutation")
++    second, again = parse_catalog_text(text)
++    assert second["metadata"]["tags"] == ["original"]
++    assert again == body
++    folder = inventory / "sample"
++    folder.mkdir()
++    (folder / "SKILL.md").write_text(text, encoding="utf-8")
++    assert st.find_all_skills()[0]["description"] == "Fallback body"
++
++
++def test_underlying_custom_parser_is_never_memoized(monkeypatch):
++    from tools.skill_catalog_parse import parse_catalog_text
++    parser = Mock(side_effect=[({"name": "one"}, ""), ({"name": "two"}, "")])
++    monkeypatch.setattr(skill_utils, "parse_frontmatter", parser)
++    assert parse_catalog_text("same")[0]["name"] == "one"
++    assert parse_catalog_text("same")[0]["name"] == "two"
++
++
++def test_real_ttl_preserves_same_stat_edit_deadline(inventory, monkeypatch):
++    import os
++    from types import SimpleNamespace
++    path = put(inventory, "alpha", "first")
++    now = [100.0]
++    monkeypatch.setattr(st, "time", SimpleNamespace(monotonic=lambda: now[0]))
++    assert st.find_all_skills()[0]["description"] == "first"
++    stat = path.stat()
++    path.write_text(path.read_text().replace("first", "other"), encoding="utf-8")
++    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
++    now[0] += st._SKILLS_CACHE_TTL_SECONDS - 1
++    assert st.find_all_skills()[0]["description"] == "first"
++    now[0] += 1
++    assert st.find_all_skills()[0]["description"] == "other"
++
++
++def test_parse_retention_is_bounded_and_errors_retry(monkeypatch):
++    from tools.skill_catalog_parse import _parse, parse_catalog_text
++    _parse.cache_clear()
++    for index in range(513):
++        assert parse_catalog_text(f"---\nname: skill-{index}\n---\n")[0]["name"] == f"skill-{index}"
++    assert _parse.cache_info().currsize == 512
++    parser = Mock(side_effect=[ValueError("broken"), ({"name": "recovered"}, "")])
++    monkeypatch.setattr(st, "_parse_frontmatter", parser)
++    with pytest.raises(ValueError, match="broken"):
++        parse_catalog_text("---\nname: recovery\n---\n")
++    assert parse_catalog_text("---\nname: recovery\n---\n")[0]["name"] == "recovered"
++
++
++@pytest.mark.parametrize("text", [
++    "plain body", "\ufeff---\nname: bom\n---\nBody", "---\ndescription: null\n---\nBody",
++    "---\nname: [broken\ndescription: fallback\n---\nBody",
++    "---\nname: sample\nmetadata: &anchor {tags: [one]}\nalias: *anchor\n---\nBody",
++])
++def test_parse_matches_literal_including_fallback(text):
++    from tools.skill_catalog_parse import parse_catalog_text
++    expected = st._parse_frontmatter(text)
++    assert parse_catalog_text(text) == expected
++    assert parse_catalog_text(text) == expected
+diff --git a/tests/tui_gateway/test_catalog_cpu_replay.py b/tests/tui_gateway/test_catalog_cpu_replay.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..59fb6dec35ed10c7c509204031c5b51eaf6c0fae
+--- /dev/null
++++ b/tests/tui_gateway/test_catalog_cpu_replay.py
+@@ -0,0 +1,53 @@
++"""Full catalog replay across due refreshes; timing is evidence, not a flaky CI gate."""
++import json
++from pathlib import Path
++import shutil
++import time
++from types import SimpleNamespace
++
++from tui_gateway.command_discovery import command_catalog
++
++
++def test_catalog_replay(tmp_path, monkeypatch, record_property):
++    from tools import skills_tool as st
++    from tools import skill_catalog_parse as reuse
++    from agent import skill_utils
++    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
++
++    home = tmp_path / "home"
++    home.mkdir()
++    root = Path(__file__).parents[2]
++    shutil.copytree(root / "skills", home / "skills")
++    shutil.copytree(root / "optional-skills", home / "external")
++    monkeypatch.setattr(skill_utils, "get_external_skills_dirs", lambda: [home / "external"])
++    monkeypatch.setattr(skill_utils, "get_project_skills_dir", lambda: None, raising=False)
++    clock = [100.0]
++    monkeypatch.setattr(st, "time", SimpleNamespace(monotonic=lambda: clock[0]))
++    candidate = reuse.parse_catalog_text
++    samples = {"before": [], "after": []}
++    outputs = {}
++    token = set_hermes_home_override(str(home))
++    try:
++        # Same full builder and inventory. Only the original pure parse is substituted.
++        # Alternate order; warm both variants, then retain every measured sample.
++        for variant in ("before", "after", "after", "before"):
++            monkeypatch.setattr(reuse, "parse_catalog_text",
++                                st._parse_frontmatter if variant == "before" else candidate)
++            clock[0] += 151.909
++            command_catalog()
++            for _ in range(4):
++                clock[0] += 151.909  # four calls per frozen 607.636s window; accelerated clock
++                start = time.process_time()
++                result = command_catalog()
++                samples[variant].append(time.process_time() - start)
++                if variant in outputs:
++                    assert result == outputs[variant]
++                outputs[variant] = result
++        assert outputs["before"] == outputs["after"]
++        assert outputs["after"]["skill_count"] > 20
++        record_property("catalog_replay", json.dumps({
++            "cpu_s": samples, "skill_count": outputs["after"]["skill_count"],
++            "parity": True, "clock": "accelerated expiry, not live RPC budget proof",
++            "inputs": "repository bundled and optional skills; isolated home, empty plugin registry"}))
++    finally:
++        reset_hermes_home_override(token)
+diff --git a/tools/skill_catalog_parse.py b/tools/skill_catalog_parse.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f463ac0268eddfaed403565db93eb6887bfe7558
+--- /dev/null
++++ b/tools/skill_catalog_parse.py
+@@ -0,0 +1,28 @@
++"""Bounded reuse of the pure text parse used by skill catalog refreshes.
++
++Do not cache catalog decisions here: profile/root precedence, disabled names,
++platform/environment/app eligibility and collision notices remain caller-owned.
++The caller still reads the current text at its existing refresh deadline, so
++in-place edits, replacement and same-stat rewrites need no new filesystem gate.
++"""
++from copy import deepcopy
++from functools import lru_cache
++
++
++@lru_cache(maxsize=512)
++def _parse(text, parser, yaml_loader):
++    # yaml_loader is part of the parser's dependency identity, not an invocation.
++    return parser(text)
++
++
++def parse_catalog_text(text: str):
++    """Parse the catalog's already-truncated text; never lend out cached YAML objects."""
++    from agent import skill_utils
++    from tools import skills_tool
++
++    # Custom parsers need not be pure (and may carry caller scope). Preserve their
++    # original invocation semantics rather than memoizing arbitrary callbacks.
++    if (skills_tool._parse_frontmatter is not skills_tool._DEFAULT_PARSE_FRONTMATTER
++            or skill_utils.parse_frontmatter is not skill_utils._DEFAULT_PARSE_FRONTMATTER):
++        return skills_tool._parse_frontmatter(text)
++    return deepcopy(_parse(text, skill_utils.parse_frontmatter, skill_utils.yaml_load))
+diff --git a/tools/skills_tool.py b/tools/skills_tool.py
+index 26e4c12d16dfaf51a596ec479ac11dae1f7c79aa..d21b4595406b8e2a5323579de4ed3ccdadefc640 100644
+--- a/tools/skills_tool.py
++++ b/tools/skills_tool.py
+@@ -253,7 +253,8 @@ def _skill_catalog(*, skip_disabled: bool = False, include_hidden: bool = False)
+             if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
+                 continue
+             try:
+-                frontmatter, body = _parse_frontmatter(_read_skill_text(skill_md)[:4000])
++                from tools.skill_catalog_parse import parse_catalog_text
++                frontmatter, body = parse_catalog_text(_read_skill_text(skill_md)[:4000])
+                 description = frontmatter.get("description", "")
+                 if not description:  # first non-heading body line (a null value stays null)
+                     description = next((ln for ln in map(str.strip, body.strip().split("\n"))
+-- 
+2.43.0
+

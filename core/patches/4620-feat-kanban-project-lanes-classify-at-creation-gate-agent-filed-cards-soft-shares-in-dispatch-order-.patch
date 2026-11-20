@@ -1,0 +1,862 @@
+From b4d4f6d68a1b3e3869c8402bf63b572a49f79248 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 13:55:36 -0800
+Subject: [PATCH] feat(kanban): project lanes: classify at creation, gate
+ agent-filed cards, soft shares in dispatch order [daveey]
+
+A card's lane is tasks.tenant; kanban.admission.lanes names them. Unconfigured is a no-op.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_admission_score.py       |   4 +-
+ hermes_cli/kanban_db.py                    |  10 +-
+ hermes_cli/kanban_db_creation.py           |   4 +-
+ hermes_cli/kanban_db_dispatch_queries.py   |   3 +-
+ hermes_cli/kanban_dependency_validation.py |   3 +
+ hermes_cli/kanban_lanes.py                 | 466 +++++++++++++++++++++
+ hermes_cli/kanban_triage_sweep.py          |   2 +-
+ tests/hermes_cli/test_kanban_lanes.py      | 235 +++++++++++
+ 8 files changed, 718 insertions(+), 9 deletions(-)
+ create mode 100644 hermes_cli/kanban_lanes.py
+ create mode 100644 tests/hermes_cli/test_kanban_lanes.py
+
+diff --git a/hermes_cli/kanban_admission_score.py b/hermes_cli/kanban_admission_score.py
+index a22aa456894cd5dcb4bf533a698561ac45ec8488..6efcd4401ef280591393dd1748750403dcc7b383 100644
+--- a/hermes_cli/kanban_admission_score.py
++++ b/hermes_cli/kanban_admission_score.py
+@@ -278,4 +278,6 @@ def rank(conn: sqlite3.Connection, rows, *, now_ms: Optional[int] = None, weight
+                                            tuple(sorted(weights.items())), tid in owners)))
+     scored.sort(key=lambda item: (not item[1].turn_owner, -item[1].total, item[1].ready_since,
+                                  metadata.get(item[0]["id"], ("normal", 0, 0))[2], item[0]["id"]))
+-    return scored
++    from hermes_cli.kanban_lanes import order
++
++    return order(conn, scored)
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index a38b7ec3f5a293827116ed67108f18796667bf9d..1693513e4944472cf8a50732a67583a4dab9e37f 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -32,7 +32,7 @@ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Any, Callable, Iterable, Optional
+ 
+-from hermes_cli import kanban_db_sync as _sync, kanban_park_pin as _park_pin, kanban_priority, kanban_source_receipt as _sr, kanban_requeue_custody as _requeue_custody, kanban_core_update_requeue as _cu_requeue
++from hermes_cli import kanban_db_sync as _sync, kanban_park_pin as _park_pin, kanban_source_receipt as _sr, kanban_requeue_custody as _requeue_custody, kanban_core_update_requeue as _cu_requeue
+ from hermes_cli.kanban_db_values import _first_line, _opt_int, _json_or_null
+ from hermes_cli.kanban_db_event import Event  # public kb.Event; helpers import lazily: no cycle
+ from hermes_cli.kanban_worker_placement import resolved_db_placement, validate_creation
+@@ -1247,7 +1247,7 @@ def create_task(
+ 
+         return create_with_origin(conn, origin_intent, creation_options)
+ 
+-    from hermes_cli.kanban_db_graph import initial_task_state
++    from hermes_cli.kanban_lanes import initial_state as lane_state
+     from hermes_cli.kanban_creator_chats import initialize_ownership
+     from hermes_cli.kanban_pr_acceptance import validate_contract
+     from hermes_cli.kanban_human_request import validate_initial_request
+@@ -1333,7 +1333,7 @@ def create_task(
+             # commit so the dispatcher never sees a half-built graph.
+             with write_txn(conn, allow_nested=True):
+                 run_insert_guard(conn, insert_guard)
+-                task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
++                task_status, tenant, lane = lane_state(conn, parents, initial_status, triage, tenant, locals())
+                 # Project worktree: fresh dir under the repo + deterministic
+                 # branch, instead of the random ``wt/<id>`` worker fallback.
+                 if project_obj is not None and workspace_kind == "worktree":
+@@ -1353,7 +1353,7 @@ def create_task(
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     """,
+                     (
+-                        task_id, title.strip(), body, assignee, task_status, kanban_priority.bounded(priority),
++                        task_id, title.strip(), body, assignee, task_status, lane.priority(priority),
+                         created_by, now, workspace_kind, workspace_path,
+                         branch_name, project_id, tenant, idempotency_key, _opt_int(max_runtime_seconds),
+                         json.dumps(skills_list) if skills_list is not None else None,
+@@ -1368,7 +1368,7 @@ def create_task(
+                 from hermes_cli.kanban_db_creation import record_created
+                 record_created(
+                     conn, task_id, assignee=assignee, status=task_status, parents=parents,
+-                    creator_task_id=creator_task_id, tenant=tenant, workspace_kind=workspace_kind,
++                    creator_task_id=creator_task_id, tenant=tenant, workspace_kind=workspace_kind, lane=lane,
+                     workspace_path=workspace_path, branch_name=branch_name, project_id=project_id,
+                     skills=skills_list, goal_mode=goal_mode, model_override=model_override,
+                     provider_override=provider_override, created_by=created_by, requires=required,
+diff --git a/hermes_cli/kanban_db_creation.py b/hermes_cli/kanban_db_creation.py
+index d2a96a5a3051786efdeba50fc39d3c2d0112838f..bbd55294cd78afe9d03ac3e496612ec1c0a24971 100644
+--- a/hermes_cli/kanban_db_creation.py
++++ b/hermes_cli/kanban_db_creation.py
+@@ -44,7 +44,7 @@ def inherit_tool_priority(conn, args, creator_task_id):
+ def record_created(conn, task_id, *, assignee, status, parents, creator_task_id,
+                    tenant, workspace_kind, workspace_path, branch_name, project_id,
+                    skills, goal_mode, model_override, provider_override, created_by, requires,
+-                   placement_policy, human_request=None, placement_audit=None):
++                   placement_policy, human_request=None, placement_audit=None, lane=None):
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_consent import snapshot
+ 
+@@ -70,6 +70,8 @@ def record_created(conn, task_id, *, assignee, status, parents, creator_task_id,
+         "priority": conn.execute("SELECT priority FROM tasks WHERE id=?", (task_id,)).fetchone()[0],
+         "consent_stops": snapshot(conn, task_id, creator_task_id),
+     })
++    from hermes_cli.kanban_lanes import record as record_lane
++    record_lane(conn, task_id, lane)
+     if isinstance(placement_audit, dict) and placement_audit.get("hub_admission"):
+         kb._append_event(conn, task_id, "hub_admission", placement_audit["hub_admission"])
+     if status == "blocked":
+diff --git a/hermes_cli/kanban_db_dispatch_queries.py b/hermes_cli/kanban_db_dispatch_queries.py
+index f37c954d0a45f9a9d5957713299159db96e53dcb..dc41a25e11e6aa03afe9d94d37a81bd0f4216ee3 100644
+--- a/hermes_cli/kanban_db_dispatch_queries.py
++++ b/hermes_cli/kanban_db_dispatch_queries.py
+@@ -38,7 +38,8 @@ def lane_rows(conn: sqlite3.Connection, status: str, *, marked_first: bool = Fal
+         f"ORDER BY {DISPATCH_ORDER}"
+     ).fetchall()
+     from hermes_cli.kanban_dispatch_priority import order_with_remote_waiters
+-    rows = order_with_remote_waiters(conn, rows)
++    from hermes_cli.kanban_lanes import drop_paused
++    rows = order_with_remote_waiters(conn, drop_paused(conn, rows))
+     if marked_first:  # replica donation reorders within a class, never across the pool partition
+         rows.sort(key=lambda row: row["admission_class"] not in ("capacity", "urgent"))
+     return rows
+diff --git a/hermes_cli/kanban_dependency_validation.py b/hermes_cli/kanban_dependency_validation.py
+index dcfa592752c3103c7e271ed6877104dc675d6952..9083115757014df9193715ecb326511b704544f5 100644
+--- a/hermes_cli/kanban_dependency_validation.py
++++ b/hermes_cli/kanban_dependency_validation.py
+@@ -17,6 +17,9 @@ def insert_link(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None
+         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+         (parent_id, child_id),
+     )
++    from hermes_cli.kanban_lanes import release_blocker
++
++    release_blocker(conn, parent_id, child_id)
+ 
+ 
+ def would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+diff --git a/hermes_cli/kanban_lanes.py b/hermes_cli/kanban_lanes.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a41aed0a62adc7ae34a5adc7d9740c9fe50ef14e
+--- /dev/null
++++ b/hermes_cli/kanban_lanes.py
+@@ -0,0 +1,466 @@
++"""Project lanes: who a card's work is for, and how worker slots are split between them. [daveey]
++
++A card's lane is ``tasks.tenant``. ``kanban.admission.lanes`` in the installation-root config names the lanes::
++
++    kanban:
++      admission:
++        lane_default: other          # lane of a card nothing else places
++        agent_priority_cap: 100      # stored priority ceiling for cards the user did not create
++        lanes:
++          myapp: {share: 35, describe: "..."}
++          hermes:
++            share: 20
++            gated: true              # cards filed by other cards or by detectors start held in triage
++            admit_per_day: 50
++            match: {creators: [self-heal], key_prefixes: ["ci-main-watch:"], repos: [hermes-agent], self_work: true}
++            gate_exempt: ['independent review']   # title regexes that skip the gate under an admitted creator
++            never_admit: ['lifecycle guard']      # title regexes the planner may never admit
++          other: {share: 10}
++
++Three things read it. Creation (:func:`initial_state`) assigns the lane (given, then a ``match`` rule, then the
++parent's or creating card's lane, then the default) and holds a gated lane's agent-filed cards in ``triage`` with
++``block_kind='lane_gate'``. Ordering (:func:`order`) gives each free slot to the lane running the fewest cards
++relative to its share; a lane with nothing ready lends its share, so shares are targets and never ceilings.
++:func:`usage` reports target against actual.
++
++With no ``lanes`` mapping every function here is a no-op: creation, ordering and the triage sweep are unchanged.
++A malformed mapping is logged and treated as absent on the creation and dispatch paths (a config typo must not stop
++card creation); :func:`policy` raises it for the CLI.
++"""
++from __future__ import annotations
++
++import logging
++import os
++import re
++import sqlite3
++import time
++from dataclasses import dataclass
++from typing import Optional
++
++_LOG = logging.getLogger(__name__)
++
++ASSIGNED, UNCLASSIFIED, GATED, ADMITTED = "lane_assigned", "lane_unclassified", "lane_gated", "lane_admitted"
++GATE_KIND = "lane_gate"
++USER = "user"
++DEFAULT_LANE = "other"
++_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
++_OPEN = "('triage', 'todo', 'scheduled', 'ready', 'running', 'blocked', 'review')"
++
++
++@dataclass(frozen=True)
++class Lane:
++    name: str
++    share: float = 0
++    gated: bool = False
++    admit_per_day: Optional[int] = None
++    paused: bool = False
++    describe: str = ""
++    creators: frozenset = frozenset()
++    key_prefixes: tuple = ()
++    repos: frozenset = frozenset()
++    self_work: bool = False
++    gate_exempt: tuple = ()
++    never_admit: tuple = ()
++
++
++@dataclass(frozen=True)
++class Policy:
++    lanes: dict
++    default: str
++    priority_cap: Optional[int]
++
++    def lane_of(self, tenant) -> str:
++        return tenant if tenant in self.lanes else self.default
++
++
++@dataclass(frozen=True)
++class Decision:
++    """What creation decided for one card; the empty decision is "lanes are not configured"."""
++    lane: Optional[str] = None
++    source: Optional[str] = None
++    gated: bool = False
++    cap: Optional[int] = None
++
++    def priority(self, value: int) -> int:
++        from hermes_cli.kanban_priority import bounded
++
++        value = bounded(value)
++        return value if self.cap is None else min(value, self.cap)
++
++
++def _strings(raw, what) -> tuple:
++    if raw is None:
++        return ()
++    if not isinstance(raw, list) or not all(isinstance(v, str) and v for v in raw):
++        raise ValueError(f"lane {what} must be a list of non-empty strings")
++    return tuple(raw)
++
++
++def _patterns(raw, what) -> tuple:
++    try:
++        return tuple(re.compile(p, re.IGNORECASE) for p in _strings(raw, what))
++    except re.error as exc:
++        raise ValueError(f"lane {what}: {exc}") from exc
++
++
++def _lane(name, raw) -> Lane:
++    if not isinstance(name, str) or not _NAME.match(name):
++        raise ValueError(f"lane name {name!r} must match {_NAME.pattern}")
++    raw = {} if raw is None else raw
++    if not isinstance(raw, dict):
++        raise ValueError(f"lane {name} must be a mapping")
++    known = {"share", "gated", "admit_per_day", "paused", "describe", "match", "gate_exempt", "never_admit"}
++    if unknown := sorted(set(raw) - known):
++        raise ValueError(f"lane {name}: unknown key(s) {', '.join(map(str, unknown))}")
++    share = raw.get("share", 0)
++    if type(share) not in (int, float) or share < 0:
++        raise ValueError(f"lane {name}: share must be a nonnegative number")
++    per_day = raw.get("admit_per_day")
++    if per_day is not None and (type(per_day) is not int or per_day < 0):
++        raise ValueError(f"lane {name}: admit_per_day must be a nonnegative integer")
++    match = raw.get("match") or {}
++    if not isinstance(match, dict) or set(match) - {"creators", "key_prefixes", "repos", "self_work"}:
++        raise ValueError(f"lane {name}: match takes creators, key_prefixes, repos, self_work")
++    return Lane(
++        name=name, share=float(share), gated=raw.get("gated") is True, admit_per_day=per_day,
++        paused=raw.get("paused") is True, describe=str(raw.get("describe") or ""),
++        creators=frozenset(_strings(match.get("creators"), "match.creators")),
++        key_prefixes=_strings(match.get("key_prefixes"), "match.key_prefixes"),
++        repos=frozenset(_strings(match.get("repos"), "match.repos")), self_work=match.get("self_work") is True,
++        gate_exempt=_patterns(raw.get("gate_exempt"), "gate_exempt"),
++        never_admit=_patterns(raw.get("never_admit"), "never_admit"))
++
++
++def parse(admission: dict) -> Optional[Policy]:
++    """The lane policy in a ``kanban.admission`` mapping; None when it names no lanes. Raises ValueError."""
++    raw = admission.get("lanes")
++    if not raw:
++        return None
++    if not isinstance(raw, dict):
++        raise ValueError("kanban.admission.lanes must be a mapping of lane name to settings")
++    lanes = {name: _lane(name, spec) for name, spec in raw.items()}
++    default = admission.get("lane_default", DEFAULT_LANE)
++    if default not in lanes:
++        raise ValueError(f"kanban.admission.lane_default {default!r} is not a configured lane")
++    cap = admission.get("agent_priority_cap")
++    if cap is not None and type(cap) is not int:
++        raise ValueError("kanban.admission.agent_priority_cap must be an integer")
++    return Policy(lanes, default, cap)
++
++
++def policy() -> Optional[Policy]:
++    from hermes_cli.kanban_admission_pools import admission_policy
++
++    return parse(admission_policy())
++
++
++def safe_policy() -> Optional[Policy]:
++    """:func:`policy` for creation and dispatch: a malformed mapping is logged and reads as no lanes."""
++    try:
++        return policy()
++    except ValueError:
++        _LOG.warning("kanban.admission.lanes is malformed; lanes are off until it is fixed", exc_info=True)
++        return None
++
++
++# ── creation ────────────────────────────────────────────────────────────────
++
++def _key_matches(lane: Lane, key) -> bool:
++    return isinstance(key, str) and bool(lane.key_prefixes) and key.startswith(lane.key_prefixes)
++
++
++def _rule_lane(pol: Policy, opts: dict) -> Optional[str]:
++    repos = {os.path.basename(str(p).rstrip("/")) for p in (opts.get("project_repo"), opts.get("workspace_path"))
++             if p}
++    for lane in pol.lanes.values():
++        if (opts.get("created_by") in lane.creators or _key_matches(lane, opts.get("idempotency_key"))
++                or (lane.self_work and opts.get("self_work") is not None) or repos & lane.repos):
++            return lane.name
++    return None
++
++
++def _creator_row(conn, opts):
++    creator = opts.get("creator_task_id")
++    if not creator:
++        return None
++    return conn.execute("SELECT tenant, status, block_kind FROM tasks WHERE id = ?", (creator,)).fetchone()
++
++
++def _classify(conn, pol: Policy, given, inherited, opts) -> tuple[str, str]:
++    if given:
++        return given, "given"
++    if lane := _rule_lane(pol, opts):
++        return lane, "rule"
++    if not inherited and (row := _creator_row(conn, opts)) is not None:
++        inherited = row["tenant"]
++    if inherited:
++        return inherited, "inherited"
++    return pol.default, "unclassified"
++
++
++def _gated(conn, pol: Policy, lane_name: str, opts: dict) -> bool:
++    """An agent-filed card in a gated lane waits for admission; the user's own cards and alarms do not."""
++    from hermes_cli.kanban_admission_score import _alarm_key
++
++    lane = pol.lanes.get(lane_name)
++    if lane is None or not lane.gated or opts.get("created_by") == USER:
++        return False
++    key = opts.get("idempotency_key")
++    filed_by_agent = bool(opts.get("creator_task_id")) or opts.get("created_by") in lane.creators \
++        or _key_matches(lane, key)
++    if not filed_by_agent or _alarm_key(key) or opts.get("admission_class") == "urgent":
++        return False
++    title = opts.get("title") or ""
++    if any(p.search(title) for p in lane.gate_exempt):
++        # Review and land work of an admitted card must be able to finish it.
++        row = _creator_row(conn, opts)
++        if row is not None and not (row["status"] == "triage" and row["block_kind"] == GATE_KIND):
++            return False
++    return True
++
++
++def initial_state(conn, parents, initial_status, triage, tenant, opts) -> tuple[str, Optional[str], Decision]:
++    """``kanban_db_graph.initial_task_state`` plus the lane decision, under the creator's write transaction.
++
++    ``opts`` is ``create_task``'s locals. Only a card that would start ``ready`` or ``todo`` is gated: an explicit
++    triage, blocked or running start is the creator's own parking and keeps its meaning.
++    """
++    from hermes_cli.kanban_db_graph import initial_task_state
++
++    status, inherited = initial_task_state(conn, parents, initial_status, triage, tenant)
++    pol = safe_policy()
++    if pol is None:
++        return status, inherited, Decision()
++    lane, source = _classify(conn, pol, tenant, inherited, opts)
++    gated = status in ("ready", "todo") and _gated(conn, pol, lane, opts)
++    cap = None if opts.get("created_by") == USER else pol.priority_cap
++    return ("triage" if gated else status), lane, Decision(lane, source, gated, cap)
++
++
++def record(conn, task_id: str, decision: Optional[Decision]) -> None:
++    """Persist a creation decision's events (and the gate mark) in the creator's transaction."""
++    if decision is None or decision.lane is None:
++        return
++    from hermes_cli.kanban_db import _append_event
++
++    _append_event(conn, task_id, ASSIGNED, {"lane": decision.lane, "source": decision.source})
++    if decision.source == "unclassified":
++        _append_event(conn, task_id, UNCLASSIFIED, {"lane": decision.lane})
++    if decision.gated:
++        conn.execute("UPDATE tasks SET block_kind = ? WHERE id = ?", (GATE_KIND, task_id))
++        _append_event(conn, task_id, GATED, {"lane": decision.lane})
++
++
++# ── moves after creation ────────────────────────────────────────────────────
++
++def assign(conn, task_id: str, lane: str, *, source: str, reason: str, pol: Optional[Policy] = None) -> None:
++    """Move a card to ``lane``; raises ValueError for an unknown lane or card."""
++    from hermes_cli import kanban_db as kb
++
++    pol = policy() if pol is None else pol
++    if pol is None or lane not in pol.lanes:
++        raise ValueError(f"unknown lane: {lane}")
++    with kb.write_txn(conn):
++        row = conn.execute("SELECT tenant FROM tasks WHERE id = ?", (task_id,)).fetchone()
++        if row is None:
++            raise ValueError(f"no such task: {task_id}")
++        conn.execute("UPDATE tasks SET tenant = ? WHERE id = ?", (lane, task_id))
++        kb._append_event(conn, task_id, ASSIGNED, {"lane": lane, "from": row["tenant"], "source": source,
++                                                   "reason": reason})
++
++
++def held(conn, lane: Optional[str] = None) -> list[sqlite3.Row]:
++    """Cards waiting at a lane gate, oldest first."""
++    sql = ("SELECT id, title, tenant, priority, created_at, created_by FROM tasks "
++           "WHERE status = 'triage' AND block_kind = ?")
++    params: tuple = (GATE_KIND,)
++    if lane is not None:
++        sql, params = sql + " AND tenant = ?", (GATE_KIND, lane)
++    return conn.execute(sql + " ORDER BY created_at, id", params).fetchall()
++
++
++def day_start(now: Optional[float] = None) -> int:
++    """Start of the host's local day: the admit budget is per local day."""
++    local = time.localtime(time.time() if now is None else now)
++    return int(time.mktime((local.tm_year, local.tm_mon, local.tm_mday, 0, 0, 0, 0, 0, -1)))
++
++
++def admitted_today(conn, lane: str, *, now: Optional[float] = None) -> int:
++    """Budgeted admissions into ``lane`` since the local day began."""
++    return conn.execute(
++        "SELECT COUNT(*) FROM task_events e WHERE e.kind = ? AND e.created_at >= ? "
++        "AND json_extract(e.payload, '$.lane') = ? AND COALESCE(json_extract(e.payload, '$.budget'), 1) = 1",
++        (ADMITTED, day_start(now), lane)).fetchone()[0]
++
++
++def admit(conn, task_id: str, *, actor: str, reason: str, budget: bool = True) -> bool:
++    """Release a gate-held card to ``ready`` (``todo`` while a parent is open). False when it is not held."""
++    from hermes_cli import kanban_db as kb
++
++    with kb.write_txn(conn, allow_nested=True):
++        row = conn.execute("SELECT tenant FROM tasks WHERE id = ? AND status = 'triage' AND block_kind = ?",
++                           (task_id, GATE_KIND)).fetchone()
++        if row is None:
++            return False
++        waiting = any(state not in ("done", "archived") for _pid, state in kb.parent_states(conn, task_id))
++        conn.execute("UPDATE tasks SET status = ?, block_kind = NULL WHERE id = ?",
++                     ("todo" if waiting else "ready", task_id))
++        kb._append_event(conn, task_id, ADMITTED, {"lane": row["tenant"], "actor": actor, "reason": reason,
++                                                   "budget": 1 if budget else 0})
++    return True
++
++
++def release_blocker(conn, parent_id: str, child_id: str) -> None:
++    """A gate-held card that another lane's open card now waits on is admitted outside the budget."""
++    rows = {r["id"]: r for r in conn.execute(
++        f"SELECT id, tenant, status, block_kind, status IN {_OPEN} AS open FROM tasks WHERE id IN (?, ?)",
++        (parent_id, child_id))}
++    parent, child = rows.get(parent_id), rows.get(child_id)
++    if parent is None or child is None or not child["open"]:
++        return
++    if parent["status"] != "triage" or parent["block_kind"] != GATE_KIND:
++        return
++    pol = safe_policy()
++    if pol is None or pol.lane_of(child["tenant"]) == pol.lane_of(parent["tenant"]):
++        return
++    admit(conn, parent_id, actor="link", reason=f"{child_id} in lane {pol.lane_of(child['tenant'])} waits on it",
++          budget=False)
++
++
++# ── ordering ────────────────────────────────────────────────────────────────
++
++def _running(conn, pol: Policy) -> dict[str, int]:
++    """Running cards per lane across the fleet: the full replica, with local rows overriding it."""
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_worker_node as wn
++
++    lanes: dict[str, str] = {}
++    if sync.board_mode(conn) == "primary":
++        replica = None
++        try:
++            replica = wn.open_replica(conn)
++            if replica is not None:
++                lanes = {r[0]: r[1] for r in replica.execute("SELECT id, tenant FROM tasks WHERE status = 'running'")}
++        except (sqlite3.Error, OSError, RuntimeError):
++            lanes = {}
++        finally:
++            if replica is not None:
++                replica.close()
++    if lanes:
++        marks = ",".join("?" for _ in lanes)
++        for tid, status in conn.execute(f"SELECT id, status FROM tasks WHERE id IN ({marks})", tuple(lanes)):
++            if status != "running":
++                del lanes[tid]
++    lanes.update((r[0], r[1]) for r in conn.execute("SELECT id, tenant FROM tasks WHERE status = 'running'"))
++    counts = dict.fromkeys(pol.lanes, 0)
++    for tenant in lanes.values():
++        counts[pol.lane_of(tenant)] += 1
++    return counts
++
++
++def _candidate_lanes(conn, pol: Policy, ids: list[str]) -> tuple[dict[str, str], set[str]]:
++    from hermes_cli.kanban_admission_score import _alarm_key
++
++    lanes, alarms = {}, set()
++    for offset in range(0, len(ids), 400):
++        batch = ids[offset:offset + 400]
++        marks = ",".join("?" for _ in batch)
++        for tid, tenant, key in conn.execute(
++                f"SELECT id, tenant, idempotency_key FROM tasks WHERE id IN ({marks})", batch):
++            lanes[tid] = pol.lane_of(tenant)
++            if _alarm_key(key):
++                alarms.add(tid)
++    return lanes, alarms
++
++
++def order(conn, scored: list, *, pol: Optional[Policy] = None) -> list:
++    """Reorder ``kanban_admission_score.rank``'s sorted ``(row, breakdown)`` list by lane share.
++
++    Land-turn owners, marked classes and alarm cards keep their place at the front. Every other pick goes to
++    the lane with the fewest ``(running + already picked) / share``; inside a lane the score order is kept.
++    Cards of a paused lane sort last (``drop_paused`` removes them from dispatch). No lanes = unchanged.
++    """
++    pol = safe_policy() if pol is None else pol
++    if pol is None or len(scored) < 2:
++        return scored
++    lanes, alarms = _candidate_lanes(conn, pol, [row["id"] for row, _parts in scored])
++    front, queues, paused = [], {}, []
++    for index, item in enumerate(scored):
++        row, parts = item
++        lane = pol.lanes[lanes.get(row["id"], pol.default)]
++        if parts.turn_owner or parts.class_rank > 0 or row["id"] in alarms:
++            front.append(item)
++        elif lane.paused:
++            paused.append(item)
++        else:
++            queues.setdefault(lane.name, []).append((index, item))
++    if len(queues) < 2:
++        return front + [item for queue in queues.values() for _i, item in queue] + paused
++    load = _running(conn, pol)
++    out = []
++    while queues:
++        def cost(name):
++            share = pol.lanes[name].share
++            return (load[name] / share if share > 0 else float("inf"), queues[name][0][0])
++        name = min(queues, key=cost)
++        out.append(queues[name].pop(0)[1])
++        load[name] += 1
++        if not queues[name]:
++            del queues[name]
++    return front + out + paused
++
++
++def drop_paused(conn, rows: list) -> list:
++    """Dispatch candidates minus cards of a paused lane (alarm and marked cards are never paused)."""
++    pol = safe_policy()
++    if pol is None or not rows or not any(lane.paused for lane in pol.lanes.values()):
++        return rows
++    lanes, alarms = _candidate_lanes(conn, pol, [row["id"] for row in rows])
++
++    def keep(row) -> bool:
++        try:
++            marked = row["admission_class"] in ("capacity", "urgent")
++        except (IndexError, KeyError):
++            marked = False
++        return marked or row["id"] in alarms or not pol.lanes[lanes.get(row["id"], pol.default)].paused
++    return [row for row in rows if keep(row)]
++
++
++# ── report ──────────────────────────────────────────────────────────────────
++
++def usage(conn, pol: Policy, *, window_s: int, now: Optional[float] = None) -> dict[str, dict]:
++    """Per lane on one connection: target and actual share of run-seconds in the window, and what is waiting."""
++    now = int(time.time() if now is None else now)
++    cutoff = now - window_s
++    out = {name: {"share": lane.share, "paused": lane.paused, "gated": lane.gated,
++                  "admit_per_day": lane.admit_per_day, "run_seconds": 0, "runs": 0, "running": 0, "ready": 0,
++                  "held": 0, "open": 0, "oldest_ready_s": None, "admitted_today": 0}
++           for name, lane in pol.lanes.items()}
++    for tenant, seconds, runs in conn.execute(
++            "SELECT t.tenant, SUM(MIN(COALESCE(r.ended_at, ?), ?) - MAX(r.started_at, ?)), COUNT(*) "
++            "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
++            "WHERE r.started_at IS NOT NULL AND r.started_at < ? AND COALESCE(r.ended_at, ?) > ? GROUP BY t.tenant",
++            (now, now, cutoff, now, now, cutoff)):
++        row = out[pol.lane_of(tenant)]
++        row["run_seconds"] += int(seconds or 0)
++        row["runs"] += runs
++    for tenant, status, kind, count, oldest in conn.execute(
++            f"SELECT tenant, status, COALESCE(block_kind, ''), COUNT(*), MIN(created_at) "
++            f"FROM tasks WHERE status IN {_OPEN} GROUP BY 1, 2, 3"):
++        row = out[pol.lane_of(tenant)]
++        row["open"] += count
++        if status == "running":
++            row["running"] += count
++        elif status == "ready":
++            row["ready"] += count
++            age = now - int(oldest or now)
++            row["oldest_ready_s"] = age if row["oldest_ready_s"] is None else max(row["oldest_ready_s"], age)
++        elif status == "triage" and kind == GATE_KIND:
++            row["held"] += count
++    total_share = sum(lane.share for lane in pol.lanes.values() if not lane.paused) or 1
++    total_run = sum(row["run_seconds"] for row in out.values()) or 1
++    for name, row in out.items():
++        row["target"] = 0.0 if row["paused"] else round(row["share"] / total_share, 4)
++        row["actual"] = round(row["run_seconds"] / total_run, 4)
++        row["admitted_today"] = admitted_today(conn, name, now=now) if row["gated"] else 0
++    return out
+diff --git a/hermes_cli/kanban_triage_sweep.py b/hermes_cli/kanban_triage_sweep.py
+index ab31238302cc25c8c63e354ab82a51553ac47415..8d0f4d667f8614cded4e9fe7e80793f28613afa0 100644
+--- a/hermes_cli/kanban_triage_sweep.py
++++ b/hermes_cli/kanban_triage_sweep.py
+@@ -109,7 +109,7 @@ def sweep_stale_triage(
+     swept: list[str] = []
+     rows = conn.execute(
+         "SELECT t.id, t.title, t.body, t.assignee, t.human_request, t.tenant FROM tasks t "
+-        "WHERE t.status = 'triage' "
++        "WHERE t.status = 'triage' AND COALESCE(t.block_kind, '') != 'lane_gate' "
+         "AND COALESCE((SELECT MAX(e.created_at) FROM task_events e WHERE e.task_id = t.id), t.created_at) <= ? "
+         "AND COALESCE((SELECT MAX(n.id) FROM task_events n WHERE n.task_id = t.id "
+         f"AND n.kind IN ({_MARKS})), 0) > "
+diff --git a/tests/hermes_cli/test_kanban_lanes.py b/tests/hermes_cli/test_kanban_lanes.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..845b19fedbd7188368746a82e8efbd76a951ab63
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_lanes.py
+@@ -0,0 +1,235 @@
++"""Project lanes: classification and the creation gate, soft shares in dispatch order, the usage report."""
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_lanes as lanes
++from hermes_cli.kanban_db_dispatch_queries import lane_rows
++from tests.hermes_cli import test_kanban_parent_first_dispatch as helpers
++
++conn = helpers.conn
++
++LANES = {
++    "myapp": {"share": 35, "describe": "Example app"},
++    "hermes": {"share": 20, "gated": True, "admit_per_day": 2,
++               "match": {"creators": ["self-heal"], "key_prefixes": ["ci-main-watch:"], "repos": ["hermes-agent"],
++                         "self_work": True},
++               "gate_exempt": ["independent review"], "never_admit": ["lifecycle guard"]},
++    "other": {"share": 10},
++}
++
++
++@pytest.fixture
++def configured(conn, monkeypatch):
++    def write(mapping=None, **admission):
++        from hermes_constants import get_default_hermes_root
++
++        doc = {"kanban": {"admission": {"lanes": LANES if mapping is None else mapping,
++                                        "agent_priority_cap": 100, **admission}}}
++        (Path(get_default_hermes_root()) / "config.yaml").write_text(json.dumps(doc))  # JSON is YAML
++    write()
++    return write
++
++
++def _task(conn, tid):
++    return conn.execute("SELECT status, tenant, priority, block_kind FROM tasks WHERE id=?", (tid,)).fetchone()
++
++
++def _kinds(conn, tid):
++    return [r[0] for r in conn.execute("SELECT kind FROM task_events WHERE task_id=? ORDER BY id", (tid,))]
++
++
++def _hermes_parent(conn):
++    """An admitted Hermes card the user filed: the creating card for agent-filed children."""
++    return kb.create_task(conn, title="core work", assignee="default", created_by="user",
++                          workspace_path="/src/hermes-agent")
++
++
++def test_no_lanes_configured_changes_nothing(conn):
++    parent = kb.create_task(conn, title="p", assignee="default", priority=900)
++    child = kb.create_task(conn, title="c", assignee="default", priority=900, creator_task_id=parent,
++                           created_by="self-heal", workspace_path="/src/hermes-agent")
++    row = _task(conn, child)
++    assert (row["status"], row["tenant"], row["priority"], row["block_kind"]) == ("ready", None, 900, None)
++    assert not [k for k in _kinds(conn, child) if k.startswith("lane_")]
++
++
++def test_agent_filed_card_in_gated_lane_waits_and_is_capped(conn, configured):
++    parent = _hermes_parent(conn)
++    assert _task(conn, parent)["status"] == "ready"  # the user's own card is never gated
++    child = kb.create_task(conn, title="follow-up", assignee="default", priority=1000, creator_task_id=parent,
++                           created_by="default", workspace_path="/src/hermes-agent")
++    row = _task(conn, child)
++    assert (row["status"], row["tenant"], row["block_kind"]) == ("triage", "hermes", lanes.GATE_KIND)
++    assert row["priority"] == 100
++    assert {lanes.ASSIGNED, lanes.GATED} <= set(_kinds(conn, child))
++
++
++def test_user_card_keeps_status_and_priority(conn, configured):
++    tid = kb.create_task(conn, title="mine", assignee="default", priority=1000, created_by="user",
++                         workspace_path="/src/hermes-agent")
++    row = _task(conn, tid)
++    assert (row["status"], row["tenant"], row["priority"], row["block_kind"]) == ("ready", "hermes", 1000, None)
++
++
++def test_rule_lane_wins_over_the_creating_cards_lane(conn, configured):
++    bb = kb.create_task(conn, title="bb", assignee="default", created_by="user", tenant="myapp")
++    child = kb.create_task(conn, title="fix the watcher", assignee="default", creator_task_id=bb,
++                           created_by="self-heal")
++    assert _task(conn, child)["tenant"] == "hermes"
++    plain = kb.create_task(conn, title="bb follow-up", assignee="default", creator_task_id=bb)
++    row = _task(conn, plain)
++    assert (row["tenant"], row["status"]) == ("myapp", "ready")
++
++
++def test_unplaced_card_is_default_lane_with_unclassified_event(conn, configured):
++    tid = kb.create_task(conn, title="something", assignee="default")
++    assert _task(conn, tid)["tenant"] == "other"
++    assert lanes.UNCLASSIFIED in _kinds(conn, tid)
++
++
++@pytest.mark.parametrize("extra", [{"idempotency_key": "pickup-stall:x"}, {"admission_class": "urgent",
++                                                                           "admission_frees": "frees a slot"}])
++def test_alarm_and_urgent_cards_skip_the_gate(conn, configured, extra):
++    parent = _hermes_parent(conn)
++    if extra.get("admission_class"):
++        extra = {"admission_class": "urgent"}
++    tid = kb.create_task(conn, title="now", assignee="default", creator_task_id=parent,
++                         workspace_path="/src/hermes-agent", **extra)
++    assert _task(conn, tid)["status"] == "ready"
++
++
++def test_gated_card_another_lane_waits_on_is_admitted(conn, configured):
++    parent = _hermes_parent(conn)
++    held = kb.create_task(conn, title="infra", assignee="default", creator_task_id=parent,
++                          workspace_path="/src/hermes-agent")
++    assert _task(conn, held)["status"] == "triage"
++    kb.create_task(conn, title="bb feature", assignee="default", tenant="myapp", parents=[held])
++    row = _task(conn, held)
++    assert (row["status"], row["block_kind"]) == ("ready", None)
++    assert lanes.admitted_today(conn, "hermes") == 0  # outside the budget
++
++
++def test_review_card_of_admitted_creator_skips_gate_but_not_of_held_one(conn, configured):
++    parent = _hermes_parent(conn)
++    review = kb.create_task(conn, title="Independent review of core work", assignee="default",
++                            creator_task_id=parent, workspace_path="/src/hermes-agent")
++    assert _task(conn, review)["status"] == "ready"
++    held = kb.create_task(conn, title="more", assignee="default", creator_task_id=parent,
++                          workspace_path="/src/hermes-agent")
++    review2 = kb.create_task(conn, title="Independent review of more", assignee="default",
++                             creator_task_id=held, workspace_path="/src/hermes-agent")
++    assert _task(conn, review2)["status"] == "triage"
++
++
++def test_triage_sweep_leaves_gate_held_card(conn, configured):
++    from hermes_cli.kanban_triage_sweep import sweep_stale_triage
++
++    parent = _hermes_parent(conn)
++    held = kb.create_task(conn, title="infra", assignee="default", creator_task_id=parent,
++                          workspace_path="/src/hermes-agent")
++    plain = kb.create_task(conn, title="needs a spec", assignee="default", triage=True, tenant="myapp")
++    conn.execute("UPDATE tasks SET created_at = created_at - 100000")
++    conn.execute("UPDATE task_events SET created_at = created_at - 100000")
++    conn.commit()
++    swept = sweep_stale_triage(conn)
++    assert plain in swept and held not in swept
++    assert _task(conn, held)["status"] == "triage"
++
++
++def test_admit_releases_and_counts_against_budget(conn, configured):
++    parent = _hermes_parent(conn)
++    held = kb.create_task(conn, title="infra", assignee="default", creator_task_id=parent,
++                          workspace_path="/src/hermes-agent")
++    assert [r["id"] for r in lanes.held(conn, "hermes")] == [held]
++    assert lanes.admit(conn, held, actor="user", reason="needed")
++    assert _task(conn, held)["status"] == "ready"
++    assert lanes.admitted_today(conn, "hermes") == 1
++    assert not lanes.admit(conn, held, actor="user", reason="again")
++
++
++def _ready_in(conn, lane, title, priority=0):
++    return kb.create_task(conn, title=title, assignee="default", priority=priority, tenant=lane, created_by="user")
++
++
++def _order(conn):
++    return [r["id"] for r in lane_rows(conn, "ready")]
++
++
++def test_under_share_lane_gets_the_next_slot(conn, configured):
++    hermes = [_ready_in(conn, "hermes", f"h{i}", priority=1000) for i in range(10)]
++    running = [_ready_in(conn, "hermes", f"r{i}") for i in range(4)]
++    conn.execute(f"UPDATE tasks SET status='running' WHERE id IN ({','.join('?' * 4)})", running)
++    conn.commit()
++    assert _order(conn)[0] in hermes  # nothing else ready: Hermes keeps the slot
++    bb = _ready_in(conn, "myapp", "bb")
++    assert _order(conn)[0] == bb
++    assert set(_order(conn)[1:]) == set(hermes)
++
++
++def test_equal_shares_alternate_and_keep_score_order_inside_a_lane(conn, configured):
++    configured({"a": {"share": 1}, "b": {"share": 1}, "other": {"share": 1}})
++    a = [_ready_in(conn, "a", f"a{i}", priority=900 - i) for i in range(3)]
++    b = [_ready_in(conn, "b", f"b{i}", priority=10 - i) for i in range(3)]
++    order = _order(conn)
++    assert [t for t in order if t in a] == a and [t for t in order if t in b] == b
++    assert {order[0], order[1]} == {a[0], b[0]} and {order[2], order[3]} == {a[1], b[1]}
++
++
++def test_marked_card_in_over_share_lane_still_first(conn, configured):
++    running = [_ready_in(conn, "hermes", f"r{i}") for i in range(4)]
++    conn.execute(f"UPDATE tasks SET status='running' WHERE id IN ({','.join('?' * 4)})", running)
++    conn.commit()
++    bb = _ready_in(conn, "myapp", "bb", priority=1000)
++    urgent = kb.create_task(conn, title="down", assignee="default", tenant="hermes", created_by="user",
++                            admission_class="urgent")
++    assert _order(conn)[:2] == [urgent, bb]
++
++
++def test_turn_owner_in_over_share_lane_still_first(conn, configured, monkeypatch):
++    from hermes_cli import kanban_host_counts, kanban_turn_urgency
++
++    running = [_ready_in(conn, "hermes", f"r{i}") for i in range(4)]
++    conn.execute(f"UPDATE tasks SET status='running' WHERE id IN ({','.join('?' * 4)})", running)
++    conn.commit()
++    bb = _ready_in(conn, "myapp", "bb", priority=1000)
++    owner = _ready_in(conn, "hermes", "landing")
++    monkeypatch.setattr(kanban_host_counts, "board_of", lambda _conn: "default")
++    monkeypatch.setattr(kanban_turn_urgency, "read_owners", lambda **_kw: {owner})
++    assert _order(conn)[:2] == [owner, bb]
++
++
++def test_paused_lane_is_not_dispatched(conn, configured):
++    mapping = json.loads(json.dumps(LANES))
++    mapping["myapp"]["paused"] = True
++    bb = _ready_in(conn, "myapp", "bb")
++    other = _ready_in(conn, "other", "o")
++    configured(mapping)
++    assert _order(conn) == [other]
++    configured()
++    assert set(_order(conn)) == {bb, other}
++
++
++def test_malformed_lanes_do_not_break_creation(conn, configured):
++    configured({"Bad Name": {"share": 1}})
++    with pytest.raises(ValueError):
++        lanes.policy()
++    tid = kb.create_task(conn, title="still works", assignee="default")
++    assert _task(conn, tid)["status"] == "ready"
++
++
++def test_usage_reports_target_actual_and_backlog(conn, configured):
++    parent = _hermes_parent(conn)
++    kb.create_task(conn, title="infra", assignee="default", creator_task_id=parent,
++                   workspace_path="/src/hermes-agent")
++    _ready_in(conn, "myapp", "bb")
++    now = 1_000_000
++    conn.execute("INSERT INTO task_runs (task_id, status, started_at, ended_at) VALUES (?, 'done', ?, ?)",
++                 (parent, now - 7200, now - 3600))
++    conn.commit()
++    out = lanes.usage(conn, lanes.policy(), window_s=6 * 3600, now=now)
++    assert out["hermes"]["run_seconds"] == 3600 and out["hermes"]["actual"] == 1.0
++    assert out["hermes"]["held"] == 1 and out["myapp"]["ready"] == 1
++    assert round(out["myapp"]["target"], 3) == round(35 / 65, 3)
+-- 
+2.43.0
+

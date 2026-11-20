@@ -1,0 +1,251 @@
+From 63ca93f72008e92a025e71633d776a1bc84babbd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 20:45:47 +0000
+Subject: [PATCH] [daveey] kanban release: match legacy comment events by uid
+ write time; stamp rows inside the lock
+
+add_comment took `now` before entering write_txn, so a row waiting on another
+writer's lock was stamped seconds before its commented event (5 s and 7 s on
+t_0b716b01a47db7f6). The legacy fallback compares those integer stamps within
+1 s, so the events stayed "Comment data unavailable" and every --seen release
+of the card was refused, while their UUIDv7 uids, minted in the one
+transaction, sit 6 ms and 1 ms apart.
+
+- add_comment stamps the row after the lock, like its event (producer fix).
+- _resolve's legacy fallback also accepts a same-author row whose UUIDv7 write
+  time is within 1 s of the event's: the existing tolerance on the writer's
+  own clock. Non-v7 or missing uids keep the old rule only.
+- test_delayed_legacy_local_writer now drifts both clocks, so it keeps testing
+  run provenance rather than the co-minted case the new rule proves.
+- Review nits on the redaction proof: ImportError fails closed; docstring says
+  masking is many-to-one; the negative test covers all three entry paths.
+
+Replay tests use the two live shapes on promote, unblock and the agent tool;
+they and the producer test fail without the source change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_comment_transcript_proof.py | 10 ++-
+ hermes_cli/kanban_db_comment_ids.py           |  4 +-
+ hermes_cli/kanban_release_comments.py         | 29 ++++++-
+ .../test_kanban_release_imported_comments.py  | 75 ++++++++++++++++++-
+ .../test_kanban_release_transcript_proof.py   |  5 +-
+ 5 files changed, 112 insertions(+), 11 deletions(-)
+
+diff --git a/hermes_cli/kanban_comment_transcript_proof.py b/hermes_cli/kanban_comment_transcript_proof.py
+index dd0900fe1bc0d86a2a09b83f8e0c8e2b19a76142..3dbe483729ff50afadcc951e63fc6e88cdc4df6d 100644
+--- a/hermes_cli/kanban_comment_transcript_proof.py
++++ b/hermes_cli/kanban_comment_transcript_proof.py
+@@ -15,9 +15,11 @@ same source integer under any other tool name refuses.
+ 
+ The retained call holds the body *before* the writer stored it, and
+ ``kanban_comment`` stores ``redact_sensitive_text(body, force=True)``. So a body
+-matches as written or after that same forced redaction, nothing looser: a
+-legacy comment quoting an E.164 number (stored as ``+141****0134``) is otherwise
+-unprovable forever and refuses every ``--seen`` release of its card.
++matches as written or after that same forced redaction: a legacy comment quoting
++an E.164 number (stored as ``+141****0134``) is otherwise unprovable forever and
++refuses every ``--seen`` release of its card. Masking is many-to-one, so a row
++with the same masked text can stand in for a missing one; it is the exact text
++the call stored, and when the true row syncs the two candidates refuse again.
+ """
+ from __future__ import annotations
+ 
+@@ -134,6 +136,6 @@ def resolve(rows, event, payload, transcript, *, board=None):
+         candidates = [r for r in rows if r['body'] in bodies
+                       and r['author'] == author.strip()
+                       and start <= r['created_at'] <= event['created_at']]
+-    except (_Unprovable, ValueError, TypeError, KeyError, AttributeError, OverflowError):
++    except (_Unprovable, ValueError, TypeError, KeyError, AttributeError, OverflowError, ImportError):
+         return []
+     return candidates if len(candidates) == 1 else []
+diff --git a/hermes_cli/kanban_db_comment_ids.py b/hermes_cli/kanban_db_comment_ids.py
+index 9179be78770810703cc1d2af4531f7bd64ccc496..bf2a3634d55f2153bca99c8ebb2ec7c6ee7b81e6 100644
+--- a/hermes_cli/kanban_db_comment_ids.py
++++ b/hermes_cli/kanban_db_comment_ids.py
+@@ -123,13 +123,15 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str,
+         raise ValueError(f"writer_kind must be 'agent' or 'human', not {writer_kind!r}")
+     from hermes_cli.kanban_comment_origin import resolve_origin
+     origin = resolve_origin(author, origin_gateway)
+-    now = int(time.time())
+     # [daveey] A comment written from inside a worker run records that run on its
+     # ``commented`` event, so the live comment bridge can skip exactly the run's own notes
+     # by id. Authorship cannot: workers and the chats steering them share a profile.
+     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
+     # compose comment writes under one outer commit.
+     with _kb.write_txn(conn, allow_nested=True):
++        # Stamped after the write lock, like the event: a stamp taken before it put the row
++        # seconds ahead of its event while another writer held the lock.
++        now = int(time.time())
+         _kb._require_task(conn, task_id)
+         if relayed_human:  # the card holder's own checks, atomic with the write (one relay per user turn)
+             from hermes_cli.kanban_relayed_human import admit
+diff --git a/hermes_cli/kanban_release_comments.py b/hermes_cli/kanban_release_comments.py
+index ad09e0ae2025fe1880b74c7e5a362854e130ea61..79a2376a24e9363df0d39409fffa9a5d5b6a6620 100644
+--- a/hermes_cli/kanban_release_comments.py
++++ b/hermes_cli/kanban_release_comments.py
+@@ -5,6 +5,7 @@ import json
+ import os
+ import shlex
+ import time
++import uuid
+ from datetime import UTC, datetime
+ 
+ UNREAD_EXIT = 4
+@@ -155,7 +156,8 @@ def _resolve(rows, event, payload, *, local_writer=False):
+     Legacy synced events have no portable reference. Require acknowledgement of
+     every plausible same-time/author row rather than guess among collisions.
+     The timestamp tolerance covers the writer crossing a second between inserts;
+-    body length cannot disambiguate because add_comment strips stored text.
++    UUIDv7 write times cover legacy rows stamped before the write lock (``_same_write``).
++    Body length cannot disambiguate because add_comment strips stored text.
+     """
+     if payload.get("comment_uid"):
+         return [r for r in rows if "uid" in r.keys() and r["uid"] == payload["comment_uid"]]
+@@ -166,10 +168,33 @@ def _resolve(rows, event, payload, *, local_writer=False):
+         # the second timestamp. Local run provenance makes its integer usable.
+         return [r for r in rows if r["id"] == payload.get("comment_id")
+                 and r["author"] == payload["author"].strip()]
+-    return [r for r in rows if abs(r["created_at"] - event["created_at"]) <= 1
++    return [r for r in rows if (abs(r["created_at"] - event["created_at"]) <= 1 or _same_write(r, event))
+             and (not payload.get("author") or r["author"] == payload["author"].strip())]
+ 
+ 
++def _uuid7_ms(uid):
++    """Millisecond write time a UUIDv7 carries; None for any other value."""
++    try:
++        value = uuid.UUID(str(uid))
++    except (ValueError, TypeError, AttributeError):
++        return None
++    return value.int >> 80 if value.version == 7 else None
++
++
++def _same_write(row, event):
++    """Row and event uids minted within a second: the same tolerance as ``created_at``, on a clock that is right.
++
++    Legacy ``add_comment`` stamped the row's ``created_at`` before waiting for the
++    write lock and the event's after it, so the two integers drift by seconds
++    (5 s and 7 s seen live) while their UUIDv7 uids, minted inside the one
++    transaction, sit milliseconds apart.
++    """
++    keys = row.keys()
++    row_ms = _uuid7_ms(row["uid"]) if "uid" in keys else None
++    event_ms = _uuid7_ms(event["uid"]) if "uid" in event.keys() else None
++    return row_ms is not None and event_ms is not None and abs(row_ms - event_ms) <= 1000
++
++
+ def cli_guard(args, tid, verb):
+     """Build a transactional precondition using the CLI's inherited caller identity."""
+     return lambda conn: check(conn, tid, session=os.environ.get("HERMES_SESSION_ID"),
+diff --git a/tests/hermes_cli/test_kanban_release_imported_comments.py b/tests/hermes_cli/test_kanban_release_imported_comments.py
+index d35ffaa26ffbe7479f59d2c4f6e45b3196503f4f..c2a813d0b813c455bd78ff2fcd928dae5c1829d8 100644
+--- a/tests/hermes_cli/test_kanban_release_imported_comments.py
++++ b/tests/hermes_cli/test_kanban_release_imported_comments.py
+@@ -167,8 +167,12 @@ def test_delayed_legacy_local_writer(board, entry, broken, capsys):
+                 payload["author"] = "another"
+             if broken == "unhashable_run":
+                 payload["writer_run_id"] = [run]
+-            conn.execute("UPDATE task_events SET created_at=created_at+21, payload=? "
+-                         "WHERE task_id=? AND kind='commented'", (json.dumps(payload), board))
++            # Both clocks drift 21 s: with co-minted uids the row is provable by write time alone
++            # (test_legacy_lock_drift_resolves_by_uid_write_time), and this test is about run provenance.
++            row_ms = int(conn.execute("SELECT created_at FROM task_comments WHERE id=?", (cid,)).fetchone()[0]) * 1000
++            conn.execute("UPDATE task_comments SET uid=? WHERE id=?", (_uid_at(row_ms), cid))
++            conn.execute("UPDATE task_events SET created_at=created_at+21, uid=?, payload=? "
++                         "WHERE task_id=? AND kind='commented'", (_uid_at(row_ms + 21000), json.dumps(payload), board))
+             if broken != "no_claim":
+                 kb._append_event(conn, board, "claimed", {
+                     "holder": "peer" if broken == "foreign" else "owner", "run_uid": "writer-run"})
+@@ -209,3 +213,70 @@ def test_legacy_ambiguous_same_second_lists_all_candidates(board, capsys, monkey
+     assert not ok and "do not release second" in output
+     ok, output = release(board, "promote", capsys, second)
+     assert ok, output
++
++
++def _uid_at(ms):
++    from hermes_cli.kanban_db_sync import uuid7
++    raw = uuid7().replace("-", "")
++    h = f"{ms:012x}" + raw[12:]
++    return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
++
++
++def _lock_drift(tid, drift_s, uid_gap_ms):
++    """t_0b716b01a47db7f6 shape: no comment_uid, no transcript, row stamped `drift_s` before its event."""
++    enable_sync(tid)
++    cid = comment(tid, session="peer-session", age=8 * 86400, body="Ladder run note from a subagent")
++    with kbc.connect_closing() as conn:
++        row = conn.execute("SELECT * FROM task_comments WHERE id=?", (cid,)).fetchone()
++        ms = row["created_at"] * 1000 + 300
++        with kbc.write_txn(conn):
++            conn.execute("UPDATE task_comments SET uid=? WHERE id=?", (_uid_at(ms), cid))
++            ev = conn.execute("SELECT id, payload FROM task_events WHERE task_id=? AND kind='commented' "
++                              "AND json_extract(payload, '$.comment_id')=?", (tid, cid)).fetchone()
++            payload = json.loads(ev["payload"])
++            payload.pop("comment_uid", None)
++            payload.pop("writer_run_id", None)
++            payload.pop("writer_run_uid", None)
++            conn.execute("UPDATE task_events SET created_at=?, uid=?, payload=? WHERE id=?",
++                         (row["created_at"] + drift_s, _uid_at(ms + uid_gap_ms), json.dumps(payload), ev["id"]))
++    return cid
++
++
++@pytest.mark.parametrize("entry", ["promote", "unblock", "tool"])
++@pytest.mark.parametrize("drift_s,uid_gap_ms", [(5, 6), (7, 1)])
++def test_legacy_lock_drift_resolves_by_uid_write_time(board, entry, drift_s, uid_gap_ms, capsys):
++    """Replay of the two live events (5 s / 6 ms and 7 s / 1 ms): proven by uid time, acknowledged by --seen."""
++    cid = _lock_drift(board, drift_s, uid_gap_ms)
++    ok, output = release(board, entry, capsys, cid - 1)
++    assert not ok and "Ladder run note" in output and "data unavailable" not in output, output
++    ok, output = release(board, entry, capsys, cid)
++    assert ok, output
++
++
++@pytest.mark.parametrize("uid_gap_ms", [1500, 60000])
++def test_legacy_uid_time_far_apart_stays_missing(board, uid_gap_ms, capsys):
++    cid = _lock_drift(board, 5, uid_gap_ms)
++    ok, output = release(board, "promote", capsys, cid + 1000)
++    assert not ok and "data unavailable" in output, output
++
++
++def test_comment_row_is_stamped_inside_the_write_lock(board, monkeypatch):
++    """The producer half: a 5 s wait for the write lock no longer separates row and event stamps."""
++    import contextlib
++    clock = [1794426069.0]
++    monkeypatch.setattr(time, "time", lambda: clock[0])
++    real = kb.write_txn
++
++    @contextlib.contextmanager
++    def slow_lock(conn, *args, **kwargs):
++        clock[0] += 5  # waiting for another writer's lock
++        with real(conn, *args, **kwargs):
++            yield
++
++    monkeypatch.setattr(kb, "write_txn", slow_lock)
++    with kbc.connect_closing() as conn:
++        cid = kb.add_comment(conn, board, "default", "stamped late", writer_kind="agent", writer_session="w")
++        row_at = conn.execute("SELECT created_at FROM task_comments WHERE id=?", (cid,)).fetchone()[0]
++        ev_at = conn.execute("SELECT created_at FROM task_events WHERE task_id=? AND kind='commented' "
++                             "AND json_extract(payload, '$.comment_id')=?", (board, cid)).fetchone()[0]
++    assert row_at == ev_at == 1794426074
+diff --git a/tests/hermes_cli/test_kanban_release_transcript_proof.py b/tests/hermes_cli/test_kanban_release_transcript_proof.py
+index 5381102fdb7bbd57592da3ed87a777740d2c422c..d6ae0ffedb9b4c16783cf1904629d248986e0065 100644
+--- a/tests/hermes_cli/test_kanban_release_transcript_proof.py
++++ b/tests/hermes_cli/test_kanban_release_transcript_proof.py
+@@ -93,11 +93,12 @@ def test_writer_redacted_body_is_proven_by_raw_receipt(board, entry, capsys):
+     assert ok, output
+ 
+ 
++@pytest.mark.parametrize('entry', ['promote', 'unblock', 'tool'])
+ @pytest.mark.parametrize('body', ['other body +14155550199 entirely', 'Mini operator: Keychain prompt confirmed by '
+                                   '+14155559999 at restart.'])
+-def test_redaction_does_not_widen_to_other_bodies(board, body, capsys):
++def test_redaction_does_not_widen_to_other_bodies(board, entry, body, capsys):
+     """Only the writer's exact transform of the retained body matches; a different number stays missing."""
+     cid, row, _raw, _stored = _redacted_delayed(board, 2)
+     retain(receipt(board, row['created_at'], ('call-1', board, body)))
+-    ok, output = release(board, 'promote', capsys, cid + 1000)
++    ok, output = release(board, entry, capsys, cid + 1000)
+     assert not ok and 'data unavailable' in output, output
+-- 
+2.43.0
+

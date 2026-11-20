@@ -1,0 +1,779 @@
+From b4996f8ccf2e04822f07149beaa6eb29260d04f3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 17:02:39 +0000
+Subject: [PATCH] fix(kanban): fence runtime tails and share capture storage
+ budget [daveey]
+
+Draft gap4 continuation, not production-enabled. Bind runtime tail receipts to sealed event bytes and deadline, track in-flight actual urgency reads, snapshot bounded detached payload primitives, and charge root/runtime metadata plus temporary file peaks under a cross-process advisory lock. Runtime arming/startup and assembled export remain incomplete. RED late-seal and caller-mutation tests reproduced; 366 consumer tests passed then 29 runtime/budget cases passed including spawned process contention. No live capture or policy changes.
+---
+ hermes_cli/kanban_fairness_budget.py          | 119 +++++++++++++
+ hermes_cli/kanban_fairness_runtime.py         | 157 ++++++++++++------
+ hermes_cli/kanban_fairness_segments.py        |   9 +-
+ hermes_cli/kanban_fairness_store.py           |   6 +
+ hermes_cli/kanban_fairness_tail.py            |  53 ++++++
+ hermes_cli/kanban_turn_urgency.py             |   8 +-
+ .../hermes_cli/test_kanban_fairness_budget.py | 119 +++++++++++++
+ .../test_kanban_fairness_runtime.py           | 124 ++++++++++++++
+ 8 files changed, 538 insertions(+), 57 deletions(-)
+ create mode 100644 hermes_cli/kanban_fairness_budget.py
+ create mode 100644 hermes_cli/kanban_fairness_tail.py
+ create mode 100644 tests/hermes_cli/test_kanban_fairness_budget.py
+
+diff --git a/hermes_cli/kanban_fairness_budget.py b/hermes_cli/kanban_fairness_budget.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..57e56159d0c1f5bbe743b171e51463005b6ac46e
+--- /dev/null
++++ b/hermes_cli/kanban_fairness_budget.py
+@@ -0,0 +1,119 @@
++"""Capture-wide logical-byte ceiling, including metadata and temporary files.
++
++Only writer/startup code calls this module; enqueue never takes a file lock or
++walks the capture. A failed partial append remains unsealed. No evidence is deleted.
++Cooperating processes serialize check + IO under one root lock. External writes
++are counted on the next write but cannot be prevented by this advisory protocol.
++"""
++from __future__ import annotations
++
++from contextlib import contextmanager
++import json
++import os
++from pathlib import Path
++
++NAME = "capture-budget.json"
++LIMIT = 512 * 1024 * 1024
++
++
++class BudgetExceeded(ValueError):
++    """The capture cannot accept this write, including its temporary-file peak."""
++
++
++@contextmanager
++def _locked(root):
++    try:
++        import fcntl
++    except ImportError as exc:
++        raise ValueError("capture budget requires advisory file locking") from exc
++    if (root / ".capture-budget.lock").is_symlink():
++        raise ValueError("budget lock must not be a symlink")
++    with (root / ".capture-budget.lock").open("a+b") as stream:
++        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
++        try:
++            yield
++        finally:
++            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
++
++
++def _used(root):
++    total, count = 0, 0
++
++    def walk(directory, depth=0):
++        nonlocal total, count
++        if depth > 4:
++            raise ValueError("capture directory nesting exceeded")
++        with os.scandir(directory) as entries:
++            for entry in entries:
++                count += 1
++                if count > 100000:
++                    raise BudgetExceeded("capture file count exceeded")
++                if entry.is_symlink():
++                    raise ValueError("capture must not contain symlinks")
++                if entry.is_dir(follow_symlinks=False):
++                    walk(entry.path, depth + 1)
++                elif entry.is_file(follow_symlinks=False):
++                    total += entry.stat(follow_symlinks=False).st_size
++                else:
++                    raise ValueError("capture must contain only regular files")
++    walk(root)
++    return total
++
++
++def _limit(root):
++    with (root / NAME).open("rb") as stream:
++        data = stream.read(257)
++    if len(data) > 256:
++        raise ValueError("invalid budget metadata")
++    value = json.loads(data)
++    if (not isinstance(value, dict) or set(value) != {"version", "max_bytes"}
++            or type(value["version"]) is not int or value["version"] != 1
++            or type(value["max_bytes"]) is not int or not 0 < value["max_bytes"] <= LIMIT):
++        raise ValueError("invalid budget metadata")
++    return value["max_bytes"]
++
++
++def initialize(root: Path, maximum=None):
++    requested = maximum
++    maximum = LIMIT if maximum is None else maximum
++    if type(maximum) is not int or not 0 < maximum <= LIMIT:
++        raise ValueError("invalid capture budget")
++    data = json.dumps({"version": 1, "max_bytes": maximum}).encode()
++    if len(data) > maximum:
++        raise BudgetExceeded("capture budget cannot hold metadata")
++    root.mkdir(parents=True, exist_ok=True)
++    if root.is_symlink():
++        raise ValueError("capture root must not be a symlink")
++    with _locked(root):
++        if (root / NAME).exists():
++            if _limit(root) != maximum and requested is not None:
++                raise ValueError("capture budget cannot change")
++            return
++        if _used(root) + len(data) > maximum:
++            raise BudgetExceeded("capture already exceeds budget")
++        _write(root / NAME, data)
++
++
++def _write(path, data):
++    tmp = path.with_name(path.name + ".tmp")
++    with tmp.open("wb") as stream:
++        stream.write(data)
++        stream.flush()
++        os.fsync(stream.fileno())
++    os.replace(tmp, path)
++
++
++def write(path, data):
++    """Route every segment/lifecycle write through its explicitly initialized root."""
++    parent = path.parent
++    root = parent.parent.parent if parent.parent.name == "runtime" else parent
++    if not (root / NAME).exists():
++        if root != parent:
++            raise ValueError("runtime capture budget missing")
++        _write(path, data)
++        return
++    with _locked(root):
++        if _used(root) + len(data) > _limit(root):
++            raise BudgetExceeded("capture storage bound exceeded")
++        _write(path, data)
++
+diff --git a/hermes_cli/kanban_fairness_runtime.py b/hermes_cli/kanban_fairness_runtime.py
+index e0a761342deb63e4f52705c773e1ec1a2ebe3610..5604f1e27b7ab0540dd16feb3b817f77a96823b2 100644
+--- a/hermes_cli/kanban_fairness_runtime.py
++++ b/hermes_cli/kanban_fairness_runtime.py
+@@ -6,6 +6,7 @@ An absent final seal (including shutdown timeout or writer failure) is incomplet
+ from __future__ import annotations
+ 
+ import atexit
++from contextlib import contextmanager
+ from collections import Counter, deque
+ import json
+ import os
+@@ -54,14 +55,38 @@ def enabled(*, board) -> bool:
+ 
+ 
+ def invalidate(*, board):
+-    """Fail closed after observation failure, without retrying the broken sink or IO.
+-
+-    Conservatively invalidate matching boards across profile scopes: losing evidence
+-    is preferable to certifying a complete epoch after an unrecorded observation.
+-    """
+-    for session in tuple(_SESSIONS.values()):
+-        if session.board == board:
++    """Fail closed after observation failure, without retrying the broken sink or IO."""
++    session = _SESSIONS.get(_key(board)) if _SESSIONS else None
++    if session is not None:
++        session.abandoned.set()
++
++
++@contextmanager
++def observation(*, board):
++    """Track actual reads across shutdown, without waiting on a busy capture lock."""
++    session = _SESSIONS.get(_key(board)) if _SESSIONS else None
++    admitted = False
++    if session is not None:
++        if session.lock.acquire(blocking=False):
++            try:
++                if not session.stopping.is_set():
++                    session.readers += 1
++                    admitted = True
++            finally:
++                session.lock.release()
++        else:
+             session.abandoned.set()
++    try:
++        yield
++    finally:
++        if admitted:
++            if session.lock.acquire(blocking=False):
++                try:
++                    session.readers -= 1
++                finally:
++                    session.lock.release()
++            else:
++                session.abandoned.set()
+ 
+ 
+ def submit(*, board, kind, payload) -> bool:
+@@ -78,40 +103,36 @@ class PayloadLimit(ValueError):
+ 
+ def bounded_payload(payload):
+     """Reject huge/deep/nonprimitive inputs before JSON allocates an unbounded copy."""
+-    pending = [iter((payload,))]
+     budget = MAX_PAYLOAD_BYTES
+-    while pending:
+-        if len(pending) > 32:
++
++    def copy(value, depth=0):
++        nonlocal budget
++        if depth > 32:
+             raise PayloadLimit("payload nesting limit")
+-        try:
+-            value = next(pending[-1])
+-        except StopIteration:
+-            pending.pop()
+-            continue
+         budget -= 1
+         if type(value) is str:
+             budget -= len(value)
+-        elif type(value) in (list, dict):
++        if budget < 0:
++            raise PayloadLimit("payload size limit")
++        if type(value) in (list, dict):
+             if len(value) > budget:
+                 raise PayloadLimit("payload item limit")
+             if type(value) is dict:
+-                for key in value:
++                result = {}
++                for key, child in value.items():
+                     if type(key) is not str:
+                         raise ValueError("payload keys must be strings")
+-                    budget -= len(key) + 1
+-                    if budget < 0:
+-                        raise PayloadLimit("payload key limit")
+-                pending.append(iter(value.values()))
+-            else:
+-                pending.append(iter(value))
+-        elif type(value) is int:
+-            if value.bit_length() > 128:
+-                raise PayloadLimit("payload integer limit")
+-        elif value is not None and type(value) not in (bool, float):
++                    result[copy(key, depth + 1)] = copy(child, depth + 1)
++                return result
++            return [copy(child, depth + 1) for child in value]
++        if type(value) is int and value.bit_length() > 128:
++            raise PayloadLimit("payload integer limit")
++        if value is not None and type(value) not in (str, bool, int, float):
+             raise ValueError("payload must contain JSON primitives")
+-        if budget < 0:
+-            raise PayloadLimit("payload size limit")
+-    raw = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8")
++        return value
++
++    # Serialize only detached primitives, never the concurrently mutable caller data.
++    raw = json.dumps(copy(payload), separators=(",", ":"), allow_nan=False).encode("utf-8")
+     if len(raw) > MAX_PAYLOAD_BYTES:
+         raise PayloadLimit("encoded payload limit")
+     return raw
+@@ -135,9 +156,18 @@ class Session:
+         self.failed = False
+         self.sealed = False
+         self.seq = 0
++        self.readers = 0
++        self.deadline_ns = None
++        self.loss_lock = threading.Lock()
+         # Validate supplied identities before starting any thread or making directories.
+         self.record("loss", self.loss_payload("clock_gap", 1), 1)
++        from hermes_cli.kanban_fairness_budget import initialize
++
++        initialize(settings.directory, settings.max_bytes)
+         self.out.mkdir(parents=True, exist_ok=False)
++        from hermes_cli.kanban_fairness_tail import open_epoch
++
++        open_epoch(self.out, self.identity)
+         from agent.memory_provider import spawn_context_thread
+ 
+         self.thread = spawn_context_thread(self.run, name="fairness-evidence", daemon=True)
+@@ -153,31 +183,39 @@ class Session:
+                            wall_ns=time.time_ns() if wall is None else wall,
+                            mono_ns=time.monotonic_ns() if mono is None else mono)
+ 
++    def note_loss(self, reason):
++        # Contention never waits on the scheduler. Uncounted loss invalidates the tail.
++        if not self.loss_lock.acquire(blocking=False):
++            self.abandoned.set()
++            return
++        try:
++            self.loss[reason] += 1
++        finally:
++            self.loss_lock.release()
++
+     def enqueue(self, kind, payload):
+         if self.stopping.is_set() or self.failed:
+             return False
+-        try:
+-            # Snapshot caller-owned data; at most one bounded record is handed to writer.
+-            raw = bounded_payload(payload)
+-            payload = json.loads(raw)
+-            self.record(kind, payload, 1)
+-        except PayloadLimit:
+-            self.loss["oversize"] += 1
+-            return False
+-        except (TypeError, ValueError, OverflowError, RecursionError, RuntimeError):
+-            self.loss["unsupported"] += 1
+-            return False
+         if not self.lock.acquire(blocking=False):
+-            self.loss["dropped"] += 1
++            self.note_loss("dropped")
+             return False
+         try:
+             if self.stopping.is_set():
+                 return False
++            # The writer's final empty-queue check shares this admission lock.
++            raw = bounded_payload(payload)
++            self.record(kind, json.loads(raw), 1)
+             if len(self.queue) >= MAX_RECORDS or self.bytes + len(raw) > MAX_QUEUE_BYTES:
+-                self.loss["dropped"] += 1
++                self.note_loss("dropped")
+                 return False
+             self.queue.append((kind, raw, len(raw), time.time_ns(), time.monotonic_ns()))
+             self.bytes += len(raw)
++        except PayloadLimit:
++            self.note_loss("oversize")
++            return False
++        except (TypeError, ValueError, OverflowError, RecursionError, RuntimeError):
++            self.note_loss("unsupported")
++            return False
+         finally:
+             self.lock.release()
+         self.wake.set()
+@@ -196,29 +234,48 @@ class Session:
+                 while True:
+                     with self.lock:
+                         item = self.queue.popleft() if self.queue else None
++                        done = item is None and self.stopping.is_set()
+                         if item is not None:
+                             self.bytes -= item[2]
+                     if item is None:
+                         break
+                     kind, payload, _, wall, mono = item
+                     self.write(kind, json.loads(payload), wall, mono)
+-                if self.stopping.is_set():
++                if done:
+                     break
+-            for reason, count in self.loss.items():
++            with self.loss_lock:
++                losses = dict(self.loss)
++            for reason, count in losses.items():
+                 self.write("loss", self.loss_payload(reason, count))
+             if self.seq and not self.abandoned.is_set():
+-                seal_records(self.out, expected_sources=[dict(source_gateway=self.identity["source_gateway"],
+-                             source_epoch=self.epoch, last_seq=self.seq)])
+-                self.sealed = True
++                manifest = seal_records(self.out, expected_sources=[dict(source_gateway=self.identity["source_gateway"],
++                                        source_epoch=self.epoch, last_seq=self.seq)])
++                from hermes_cli.kanban_fairness_tail import close_epoch
++
++                completed = time.monotonic_ns()
++                if not self.abandoned.is_set() and self.deadline_ns is not None and completed <= self.deadline_ns:
++                    close_epoch(self.out, self.identity, manifest, self.deadline_ns, completed)
++                    self.sealed = True
+         except (OSError, ValueError, TypeError, RuntimeError):
+             # Evidence failure cannot change scheduler behavior; unsealed epoch is a gap.
+             self.failed = True
+-            self.loss["writer_error"] += 1
++            self.note_loss("writer_error")
+ 
+     def close(self, timeout=2.0):
++        timeout = min(2.0, max(0.0, timeout))
++        if self.deadline_ns is None:
++            self.deadline_ns = time.monotonic_ns() + int(timeout * 1_000_000_000)
+         self.stopping.set()
++        if self.lock.acquire(blocking=False):
++            try:
++                if self.readers:
++                    self.abandoned.set()
++            finally:
++                self.lock.release()
++        else:
++            self.abandoned.set()
+         self.wake.set()
+-        self.thread.join(min(2.0, max(0.0, timeout)))
++        self.thread.join(timeout)
+         if self.thread.is_alive():
+             self.abandoned.set()
+         for key, session in tuple(_SESSIONS.items()):
+diff --git a/hermes_cli/kanban_fairness_segments.py b/hermes_cli/kanban_fairness_segments.py
+index bf0decc163831b6db107f7f78cabe4d681fa8e8d..a0a1967ba673dc285f0147651df4d4c8e8bf084a 100644
+--- a/hermes_cli/kanban_fairness_segments.py
++++ b/hermes_cli/kanban_fairness_segments.py
+@@ -18,12 +18,9 @@ def encoded(value) -> bytes:
+ 
+ 
+ def write(path: Path, data: bytes) -> None:
+-    tmp = path.with_name(path.name + ".tmp")
+-    with tmp.open("wb") as stream:
+-        stream.write(data)
+-        stream.flush()
+-        os.fsync(stream.fileno())
+-    os.replace(tmp, path)
++    from hermes_cli.kanban_fairness_budget import write as bounded_write
++
++    bounded_write(path, data)
+ 
+ 
+ MAX_METADATA_BYTES = 8 * 1024 * 1024
+diff --git a/hermes_cli/kanban_fairness_store.py b/hermes_cli/kanban_fairness_store.py
+index 08b4f3a16abc5b36de2630ea2fece56474e9bddd..df2771241d5669842958f3b5a2bb3b9e008f39e7 100644
+--- a/hermes_cli/kanban_fairness_store.py
++++ b/hermes_cli/kanban_fairness_store.py
+@@ -68,6 +68,9 @@ def drain(conn: sqlite3.Connection, out: Path) -> dict:
+             _gap(receipts, "journal_missing", "database no longer carries the armed journal")
+             _write(out / RECEIPTS, segments.encoded(receipts))
+         return receipts
++    from hermes_cli.kanban_fairness_budget import initialize
++
++    initialize(out)
+     if receipts["capture_id"] is None:
+         _bind(conn, receipts, state)
+         _write(out / RECEIPTS, segments.encoded(receipts))
+@@ -144,8 +147,11 @@ def write_manifest(conn: sqlite3.Connection, out: Path, *, board: str, assumptio
+ 
+ 
+ def load(out: Path) -> dict:
++    from hermes_cli.kanban_fairness_tail import validate_tail
++
+     capture = segments.load_records(out)
+     manifest, records, gaps = capture["manifest"], capture["records"], capture["gaps"]
++    gaps.extend(validate_tail(out, manifest))
+     expected = 1
+     for record in records:
+         if record["kind"] not in ("opening", "row_change"):
+diff --git a/hermes_cli/kanban_fairness_tail.py b/hermes_cli/kanban_fairness_tail.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2b896ce7ef36a42f0e084f02f5edfeafdaa5b6c9
+--- /dev/null
++++ b/hermes_cli/kanban_fairness_tail.py
+@@ -0,0 +1,53 @@
++"""Runtime-only closing receipts; a late segment seal is not a clean epoch tail.
++
++These lifecycle files do not change the v1 event envelope. The final timestamp is
++observed after segment seal IO, in the same process monotonic clock as the deadline.
++Missing or invalid receipts are incomplete evidence, never a zero-loss assertion.
++"""
++from __future__ import annotations
++
++import json
++
++from hermes_cli.kanban_fairness_segments import encoded, read_bounded, write
++
++OPEN = "runtime-open.json"
++CLOSE = "runtime-close.json"
++IDENTITY = {"capture_id", "board_uid", "source_gateway", "source_epoch", "clock_error_ns"}
++
++
++def open_epoch(out, identity):
++    write(out / OPEN, encoded({"version": 1, **identity}))
++
++
++def close_epoch(out, identity, manifest, deadline_ns, completed_ns):
++    write(out / CLOSE, encoded({"version": 1, **identity, "final_seal": manifest["final_seal"],
++                               "deadline_ns": deadline_ns, "completed_ns": completed_ns}))
++
++
++def validate_tail(out, manifest):
++    """Return gaps for runtime directories; preserve existing nonruntime captures."""
++    if out.parent.name != "runtime" and not (out / OPEN).exists():
++        return []
++    try:
++        opening = json.loads(read_bounded(out / OPEN, 4096))
++        closing = json.loads(read_bounded(out / CLOSE, 4096))
++        if (not isinstance(opening, dict) or not isinstance(closing, dict)
++                or set(opening) != IDENTITY | {"version"}
++                or set(closing) != IDENTITY | {"version", "final_seal", "deadline_ns", "completed_ns"}
++                or type(opening["version"]) is not int or opening["version"] != 1
++                or type(closing["version"]) is not int or closing["version"] != 1):
++            raise ValueError("runtime receipt shape")
++        if any(opening[k] != closing[k] for k in IDENTITY):
++            raise ValueError("runtime receipt identity")
++        if any(closing[k] != manifest.get(k) for k in ("capture_id", "board_uid", "final_seal")):
++            raise ValueError("runtime receipt seal")
++        sources = manifest.get("sources")
++        if (not isinstance(sources, list) or len(sources) != 1
++                or any(sources[0].get(k) != closing[k] for k in ("source_gateway", "source_epoch"))):
++            raise ValueError("runtime receipt source")
++        if (any(type(closing[k]) is not int or closing[k] < 0 for k in ("completed_ns", "deadline_ns"))
++                or closing["completed_ns"] > closing["deadline_ns"]):
++            raise ValueError("runtime deadline exceeded")
++    except (OSError, ValueError, TypeError, KeyError, RecursionError):
++        return [{"code": "runtime_tail"}]
++    return []
+diff --git a/hermes_cli/kanban_turn_urgency.py b/hermes_cli/kanban_turn_urgency.py
+index 6368c06c924606f7badbbae0d52a5ba9a4a03496..7dad4b8d598ae333513a725ce7c8fb07fe39757c 100644
+--- a/hermes_cli/kanban_turn_urgency.py
++++ b/hermes_cli/kanban_turn_urgency.py
+@@ -23,7 +23,13 @@ def read_owners(*, board: str, now_s: float, path=None) -> set[str]:
+     """Return cached owner IDs, or no urgency when observation is invalid."""
+     from hermes_cli import kanban_fairness_runtime as runtime
+ 
+-    capture = runtime.enabled(board=board) if isinstance(board, str) else False
++    if not isinstance(board, str) or not runtime.enabled(board=board):
++        return _read_owners(board=board, now_s=now_s, path=path, capture=False)
++    with runtime.observation(board=board):
++        return _read_owners(board=board, now_s=now_s, path=path, capture=True)
++
++
++def _read_owners(*, board, now_s, path, capture):
+     raw = None
+ 
+     def result(owners=None, outcome="invalid"):
+diff --git a/tests/hermes_cli/test_kanban_fairness_budget.py b/tests/hermes_cli/test_kanban_fairness_budget.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7129f9077a9c648f5e1c007809076633c21c8348
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_fairness_budget.py
+@@ -0,0 +1,119 @@
++"""Real on-disk aggregate bound across DB exports and runtime epochs."""
++import threading
++
++import pytest
++
++from hermes_cli import kanban_fairness_budget as budget
++from hermes_cli import kanban_fairness_segments as segments
++
++
++def total(root):
++    return sum(p.stat().st_size for p in root.rglob("*") if p.is_file())
++
++
++def test_two_epoch_writes_share_bound(tmp_path):
++    root = tmp_path / "capture"
++    budget.initialize(root, 4096)
++    one, two = root / "runtime" / "one", root / "runtime" / "two"
++    one.mkdir(parents=True)
++    two.mkdir(parents=True)
++    segments.write(one / "segment-000001.jsonl", b"a" * 2500)
++    with pytest.raises(budget.BudgetExceeded):
++        segments.write(two / "segment-000001.jsonl", b"b" * 2500)
++    assert total(root) <= 4096
++    assert (one / "segment-000001.jsonl").read_bytes() == b"a" * 2500
++
++
++def test_replacement_counts_temp_peak_and_orphans(tmp_path):
++    root = tmp_path / "capture"
++    budget.initialize(root, 4096)
++    segments.write(root / "receipts.json", b"a" * 2000)
++    (root / "orphan.tmp").write_bytes(b"x" * 500)
++    with pytest.raises(budget.BudgetExceeded):
++        segments.write(root / "receipts.json", b"b" * 2000)
++    assert (root / "receipts.json").read_bytes() == b"a" * 2000
++    assert (root / "orphan.tmp").exists()
++
++
++def test_concurrent_writers_do_not_overshoot(tmp_path):
++    root = tmp_path / "capture"
++    budget.initialize(root, 4096)
++    barrier = threading.Barrier(3)
++    results = []
++
++    def writer(name):
++        barrier.wait()
++        try:
++            segments.write(root / name, b"a" * 2500)
++            results.append(True)
++        except budget.BudgetExceeded:
++            results.append(False)
++
++    threads = [threading.Thread(target=writer, args=(name,)) for name in ("one", "two")]
++    for thread in threads:
++        thread.start()
++    barrier.wait()
++    for thread in threads:
++        thread.join(3)
++        assert not thread.is_alive()
++    assert sorted(results) == [False, True]
++    assert total(root) <= 4096
++
++
++def _process_writer(root, name, barrier, results):
++    barrier.wait(timeout=10)
++    try:
++        segments.write(root / name, b"a" * 2500)
++        results.put(True)
++    except budget.BudgetExceeded:
++        results.put(False)
++
++
++def test_processes_share_root_lock(tmp_path):
++    import multiprocessing
++
++    root = tmp_path / "capture"
++    budget.initialize(root, 4096)
++    context = multiprocessing.get_context("spawn")
++    barrier, results = context.Barrier(3), context.Queue()
++    processes = [context.Process(target=_process_writer, args=(root, name, barrier, results))
++                 for name in ("one", "two")]
++    try:
++        for process in processes:
++            process.start()
++        barrier.wait(timeout=10)
++        for process in processes:
++            process.join(10)
++            assert process.exitcode == 0
++        assert sorted(results.get(timeout=2) for _ in processes) == [False, True]
++        assert total(root) <= 4096
++    finally:
++        for process in processes:
++            if process.is_alive():
++                process.terminate()
++                process.join(3)
++        results.close()
++        results.join_thread()
++
++
++def test_runtime_missing_budget_refuses(tmp_path):
++    path = tmp_path / "capture" / "runtime" / "epoch"
++    path.mkdir(parents=True)
++    with pytest.raises(ValueError, match="budget missing"):
++        segments.write(path / "runtime-close.json", b"{}")
++    assert not (path / "runtime-close.json").exists()
++
++
++def test_existing_budget_cannot_be_silently_raised(tmp_path):
++    budget.initialize(tmp_path, 4096)
++    with pytest.raises(ValueError):
++        budget.initialize(tmp_path, 8192)
++
++
++def test_symlink_cannot_escape_budget(tmp_path):
++    root = tmp_path / "capture"
++    budget.initialize(root, 4096)
++    (root / "outside").symlink_to(tmp_path / "elsewhere")
++    with pytest.raises(ValueError):
++        segments.write(root / "receipts.json", b"data")
++    assert not (root / "receipts.json").exists()
+diff --git a/tests/hermes_cli/test_kanban_fairness_runtime.py b/tests/hermes_cli/test_kanban_fairness_runtime.py
+index 12c6a1719d4142fc7fc1838b47bf7261146e92a2..6dbf3400ebfa414dce59d78304b0cdb46c8786db 100644
+--- a/tests/hermes_cli/test_kanban_fairness_runtime.py
++++ b/tests/hermes_cli/test_kanban_fairness_runtime.py
+@@ -135,6 +135,130 @@ def test_ten_thousand_submissions_do_not_wait_for_writer(tmp_path, monkeypatch):
+         session.close()
+ 
+ 
++def test_timeout_during_seal_cannot_certify_epoch(tmp_path, monkeypatch):
++    entered, release = threading.Event(), threading.Event()
++    actual = runtime.seal_records
++
++    def held(*args, **kwargs):
++        entered.set()
++        assert release.wait(5)
++        return actual(*args, **kwargs)
++
++    monkeypatch.setattr(runtime, "seal_records", held)
++    session = activate(tmp_path, monkeypatch)
++    assert runtime.submit(board="default", kind="loss", payload=session.loss_payload("redaction", 1))
++    closer = threading.Thread(target=lambda: session.close(timeout=0.1))
++    closer.start()
++    try:
++        assert entered.wait(2)
++        closer.join(2)
++        assert not closer.is_alive()
++    finally:
++        release.set()
++        session.thread.join(3)
++    assert not session.sealed
++    assert "runtime_tail" in {g["code"] for g in load(session.out)["gaps"]}
++
++
++def test_snapshot_detaches_before_serialization(monkeypatch):
++    payload = {"values": ["small"]}
++    actual = runtime.json.dumps
++
++    def mutate(snapshot, **kwargs):
++        payload["values"].append("x" * (runtime.MAX_PAYLOAD_BYTES + 1))
++        return actual(snapshot, **kwargs)
++
++    monkeypatch.setattr(runtime.json, "dumps", mutate)
++    assert json.loads(runtime.bounded_payload(payload)) == {"values": ["small"]}
++
++
++def test_inflight_submission_cannot_be_silently_sealed(tmp_path, monkeypatch):
++    entered, release = threading.Event(), threading.Event()
++    session = activate(tmp_path, monkeypatch)
++    assert runtime.submit(board="default", kind="loss", payload=session.loss_payload("redaction", 1))
++    actual = runtime.bounded_payload
++
++    def held(payload):
++        entered.set()
++        assert release.wait(5)
++        return actual(payload)
++
++    monkeypatch.setattr(runtime, "bounded_payload", held)
++    producer = threading.Thread(target=lambda: session.enqueue("loss", session.loss_payload("redaction", 1)))
++    producer.start()
++    try:
++        assert entered.wait(2)
++        assert not session.close(timeout=0)
++    finally:
++        release.set()
++        producer.join(3)
++        session.thread.join(3)
++    assert not session.sealed
++
++
++@pytest.mark.parametrize("mutation", ["missing", "late", "identity", "seal", "malformed"])
++def test_runtime_tail_is_required_and_bound(tmp_path, monkeypatch, mutation):
++    session = activate(tmp_path, monkeypatch)
++    assert session is not None
++    assert runtime.submit(board="default", kind="loss", payload=session.loss_payload("redaction", 1))
++    assert session.close()
++    closing = session.out / "runtime-close.json"
++    data = json.loads(closing.read_bytes())
++    assert "runtime_tail" not in {g["code"] for g in load(session.out)["gaps"]}
++    if mutation == "missing":
++        closing.unlink()
++    elif mutation == "malformed":
++        closing.write_text("[]")
++    else:
++        if mutation == "late":
++            data["completed_ns"] = data["deadline_ns"] + 1
++        elif mutation == "identity":
++            data["source_epoch"] = "other"
++        else:
++            data["final_seal"] = "0" * 64
++        closing.write_text(json.dumps(data))
++    assert "runtime_tail" in {g["code"] for g in load(session.out)["gaps"]}
++
++
++def test_actual_read_inflight_at_close_is_incomplete(tmp_path, monkeypatch):
++    from pathlib import Path
++
++    session = activate(tmp_path, monkeypatch)
++    assert session is not None
++    assert runtime.submit(board="default", kind="loss", payload=session.loss_payload("redaction", 1))
++    entered, release = threading.Event(), threading.Event()
++    path = tmp_path / "missing-owner-document"
++    actual = Path.open
++
++    def held(self, *args, **kwargs):
++        if self == path:
++            entered.set()
++            assert release.wait(5)
++        return actual(self, *args, **kwargs)
++
++    monkeypatch.setattr(Path, "open", held)
++    results = []
++    reader = threading.Thread(target=lambda: results.append(read_owners(board="default", now_s=150, path=path)))
++    reader.start()
++    try:
++        assert entered.wait(2)
++        assert not session.close()
++    finally:
++        release.set()
++        reader.join(3)
++    assert results == [set()]
++    assert "runtime_tail" in {g["code"] for g in load(session.out)["gaps"]}
++
++
++def test_loss_lock_contention_fails_closed(tmp_path, monkeypatch):
++    session = activate(tmp_path, monkeypatch)
++    assert session is not None
++    with session.loss_lock:
++        session.note_loss("dropped")
++    assert session.abandoned.is_set()
++    assert not session.close()
++
++
+ def test_overflow_and_tail_are_bounded(tmp_path, monkeypatch):
+     entered, release = threading.Event(), threading.Event()
+     actual = runtime.append_records
+-- 
+2.43.0
+

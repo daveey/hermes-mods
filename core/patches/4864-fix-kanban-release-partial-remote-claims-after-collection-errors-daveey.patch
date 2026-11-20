@@ -1,0 +1,138 @@
+From 727e7b74d40ac2c5061c82607148da622ce7a6f6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 03:21:06 +0000
+Subject: [PATCH] fix(kanban): release partial remote claims after collection
+ errors [daveey]
+
+Per-row legacy alias reservations commit before later transcript reads. Preserve partial offers in the caller and release undelivered claims after collection failure, retaining delivered receipts. RED: ordinary and legacy same-holder retries lost the first card (2 failures); base legacy control passes. GREEN: owner delivery and rehome suites pass. Also cover malformed remote-ref board inference and correct transaction-read comment.
+---
+ .../test_kanban_remote_owner_delivery.py      |  8 +++++
+ .../tui_gateway/test_kanban_remote_rehome.py  | 31 +++++++++++++++++++
+ tui_gateway/kanban_remote_notices.py          | 12 ++++---
+ 3 files changed, 46 insertions(+), 5 deletions(-)
+
+diff --git a/tests/gateway/test_kanban_remote_owner_delivery.py b/tests/gateway/test_kanban_remote_owner_delivery.py
+index bde9ff2fcbba2633a87680815efde41dfbe3c709..1fcfb5d7ec99689d69b9e3c1c29efbc959923c7a 100644
+--- a/tests/gateway/test_kanban_remote_owner_delivery.py
++++ b/tests/gateway/test_kanban_remote_owner_delivery.py
+@@ -105,6 +105,14 @@ def test_remote_blocked_metadata_preserves_premise_and_board():
+     assert card['board'] == 'research'
+ 
+ 
++@pytest.mark.parametrize('ref', ['', 'worker-6/default/t_card', 'worker-6/default/board/extra/t_card'])
++def test_remote_metadata_does_not_infer_board_from_malformed_ref(ref):
++    item = {'ref': ref, 'state': 'blocked@1', 'event_key': 'event', 'text': 'blocked'}
++    card = kro._metadata(item)['kanban_cards'][0]
++    assert card['board'] == ''
++    assert card['kinds'] == (['blocked'] if ref else [])
++
++
+ @pytest.mark.parametrize(('state', 'kind'), [('done@1', 'completed'),
+                                               ('request_withdrawn@1', 'request_withdrawn'), ('other@1', None)])
+ def test_remote_outcome_metadata_never_relabels(monkeypatch, state, kind):
+diff --git a/tests/tui_gateway/test_kanban_remote_rehome.py b/tests/tui_gateway/test_kanban_remote_rehome.py
+index b636af4e598b08f0f7c5d8065857d3575f3ee972..b123316343134dc560e12e0a9dccb0a4aca2d5f8 100644
+--- a/tests/tui_gateway/test_kanban_remote_rehome.py
++++ b/tests/tui_gateway/test_kanban_remote_rehome.py
+@@ -287,6 +287,37 @@ def test_opposite_home_legacy_reoffers_are_serialized(tmp_path, monkeypatch):
+     assert sorted(map(len, offers)) == [0, 1]
+ 
+ 
++@pytest.mark.parametrize('legacy', [False, True])
++def test_collect_callback_failure_releases_earlier_unreturned_claim(tmp_path, monkeypatch, legacy):
++    now = time.time()
++    hub = once._hub(tmp_path, now)
++    ledger = tmp_path / 'ledger.db'
++    tasks = [{'id': tid, 'status': 'done', 'completed_at': now} for tid in ['t_first', 't_second']]
++    cards = [{'gw': 'worker-6', 'key': f"default/default/{task['id']}", 'task': task} for task in tasks]
++    monkeypatch.setattr(krn, '_chat_index', lambda *_a, **_kw: ('macbook', {once.CHAT: cards}, {}))
++    if legacy:
++        conn = krn._ledger(ledger)
++        with conn:
++            for card in cards:
++                conn.execute('INSERT INTO notices (session, ref, state, at, delivered, legacy_seen) '
++                             'VALUES (?,?,?,?,1,0)',
++                             (once.CHAT, f"worker-6/{card['key']}", krn._notice_state(card['task']), now))
++        conn.close()
++    calls = []
++    def fails_second(key, task_id):
++        calls.append((key, task_id))
++        if 't_second' in key:
++            raise OSError('second transcript unavailable')
++        return False
++    assert krn.collect(once.CHAT, 'default', hub_db=hub, ledger=ledger, now=now,
++                       transcript_has=fails_second) == []
++    assert any('t_second' in key for key, _ in calls)
++    # Same holder must immediately retry, not wait for its process to die.
++    offered = krn.collect(once.CHAT, 'default', hub_db=hub, ledger=ledger, now=now + 1,
++                           transcript_has=lambda *_: False)
++    assert {item['ref'].rsplit('/', 1)[-1] for item in offered} == {'t_first', 't_second'}
++
++
+ def test_legacy_reconciliation_preserves_replaced_keyed_receipt(tmp_path):
+     now = time.time()
+     hub = once._hub(tmp_path, now)
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 37426868bc6bb7d0a0ebb8d1bd302a451a4d7dcc..4358abb596f2d080d4ee008a9b23b569c8e6e2ed 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -492,7 +492,7 @@ def _notice_item(card: dict, session_key: str, me: str, profile: str, now: Optio
+ 
+ 
+ def _reconcile_legacy(conn, session_key: str, cards: list, now: float, transcript_has, me: str,
+-                      profile: str) -> list:
++                      profile: str, *, offered=None) -> list:
+     """Re-offer a pre-fix ``delivered=1`` row once, if it is still inside ``FRESH_S`` and in no transcript."""
+     if transcript_has is None:
+         return []
+@@ -509,7 +509,7 @@ def _reconcile_legacy(conn, session_key: str, cards: list, now: float, transcrip
+         by_state[(f"{card['gw']}/{card['key']}", _notice_state(task))] = card
+     pid, start = _my_holder()
+     stale = 0
+-    out = []
++    out = [] if offered is None else offered
+     for row in rows:
+         card = by_state.get((row["ref"], row["state"]))
+         if (card is None and (row['ref'].rsplit('/', 1)[-1], row['state']) in logical_states
+@@ -627,7 +627,7 @@ def _claim_notice_locked(conn, *, session, ref, state, now, fresh, notice_key, t
+                         ref, state, session)
+             return "acked"
+         if not fresh and isinstance(settle_reason, _ExpiredReason):
+-            settle_reason = settle_reason()  # outside the write txn: it may scan the transcript
++            settle_reason = settle_reason()  # the logical claim transaction includes this transcript read
+         reason = str(settle_reason)
+         with conn:
+             conn.execute(
+@@ -737,6 +737,7 @@ def collect(session_key: str, profile: str, *, hub_db: Optional[Path] = None, le
+         return []
+     now = time.time() if now is None else now
+     profile = profile or "default"
++    out: list[dict] = []
+     try:
+         sids = (session_key, *lineage)
+         if hub_db is None and ledger is None:  # the host's own replica: keep its published copy current
+@@ -747,11 +748,10 @@ def collect(session_key: str, profile: str, *, hub_db: Optional[Path] = None, le
+         cards = [dict(c, sid=sid) for sid in sids for c in by_sid.get(sid, ())]
+         if not cards:
+             return []
+-        out: list[dict] = []
+         conn = _ledger(ledger)
+         try:
+             with conn:
+-                out.extend(_reconcile_legacy(conn, session_key, cards, now, transcript_has, me, profile))
++                _reconcile_legacy(conn, session_key, cards, now, transcript_has, me, profile, offered=out)
+             offered = {(item["ref"], item["state"]) for item in out}
+             for card in cards:
+                 from tui_gateway.kanban_remote_late import owner_time
+@@ -807,6 +807,8 @@ def collect(session_key: str, profile: str, *, hub_db: Optional[Path] = None, le
+             return []
+     except Exception:
+         logger.debug("remote kanban collect failed", exc_info=True)
++        from tui_gateway.kanban_remote_late import release_undelivered
++        release_undelivered(out, ledger)
+         return []
+ 
+ 
+-- 
+2.43.0
+

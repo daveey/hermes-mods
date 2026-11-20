@@ -1,0 +1,125 @@
+From 0a1a3797c4c1922de79aed41bd896c68edaa6f4c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 05:40:01 +0000
+Subject: [PATCH] [daveey] kanban link: classify replica-only endpoints as
+ foreign cards
+
+Problem: two hub chats tried the same parent on worker-4 and received unknown task(s), although the synced Board held it. The graph write was correctly refused; its diagnosis and recovery were not.
+
+Why: link validation checks only live task rows. Graph tool arguments name parent_id/child_id, so the replica-aware task_id write handling used by comment/complete never ran. Existing replica tests covered show/comment but not graph endpoints. Repeated incidents therefore hit the same misleading local-missing path.
+
+Use the established read-only foreign-card lookup on both endpoints before attempting a link. Return foreign_card with ownership provenance and explicit owner-verification/recovery instructions. Keep local graph authority unchanged: no replica imports, graph writes or automatic remote mutations. Verify current owners before a card wait because created_on is provenance, not necessarily current execution placement.
+
+Proof: new parent regression RED on unchanged main; GREEN 121 tests (link replica, kanban tools, scratch-home fence), plus 11 link/show replica tests. Disabling the foreign branch kills both endpoint regressions (3 passed, 2 failed). scripts/check: all 20 checks pass. Historical source messages 1314769-1314770 and 1314867-1314868 in the two task-named sessions; replica created_on=worker-4.
+---
+ tests/tools/test_kanban_link_replica.py | 72 +++++++++++++++++++++++++
+ tools/kanban_tools_graph.py             | 14 +++++
+ 2 files changed, 86 insertions(+)
+ create mode 100644 tests/tools/test_kanban_link_replica.py
+
+diff --git a/tests/tools/test_kanban_link_replica.py b/tests/tools/test_kanban_link_replica.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2f94d7f4e7df187f783e9b2a456a31f981142cf7
+--- /dev/null
++++ b/tests/tools/test_kanban_link_replica.py
+@@ -0,0 +1,72 @@
++"""Replica-only graph endpoints are foreign, not nonexistent board cards."""
++import json
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from tests.tools import test_kanban_show_replica as fixtures
++from tools import kanban_tools as kt
++
++boards = fixtures.boards
++
++
++def test_link_foreign_child_routes_to_owner(boards):
++    child, _ = boards
++    with kbc.connect() as live:
++        parent = kb.create_task(live, title="Local parent")
++    out = json.loads(kt._handle_link({"parent_id": parent, "child_id": child}))
++    assert out.get("rejection") == "foreign_card", out
++    assert child in out["error"] and "owner-gateway" in out["error"]
++    assert "If the child is remote, ask its owner" in out["error"]
++    with kbc.connect() as live:
++        assert kb.child_ids(live, parent) == []
++
++
++def test_link_local_endpoints_still_gates_child(boards):
++    with kbc.connect() as live:
++        parent = kb.create_task(live, title="Local parent")
++        child = kb.create_task(live, title="Local child")
++        kb.recompute_ready(live)
++    out = json.loads(kt._handle_link({"parent_id": parent, "child_id": child}))
++    assert out.get("gated") is True, out
++    with kbc.connect() as live:
++        assert kb.parent_ids(live, child) == [parent]
++        assert kb.get_task(live, child).status == "todo"
++
++
++def test_link_unknown_endpoint_stays_unknown(boards):
++    with kbc.connect() as live:
++        child = kb.create_task(live, title="Local child")
++    out = json.loads(kt._handle_link({"parent_id": "t_missing", "child_id": child}))
++    assert "unknown task(s): t_missing" in out["error"]
++    assert out.get("rejection") != "foreign_card"
++
++
++def test_link_disabled_sync_stays_unknown(boards, monkeypatch):
++    parent, _ = boards
++    monkeypatch.setattr(fixtures.sync, "sync_config", lambda: {"enabled": False})
++    with kbc.connect() as live:
++        child = kb.create_task(live, title="Local child")
++    out = json.loads(kt._handle_link({"parent_id": parent, "child_id": child}))
++    assert "unknown task(s)" in out["error"]
++    assert out.get("rejection") != "foreign_card"
++
++
++def test_link_foreign_parent_names_owner_without_writing(boards):
++    parent, shadow = boards
++    with kbc.connect() as live:
++        child = kb.create_task(live, title="Local child")
++        before = live.execute("SELECT * FROM tasks WHERE id = ?", (child,)).fetchone()
++        events = live.execute("SELECT count(*) FROM task_events").fetchone()[0]
++    replica_before = shadow.read_bytes()
++    out = json.loads(kt._handle_link({"parent_id": parent, "child_id": child}))
++    assert out.get("rejection") == "foreign_card", out
++    assert parent in out["error"] and "owner-gateway" in out["error"]
++    assert "unknown task(s)" not in out["error"]
++    assert "Do not retry" in out["error"]
++    assert "awaiting" in out["error"]
++    assert shadow.read_bytes() == replica_before
++    with kbc.connect() as live:
++        assert kb.get_task(live, parent) is None
++        assert tuple(live.execute("SELECT * FROM tasks WHERE id = ?", (child,)).fetchone()) == tuple(before)
++        assert live.execute("SELECT count(*) FROM task_events").fetchone()[0] == events
++        assert kb.parent_ids(live, child) == []
+diff --git a/tools/kanban_tools_graph.py b/tools/kanban_tools_graph.py
+index 1ad945c94b485756be00ec4e80eecd7b48da06fa..3e76c75c9327c1b8d3571743608d8a4f731a4f8e 100644
+--- a/tools/kanban_tools_graph.py
++++ b/tools/kanban_tools_graph.py
+@@ -32,6 +32,20 @@ def handle_link(args: dict, **kw) -> str:
+             refused = kre.refusal(conn, "kanban_link", own)
+             if refused:
+                 return refused
++        # Graph tools carry two endpoints, not the task_id checked by other writes.
++        from hermes_cli import kanban_foreign_card as kfc
++        from tools.registry import tool_error
++        for endpoint in (child_id, parent_id):
++            foreign = kfc.refusal(conn, str(endpoint))
++            if foreign:
++                return tool_error(
++                    foreign + " Do not retry this local link or import a replica card. "
++                    "Read both endpoints with cross_task to verify their current owners and existing edges. "
++                    "If the child is local and still needs a remote parent, park the child with "
++                    "kind='time', awaiting={kind:'card', ref:'" + str(parent_id) + "', "
++                    "gateway:'<verified-parent-owner>'}. If the child is remote, ask its owner "
++                    "by comment to arrange the dependency; do not park a different card here.",
++                    rejection=kfc.REJECTION)
+         gated = kb.link_tasks(
+             conn, parent_id=parent_id, child_id=child_id,
+             expected_child_run_id=_worker_run_id(str(child_id)))
+-- 
+2.43.0
+

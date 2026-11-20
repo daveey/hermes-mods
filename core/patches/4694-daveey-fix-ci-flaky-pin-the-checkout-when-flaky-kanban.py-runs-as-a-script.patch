@@ -1,0 +1,119 @@
+From 4077e682db3a4d1f3c36c33a83ebddd943d43925 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 01:44:31 +0000
+Subject: [PATCH] [daveey] fix(ci-flaky): pin the checkout when flaky_kanban.py
+ runs as a script
+
+The hub cron ci-flaky-cards runs `<dependency venv python> scripts/ci/flaky_kanban.py`. The
+venv resolves hermes_cli to its generation's workspace snapshot, which is rebuilt only when
+dependencies change. Run as a script, flaky_kanban.py had only scripts/ci on sys.path, so
+it loaded the stale snapshot. Every run since 2026-11-18 00:23 UTC then died with
+`No module named 'hermes_cli.kanban_selfwork_producer'`: that module (93edd0b20f87) is newer
+than the snapshot (self-heal cron-d0f9004adc).
+
+The script-mode import branch now puts its own checkout right after scripts/ci, ahead of
+PYTHONPATH and site-packages. The regression test runs the script with a decoy hermes_cli
+package on PYTHONPATH. Before the fix it fails with the production ModuleNotFoundError; after
+it, it passes. The 561 flaky CI tests pass.
+---
+ scripts/ci/flaky_kanban.py                |  9 +++
+ tests/ci/test_flaky_kanban_import_root.py | 67 +++++++++++++++++++++++
+ 2 files changed, 76 insertions(+)
+ create mode 100644 tests/ci/test_flaky_kanban_import_root.py
+
+diff --git a/scripts/ci/flaky_kanban.py b/scripts/ci/flaky_kanban.py
+index d0615b9de3154cf26c9a8655074cf0daa049222e..607b7a1c09f0fe3c8d7f4638a0ac86eff8afe0aa 100644
+--- a/scripts/ci/flaky_kanban.py
++++ b/scripts/ci/flaky_kanban.py
+@@ -55,6 +55,15 @@ try:
+     from scripts.ci import flaky_artifact_poll as fap
+     from scripts.ci.flaky_intake import Journal
+ except ImportError:  # run as a script: scripts/ci is sys.path[0]
++    # Pin this checkout right after scripts/ci, ahead of PYTHONPATH and site-packages. A managed install's
++    # dependency venv (what the hub cron runs this on) otherwise resolves hermes_cli to its generation's
++    # workspace snapshot, which lacks modules newer than the last dependency change (self-heal
++    # cron-d0f9004adc: `No module named 'hermes_cli.kanban_selfwork_producer'`).
++    # tests/ci/test_flaky_kanban_import_root.py.
++    _CHECKOUT = str(Path(__file__).resolve().parents[2])
++    if _CHECKOUT in sys.path:
++        sys.path.remove(_CHECKOUT)
++    sys.path.insert(1, _CHECKOUT)
+     import flaky_artifact_poll as fap  # type: ignore[no-redef]
+     from flaky_intake import Journal  # type: ignore[no-redef]
+ 
+diff --git a/tests/ci/test_flaky_kanban_import_root.py b/tests/ci/test_flaky_kanban_import_root.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e2345e0139f576b7d6cda3c46b11354647557cd1
+--- /dev/null
++++ b/tests/ci/test_flaky_kanban_import_root.py
+@@ -0,0 +1,67 @@
++"""scripts/ci/flaky_kanban.py run as a script imports hermes_cli from its own checkout.
++
++The hub cron `ci-flaky-cards` launches ``<interpreter> scripts/ci/flaky_kanban.py``. On a managed (PM) install
++that interpreter is a dependency-generation venv whose default ``hermes_cli`` is the generation's workspace
++snapshot, rebuilt only on a dependency change. Script execution puts only scripts/ci on sys.path, so the stale
++snapshot won: ``No module named 'hermes_cli.kanban_selfwork_producer'`` on every run once the producer path
++imported a module newer than the snapshot (self-heal cron-d0f9004adc).
++
++A decoy ``hermes_cli`` package on PYTHONPATH stands in for that snapshot: it ranks ahead of site-packages the
++same way, and it records any import of itself.
++"""
++from __future__ import annotations
++
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[2]
++SCRIPT = ROOT / "scripts" / "ci" / "flaky_kanban.py"
++
++
++def _decoy(tmp_path: Path) -> tuple[Path, Path]:
++    pkg = tmp_path / "snapshot" / "hermes_cli"
++    pkg.mkdir(parents=True)
++    marker = tmp_path / "decoy-imported"
++    (pkg / "__init__.py").write_text(
++        "import os, pathlib\n"
++        f"pathlib.Path({str(marker)!r}).write_text('stale snapshot hermes_cli imported')\n")
++    return pkg.parent, marker
++
++
++def _run(tmp_path: Path, *args: str) -> tuple[subprocess.CompletedProcess, Path]:
++    snapshot, marker = _decoy(tmp_path)
++    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONSAFEPATH")}
++    env["PYTHONPATH"] = str(snapshot)
++    proc = subprocess.run([sys.executable, str(SCRIPT), *args], cwd=tmp_path, env=env,
++                          capture_output=True, text=True, timeout=120, check=False)
++    return proc, marker
++
++
++def test_script_run_prefers_its_checkout_over_a_stale_hermes_cli(tmp_path):
++    proc, marker = _run(tmp_path, "--help")
++    assert proc.returncode == 0, proc.stderr[-2000:]
++    assert not marker.exists(), "flaky_kanban.py imported a foreign hermes_cli ahead of its own checkout"
++
++
++def test_script_run_resolves_the_selfwork_producer_from_its_checkout(tmp_path):
++    """The exact import that failed live (flaky_selfwork.py), from the script's own process."""
++    snapshot, marker = _decoy(tmp_path)
++    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONSAFEPATH")}
++    env["PYTHONPATH"] = str(snapshot)
++    probe = (
++        "import runpy, sys\n"
++        f"sys.argv = [{str(SCRIPT)!r}, '--help']\n"
++        f"sys.path[0] = {str(SCRIPT.parent)!r}\n"  # what `python scripts/ci/flaky_kanban.py` gets
++        "try:\n"
++        f"    runpy.run_path({str(SCRIPT)!r}, run_name='flaky_kanban_probe')\n"
++        "finally:\n"
++        "    from hermes_cli.kanban_selfwork_producer import validate\n"
++        "    import hermes_cli\n"
++        "    print(hermes_cli.__file__)\n")
++    proc = subprocess.run([sys.executable, "-c", probe], cwd=tmp_path, env=env,
++                          capture_output=True, text=True, timeout=120, check=False)
++    assert proc.returncode == 0, proc.stderr[-2000:]
++    assert Path(proc.stdout.strip().splitlines()[-1]).resolve() == ROOT / "hermes_cli" / "__init__.py"
++    assert not marker.exists()
+-- 
+2.43.0
+

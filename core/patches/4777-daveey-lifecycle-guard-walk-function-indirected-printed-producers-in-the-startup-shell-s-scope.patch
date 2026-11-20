@@ -1,0 +1,398 @@
+From f7161545b7b49ad0716bdb0cea4de04a0dc3dcf8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 21:45:17 +0000
+Subject: [PATCH] [daveey] lifecycle guard: walk function-indirected printed
+ producers in the startup shell's scope
+
+`f() { printf 't ( bash <db> )'; }; f | bash -l` returned (False, None): the definition and the
+call are separate printed units (a top-level `;` ends a unit), so the unit feeding the login
+shell, `f | bash -l`, held no printer, and the function body's printed text was never walked
+with the nested shell's unknown alias names. Real bash pipes the body's output into that shell
+(`f() { printf 'echo FED\n'; }; f | bash` prints FED).
+
+Fix (card t_028a39b21383a50d), without merging units, so unrelated pipelines keep their scope:
+- `_unit_feeds_nested_stdin` also returns where the last fed startup shell's command ends; only
+  words before it (the producers) count as calls.
+- New `cron/lifecycle_guard_printed_functions.py`: resolves the function definitions in the
+  command's printed units (`NAME ( )`, `function NAME [( )]`, a body on the next line, any
+  compound body, definitions inside groups). A name called upstream, as a word or inside one
+  (`"$(f)"`, `` `f` ``), walks every definition of it (redefinitions), transitively through
+  the names its bodies use (`f` calling `g`, callee defined later), each definition once per
+  command (ends recursion); heredoc bodies a definition owns go with it. A body that cannot be
+  delimited extends to the end of its unit (fail closed). Names the text never defines
+  (session/startup-file functions, eval-built text) resolve to nothing, as for other
+  session-defined commands.
+- `_printed_pipeline_units`: the word after `function NAME` is in command position, so
+  `function f { ...; }` stays one group unit instead of splitting at its inner `;`.
+
+Tests: tests/cron/test_lifecycle_guard_printed_functions.py: 21 refusal shapes (red on main
+5d9e537979, together with 2 structural asserts: 23 failed / 44 passed), negatives under three
+session-alias sets (plain/-s/-c shells, uncalled or downstream functions, unrelated definitions,
+longer names), session-alias controls, and real-Bash harmless-marker proofs of the
+producer/consumer flow (direct, next-line body, nested call, redefinition, $(f), subshell body)
+plus an uncalled-function negative.
+---
+ cron/lifecycle_guard_nested_shells.py         |  37 +++++-
+ cron/lifecycle_guard_printed_functions.py     | 125 ++++++++++++++++++
+ .../test_lifecycle_guard_printed_functions.py | 116 ++++++++++++++++
+ 3 files changed, 271 insertions(+), 7 deletions(-)
+ create mode 100644 cron/lifecycle_guard_printed_functions.py
+ create mode 100644 tests/cron/test_lifecycle_guard_printed_functions.py
+
+diff --git a/cron/lifecycle_guard_nested_shells.py b/cron/lifecycle_guard_nested_shells.py
+index b4b7106a64e41e3bafbf2206f6771668de045d42..eb77307b55882a207902552d0fbd154bccb84c2b 100644
+--- a/cron/lifecycle_guard_nested_shells.py
++++ b/cron/lifecycle_guard_nested_shells.py
+@@ -508,6 +508,7 @@ def _printed_pipeline_units(command: str) -> list[_PrintedUnit]:
+     depth = 0
+     continued = False
+     command_position = True
++    function_name = False  # the previous word was the `function` keyword
+     cases: dict[int, str] = {}  # depth -> subject/header, pattern, or arm body
+     for line, bodies in _lines_with_heredoc_bodies(command):
+         touched = [unit]
+@@ -536,7 +537,12 @@ def _printed_pipeline_units(command: str) -> list[_PrintedUnit]:
+                     if case_role == "data":
+                         unit.events.append(("data", word))
+                         continue
++                    after_function = function_name
++                    function_name = (command_position and word == "function"
++                                     and not getattr(word, "quoted", False))
+                     role, command_position = _printed_word_role(word, command_position)
++                    # `function NAME {`: the word after the name is a compound command.
++                    command_position = command_position or after_function
+                     if role == "close":
+                         cases.pop(depth, None)
+                     depth = depth + 1 if role == "open" else max(0, depth - (role == "close"))
+@@ -585,16 +591,27 @@ def _unit_feeds_nested_stdin(
+     unit: _PrintedUnit, reads: Callable[[list[str]], bool] = _reads_nested_stdin,
+     *, output_processes: bool = False,
+ ) -> tuple[bool, bool]:
+-    """``(printed text, heredoc body output)``: whether a pipe in *unit* feeds a command *reads*
+-    accepts (by default a startup shell reading stdin), and whether a heredoc-owning producer
+-    upstream of that pipe feeds it. A list operator or line break ends a pipe inside a group:
++    """Preserve the two-field consumer contract for ordinary pipe-flow callers."""
++    feeds, body, _end = _unit_nested_stdin_flow(unit, reads, output_processes=output_processes)
++    return feeds, body
++
++
++def _unit_nested_stdin_flow(
++    unit: _PrintedUnit, reads: Callable[[list[str]], bool] = _reads_nested_stdin,
++    *, output_processes: bool = False,
++) -> tuple[bool, bool, int]:
++    """Return ``(printed text, heredoc body output, upstream end)`` for a pipe feeding *reads*.
++    The last field ends the last consumer's command; function producers are resolved only
++    before that boundary. The second field tracks a heredoc-owning upstream producer. A list
++    operator or line break ends a pipe inside a group:
+     what follows reads the group's stdin (nit 2)."""
+     feeds = feeds_body = False
++    upstream_end = 0
+     piped = carried = own_body = False
+     frames: list[list[bool]] = []  # [piped, carried, holds a body] at each open group
+     suspended: dict[int, tuple[bool, bool, bool]] = {}
+     words: list[str] = []
+-    for role, word in [*unit.events, ("list", ";")]:
++    for index, (role, word) in enumerate([*unit.events, ("list", ";")]):
+         if role == "data":
+             continue
+         if role == "word":
+@@ -607,6 +624,7 @@ def _unit_feeds_nested_stdin(
+         if words and piped and reads(words):
+             feeds = True
+             feeds_body = feeds_body or carried
++            upstream_end = index
+         process = (output_processes and role == "open" and word == "("
+                    and bool(words) and words[-1] == ">" and _syntax_word(words[-1]))
+         words = []
+@@ -629,7 +647,7 @@ def _unit_feeds_nested_stdin(
+                 piped, carried, own_body = suspended.pop(len(frames))
+         else:
+             piped = carried = own_body = False
+-    return feeds, feeds_body
++    return feeds, feeds_body, upstream_end
+ 
+ 
+ def _iter_nested_printed_payloads(command: str, *, pipes: bool = True) -> Iterator[str]:
+@@ -642,19 +660,24 @@ def _iter_nested_printed_payloads(command: str, *, pipes: bool = True) -> Iterat
+     print is walked too when that producer is upstream of the pipe (nit 1).
+     """
+     from cron.lifecycle_guard_output import iter_printed_shell_payloads
++    from cron.lifecycle_guard_printed_functions import FunctionProducers
+ 
+     piped = pipes and "|" in command
+     substituted = _STDIN_PROCESS_OPENER.search(command) is not None
+     if not (piped or substituted):
+         return  # do not tokenize large generators with neither feed a second time
+-    for unit in _printed_pipeline_units(command):
++    units = _printed_pipeline_units(command)
++    functions = FunctionProducers(units)
++    for unit in units:
+         texts = _stdin_substitution_texts(unit) if substituted else []
+-        feeds, feeds_body = _unit_feeds_nested_stdin(unit) if piped else (False, False)
++        feeds, feeds_body, upstream_end = _unit_nested_stdin_flow(unit) if piped else (False, False, 0)
+         if feeds:
+             text = unit.text()
+             if feeds_body and unit.bodies:
+                 text = "\n".join([text, *unit.bodies])
+             texts.append(text)
++            # Resolve only calls upstream of the pipe-fed startup shell.
++            texts.extend(functions.called_texts(unit.events[:upstream_end]))
+         for text in texts:
+             for payload, _raw_quote in iter_printed_shell_payloads(text, shell_sink=True):
+                 yield payload
+diff --git a/cron/lifecycle_guard_printed_functions.py b/cron/lifecycle_guard_printed_functions.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2ac91f59f10a41e98913db3dc18f7f2466b3cfaa
+--- /dev/null
++++ b/cron/lifecycle_guard_printed_functions.py
+@@ -0,0 +1,125 @@
++"""Function-indirected producers of text a startup shell reads (card t_028a39b21383a50d).
++
++``f() { printf 'T'; }; f | bash -l`` prints ``T`` into a login shell, which parses it with alias
++names of its own. The definition and the call are separate printed units (a top-level ``;`` ends
++a unit, and merging units would change unrelated pipelines' alias scope), so the call's unit alone
++holds no printer. Here the definitions a feeding pipeline calls upstream of that shell are resolved
++from the same command text and their bodies walked in the nested scope as well.
++
++Bounds and conservative choices:
++
++* every definition of a called name counts (a redefinition may run either body, depending on
++  order and control flow), as does every function its bodies name in turn (``f`` calling ``g``);
++  each definition is walked once per command, which also ends recursion;
++* a name counts as called wherever it appears as a word inside an upstream word (``f``,
++  ``"$(f)"``, `` `f` ``, ``xargs f``), and a name the text never defines (a session or
++  startup-file function, ``eval``-built text) resolves to nothing: such bodies are outside the
++  walked text, as for every other session-defined command;
++* a body whose compound cannot be delimited extends to the end of its unit (and the next unit
++  when the header ends one, as in ``f()``\\n``{ … }``): it fails closed by walking more text.
++"""
++
++from __future__ import annotations
++
++import re
++from collections.abc import Sequence
++from typing import TYPE_CHECKING, Optional
++
++if TYPE_CHECKING:
++    from cron.lifecycle_guard_nested_shells import _PrintedUnit
++
++# Characters that may continue a function name (bash accepts most non-metacharacters).
++_NAME_CHARS = r"A-Za-z0-9_.:@%+\-/,^~"
++
++
++def _definition_header(events: Sequence[tuple[str, str]], index: int) -> Optional[tuple[str, int]]:
++    """``(name, index of the body's first event)`` when a function definition starts at *index*:
++    ``function NAME [( )]`` or ``NAME ( )``."""
++    role, word = events[index]
++    if role != "word":
++        return None
++    following = list(events[index + 1:index + 3])
++    if word == "function" and not getattr(word, "quoted", False) and following and (
++            following[0][0] == "word"):
++        start = index + 2
++        if list(events[start:start + 2]) == [("open", "("), ("close", ")")]:
++            start += 2
++        return following[0][1], start
++    after_keyword = index and events[index - 1] == ("word", "function") and not getattr(
++        events[index - 1][1], "quoted", False)
++    if following == [("open", "("), ("close", ")")] and not after_keyword:
++        return word, index + 3
++    return None
++
++
++def _compound_events(events: Sequence[tuple[str, str]], start: int) -> list[tuple[str, str]]:
++    """The events of the compound command starting at *start*; the rest of *events* when it does
++    not open one there or never closes (fail closed)."""
++    while start < len(events) and events[start][0] == "newline":
++        start += 1
++    if start >= len(events) or events[start][0] != "open":
++        return list(events[start:])
++    depth = 0
++    for position in range(start, len(events)):
++        role = events[position][0]
++        depth += (role == "open") - (role == "close")
++        if depth <= 0:
++            return list(events[start:position + 1])
++    return list(events[start:])
++
++
++class FunctionProducers:
++    """The function definitions in a command's printed units, resolved on first use."""
++
++    def __init__(self, units: Sequence[_PrintedUnit]) -> None:
++        self._units = units
++        self._definitions: Optional[dict[str, list[_PrintedUnit]]] = None
++        self._pattern: Optional[re.Pattern[str]] = None
++        self._walked: set[int] = set()
++
++    def _load(self) -> dict[str, list[_PrintedUnit]]:
++        if self._definitions is not None:
++            return self._definitions
++        from cron.lifecycle_guard_nested_shells import _is_heredoc_opener, _PrintedUnit
++
++        definitions: dict[str, list[_PrintedUnit]] = {}
++        for unit_index, unit in enumerate(self._units):
++            for index in range(len(unit.events)):
++                header = _definition_header(unit.events, index)
++                if header is None:
++                    continue
++                name, start = header
++                source = unit
++                if start >= len(unit.events) and unit_index + 1 < len(self._units):
++                    source, start = self._units[unit_index + 1], 0  # `f()`⏎`{ … }`
++                body = _PrintedUnit()
++                body.events = _compound_events(source.events, start)
++                if any(role == "word" and _is_heredoc_opener(word) for role, word in body.events):
++                    body.bodies = list(source.bodies)
++                if body.events and name:
++                    definitions.setdefault(name, []).append(body)
++        self._definitions = definitions
++        if definitions:
++            names = "|".join(re.escape(name) for name in sorted(definitions, key=len, reverse=True))
++            self._pattern = re.compile(rf"(?<![{_NAME_CHARS}])(?:{names})(?![{_NAME_CHARS}])")
++        return definitions
++
++    def called_texts(self, events: Sequence[tuple[str, str]]) -> list[str]:
++        """Texts (bodies with their heredoc bodies) of the not yet walked definitions that
++        *events* call, directly or through other bodies."""
++        if not any(role == "word" for role, _word in events):
++            return []
++        definitions = self._load()
++        if not definitions or self._pattern is None:
++            return []
++        texts: list[str] = []
++        pending = [word for role, word in events if role in ("word", "data")]
++        while pending:
++            for name in self._pattern.findall(pending.pop()):
++                for body in definitions.get(name, ()):
++                    if id(body) in self._walked:
++                        continue
++                    self._walked.add(id(body))
++                    texts.append("\n".join([body.text(), *body.bodies]))
++                    pending.extend(word for role, word in body.events if role in ("word", "data"))
++        return texts
+diff --git a/tests/cron/test_lifecycle_guard_printed_functions.py b/tests/cron/test_lifecycle_guard_printed_functions.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..410fbd867717c406f30a88061dfac7fad472e025
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_printed_functions.py
+@@ -0,0 +1,116 @@
++"""Card t_028a39b21383a50d: a function's printed output flows into the startup shell its call
++pipes to (``f() { printf 'T'; }; f | bash -l``), though definition and call are separate printed
++units. The nested shell parses that text with alias names of its own, so ``t (`` may be a
++subshell there: the db path is executed and the guard must refuse to inspect the SQLite file."""
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from cron.lifecycle_guard_nested_shells import _printed_pipeline_units, _unit_nested_stdin_flow
++from tests.cron import test_lifecycle_guard_session_aliases as aliases
++
++live_kanban_db = aliases.live_kanban_db
++
++_PRINT = "printf 't ( bash {db} )'"
++
++
++@pytest.mark.parametrize("shape", [
++    "f() {{ {p}; }}; f | bash -l",  # the card's repro
++    "function f {{ {p}; }}; f | bash -l",
++    "function f() {{ {p}; }}; f | bash -l",
++    "f()\n{{ {p}; }}\nf | bash -l",
++    "function f\n{{ {p}; }}\nf | bash -l",
++    "f() ( {p} ); f | cat | bash -l",
++    "f() if :; then {p}; fi; f | bash -l",
++    "f() {{ {p}; }}; f |& zsh",
++    "f() {{ {p}; }}; f | ssh h",
++    "f() {{ {p}; }}\nf |\nbash -l",
++    "f() {{ {p}; }}; {{ f; }} | bash -l",
++    "f() {{ {p}; }}; f | {{ cat; bash -l; }}",
++    "{{ f() {{ {p}; }}; }}; f | bash -l",  # defined inside a group
++    "g() {{ {p}; }}; f() {{ g; }}; f | bash -l",  # called through another function
++    "f() {{ g; }}; g() {{ {p}; }}; f | bash -l",  # callee defined after the caller
++    "f() {{ printf ':'; }}; f() {{ {p}; }}; f | bash -l",  # redefinition: the body that runs
++    "f() {{ {p}; }}; f() {{ printf ':'; }}; f | bash -l",  # either may run (order, control)
++    "f() {{ {p}; [ -n \"$1\" ] || f x; }}; f | bash -l",  # recursion terminates
++    "f() {{ {p}; }}; echo \"$(f)\" | bash -l",
++    "f() {{ {p}; }}; echo `f` | bash -l",
++    "f() {{ python3 - <<'PY'\nprint('t ( bash {db} )')\nPY\n}}; f | bash -l",
++])
++def test_function_producer_feeds_startup_shell(tmp_path, live_kanban_db, shape):
++    text = shape.format(p=_PRINT.format(db=live_kanban_db), db=live_kanban_db)
++    unsafe, refusal = scan_gateway_lifecycle(
++        text, cwd=str(tmp_path), session_aliases=frozenset({"zz"}))
++    assert unsafe is True and refusal is not None and "SQLite" in refusal
++
++
++@pytest.mark.parametrize("shape", [
++    "f() {{ {p}; }}; f | bash",  # a plain shell holds the session's aliases only
++    "f() {{ {p}; }}; f | bash -s",
++    "f() {{ {p}; }}; f | bash -l -c ':'",
++    "f() {{ {p}; }}; f; printf ':' | bash -l",  # f prints to the terminal, not the shell
++    "f() {{ {p}; }}; f && printf ':' | bash -l",
++    "f() {{ {p}; }}\nf\nprintf ':' | bash -l",
++    "f() {{ {p}; }}; g() {{ printf ':'; }}; g | bash -l",  # an unrelated definition
++    "f() {{ {p}; }}; printf ':' | bash -l | f",  # downstream of the shell
++    "f() {{ {p}; }}; ff | bash -l",  # a longer name is no call
++    "f() {{ printf ':'; }}; f | bash -l",
++    "f() {{ {p}; }}; f | cat; printf ':' | bash -l",
++])
++@pytest.mark.parametrize("names", [frozenset(), frozenset({"zz"}), aliases._STOCK_ALIASES])
++def test_function_output_outside_startup_shell_stays_allowed(tmp_path, live_kanban_db, shape, names):
++    text = shape.format(p=_PRINT.format(db=live_kanban_db))
++    assert scan_gateway_lifecycle(text, cwd=str(tmp_path), session_aliases=names) == (False, None)
++
++
++@pytest.mark.parametrize("names", [frozenset({"t"}), None])
++def test_session_alias_still_refuses_plain_shell(tmp_path, live_kanban_db, names):
++    """Control: with `t` a session alias (or unknown names) even a plain shell refuses."""
++    text = "f() { " + _PRINT.format(db=live_kanban_db) + "; }; f | bash"
++    unsafe, refusal = scan_gateway_lifecycle(text, cwd=str(tmp_path), session_aliases=names)
++    assert unsafe is True and refusal is not None
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("shape", [
++    "f() { printf 'echo FED\\n'; }; f | bash --noprofile --norc",
++    "function f\n{ printf 'echo FED\\n'; }\nf | bash --noprofile --norc",
++    "g() { printf 'echo FED\\n'; }; f() { g; }; f | bash --noprofile --norc",
++    "f() { printf ':\\n'; }; f() { printf 'echo FED\\n'; }; f | bash --noprofile --norc",
++    "f() { printf 'echo FED\\n'; }; echo \"$(f)\" | bash --noprofile --norc",
++    "f() ( printf 'echo FED\\n' ); f | cat | bash --noprofile --norc",
++])
++def test_real_bash_function_output_reaches_piped_shell(tmp_path, shape):
++    """Harmless marker: the consumer shell executes what the called function printed."""
++    result = subprocess.run(["bash", "--noprofile", "--norc", "-c", shape], cwd=tmp_path,
++                            capture_output=True, text=True, encoding="utf-8", timeout=10,
++                            check=True)
++    assert result.stdout == "FED\n"
++
++
++@pytest.mark.platforms("posix")
++def test_real_bash_uncalled_function_output_does_not_reach_shell(tmp_path):
++    text = "f() { printf 'echo FED\\n'; }; f; printf ':\\n' | bash --noprofile --norc"
++    result = subprocess.run(["bash", "--noprofile", "--norc", "-c", text], cwd=tmp_path,
++                            capture_output=True, text=True, encoding="utf-8", timeout=10,
++                            check=True)
++    assert result.stdout == "echo FED\n"  # printed, never executed
++
++
++@pytest.mark.parametrize("definition", ["function f", "function f()", "f()"])
++def test_function_keyword_body_is_one_unit(definition):
++    units = _printed_pipeline_units(definition + " { printf ':'; echo x; }; f | bash -l")
++    assert len(units) == 2
++    roles = [role for role, _word in units[0].events]
++    assert roles.count("open") - roles.count("close") == 0
++    assert ("close", "}") in units[0].events
++    assert units[1].text() == "f | bash -l"
++
++
++def test_upstream_end_stops_before_downstream_words():
++    unit, = _printed_pipeline_units("g | bash -l | f")
++    feeds, _body, end = _unit_nested_stdin_flow(unit)
++    assert feeds
++    assert ("word", "g") in unit.events[:end]
++    assert ("word", "f") not in unit.events[:end]
+-- 
+2.43.0
+

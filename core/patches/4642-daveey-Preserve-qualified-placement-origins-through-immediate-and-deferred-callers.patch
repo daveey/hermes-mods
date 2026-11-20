@@ -1,0 +1,405 @@
+From a1cab2736cd50734e1a325d320fb50776ac4f442 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:50:32 +0000
+Subject: [PATCH] [daveey] Preserve qualified placement origins through
+ immediate and deferred callers
+
+---
+ hermes_cli/kanban_placement_forward.py        | 15 +++-
+ hermes_cli/kanban_placement_provenance.py     | 37 +++++++++
+ tests/hermes_cli/test_placement_provenance.py | 56 +++++++++++++
+ .../test_kanban_cross_board_creator_chats.py  | 11 ++-
+ .../tools/test_placement_qualified_callers.py | 83 +++++++++++++++++++
+ tools/kanban_tools.py                         | 17 +++-
+ tools/kanban_tools_placement.py               | 36 ++++----
+ 7 files changed, 226 insertions(+), 29 deletions(-)
+ create mode 100644 hermes_cli/kanban_placement_provenance.py
+ create mode 100644 tests/hermes_cli/test_placement_provenance.py
+ create mode 100644 tests/tools/test_placement_qualified_callers.py
+
+diff --git a/hermes_cli/kanban_placement_forward.py b/hermes_cli/kanban_placement_forward.py
+index ace2be2d53eb7d03521545a4d7f4d7f1f3e010e4..f0bea47bd51adfcaa18194b715274445cafd7cd6 100644
+--- a/hermes_cli/kanban_placement_forward.py
++++ b/hermes_cli/kanban_placement_forward.py
+@@ -59,11 +59,12 @@ MODULE = "hermes_cli.kanban_placement_forward"
+ # --- state -------------------------------------------------------------------------------------
+ 
+ def record_deferral(conn: sqlite3.Connection, task_id: str, *, target: str, origin_session: Optional[str],
+-                    origin_profile: str) -> None:
++                    origin_profile: str, origin_gateway: Optional[str] = None) -> None:
+     from hermes_cli import kanban_db as kb
+     with kb.write_txn(conn):
+         kb._append_event(conn, task_id, DEFERRED, {
+-            "target": target, "origin_session": origin_session or None, "origin_profile": origin_profile})
++            "target": target, "origin_session": origin_session or None, "origin_profile": origin_profile,
++            **({"origin_gateway": origin_gateway} if origin_gateway else {})})
+ 
+ 
+ def state(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+@@ -573,9 +574,14 @@ class Forwarder:
+         return self._await(task, target, rid)
+ 
+     def _create(self, args: dict, target: str, st: dict, key: str) -> dict:
++        forwarding = {}
++        if st.get("origin_gateway") and st["origin_gateway"] != self.self_gw:
++            from hermes_cli.kanban_placement_provenance import forwarding_authority
++            forwarding = {"origin_gateway": st["origin_gateway"], **forwarding_authority(
++                self.conn, self.task_id, self.run_id, self_gw=self.self_gw)}
+         return self.create(args, target=target, origin_session=st.get("origin_session"),
+                            origin_profile=st.get("origin_profile") or "default", self_gw=self.self_gw,
+-                           cfg=self.cfg, hub_cli=self.hub_cli, transport_key=key)
++                           cfg=self.cfg, hub_cli=self.hub_cli, transport_key=key, **forwarding)
+ 
+     def _await(self, task, target: str, rid: str) -> str:
+         from hermes_cli.kanban_placement import FAILED_STATES
+@@ -655,6 +661,9 @@ class Forwarder:
+             kb._append_event(self.conn, self.task_id, kind, payload)
+ 
+     def _cancel(self, why: str) -> str:
++        st = state(self.conn, self.task_id) or {}
++        if st.get("origin_gateway") and st["origin_gateway"] != self.self_gw:
++            return self._park_clock(f"qualified origin forwarding refused; no local fallback: {why}")
+         self._event(CANCELLED, {"why": why})
+         return "fallback"
+ 
+diff --git a/hermes_cli/kanban_placement_provenance.py b/hermes_cli/kanban_placement_provenance.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d82db8d539bff552e9617c0c6e52dd39dc43b05f
+--- /dev/null
++++ b/hermes_cli/kanban_placement_provenance.py
+@@ -0,0 +1,37 @@
++"""Discover a forwarding creator identity; the origin gateway authenticates it.
++
++Replica ownership is a routing hint, not permission. Only the origin-local
++binding plus the server-owned lease can authorize the resulting request.
++"""
++from __future__ import annotations
++
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli.kanban_execution_observations import board_owner_profile
++from hermes_cli.kanban_origin import _replica_task_owners
++from hermes_cli.kanban_placement_forward import opened_board
++
++
++def forwarding_authority(conn, task_id, run_id, *, self_gw):
++    """Require evidenced owner namespace and portable run identity, never guess."""
++    if conn is None or not task_id or not self_gw:
++        raise ValueError("origin_forward_creator_unknown")
++    board = opened_board(conn)
++    cols = sync.table_columns(conn, "tasks")
++    if "created_on" not in cols:
++        raise ValueError("origin_forward_creator_unknown")
++    row = conn.execute("SELECT created_on FROM tasks WHERE id=?", (task_id,)).fetchone()
++    gateway = row[0] if row else None
++    if not gateway:
++        raise ValueError("origin_forward_creator_unknown")
++    if gateway == self_gw:
++        path = sync._db_key(conn)
++        profile = board_owner_profile(path) if path else None
++    else:
++        profiles = {profile for gw, profile in _replica_task_owners(task_id, board) if gw == gateway}
++        profile = next(iter(profiles)) if len(profiles) == 1 else None
++    run = conn.execute("SELECT task_id FROM task_runs WHERE id=?", (run_id,)).fetchone()
++    uid = sync.run_uid(conn, run_id) if run and run[0] == task_id else None
++    if not profile or not uid:
++        raise ValueError("origin_forward_creator_unknown")
++    return {"creator": {"gateway": gateway, "profile": profile, "board": board, "task_id": task_id},
++            "run_uid": uid}
+diff --git a/tests/hermes_cli/test_placement_provenance.py b/tests/hermes_cli/test_placement_provenance.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7f92e3553f81f9776adc3b095e5f9d4794946137
+--- /dev/null
++++ b/tests/hermes_cli/test_placement_provenance.py
+@@ -0,0 +1,56 @@
++"""Foreign creator discovery never substitutes the executing worker namespace."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_placement_provenance as provenance
++
++
++@pytest.fixture
++def db(monkeypatch):
++    conn = sqlite3.connect(":memory:")
++    conn.executescript("CREATE TABLE tasks(id TEXT, created_on TEXT);"
++                       "CREATE TABLE task_runs(id INTEGER, task_id TEXT, uid TEXT);"
++                       "INSERT INTO tasks VALUES ('t_creator','hub');"
++                       "INSERT INTO task_runs VALUES (7,'t_creator','run-portable');")
++    monkeypatch.setattr(provenance, "opened_board", lambda c: "research")
++    monkeypatch.setattr(provenance.sync, "board_mode", lambda c: "primary")
++    monkeypatch.setattr(provenance, "_replica_task_owners", lambda t, b: [("hub", "owner-profile")])
++    yield conn
++    conn.close()
++
++
++def test_exact_foreign_owner_and_run(db):
++    assert provenance.forwarding_authority(db, "t_creator", 7, self_gw="worker-7") == {
++        "creator": {"gateway": "hub", "profile": "owner-profile", "board": "research", "task_id": "t_creator"},
++        "run_uid": "run-portable"}
++
++
++@pytest.mark.parametrize("owners", [[], [("other", "default")], [("hub", "a"), ("hub", "b")]])
++def test_unknown_or_ambiguous_owner_never_uses_worker_profile(db, monkeypatch, owners):
++    monkeypatch.setattr(provenance, "_replica_task_owners", lambda t, b: owners)
++    with pytest.raises(ValueError, match="creator_unknown"):
++        provenance.forwarding_authority(db, "t_creator", 7, self_gw="worker-7")
++
++
++@pytest.mark.parametrize("change", ["UPDATE tasks SET created_on=NULL", "DELETE FROM tasks",
++                                    "UPDATE task_runs SET task_id='t_other'", "UPDATE task_runs SET uid=NULL",
++                                    "DELETE FROM task_runs"])
++def test_unknown_owner_or_run_refuses(db, change):
++    db.execute(change)
++    with pytest.raises(ValueError, match="creator_unknown"):
++        provenance.forwarding_authority(db, "t_creator", 7, self_gw="worker-7")
++
++
++def test_local_owner_uses_board_namespace_not_active_profile(db, monkeypatch):
++    db.execute("UPDATE tasks SET created_on='worker-7'")
++    monkeypatch.setattr(provenance.sync, "_db_key", lambda c: "/evidenced/board.db")
++    monkeypatch.setattr(provenance, "board_owner_profile", lambda p: "board-profile")
++    result = provenance.forwarding_authority(db, "t_creator", 7, self_gw="worker-7")
++    assert result["creator"]["profile"] == "board-profile"
++
++
++def test_unsynced_run_is_not_authority(db, monkeypatch):
++    monkeypatch.setattr(provenance.sync, "board_mode", lambda c: "off")
++    with pytest.raises(ValueError, match="creator_unknown"):
++        provenance.forwarding_authority(db, "t_creator", 7, self_gw="worker-7")
+diff --git a/tests/tools/test_kanban_cross_board_creator_chats.py b/tests/tools/test_kanban_cross_board_creator_chats.py
+index a790ba4f9e151415eba105efbd55dd63867ebac1..5b3ba8c7802ca69c7a87119ede54e0db35bf6d30 100644
+--- a/tests/tools/test_kanban_cross_board_creator_chats.py
++++ b/tests/tools/test_kanban_cross_board_creator_chats.py
+@@ -131,13 +131,16 @@ def test_placed_worker_child_of_an_unresolved_creator_has_no_origin(placed, monk
+     assert placed == [{"target": "hub", "origin_session": None, "origin_profile": "default"}]
+ 
+ 
+-def test_placed_worker_child_skips_a_chat_on_another_gateway(placed, monkeypatch):
+-    """hermes-hub create-task binds an origin on THIS gateway only, so a foreign chat cannot be the origin."""
++def test_placed_foreign_chat_without_creator_authority_refuses(placed, monkeypatch):
++    """A foreign chat must never be silently dropped or stamped with this worker."""
+     with kbc.connect_closing() as conn:
+         creator = kb.create_task(conn, title="creator", assignee="default", session_id=WORKER)
+         _link(conn, creator, "away", None, CHAT)
+-    _place(creator, monkeypatch)
+-    assert placed == [{"target": "hub", "origin_session": None, "origin_profile": "default"}]
++    monkeypatch.setenv("HERMES_KANBAN_TASK", creator)
++    out = json.loads(tools._handle_create({"title": "routed child", "assignee": "default", "requires": []}))
++    assert out.get("created") is False, out
++    assert "origin_forward_creator_unknown" in out["error"]
++    assert placed == []
+ 
+ 
+ def test_deferred_worker_child_records_the_creator_chat_for_its_forward(placed, monkeypatch):
+diff --git a/tests/tools/test_placement_qualified_callers.py b/tests/tools/test_placement_qualified_callers.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..73109b6907bfcf8b564b8a709559dcffcb307d5b
+--- /dev/null
++++ b/tests/tools/test_placement_qualified_callers.py
+@@ -0,0 +1,83 @@
++"""Placement discovery and caller fences retain a qualified foreign origin."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_placement as kp
++from hermes_cli import kanban_placement_forward as kpf
++from hermes_cli import kanban_placement_provenance as provenance
++from tests.tools import test_kanban_cross_board_creator_chats as helpers
++from tools import kanban_tools as tools
++
++home = helpers.home
++AUTHORITY = {"creator": {"gateway": "hub", "profile": "owner", "board": "default", "task_id": "t_creator"},
++             "run_uid": "run-portable"}
++
++
++def creator(monkeypatch):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="creator", assignee="default", session_id=helpers.WORKER)
++        helpers._link(conn, tid, "macbook", "chat-profile", helpers.FOREIGN_CHAT)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_SESSION_ID", helpers.WORKER)
++    monkeypatch.setenv("HERMES_SESSION_KEY", helpers.WORKER)
++    return tid
++
++
++def test_immediate_preserves_full_origin_and_creator(home, monkeypatch):
++    tid = creator(monkeypatch)
++    sent, authorities = [], []
++    monkeypatch.setattr(kp, "decide", lambda *a, **k: {"where": "hub", "why": "route"})
++    def authority(conn, task_id, run_id, *, self_gw):
++        authorities.append(task_id)
++        return AUTHORITY
++    monkeypatch.setattr(provenance, "forwarding_authority", authority)
++    monkeypatch.setattr(kp, "create_remote", lambda args, **kw: sent.append(kw) or {
++        "ok": True, "request_id": "forward:test", "queued_only": True})
++    out = json.loads(tools._handle_create({"title": "child", "requires": []}))
++    assert out["ok"] is True
++    assert authorities == [tid]
++    assert sent[0]["origin_gateway"] == "macbook"
++    assert sent[0]["origin_profile"] == "chat-profile"
++    assert sent[0]["origin_session"] == helpers.FOREIGN_CHAT
++    assert sent[0]["creator"] == AUTHORITY["creator"]
++    assert sent[0]["run_uid"] == AUTHORITY["run_uid"]
++
++
++@pytest.mark.parametrize("exception", [False, True])
++def test_qualified_transport_failure_never_creates_local(home, monkeypatch, exception):
++    creator(monkeypatch)
++    monkeypatch.setattr(kp, "decide", lambda *a, **k: {"where": "hub", "why": "route"})
++    monkeypatch.setattr(provenance, "forwarding_authority", lambda *a, **k: AUTHORITY)
++    def send(*a, **k):
++        if exception:
++            raise OSError("uncertain send")
++        return {"ok": False, "error": "refused"}
++    monkeypatch.setattr(kp, "create_remote", send)
++    out = json.loads(tools._handle_create({"title": "must not exist", "requires": []}))
++    assert out["created"] is False
++    with kbc.connect_closing() as conn:
++        assert not conn.execute("SELECT 1 FROM tasks WHERE title='must not exist'").fetchone()
++
++
++def test_deferred_retains_gateway_and_uses_current_deferred_creator(home, monkeypatch):
++    creator(monkeypatch)
++    monkeypatch.setattr(kp, "decide", lambda *a, **k: {"where": "local", "defer": "hub", "why": "parents"})
++    out = json.loads(tools._handle_create({"title": "deferred child", "requires": []}))
++    assert out["ok"] is True, out
++    calls = []
++    with kbc.connect_closing() as conn:
++        st = kpf.state(conn, out["task_id"])
++        assert st["origin_gateway"] == "macbook"
++        fwd = kpf.Forwarder(conn, out["task_id"], 17)
++        monkeypatch.setattr(provenance, "forwarding_authority", lambda c, t, r, **kw: calls.append((t, r)) or AUTHORITY)
++        fwd.create = lambda a, **kw: kw
++        result = fwd._create({}, "hub", st, "immutable-key")
++        assert calls == [(out["task_id"], 17)]
++        assert result["origin_gateway"] == "macbook"
++        assert result["transport_key"] == "immutable-key"
++        fwd._park_clock = lambda why: "requeued"
++        assert fwd._cancel("authority refused") == "requeued"
++        assert kpf.state(conn, out["task_id"])["origin_gateway"] == "macbook"
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 8b0df3ac24f0db82d87372f6cd62f5061e3eaa85..9a2b23cbc6b080b7363d60ae21cd98df6cba17fc 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1458,7 +1458,8 @@ def _placed_rejection(kp, rid: str, target: str, fields: dict) -> Optional[str]:
+ 
+ 
+ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, session_id, conn=None,
+-                  note_local_pin: bool = True, origin_profile=None) -> tuple[Optional[str], Optional[dict]]:
++                  note_local_pin: bool = True, origin_profile=None, origin_gateway=None,
++                  creator_task_id=None) -> tuple[Optional[str], Optional[dict]]:
+     """[daveey] Create the card on the gateway ``kanban.placement`` routes this one to.
+ 
+     Returns a remote result/refusal, or local placement metadata. Worker-policy metadata
+@@ -1488,13 +1489,18 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+             return (tool_error(stranded, rejection="sync_not_running"), None) if stranded else (None, local)
+         self_gw = reg.self_gateway() or "local"
+         cfg = kp.config()
++        forwarding = {}
++        if origin_gateway and origin_gateway != self_gw:
++            from hermes_cli.kanban_placement_provenance import forwarding_authority
++            forwarding = {"origin_gateway": origin_gateway, **forwarding_authority(
++                conn, creator_task_id, _worker_run_id(creator_task_id) if creator_task_id else None, self_gw=self_gw)}
+         placed = kp.create_remote(view, target=target, origin_session=session_id,
+                                   origin_profile=origin_profile or current_profile_name("default") or "default",
+-                                  self_gw=self_gw, cfg=cfg, hub_cli=reg.hub_cli_path(cfg.get("hub_cli")))
++                                  self_gw=self_gw, cfg=cfg, hub_cli=reg.hub_cli_path(cfg.get("hub_cli")), **forwarding)
+         if not placed.get("ok"):
+             logger.warning("kanban placement: %s refused the card (%s)",
+                            target, placed.get("error"))
+-            if placed.get("fatal") or kp.explicit_foreign_pin(view, reg.self_gateway()):
++            if forwarding or placed.get("fatal") or kp.explicit_foreign_pin(view, reg.self_gateway()):
+                 return _placement_refused(target, f"{target} refused the card: {placed.get('error')}"), None
+             return None, None
+         rid = placed["request_id"]
+@@ -1527,6 +1533,9 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+         return _ok(task_id=None, status="queued", **fields, runs_where=target, note=note), None
+     except Exception as exc:
+         logger.warning("kanban placement failed", exc_info=True)
++        if origin_gateway:
++            return _placement_refused(str(args.get("placement") or "auto"),
++                                      f"qualified origin forwarding failed: {exc}"), None
+         try:
+             from hermes_cli import kanban_placement as kp2
+             from hermes_cli import kanban_capability_registry as reg2
+@@ -1633,7 +1642,7 @@ def _handle_create(args: dict, **kw) -> str:
+             place_origin = _placement_origin(conn, self_tid, session_id)  # a worker's: its creator's chat
+             remote, marker_placement = _place_remote(
+                 args, assignee=str(assignee), skills=skills, parents=parents, project_id=project_id, conn=conn,
+-                note_local_pin=pinned_machine is None, **place_origin)  # a machine pin was rewritten to "local"
++                creator_task_id=self_tid, note_local_pin=pinned_machine is None, **place_origin)
+             if remote is not None:
+                 return remote
+             if marker_placement and marker_placement.get("runs_on") and runs_on is None:
+diff --git a/tools/kanban_tools_placement.py b/tools/kanban_tools_placement.py
+index c393efd6019e89f6d22f5e3a5b3030151a06cf25..b1f507dc5de967c97baa60ce9fc57d3fa390e1da 100644
+--- a/tools/kanban_tools_placement.py
++++ b/tools/kanban_tools_placement.py
+@@ -77,26 +77,25 @@ def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
+ 
+ 
+ def _placement_origin(conn, creator_task_id: Optional[str], session_id: Optional[str]) -> dict:
+-    """``{session_id, origin_profile}`` a card routed to another gateway carries as its origin chat. [daveey]
++    """Preserve the discovered chat owner, including a foreign gateway.
+ 
+-    The receiving gateway never sees a worker's creator card (it lives on this board), so it cannot walk to the
+-    creator's chat itself. A dispatcher worker sends the nearest real chat ``resolve_chats`` finds here: on THIS
+-    gateway only, because ``hermes-hub create-task`` binds an origin on the sending gateway. A worker transcript is
+-    never an origin (no chat reads it back); anything else keeps the caller's session. ``origin_profile`` None
+-    means this process's profile.
++    Discovery is not authorization: foreign sessions are verified on their own
++    gateway by the authenticated forward adapter, never in the worker's state.db.
++    Resolution errors must not turn a qualified origin into a plain local session.
+     """
+     from hermes_cli.kanban_db_notify import is_headless_session
+     if creator_task_id:
+-        try:  # never raises: placement itself decides what an identity failure means
+-            from hermes_cli import kanban_capability_registry as reg
+-            from hermes_cli.kanban_creator_chats import resolve_chats
+-            self_gw = reg.self_gateway()
+-            has_links = conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone()
+-            for owner in (resolve_chats(conn, creator_task_id) if has_links else []):
+-                if self_gw and owner["chat_gateway"] == self_gw and _persisted_session_id(owner["chat_session"]):
+-                    return {"session_id": owner["chat_session"], "origin_profile": owner.get("chat_profile") or None}
+-        except Exception:
+-            logger.warning("Could not resolve the creator chat for a placed card", exc_info=True)
++        from hermes_cli import kanban_capability_registry as reg
++        from hermes_cli.kanban_creator_chats import resolve_chats
++        self_gw = reg.self_gateway()
++        has_links = conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone()
++        for owner in (resolve_chats(conn, creator_task_id) if has_links else []):
++            gateway, session = owner["chat_gateway"], owner["chat_session"]
++            if gateway and gateway != self_gw:
++                return {"session_id": session, "origin_profile": owner.get("chat_profile") or "default",
++                        "origin_gateway": gateway}
++            if self_gw and gateway == self_gw and _persisted_session_id(session):
++                return {"session_id": session, "origin_profile": owner.get("chat_profile") or None}
+     if session_id and is_headless_session(session_id):
+         return {"session_id": None, "origin_profile": None}
+     return {"session_id": session_id, "origin_profile": None}
+@@ -203,7 +202,7 @@ def _denied_fields(conn, task_id: str, marker_placement: dict) -> Optional[dict]
+ 
+ 
+ def _marker_placement_fields(conn, new_tid: str, marker_placement: Optional[dict], session_id: Optional[str],
+-                             origin_profile: Optional[str] = None) -> dict:
++                             origin_profile: Optional[str] = None, origin_gateway: Optional[str] = None) -> dict:
+     """Result fields for a card a placement marker kept here; a deferred card records its forward. [daveey]"""
+     if not marker_placement:
+         return {}
+@@ -214,7 +213,8 @@ def _marker_placement_fields(conn, new_tid: str, marker_placement: Optional[dict
+         from hermes_cli import kanban_placement_forward as _kpf
+         from hermes_cli.profiles import current_profile_name as _cpn
+         _kpf.record_deferral(conn, new_tid, target=marker_placement["defer"], origin_session=session_id,
+-                             origin_profile=origin_profile or _cpn("default") or "default")
++                             origin_profile=origin_profile or _cpn("default") or "default",
++                             origin_gateway=origin_gateway)
+         return {"placement": {"where": "local", "defer": marker_placement["defer"], "why": marker_placement["why"]},
+                 "note": (f"Created here as {new_tid} so it can wait on its parents; it runs on "
+                          f"{marker_placement['defer']}, not here: when the parents finish the dispatcher "
+-- 
+2.43.0
+

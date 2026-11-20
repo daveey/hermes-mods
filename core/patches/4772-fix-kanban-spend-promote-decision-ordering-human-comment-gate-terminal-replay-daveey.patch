@@ -1,0 +1,268 @@
+From 0efd51fea4e8adf0015917b53f6336eaa8c59a5c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 00:47:37 +0000
+Subject: [PATCH] fix(kanban): spend_promote decision ordering, human-comment
+ gate, terminal replay [daveey]
+
+Review/mutation follow-up to the spend_promote operator action. The decision comment must
+follow the stop in event order (a same-second comment written before the stop no longer
+counts), a human comment on the card after the decision comment requires a new decision
+comment (the manual promote's unread-comment gate for this path), a replay after the card
+finished answers already_applied instead of a terminal refusal, and numeric strings accept
+ASCII digits only (a Unicode digit no longer escapes as ValueError).
+
+Proof: mutation pass over every new condition (36 mutants): all killed except >= vs > on
+_event_order, equivalent because the tuple ends in the unique event id. 8 new tests (triage
+and pending gates, producer kind/episode/absence, comment caller and same-second order, human
+comment, home runs/reason bounds, open parent, all-or-nothing rollback); 139 tests across
+spend_promote, operator_call, spend_budget, spend_decision_routing, supervisor_requests,
+docs_drift pass.
+---
+ hermes_cli/kanban_operator_call.py            |   6 +-
+ hermes_cli/kanban_spend_promote.py            |  33 +++--
+ tests/hermes_cli/test_kanban_spend_promote.py | 125 +++++++++++++++++-
+ website/docs/user-guide/features/kanban.md    |   6 +-
+ 4 files changed, 154 insertions(+), 16 deletions(-)
+
+diff --git a/hermes_cli/kanban_operator_call.py b/hermes_cli/kanban_operator_call.py
+index c2d6a8d65ffc8bf41f137c7269036d253a177dd3..b5bd2d14953741d8f1a92b962671de65c0450a95 100644
+--- a/hermes_cli/kanban_operator_call.py
++++ b/hermes_cli/kanban_operator_call.py
+@@ -673,11 +673,11 @@ def _apply(conn: sqlite3.Connection, payload: dict, own: str) -> tuple[str, Opti
+     if action == "creator_archive":
+         from hermes_cli.kanban_creator_archive import apply
+         return apply(conn, payload, extra)
+-    if task.status in ("done", "archived"):
+-        return "refused", f"{target} is {task.status}"
+-    if action == "spend_promote":
++    if action == "spend_promote":  # its marker answers a replay first; its scope refuses any non-triage card
+         from hermes_cli import kanban_spend_promote as ksp
+         return ksp.apply(conn, payload, extra)
++    if task.status in ("done", "archived"):
++        return "refused", f"{target} is {task.status}"
+     if action == "comment":
+         if _marker(conn, target, COMMENT_MARK, uid):
+             return "already_applied", None
+diff --git a/hermes_cli/kanban_spend_promote.py b/hermes_cli/kanban_spend_promote.py
+index 3337f0afe7688b6c0b7a6213157aafef638d9a30..5122565653f89cf420712872291a42c97aa35a8c 100644
+--- a/hermes_cli/kanban_spend_promote.py
++++ b/hermes_cli/kanban_spend_promote.py
+@@ -13,7 +13,8 @@ board writes), and an operator ``unblock`` is not a decision. This is the one su
+ Scope, checked on the replica at request time and again on the home's live file inside the write transaction:
+ the target is in triage under a pending spend hold whose CURRENT stop is ``episode``; that stop's
+ ``spend_budget_decision_ready`` producer is a supervisor and it is the calling card; the decision comment is the
+-caller's own operator comment on the target, written after the stop; no human hold and no open parent. The
++caller's own operator comment on the target, written after the stop (event order, not just the second), and no
++human has commented on the card since that decision comment; no human hold and no open parent. The
+ operator courier proves the caller (live run, Board lease holder, Board evidence) before the home applies it.
+ 
+ The home then, in ONE transaction: moves the card triage -> ready, records a ``spend_budget_set`` override of
+@@ -44,7 +45,7 @@ def _pos_int(value: Any) -> Optional[int]:
+         return None
+     if isinstance(value, int):
+         return value
+-    if isinstance(value, str) and value.strip().isdigit():
++    if isinstance(value, str) and value.strip().isascii() and value.strip().isdecimal():
+         return int(value.strip())
+     return None
+ 
+@@ -125,19 +126,31 @@ def scope_refusal(conn: sqlite3.Connection, target: str, requester: Optional[str
+     if producer.get("kind") != "supervisor" or producer.get("task_id") != requester:
+         return (f"spend stop {episode} on {target} names its decision owner as {producer.get('kind')} "
+                 f"{producer.get('task_id') or ''}".rstrip() + f", not {requester}")
+-    cid = _pos_int(comment_id)
+-    recorded = False
+-    for raw, at in conn.execute("SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind = ?",
+-                                (target, COMMENT_MARK)):
+-        p = _payload(raw)
++    from hermes_cli.kanban_sync_divergence import _event_order
++    cid, after = _pos_int(comment_id), _event_order(stop)
++    decided = None
++    for ev in conn.execute("SELECT * FROM task_events WHERE task_id = ? AND kind = ?", (target, COMMENT_MARK)):
++        ev = dict(ev)
++        p = _payload(ev["payload"])
+         if (cid is not None and _pos_int(p.get("comment_id")) == cid
+                 and (p.get("operator_caller") or {}).get("task_id") == requester
+-                and int(at or 0) >= int(stop["created_at"] or 0)):
+-            recorded = True
++                and _event_order(ev) > after):
++            decided = ev
+             break
+-    if not recorded:
++    if decided is None:
+         return (f"decision comment {comment_id} is not {requester}'s operator comment on {target} made after "
+                 f"spend stop {episode}; record the decision there first")
++    # A human who spoke on the card after the decision was recorded has not been heard by it: the decision card
++    # reads that comment and records a new decision (the manual promote's unread-comment gate, for this path).
++    decided_at = _event_order(decided)
++    for ev in conn.execute(
++            "SELECT * FROM task_events WHERE task_id = ? AND kind = 'commented' AND json_valid(payload) AND "
++            "(json_extract(payload, '$.writer_kind') = 'human' "
++            "OR json_extract(payload, '$.relayed_human') IS NOT NULL)",
++            (target,)):
++        if _event_order(dict(ev)) > decided_at:
++            return (f"a human commented on {target} after decision comment {cid}; read it and record a new "
++                    "decision comment first")
+     return None
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_spend_promote.py b/tests/hermes_cli/test_kanban_spend_promote.py
+index b7a2c7d542a8f383eb2419f903ee15a3bdb13ac7..a22b91e7093745bfa6a4681ecc856bd5967a3138 100644
+--- a/tests/hermes_cli/test_kanban_spend_promote.py
++++ b/tests/hermes_cli/test_kanban_spend_promote.py
+@@ -254,7 +254,7 @@ def test_decision_comment_must_be_the_callers_after_the_stop(fleet):
+ 
+ @pytest.mark.parametrize("bad", [{"runs": 0}, {"runs": 21}, {"runs": True}, {"runs": "x"}, {"episode": ""},
+                                  {"decision_comment_id": None}, {"decision_comment_id": 0}, {"reason": " "},
+-                                 {"exempt": True}, {"task_id": ""}])
++                                 {"exempt": True}, {"task_id": ""}, {"runs": "²"}])
+ def test_invalid_spend_promote_ops_are_refused(fleet, bad):
+     with pytest.raises(ksr.SupervisorRequestError) as exc:
+         _submit(fleet, {**_op(fleet, "e", 1), **bad})
+@@ -265,3 +265,126 @@ def test_tool_schema_exposes_spend_promote():
+     from tools import kanban_tools_schemas as schemas
+     text = json.dumps({k: getattr(schemas, k) for k in dir(schemas) if not k.startswith("_")}, default=str)
+     assert "spend_promote" in text and "decision_comment_id" in text
++
++
++def _mark(f, cid, *, caller=None, at=None):
++    """An operator comment marker on the target, as the home writes it for ``caller``'s comment ``cid``."""
++    with kb.write_txn(f.h):
++        kb._append_event(f.h, f.target, kox.COMMENT_MARK, {"comment_id": cid, "operator_request_uid": f"m{cid}",
++                                                          "operator_caller": {"task_id": caller or f.caller}})
++        if at is not None:
++            f.h.execute("UPDATE task_events SET created_at = ? WHERE id = (SELECT MAX(id) FROM task_events)", (at,))
++
++
++def _direct(f, episode, cid, uid="req-direct", **args):
++    return {"target_task_id": f.target, "request_uid": uid, "caller": {"gateway": f.name(f.w), "task_id": f.caller},
++            "args": {"runs": 4, "episode": episode, "decision_comment_id": cid, "reason": "re-scoped", **args}}
++
++
++def _untouched(f):
++    assert kb.get_task(f.h, f.target).status == "triage"
++    assert not _events(f.h, f.target, "promoted_manual") and not _events(f.h, f.target, ksb.OVERRIDE_EVENT)
++
++
++def test_target_must_still_be_triaged_and_pending(fleet):
++    f = fleet
++    episode = _stop(f)
++    _mark(f, 701)
++    assert ksp.scope_refusal(f.h, f.target, f.caller, episode, 701) is None
++    with kb.write_txn(f.h):
++        f.h.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (f.target,))
++    assert "not held in triage" in ksp.scope_refusal(f.h, f.target, f.caller, episode, 701)
++    with kb.write_txn(f.h):  # promoted by someone else, then triaged for another reason: no pending decision
++        kb._append_event(f.h, f.target, "promoted_manual", {"actor": "user", "reason": "x"})
++        f.h.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (f.target,))
++    assert "no pending spend-budget decision" in ksp.scope_refusal(f.h, f.target, f.caller, episode, 701)
++
++
++def test_producer_receipt_must_name_this_supervisor_for_this_episode(fleet):
++    f = fleet
++    episode = _stop(f, producer_task="t_nobody")
++    _mark(f, 702)
++    with kb.write_txn(f.h):  # strip the receipt: none for this episode
++        f.h.execute("DELETE FROM task_events WHERE task_id = ? AND kind = ?", (f.target, ksd.NOTICE))
++    assert "no decision producer receipt" in ksp.scope_refusal(f.h, f.target, f.caller, episode, 702)
++    with kb.write_txn(f.h):  # a receipt naming the caller, but for another episode
++        kb._append_event(f.h, f.target, ksd.NOTICE, {"episode": "other",
++                                                     "producer": {"kind": "supervisor", "task_id": f.caller}})
++    assert "no decision producer receipt" in ksp.scope_refusal(f.h, f.target, f.caller, episode, 702)
++    with kb.write_txn(f.h):  # this episode, the caller's id, but a chat owns the decision
++        kb._append_event(f.h, f.target, ksd.NOTICE, {"episode": episode,
++                                                     "producer": {"kind": "chats", "task_id": f.caller}})
++    assert "names its decision owner" in ksp.scope_refusal(f.h, f.target, f.caller, episode, 702)
++    with kb.write_txn(f.h):
++        kb._append_event(f.h, f.target, ksd.NOTICE, {"episode": episode,
++                                                     "producer": {"kind": "supervisor", "task_id": f.caller}})
++    assert ksp.scope_refusal(f.h, f.target, f.caller, episode, 702) is None
++
++
++def test_decision_comment_must_be_the_callers_own_and_strictly_after_the_stop(fleet):
++    f = fleet
++    at = int(time.time()) - 1000
++    _mark(f, 703, at=at)  # same second as the stop, but written before it
++    episode = _stop(f, at=at)
++    assert "decision comment" in ksp.scope_refusal(f.h, f.target, f.caller, episode, 703)
++    _mark(f, 704, caller="t_other_supervisor")
++    assert "decision comment" in ksp.scope_refusal(f.h, f.target, f.caller, episode, 704)
++    _mark(f, 705)
++    assert ksp.scope_refusal(f.h, f.target, f.caller, episode, 705) is None
++
++
++def test_human_comment_after_the_decision_needs_a_new_decision(fleet):
++    f = fleet
++    episode = _stop(f)
++    _mark(f, 706)
++    with kb.write_txn(f.h):
++        kb._append_event(f.h, f.target, "commented", {"writer_kind": "human"})
++    assert "a human commented" in ksp.scope_refusal(f.h, f.target, f.caller, episode, 706)
++    _mark(f, 707)
++    assert ksp.scope_refusal(f.h, f.target, f.caller, episode, 707) is None
++    with kb.write_txn(f.h):
++        kb._append_event(f.h, f.target, "commented", {"relayed_human": True})
++    assert "a human commented" in ksp.scope_refusal(f.h, f.target, f.caller, episode, 707)
++
++
++def test_home_apply_bounds_runs_and_reason(fleet):
++    f = fleet
++    episode = _stop(f)
++    _mark(f, 708)
++    for bad in ({"runs": 0}, {"runs": ksp.MAX_RUNS + 1}, {"runs": "²"}, {"reason": " "}):
++        assert ksp.apply(f.h, _direct(f, episode, 708, **bad), {})[0] == "refused", bad
++    _untouched(f)
++    extra = {"operator_request_uid": "req-direct"}
++    assert ksp.apply(f.h, _direct(f, episode, 708, runs="4"), extra)[0] == "applied"
++    assert _events(f.h, f.target, ksb.OVERRIDE_EVENT)[-1]["runs"] == 4
++    # A replay after the card finished still answers already_applied, not a terminal refusal.
++    with kb.write_txn(f.h):
++        f.h.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (f.target,))
++    assert kox._apply(f.h, {**_direct(f, episode, 708), "action": "spend_promote"}, "x")[0] == "already_applied"
++
++
++def test_open_parent_is_refused_at_home(fleet):
++    f = fleet
++    episode = _stop(f)
++    _mark(f, 709)
++    parent = f.card(f.h, "an open parent")
++    with kb.write_txn(f.h):
++        f.h.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (parent, f.target))
++    outcome, why = ksp.apply(f.h, _direct(f, episode, 709), {"operator_request_uid": "req-direct"})
++    assert outcome == "refused" and parent in why
++    _untouched(f)
++    with kb.write_txn(f.h):
++        f.h.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (parent,))
++    assert ksp.apply(f.h, _direct(f, episode, 709), {"operator_request_uid": "req-direct"})[0] == "applied"
++
++
++def test_promotion_is_all_or_nothing(fleet, monkeypatch):
++    f = fleet
++    episode = _stop(f)
++    _mark(f, 710)
++    monkeypatch.setattr(ksp, "scope_refusal", lambda *a: None)  # scope passed, then the card left triage
++    with kb.write_txn(f.h):
++        f.h.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (f.target,))
++    with pytest.raises(RuntimeError):
++        ksp.apply(f.h, _direct(f, episode, 710), {"operator_request_uid": "req-direct"})
++    assert not _events(f.h, f.target, "promoted_manual") and not _events(f.h, f.target, ksb.OVERRIDE_EVENT)
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index fc3e978203ab16be7b128cae53216d6e622ed94e..98fe021252d003ad08e49079153ebd39526f70c5 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -689,8 +689,10 @@ releases it with one operator call, never an unblock:
+ `kanban_supervisor_request` op `{"op": "operator", "action": "spend_promote",
+ "task_id", "runs" (1-20), "episode" (uid of the current spend_budget_triaged
+ event), "decision_comment_id" (its earlier operator comment recording the
+-decision), "reason"}`. Only the card the stop's producer names may make it; the
+-card's home rechecks the stop, producer, comment, human holds and parents, then
++decision), "reason"}`. Only the card the stop's producer names may make it, and
++only after its decision comment (a human comment after it needs a new decision
++comment); the card's home rechecks the stop, producer, comment, human holds and
++parents, then
+ records `spend_budget_set` (exactly `runs` runs, any cache-read override kept)
+ and `promoted_manual` (with `spend_budget`) in one transaction. That promotion
+ opens the new window, so the card gets exactly `runs` more runs.
+-- 
+2.43.0
+

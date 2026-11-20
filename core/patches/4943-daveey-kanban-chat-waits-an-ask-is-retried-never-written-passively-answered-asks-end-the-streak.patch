@@ -1,0 +1,365 @@
+From b31fffd8cbe35d470ddaad78362fddd51859e0c3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 07:29:02 +0000
+Subject: [PATCH] [daveey] kanban chat waits: an ask is retried, never written
+ passively; answered asks end the streak
+
+Review and adversarial pass of the previous head:
+- The once-per-hour budget exemption was charged before routing, so a
+  slots-busy pass or a second question within the hour still turned the ask
+  into a passive, acked row. The exemption is gone. Instead an ask the sweeper
+  cannot wake now (budget spent or slots busy) is handed back and retried each
+  pass, the budget still pacing wakes; one undelivered for ASK_OVERDUE_S (2 h)
+  goes to David via kanban_decision_ask.escalate (scheduled -> triage ->
+  needs_input with the question), the same path as the owner fallback.
+- With one premise per orchestrator, separately answered questions escalated
+  on the third park. prior_same_premise now ends the streak at a chat park
+  whose own comment probe (--after-id N) has a non-system comment after it.
+  Unanswered or reworded re-asks still escalate on the third park.
+
+Tests: budget spent and slots busy hand the ask back and wake on a later pass
+(no passive row); an ask undelivered for 2 h blocks the card needs_input;
+three answered questions park three times without escalating. 55 tests;
+16 neighbouring files (403 tests) pass.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_awaiting.py                |  16 +++
+ hermes_cli/kanban_decision_ask.py            |  36 ++++---
+ tests/hermes_cli/test_kanban_decision_ask.py | 105 ++++++++++++++-----
+ tui_gateway/kanban_unloaded.py               |  54 +++++-----
+ 4 files changed, 145 insertions(+), 66 deletions(-)
+
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index e5df0d15fd0b9ef3c79368d1ca9b9897cccc8593..c1eb633ce984e536a512d991958b90eddc688ca4 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -915,11 +915,27 @@ def prior_same_premise(conn: sqlite3.Connection, task_id: str, premise: str, *,
+             continue  # a continuation with no wait, or a legacy park
+         if got["premise"] != premise and not (probe and got.get("probe") == probe):
+             break
++        if got.get("kind") == CHAT and _answered_since(conn, task_id, data.get("wake_check")):
++            break  # that ask was answered: a later question is new work, not the same stuck wait
+         if not is_healthy(got):
+             count += 1
+     return count
+ 
+ 
++_AFTER_ID = re.compile(r"--after-id\s+(\d+)")
++
++
++def _answered_since(conn: sqlite3.Connection, task_id: str, wake_check: Optional[str]) -> bool:
++    """A chat park's own comment probe (``wait-comment --after-id N``) and an answer after it: any comment above N
++    not written by a kernel writer. Review of #3647: three separately answered questions escalated."""
++    m = _AFTER_ID.search(wake_check or "")
++    if not m:
++        return False
++    from hermes_cli.kanban_comment_origin import is_system_author
++    return any(not is_system_author(author) for (author,) in conn.execute(
++        "SELECT author FROM task_comments WHERE task_id = ? AND id > ?", (task_id, int(m.group(1)))))
++
++
+ def probe_fire_reparks(conn: sqlite3.Connection, task_id: str, premise: str, probe: Optional[str]) -> int:
+     """Trailing fire->re-park cycles on one opaque ``probe``: ``condition_met`` wakes by that probe, each
+     followed by a re-park on the same premise/probe, newest first. Stops at an escalation, a park on
+diff --git a/hermes_cli/kanban_decision_ask.py b/hermes_cli/kanban_decision_ask.py
+index b05d004397d6345b7e7d9d757674adc274afd362..ac979223090e8629dc1f27f31b81ba1a13646e91 100644
+--- a/hermes_cli/kanban_decision_ask.py
++++ b/hermes_cli/kanban_decision_ask.py
+@@ -49,34 +49,42 @@ def post_notice(conn, task_id: str, *, reason: str | None, awaiting: Any, run_id
+ 
+ def owner_fallback(conn, task_id: str) -> bool:
+     """On the owning gateway, after an imported ``decision_requested``: no wakeable subscriber means nobody gets
+-    the ask, so block the still-parked card ``needs_input`` with the question. True when it blocked."""
++    the ask, so it becomes David's (:func:`escalate`). True when it blocked."""
+     from hermes_cli import kanban_awaiting as kaw
++    from hermes_cli import kanban_wake_check as kwc
++    if kaw.has_chat_subscriber(conn, task_id):
++        return False
++    own = kwc.own_gateway(conn)
++    return escalate(conn, task_id, f"no chat subscribed to it on {own or 'its owning gateway'} can be woken")
++
++
++def escalate(conn, task_id: str, why_unanswered: str) -> bool:
++    """A still-parked card whose orchestrator ask cannot reach anyone: leave the park (``scheduled`` -> ``triage``,
++    probe cleared, ``decision_unanswerable``) and block it ``needs_input`` with the question, as the spend-budget hold
++    leaves a park. If the block is refused it stays visibly in triage. True when it blocked."""
+     from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_wake_check as kwc
+     task = kb.get_task(conn, task_id)
+-    if task is None or task.status != "scheduled" or kaw.has_chat_subscriber(conn, task_id):
++    if task is None or task.status != "scheduled":
+         return False
+     ask = [e for e in kb.list_events(conn, task_id) if e.kind == NOTICE_KIND]
+-    question = str((ask[-1].payload or {}).get("why") or (ask[-1].payload or {}).get("reason") or "") if ask else ""
+-    question = question.strip()[:1500] or "the decision named in the card's latest comment"
+-    from hermes_cli import kanban_wake_check as kwc
+-    own = kwc.own_gateway(conn)
+-    # A parked card cannot be blocked directly (block_task takes running/ready/triage): leave the park first, as the
+-    # spend-budget hold does. If the block below is refused, the card still sits visibly in triage.
++    payload = (ask[-1].payload or {}) if ask else {}
++    question = str(payload.get("why") or payload.get("reason") or "").strip()[:1500]
++    question = question or "the decision named in the card's latest comment"
+     with kb.write_txn(conn):
+         if conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ? AND status = 'scheduled'",
+                         (task_id,)).rowcount != 1:
+             return False
+         kwc.set_check(conn, task_id, None, None)
+-        kb._append_event(conn, task_id, UNANSWERED_KIND, {"why": question, "gateway": own})
++        kb._append_event(conn, task_id, UNANSWERED_KIND, {"why": question, "because": why_unanswered})
+     return bool(kb.block_task(
+         conn, task_id, kind="needs_input",
+-        reason=("This card's worker parked waiting on its orchestrator's decision, but no chat subscribed to the "
+-                "card can be woken here. 1) Answer the question below with a comment on the card. 2) Then unblock "
+-                "it.\n" + question),
++        reason=(f"This card's worker parked waiting on its orchestrator's decision, but {why_unanswered}. "
++                "1) Answer the question below with a comment on the card. 2) Then unblock it.\n" + question),
+         human_request={
+             "action": "Answer the card's question: " + question[:400],
+-            "why_human": "its worker asked its orchestrator, and no subscribed chat on the owning gateway can take it",
++            "why_human": f"its worker asked its orchestrator, and {why_unanswered}",
+             "interaction": "reply",
+             "scope": f"card {task_id}: {str(task.title or '')[:120]}",
+-            "evidence": f"decision_requested on {task_id}; no wakeable notify subscription on {own or 'this gateway'}",
++            "evidence": f"decision_requested on {task_id}; {why_unanswered}",
+         }))
+diff --git a/tests/hermes_cli/test_kanban_decision_ask.py b/tests/hermes_cli/test_kanban_decision_ask.py
+index 4ba494d6d859e7828d453b39d9809e4ecefc3a96..1ac06caeefeb87196ad833756379b0196fdcfc68 100644
+--- a/tests/hermes_cli/test_kanban_decision_ask.py
++++ b/tests/hermes_cli/test_kanban_decision_ask.py
+@@ -491,29 +491,14 @@ class _ChatStore:
+         return lambda *a, **k: None
+ 
+ 
+-def test_spent_wake_budget_still_wakes_the_orchestrator_for_an_ask(kanban_home, monkeypatch) -> None:
+-    """Adversarial review of #3647: with the chat's hourly wake budget spent by other cards, the sweeper wrote the
+-    ask as a passive row and acked it, so no turn ever read it and the card stayed parked."""
++def _sweep(chat, now, *, busy_slots=False):
+     from tui_gateway import kanban_unloaded as ku
+-    chat = _session()
+-    with kbc.connect_closing() as conn:
+-        tid = _running(conn)
+-        _subscribe(conn, tid, chat)
+-        _as_worker(monkeypatch, conn, tid)
+-        out = _tool("schedule", {"reason": LIVE_REASON, "clock_only": True, "awaiting": LIVE_AWAITING})
+-        assert kb.get_task(conn, tid).status == "scheduled", out
+-    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+-    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+-    now = time.time() + 10
+-    ku._reset_wake_budget_for_tests()
+-    for i in range(ku.WAKES_PER_HOUR):  # the orchestrator's other cards woke it this hour
+-        ku._charge_wake(chat, now - 60 * (i + 1))
+-    assert not ku._has_wake_budget(chat, now)
+     wakes, rows = [], []
+ 
+     class Store(_ChatStore):
+         def append_kanban_notice(self, tip, text, metadata):
+             rows.append(text)
++            return True
+ 
+     @contextlib.contextmanager
+     def session_db(chat_id):
+@@ -523,12 +508,69 @@ def test_spent_wake_budget_still_wakes_the_orchestrator_for_an_ask(kanban_home,
+         wakes.append(text)
+         return "started"
+ 
+-    ku.sweep_once(set(), grace_s=0, now=now, session_db=session_db, wake=wake, holders=list,
+-                  spawn=lambda job: job())
++    if busy_slots:
++        taken = 0
++        while ku._wake_slots.acquire(blocking=False):
++            taken += 1
++    try:
++        ku.sweep_once(set(), grace_s=0, now=now, session_db=session_db, wake=wake, holders=list,
++                      spawn=lambda job: job())
++    finally:
++        if busy_slots:
++            for _ in range(taken):
++                ku._wake_slots.release()
++    return wakes, rows
++
++
++def _parked_ask(monkeypatch):
++    chat = _session()
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _subscribe(conn, tid, chat)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": LIVE_REASON, "clock_only": True, "awaiting": LIVE_AWAITING})
++        assert kb.get_task(conn, tid).status == "scheduled", out
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
++    return chat, tid
++
++
++@pytest.mark.parametrize("busy_slots", [False, True])
++def test_an_ask_that_cannot_wake_now_is_retried_never_written_passively(kanban_home, monkeypatch,
++                                                                       busy_slots) -> None:
++    """Adversarial review of #3647: with the chat's hourly wake budget spent (or every wake slot busy), the sweeper
++    wrote the ask as a passive row and acked it; no turn read it and the card stayed parked."""
++    from tui_gateway import kanban_unloaded as ku
++    chat, _tid = _parked_ask(monkeypatch)
++    now = time.time() + 10
++    ku._reset_wake_budget_for_tests()
++    if not busy_slots:
++        for i in range(ku.WAKES_PER_HOUR):  # the orchestrator's other cards woke it this hour
++            ku._charge_wake(chat, now - 60 * (i + 1))
++    wakes, rows = _sweep(chat, now, busy_slots=busy_slots)
++    assert not wakes and not rows  # handed back, not written passively
++    later = now + (60 if busy_slots else 3600)  # a slot frees / the budget's hour slides
++    wakes, rows = _sweep(chat, later)
+     assert len(wakes) == 1 and "parked until you decide" in wakes[0] and not rows, (wakes, rows)
+     ku._reset_wake_budget_for_tests()
+ 
+ 
++def test_an_ask_undelivered_for_two_hours_goes_to_david(kanban_home, monkeypatch) -> None:
++    from tui_gateway import kanban_unloaded as ku
++    chat, tid = _parked_ask(monkeypatch)
++    now = time.time() + ku.ASK_OVERDUE_S + 60
++    ku._reset_wake_budget_for_tests()
++    for i in range(ku.WAKES_PER_HOUR):
++        ku._charge_wake(chat, now - 60 * (i + 1))
++    _sweep(chat, now)
++    with kbc.connect_closing() as conn:
++        task = kb.get_task(conn, tid)
++        assert task.status == "blocked", task.status
++        request = json.loads(task.human_request) if isinstance(task.human_request, str) else task.human_request
++        assert "premise A/B/C" in request["action"] or "Owning orchestrator" in request["action"], request
++    ku._reset_wake_budget_for_tests()
++
++
+ def test_reworded_chat_reask_still_escalates(kanban_home, monkeypatch) -> None:
+     """Adversarial review of #3647: the premise hashed the question, so a reworded re-ask never escalated."""
+     monkeypatch.setattr(kaw, "_supervisor_profile", lambda task: None)
+@@ -564,12 +606,19 @@ def test_declared_chat_wait_needs_no_probe_or_clock_flag(kanban_home, monkeypatc
+         assert "wait-comment" in kwc.get_state(conn, tid)["cmd"]
+ 
+ 
+-def test_budget_exemption_is_once_per_card_per_hour() -> None:
+-    from tui_gateway import kanban_unloaded as ku
+-    ku._reset_wake_budget_for_tests()
+-    ident = {"task_id": "t_0000aaaa"}
+-    assert ku._ask_exempt_ok("chat-1", ident, 1000.0)
+-    assert not ku._ask_exempt_ok("chat-1", ident, 1000.0 + 600)
+-    assert ku._ask_exempt_ok("chat-1", {"task_id": "t_0000bbbb"}, 1000.0 + 600)  # another card's question
+-    assert ku._ask_exempt_ok("chat-1", ident, 1000.0 + ku.ASK_EXEMPT_S)
+-    ku._reset_wake_budget_for_tests()
++def test_separately_answered_questions_do_not_escalate(kanban_home, monkeypatch) -> None:
++    """Review of #3647: with one premise per orchestrator, three questions each answered escalated on the third."""
++    monkeypatch.setattr(kaw, "_supervisor_profile", lambda task: None)
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _subscribe(conn, tid)
++        for n in range(3):
++            _as_worker(monkeypatch, conn, tid)
++            out = _tool("schedule", {"reason": f"waiting for the owning orchestrator decision {n}", "clock_only": True,
++                                     "awaiting": {"kind": "chat", "ref": "owning orchestrator", "why": f"question {n}?"}})
++            assert out.get("status") == "scheduled", (n, out)
++            kb.add_comment(conn, tid, "default", f"Answer {n}: go with A.")
++            assert kb.unblock_task(conn, tid)
++            with kb.write_txn(conn):
++                conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++            assert kb.claim_task(conn, tid, claimer="worker") is not None
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index 002c7e53bf5983237e08071be571f1265a37d193..1892277232e5514d691a8f4bcf19516f3dc74fde 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -76,8 +76,11 @@ _sweeper_started = False
+ _sweeper_lock = threading.Lock()
+ _wake_lock = threading.Lock()
+ _wake_times: dict[str, list[float]] = {}  # chat -> recent started wakes (this process)
+-_ask_exempt: dict[tuple[str, str], float] = {}  # (chat, card) -> last budget-exempt ask wake (this process)
+-ASK_EXEMPT_S = 3600.0
++# [daveey] A worker's question to its orchestrator (``decision_requested``) is never written as a passive row: one
++# that cannot wake its chat now (budget spent, slots busy) is handed back and retried, the budget still pacing
++# wakes; one still undelivered after ASK_OVERDUE_S goes to David as a visible needs_input block
++# (kanban_decision_ask.escalate). Adversarial review of #3647.
++ASK_OVERDUE_S = 2 * 3600.0
+ _wake_slots = wake_slots.WakeSlots(MAX_PARALLEL_WAKES)
+ _slot_waits: dict[tuple, float] = {}  # remote notice -> when slots first refused it (this process)
+ 
+@@ -93,7 +96,6 @@ _overdue_warned: set[tuple[str, str, str]] = set()
+ def _reset_wake_budget_for_tests() -> None:
+     with _wake_lock:
+         _wake_times.clear()
+-        _ask_exempt.clear()
+ 
+ 
+ def _reset_overdue_for_tests() -> None:
+@@ -465,11 +467,20 @@ def _deliver_sub(conn, slug, sub, ident, grace_s, now, session_db, _kb, _kbn, ki
+                 "task_id": ident["task_id"], "event_ids": [int(e.id) for e in claimed],
+                 # event-id identity shared with the live poller: a notice it already wrote is not written twice
+                 "kanban_event_keys": [f"{slug}:{int(e.id)}" for e in claimed if fmt(sub, task, e, slug)]}
+-    # [daveey] A worker's question to its orchestrator is not budgeted: a passive row nobody reads leaves the card
+-    # parked until its deadline (adversarial review of #3647). It cannot chain: each ask is a new park, and an
+-    # identical re-park escalates at kanban_awaiting.REPARK_LIMIT.
+-    asks = any(getattr(e, "kind", "") == "decision_requested" for e in claimed) and _ask_exempt_ok(tip, ident, now)
+-    held_by, verdict = _route_notice(holders, ident, tip, slug, task, texts, now, grace_s, exempt_budget=asks)
++    held_by, verdict = _route_notice(holders, ident, tip, slug, task, texts, now, grace_s)
++    asks = [e for e in claimed if getattr(e, "kind", "") == "decision_requested"]
++    if asks and verdict in ("skipped:budget", "skipped:slots"):
++        if _ask_waits(asks, now):
++            with contextlib.suppress(Exception):
++                _kbn.rewind_notify_cursor(conn, claimed_cursor=new, old_cursor=old, **ident)
++            if _note_stall(_stall_key(slug, ident), f"orchestrator ask waiting for a wake ({verdict})"):
++                logger.info("kanban ask for %s/%s to chat %s deferred (%s); retrying next pass",
++                            slug, ident["task_id"], tip, verdict)
++            return None
++        from hermes_cli import kanban_decision_ask
++        with contextlib.suppress(Exception):
++            kanban_decision_ask.escalate(conn, ident["task_id"], f"its orchestrator chat {tip} could not be woken "
++                                         f"for {ASK_OVERDUE_S / 3600:.0f} h ({verdict})")
+     if verdict == "skipped:slots" and _slots_may_wait(claimed, now):
+         # Every wake slot is busy: hand the range back so the next pass wakes the chat, instead of a passive row
+         # that no turn reads (design t_01a1d45d75851804 R4). An OVERDUE_S-old notice gets its row as before.
+@@ -503,6 +514,15 @@ def _deliver_sub(conn, slug, sub, ident, grace_s, now, session_db, _kb, _kbn, ki
+             "texts": texts, "woken": verdict == "started", "wake_result": verdict, "held_by": held_by}
+ 
+ 
++def _ask_waits(asks: list, now: float) -> bool:
++    """An undelivered orchestrator ask waits for a wake until its oldest event is ``ASK_OVERDUE_S`` old."""
++    try:
++        oldest = min(float(getattr(e, "created_at", 0) or 0) for e in asks)
++    except ValueError:
++        return False
++    return now - oldest < ASK_OVERDUE_S
++
++
+ def _slots_may_wait(events: list, now: float) -> bool:
+     """A notice refused a wake slot waits for the next pass unless its oldest event is ``OVERDUE_S`` old."""
+     try:
+@@ -539,20 +559,7 @@ def _undelivered(db, tip, slug, claimed: list) -> list:
+     return [e for e in claimed if f"{slug}:{int(e.id)}" not in done]
+ 
+ 
+-def _ask_exempt_ok(tip: str, ident: dict, now: float) -> bool:
+-    """One budget-exempt ask wake per chat and card per ``ASK_EXEMPT_S``: an orchestrator answering "not yet" and a
+-    re-park must not wake it without bound (the re-park also escalates at REPARK_LIMIT). Charged here."""
+-    key = (tip, str(ident.get("task_id") or ""))
+-    with _wake_lock:
+-        last = _ask_exempt.get(key)
+-        if last is not None and now - last < ASK_EXEMPT_S:
+-            return False
+-        _ask_exempt[key] = now
+-        return True
+-
+-
+-def _route_notice(holders, ident, tip, slug, task, texts, now, grace_s,
+-                  exempt_budget: bool = False) -> tuple[Optional[str], Optional[str]]:
++def _route_notice(holders, ident, tip, slug, task, texts, now, grace_s) -> tuple[Optional[str], Optional[str]]:
+     """``(held_by, verdict)``: verdict None means a wake slot was taken and the caller must spawn the wake; any other
+     verdict says why the row is written now. Never raises: the events are already claimed."""
+     held_by = None
+@@ -561,8 +568,7 @@ def _route_notice(holders, ident, tip, slug, task, texts, now, grace_s,
+         if held_by:
+             logger.warning("kanban poller miss: chat %s is held by %s but its poller did not claim %s/%s within "
+                            "%.0fs; the sweeper is delivering it", tip, held_by, slug, ident["task_id"], grace_s)
+-        skip = _wake_skip_reason(task, texts) or (
+-            None if exempt_budget or _has_wake_budget(tip, now) else "skipped:budget")
++        skip = _wake_skip_reason(task, texts) or (None if _has_wake_budget(tip, now) else "skipped:budget")
+     except Exception:
+         logger.warning("kanban sweep routing for %s failed; writing the notice row", tip, exc_info=True)
+         return held_by, "error"
+-- 
+2.43.0
+

@@ -1,0 +1,251 @@
+From 562deca3450ff2a7675efe4e3bc69d11a06e4ef0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 21:26:25 +0000
+Subject: [PATCH] fix(kanban): permit exactly attested SSH pool requirements
+ [daveey]
+
+Why: scoped pickup recovery could not move a card requiring ssh:mini off a
+shutdown-held worker even though another worker carried the operator label.
+Core deliberately excluded SSH because Board selection lacked its mapping.
+Board PR148 is now merged/deployed at 7ddd9fd5710061d69d558722e5044df7d755ea42;
+live isolated reserve probes recognize mini/mbp and reject ssh:other.
+
+Enable only ssh:mini and ssh:mbp in the existing core Board allowlist.
+Preserve per-host operator attestation, freshness/hold/claim fences and task
+requirements through the real scoped alarm move. Remove test monkeypatching
+that concealed the production contract. Document access revocation and the
+difference between structural queue admission and execution eligibility.
+
+Proof:
+- Canonical runner: 20 consumer/docs files, 1118 passed, 0 failed.
+- Removing either SSH entry: three targeted failures per mutant, including
+  the corresponding real alarm move; source restored after each.
+- Read-only hub allowlist-delta replay: 29840 rows, 70 changed replicas of
+  51 distinct tasks, all explicitly declaring mini/mbp (includes history
+  and archived fixtures). This is contract replay, not claim eligibility.
+- Board live probe fixtures archived and read back; worker-2 hold retained.
+- No requirement edits, worker restarts, CI implementation edits or spend.
+---
+ hermes_cli/kanban_pickup_stall_repin.py       |  6 +--
+ hermes_cli/kanban_placement_coordination.py   |  4 +-
+ .../test_kanban_coordination_placement.py     | 30 +++++++++++---
+ .../hermes_cli/test_kanban_declared_access.py |  7 ----
+ .../test_kanban_pickup_stall_repin.py         | 41 ++++++++++++++++---
+ .../features/kanban-worker-lanes.md           | 17 ++++++++
+ 6 files changed, 83 insertions(+), 22 deletions(-)
+
+diff --git a/hermes_cli/kanban_pickup_stall_repin.py b/hermes_cli/kanban_pickup_stall_repin.py
+index 55d5252c62645b54cb9464cfdf6bea9f6f959c0c..898e58411c0cccbf5a77978c7b10a4d430c9d48d 100644
+--- a/hermes_cli/kanban_pickup_stall_repin.py
++++ b/hermes_cli/kanban_pickup_stall_repin.py
+@@ -210,9 +210,9 @@ def scope_refusal(conn: sqlite3.Connection, alarm: Any, target: Any, runs_on: An
+     except ValueError as exc:
+         return str(exc)
+     if labels == [pool_label()]:
+-        # A worker may attest ssh access, but the Board's pool selection cannot place it, nor a requires or skills it
+-        # cannot read (not a JSON list of strings): the card would sit in task_requirement_unsupported or
+-        # task_metadata_invalid instead of leaving the stalled machine. A pool worker must also carry skill:<s>.
++        # Declared access must have Board selection support; malformed requires/skills also cannot be placed.
++        # Otherwise the card sits in task_requirement_unsupported or task_metadata_invalid instead of leaving
++        # the stalled machine. A pool worker must also carry skill:<s>.
+         from hermes_cli.kanban_placement_coordination import board_refusal
+         if why := malformed_requires(target) or malformed_skills(target) or board_refusal(_requires(target)):
+             return f"{target['id']} cannot go to {pool_label()}: {why}"
+diff --git a/hermes_cli/kanban_placement_coordination.py b/hermes_cli/kanban_placement_coordination.py
+index e0249b6bf03ece1123da6a5bd4579e7206ec77bf..507ab7fcb173a6870b61d5e180ece424dab78a88 100644
+--- a/hermes_cli/kanban_placement_coordination.py
++++ b/hermes_cli/kanban_placement_coordination.py
+@@ -75,8 +75,8 @@ ACCESS_LABELS = {"ssh:mbp": "capability:ssh-mbp", "ssh:mini": "capability:ssh-mi
+ # Declared access must mirror the Board's worker/src/worker_placement.ts supportedRequirement
+ # and requirementLabel contract. Deploy Board support before extending this set: otherwise
+ # enrolled cards queue forever with task_requirement_unsupported despite attested access.
+-# SSH requirements remain unsupported; read and write each require their own attestation.
+-BOARD_PLACEABLE_ACCESS: frozenset = frozenset({"hub:read", "hub:write"})
++# Each host's SSH access and hub read/write require their own operator attestation.
++BOARD_PLACEABLE_ACCESS: frozenset = frozenset({"hub:read", "hub:write", "ssh:mini", "ssh:mbp"})
+ BOARD_REASON = "declared access the Board cannot place"
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_coordination_placement.py b/tests/hermes_cli/test_kanban_coordination_placement.py
+index 0fc016f6d1b608f37df2d40f1ea3d5f3bf3d26f7..9afefb096457cd52f6473ba8355d33a34e49c776 100644
+--- a/tests/hermes_cli/test_kanban_coordination_placement.py
++++ b/tests/hermes_cli/test_kanban_coordination_placement.py
+@@ -22,8 +22,7 @@ def fleet(monkeypatch):
+ 
+ @pytest.fixture
+ def board_maps_access(monkeypatch):
+-    """The Board after it maps declared access (ssh:mbp/ssh:mini/hub:read) to pool labels; until then core keeps
+-    those cards home (``BOARD_PLACEABLE_ACCESS`` is empty), so the attestation logic below is dormant."""
++    """Explicit full Board support for tests of the independent attestation fences."""
+     from hermes_cli import kanban_placement_coordination as coord
+     monkeypatch.setattr(coord, "BOARD_PLACEABLE_ACCESS", frozenset(coord.ACCESS_LABELS))
+ 
+@@ -458,6 +457,7 @@ def test_declared_access_stays_home_until_the_board_maps_it(fleet, monkeypatch,
+     """Every eligible member attests every label, yet the Board would leave an enrolled card queued
+     (``task_requirement_unsupported``): keep it home-only, where it at least runs."""
+     from hermes_cli import kanban_placement_coordination as coord
++    monkeypatch.setattr(coord, "BOARD_PLACEABLE_ACCESS", frozenset({"hub:read", "hub:write"}))
+     cfg, entry, machines = fleet
+     cfg["carried_requires"] = ["terminal"]
+     cfg["worker_pools"]["hub"] = ["held", "worker"]
+@@ -474,8 +474,9 @@ def test_declared_access_stays_home_until_the_board_maps_it(fleet, monkeypatch,
+     assert coord.stranded(card, cfg, coord.REASON) == ["worker"]
+ 
+ 
+-@pytest.mark.parametrize("requires", [["hub:read"], ["hub:write"], ["terminal", "file", "hub:read", "hub:write"]])
+-def test_declared_hub_access_is_board_placeable(fleet, requires):
++@pytest.mark.parametrize("requires", [["ssh:mini"], ["ssh:mbp"], ["hub:read"], ["hub:write"],
++                                      ["terminal", "file", "hub:read", "hub:write", "ssh:mini", "ssh:mbp"]])
++def test_declared_access_is_board_placeable(fleet, requires):
+     """Use the real supported-access set, not the broader hypothetical Board fixture."""
+     from hermes_cli import kanban_placement_coordination as coord
+     cfg, entry, machines = fleet
+@@ -484,7 +485,7 @@ def test_declared_hub_access_is_board_placeable(fleet, requires):
+     machines["held"] = {**entry, "labels": [], "hold": True}
+     assert coord.board_refusal(requires) is None
+     labels = coord.access_requirements(requires)
+-    assert labels == {"capability:" + r.replace(":", "-") for r in requires if r.startswith("hub:")}
++    assert labels == {"capability:" + r.replace(":", "-") for r in requires if r.startswith(("hub:", "ssh:"))}
+     entry["labels"] += list(labels)
+     assert reason("read the log", cfg, requires) is None
+     card = {"placement_policy": "worker-first-v1", "title": "Read the log", "body": "read the log",
+@@ -498,6 +499,25 @@ def test_declared_hub_access_is_board_placeable(fleet, requires):
+     assert coord.attested(["held", "worker"], labels) is True
+ 
+ 
++def test_board_access_allowlist_is_exact():
++    from hermes_cli import kanban_placement_coordination as coord
++    assert coord.BOARD_PLACEABLE_ACCESS == {"hub:read", "hub:write", "ssh:mini", "ssh:mbp"}
++
++
++@pytest.mark.parametrize("access", ["ssh:mini", "ssh:mbp"])
++@pytest.mark.parametrize("field,value", [("last_seen", 0), ("hold", True), ("labels", [])])
++def test_ssh_claim_refuses_expired_held_or_revoked_attestation(fleet, access, field, value):
++    from hermes_cli import kanban_placement_coordination as coord
++    cfg, entry, _ = fleet
++    entry["labels"] += ACCESS
++    card = {"placement_policy": "worker-first-v1", "title": "Read evidence", "requires": [access]}
++    assert reason("read evidence", cfg, [access]) is None
++    assert coord.claim_refusal(card, "worker") is None
++    entry[field] = value
++    assert reason("read evidence", cfg, [access]) == coord.REASON
++    assert coord.claim_refusal(card, "worker") == coord.REASON
++
++
+ @pytest.mark.parametrize("text", [
+     "Read it with `hub-admin 'hermes-hub outcomes --id t_x-v1'`",
+     'hub-admin "hermes-hub requests --json"',
+diff --git a/tests/hermes_cli/test_kanban_declared_access.py b/tests/hermes_cli/test_kanban_declared_access.py
+index 9cacb0663ac4e591425ecffc69d9ea7c9ae97023..de75e0fc2d7ed91e1c7dde24059e4b2d04194064 100644
+--- a/tests/hermes_cli/test_kanban_declared_access.py
++++ b/tests/hermes_cli/test_kanban_declared_access.py
+@@ -18,13 +18,6 @@ __all__ = ["conn"]
+ fleet = helpers.fleet
+ 
+ 
+-@pytest.fixture(autouse=True)
+-def _board_maps_access(monkeypatch):
+-    """These contracts only matter once the Board places declared access (core keeps it home until then)."""
+-    from hermes_cli import kanban_placement_coordination as coordination
+-    monkeypatch.setattr(coordination, "BOARD_PLACEABLE_ACCESS", frozenset(coordination.ACCESS_LABELS))
+-
+-
+ def card(body, requires=()):
+     return {"title": "Check remote evidence", "body": body, "requires": list(requires)}
+ 
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall_repin.py b/tests/hermes_cli/test_kanban_pickup_stall_repin.py
+index 336438c0773712fe4d26a9d22bdee2bb12d54a37..6ad118ea55b1f922b854f028ce38ee0393d00dbb 100644
+--- a/tests/hermes_cli/test_kanban_pickup_stall_repin.py
++++ b/tests/hermes_cli/test_kanban_pickup_stall_repin.py
+@@ -273,17 +273,20 @@ def test_declared_hub_write_needs_the_hyphenated_label_a_worker_attests(board):
+ 
+ 
+ @pytest.mark.parametrize("access", ["ssh:mbp", "ssh:mini"])
+-def test_declared_ssh_access_refuses_the_pool_queue_with_the_board_reason(board, access):
+-    """t_01a1d2b4b091e158: workers attest ``capability:ssh-mbp``/``ssh-mini``, but the Board's pool selection cannot
+-    place ssh access, so a pool move would leave the card in task_requirement_unsupported."""
++def test_declared_ssh_access_uses_the_attested_pool_queue(board, access):
++    """The deployed Board maps these exact requirements; do not discard access to move a card."""
+     from hermes_cli import kanban_placement_coordination as coord
+     board.set(board.target, requires=json.dumps([access]))
+     label = coord.requirement_label(access)
+     machines = _pooled(worker_2={"labels": [*_worker(X)["labels"], POOL, label]})
+     assert rp.pool_refusal(M, machines, rp._need(board.conn.execute(
+         "SELECT * FROM tasks WHERE id = ?", (board.target,)).fetchone()), NOW) is None  # a worker qualifies
+-    why = board.why(runs_on=[POOL], machines=machines)
+-    assert why is not None and coord.BOARD_REASON in why, why
++    assert board.why(runs_on=[POOL], machines=machines) is None
++    assert label in board.why(runs_on=[POOL], machines=_pooled())
++    # Pool admission is structural: it may queue while stale, but claim-time freshness still refuses execution.
++    assert board.why(runs_on=[POOL], machines=_pooled(worker_2={
++        **machines[X], "last_seen": NOW - 301_000})) is None
++    assert board.why(runs_on=[POOL], machines=_pooled(worker_2={**machines[X], "hold": True})) is not None
+ 
+ 
+ @pytest.mark.parametrize("stored", ['{"a":1}', '"ssh:mbp"', '["terminal", 3]', "null", "not json"])
+@@ -478,6 +481,34 @@ def test_the_alarms_run_re_places_a_listed_card_onto_the_pool_queue(held, monkey
+     assert kb.get_task(hub.conn, alarm).status == "running"
+ 
+ 
++@pytest.mark.parametrize("access", ["ssh:mini", "ssh:mbp"])
++def test_the_alarm_tool_moves_attested_ssh_without_dropping_access(held, monkeypatch, access):
++    hub, _worker_gw, alarm, (a, _b), _unlisted = held
++    required = ["terminal", "git", access]
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET requires = ? WHERE id = ?", (json.dumps(required), a))
++    pooled = {**support.MACHINES[X], "labels": [*support.MACHINES[X]["labels"], POOL,
++                                               "capability:terminal", "capability:git"]}
++    monkeypatch.setitem(support.MACHINES, X, pooled)
++    hub.enter()
++    out = _move(a, [POOL])
++    assert out.get("ok") is not True, out
++    assert place._pin(hub.conn, a) == [f"machine:{M}"]
++    label = "capability:" + access.replace(":", "-")
++    monkeypatch.setitem(support.MACHINES, X, {**pooled, "labels": [*pooled["labels"], label]})
++    hub.enter()
++    out = _move(a, [POOL])
++    assert out.get("ok") is True, out
++    assert place._pin(hub.conn, a) == [POOL]
++    stored = hub.conn.execute("SELECT requires FROM tasks WHERE id = ?", (a,)).fetchone()[0]
++    assert json.loads(stored) == required
++    [moved] = [json.loads(e[0]) for e in hub.conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'moved'", (a,))]
++    assert moved["pickup_stall_alarm"] == alarm and moved["stalled_machine"] == M
++    assert support.MACHINES[M]["hold"] is True
++    assert kb.get_task(hub.conn, alarm).status == "running"
++
++
+ def test_the_alarms_run_may_not_move_an_unlisted_card_or_back_onto_the_stalled_machine(held):
+     hub, _worker_gw, _alarm, (a, _b), unlisted = held
+     out = _move(unlisted, [f"machine:{X}"])
+diff --git a/website/docs/user-guide/features/kanban-worker-lanes.md b/website/docs/user-guide/features/kanban-worker-lanes.md
+index cf1873dbbc6176133ff8cb9b498ae000ece9e404..51470fce5dde7c0790045d4f7b086f40100f989f 100644
+--- a/website/docs/user-guide/features/kanban-worker-lanes.md
++++ b/website/docs/user-guide/features/kanban-worker-lanes.md
+@@ -48,6 +48,23 @@ structured `metadata.hermes.requires_toolsets` / `requires_tools` (the fields th
+ its visibility) do count: `terminal`, `file` and `kanban` toolsets, or a tool those toolsets own,
+ are added to the card's requirements, even to an explicit `[]`.
+ 
++#### Attested SSH access on the worker pool (fork)
++
++The Board and core support exactly `ssh:mini` and `ssh:mbp`, mapped respectively to
++operator-owned `capability:ssh-mini` and `capability:ssh-mbp` registry labels. Deploy
++Board support before enabling these declarations in core. Other SSH spellings are not
++supported by Board pool selection. Preserve the exact `requires` list during a pool move;
++removing access requirements is not an assignment repair.
++
++These labels attest that access was granted, not that an SSH connection currently works.
++They do not install credentials or grant new permissions. On revocation or broken access,
++remove the corresponding operator registry label; selection and claim recheck it. Existing
++registry/heartbeat and metrics freshness checks remain mandatory for execution. Labels
++have no separate credential-expiry timestamp, and the registry read and claim transaction
++are not atomic with a concurrent label removal. A scoped pickup alarm may queue a listed
++card away from a held worker without lifting that hold; structural queue admission is not
++proof that a fresh, eligible worker has claimed it.
++
+ #### Declaring requirements (`kanban.require_capability_declaration`)
+ 
+ With `kanban.require_capability_declaration: true` (fork setting; default `false`; read from the
+-- 
+2.43.0
+

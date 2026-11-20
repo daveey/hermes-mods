@@ -1,0 +1,657 @@
+From b6810bb168aae55db182774e5c0d8e2cb05caa8d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 15:20:26 -0800
+Subject: [PATCH] [daveey] desktop: the retry card needs the store's word that
+ a turn left no reply
+
+On 2026-11-17 a hub chat turn completed with a stored 623-char reply and Desktop
+painted "Hermes ended this turn without a reply" with a Retry that would have run
+the prompt twice. recoverEndedLiveTurn stamped that notice from the local
+transcript whenever its stored-transcript read did not apply:
+hydrateStoredSessionTranscript returns silently when the read is superseded, held
+behind a replay, or fails three times, and the caller could not tell.
+
+- hydrateStoredSessionTranscript resolves true only when a stored page was applied.
+- recoverEndedLiveTurn re-reads the store (2 s, 8 s, 20 s) while no read has
+  applied; only after the last one does the local transcript decide. Each
+  recovery logs one [silent-turn] line with the store read's outcome.
+- disproveNoReplyNotice: the turn's own stream output, or a liveness poll that
+  lists it working, takes a wrong stamp back and drops the pending re-read.
+
+Which of the two readings happened on 2026-11-17 (ended verdict during the 95 s
+throttle hold, or a true end whose store read was dropped) is not established:
+Desktop logged nothing then. The [silent-turn] lines now record it.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .../contrib/hooks/live-status-reap.test.ts    |  24 ++++
+ .../contrib/hooks/use-background-sync.test.ts |  25 +++-
+ .../app/contrib/hooks/use-background-sync.ts  |  26 ++--
+ .../hooks/no-reply-notice-disproved.test.tsx  | 111 +++++++++++++++++
+ .../use-message-stream/gateway-event/index.ts |  20 ++-
+ apps/desktop/src/store/session-states.ts      | 114 ++++++++++++++++--
+ .../src/store/session-watchdog.test.ts        | 114 ++++++++++++++++++
+ 7 files changed, 411 insertions(+), 23 deletions(-)
+ create mode 100644 apps/desktop/src/app/session/hooks/no-reply-notice-disproved.test.tsx
+
+diff --git a/apps/desktop/src/app/contrib/hooks/live-status-reap.test.ts b/apps/desktop/src/app/contrib/hooks/live-status-reap.test.ts
+index da7b496e3fcbd0e67375374c59499f6a0e17e745..94a65fd809d249c982a0b8c56da95847b731816b 100644
+--- a/apps/desktop/src/app/contrib/hooks/live-status-reap.test.ts
++++ b/apps/desktop/src/app/contrib/hooks/live-status-reap.test.ts
+@@ -1,6 +1,8 @@
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ import { buildToolView } from '@/components/assistant-ui/tool/fallback-model'
++import { textPart } from '@/lib/chat-messages'
++import { NO_REPLY_ERROR } from '@/lib/chat-messages/no-reply'
+ import { createClientSessionState } from '@/lib/chat-runtime'
+ import { $activeSessionId, $selectedStoredSessionId, $unreadFinishedSessionIds } from '@/store/session'
+ import {
+@@ -51,6 +53,28 @@ describe('rehydrateLiveSessionStatuses — reaping vanished runtimes', () => {
+     expect($workingSessionIds.get()).toEqual([])
+   })
+ 
++  it('takes back a "no reply" stamp when the snapshot lists that turn as working', () => {
++    publishSessionState('runtime-live', {
++      ...createClientSessionState('stored-live'),
++      messages: [
++        { id: 'u1', parts: [textPart('resume')], role: 'user' },
++        {
++          error: NO_REPLY_ERROR,
++          errorSurface: { code: 'no_reply', layer: 'runtime', retryable: true },
++          id: 'a1',
++          parts: [],
++          role: 'assistant'
++        }
++      ]
++    })
++
++    rehydrateLiveSessionStatuses({
++      sessions: [{ id: 'runtime-live', session_key: 'stored-live', status: 'working' }]
++    })
++
++    expect($sessionStates.get()['runtime-live']?.messages.map(message => message.id)).toEqual(['u1'])
++  })
++
+   it('fires the unread "your turn" marker for a vanished background session', () => {
+     rehydrateLiveSessionStatuses({
+       sessions: [{ id: 'runtime-b', session_key: 'stored-b', status: 'working' }]
+diff --git a/apps/desktop/src/app/contrib/hooks/use-background-sync.test.ts b/apps/desktop/src/app/contrib/hooks/use-background-sync.test.ts
+index 4b7adce16040d317a6f8045715242d92f89b95e9..ac3fceb75f1a4844090a39d4f876ddd495795889 100644
+--- a/apps/desktop/src/app/contrib/hooks/use-background-sync.test.ts
++++ b/apps/desktop/src/app/contrib/hooks/use-background-sync.test.ts
+@@ -1542,7 +1542,8 @@ describe('an empty persisted page over a populated runtime', () => {
+     })
+ 
+     await vi.advanceTimersByTimeAsync(250)
+-    await hydrated
++    // Applied: the caller may trust what the transcript now shows.
++    expect(await hydrated).toBe(true)
+ 
+     expect(fixture.updateSessionState).toHaveBeenCalledTimes(1)
+     expect(
+@@ -1551,4 +1552,26 @@ describe('an empty persisted page over a populated runtime', () => {
+         ?.messages.flatMap(message => message.parts.map(part => ('text' in part ? part.text : '')))
+     ).toContain('a newer answer')
+   })
++
++  it('post-turn hydrate: reports a read that never applied, so no one treats the turn as replyless', async () => {
++    vi.useFakeTimers()
++    const fixture = makeRefresh()
++
++    fixture.state.messages = populated()
++    publishSessionState(ACTIVE_RUNTIME_ID, fixture.state)
++    vi.mocked(getLatestSessionMessages).mockRejectedValue(new Error('store unreachable'))
++
++    const hydrated = hydrateStoredSessionTranscript({
++      attempts: 2,
++      storedSessionId: ACTIVE_STORED_ID,
++      runtimeSessionId: ACTIVE_RUNTIME_ID,
++      storedProfile: 'default',
++      updateSessionState: fixture.updateSessionState
++    })
++
++    await vi.advanceTimersByTimeAsync(250)
++
++    expect(await hydrated).toBe(false)
++    expect(fixture.updateSessionState).not.toHaveBeenCalled()
++  })
+ })
+diff --git a/apps/desktop/src/app/contrib/hooks/use-background-sync.ts b/apps/desktop/src/app/contrib/hooks/use-background-sync.ts
+index 1842be8e34f55e05005807e6e9d2f1c1c6a91d4f..528465d5f9ca5f24dcb579c4fc1e44907f992f71 100644
+--- a/apps/desktop/src/app/contrib/hooks/use-background-sync.ts
++++ b/apps/desktop/src/app/contrib/hooks/use-background-sync.ts
+@@ -51,6 +51,7 @@ import {
+   $sessionStates,
+   $sessionTiles,
+   confirmReconnectSettlesExcept,
++  disproveNoReplyNotice,
+   noteSessionEvent,
+   publishSessionState,
+   SESSION_WATCHDOG_TIMEOUT_MS,
+@@ -446,7 +447,9 @@ export async function reconcileTileTranscripts({
+   }
+ }
+ 
+-/** Best-effort post-turn fallback when the live stream did not carry an answer. */
++/** Best-effort post-turn fallback when the live stream did not carry an answer.
++ *  Resolves true only when a stored page was read and applied: a superseded,
++ *  held or failed read says nothing about whether the turn has a reply. */
+ export async function hydrateStoredSessionTranscript({
+   attempts,
+   storedSessionId,
+@@ -459,11 +462,11 @@ export async function hydrateStoredSessionTranscript({
+   runtimeSessionId: string
+   storedProfile: ProfileScope
+   updateSessionState: ActiveTranscriptRefreshDeps['updateSessionState']
+-}): Promise<void> {
++}): Promise<boolean> {
+   const replay = pendingSessionReplay(runtimeSessionId)
+ 
+   if (replay && !(await replay)) {
+-    return
++    return false
+   }
+ 
+   const messagesAtRequest = $sessionStates.get()[runtimeSessionId]?.messages
+@@ -478,7 +481,7 @@ export async function hydrateStoredSessionTranscript({
+     }
+ 
+     if (superseded()) {
+-      return
++      return false
+     }
+ 
+     try {
+@@ -486,13 +489,13 @@ export async function hydrateStoredSessionTranscript({
+       const replayAtReturn = pendingSessionReplay(runtimeSessionId)
+ 
+       if (replayAtReturn && !(await replayAtReturn)) {
+-        return
++        return false
+       }
+ 
+       // This fallback belongs to the completed turn, not any subsequent turn
+       // that ran during the read or retry delay. Its todo restore is stale too.
+       if (superseded()) {
+-        return
++        return false
+       }
+ 
+       // A zero-row page over the populated turn is a transient read, not the
+@@ -508,7 +511,7 @@ export async function hydrateStoredSessionTranscript({
+       )
+ 
+       if (superseded()) {
+-        return
++        return false
+       }
+ 
+       updateSessionState(
+@@ -553,11 +556,13 @@ export async function hydrateStoredSessionTranscript({
+         clearActiveSessionTodos(runtimeSessionId)
+       }
+ 
+-      return
++      return true
+     } catch {
+       // Best-effort fallback when live stream payloads are empty.
+     }
+   }
++
++  return false
+ }
+ 
+ /** Reconcile one persisted transcript snapshot into the currently viewed session. */
+@@ -875,6 +880,11 @@ export function rehydrateLiveSessionStatuses(
+       // feeds the clock without claiming a spinner, since a lazy resume
+       // builds with no turn at all.
+       noteSessionEvent(runtimeSessionId)
++
++      if (working) {
++        // The backend lists the turn as running: a "no reply" stamp on it was wrong.
++        disproveNoReplyNotice(runtimeSessionId)
++      }
+     }
+ 
+     if (!working) {
+diff --git a/apps/desktop/src/app/session/hooks/no-reply-notice-disproved.test.tsx b/apps/desktop/src/app/session/hooks/no-reply-notice-disproved.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe2a22e370ba636b5bdff9832a98a238bd6d9f5c
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/no-reply-notice-disproved.test.tsx
+@@ -0,0 +1,111 @@
++import type { GatewayEvent } from '@hermes/shared'
++import { QueryClient } from '@tanstack/react-query'
++import { act, cleanup, renderHook } from '@testing-library/react'
++import { useRef } from 'react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { textPart } from '@/lib/chat-messages'
++import { NO_REPLY_ERROR } from '@/lib/chat-messages/no-reply'
++import { createClientSessionState } from '@/lib/chat-runtime'
++import { setActiveSessionId, setAwaitingResponse, setBusy, setMessages } from '@/store/session'
++import { $sessionStates, clearAllSessionStates, publishSessionState } from '@/store/session-states'
++
++import { useMessageStream } from './use-message-stream'
++import { useSessionStateCache } from './use-session-state-cache'
++
++// The silent-turn check stamped "Hermes ended this turn without a reply" on a
++// turn, and that turn then kept producing. Its own stream output is the proof
++// the stamp was wrong; a frame that is not turn output proves nothing.
++const runtimeId = 'stamped-runtime'
++const noop = async () => undefined
++
++function mount() {
++  return renderHook(() => {
++    const busyRef = useRef(false)
++    const queryClient = useRef(new QueryClient()).current
++
++    const cache = useSessionStateCache({
++      activeSessionId: null,
++      selectedStoredSessionId: null,
++      busyRef,
++      setMessages,
++      setBusy,
++      setAwaitingResponse
++    })
++
++    return useMessageStream({
++      ...cache,
++      queryClient,
++      hydrateFromStoredSession: noop,
++      refreshHermesConfig: noop,
++      refreshSessions: noop
++    })
++  })
++}
++
++function stamp() {
++  publishSessionState(runtimeId, {
++    ...createClientSessionState('stamped-stored'),
++    messages: [
++      { id: 'u1', parts: [textPart('resume')], role: 'user' },
++      {
++        error: NO_REPLY_ERROR,
++        errorSurface: { code: 'no_reply', layer: 'runtime', retryable: true },
++        id: 'a-notice',
++        parts: [],
++        role: 'assistant'
++      }
++    ]
++  })
++}
++
++const notice = () => $sessionStates.get()[runtimeId]?.messages.find(message => message.id === 'a-notice')
++
++describe('a no-reply notice on a turn that is still producing', () => {
++  beforeEach(() => {
++    vi.useFakeTimers()
++    clearAllSessionStates()
++    setActiveSessionId(null)
++    setMessages([])
++  })
++
++  afterEach(() => {
++    cleanup()
++    vi.runOnlyPendingTimers()
++    vi.useRealTimers()
++    clearAllSessionStates()
++  })
++
++  it('leaves when the turn emits stream output', () => {
++    const { result } = mount()
++
++    stamp()
++    expect(notice()?.error).toBe(NO_REPLY_ERROR)
++
++    act(() =>
++      result.current.handleGatewayEvent({
++        session_id: runtimeId,
++        type: 'reasoning.delta',
++        payload: { text: 'still thinking' }
++      } as GatewayEvent)
++    )
++
++    expect(notice()).toBeUndefined()
++  })
++
++  it('stays for a frame that is not turn output', () => {
++    const { result } = mount()
++
++    stamp()
++
++    act(() =>
++      result.current.handleGatewayEvent({
++        session_id: runtimeId,
++        type: 'session.info',
++        payload: {}
++      } as GatewayEvent)
++    )
++
++    expect(notice()?.error).toBe(NO_REPLY_ERROR)
++  })
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/index.ts b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/index.ts
+index fa477cebdc693f3f4cba6863c5e854edbfce37b2..cd03e0d4d695108877eb97fa4d160853b71738ef 100644
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/index.ts
+@@ -14,7 +14,7 @@ import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
+ import { replayPendingApproval } from '@/store/prompts'
+ import { setSessionProviderWait } from '@/store/provider-wait'
+ import { isSessionGone } from '@/store/session-gone-latch'
+-import { noteSessionEvent } from '@/store/session-states'
++import { disproveNoReplyNotice, noteSessionEvent } from '@/store/session-states'
+ import { setSessionDraftingTool } from '@/store/tool-drafting'
+ 
+ import { handleAdmittedMessageEvent } from './admitted-message'
+@@ -54,6 +54,20 @@ const DRAFT_SUPERSEDING_EVENT_TYPES = new Set([
+   'tool.start'
+ ])
+ 
++// The turn's own stream output: any of these after a "turn ended without a
++// reply" stamp proves that stamp wrong (store/session-states disproveNoReplyNotice).
++const TURN_OUTPUT_EVENT_TYPES = new Set([
++  'message.complete',
++  'message.delta',
++  'message.interim',
++  'message.start',
++  'reasoning.delta',
++  'thinking.delta',
++  'tool.complete',
++  'tool.generating',
++  'tool.start'
++])
++
+ const COMPACTION_RESUME_EVENT_TYPES = new Set([
+   'message.delta',
+   'message.interim',
+@@ -313,6 +327,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
+         // state — proves this session is still producing. Silence after the
+         // last one force-settles a dead turn, partial payload included.
+         if (sessionId) {
++          if (TURN_OUTPUT_EVENT_TYPES.has(event.type)) {
++            disproveNoReplyNotice(sessionId)
++          }
++
+           noteSessionEvent(sessionId)
+           retireTurnToolProgress(event.type, sessionId)
+         }
+diff --git a/apps/desktop/src/store/session-states.ts b/apps/desktop/src/store/session-states.ts
+index 9d4a910caba6bf579daa941a73a7e83865bb29b6..6e5a6bf97167d9916d9cbfdf113e3f5223501d12 100644
+--- a/apps/desktop/src/store/session-states.ts
++++ b/apps/desktop/src/store/session-states.ts
+@@ -34,7 +34,8 @@ import {
+ import { resolveRememberedActivePane, workspaceScopeKey } from '@/components/pane-shell/workspace-scope'
+ import type { WorkspaceMode } from '@/contrib/types'
+ import { dropBrowserProfilePrefs, migrateBrowserProfilePrefs } from '@/lib/browser-profile-prefs'
+-import { finalizeInterruptedMessages, sealOpenToolParts } from '@/lib/chat-messages'
++import { type ChatMessage, finalizeInterruptedMessages, sealOpenToolParts } from '@/lib/chat-messages'
++import { isNoReplyNotice } from '@/lib/chat-messages/no-reply'
+ import { tileFocusStampOnFocusChange } from '@/lib/session-timer-since'
+ import { stableArray } from '@/lib/stable-array'
+ import { type StopOrigin } from '@/lib/stop-origin'
+@@ -374,7 +375,9 @@ interface LiveTurnBackend {
+    *  owner, so this only answers for sessions it provably owns. */
+   request: AmbientGatewayRequest
+   /** Pull the stored transcript for an on-screen session whose turn the
+-   *  backend reported ended, so a reply that finished there shows up here. */
++   *  backend reported ended, so a reply that finished there shows up here.
++   *  Resolving `false` means no stored page was applied (read failed, held or
++   *  superseded): the store has not said whether the turn has a reply. */
+   refreshTranscript?: (runtimeId: string, storedSessionId: string) => Promise<unknown> | unknown
+ }
+ 
+@@ -542,21 +545,106 @@ function markTurnWithoutReply(runtimeId: string) {
+   )
+ }
+ 
++// Delays before re-reading the store for an ended turn whose first read did
++// not apply. After the last one the local transcript decides.
++export const ENDED_TURN_STORE_RETRY_MS = [2_000, 8_000, 20_000]
++
++const endedTurnRecoveries = new Map<string, object>()
++
+ async function recoverEndedLiveTurn(runtimeId: string) {
+-  const storedSessionId = $sessionStates.get()[runtimeId]?.storedSessionId ?? null
+-  const refreshTranscript = liveTurnBackend?.refreshTranscript
+-
+-  // Only a session on screen reads its history now; a background session
+-  // reads it when the user opens it, like the running=false edge.
+-  if (refreshTranscript && storedSessionId && runtimeReferenced(runtimeId, storedSessionId)) {
+-    try {
+-      await refreshTranscript(runtimeId, storedSessionId)
+-    } catch {
+-      // The local transcript still decides whether a reply arrived.
++  const recovery = {}
++  endedTurnRecoveries.set(runtimeId, recovery)
++
++  try {
++    for (let attempt = 0; ; attempt += 1) {
++      const storedSessionId = $sessionStates.get()[runtimeId]?.storedSessionId ?? null
++      const refreshTranscript = liveTurnBackend?.refreshTranscript
++
++      // Only a session on screen reads its history now; a background session
++      // reads it when the user opens it, like the running=false edge.
++      if (!refreshTranscript || !storedSessionId || !runtimeReferenced(runtimeId, storedSessionId)) {
++        break
++      }
++
++      let applied = false
++
++      try {
++        applied = (await refreshTranscript(runtimeId, storedSessionId)) !== false
++      } catch {
++        // No answer from the store: read again below.
++      }
++
++      if (endedTurnRecoveries.get(runtimeId) !== recovery) {
++        return
++      }
++
++      // The retry card offers to run the prompt again, so it needs the store's
++      // word that the turn left no reply. A read that did not apply (the
++      // #silent-turn incident of 2026-11-17: the reply was stored, the read
++      // was dropped) is asked again before the local transcript decides.
++      if (applied || attempt >= ENDED_TURN_STORE_RETRY_MS.length) {
++        logSilentTurnCheck(
++          `[silent-turn] runtime=${runtimeId} stored=${storedSessionId} recovery store_read=${applied ? 'applied' : 'none'} attempts=${attempt + 1}`
++        )
++
++        break
++      }
++
++      await new Promise(resolve => setTimeout(resolve, ENDED_TURN_STORE_RETRY_MS[attempt]))
++
++      const state = $sessionStates.get()[runtimeId]
++
++      if (endedTurnRecoveries.get(runtimeId) !== recovery || !state || isLiveTurnAwaitingEvents(state)) {
++        return
++      }
++    }
++
++    markTurnWithoutReply(runtimeId)
++  } finally {
++    if (endedTurnRecoveries.get(runtimeId) === recovery) {
++      endedTurnRecoveries.delete(runtimeId)
+     }
+   }
++}
++
++/** The backend, or the turn's own stream, showed a turn still producing after
++ *  it was stamped "ended without a reply": the stamp was wrong, so it and its
++ *  Retry leave. A pending store re-read for that turn is dropped too. */
++export function disproveNoReplyNotice(runtimeId: string) {
++  endedTurnRecoveries.delete(runtimeId)
++
++  const stamped = (messages: ChatMessage[]) => {
++    const tail = messages.findLastIndex(message => message.role === 'user' && !message.hidden)
++
++    return messages.some((message, index) => index > tail && isNoReplyNotice(message)) ? tail : null
++  }
++
++  if (stamped($sessionStates.get()[runtimeId]?.messages ?? []) === null) {
++    return
++  }
++
++  writeSessionState(runtimeId, state => {
++    const tail = stamped(state.messages)
+ 
+-  markTurnWithoutReply(runtimeId)
++    if (tail === null) {
++      return state
++    }
++
++    return {
++      ...state,
++      messages: state.messages.flatMap((message, index) => {
++        if (index <= tail || !isNoReplyNotice(message)) {
++          return [message]
++        }
++
++        const { error: _error, errorSurface: _errorSurface, ...rest } = message
++
++        // The notice's own empty bubble carried nothing else.
++        return rest.parts.length ? [rest] : []
++      })
++    }
++  })
++  logSilentTurnCheck(`[silent-turn] runtime=${runtimeId} no_reply_notice=disproved`)
+ }
+ 
+ /** The silence window ran out: ask the backend. Running keeps the turn and
+diff --git a/apps/desktop/src/store/session-watchdog.test.ts b/apps/desktop/src/store/session-watchdog.test.ts
+index b0908f98f414506a98554b41d00c979ae0ce410f..d0c234d351ab47febc80f758b1ec3492ad000306 100644
+--- a/apps/desktop/src/store/session-watchdog.test.ts
++++ b/apps/desktop/src/store/session-watchdog.test.ts
+@@ -12,6 +12,8 @@ import {
+   $stalledSessionIds,
+   $workingSessionIds,
+   clearAllSessionStates,
++  disproveNoReplyNotice,
++  ENDED_TURN_STORE_RETRY_MS,
+   LIVE_TURN_EVENT_SILENCE_MS,
+   LIVE_TURN_PROBE_TIMEOUT_MS,
+   liveTurnCheckLine,
+@@ -384,6 +386,118 @@ describe('live turn event silence', () => {
+     expect(card('rt-screen')).toBeUndefined()
+   })
+ 
++  it('does not offer a retry while the store has not said the turn had no reply', async () => {
++    $activeSessionId.set('rt-unread')
++    publishSessionState(
++      'rt-unread',
++      state({ awaitingResponse: true, busy: true, storedSessionId: 's-unread', turnLive: true })
++    )
++
++    // The first read is dropped (superseded, held or failed); the second lands the stored reply.
++    const refreshTranscript = vi
++      .fn<(runtimeId: string) => Promise<boolean>>()
++      .mockResolvedValueOnce(false)
++      .mockImplementationOnce(async runtimeId => {
++        publishSessionState(runtimeId, {
++          ...$sessionStates.get()[runtimeId]!,
++          messages: [{ id: 'stored-reply', parts: [textPart('finished on the backend')], role: 'assistant' }]
++        })
++
++        return true
++      })
++
++    backend(async () => ({ sessions: [] }), refreshTranscript)
++    noteSessionEvent('rt-unread')
++
++    await vi.advanceTimersByTimeAsync(SILENCE_MS)
++
++    expect(refreshTranscript).toHaveBeenCalledTimes(1)
++    expect($workingSessionIds.get()).not.toContain('s-unread')
++    expect(card('rt-unread')).toBeUndefined()
++
++    await vi.advanceTimersByTimeAsync(ENDED_TURN_STORE_RETRY_MS[0])
++
++    expect(refreshTranscript).toHaveBeenCalledTimes(2)
++    expect(card('rt-unread')).toBeUndefined()
++    expect(chatMessageText($sessionStates.get()['rt-unread']!.messages[0])).toBe('finished on the backend')
++  })
++
++  it('falls back to the local transcript once every store read came back empty-handed', async () => {
++    $activeSessionId.set('rt-nostore')
++    publishSessionState(
++      'rt-nostore',
++      state({ awaitingResponse: true, busy: true, storedSessionId: 's-nostore', turnLive: true })
++    )
++
++    const refreshTranscript = vi.fn(async () => {
++      throw new Error('store unreachable')
++    })
++
++    backend(async () => ({ sessions: [] }), refreshTranscript)
++    noteSessionEvent('rt-nostore')
++
++    await vi.advanceTimersByTimeAsync(SILENCE_MS)
++
++    const retries = ENDED_TURN_STORE_RETRY_MS.reduce((sum, ms) => sum + ms, 0)
++
++    await vi.advanceTimersByTimeAsync(retries - 1)
++    expect(card('rt-nostore')).toBeUndefined()
++
++    await vi.advanceTimersByTimeAsync(1)
++    expect(refreshTranscript).toHaveBeenCalledTimes(ENDED_TURN_STORE_RETRY_MS.length + 1)
++    expect(card('rt-nostore')?.errorSurface?.code).toBe('no_reply')
++  })
++
++  it('takes the retry card back when the turn it was stamped on turns out to be running', async () => {
++    $activeSessionId.set('rt-alive')
++    publishSessionState(
++      'rt-alive',
++      state({
++        awaitingResponse: true,
++        busy: true,
++        messages: [
++          { id: 'u1', parts: [textPart('resume')], role: 'user' },
++          { id: 'a1', parts: [{ type: 'text', text: '' }], pending: true, role: 'assistant' }
++        ],
++        storedSessionId: 's-alive',
++        streamId: 'a1',
++        turnLive: true
++      })
++    )
++    backend(async () => ({ sessions: [] }))
++    noteSessionEvent('rt-alive')
++
++    await vi.advanceTimersByTimeAsync(SILENCE_MS)
++    expect(card('rt-alive')?.errorSurface?.code).toBe('no_reply')
++
++    disproveNoReplyNotice('rt-alive')
++
++    const messages = $sessionStates.get()['rt-alive']!.messages
++    expect(card('rt-alive')).toBeUndefined()
++    expect(messages.every(message => !message.error)).toBe(true)
++    expect(messages.map(message => message.id)).toEqual(['u1', 'a1'])
++  })
++
++  it('drops a pending store re-read once the turn is shown running', async () => {
++    $activeSessionId.set('rt-revived')
++    publishSessionState(
++      'rt-revived',
++      state({ awaitingResponse: true, busy: true, storedSessionId: 's-revived', turnLive: true })
++    )
++
++    const refreshTranscript = vi.fn(async () => false)
++
++    backend(async () => ({ sessions: [] }), refreshTranscript)
++    noteSessionEvent('rt-revived')
++
++    await vi.advanceTimersByTimeAsync(SILENCE_MS)
++    disproveNoReplyNotice('rt-revived')
++    await vi.advanceTimersByTimeAsync(ENDED_TURN_STORE_RETRY_MS.reduce((sum, ms) => sum + ms, 0))
++
++    expect(refreshTranscript).toHaveBeenCalledTimes(1)
++    expect(card('rt-revived')).toBeUndefined()
++  })
++
+   it('leaves a background session to read its history when opened', async () => {
+     publishSessionState('rt-bg', state({ awaitingResponse: true, busy: true, storedSessionId: 's-bg', turnLive: true }))
+     const refreshTranscript = vi.fn()
+-- 
+2.43.0
+

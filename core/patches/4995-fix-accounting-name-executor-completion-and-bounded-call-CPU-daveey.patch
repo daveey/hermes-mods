@@ -1,0 +1,469 @@
+From 4d79b6d9d23df562ce05c3e71d569b94f1ecbe96 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 17:09:38 +0000
+Subject: [PATCH] fix(accounting): name executor completion and bounded call
+ CPU [daveey]
+
+Why: mature Mac snapshots still show about 2.2% of one core in the
+concurrent.futures worker outside submitted-function scopes. Work item
+completion runs synchronous Future callbacks after the function scope ends.
+The deadline worker also hides its callable behind an unscoped closure.
+
+Wrap the original CPython work item run (legacy and task-triple layouts)
+in an exclusive executor_item/<logical function> scope. Existing nested
+thread scopes retain their own CPU; the item scope records the remainder.
+Name bounded-sync calls without altering deadlines or context. Diagnostic
+entry, naming and booking failures must not skip/retry operations, replace
+their exceptions or kill pool workers. Raise bounded target capacity to256.
+
+Proof:
+- Initial completion/cap RED:2 failures,2 controls passed. Expanded RED
+  also fails the previously unnamed bounded call.
+- Final23 importing suites:439 passed,13 skipped,0 failed.
+- Eleven exact-anchor mutants killed, baseline44 passed: swapped native
+  user/system fields, list/iterator attribution gaps, cap, missing scopes,
+  disabled toggles, and diagnostic enter/exit/name failures.
+- Native Linux syscall/user split test plus synthetic unequal proc fields.
+- Full staged scripts/check --base origin/main passes.
+- Independent precommit review's diagnostic-failure findings addressed;
+  exact-head review and CI still required before landing.
+
+No optimization or causal live CPU reduction claimed. Queue/semaphore costs
+remain outside the item scope; natural Mac deployment and mature idle
+readback are still owed by t_84a411c80a478c57.
+---
+ agent/deadline.py                             |   7 +-
+ hermes_cli/loop_accounting.py                 |  41 ++-
+ .../test_loop_accounting_completion.py        | 279 ++++++++++++++++++
+ .../test_loop_accounting_residual.py          |   2 +-
+ .../test_loop_accounting_thread_targets.py    |   8 +-
+ 5 files changed, 329 insertions(+), 8 deletions(-)
+ create mode 100644 tests/hermes_cli/test_loop_accounting_completion.py
+
+diff --git a/agent/deadline.py b/agent/deadline.py
+index ecc7954480f192fe65b4b620bb98e2e6abe9b3ed..33d8f03bed7336a8dd1a916a2770f26ef934bfb6 100644
+--- a/agent/deadline.py
++++ b/agent/deadline.py
+@@ -349,10 +349,15 @@ def run_bounded_sync(
+     box: dict[str, Any] = {}
+     done = threading.Event()
+     ctx = contextvars.copy_context()
++    try:
++        from hermes_cli.loop_accounting import scoped_call, scopes_enabled
++        scoped_fn = scoped_call("thread", fn) if scopes_enabled() else fn
++    except Exception:  # health: allow BLE001 -- naming must not prevent the bounded operation
++        scoped_fn = fn
+ 
+     def _worker() -> None:
+         try:
+-            box["value"] = ctx.run(fn)
++            box["value"] = ctx.run(scoped_fn)
+         except BaseException as exc:  # re-raised in caller; must not vanish
+             box["exc"] = exc
+         finally:
+diff --git a/hermes_cli/loop_accounting.py b/hermes_cli/loop_accounting.py
+index 2cc353feb2b063107bdd995ffbce6dbf337c377c..37494e47ade9cf35bde80b5d91a937a7a143e5a0 100644
+--- a/hermes_cli/loop_accounting.py
++++ b/hermes_cli/loop_accounting.py
+@@ -914,8 +914,18 @@ def _callable_name(fn: Any, args: tuple = ()) -> str:
+ 
+ 
+ def _run_scoped(name: str, fn: Callable, *args: Any, **kwargs: Any) -> Any:
+-    with Scope(name):
++    try:
++        observed = Scope(name)
++        observed.__enter__()
++    except Exception:  # health: allow BLE001 -- diagnostics cannot prevent the operation
++        return fn(*args, **kwargs)
++    try:
+         return fn(*args, **kwargs)
++    finally:
++        try:
++            observed.__exit__(*sys.exc_info())
++        except Exception:  # health: allow BLE001 -- never replace results/errors or retry the operation
++            logger.debug("loop accounting: scope booking failed", exc_info=True)
+ 
+ 
+ def scoped_call(prefix: str, fn: Callable, args: tuple = ()) -> Callable:
+@@ -973,6 +983,27 @@ def instrument_executors() -> bool:
+         return False
+     _instrumented["executors"] = True
+     from concurrent.futures import ThreadPoolExecutor
++    from concurrent.futures.thread import _WorkItem
++    item_orig = _WorkItem.run
++
++    def run_item(self, *args, **kwargs):
++        if not scopes_enabled():
++            return item_orig(self, *args, **kwargs)
++        # 3.14 stores the invocation as a task triple; older CPython uses fn/args.
++        try:
++            if hasattr(self, "task"):
++                func, call_args, _ = self.task
++            else:
++                func, call_args = self.fn, self.args
++            name = "executor_item/" + _callable_name(func, call_args)
++        except Exception:  # health: allow BLE001 -- diagnostics must not break future completion
++            return item_orig(self, *args, **kwargs)
++        # The submitted scope has ended when Future invokes completion callbacks.
++        # Scope subtracts inner accounting, leaving only item/custody/completion CPU.
++        return _run_scoped(name, item_orig, self, *args, **kwargs)
++
++    run_item._la_orig = item_orig  # type: ignore[attr-defined]
++    _WorkItem.run = run_item  # type: ignore[method-assign]
+     pool_orig = ThreadPoolExecutor.submit
+ 
+     def submit(self, func, /, *args, **kwargs):
+@@ -1044,11 +1075,11 @@ def instrument_callbacks() -> bool:
+     return True
+ 
+ 
+-MAX_TARGET_KEYS = 64  # distinct thread targets; later ones fold into TARGET_OTHER
++MAX_TARGET_KEYS = 256  # distinct thread targets; later ones fold into TARGET_OTHER
+ TARGET_OTHER = "other"
+ 
+ 
+-def _target_key(target: Any, args: tuple | list = ()) -> str:
++def _target_key(target: Any, args: Any = ()) -> str:
+     """Name of a ``Thread`` target (``module.qualname``; a lambda also gets its line number)."""
+     # Inspection must not consume one-shot iterables before Thread.run uses them.
+     inspect_args = tuple(args) if isinstance(args, (tuple, list)) else ()
+@@ -1122,7 +1153,9 @@ def uninstrument() -> None:
+         threading.Thread.run = threading.Thread.run._la_orig  # type: ignore[attr-defined,method-assign]
+     if _instrumented.pop("executors", None):
+         from concurrent.futures import ThreadPoolExecutor
+-        ThreadPoolExecutor.submit = ThreadPoolExecutor.submit._la_orig  # type: ignore[attr-defined,method-assign]
++        from concurrent.futures.thread import _WorkItem
++        _WorkItem.run = _WorkItem.run._la_orig  # type: ignore[attr-defined,method-assign]
++        ThreadPoolExecutor.submit = ThreadPoolExecutor.submit._la_orig  # type: ignore[method-assign]
+         import asyncio.base_events as be
+         be.BaseEventLoop.run_in_executor = be.BaseEventLoop.run_in_executor._la_orig  # type: ignore[attr-defined]
+         try:
+diff --git a/tests/hermes_cli/test_loop_accounting_completion.py b/tests/hermes_cli/test_loop_accounting_completion.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d2e13c2cf03e6e7e578f12bb40a988fc61d0a477
+--- /dev/null
++++ b/tests/hermes_cli/test_loop_accounting_completion.py
+@@ -0,0 +1,279 @@
++"""CPU left outside submitted functions is attributed to the completing work item."""
++from concurrent.futures import ThreadPoolExecutor
++import threading
++import time
++
++import pytest
++
++from hermes_cli import loop_accounting as la
++
++
++@pytest.fixture(autouse=True)
++def accounting():
++    la.stop()
++    la.reset()
++    yield
++    la.uninstrument()
++    la.reset()
++
++
++def burn(seconds):
++    end = time.thread_time() + seconds
++    while time.thread_time() < end:
++        pass
++
++
++def test_completion_cpu_named_without_counting_target_twice():
++    la.instrument_executors()
++    release = threading.Event()
++    entered = threading.Event()
++
++    def job():
++        entered.set()
++        assert release.wait(10)
++        burn(0.03)
++        return 42
++
++    def completion(future):
++        assert future.result() == 42
++        burn(0.06)
++
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        future = pool.submit(job)
++        try:
++            assert entered.wait(10)
++            future.add_done_callback(completion)
++        finally:
++            release.set()
++        assert future.result(timeout=10) == 42
++    rows = la.counters()
++    name = la._callable_name(job)
++    inner = rows['thread/' + name]
++    outer = rows['executor_item/' + name]
++    assert inner['runs'] == outer['runs'] == 1
++    assert 0.025 <= inner['cpu_s'] < 0.06
++    assert 0.055 <= outer['cpu_s'] < 0.09
++    assert la.snapshot()['process']['accounted_cpu_s'] == pytest.approx(
++        inner['cpu_s'] + outer['cpu_s'], abs=0.005)
++
++
++def test_default_target_capacity_keeps_names_past_64():
++    la.instrument_thread_targets()
++    for i in range(70):
++        def target():
++            pass
++        target.__qualname__ = f'target_{i}'
++        thread = threading.Thread(target=target)
++        thread.start()
++        thread.join()
++    assert len(la._target_exited) == 70
++    assert la.TARGET_OTHER not in la._target_exited
++
++
++def test_proc_stat_user_system_direction(tmp_path):
++    # Linux fields 14/15 (utime/stime), not merely their commutative sum.
++    stat = tmp_path / 'stat'
++    fields = ['S'] + ['0'] * 10 + ['123', '37'] + ['0'] * 10
++    stat.write_text('42 (name with ) spaces) ' + ' '.join(fields), encoding='ascii')
++    assert la._proc_stat_split(str(stat), 100.0) == ('name with ) spaces', 1.23, 0.37)
++
++
++@pytest.mark.parametrize('prescoped', [False, True])
++def test_deadline_callable_is_named_and_context_preserved(prescoped):
++    from contextvars import ContextVar
++    from agent.deadline import run_bounded_sync
++
++    value = ContextVar('deadline-value', default='missing')
++    value.set('submitted')
++
++    def job():
++        burn(0.02)
++        return value.get()
++
++    target = la.scoped_call('thread', job) if prescoped else job
++    result = run_bounded_sync(target, 10)
++    assert result.value == 'submitted'
++    rows = {key: row for key, row in la.counters().items() if key.startswith('thread/')}
++    assert list(rows) == ['thread/' + la._callable_name(job)]
++    assert next(iter(rows.values()))['runs'] == 1
++
++
++@pytest.mark.parametrize('enabled', [False, True])
++def test_deadline_failure_keeps_exception_and_scope_toggle(monkeypatch, enabled):
++    from agent.deadline import run_bounded_sync
++
++    monkeypatch.setattr(la, 'scopes_enabled', lambda: enabled)
++    failure = ValueError('original')
++
++    def job():
++        raise failure
++
++    with pytest.raises(ValueError) as caught:
++        run_bounded_sync(job, 10)
++    assert caught.value is failure
++    assert bool(la.counters()) is enabled
++
++
++def test_item_hook_restores_and_disabled_scopes_leave_no_rows(monkeypatch):
++    from concurrent.futures.thread import _WorkItem
++
++    original = _WorkItem.run
++    assert la.instrument_executors()
++    wrapped = _WorkItem.run
++    assert wrapped is not original
++    assert not la.instrument_executors()
++    assert _WorkItem.run is wrapped
++    monkeypatch.setattr(la, 'scopes_enabled', lambda: False)
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        assert pool.submit(lambda: 42).result(timeout=10) == 42
++    assert la.counters() == {}
++    la.uninstrument()
++    assert _WorkItem.run is original
++
++
++@pytest.mark.parametrize('shape', ['legacy', 'task', 'unknown'])
++def test_item_shapes_keep_original_invocation(monkeypatch, shape):
++    from concurrent.futures.thread import _WorkItem
++    from types import SimpleNamespace
++
++    seen = []
++
++    def original(item, *args, **kwargs):
++        seen.append((item, args, kwargs))
++        return 42
++
++    def job():
++        pass
++
++    monkeypatch.setattr(_WorkItem, 'run', original)
++    la.instrument_executors()
++    item = SimpleNamespace()
++    if shape == 'legacy':
++        item.fn, item.args = job, ()
++    elif shape == 'task':
++        item.task = (job, (), {})
++    assert _WorkItem.run(item, 'context', extra=3) == 42
++    assert seen == [(item, ('context',), {'extra': 3})]
++    rows = la.counters()
++    if shape == 'unknown':
++        assert rows == {}
++    else:
++        assert rows['executor_item/' + la._callable_name(job)]['runs'] == 1
++    la.uninstrument()
++
++
++@pytest.mark.platforms('linux')
++def test_native_proc_split_distinguishes_user_burn_and_syscalls():
++    import os
++
++    results = {}
++
++    def measure(label, work):
++        path = f'/proc/self/task/{threading.get_native_id()}/stat'
++        before = la._proc_stat_split(path, la._clk_tck())
++        work()
++        after = la._proc_stat_split(path, la._clk_tck())
++        assert before is not None and after is not None
++        results[label] = (after[1] - before[1], after[2] - before[2])
++
++    def syscalls():
++        fd = os.open('/dev/zero', os.O_RDONLY)
++        try:
++            end = time.thread_time() + 0.3
++            while time.thread_time() < end:
++                os.read(fd, 1024 * 1024)
++        finally:
++            os.close(fd)
++
++    def user_work():
++        end = time.thread_time() + 0.3
++        while time.thread_time() < end:
++            sum(i * i for i in range(10000))
++
++    for label, work in [('user', user_work), ('system', syscalls)]:
++        thread = threading.Thread(target=measure, args=(label, work))
++        thread.start()
++        thread.join(30)
++        assert not thread.is_alive()
++    assert results['user'][0] > results['user'][1] + 0.1, results
++    assert results['system'][1] > results['system'][0] + 0.1, results
++
++
++@pytest.mark.parametrize('phase', ['enter', 'exit', 'name'])
++@pytest.mark.parametrize('raises', [False, True])
++def test_deadline_diagnostics_never_retry_or_replace_operation(monkeypatch, phase, raises):
++    from agent.deadline import run_bounded_sync
++
++    original = la.Scope
++
++    class BrokenScope(original):
++        def __enter__(self):
++            if phase == 'enter':
++                raise RuntimeError('diagnostic enter')
++            return super().__enter__()
++
++        def __exit__(self, *args):
++            raise RuntimeError('diagnostic exit')
++
++    def broken_name(*args):
++        raise RuntimeError('diagnostic name')
++
++    monkeypatch.setattr(la, 'Scope', BrokenScope)
++    if phase == 'name':
++        monkeypatch.setattr(la, 'scoped_call', broken_name)
++    calls = []
++    failure = ValueError('operation')
++
++    def job():
++        calls.append(1)
++        if raises:
++            raise failure
++        return 42
++
++    if raises:
++        with pytest.raises(ValueError) as caught:
++            run_bounded_sync(job, 10)
++        assert caught.value is failure
++    else:
++        assert run_bounded_sync(job, 10).value == 42
++    assert calls == [1]
++
++
++@pytest.mark.parametrize('phase', ['enter', 'exit'])
++def test_item_diagnostic_failure_does_not_kill_pool(monkeypatch, phase):
++    original = la.Scope
++
++    class BrokenItemScope(original):
++        def __enter__(self):
++            if self.name.startswith('executor_item/') and phase == 'enter':
++                raise RuntimeError('diagnostic enter')
++            return super().__enter__()
++
++        def __exit__(self, *args):
++            if self.name.startswith('executor_item/'):
++                raise RuntimeError('diagnostic exit')
++            return super().__exit__(*args)
++
++    monkeypatch.setattr(la, 'Scope', BrokenItemScope)
++    la.instrument_executors()
++    calls = []
++
++    def job():
++        calls.append(1)
++        return len(calls)
++
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        assert pool.submit(job).result(timeout=10) == 1
++        assert pool.submit(job).result(timeout=10) == 2
++    assert calls == [1, 1]
++
++
++def test_unknown_thread_args_are_not_inspected():
++    def original(*args):
++        return args
++
++    class InvocationOnly:
++        def __iter__(self):
++            raise AssertionError('diagnostic inspection must not iterate')
++
++    assert la._target_key(original, InvocationOnly()) == la._callable_name(original)
+diff --git a/tests/hermes_cli/test_loop_accounting_residual.py b/tests/hermes_cli/test_loop_accounting_residual.py
+index 94ac703d54157891e0c9cdb218b4d5ff93da9418..7ae4f05adae4d5e39e4dcabdfa1f65eb37c772e7 100644
+--- a/tests/hermes_cli/test_loop_accounting_residual.py
++++ b/tests/hermes_cli/test_loop_accounting_residual.py
+@@ -191,7 +191,7 @@ def test_gateway_direct_pool_submission_is_named(monkeypatch, tmp_path, enabled)
+         assert await threads.run_in_pool(None, copy_context(), direct_job) == 42
+ 
+     asyncio.run(main())
+-    names = {k: v for k, v in la.counters().items() if k.endswith("direct_job")}
++    names = {k: v for k, v in la.counters().items() if k.startswith("thread/") and k.endswith("direct_job")}
+     if enabled:
+         assert len(names) == 1, la.counters()
+         st = next(iter(names.values()))
+diff --git a/tests/hermes_cli/test_loop_accounting_thread_targets.py b/tests/hermes_cli/test_loop_accounting_thread_targets.py
+index a9aa72eaa66816facf3ec35c334207c03af3c8c9..13d7518f4dde336cf6e7eaab8a7ba74ee549d168 100644
+--- a/tests/hermes_cli/test_loop_accounting_thread_targets.py
++++ b/tests/hermes_cli/test_loop_accounting_thread_targets.py
+@@ -290,9 +290,13 @@ def test_thread_attribution_does_not_consume_iterator_args(carrier):
+     th.join()
+     assert seen == [expected]
+     assert list(args) == []  # Only the actual invocation consumes the iterator.
++    assert sum(row["threads"] for row in la._target_exited.values()) == 1
++    if carrier != "context":
++        assert la._target_key(original) in la._target_exited
+ 
+ 
+-def test_context_thread_names_original_target():
++@pytest.mark.parametrize("args_type", [tuple, list])
++def test_context_thread_names_original_target(args_type):
+     from contextvars import Context
+ 
+     la.instrument_thread_targets()
+@@ -300,7 +304,7 @@ def test_context_thread_names_original_target():
+     def original(value):
+         assert value == 42
+ 
+-    th = threading.Thread(target=Context().run, args=(original, 42))
++    th = threading.Thread(target=Context().run, args=args_type((original, 42)))
+     th.start()
+     th.join()
+     assert la._target_key(original) in la._target_exited
+-- 
+2.43.0
+

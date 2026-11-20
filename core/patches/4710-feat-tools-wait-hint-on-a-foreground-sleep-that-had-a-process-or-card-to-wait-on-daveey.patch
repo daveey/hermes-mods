@@ -1,0 +1,944 @@
+From 53c07f753cbdaa5b09f82497b5c5e0e7c86c098c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 17:02:46 -0800
+Subject: [PATCH] feat(tools): wait_hint on a foreground sleep that had a
+ process or card to wait on [daveey]
+
+A foreground terminal command that sleeps a minute or more, or poll-loops with
+sleeps of 5 s or more, gets a `wait_hint` field when the caller's task has a
+tracked running job (names process_manage wait) or the command reads one
+card's status (worker: park with awaiting kind=card; chat: the completion
+notice). Measured on the hub over 7 days: half of 52 h of sleep-polling sat
+behind a tracked process and 28% re-read another card.
+
+Contract (tools/terminal_tool_wait_hint.py):
+- Only adds a field. Nothing is refused or rewritten; the scan is one linear
+  pass with an 8,000-character bound.
+- Only for a foreground command whose own execution took 30 s or more (the
+  successful env.execute attempt, timed in _run_foreground: not the text, and
+  not the approval wait, sandbox start or retries) and finished cleanly:
+  exit 0, no error, no status, not backgrounded by the tool. A non-zero exit is
+  also how a timeout, an interrupt and some backend failures report, so those
+  get nothing.
+- The process hint carries timeout=<the measured time>, so following it never
+  blocks longer than the command it replaces, even if the process is a server.
+- Silence over a wrong hint: none when the command then looks elsewhere
+  (service probe, CI, remote host), for a recognised server or notify-on-exit
+  process, or for a worker's own card. Quotes, expansions, heredoc bodies and
+  comments are not read as commands by the sleep scan.
+
+Known imprecision: the board-database card check reads the raw command, and
+neither card check looks at whether the read came after the sleep.
+
+Not covered: a chat waiting on a card it did not create has no subscribe path.
+The process hint matches on the calling turn's task id, so a process started in
+an earlier one-shot turn is not seen.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ tests/tools/test_terminal_tool_wait_hint.py | 528 ++++++++++++++++++++
+ tools/terminal_tool.py                      |  20 +-
+ tools/terminal_tool_wait_hint.py            | 302 +++++++++++
+ 3 files changed, 848 insertions(+), 2 deletions(-)
+ create mode 100644 tests/tools/test_terminal_tool_wait_hint.py
+ create mode 100644 tools/terminal_tool_wait_hint.py
+
+diff --git a/tests/tools/test_terminal_tool_wait_hint.py b/tests/tools/test_terminal_tool_wait_hint.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ce44eb21123dac59a465bf70f3e99f38d425b383
+--- /dev/null
++++ b/tests/tools/test_terminal_tool_wait_hint.py
+@@ -0,0 +1,528 @@
++"""A foreground sleep/poll command gets a wait_hint when a process or card could be waited on."""
++
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from tools import terminal_tool_wait_hint as wh
++
++CARD = "t_9791ec808c66123a"
++OWN = "t_b3736378962a5ab0"
++OK = json.dumps({"output": "done", "exit_code": 0, "error": None})
++SLEEP_TAIL = "sleep 540; tail suite.log"
++
++
++def _proc(pid="proc_4dae56ca81f6", command="scripts/run_tests.sh tests/ > suite.log 2>&1", *, notify=False, started_at=100.0):
++    return SimpleNamespace(id=pid, command=command, notify_on_complete=notify, started_at=started_at)
++
++
++@pytest.fixture
++def running(monkeypatch):
++    """Set the tracked running processes the hint sees for task 'task-1'."""
++    procs = []
++    monkeypatch.setattr(wh, "_running_processes", lambda task_id: list(procs) if task_id == "task-1" else [])
++    return procs
++
++
++class TestIsSleepWait:
++    @pytest.mark.parametrize("command", [
++        "sleep 540; tail -c 600 run.log",
++        "sleep 60",
++        "cd /tmp && sleep 175; cat out.txt",
++        "sleep 2m; date -u",
++        "date; sleep 120 && ls",
++        "(sleep 300; tail log)",
++        "{ sleep 90; cat out.txt; }",
++        "if [ -f done ]; then cat out; else sleep 90; fi",
++        "for i in $(seq 1 19); do [ -f done ] && break; sleep 10; done; tail log",
++        "while pgrep -f ship.sh >/dev/null; do sleep 10; done; tail ship.log",
++        "until grep -q '^rc=' out.txt; do\n  sleep 5\ndone",
++    ])
++    def test_sleep_waits(self, command):
++        assert wh.is_sleep_wait(command)
++
++    @pytest.mark.parametrize("command", [
++        "sleep 5; curl -s localhost:8080/health",                      # settle delay
++        "sleep 0.5 && ls",
++        "for f in a b; do echo $f; done; sleep 2; ls",                 # short sleep after, not in, the loop
++        "cat > run.sh <<'EOF'\nsleep 600\nEOF",                         # heredoc body: nothing slept
++        "cat > run.sh <<EOF\nwhile true; do\nsleep 5\ndone\nEOF\nchmod +x run.sh",
++        'git commit -m "retry; sleep 90 less"',                        # quoted text
++        "grep -n 'x|sleep 120' notes.txt",
++        "echo 'while true; do sleep 5; done' > loop.sh",
++        "pytest tests/test_sleep.py -k 'sleep 600'",
++        "grep -rn 'time.sleep(120)' src",
++        "sleep $N; tail log",                                          # computed duration: not judged
++        "for i in 1 2; do sleep 0.1; done; echo ok",                   # a pacing delay, not a poll loop
++        "for h in a b; do ssh $h uptime & done; sleep 5; wait",        # `done` after `&`
++        "while read x; do { echo $x; } done < f; sleep 2; ls",
++        "cat > run.sh <<\\EOF\nsleep 600\nEOF",
++        "cat > run.sh <<'END-OF'\nsleep 600\nEND-OF",
++        "cat > a <<A; cat > b <<B\nsleep 600\nA\nsleep 700\nB\nls",    # two heredocs on one line
++        "# don't forget\ngit commit -m 'wip; sleep 90 dropped'",        # apostrophe inside a comment
++        "echo 'a'\\''b; sleep 90 '",
++        "ls # nothing; sleep 600",
++        "git commit -m fix: do sleep 90 less often",                   # do/then/else as plain words
++        "echo waiting then sleep 120 seconds",
++        "sleep 60 " + "x" * 9000,                                      # over the size bound: not examined
++        "sleep " + "9" * 400 + "; ls",                                 # not a duration (and no float overflow)
++        "echo $'it\\'s; sleep 90 '",                                    # ANSI-C quoting
++        "(sleep 90 &) ; echo started",                                 # backgrounded: does not hold the call
++        "sleep 61 &",
++        "echo ${HOME} sleep 90",                                       # words after an expansion
++        "echo $(date) sleep 90",
++        "echo ${#a} 'x\nsleep 90\ny'",                                 # `${#` is not a comment
++        'echo "$(echo "a; sleep 90")"',                                # quotes nested in a substitution
++        "",
++    ])
++    def test_not_sleep_waits(self, command):
++        assert not wh.is_sleep_wait(command)
++
++
++class TestAwaitedCardId:
++    @pytest.mark.parametrize("command", [
++        f"sleep 400; hermes kanban show {CARD} | grep status",
++        f"sleep 400; hermes kanban --board runners show {CARD}",
++        f"sleep 150; sqlite3 -readonly ~/.hermes/kanban.db \"select status from tasks where id='{CARD}'\"",
++        f"sleep 150; sqlite3 -readonly ~/.hermes/kanban/sync-shadow/default.db \"select status from tasks where id='{CARD}'\"",
++    ])
++    def test_reads_one_card(self, command):
++        assert wh.awaited_card_id(command) == CARD
++
++    @pytest.mark.parametrize("command", [
++        f"sleep 90; hermes kanban comment {CARD} 'will show later'",
++        f"sleep 90; hermes kanban complete {CARD} --show",
++        f"sleep 90; cat kanban.db.bak; echo {CARD}",
++        f"sleep 90; ls ~/.hermes/kanban.db; echo {CARD}",
++        f"sleep 90; echo 'run hermes kanban show {CARD}'; hermes kanban unblock {CARD}",
++        f"sleep 90; hermes kanban complete {OWN} --note show {CARD}",
++        f"sleep 90; hermes kanban create --title show {CARD}",
++        f"sleep 90; git -C ~/kanban show {CARD}",
++        f"sleep 90; echo \"kanban.db 'select id={CARD}\"",
++        f"sleep 90; sqlite3 ~/.hermes/kanban.db \"update tasks set x=1 where id in (select '{CARD}')\"",
++        f"sleep 90; sqlite3 ~/.hermes/kanban.db \"select count(*) from tasks where parent_id='{CARD}'\"",
++    ])
++    def test_not_a_status_read(self, command):
++        assert wh.awaited_card_id(command) is None
++
++    def test_two_cards_is_not_one_wait(self):
++        assert wh.awaited_card_id(f"sleep 120; hermes kanban show {CARD}; hermes kanban show {OWN}") is None
++
++    def test_card_id_in_a_path_is_a_workspace_not_a_status_read(self):
++        assert wh.awaited_card_id(f"sleep 405; tail -1 ~/.hermes/kanban/workspaces/{CARD}/probe.log") is None
++        assert wh.awaited_card_id(f"sleep 90; hermes kanban list; cat ~/.hermes/kanban/workspaces/{CARD}/out.log") is None
++        assert wh.awaited_card_id(f"sleep 90; hermes kanban show {CARD}; cat ~/.hermes/kanban/workspaces/{OWN}/out.log") == CARD
++
++    def test_a_workers_own_card_is_not_a_card_to_park_on(self):
++        assert wh.awaited_card_id(f"sleep 120; hermes kanban show {OWN}", own_card=OWN) is None
++        assert wh.awaited_card_id(f"sleep 120; hermes kanban show {CARD}", own_card=OWN) == CARD
++
++
++class TestWaitHint:
++    def test_running_process_names_the_wait_call(self, running):
++        running.append(_proc())
++        hint = wh.wait_hint(SLEEP_TAIL, "task-1", 600, kanban_task=OWN)
++        assert "process_manage(action='wait', session_id='proc_4dae56ca81f6', timeout=600)" in hint
++        assert "scripts/run_tests.sh" in hint
++
++    def test_the_offered_wait_is_no_longer_than_the_command_took(self, running):
++        """An unrecognised server (`python app.py`) may be named; following the hint then blocks at
++        most as long as the command just did, measured, never the 400 s default window."""
++        running.append(_proc("proc_app", "python app.py"))
++        assert "session_id='proc_app', timeout=61)" in wh.wait_hint("sleep 60; tail -20 server.log", "task-1", 61.4, kanban_task="")
++        loop = "until grep -q 'Running on' app.log; do sleep 5; done"
++        assert "timeout=45)" in wh.wait_hint(loop, "task-1", 45.9, kanban_task="")
++
++    @pytest.mark.parametrize("command", [
++        "until grep -q 'Running on' app.log; do sleep 5; done",     # readiness loop that hit after 5-15 s
++        "for i in 1 2 3; do sleep 5; tail -1 run.log; done",
++        "[ -f done ] || sleep 3600; tail log",                      # untaken branch: slept 0 s
++        "f() { sleep 90; }; echo defined",                          # function body: slept 0 s
++        "false && sleep 90; echo skipped",
++        f"[ -f done ] || sleep 600; hermes kanban show {CARD}",
++    ])
++    @pytest.mark.parametrize("elapsed", [0.1, 15.0, 29.9, float("nan"), None, "600", True])
++    def test_a_command_that_returned_quickly_gets_no_hint(self, running, command, elapsed):
++        """Whatever the text says, a call that did not hold for half a minute did not wait."""
++        running.append(_proc("proc_app", "python app.py"))
++        assert wh.wait_hint(command, "task-1", elapsed, kanban_task=OWN) is None
++        assert wh.annotate(OK, command, background=False, task_id="task-1", elapsed_seconds=elapsed) is OK
++
++    def test_newest_process_is_named_not_the_oldest(self, running):
++        running.extend([_proc("proc_build", "make all", started_at=10.0), _proc("proc_suite", started_at=50.0)])
++        hint = wh.wait_hint(SLEEP_TAIL, "task-1", 600, kanban_task="")
++        assert "session_id='proc_suite'" in hint and "proc_build" not in hint
++
++    @pytest.mark.parametrize("server", [
++        "npm run dev", "pnpm dev", "python -m http.server 8000", "uvicorn app:app --port 8000",
++        "vite --host", "tail -f server.log", "cargo watch -x test", "bin/server --port 9",
++    ])
++    def test_a_recognised_server_is_skipped(self, running, server):
++        """A command on the server list is not offered; newer than the job, it is still skipped. (A
++        server the list does not know is covered by the bounded timeout, tested below.)"""
++        running.append(_proc("proc_server", server, started_at=90.0))
++        assert wh.wait_hint("sleep 60; tail -20 server.log", "task-1", 600, kanban_task="") is None
++        running.append(_proc("proc_suite", started_at=20.0))
++        assert "session_id='proc_suite'" in wh.wait_hint(SLEEP_TAIL, "task-1", 600, kanban_task="")
++
++    @pytest.mark.parametrize("command", [
++        "sleep 300; gh run view 123",
++        "sleep 90; docker compose ps",
++        "sleep 120; ssh box tail -1 run.log",
++        "sleep 60; python -c \"import requests; requests.get('http://localhost:8000/health')\"",
++        "sleep 60; http :8080/health",
++    ])
++    def test_a_sleep_that_then_looks_elsewhere_gets_no_process_hint(self, running, command):
++        running.append(_proc())
++        assert wh.wait_hint(command, "task-1", 600, kanban_task="") is None
++
++    @pytest.mark.parametrize("command", [
++        "sleep 60; curl -s localhost:8080/health",
++        "for i in $(seq 1 30); do curl -sf localhost:3000/health && break; sleep 1; done",
++        "sleep 90; nc -z 127.0.0.1 5432",
++    ])
++    def test_a_service_probe_gets_no_process_hint(self, running, command):
++        """The running process is a server that never exits: a wait on it would block the whole window."""
++        running.append(_proc("proc_server", "npm run dev"))
++        assert wh.wait_hint(command, "task-1", 600, kanban_task="") is None
++
++    def test_a_process_that_notifies_on_exit_gets_no_hint(self, running):
++        """Its own notes say not to wait or poll again; the hint must not contradict them."""
++        running.append(_proc(notify=True))
++        assert wh.wait_hint(SLEEP_TAIL, "task-1", 600, kanban_task="") is None
++
++    def test_a_notifying_process_is_skipped_for_one_that_does_not(self, running):
++        running.extend([_proc("proc_notify", notify=True, started_at=90.0), _proc("proc_plain", started_at=20.0)])
++        assert "session_id='proc_plain'" in wh.wait_hint(SLEEP_TAIL, "task-1", 600, kanban_task="")
++
++    def test_secrets_in_the_process_command_are_redacted(self, running):
++        secret = "sk-ant-api03-" + "A" * 40
++        running.append(_proc(command=f"ANTHROPIC_API_KEY={secret} python run.py"))
++        hint = wh.wait_hint(SLEEP_TAIL, "task-1", 600, kanban_task="")
++        assert "proc_4dae56ca81f6" in hint and secret not in hint
++
++    def test_a_secret_straddling_the_shortening_point_does_not_leak(self, running):
++        """Redact first, shorten second: a token cut at 80 characters no longer matches a pattern."""
++        from agent.redact import redact_sensitive_text
++
++        secret = "ghp_" + "a1B2c3D4e5" * 4
++        command = "x" * 60 + f" GITHUB_TOKEN={secret} python run.py"
++        running.append(_proc(command=command))
++        hint = wh.wait_hint(SLEEP_TAIL, "task-1", 600, kanban_task="")
++        assert redact_sensitive_text(command, code_file=True)[:80] in hint
++        assert secret[:12] not in hint
++
++    def test_no_running_process_and_no_card_gives_no_hint(self, running):
++        assert wh.wait_hint(SLEEP_TAIL, "task-1", 600, kanban_task=OWN) is None
++
++    def test_another_tasks_process_gives_no_hint(self, running):
++        running.append(_proc())
++        assert wh.wait_hint(SLEEP_TAIL, "task-2", 600, kanban_task=OWN) is None
++
++    def test_no_task_id_gives_no_process_hint(self, running):
++        running.append(_proc())
++        assert wh.wait_hint(SLEEP_TAIL, None, 600, kanban_task=OWN) is None
++
++    def test_not_a_sleep_gives_no_hint_even_with_a_running_process(self, running):
++        running.append(_proc())
++        assert wh.wait_hint("tail suite.log", "task-1", 600, kanban_task=OWN) is None
++
++    def test_worker_card_wait_names_the_park(self, running):
++        hint = wh.wait_hint(f"sleep 400; hermes kanban show {CARD}", "task-1", 600, kanban_task=OWN)
++        assert "awaiting={'kind': 'card', 'ref': '" + CARD + "'}" in hint
++        assert "kanban_schedule" in hint and "process_manage" not in hint
++
++    def test_worker_reading_its_own_card_gets_no_park_hint(self, running):
++        assert wh.wait_hint(f"sleep 400; hermes kanban show {OWN}", "task-1", 600, kanban_task=OWN) is None
++
++    def test_chat_card_wait_points_at_the_completion_notice(self, running):
++        hint = wh.wait_hint(f"sleep 400; hermes kanban show {CARD}", "task-1", 600, kanban_task="")
++        assert CARD in hint and "end the turn" in hint
++        assert "awaiting" not in hint  # a chat cannot park
++
++    def test_worker_is_detected_from_the_environment(self, running, monkeypatch):
++        command = f"sleep 400; hermes kanban show {CARD}"
++        monkeypatch.setenv("HERMES_KANBAN_TASK", OWN)
++        assert "awaiting" in wh.wait_hint(command, "task-1", 600)
++        monkeypatch.delenv("HERMES_KANBAN_TASK")
++        assert "end the turn" in wh.wait_hint(command, "task-1", 600)
++
++    def test_process_and_card_both_apply(self, running):
++        running.append(_proc())
++        hint = wh.wait_hint(f"sleep 400; hermes kanban show {CARD}", "task-1", 600, kanban_task=OWN)
++        assert "process_manage" in hint and "awaiting" in hint
++
++
++class TestAnnotate:
++    def test_adds_the_hint_and_keeps_the_result(self, running):
++        running.append(_proc())
++        out = json.loads(wh.annotate(OK, SLEEP_TAIL, background=False, task_id="task-1", elapsed_seconds=600))
++        assert out["output"] == "done" and out["exit_code"] == 0
++        assert "process_manage" in out["wait_hint"]
++
++    def test_unchanged_without_a_hint(self, running):
++        assert wh.annotate(OK, SLEEP_TAIL, background=False, task_id="task-1", elapsed_seconds=600) is OK
++        running.append(_proc())
++        assert wh.annotate(OK, "ls", background=False, task_id="task-1", elapsed_seconds=600) is OK
++
++    def test_background_call_is_unchanged(self, running):
++        running.append(_proc())
++        assert wh.annotate(OK, SLEEP_TAIL, background=True, task_id="task-1", elapsed_seconds=600) is OK
++
++    @pytest.mark.parametrize("result", ["not json", json.dumps(["a"]), json.dumps({"error": "refused"})])
++    def test_unrecognised_result_is_unchanged(self, running, result):
++        running.append(_proc())
++        assert wh.annotate(result, SLEEP_TAIL, background=False, task_id="task-1", elapsed_seconds=600) is result
++
++    def test_non_string_command_is_unchanged(self, running):
++        running.append(_proc())
++        assert wh.annotate(OK, None, background=False, task_id="task-1", elapsed_seconds=600) is OK
++
++    def test_a_failing_lookup_never_costs_the_result(self, monkeypatch):
++        def boom(task_id):
++            raise RuntimeError("registry down")
++
++        monkeypatch.setattr(wh, "_running_processes", boom)
++        assert wh.annotate(OK, SLEEP_TAIL, background=False, task_id="task-1", elapsed_seconds=600) is OK
++
++
++class TestRealResultShapes:
++    """The envelopes terminal_tool() really returns for a command that did not simply finish."""
++
++    def _unchanged(self, running, result):
++        running.append(_proc())
++        assert wh.annotate(result, SLEEP_TAIL, background=False, task_id="task-1", elapsed_seconds=600) is result
++
++    def test_refused_command_is_unchanged(self, running):
++        from tools.terminal_tool import _error_json
++
++        self._unchanged(running, _error_json("Command blocked: gateway lifecycle", status="blocked"))
++
++    def test_fatal_error_is_unchanged(self, running):
++        from tools.terminal_tool import _fatal_error_json
++
++        self._unchanged(running, _fatal_error_json(RuntimeError("backend exploded")))
++
++    def test_degraded_backend_is_unchanged(self, running):
++        self._unchanged(running, json.dumps({"output": "", "exit_code": -1, "error": "unreachable", "status": "degraded"}))
++
++    def test_yielded_sleep_is_not_told_to_wait_on_itself(self, running):
++        """A user message mid-command turns the running sleep into a tracked process of this task."""
++        running.append(_proc("proc_self", SLEEP_TAIL))
++        yielded = json.dumps({"output": "", "exit_code": None, "error": None, "status": "yielded_to_background",
++                              "session_id": "proc_self", "note": "respond to the user now"})
++        assert wh.annotate(yielded, SLEEP_TAIL, background=False, task_id="task-1", elapsed_seconds=600) is yielded
++
++    def test_still_running_result_without_a_status_is_unchanged(self, running):
++        self._unchanged(running, json.dumps({"output": "", "exit_code": None, "error": None, "session_id": "proc_x"}))
++
++    def test_command_that_never_produced_an_exit_status_is_unchanged(self, running):
++        """exit_code -1 without a status: execution failed before the command exited."""
++        from tools.terminal_tool import _error_json
++
++        self._unchanged(running, _error_json("Command execution failed: backend gone"))
++
++    def test_trailing_ampersand_sleep_is_not_told_to_wait_on_itself(self, running):
++        """`sleep 61 &` in a foreground call is spawned as a tracked background process."""
++        running.append(_proc("proc_self", "sleep 61", started_at=999.0))
++        spawned = json.dumps({"output": "Background process started", "session_id": "proc_self", "pid": 4242,
++                              "exit_code": 0, "error": None, "auto_backgrounded": "Ran in the background"})
++        assert wh.annotate(spawned, "date; sleep 61 &", background=False, task_id="task-1", elapsed_seconds=600) is spawned
++
++    @pytest.mark.parametrize("marker", ["session_id", "pid", "auto_backgrounded", "promoted_from_foreground"])
++    def test_any_sign_of_a_spawn_keeps_the_result_unchanged(self, running, marker):
++        """A foreground call above the timeout cap is promoted to a background process the same way."""
++        self._unchanged(running, json.dumps({"output": "Background process started", "exit_code": 0, "error": None, marker: "x"}))
++
++    @pytest.mark.parametrize("envelope", [
++        {"output": "", "exit_code": 124, "error": "Command timed out after 180 seconds"},   # backend exception path
++        {"output": "[Command timed out after 180s]", "exit_code": 124, "error": None},      # cut by Hermes
++        {"output": "[Command interrupted]", "exit_code": 130, "error": None},               # user interrupt
++        {"output": "[host is exiting: command not started]", "exit_code": 130, "error": None},
++        {"output": "", "exit_code": 1, "error": "something went wrong"},
++    ])
++    def test_cut_short_or_errored_command_is_unchanged(self, running, envelope):
++        """The sleep did not run its course, so there is no "instead" to offer."""
++        self._unchanged(running, json.dumps(envelope))
++
++    @pytest.mark.parametrize("envelope", [
++        {"output": "tail: suite.log: No such file", "exit_code": 1, "error": None},
++        {"output": "Managed Modal exec poll failed: ConnectionError", "exit_code": 1, "error": None},   # backend failure
++        {"output": "", "exit_code": 2, "error": None},
++    ])
++    def test_non_zero_exit_is_unchanged(self, running, envelope):
++        """A non-zero status is also how some backends report their own failure; only a clean finish counts."""
++        self._unchanged(running, json.dumps(envelope))
++
++
++class TestScanCost:
++    """The scan runs on the tool thread after the command finished: it must not hold the result."""
++
++    @pytest.mark.parametrize("command", [
++        "sleep 1; " + "while " * 500 + "do " * 500 + "; a" * 500,
++        "sleep 1\n" + "cat <<EOF\n" * 600,
++        "sleep 1; " + "'" * 3999,
++        "sleep 1; " + "for i in 1; do sleep 1; done; " * 250,
++        "sleep 60; ./kanban " + " ".join(f"--opt{i} v{i}" for i in range(400)) + " run",   # was exponential
++        "sleep 60; kanban " + "--a " * 1500,
++        "sleep 60; kanban " + "--a b " * 1200 + "run",
++        "sleep 60; kanban " + "--a=b " * 1200 + "run",
++        "sleep 60; sqlite3 " + "kanban.db " * 700,
++        "sleep 60; " + "kanban show " * 600,
++        "sleep 60; x kanban.db '" + "select " * 900,
++        "sleep 1; " + "$(" * 3000,
++        "sleep 1; " + "${" * 3000,
++        "sleep 1; " + '"$(' * 2000,
++    ])
++    def test_crafted_commands_are_scanned_quickly(self, command):
++        import time
++
++        assert len(command) <= wh.MAX_COMMAND_CHARS
++        started = time.monotonic()
++        wh.is_sleep_wait(command)
++        wh.awaited_card_id(command)
++        assert time.monotonic() - started < 1.0
++
++
++class TestHandlerPath:
++    """The real entry: the registered terminal handler, with a real tracked background process."""
++
++    def test_terminal_handler_adds_the_hint_for_a_live_background_process(self, tmp_path, monkeypatch):
++        from tools import terminal_tool as tt
++        from tools.process_registry import process_registry
++
++        monkeypatch.setattr(tt, "terminal_tool", lambda **kw: OK)  # no command ran: nothing was timed
++        monkeypatch.setattr(wh, "_running_processes", lambda task_id: [_proc()])
++        assert "wait_hint" not in json.loads(tt._handle_terminal({"command": "sleep 60; tail suite.log"}, task_id="task-handler"))
++        monkeypatch.undo()
++        monkeypatch.setattr(tt, "terminal_tool", lambda **kw: (wh.note_execute_seconds(600.0), OK)[1])
++        session = process_registry.spawn_local("sleep 30", cwd=str(tmp_path), task_id="task-handler")
++        session.notify_on_complete = False
++        try:
++            out = json.loads(tt._handle_terminal({"command": "sleep 60; tail suite.log"}, task_id="task-handler"))
++            assert f"session_id='{session.id}'" in out["wait_hint"]
++            plain = tt._handle_terminal({"command": "ls"}, task_id="task-handler")
++            assert "wait_hint" not in json.loads(plain)
++            other = tt._handle_terminal({"command": "sleep 60; tail suite.log"}, task_id="another-task")
++            assert "wait_hint" not in json.loads(other)
++            session.notify_on_complete = True
++            notified = tt._handle_terminal({"command": "sleep 60; tail suite.log"}, task_id="task-handler")
++            assert "wait_hint" not in json.loads(notified)
++        finally:
++            process_registry.kill_process(session.id)
++        after = json.loads(tt._handle_terminal({"command": "sleep 60; tail suite.log"}, task_id="task-handler"))
++        assert "wait_hint" not in after  # the process is gone: nothing better to wait on
++
++    def test_real_terminal_call_with_a_trailing_ampersand_gets_no_hint(self, tmp_path, monkeypatch):
++        """Unstubbed: the real terminal tool backgrounds `sleep 61 &` itself; that sleep is the only
++        running process of the task and must not be offered as something to wait on."""
++        from tools import terminal_tool as tt
++        from tools.process_registry import process_registry
++
++        monkeypatch.setenv("TERMINAL_ENV", "local")
++        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++        monkeypatch.setattr(wh, "MIN_ELAPSED_SECONDS", 0)  # the spawn returns at once: test the envelope gate alone
++        out = json.loads(tt._handle_terminal({"command": "sleep 61 &", "workdir": str(tmp_path)}, task_id="task-amp"))
++        try:
++            assert out.get("session_id") and out.get("auto_backgrounded"), out
++            assert "wait_hint" not in out
++        finally:
++            for proc in process_registry.running_owned_by("task-amp"):
++                process_registry.kill_process(proc.id)
++
++    def test_real_terminal_call_promoted_past_the_foreground_cap_gets_no_hint(self, tmp_path, monkeypatch):
++        """Unstubbed: timeout above the foreground cap makes the tool start the sleep in the background,
++        while another silent job of the task is running."""
++        from tools import terminal_tool as tt
++        from tools.process_registry import process_registry
++
++        monkeypatch.setenv("TERMINAL_ENV", "local")
++        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++        monkeypatch.setattr(wh, "MIN_ELAPSED_SECONDS", 0)  # the spawn returns at once: test the envelope gate alone
++        other = process_registry.spawn_local("sleep 30", cwd=str(tmp_path), task_id="task-promoted")
++        other.notify_on_complete = False
++        try:
++            out = json.loads(tt._handle_terminal(
++                {"command": "sleep 61; echo hi", "workdir": str(tmp_path), "timeout": tt.FOREGROUND_MAX_TIMEOUT + 100},
++                task_id="task-promoted"))
++            assert out.get("promoted_from_foreground"), out
++            assert "wait_hint" not in out
++        finally:
++            for proc in process_registry.running_owned_by("task-promoted"):
++                process_registry.kill_process(proc.id)
++
++    def test_terminal_handler_leaves_a_refusal_alone(self, tmp_path, monkeypatch):
++        from tools import terminal_tool as tt
++        from tools.process_registry import process_registry
++
++        refused = tt._error_json("Command blocked", status="blocked")
++        monkeypatch.setattr(tt, "terminal_tool", lambda **kw: (wh.note_execute_seconds(600.0), refused)[1])
++        session = process_registry.spawn_local("sleep 30", cwd=str(tmp_path), task_id="task-refused")
++        session.notify_on_complete = False
++        try:
++            assert tt._handle_terminal({"command": "sleep 60; tail suite.log"}, task_id="task-refused") is refused
++        finally:
++            process_registry.kill_process(session.id)
++
++
++    def test_only_the_commands_own_run_time_counts(self, monkeypatch):
++        """A call that spent 40 s before the command (approval, sandbox start, retries) and 1 s in it
++        did not wait: the handler's wall time is not what is measured."""
++        from tools import terminal_tool as tt
++
++        monkeypatch.setattr(wh, "_running_processes", lambda task_id: [_proc()])
++        monkeypatch.setattr(tt, "terminal_tool", lambda **kw: (wh.note_execute_seconds(1.2), OK)[1])
++        clock = iter([1000.0, 1041.0, 1042.0, 1043.0])
++        monkeypatch.setattr(tt.time, "monotonic", lambda: next(clock, 1050.0))
++        assert tt._handle_terminal({"command": "sleep 60; tail suite.log"}, task_id="task-clock") is OK
++        monkeypatch.setattr(tt, "terminal_tool", lambda **kw: (wh.note_execute_seconds(47.5), OK)[1])
++        out = json.loads(tt._handle_terminal({"command": "sleep 60; tail suite.log"}, task_id="task-clock"))
++        assert "timeout=47)" in out["wait_hint"] and "(47s)" in out["wait_hint"]
++
++    def test_a_time_left_by_an_earlier_call_is_not_reused(self, monkeypatch):
++        from tools import terminal_tool as tt
++
++        monkeypatch.setattr(wh, "_running_processes", lambda task_id: [_proc()])
++        wh.note_execute_seconds(600.0)  # e.g. an earlier call whose result was never annotated
++        monkeypatch.setattr(tt, "terminal_tool", lambda **kw: OK)
++        assert tt._handle_terminal({"command": "sleep 60; tail suite.log"}, task_id="task-stale") is OK
++        assert wh.take_execute_seconds() is None
++
++    def test_real_foreground_command_is_timed_by_its_execution(self, tmp_path, monkeypatch):
++        """Unstubbed: `sleep 1` through the real terminal tool, with a real tracked job running. The
++        timed value is the command's own run (about 1 s), which the lowered floor lets through."""
++        from tools import terminal_tool as tt
++        from tools.process_registry import process_registry
++
++        monkeypatch.setenv("TERMINAL_ENV", "local")
++        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++        monkeypatch.setattr(wh, "MIN_SLEEP_SECONDS", 1)
++        job = process_registry.spawn_local("sleep 30", cwd=str(tmp_path), task_id="task-real")
++        job.notify_on_complete = False
++        try:
++            monkeypatch.setattr(wh, "MIN_ELAPSED_SECONDS", 30)
++            quick = json.loads(tt._handle_terminal({"command": "sleep 1; echo hi", "workdir": str(tmp_path)}, task_id="task-real"))
++            assert quick["exit_code"] == 0 and "wait_hint" not in quick  # ran 1 s: under the real floor
++            monkeypatch.setattr(wh, "MIN_ELAPSED_SECONDS", 0.9)
++            out = json.loads(tt._handle_terminal({"command": "sleep 1; echo hi", "workdir": str(tmp_path)}, task_id="task-real"))
++            # About 1 s; a loaded runner may stretch it, never to the 30 s a whole-suite stall would need.
++            import re
++            m = re.search(rf"session_id='{job.id}', timeout=(\d+)\)", out["wait_hint"])
++            assert m and 1 <= int(m.group(1)) < 20, out["wait_hint"]
++        finally:
++            process_registry.kill_process(job.id)
++
++    def test_a_failing_time_note_never_reruns_the_command(self, tmp_path, monkeypatch):
++        """The note is taken inside the retry loop: if it raised, a finished command would run again."""
++        from tools import terminal_tool as tt
++
++        def boom(seconds):
++            raise RuntimeError("thread-local gone")
++
++        monkeypatch.setenv("TERMINAL_ENV", "local")
++        monkeypatch.setattr(wh, "note_execute_seconds", boom)
++        marker = tmp_path / "runs.txt"
++        out = json.loads(tt._handle_terminal({"command": f"echo ran >> {marker}; echo ok", "workdir": str(tmp_path)}, task_id="task-note"))
++        assert out["exit_code"] == 0 and "ok" in out["output"]
++        assert marker.read_text().count("ran") == 1
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index e22bedff5c93ffd1b6b92993b311a44b4d0f4694..61ed33711d91abeb5b7d5682bfb5ba690b45cfcf 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -1448,6 +1448,16 @@ def _survivable_foreground(command: str, env: Any, plan: _ExecPlan, *, task_id:
+     return SurvivableForeground(command=command, task_id=eff, owner_task_id=task_id or eff, session_key=session_key)
+ 
+ 
++def _note_execute_seconds(seconds: float) -> None:
++    """Never raises: it is called inside the retry ``try``, where an exception would re-run a
++    command that already finished."""
++    try:
++        from tools.terminal_tool_wait_hint import note_execute_seconds
++        note_execute_seconds(seconds)
++    except Exception:
++        logger.debug("wait hint: could not record the command's run time", exc_info=True)
++
++
+ def _run_foreground(
+     command: str, env: Any, plan: _ExecPlan, *,
+     task_id: Optional[str], session_id: Optional[str], session_key: str, cwd_key: str,
+@@ -1487,8 +1497,11 @@ def _run_foreground(
+             result = None
+             oom_watch = OomWatch(survivable) if env_type == "local" else None  # OOM kills in its scope [daveey]
+             try:
++                _execute_started = time.monotonic()
+                 result = env.execute(command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
+                                      **exec_kwargs)
++                # This attempt's own run time, for the wait hint: not approval, sandbox start or retries.
++                _note_execute_seconds(time.monotonic() - _execute_started)
+             finally:
+                 if survivable is not None:
+                     survivable.release(result)
+@@ -1887,7 +1900,9 @@ def _handle_terminal(args, **kw):
+             )
+     if heartbeat:
+         notify_on_complete = True  # the heartbeat rides the completion delivery path
+-    return terminal_tool(
++    from tools.terminal_tool_wait_hint import annotate as _annotate_wait_hint, take_execute_seconds
++    take_execute_seconds()  # drop anything an earlier call on this thread left unread
++    return _annotate_wait_hint(terminal_tool(
+         command=args.get("command"),
+         background=args.get("background", False),
+         timeout=args.get("timeout"),
+@@ -1900,7 +1915,8 @@ def _handle_terminal(args, **kw):
+         heartbeat=heartbeat,
+         persist_on_release=persist_on_release,
+         http_readback=args.get("http_readback", False),
+-    )
++    ), args.get("command"), background=bool(args.get("background", False)), task_id=kw.get("task_id"),
++        elapsed_seconds=take_execute_seconds())
+ 
+ 
+ registry.register(
+diff --git a/tools/terminal_tool_wait_hint.py b/tools/terminal_tool_wait_hint.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..55ddfa7fba959215a2c8f2600342b264b8265236
+--- /dev/null
++++ b/tools/terminal_tool_wait_hint.py
+@@ -0,0 +1,302 @@
++"""A note on a foreground ``sleep``/poll command that had something better to wait on. [daveey]
++
++Measured on the hub over 7 days: 52 h of agent time in 2,838 terminal calls of the shape
++``sleep 540; tail run.log`` or ``sleep 150; hermes kanban show t_...``. Half waited on a background
++process the same session had started (``process_manage(action="wait")`` returns the moment it exits);
++28% re-read the status of another card (a Kanban worker can park on that card).
++
++This only ADDS a ``wait_hint`` field to the result of a foreground command that ran to an exit
++status. It never refuses or rewrites a command, and its own work is linear in the command length
++(longer commands are skipped), so a wrong match costs one sentence, not a lost or late result.
++
++A hint is only given for a command whose own execution held the call for half a minute or more
++(the successful ``env.execute`` attempt, timed in ``_run_foreground``; not the text, and not the
++approval wait, sandbox start or retries around it), and the process hint carries ``timeout=<that measured
++time>``: following it never blocks longer than the command it replaces, even when the named process
++turns out to be a server that never exits. Beyond that it prefers silence to a wrong hint. No hint for: a result that is not a plain finished command
++(refused, errored, degraded, yielded, or turned into a background process), a sleep followed by a
++look at something outside this machine's own job (a service probe, CI, a remote host), a process
++that is a server or already notifies on exit, and a worker reading its own card. Shell text that is
++data (quotes, heredoc bodies, comments) is not read as commands.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++import re
++import threading
++
++logger = logging.getLogger(__name__)
++
++# Commands longer than this are not examined: the scan below is linear, this bounds it outright.
++MAX_COMMAND_CHARS = 8000
++# Shortest single sleep worth a note; anything shorter is a settle delay, not a wait.
++MIN_SLEEP_SECONDS = 60
++# Shortest sleep inside a shell loop that makes the loop a poll loop.
++MIN_LOOP_SLEEP_SECONDS = 5
++# A command that returned faster than this did not wait on anything (a readiness loop that hit at
++# once, a sleep in an untaken branch or a function body): no hint.
++MIN_ELAPSED_SECONDS = 30
++_UNIT_SECONDS = {"": 1, "s": 1, "m": 60, "h": 3600}
++
++_HEREDOC_START_RE = re.compile(r"<<-?[ \t]*\\?['\"]?([^\s'\"|;&<>()]+)")
++_SEGMENT_SPLIT_RE = re.compile(r"[;&|\n(){}]+")
++_BACKGROUNDED_RE = re.compile(r"\s*&(?!&)")  # the separator after a command is a lone `&`
++_SLEEP_SEGMENT_RE = re.compile(r"(?:(?:do|then|else)\s+)*sleep\s+(\d{1,7}(?:\.\d{1,3})?)([smh]?)(?:\s|$)")
++_LOOP_START_RE = re.compile(r"(?:while|until|for)\b")
++_DO_RE = re.compile(r"do(?:\s|$)")
++_DONE_RE = re.compile(r"done\b")
++
++# What the command looks at after sleeping is not this session's own job: a listening service, CI,
++# another host. A wait on the running process would be the wrong advice (often it is the server).
++_ELSEWHERE_RE = re.compile(
++    r"\b(?:curl|wget|nc|ncat|http|https|pg_isready|redis-cli|lsof|gh|docker|kubectl|ssh|aws|gcloud|systemctl|launchctl)\b"
++    r"|\blocalhost\b|\b127\.0\.0\.1\b|\b0\.0\.0\.0\b|https?://|\bss\s+-")
++# A background command that serves or watches until killed: waiting for it to exit never returns.
++_SERVER_COMMAND_RE = re.compile(
++    r"\b(?:serve|server|runserver|uvicorn|gunicorn|hypercorn|vite|webpack|nodemon|watch|tail\s+-[a-zA-Z]*[fF])\b"
++    r"|\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:dev|start|preview)\b|http\.server|--watch\b")
++
++# `kanban [--flag [value]]... show <id>` as a command word in code (not in a quoted string, not a path
++# component). Each flag token matches one way only, so the cost is linear; an earlier pattern that
++# let a flag match two ways backtracked exponentially.
++_CARD_SHOW_RE = re.compile(r"(?<![\w/.-])kanban\s+(?:--[\w-]+(?:=\S+|\s+[^\s-]\S*)?\s+)*show\s+(t_[0-9a-f]{8,})\b")
++# sqlite3 on a board database with a statement that STARTS with select and filters on id = <card>.
++_CARD_QUERY_RE = re.compile(
++    r"\bsqlite3\b[^;|&\n]{0,200}?(?:kanban\.db|sync-shadow/[\w.-]{1,80}\.db)(?![\w.])\s+[\"']\s*select\b"
++    r"[^;|&\n]{0,400}?(?<![\w.])id\s*=\s*[\"']?(t_[0-9a-f]{8,})\b", re.IGNORECASE)
++
++
++_measured = threading.local()
++
++
++def note_execute_seconds(seconds: float) -> None:
++    """Record how long the foreground command of the current terminal call ran (same thread)."""
++    _measured.seconds = seconds
++
++
++def take_execute_seconds() -> float | None:
++    """The recorded run time of this thread's last foreground command, cleared on read; ``None``
++    when no command ran to completion (refused, failed, backgrounded) since the last read."""
++    seconds = getattr(_measured, "seconds", None)
++    _measured.seconds = None
++    return seconds
++
++
++def _held_the_call(elapsed_seconds) -> bool:
++    return (isinstance(elapsed_seconds, (int, float)) and not isinstance(elapsed_seconds, bool)
++            and elapsed_seconds >= MIN_ELAPSED_SECONDS)
++
++
++def _drop_heredoc_bodies(command: str) -> str:
++    """``command`` without heredoc bodies (their lines are data). A ``<<`` that is not a heredoc may
++    swallow the rest of the command, which only makes the scan see less."""
++    kept, pending = [], []
++    for line in command.split("\n"):
++        if pending:
++            if line.strip() == pending[0]:
++                pending.pop(0)
++            continue
++        kept.append(line)
++        pending = _HEREDOC_START_RE.findall(line)
++    return "\n".join(kept)
++
++
++def _skip_group(text: str, start: int, opener: str, closer: str) -> int:
++    """Index just past the group opened at ``start`` (nesting counted); end of text if unclosed."""
++    depth, i = 0, start
++    while i < len(text):
++        if text[i] == opener:
++            depth += 1
++        elif text[i] == closer:
++            depth -= 1
++            if depth == 0:
++                return i + 1
++        i += 1
++    return len(text)
++
++
++def _code_only(command: str) -> str:
++    """Shell text with data blanked, in one pass: quoted strings (``'..'``, ``".."``, ``$'..'``) and
++    expansions (``${..}``, ``$(..)``) become one opaque word; comments and heredoc bodies are removed."""
++    out, i, text = [], 0, _drop_heredoc_bodies(command)
++    while i < len(text):
++        ch = text[i]
++        nxt = text[i + 1] if i + 1 < len(text) else ""
++        if ch == "\\":
++            i += 2  # an escaped character is never a quote, separator or comment start
++            continue
++        if ch == "$" and nxt in "{(":
++            i = _skip_group(text, i + 1, nxt, "}" if nxt == "{" else ")")
++            out.append(" V ")
++            continue
++        if ch in "'\"" or (ch == "$" and nxt == "'"):
++            ansi_c = ch == "$"
++            quote = "'" if ansi_c else ch
++            i += 2 if ansi_c else 1
++            while i < len(text) and text[i] != quote:
++                if quote == '"' and text.startswith("$(", i):
++                    i = _skip_group(text, i + 1, "(", ")")  # a substitution's own quotes do not close ours
++                else:
++                    # Backslash escapes exist inside ".." and $'..', not inside plain '..'.
++                    i += 2 if text[i] == "\\" and (ansi_c or quote == '"') else 1
++            i += 1
++            out.append(" Q ")  # the string stays one opaque word, so the text around it is not joined
++            continue
++        if ch == "#" and (not out or out[-1][-1].isspace() or out[-1][-1] in ";&|(){}"):
++            while i < len(text) and text[i] != "\n":
++                i += 1
++            continue
++        out.append(ch)
++        i += 1
++    return "".join(out)
++
++
++def _sleeps(code: str) -> list[tuple[float, bool]]:
++    """``(seconds, inside a loop body)`` for each foreground ``sleep N`` that is a command of its own
++    (a sleep followed by a lone ``&`` runs in the background and does not hold the call)."""
++    found, depth, pos = [], 0, 0
++    for sep in [*_SEGMENT_SPLIT_RE.finditer(code), None]:
++        segment = code[pos:sep.start() if sep else len(code)].strip()
++        backgrounded = bool(sep and _BACKGROUNDED_RE.match(sep.group()))
++        pos = sep.end() if sep else len(code)
++        if not segment:
++            continue
++        if _DONE_RE.match(segment):
++            depth = max(0, depth - 1)
++            continue
++        if _DO_RE.match(segment):
++            depth += 1
++        elif _LOOP_START_RE.match(segment):
++            continue
++        m = _SLEEP_SEGMENT_RE.match(segment)
++        if m and not backgrounded:
++            found.append((float(m.group(1)) * _UNIT_SECONDS[m.group(2)], depth > 0))
++    return found
++
++
++def _wait_sleeps(command: str) -> list[tuple[float, bool]]:
++    if not command or len(command) > MAX_COMMAND_CHARS:
++        return []
++    return [(seconds, in_loop) for seconds, in_loop in _sleeps(_code_only(command))
++            if seconds >= MIN_SLEEP_SECONDS or (in_loop and seconds >= MIN_LOOP_SLEEP_SECONDS)]
++
++
++def is_sleep_wait(command: str) -> bool:
++    """True for a command that waits by sleeping: a literal foreground sleep of a minute or more, or
++    one of 5 s or more inside a shell loop body. Quotes, expansions, heredocs and comments do not count."""
++    return bool(_wait_sleeps(command))
++
++
++def awaited_card_id(command: str, *, own_card: str | None = None) -> str | None:
++    """The one card whose status the command reads (``kanban show <id>`` in code, or a board DB
++    ``select ... id = <id>``), if it is not ``own_card``."""
++    command = command or ""
++    if len(command) > MAX_COMMAND_CHARS:
++        return None
++    ids = {*_CARD_SHOW_RE.findall(_code_only(command)), *_CARD_QUERY_RE.findall(command)}
++    if len(ids) != 1:
++        return None
++    card = ids.pop()
++    return None if card == (own_card or "").strip() else card
++
++
++def _running_processes(task_id: str | None) -> list:
++    if not task_id:
++        return []
++    try:
++        from tools.process_registry import process_registry
++        return process_registry.running_owned_by(task_id)
++    except Exception:
++        logger.debug("wait hint: process lookup failed", exc_info=True)
++        return []
++
++
++def _waitable_process(command: str, task_id: str | None):
++    """The newest running job of this task that a wait would help with, or ``None``: none when the
++    command looks elsewhere after sleeping, and never a server or a process that notifies on exit."""
++    if _ELSEWHERE_RE.search(command):
++        return None
++    candidates = [p for p in _running_processes(task_id)
++                  if not getattr(p, "notify_on_complete", False)
++                  and not _SERVER_COMMAND_RE.search(getattr(p, "command", "") or "")]
++    return max(candidates, key=lambda p: getattr(p, "started_at", 0) or 0) if candidates else None
++
++
++def _shown_command(proc) -> str:
++    """The process command, redacted BEFORE it is shortened (a cut token no longer matches)."""
++    try:
++        from agent.redact import redact_sensitive_text
++        return redact_sensitive_text(getattr(proc, "command", "") or "", code_file=True)[:80]
++    except Exception:
++        logger.debug("wait hint: could not redact the process command; showing none", exc_info=True)
++        return ""
++
++
++def wait_hint(command: str, task_id: str | None, elapsed_seconds: float | None, *,
++              kanban_task: str | None = None) -> str | None:
++    """The note for ``command``, which took ``elapsed_seconds``, or ``None`` when it is not a
++    sleep-wait, returned quickly, or nothing better exists. ``kanban_task`` is this worker's own
++    card ("" for a chat); default: ``HERMES_KANBAN_TASK``."""
++    if not _held_the_call(elapsed_seconds) or not is_sleep_wait(command):
++        return None
++    if kanban_task is None:
++        kanban_task = os.environ.get("HERMES_KANBAN_TASK") or ""
++    kanban_task = kanban_task.strip()
++    parts = []
++    proc = _waitable_process(command, task_id)
++    if proc is not None:
++        seconds = int(min(elapsed_seconds, 86400))
++        parts.append(
++            f"Background process {proc.id} ({_shown_command(proc)}) is still running. If this command was "
++            f"waiting for it to finish, process_manage(action='wait', session_id='{proc.id}', timeout={seconds}) "
++            f"waits no longer than this command ran ({seconds}s) but returns the moment the process exits, "
++            "with its output; use that instead of sleeping and reading its log.")
++    card = awaited_card_id(command, own_card=kanban_task)
++    if card:
++        if kanban_task:
++            parts.append(
++                f"To wait on card {card}, park this card instead of sleeping: kanban_schedule or kanban_block "
++                f"with awaiting={{'kind': 'card', 'ref': '{card}'}} (add gateway=<name> if it lives on another "
++                "gateway). This card wakes when that one finishes, and the worker slot is free meanwhile.")
++        else:
++            parts.append(
++                f"If this chat created card {card} (kanban_create), its result is delivered here when it "
++                "finishes: end the turn instead of sleeping and re-reading its status.")
++    return " ".join(parts) or None
++
++
++# Keys that mark a result as something other than a foreground command that ran to an exit status:
++# an outcome label, or a command the tool turned into a tracked background process (a trailing `&`,
++# a timeout above the foreground cap) - its own sleep is then the "running process".
++_NOT_A_FINISHED_COMMAND_KEYS = ("status", "session_id", "pid", "auto_backgrounded", "promoted_from_foreground", "wait_hint")
++
++
++def annotate(result: str, command, *, background: bool, task_id: str | None, elapsed_seconds: float | None) -> str:
++    """``result`` (the terminal tool's JSON) with ``wait_hint`` added when one applies.
++    ``elapsed_seconds`` is how long the command itself ran (``take_execute_seconds``). Unchanged for a background call, a non-string
++    command, a non-JSON result, and any result that is not a foreground command that finished
++    cleanly: only ``exit_code == 0`` with no ``error``, no ``status`` and no sign of a spawn counts.
++    (A non-zero status is also what a cut-short command, an interrupt and some backend failures
++    report, and they cannot be told apart here.)"""
++    if background or not isinstance(command, str) or not isinstance(result, str):
++        return result
++    try:
++        if not _held_the_call(elapsed_seconds) or not is_sleep_wait(command):
++            return result
++        data = json.loads(result)
++        if not isinstance(data, dict) or any(key in data for key in _NOT_A_FINISHED_COMMAND_KEYS):
++            return result
++        exit_code = data.get("exit_code")
++        if isinstance(exit_code, bool) or exit_code != 0 or not isinstance(exit_code, int) or data.get("error"):
++            return result
++        hint = wait_hint(command, task_id, elapsed_seconds)
++        if not hint:
++            return result
++        data["wait_hint"] = hint
++        return json.dumps(data, ensure_ascii=False)
++    except Exception:
++        logger.debug("wait hint skipped", exc_info=True)
++        return result  # a hint must never cost the caller its result
+-- 
+2.43.0
+

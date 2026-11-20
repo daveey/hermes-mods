@@ -1,0 +1,250 @@
+From 8ce8e91bd9a90388daa7beccf78fdeabea54ed62 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 07:39:24 +0000
+Subject: [PATCH] fix(kanban): propose recovery for pins absent from fresh
+ registry [daveey]
+
+Revoked machines disappear from the active-list registry, so requiring an
+entry prevented their creator-owned cards from reaching Board adjudication.
+Propose stale_pin for a single absent pin only after fresh valid membership
+and the existing current portability/never-ran checks. The Board remains the
+only assignment authority and distinguishes revoked from unknown names.
+
+Validate raw registry shape before marking a fetch successful: missing or
+malformed membership must not normalize to a fresh empty set. Keep cached
+last-good offline discovery, but deny recovery after failed refresh. Reuse
+the revision/cooldown refusal cache for pin_not_stale to bound unknown-name
+proposals. Preserve owner move, CAS/source, labels, and active/held handling.
+
+Proof: new regressions fail on base (11 failures); initial focused GREEN
+47 passed. Added malformed-after-last-good and absent owner-move controls.
+Whole-tree scripts/check passes all 20 checks. Direct consumer suite is
+recorded on implementation card t_9d4bd881aa780900. Controlled deployed Board
+fixture proof remains with parent t_334f72cc1c030696 after deployment.
+---
+ hermes_cli/kanban_placement_recovery.py       |  10 +-
+ hermes_cli/kanban_worker_node.py              |   7 +-
+ hermes_cli/kanban_worker_placement.py         |   6 +-
+ .../test_kanban_absent_pin_recovery.py        | 107 ++++++++++++++++++
+ .../test_kanban_recovery_guard_isolation.py   |   5 +-
+ .../test_kanban_stale_pin_recovery.py         |   3 +-
+ 6 files changed, 131 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_absent_pin_recovery.py
+
+diff --git a/hermes_cli/kanban_placement_recovery.py b/hermes_cli/kanban_placement_recovery.py
+index 13d7d78b0b0951f621457d202aaea7a19f7a5cee..ce6792d0c60edee8c7fea3773cce52dd07dfc13f 100644
+--- a/hermes_cli/kanban_placement_recovery.py
++++ b/hermes_cli/kanban_placement_recovery.py
+@@ -90,7 +90,15 @@ def recovery_mode(conn, row, cfg, *, board="default"):
+     names = [label.removeprefix("machine:") for label in labels or [] if label.startswith("machine:")]
+     if len(names) != 1:
+         return None
+-    entry = ((node.registry(require_fresh=True) or {}).get("machines") or {}).get(names[0])
++    snapshot = node.registry(require_fresh=True)
++    machines = snapshot.get("machines") if isinstance(snapshot, dict) else None
++    if not isinstance(machines, dict):
++        return None
++    if names[0] not in machines:
++        # Active-list discovery omits revoked names. Only the Board can distinguish
++        # a retired pin from an unknown name; absence is a proposal, not authority.
++        return "stale_pin" if current_portable(conn, row, cfg) else None
++    entry = machines[names[0]]
+     if not isinstance(entry, dict):
+         return None
+     seen = entry.get("last_seen")
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index b3cb70ee1ecdf74e7fa649ae89a44182f3828106..1ceb511e53bae1bd393681be8b28323fc73877c4 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -253,11 +253,16 @@ def _registry_locked() -> Optional[Mapping[str, Any]]:
+         fetch = hub.machines
+     try:
+         raw = fetch()
++        machines = raw.get("machines") if isinstance(raw, dict) else None
++        if (not isinstance(machines, list) or any(
++                not isinstance(m, dict) or not isinstance(m.get("name"), str) or not m["name"].strip()
++                for m in machines) or len({m["name"] for m in machines}) != len(machines)):
++            raise ValueError("malformed machine registry")
++        value = {"me": raw.get("me"), "machines": {m["name"]: m for m in machines}}
+     except Exception as exc:  # health: allow BLE001 -- registry unreachable: pick up nothing this tick
+         _REGISTRY.update(at=time.monotonic(), retry=True)
+         _log.info("kanban worker node: machine registry unavailable (%s: %s)", type(exc).__name__, exc)
+         return _REGISTRY["value"]
+-    value = {"me": raw.get("me"), "machines": {m["name"]: m for m in raw.get("machines") or [] if m.get("name")}}
+     now = time.monotonic()
+     _REGISTRY.update(at=now, value=value, retry=False, ok_at=now)
+     return value
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index f95c8e58967284aa31a23f3ae3d7acd07f60d19e..0149e189707ea2966d6979eb18f40fe140eb25e9 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -14,8 +14,8 @@ POLICY = "worker-first-v1"
+ WAITING = "waiting_for_worker_capacity"
+ MAX_RESERVES_PER_TICK = 4
+ DISPATCH_NETWORK_BUDGET_S = 2.0
+-# A 409 not_claimable means the Board row moved on (leased, or not ready) and this copy has not pulled it yet.
+-# Re-asking at the same revision every dispatcher tick only repeats the refusal; wait for a new revision instead.
++# A 409 not_claimable means the Board row moved on (leased, or not ready); pin_not_stale rejects recovery.
++# Re-asking the same revision every tick repeats the refusal; retry after a new revision or bounded cooldown.
+ NOT_CLAIMABLE_BACKOFF_S = 600.0
+ _refused: dict[tuple[str, str], tuple[int, float]] = {}  # (board, task) -> (refused revision, retry after)
+ # (board, task) -> revision at which the Board refused the worker-first self-check's repin: any 4xx but
+@@ -465,6 +465,8 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None, may_pull=True):
+                     continue
+                 fence = None
+                 _remember_refusal(refusals, key, row["sync_version"], exc)
++                if mode == "stale_pin" and rejection_code(exc) == "pin_not_stale":
++                    _refused[key] = (row["sync_version"], now + NOT_CLAIMABLE_BACKOFF_S)
+                 if rejection_code(exc) == "not_claimable":
+                     # The Board already has it leased or not ready: our copy is behind. Back off at this revision.
+                     _refused[key] = (row["sync_version"], now + NOT_CLAIMABLE_BACKOFF_S)
+diff --git a/tests/hermes_cli/test_kanban_absent_pin_recovery.py b/tests/hermes_cli/test_kanban_absent_pin_recovery.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3721af0f42ced48cfc3638500977cec21d5a186c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_absent_pin_recovery.py
+@@ -0,0 +1,107 @@
++"""Fresh active-list absence proposes Board adjudication, not local reassignment."""
++import pytest
++
++from hermes_cli import kanban_placement_recovery as recovery
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_worker_node as node
++from hermes_cli import kanban_worker_placement as wp
++from tests.hermes_cli import test_kanban_placement_recovery as fixtures
++
++conn = fixtures.conn
++setup = fixtures.setup
++
++
++@pytest.fixture
++def registry(monkeypatch):
++    clock = [100.0]
++    monkeypatch.setattr(node.time, "monotonic", lambda: clock[0])
++    monkeypatch.setattr(node, "_REGISTRY", dict(at=None, value=None, retry=False, ok_at=None))
++    monkeypatch.setattr(node, "_FETCH", lambda: {"machines": []})
++    return clock
++
++
++def test_absent_pin_proposes_board_with_revision_and_retains_labels(setup, registry):
++    db, hub = setup
++    tid = fixtures.make(db, runs_on='["machine:retired", "linux"]')
++    row = dict(db.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++    assert recovery.recovery_mode(db, row, {}) == "stale_pin"
++    assert wp.reevaluate(db, hub, "default", "hub") == 1
++    assert hub.calls == [("default", {"task_id": tid, "expected_revision": 4,
++                                     "mode": "stale_pin", "candidates": ["worker-2"]})]
++    assert dict(db.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()) == row
++
++
++def test_unknown_name_board_refusal_is_unchanged_and_bounded(setup, registry):
++    db, hub = setup
++    tid = fixtures.make(db, runs_on='["machine:unknown", "linux"]')
++    before = dict(db.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++
++    def reject(board, **body):
++        hub.calls.append((board, body))
++        raise client.HubError(409, '{"error":"pin_not_stale"}')
++
++    hub.recover = reject
++    assert wp.reevaluate(db, hub, "default", "hub") == 0
++    assert len(hub.calls) == 1
++    assert dict(db.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()) == before
++    assert wp.reevaluate(db, hub, "default", "hub") == 0
++    assert len(hub.calls) == 1
++    registry[0] += 601
++    wp.reevaluate(db, hub, "default", "hub")
++    assert len(hub.calls) == 2
++
++
++@pytest.mark.parametrize("raw", [None, {}, [], {"machines": None}, {"machines": {}},
++                                     {"machines": [None]}, {"machines": [{}]},
++                                     {"machines": [{"name": 3}]},
++                                     {"machines": [{"name": "x"}, {"name": "x"}]}])
++@pytest.mark.parametrize("had_good", [False, True])
++def test_malformed_registry_never_becomes_fresh_absence(setup, registry, monkeypatch, raw, had_good):
++    db, hub = setup
++    fixtures.make(db, runs_on='["machine:retired"]')
++    if had_good:
++        assert node.registry(require_fresh=True) == {"me": None, "machines": {}}
++        registry[0] += node.REGISTRY_TTL_S + 1
++    monkeypatch.setattr(node, "_FETCH", lambda: raw)
++    assert node.registry(require_fresh=True) is None
++    assert wp.reevaluate(db, hub, "default", "hub") == 0
++    assert not hub.calls
++
++
++@pytest.mark.parametrize("had_good", [False, True])
++def test_outage_or_expired_last_good_cannot_propose_absence(setup, registry, monkeypatch, had_good):
++    db, hub = setup
++    fixtures.make(db, runs_on='["machine:retired"]')
++    if had_good:
++        assert node.registry(require_fresh=True) == {"me": None, "machines": {}}
++        registry[0] += node.REGISTRY_TTL_S + 1
++
++    def offline():
++        raise OSError("offline")
++
++    monkeypatch.setattr(node, "_FETCH", offline)
++    assert wp.reevaluate(db, hub, "default", "hub") == 0
++    assert not hub.calls
++
++
++@pytest.mark.parametrize("fields", [
++    {"requires": '["host_repo"]'}, {"workspace_kind": "worktree"},
++    {"workspace_path": "/unpublished"}, {"lease_holder": "retired", "lease_expires": 1},
++    {"claim_lock": "owner"}, {"status": "running"}, {"status": "review"},
++    {"created_on": "other"}, {"sync_version": None}, {"body": "Read credentials on the hub"},
++    {"runs_on": '["machine:retired", "machine:other"]'},
++])
++def test_absence_retains_independent_fences(setup, registry, fields):
++    db, hub = setup
++    fixtures.make(db, **{"runs_on": '["machine:retired"]', **fields})
++    assert wp.reevaluate(db, hub, "default", "hub") == 0
++    assert not hub.calls
++
++
++def test_absence_does_not_recover_previously_run_card(setup, registry):
++    db, hub = setup
++    tid = fixtures.make(db, runs_on='["machine:retired"]')
++    db.execute("INSERT INTO task_runs(task_id,profile,status,started_at) VALUES (?, 'default', 'done', 1)", (tid,))
++    db.commit()
++    assert wp.reevaluate(db, hub, "default", "hub") == 0
++    assert not hub.calls
+diff --git a/tests/hermes_cli/test_kanban_recovery_guard_isolation.py b/tests/hermes_cli/test_kanban_recovery_guard_isolation.py
+index b5b9d06fe8223acb73077442c1f0d36f9824aa06..9f08395665bcc81ebe097041fa265515134fa660 100644
+--- a/tests/hermes_cli/test_kanban_recovery_guard_isolation.py
++++ b/tests/hermes_cli/test_kanban_recovery_guard_isolation.py
+@@ -31,12 +31,13 @@ def test_snapshot_fence_without_pending_outbox(setup, change):
+     assert not recovery.unchanged_ready(db, row)
+ 
+ 
+-def test_pending_owner_move_preempts_stale_recovery(setup, monkeypatch):
++@pytest.mark.parametrize("machines", [{"worker-1": {"state": "revoked"}}, {}])
++def test_pending_owner_move_preempts_stale_recovery(setup, monkeypatch, machines):
+     db, _ = setup
+     tid = fixtures.fixtures.acknowledged(db, placement_policy=wp.POLICY, runs_on='["machine:worker-1"]')
+     kb._append_event(db, tid, "moved", {"runs_on": ["machine:worker-2"]})
+     db.commit()
+-    monkeypatch.setattr(node, "registry", lambda **kw: {"machines": {"worker-1": {"state": "revoked"}}})
++    monkeypatch.setattr(node, "registry", lambda **kw: {"machines": machines})
+     row = dict(db.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
+     assert wp.requested_move(db, tid) == ["machine:worker-2"]
+     assert recovery.recovery_mode(db, row, {}) is None
+diff --git a/tests/hermes_cli/test_kanban_stale_pin_recovery.py b/tests/hermes_cli/test_kanban_stale_pin_recovery.py
+index 98a671d7b0ced44a53218c729871c88f826a6c4d..ef436c6e58736b21ee6021eedd60027092508f54 100644
+--- a/tests/hermes_cli/test_kanban_stale_pin_recovery.py
++++ b/tests/hermes_cli/test_kanban_stale_pin_recovery.py
+@@ -26,7 +26,8 @@ def test_stale_pin_recovery_requests_board_recheck(setup, monkeypatch, entry):
+         "machine:worker-1", "linux"]
+ 
+ 
+-@pytest.mark.parametrize("registry", [None, {}, {"machines": {}},
++@pytest.mark.parametrize("registry", [None, {}, {"machines": None},
++    {"machines": {"worker-1": None}},
+     {"machines": {"worker-1": {"state": "active"}}},
+     {"machines": {"worker-1": {"state": "active", "last_seen": "bad"}}},
+     {"machines": {"worker-1": {"state": "active", "last_seen": 0}}},
+-- 
+2.43.0
+

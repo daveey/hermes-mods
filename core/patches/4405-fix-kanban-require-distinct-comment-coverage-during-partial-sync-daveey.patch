@@ -1,0 +1,150 @@
+From 93b03fd7aaf99356392a7e27a3240e74f69716c8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 04:04:47 +0000
+Subject: [PATCH] fix(kanban): require distinct comment coverage during partial
+ sync [daveey]
+
+Review found that two legacy events could independently resolve to one already-read comment, releasing content absent from a partial import. Require injective event-to-row coverage in every connected candidate component before accepting acknowledgements. Include own, old and un-attributed events in coverage, since their rows cannot stand in for missing foreign content. Matching establishes completeness only; still list every plausible legacy candidate, preserving the conservative watermark policy and 60-minute default. System paths are unchanged.
+
+Proof: expanded reviewer reproducer RED with nine failures on the previous published head. GREEN: 125 tests across import/unread suites and all four requested regression guards (29 tests). New cases cover all manual surfaces, mixed UID/legacy events, own/no-session siblings, no-mutation refusal, sync recovery, augmenting paths and Hall-deficient graphs. Five additional lifecycle consumer files: 21 passed, 10 pre-existing skips. All scripts/check checks passed. No existing fixtures needed --seen. Advisory independent diff review found no correctness issues; final exact-head review and CI remain required. Card t_9ef4956ed2ea24fe; addresses review 5908786859 on PR #3133.
+---
+ hermes_cli/kanban_release_comments.py         | 59 ++++++++++++++++++-
+ .../test_kanban_release_imported_comments.py  | 42 +++++++++++++
+ 2 files changed, 99 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_release_comments.py b/hermes_cli/kanban_release_comments.py
+index 29b36105f90e6419cdb43abf81bfa5a1f520e39c..ae0eb3919180687f0e74fe723a06cc2a791c76a4 100644
+--- a/hermes_cli/kanban_release_comments.py
++++ b/hermes_cli/kanban_release_comments.py
+@@ -35,11 +35,16 @@ def check(conn, tid, *, session, seen=None, verb="unblock", board=None):
+     if not events:
+         return
+     rows = conn.execute("SELECT * FROM task_comments WHERE task_id=? ORDER BY id", (tid,)).fetchall()
++    all_events = conn.execute(
++        "SELECT * FROM task_events WHERE task_id=? AND kind='commented'", (tid,),
++    ).fetchall()
++    resolved = {e["id"]: _resolve(rows, e, json.loads(e["payload"] or "{}")) for e in all_events}
++    missing = _missing_coverage(resolved)
+     comments = []
+     for event in events:
+         payload = json.loads(event["payload"])
+-        candidates = _resolve(rows, event, payload)
+-        if not candidates:
++        candidates = resolved[event["id"]]
++        if event["id"] in missing:
+             # A partial sync must not turn missing comment data into permission.
+             comments.append(_listing(None, "Comment data unavailable; wait for sync and read again. --seen cannot "
+                                      "acknowledge missing data.", event, payload))
+@@ -57,6 +62,56 @@ def check(conn, tid, *, session, seen=None, verb="unblock", board=None):
+     raise UnreadComments(comments, shlex.join(command))
+ 
+ 
++def _missing_coverage(resolved):
++    """Reject ambiguous components without distinct rows for every event.
++
++    Own/old events still consume rows: filtering them before matching lets their
++    rows stand in for a missing foreign comment. Matching proves completeness,
++    not identity, so the caller still lists *all* plausible legacy candidates.
++    """
++    by_row = {}
++    for eid, rows in resolved.items():
++        for row in rows:
++            by_row.setdefault(row["id"], set()).add(eid)
++    remaining, missing = set(resolved), set()
++    while remaining:
++        component, pending = set(), {next(iter(remaining))}
++        while pending:
++            eid = pending.pop()
++            component.add(eid)
++            for row in resolved[eid]:
++                pending.update(by_row[row["id"]] - component)
++        remaining -= component
++        owners = {}
++        if not all(_match(eid, resolved, owners) for eid in component):
++            missing.update(component)
++    return missing
++
++
++def _match(start, resolved, owners):
++    """Iterative augmenting path; no recursion limit for large comment threads."""
++    pending, visited_rows = [start], set()
++    previous: dict[int, tuple[int, int] | None] = {start: None}
++    for eid in pending:
++        for row in resolved[eid]:
++            rid = row["id"]
++            if rid in visited_rows:
++                continue
++            visited_rows.add(rid)
++            owner = owners.get(rid)
++            if owner is None:
++                while True:
++                    owners[rid] = eid
++                    step = previous[eid]
++                    if step is None:
++                        return True
++                    eid, rid = step
++            if owner not in previous:
++                previous[owner] = (eid, rid)
++                pending.append(owner)
++    return False
++
++
+ def _listing(cid, body, event, payload):
+     return {"id": cid, "writer_session": payload["writer_session"],
+             "time": datetime.fromtimestamp(event["created_at"], UTC).isoformat(), "body": body[:300]}
+diff --git a/tests/hermes_cli/test_kanban_release_imported_comments.py b/tests/hermes_cli/test_kanban_release_imported_comments.py
+index 7932924e701de51483dc2105b7f52c95817812ec..c5e4d5a601320ebb8458187d5a5b3884555097e8 100644
+--- a/tests/hermes_cli/test_kanban_release_imported_comments.py
++++ b/tests/hermes_cli/test_kanban_release_imported_comments.py
+@@ -105,6 +105,48 @@ def test_missing_imported_comment_is_not_acknowledged_by_colliding_id(board, por
+     assert ok, output
+ 
+ 
++@pytest.mark.parametrize("entry", ["promote", "unblock", "tool"])
++@pytest.mark.parametrize("portable", [False, True])
++@pytest.mark.parametrize("sibling_session", ["peer-session", "reader", None])
++@pytest.mark.parametrize("sibling_portable", [True, False])
++def test_partial_sync_cannot_reuse_acknowledged_sibling(
++        board, entry, portable, sibling_session, sibling_portable, capsys, monkeypatch):
++    monkeypatch.setattr(time, "time", lambda: 1794700000)
++    enable_sync(board)
++    read_id = imported(board, 800001, portable=sibling_portable, suffix="read", session=sibling_session)
++    payload = {"comment_id": 800002, "author": "default", "writer_session": "peer-session"}
++    if portable:
++        payload["comment_uid"] = "remote-comment-unread"
++    change = sync.RemoteChange(3, "task_events", "remote-event-unread", "upsert",
++                              {"task_id": board, "kind": "commented",
++                               "created_at": int(time.time()) - 180,
++                               "payload": json.dumps(payload)}, 1, "", "peer")
++    with kbc.connect_closing() as conn:
++        assert sync.apply_remote_changes(conn, [change], new_cursor=3, observers=False).applied == 1
++    before = snapshot(board)
++    ok, output = release(board, entry, capsys, read_id)
++    assert not ok and "Comment data unavailable" in output, output
++    assert snapshot(board) == before
++    restored = imported(board, 800002, portable=portable, suffix="unread")
++    ok, output = release(board, entry, capsys, read_id)
++    assert not ok and "do not release unread" in output, output
++    ok, output = release(board, entry, capsys, restored)
++    assert ok, output
++
++
++@pytest.mark.parametrize("candidates,missing", [
++    ({1: [1], 2: [1]}, {1, 2}),
++    ({1: [1, 2], 2: [1]}, set()),  # Reassign the first event, rather than greedily fail.
++    ({1: [1], 2: [1], 3: [1, 2, 3]}, {1, 2, 3}),  # Equal totals do not prove Hall coverage.
++    ({1: [], 2: [2]}, {1}),  # Missing unrelated history does not poison a complete component.
++    ({1: [1, 2], 2: [2, 3], 3: [1]}, set()),
++])
++def test_event_coverage_requires_injective_matching(candidates, missing):
++    from hermes_cli.kanban_release_comments import _missing_coverage
++    resolved = {eid: [{"id": rid} for rid in rows] for eid, rows in candidates.items()}
++    assert _missing_coverage(resolved) == missing
++
++
+ def test_writer_stamps_actual_comment_uid(board):
+     enable_sync(board)
+     cid = comment(board)
+-- 
+2.43.0
+

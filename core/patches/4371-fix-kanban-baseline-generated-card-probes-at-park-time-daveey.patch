@@ -1,0 +1,362 @@
+From 61f9fa477230118a341f4fd6fb2a9ecba041c2ed Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 22:55:40 +0000
+Subject: [PATCH] fix(kanban): baseline generated card probes at park time
+ [daveey]
+
+A first park on a blocked/review producer woke immediately because the
+wait-check default includes those statuses, yet handled_status only knew
+about earlier condition_met events. The confirmation observation was not
+used, and local confirmation did not even store an observation.
+
+Record local observations and mark generated card probes. Only those
+probes use the latest park observation as their implicit baseline; explicit
+commands, --until and --from keep their prior behavior. A newer
+condition_met keeps precedence. Persist departure inside the generation-
+fenced result transaction so blocked -> running -> blocked wakes again.
+The 24-hour wake_at backstop is unchanged.
+
+The CLI dry-run hypothesis is confirmed: _cli_wake_check dry-runs the
+supplied command before _cli_awaiting generates the default card probe.
+No regression assertion requiring an immediate blocked-producer wake was
+superseded. An initial metadata-only failure in
+ test_continue_still_infers_an_unrelated_live_card exposed unnecessary
+marking of inferred card records; the implementation now leaves those
+records unchanged and the original assertion passes unedited.
+
+Proof: initial regression file RED on base (10 failures, 3 passes).
+GREEN after final rebase: all six requested guards plus 16 new cases,
+237 passed. Broader consumer sweep before the final --until preservation
+refinement: 79 files, 1917 passed, 1 skipped. scripts/check --base
+origin/main: all 20 checks green. Replica cases use the real registry
+SQLite reader with unavailable SSH, not mocked verdicts.
+
+Legacy parks have no provenance bit: identical explicit and generated
+commands cannot be distinguished retrospectively. They retain existing
+behavior until the next park; new generated parks preserve explicit-probe
+semantics without guessing from command text alone.
+
+Implementation task: t_4bfa341f85b71f69
+---
+ hermes_cli/kanban_awaiting.py                 |   6 +
+ hermes_cli/kanban_wait_baseline.py            |  68 +++++++
+ hermes_cli/kanban_wait_check.py               |   5 +
+ hermes_cli/kanban_wake_check.py               |   2 +
+ .../test_kanban_park_observed_baseline.py     | 170 ++++++++++++++++++
+ 5 files changed, 251 insertions(+)
+ create mode 100644 hermes_cli/kanban_wait_baseline.py
+ create mode 100644 tests/hermes_cli/test_kanban_park_observed_baseline.py
+
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index 46cf8c20487487a5d51247ed00e28b82f5c7eaa6..1a9586bb575d19bc8d764d310f7c70f86ae3b35b 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -168,6 +168,8 @@ def normalize(value: Any) -> Optional[dict]:
+     if kind not in KINDS:
+         raise AwaitingError(INVALID_AWAITING, f"awaiting.kind must be one of {list(KINDS)} (got {kind!r})")
+     out = {"kind": kind}
++    if value.get("auto_card_probe") is True:
++        out["auto_card_probe"] = True
+     for key in ("ref", "why", "gateway", "board"):
+         raw = value.get(key)
+         if raw is not None and not isinstance(raw, str):
+@@ -444,6 +446,8 @@ def _check_card(conn: sqlite3.Connection, task_id: str, awaiting: dict, text: st
+         done = _completed_at(owner, ref)
+         if done:
+             raise producer_done_error(ref, done)
++        row = owner.execute("SELECT status FROM tasks WHERE id = ?", (ref,)).fetchone()
++        awaiting["observed"] = f"{ref} {row[0]}"
+ 
+ 
+ def _check_run(conn, task_id, awaiting, text) -> None:
+@@ -931,6 +935,8 @@ def card_probe(awaiting: Optional[dict]) -> Optional[str]:
+         argv += ["--gateway", awaiting["gateway"]]
+     if awaiting.get("board"):
+         argv += ["--board", awaiting["board"]]
++    if not awaiting.get("inferred"):
++        awaiting["auto_card_probe"] = True
+     return shlex.join(argv)
+ 
+ 
+diff --git a/hermes_cli/kanban_wait_baseline.py b/hermes_cli/kanban_wait_baseline.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a7fad868762ff7d57c7b5c9f7a0ad054034e24c0
+--- /dev/null
++++ b/hermes_cli/kanban_wait_baseline.py
+@@ -0,0 +1,68 @@
++"""Park-time baselines for generated card probes, not explicit user commands. [daveey]"""
++from __future__ import annotations
++
++import json
++import sqlite3
++from pathlib import Path
++
++DEPARTED = "awaited_card_departed"
++
++
++def _latest(query, waiter):
++    from hermes_cli.kanban_continuation import SCHEDULED_ENTRY_EVENTS
++    kinds = (*SCHEDULED_ENTRY_EVENTS, "condition_met", DEPARTED)
++    marks = ",".join("?" for _ in kinds)
++    rows = query(f"SELECT kind, payload FROM task_events WHERE task_id=? AND kind IN ({marks}) "
++                 "ORDER BY id DESC LIMIT 1", (waiter, *kinds))
++    if not rows:
++        return None
++    kind, raw = rows[0]
++    try:
++        payload = json.loads(raw or "{}")
++    except (TypeError, ValueError):
++        return None
++    if not isinstance(payload, dict):
++        return None
++    if kind in ("condition_met", DEPARTED):
++        return None if kind == "condition_met" else (payload.get("ref"), None, payload.get("wake_check"))
++    record = payload.get("awaiting") or {}
++    if not isinstance(record, dict) or record.get("kind") != "card" or record.get("auto_card_probe") is not True:
++        return None
++    from hermes_cli.kanban_awaiting import card_probe
++    cmd = card_probe(dict(record))
++    if payload.get("wake_check") != cmd:
++        return None
++    target = record.get("ref")
++    words = str(record.get("observed") or "").split()
++    status = words[1] if len(words) >= 2 and words[0] == target else None
++    return target, status if status in ("blocked", "review") else None, cmd
++
++
++def park_status(waiter, db_path, target):
++    """(applies, baseline); a newer condition_met leaves the existing handled-status rule in charge."""
++    if not waiter or not db_path:
++        return False, None
++    from hermes_cli.kanban_wait_check import _query
++    try:
++        found = _latest(lambda sql, args: _query(Path(db_path), sql, args), waiter)
++    except (ValueError, TypeError, AttributeError, OSError, sqlite3.Error):
++        return False, None
++    if found and found[0] == target:
++        return True, found[1]
++    return False, None
++
++
++def record_departure(conn, waiter, cmd, output):
++    """Retire the baseline on an observed nonterminal change, inside the generation-fenced result txn.
++
++    A probe subprocess never writes the board. Persist once here so a later return to blocked/review wakes,
++    including after a dispatcher restart or an intervening transport error.
++    """
++    found = _latest(lambda sql, args: conn.execute(sql, args).fetchall(), waiter)
++    if not found or found[1] is None or found[2] != cmd:
++        return
++    words = output.split()
++    if len(words) < 2 or words[0] != found[0] or words[1] not in ("todo", "ready", "running", "scheduled"):
++        return
++    from hermes_cli import kanban_db as kb
++    kb._append_event(conn, waiter, DEPARTED, {"ref": found[0], "wake_check": cmd, "status": words[1]})
+diff --git a/hermes_cli/kanban_wait_check.py b/hermes_cli/kanban_wait_check.py
+index efc425fc8e0a43f37203f86f2712090a31f3b7ba..a0a57b5f36e4ebea339a8a12a475e2c5f66d7b44 100644
+--- a/hermes_cli/kanban_wait_check.py
++++ b/hermes_cli/kanban_wait_check.py
+@@ -242,6 +242,11 @@ def run(args) -> int:
+         # Implicit --from, for dispatcher probe runs only (a worker running wait-check by hand sees the plain
+         # status): the status the waiter already handled (see handled_status).
+         seen = handled_status(os.environ.get("HERMES_KANBAN_TASK"), os.environ.get("HERMES_KANBAN_DB"), args.target)
++        if not args.until:
++            from hermes_cli.kanban_wait_baseline import park_status
++            found, parked = park_status(os.environ.get("HERMES_KANBAN_TASK"), os.environ.get("HERMES_KANBAN_DB"), args.target)
++            if found:
++                seen = parked
+         since = (seen,) if seen else ()
+     gw = getattr(args, "gateway", None)
+     if args.check == "capability-owner":
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 33dfda3f0956187c8c2f9322da6a4468c3a53592..a73576437833ce75986db5833ece6605ab27170c 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -888,6 +888,8 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+                 kb.add_comment(conn, task_id, "kanban-dispatcher", note)
+             return woke
+         if rc == 1 and not output_error(out):
++            from hermes_cli.kanban_wait_baseline import record_departure
++            record_departure(conn, task_id, cmd, out)
+             if dead_ancestry:
+                 from hermes_cli.kanban_dead_ancestry import wake_once
+                 woke = wake_once(conn, task_id, cmd, dead_ancestry)
+diff --git a/tests/hermes_cli/test_kanban_park_observed_baseline.py b/tests/hermes_cli/test_kanban_park_observed_baseline.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4091a62f6c34e79a86b1a9a184b16d2fbc0dcb75
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_park_observed_baseline.py
+@@ -0,0 +1,170 @@
++"""A generated card probe waits for a change from the park-time observation. [daveey]"""
++from __future__ import annotations
++
++import argparse
++import contextlib
++import io
++import json
++import shlex
++import subprocess
++import time
++
++import pytest
++
++from hermes_cli import kanban_cli_park as cli
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_wait_check as wait
++from hermes_cli import kanban_wake_check as wake
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
++    monkeypatch.setenv("HERMES_KANBAN_WAKE_DRYRUN", "0")
++    kb.init_db()
++    with kbc.connect_closing() as conn:
++        yield conn
++    wake._shutdown_for_tests()
++
++
++def _status(conn, tid, status):
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status=?, human_request=? WHERE id=?",
++                     (status, json.dumps({"action": "answer"}) if status == "blocked" else None, tid))
++
++
++def _park(conn, monkeypatch, status, *, explicit=False, gateway=None):
++    producer = kb.create_task(conn, title="producer")
++    _status(conn, producer, status)
++    owner = kb.create_task(conn, title="waiter")
++    args = argparse.Namespace(awaiting=f"card:{producer}", awaiting_why=None, reason="waiting for producer",
++                              wake_check=f"hermes kanban wait-check task {producer}" if explicit else None)
++    if gateway:
++        args.awaiting = {"kind": "card", "ref": producer, "gateway": gateway}
++        monkeypatch.setattr(wait, "check_remote", lambda *a, **kw: (0, f"{producer} {status} (replica)"))
++    record, fields = cli._cli_awaiting(args, cli._cli_wake_check(args))
++    assert kb.schedule_task(conn, owner, reason=args.reason, awaiting=record, wake_check=fields[0])
++    monkeypatch.setenv("HERMES_KANBAN_TASK", owner)
++    monkeypatch.setenv("HERMES_KANBAN_WAKE_PROBE", "1")
++    return owner, producer
++
++
++def _probe(conn, owner, *, until=None):
++    state = wake.get_state(conn, owner)
++    parser = argparse.ArgumentParser()
++    parser.add_argument("check")
++    parser.add_argument("target")
++    for flag in ("--gateway", "--board", "--until"):
++        parser.add_argument(flag)
++    parser.add_argument("--from", dest="since")
++    args = parser.parse_args(shlex.split(state["cmd"])[3:])
++    if until:
++        args.until = until
++    out = io.StringIO()
++    with contextlib.redirect_stdout(out):
++        rc = wait.run(args)
++    return rc, out.getvalue(), state
++
++
++def _apply(conn, owner):
++    rc, out, state = _probe(conn, owner)
++    wake.apply_result(conn, owner, state["cmd"], rc, out, generation=state["generation"])
++    return rc
++
++
++@pytest.mark.parametrize("status", ["blocked", "review"])
++@pytest.mark.parametrize("finished", ["done", "archived", "triage"])
++def test_first_generated_probe_waits_then_wakes(board, monkeypatch, status, finished):
++    owner, producer = _park(board, monkeypatch, status)
++    assert _apply(board, owner) == 1
++    assert kb.get_task(board, owner).status == "scheduled"
++    _status(board, producer, finished)
++    assert _apply(board, owner) == 0
++    assert kb.get_task(board, owner).status == "ready"
++
++
++def test_running_at_park_then_blocked_still_wakes(board, monkeypatch):
++    owner, producer = _park(board, monkeypatch, "running")
++    assert _apply(board, owner) == 1
++    _status(board, producer, "blocked")
++    assert _apply(board, owner) == 0
++
++
++def test_leaving_and_returning_to_baseline_wakes(board, monkeypatch):
++    owner, producer = _park(board, monkeypatch, "blocked")
++    assert _apply(board, owner) == 1
++    _status(board, producer, "running")
++    assert _apply(board, owner) == 1
++    _status(board, producer, "blocked")
++    assert _apply(board, owner) == 0
++
++
++@pytest.mark.parametrize("explicit", [False, True])
++def test_explicit_command_or_until_unchanged(board, monkeypatch, explicit):
++    owner, _ = _park(board, monkeypatch, "blocked", explicit=explicit)
++    assert _probe(board, owner, until=None if explicit else "blocked")[0] == 0
++
++
++def test_daily_deadline_still_wakes(board, monkeypatch):
++    owner, _ = _park(board, monkeypatch, "blocked")
++    assert _apply(board, owner) == 1
++    park = [e for e in kb.list_events(board, owner) if e.kind == "scheduled"][-1]
++    assert 86390 <= park.payload["wake_at"] - time.time() <= 86400
++    from hermes_cli.kanban_continuation import wake_due_continuations
++    wake_due_continuations(board, now=park.payload["wake_at"] + 1)
++    assert kb.get_task(board, owner).status == "ready"
++
++
++@pytest.mark.parametrize("status", ["blocked", "review"])
++def test_gateway_replica_first_park_then_done(board, monkeypatch, tmp_path, status):
++    original = wait.check_remote
++    owner, producer = _park(board, monkeypatch, status, gateway="macbook")
++    monkeypatch.setattr(wait, "check_remote", original)
++    monkeypatch.setattr(wait.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 255, "", "offline"))
++    import sqlite3
++    state = tmp_path / "hub-state"
++    state.mkdir()
++    monkeypatch.setenv("HERMES_HUB_STATE", str(state))
++    with sqlite3.connect(state / "hub.db") as replica:
++        replica.execute("CREATE TABLE replica(gw TEXT, coll TEXT, key TEXT, data TEXT, updated_at INTEGER)")
++        scope = {"task_scopes": [{"board": "default", "profile": "default", "state": "ok",
++                                  "observed_at": time.time()}]}
++        replica.execute("INSERT INTO replica VALUES(?,?,?,?,?)",
++                        ("macbook", "gateway", "macbook", json.dumps(scope), 1))
++        row = dict(id=producer, board="default", status=status, gateway="macbook", profile="default",
++                   owner_profile="default", wait_observation={"parked_agent": False, "orphan_reason": None})
++        replica.execute("INSERT INTO replica VALUES(?,?,?,?,?)",
++                        ("macbook", "tasks", f"default/default/{producer}", json.dumps(row), 1))
++        replica.commit()
++        assert _apply(board, owner) == 1
++        row["status"] = "done"
++        replica.execute("UPDATE replica SET data=? WHERE coll='tasks'", (json.dumps(row),))
++        replica.commit()
++        assert _apply(board, owner) == 0
++
++
++@pytest.mark.parametrize("newer", [False, True])
++def test_condition_met_precedence_uses_event_order(board, monkeypatch, newer):
++    owner, producer = _park(board, monkeypatch, "blocked")
++    state = wake.get_state(board, owner)
++    park = [e for e in kb.list_events(board, owner) if e.kind == "scheduled"][-1].payload
++    with kb.write_txn(board):
++        kb._append_event(board, owner, "condition_met", {"wake_check": state["cmd"],
++                                                         "output": f"{producer} review"})
++        if not newer:
++            kb._append_event(board, owner, "scheduled", park)
++    _status(board, producer, "review")
++    assert _probe(board, owner)[0] == (1 if newer else 0)
++    # --until retains the old handled-condition rule even when the generated park is newer.
++    assert _probe(board, owner, until="review")[0] == 1
++
++
++def test_stale_result_cannot_retire_baseline(board, monkeypatch):
++    owner, producer = _park(board, monkeypatch, "blocked")
++    state = wake.get_state(board, owner)
++    wake.apply_result(board, owner, state["cmd"], 1, f"{producer} running", generation="old-generation")
++    assert _probe(board, owner)[0] == 1
+-- 
+2.43.0
+

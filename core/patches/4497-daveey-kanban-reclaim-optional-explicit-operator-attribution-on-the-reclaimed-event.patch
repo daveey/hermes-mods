@@ -1,0 +1,320 @@
+From ca1802c8a8e4ea089d68479b2bd5b2d5e089a23e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 18:28:08 +0000
+Subject: [PATCH] [daveey] kanban reclaim: optional explicit-operator
+ attribution on the reclaimed event
+
+Worker core-update containment (t_f5ae6712b53e34e3, spec containment-spec.md
+d2464db1) makes routine worker core updates idle-only; the only remaining
+worker interruption is an explicit operator emergency
+(state worker-core-update --interrupt-worker-runs). That route keeps the exact
+reason "hermes-sync core update: restart-safe worker requeue" and must be
+distinguishable in the durable reclaimed event for the 6h containment query.
+
+- kanban reclaim gains --urgency-source {explicit_operator} and
+  --interrupt-target <lowercase 40-hex>; both or neither, and only with the
+  exact core-update requeue reason. Invalid/partial input refuses (exit 2)
+  before any signal or claim change.
+- kanban_db.reclaim_task(urgency_source=, interrupt_target=) validates the
+  same way (ValueError before termination) and adds both fields to the
+  existing reclaimed payload only when present. Legacy payload unchanged
+  (absent = unknown attribution).
+- hermes-sync probes `kanban reclaim --help` for both flags before any
+  emergency signal; this commit ships first so every worker has the
+  capability before containment activates.
+
+Tests: tests/hermes_cli/test_kanban_reclaim_attribution.py (parser -> cmd ->
+event end to end, help lists both flags, partial/invalid refusal before
+reclaim, DB-layer refusal before signalling, legacy payload unchanged).
+---
+ hermes_cli/kanban.py                          |  11 +-
+ hermes_cli/kanban_core_update_requeue.py      |  22 +++
+ hermes_cli/kanban_db.py                       |  13 +-
+ hermes_cli/kanban_parser.py                   |   8 +-
+ .../test_kanban_reclaim_attribution.py        | 159 ++++++++++++++++++
+ 5 files changed, 204 insertions(+), 9 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_reclaim_attribution.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 6277cae0658e4972b9617d75b05f302c0272d553..7db6b03b0716f746585153389a697f25ff766ce5 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -856,8 +856,17 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
+ 
+ 
+ def _cmd_reclaim(args: argparse.Namespace) -> int:
++    from hermes_cli.kanban_core_update_requeue import reclaim_attribution
++    reason = getattr(args, "reason", None)
++    attribution = dict(urgency_source=getattr(args, "urgency_source", None),
++                       interrupt_target=getattr(args, "interrupt_target", None))
++    try:
++        reclaim_attribution(reason, **attribution)
++    except ValueError as exc:
++        print(f"kanban reclaim: refused: {exc}", file=sys.stderr)
++        return 2
+     with kbc.connect_closing() as conn:
+-        ok = kb.reclaim_task(conn, args.task_id, reason=getattr(args, "reason", None))
++        ok = kb.reclaim_task(conn, args.task_id, reason=reason, **attribution)
+     return _ok_or_err(ok, f"cannot reclaim {args.task_id} (not running or unknown id)",
+                       f"Reclaimed {args.task_id}")
+ 
+diff --git a/hermes_cli/kanban_core_update_requeue.py b/hermes_cli/kanban_core_update_requeue.py
+index 4af2ce59cc3f7de2b1a586f0df20352c0d222670..7cd538295b3ab95013bb3626386a0495bca0fd27 100644
+--- a/hermes_cli/kanban_core_update_requeue.py
++++ b/hermes_cli/kanban_core_update_requeue.py
+@@ -29,6 +29,28 @@ CORE_UPDATE_REQUEUE_REASON = "hermes-sync core update: restart-safe worker reque
+ 
+ _FAILURE_KINDS = ("crashed", "timed_out", "spawn_failed", "gave_up")
+ 
++# Optional attribution for the explicit worker interruption route (state ``worker-core-update
++# --interrupt-worker-runs``). Routine worker updates never reclaim; legacy events without it
++# are "unknown". hermes-sync probes ``kanban reclaim --help`` for both flags before signalling.
++URGENCY_SOURCES = ("explicit_operator",)
++_HEX = frozenset("0123456789abcdef")
++
++
++def reclaim_attribution(reason, urgency_source, interrupt_target) -> dict:
++    """Validated payload fields for a reclaim: ``{}`` (legacy) or both fields; else ValueError."""
++    if urgency_source is None and interrupt_target is None:
++        return {}
++    if urgency_source is None or interrupt_target is None:
++        raise ValueError("reclaim attribution needs both --urgency-source and --interrupt-target")
++    if type(urgency_source) is not str or urgency_source not in URGENCY_SOURCES:
++        raise ValueError(f"reclaim attribution: unknown urgency source {urgency_source!r}")
++    if (type(interrupt_target) is not str or len(interrupt_target) != 40
++            or not set(interrupt_target) <= _HEX):
++        raise ValueError("reclaim attribution: --interrupt-target must be a lowercase 40-hex commit")
++    if reason != CORE_UPDATE_REQUEUE_REASON:
++        raise ValueError(f"reclaim attribution only applies to reason {CORE_UPDATE_REQUEUE_REASON!r}")
++    return {"urgency_source": urgency_source, "interrupt_target": interrupt_target}
++
+ 
+ def is_core_update_requeue(conn: sqlite3.Connection, run) -> bool:
+     """True only for a run the core updater's restart-safe requeue closed."""
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index cea78a488bc153a75dc7aedc498eaea8ef517c02..6be3b4f6db92f89ab230614aed16f65101b837fe 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -32,7 +32,7 @@ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Any, Callable, Iterable, Optional
+ 
+-from hermes_cli import kanban_db_sync as _sync, kanban_park_pin as _park_pin, kanban_priority, kanban_source_receipt as _sr, kanban_requeue_custody as _requeue_custody
++from hermes_cli import kanban_db_sync as _sync, kanban_park_pin as _park_pin, kanban_priority, kanban_source_receipt as _sr, kanban_requeue_custody as _requeue_custody, kanban_core_update_requeue as _cu_requeue
+ from hermes_cli.kanban_db_values import _first_line, _opt_int, _json_or_null
+ from hermes_cli.kanban_db_event import Event  # public kb.Event; helpers import lazily: no cycle
+ from hermes_cli.kanban_worker_placement import resolved_db_placement, validate_creation
+@@ -2302,21 +2302,20 @@ def _record_reclaim(
+ 
+ def reclaim_task(
+     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None, signal_fn=None,
++    urgency_source: Optional[str] = None, interrupt_target: Optional[str] = None,
+ ) -> bool:
+     """Operator reclaim regardless of TTL: release the claim, restore the source
+-    phase, reset the failure counter. False when not running."""
++    phase, reset the failure counter. False when not running. Bad attribution raises first."""
++    attribution = _cu_requeue.reclaim_attribution(reason, urgency_source, interrupt_target)
+     row = conn.execute(
+         "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?", (task_id,),
+     ).fetchone()
+-    if not row:
+-        return False
+-    idle = row["status"] != "running" and row["claim_lock"] is None
+-    if idle or _sync.refuse_foreign_reclaim(conn, task_id):
++    if not row or (row["status"] != "running" and row["claim_lock"] is None) or _sync.refuse_foreign_reclaim(conn, task_id):
+         return False
+     prev_lock = row["claim_lock"]
+     termination = _terminate_reclaimed_worker(
+         row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"])
+-    custody = _requeue_custody.for_requeue(conn, task_id, reason)  # core update: end plain processes, pin persisted
++    custody = {**_requeue_custody.for_requeue(conn, task_id, reason), **attribution}  # core update: end plain processes, pin persisted
+     with write_txn(conn):
+         retry_status = _retry_status_for_run(conn, task_id)
+         cur = conn.execute(
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index ba46e1611f8e5688894d623a4706bad42edc6a69..99ab6924d3ad5d0fe5d1e7438aacc6d0b2766532 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -404,7 +404,13 @@ _SPECS = [
+              help="--mandatory: a far quota wall never moves this pin to a same-class peer (the card waits "
+                   "for the reset). --no-mandatory lifts that. Omit to keep the card's setting."),
+     ], help="Set or clear a task's model/provider override (takes effect on the next dispatch)"),
+-    _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task"),
++    _cmd("reclaim", [
++        _TASK_ID, _RECLAIM_REASON,
++        _arg("--urgency-source", dest="urgency_source", choices=("explicit_operator",), default=None,
++             help="Attribution for an explicit core-update interruption (with --interrupt-target)"),
++        _arg("--interrupt-target", dest="interrupt_target", default=None,
++             help="40-hex minimum core target of that interruption (with --urgency-source)"),
++    ], help="Release an active worker claim on a running task"),
+     _cmd("move", [
+         _TASK_ID,
+         _arg("--runs-on", dest="runs_on", default=None,
+diff --git a/tests/hermes_cli/test_kanban_reclaim_attribution.py b/tests/hermes_cli/test_kanban_reclaim_attribution.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..762e6023c449838ef8c9cf108a444f75b3c4ea98
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_reclaim_attribution.py
+@@ -0,0 +1,159 @@
++"""Optional explicit-operator attribution on the core-update requeue reclaim. [daveey]
++
++The worker core-update containment (state ``hermes-sync``) lets only an explicit operator
++emergency interrupt managed worker runs. That route keeps the exact requeue reason and adds
++``urgency_source="explicit_operator"`` plus ``interrupt_target`` (the 40-hex minimum core
++target) to the existing durable ``reclaimed`` event, so a later 6 h query can tell explicit
++interruptions from routine (now forbidden) ones. Legacy reclaims carry neither field
++(= unknown). Invalid or partial attribution is refused before any signal or claim change.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli.kanban_core_update_requeue import (
++    CORE_UPDATE_REQUEUE_REASON,
++    reclaim_attribution,
++)
++
++TARGET = "0123456789abcdef0123456789abcdef01234567"
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    # Never signal a real process from these tests.
++    monkeypatch.setattr(kb, "_terminate_reclaimed_worker",
++                        lambda *a, **k: {"termination_attempted": False})
++    kb.init_db()
++    return home
++
++
++def _parser():
++    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
++    kc.build_parser(parser.add_subparsers(dest="command"))
++    return parser
++
++
++def _running(title="t"):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title=title, assignee="default")
++        assert kb.claim_task(conn, tid) is not None
++    return tid
++
++
++def _reclaims(tid):
++    with kbc.connect_closing() as conn:
++        rows = conn.execute(
++            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'reclaimed'", (tid,)).fetchall()
++        status = kb.get_task(conn, tid).status
++    return [json.loads(r["payload"]) for r in rows], status
++
++
++def _cli(*argv):
++    args = _parser().parse_args(["kanban", *argv])
++    return kc.kanban_command(args)
++
++
++def test_parser_to_event_carries_explicit_operator_attribution(kanban_home):
++    tid = _running()
++    rc = _cli("reclaim", tid, "--reason", CORE_UPDATE_REQUEUE_REASON,
++              "--urgency-source", "explicit_operator", "--interrupt-target", TARGET)
++    assert rc == 0
++    events, status = _reclaims(tid)
++    assert status == "ready"
++    assert len(events) == 1
++    assert events[0]["reason"] == CORE_UPDATE_REQUEUE_REASON
++    assert events[0]["urgency_source"] == "explicit_operator"
++    assert events[0]["interrupt_target"] == TARGET
++
++
++def test_legacy_reclaim_payload_is_unchanged(kanban_home):
++    tid = _running()
++    assert _cli("reclaim", tid, "--reason", CORE_UPDATE_REQUEUE_REASON) == 0
++    events, _ = _reclaims(tid)
++    assert len(events) == 1
++    assert "urgency_source" not in events[0]
++    assert "interrupt_target" not in events[0]
++
++
++def test_help_lists_both_flags(capsys):
++    with pytest.raises(SystemExit) as exc:
++        _parser().parse_args(["kanban", "reclaim", "--help"])
++    assert exc.value.code == 0
++    out = capsys.readouterr().out
++    assert "--urgency-source" in out and "--interrupt-target" in out
++
++
++def test_unknown_urgency_source_is_a_usage_error(kanban_home):
++    tid = _running()
++    with pytest.raises(SystemExit) as exc:
++        _parser().parse_args(["kanban", "reclaim", tid, "--reason", CORE_UPDATE_REQUEUE_REASON,
++                              "--urgency-source", "routine", "--interrupt-target", TARGET])
++    assert exc.value.code == 2
++    _, status = _reclaims(tid)
++    assert status == "running"
++
++
++@pytest.mark.parametrize("extra", [
++    ["--urgency-source", "explicit_operator"],                       # target missing
++    ["--interrupt-target", TARGET],                                  # source missing
++    ["--urgency-source", "explicit_operator", "--interrupt-target", TARGET.upper()],
++    ["--urgency-source", "explicit_operator", "--interrupt-target", TARGET[:-1]],
++    ["--urgency-source", "explicit_operator", "--interrupt-target", TARGET + "0"],
++    ["--urgency-source", "explicit_operator", "--interrupt-target", "g" * 40],
++    ["--urgency-source", "explicit_operator", "--interrupt-target", " " + TARGET[1:]],
++])
++def test_invalid_or_partial_attribution_refuses_before_reclaim(kanban_home, extra, capsys):
++    tid = _running()
++    rc = _cli("reclaim", tid, "--reason", CORE_UPDATE_REQUEUE_REASON, *extra)
++    assert rc != 0
++    assert "attribution" in capsys.readouterr().err
++    events, status = _reclaims(tid)
++    assert events == [] and status == "running"
++
++
++def test_attribution_requires_the_exact_requeue_reason(kanban_home, capsys):
++    tid = _running()
++    rc = _cli("reclaim", tid, "--reason", "something else",
++              "--urgency-source", "explicit_operator", "--interrupt-target", TARGET)
++    assert rc != 0
++    events, status = _reclaims(tid)
++    assert events == [] and status == "running"
++
++
++def test_db_layer_refuses_before_signalling(kanban_home, monkeypatch):
++    tid = _running()
++    signalled = []
++    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", lambda *a, **k: signalled.append(a) or {})
++    with kbc.connect_closing() as conn:
++        with pytest.raises(ValueError):
++            kb.reclaim_task(conn, tid, reason=CORE_UPDATE_REQUEUE_REASON,
++                            urgency_source="explicit_operator", interrupt_target="nope")
++    assert signalled == []
++    assert _reclaims(tid) == ([], "running")
++
++
++@pytest.mark.parametrize("source,target", [
++    (None, None), ("explicit_operator", TARGET)])
++def test_reclaim_attribution_valid(source, target):
++    got = reclaim_attribution(CORE_UPDATE_REQUEUE_REASON, source, target)
++    assert got == ({} if source is None else {"urgency_source": source, "interrupt_target": target})
++
++
++@pytest.mark.parametrize("source,target", [
++    ("explicit_operator", None), (None, TARGET), ("routine", TARGET), (True, TARGET),
++    ("explicit_operator", 123), ("explicit_operator", TARGET + "\n"), ("", TARGET)])
++def test_reclaim_attribution_invalid(source, target):
++    with pytest.raises(ValueError):
++        reclaim_attribution(CORE_UPDATE_REQUEUE_REASON, source, target)
+-- 
+2.43.0
+

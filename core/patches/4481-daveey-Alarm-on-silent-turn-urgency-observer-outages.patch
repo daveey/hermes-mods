@@ -1,0 +1,449 @@
+From cfe493a48bdedbc754f0148698a63610a358d82d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 08:37:36 +0000
+Subject: [PATCH] [daveey] Alarm on silent turn-urgency observer outages
+
+Why: failed or missing observations silently expired, so admission consumers could not distinguish unknown from empty. The observer has no alarm responsibility; gateway maintenance now detects enabled-host outages after an inclusive 600s grace, reuses one host repair card with hourly repeats and recovery comments. Named profiles and nondefault boards cannot duplicate the account alarm. No scoring or source access changes.
+
+Proof: canonical focused suites: 100 passed (turn urgency, new alarm, existing worker-resource alarm); scripts/check --base origin/main green. New state tick-status tests and all state turn-urgency suites: 59 passed. Preliminary independent review edge cases covered: profile home, repeated recovery, cache/status crash, card/event crash, initial upgraded-board discovery. Live 11-minute incident proof remains required after both halves deploy.
+---
+ hermes_cli/kanban_parent_unclaimed.py         |   2 +
+ hermes_cli/turn_urgency_status_alarm.py       | 207 ++++++++++++++++++
+ .../test_turn_urgency_status_alarm.py         | 198 +++++++++++++++++
+ 3 files changed, 407 insertions(+)
+ create mode 100644 hermes_cli/turn_urgency_status_alarm.py
+ create mode 100644 tests/hermes_cli/test_turn_urgency_status_alarm.py
+
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index 558e07cbd13cba1b5dc7289876bdd2c6850f98c9..7a74b3aa99d40c92264c338e817ac2e1cf3e40b0 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -220,6 +220,8 @@ def safe_sweep(conn) -> int:
+     kanban_pickup_stall.safe_sweep(conn)  # pinned foreign cards this worker node has not picked up [daveey]
+     from hermes_cli import worker_resources_unknown_alarm
+     worker_resources_unknown_alarm.safe_sweep(conn)  # every claim here refused worker_resources_unknown
++    from hermes_cli import turn_urgency_status_alarm
++    turn_urgency_status_alarm.safe_sweep(conn)
+     return posted + kanban_chat_wait.safe_sweep(conn)
+ 
+ 
+diff --git a/hermes_cli/turn_urgency_status_alarm.py b/hermes_cli/turn_urgency_status_alarm.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d1cfc5f73a80459baa4aa6e2fa8c7dc262d16649
+--- /dev/null
++++ b/hermes_cli/turn_urgency_status_alarm.py
+@@ -0,0 +1,207 @@
++"""Detect silent turn-observer outages on the gateway's normal maintenance tick. [daveey]
++
++Only the default primary board files host incidents. The observer writes local
++status; this consumer owns Kanban writes, independently of admission scoring.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import os
++import sys
++import tempfile
++import time
++from datetime import UTC, datetime
++from pathlib import Path
++
++from hermes_cli.kanban_turn_urgency import _finite_clock
++
++_log = logging.getLogger(__name__)
++DETECTOR = 'turn-urgency-detector'
++KEY_PREFIX = 'turn-urgency-unknown:'
++GRACE_SECONDS = 600
++REPEAT_SECONDS = 3600
++
++
++def _home():
++    from hermes_constants import get_hermes_home
++    return get_hermes_home()
++
++
++def _enabled():
++    if sys.platform != 'linux':
++        return False
++    # The installed account service does not publish into named profile homes.
++    if _home().resolve() != (Path.home() / '.hermes').resolve():  # health: allow HX001 -- account systemd service target
++        return False
++    # Read systemd's actual enablement link; an installed unit alone is not enabled.
++    config = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
++    return (config / 'systemd/user/timers.target.wants/hermes-turn-urgency.timer').is_file()
++
++
++def _default_board(conn):
++    from hermes_cli.kanban_db_sync import board_slug_for_path
++    path = conn.execute('PRAGMA database_list').fetchone()[2]
++    return bool(path) and board_slug_for_path(path) == 'default'
++
++
++def _read(path):
++    try:
++        with path.open('rb') as stream:
++            raw = stream.read(128 * 1024 + 1)
++        value = json.loads(raw) if len(raw) <= 128 * 1024 else None
++        return value if isinstance(value, dict) else {}
++    except (OSError, ValueError, RecursionError):
++        return {}
++
++
++def _write(path, value):
++    fd, name = tempfile.mkstemp(prefix='.turn-alarm-', dir=path.parent)
++    try:
++        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
++            json.dump(value, stream)
++            stream.flush()
++            os.fsync(stream.fileno())
++        os.replace(name, path)
++    finally:
++        Path(name).unlink(missing_ok=True)
++
++
++def _clock(value, now):
++    return value if _finite_clock(value) and 0 <= value <= now else None
++
++
++def _health(home, now):
++    """Healthy empty owners differ from missing, malformed or expired cache."""
++    path = home / 'cache/kanban-turn-urgency.json'
++    cache = _read(path)
++    status = _read(path.with_suffix('.status.json'))
++    if status.get('version') != 1 or status.get('board') != 'default':
++        status = {}
++    observed = _clock(cache.get('observed_at'), now)
++    until = cache.get('valid_until')
++    valid = (type(cache.get('version')) is int and cache['version'] == 1
++             and cache.get('board') == 'default'
++             and isinstance(cache.get('source_revision'), str) and bool(cache['source_revision'].strip())
++             and observed is not None and _finite_clock(until)
++             and observed <= now < until <= observed + 120
++             and isinstance(cache.get('owners'), list) and len(cache['owners']) <= 4096)
++    if valid:
++        for owner in cache['owners']:
++            if (not isinstance(owner, dict)
++                    or not all(isinstance(owner.get(k), str) and owner[k].strip()
++                               for k in ('task_id', 'source', 'ref', 'head'))
++                    or owner['source'] not in ('core-lane', 'state-turn')
++                    or not _finite_clock(owner.get('expires_at')) or owner['expires_at'] <= now):
++                valid = False
++                break
++    success = _clock(status.get('last_success_at'), now)
++    first = _clock(status.get('first_failure_at'), now)
++    # A started/in-flight tick does not invalidate a previous fresh observation.
++    if valid:
++        return True, observed, None
++    # A cache published before a status-write crash is still a successful observation.
++    successes = [value for value in (success, observed) if value is not None]
++    since = max(successes) if successes else first
++    error = status.get('last_error')
++    if not isinstance(error, str) or not error:
++        error = 'missing cache' if not path.exists() else 'expired cache' if observed is not None else 'invalid cache'
++    return False, since, error.splitlines()[-1][:512]
++
++
++def _stamp(now):
++    return datetime.fromtimestamp(now, UTC).isoformat()
++
++
++def _last_event(conn, card):
++    row = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'turn_urgency_alarm' "
++                       "ORDER BY id DESC LIMIT 1", (card,)).fetchone()
++    return json.loads(row[0]) if row else {}
++
++
++def _comment(conn, card, now, recovered, body):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_comment_ids import add_comment
++    with kb.write_txn(conn):
++        add_comment(conn, card, DETECTOR, body, system=True)
++        kb._append_event(conn, card, 'turn_urgency_alarm', {'at': now, 'recovered': recovered})
++
++
++def _incident(conn, host, now, since, error, healthy):
++    from hermes_cli import kanban_db as kb
++    prefix = f'{KEY_PREFIX}{host}:'
++    rows = conn.execute('SELECT id, status FROM tasks WHERE idempotency_key >= ? AND idempotency_key < ? '
++                        'ORDER BY created_at DESC, id DESC', (prefix, prefix + '\U0010ffff')).fetchall()
++    opened = next((row for row in rows if row['status'] not in ('done', 'archived')), None)
++    row = opened or (rows[0] if rows else None)
++    if healthy:
++        if row and not _last_event(conn, row['id']).get('recovered'):
++            _comment(conn, row['id'], now, True, f'Turn-urgency observer recovered at {_stamp(now)} on {host}.')
++        return None
++    if now - since < GRACE_SECONDS:
++        return None
++    detail = (f'No successful turn-urgency observation on {host} since {_stamp(since)}.\n'
++              f'Last error: {error}\n\n'
++              'Read: `journalctl --user -u hermes-turn-urgency.service --since "30 minutes ago"`.\n'
++              'Inspect ~/.hermes/cache/kanban-turn-urgency.status.json and the owner cache. '
++              'Repair the observer or its source access; do not change admission scoring. '
++              'This is agent-fixable work, not a human decision. Preserve any deliberate quota containment; '
++              'coordinate with its repair owner before restarting timers.')
++    if opened:
++        card = opened['id']
++        last = _last_event(conn, card)
++        if not last or last.get('recovered'):
++            # Heal a create/event crash and re-arm recovery without adding an
++            # extra failure comment inside the hourly repeat window.
++            last = {'at': last.get('at', now), 'recovered': False}
++            with kb.write_txn(conn):
++                kb._append_event(conn, card, 'turn_urgency_alarm', last)
++        if now - last['at'] >= REPEAT_SECONDS:
++            _comment(conn, card, now, False, f'Turn-urgency failure still present at {_stamp(now)}.\n{detail}')
++        return card
++    from hermes_cli.kanban_triage_sweep import _supervisor_profile
++    card = kb.create_task(conn, title=f'Turn-urgency observer has no successful observation on {host} for 10 min',
++                          body=detail, assignee=_supervisor_profile(), created_by=DETECTOR,
++                          workspace_kind='scratch', requires=['terminal', 'file', 'git', 'hub:write'],
++                          runs_on=['pool:worker', 'capability:hub-write'],
++                          idempotency_key=f'{prefix}{now.hex()}', priority=-1)
++    with kb.write_txn(conn):
++        kb._append_event(conn, card, 'turn_urgency_alarm', {'at': now, 'recovered': False})
++    return card
++
++
++def sweep(conn, *, now=None):
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_worker_node as wn
++    if not _default_board(conn) or sync.board_mode(conn) != 'primary' or not _enabled():
++        return None
++    import fcntl
++    now = float(time.time() if now is None else now)
++    if not _finite_clock(now):
++        return None
++    home = _home()
++    directory = home / 'cache'
++    directory.mkdir(parents=True, exist_ok=True)
++    # Multiple gateway/profile maintenance processes share a host-level receipt.
++    with (directory / '.turn-urgency-alarm.lock').open('a') as lock:
++        try:
++            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        except BlockingIOError:
++            return None
++        path = directory / 'turn-urgency-alarm.json'
++        receipt = _read(path)
++        healthy, since, error = _health(home, now)
++        if since is None:
++            since = _clock(receipt.get('since'), now)
++        if since is None:
++            since = now
++        _write(path, {'since': now if healthy else since})
++        return _incident(conn, wn._own(conn), now, since, error, healthy)
++
++
++def safe_sweep(conn):
++    try:
++        return sweep(conn)
++    except Exception:  # health: allow BLE001 -- alarm failure must not stop dispatch
++        _log.warning('kanban dispatcher: turn-urgency alarm sweep failed', exc_info=True)
++        return None
+diff --git a/tests/hermes_cli/test_turn_urgency_status_alarm.py b/tests/hermes_cli/test_turn_urgency_status_alarm.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..de994239467e873242036cb3b12d59c03f3aca19
+--- /dev/null
++++ b/tests/hermes_cli/test_turn_urgency_status_alarm.py
+@@ -0,0 +1,198 @@
++"""Virtual-clock host incidents, separate from admission scoring."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import turn_urgency_status_alarm as alarm
++
++
++@pytest.fixture
++def rig(tmp_path, monkeypatch):
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_worker_node as wn
++    from hermes_cli import kanban_triage_sweep as triage
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_constants import get_hermes_home
++    get_hermes_home().mkdir(parents=True, exist_ok=True)
++    (get_hermes_home() / 'config.yaml').write_text(
++        'terminal:\n  backend: local\nkanban:\n  sync:\n    enabled: true\n')
++    monkeypatch.setattr(wn, 'registry', lambda **kw: None)
++    conn = kbc.connect(tmp_path / 'kanban.db')
++    from hermes_cli import kanban_sync_client
++    kanban_sync_client.ensure_identity(conn, 'default', 'test-worker')
++    monkeypatch.setattr(alarm, '_home', lambda: tmp_path)
++    monkeypatch.setattr(alarm, '_enabled', lambda: True)
++    monkeypatch.setattr(alarm, '_default_board', lambda conn: True)
++    monkeypatch.setattr(sync, 'board_mode', lambda conn: 'primary')
++    monkeypatch.setattr(wn, '_own', lambda conn: 'test-worker')
++    monkeypatch.setattr(triage, '_supervisor_profile', lambda: 'default')
++    yield conn, tmp_path
++    conn.close()
++
++
++def cache(home, now):
++    path = home / 'cache/kanban-turn-urgency.json'
++    path.parent.mkdir(exist_ok=True)
++    path.write_text(json.dumps({'version': 1, 'board': 'default', 'observed_at': now,
++                               'valid_until': now+120, 'source_revision': 'test', 'owners': []}))
++
++
++def status(home, first, error='gh timed out', success=None):
++    path = home / 'cache/kanban-turn-urgency.status.json'
++    path.parent.mkdir(exist_ok=True)
++    path.write_text(json.dumps({'version': 1, 'board': 'default', 'checked_at': first,
++                               'last_success_at': success, 'first_failure_at': first,
++                               'last_error': error}))
++
++
++def cards(conn):
++    return conn.execute('SELECT * FROM tasks WHERE created_by = ?', (alarm.DETECTOR,)).fetchall()
++
++
++def comments(conn):
++    return [r[0] for r in conn.execute('SELECT body FROM task_comments WHERE author = ?', (alarm.DETECTOR,))]
++
++
++@pytest.mark.parametrize('error', ['auth failure', 'guard evidence deadline exhausted', 'gh timed out',
++                                  'missing cache', 'expired cache'])
++def test_exact_fractional_boundary_and_hourly_repeat(rig, error):
++    conn, home = rig
++    first = 1800000000.875
++    if error == 'expired cache':
++        cache(home, first)
++    elif error != 'missing cache':
++        status(home, first, error)
++    assert alarm.sweep(conn, now=first) is None
++    assert alarm.sweep(conn, now=first+599.999) is None
++    card = alarm.sweep(conn, now=first+600)
++    assert card and len(cards(conn)) == 1
++    assert error in cards(conn)[0]['body']
++    assert 'journalctl --user -u hermes-turn-urgency.service' in cards(conn)[0]['body']
++    assert cards(conn)[0]['human_request'] is None
++    alarm.sweep(conn, now=first+601)
++    assert comments(conn) == []
++    alarm.sweep(conn, now=first+4200)
++    assert len(comments(conn)) == 1
++    alarm.sweep(conn, now=first+4201)
++    assert len(comments(conn)) == 1 and len(cards(conn)) == 1
++
++
++def test_recovery_inside_grace_files_nothing(rig):
++    conn, home = rig
++    first = 1800000000.125
++    status(home, first)
++    alarm.sweep(conn, now=first)
++    cache(home, first+599)
++    status(home, first+599, None, first+599)
++    alarm.sweep(conn, now=first+599)
++    assert cards(conn) == [] and comments(conn) == []
++
++
++def test_recovery_one_comment_and_later_failure_reuses_open_card(rig):
++    conn, home = rig
++    first = 1800000000.125
++    status(home, first)
++    card = alarm.sweep(conn, now=first+600)
++    cache(home, first+650)
++    status(home, first+650, None, first+650)
++    alarm.sweep(conn, now=first+650)
++    alarm.sweep(conn, now=first+651)
++    assert len(comments(conn)) == 1 and 'recovered at ' in comments(conn)[0]
++    status(home, first+800, 'auth failure', first+650)
++    assert alarm.sweep(conn, now=first+1250) == card
++    assert len(cards(conn)) == 1
++
++
++@pytest.mark.parametrize('terminal', ['done', 'archived'])
++def test_closed_incident_gets_new_card(rig, terminal):
++    conn, home = rig
++    first = 1800000000.125
++    status(home, first)
++    old = alarm.sweep(conn, now=first+600)
++    with kb.write_txn(conn):
++        conn.execute('UPDATE tasks SET status = ? WHERE id = ?', (terminal, old))
++    new = alarm.sweep(conn, now=first+601)
++    assert new != old and len(cards(conn)) == 2
++
++
++def test_missing_cache_first_seen_survives_detector_restart(rig):
++    conn, _home = rig
++    first = 1800000000.125
++    alarm.sweep(conn, now=first)
++    # No process-local streak state: a later sweep reads the persisted receipt.
++    assert alarm.sweep(conn, now=first+599.99) is None
++    assert alarm.sweep(conn, now=first+600)
++
++
++def test_cache_publish_crash_does_not_roll_back_success(rig):
++    conn, home = rig
++    status(home, 900.125, 'observation did not complete', 100.125)
++    cache(home, 1000.125)
++    alarm.sweep(conn, now=1100.125)
++    assert alarm.sweep(conn, now=1599.999) is None
++    assert alarm.sweep(conn, now=1600.125)
++
++
++def test_second_recovery_inside_hour_is_not_lost(rig):
++    conn, home = rig
++    status(home, 1000.125)
++    alarm.sweep(conn, now=1600.125)
++    cache(home, 1650.125)
++    alarm.sweep(conn, now=1650.125)
++    status(home, 1800.125, success=1650.125)
++    alarm.sweep(conn, now=2400.125)
++    cache(home, 2450.125)
++    alarm.sweep(conn, now=2450.125)
++    assert len(comments(conn)) == 2
++    assert all('recovered at ' in comment for comment in comments(conn))
++    assert len(cards(conn)) == 1
++
++
++def test_missing_initial_event_self_heals(rig, monkeypatch):
++    conn, home = rig
++    status(home, 1000.125)
++    append = kb._append_event
++    def crash(db, card, kind, payload=None, **kw):
++        if kind == 'turn_urgency_alarm':
++            raise RuntimeError('crash after create')
++        return append(db, card, kind, payload, **kw)
++    with monkeypatch.context() as patcher:
++        patcher.setattr(kb, '_append_event', crash)
++        with pytest.raises(RuntimeError, match='crash after create'):
++            alarm.sweep(conn, now=1600.125)
++    assert len(cards(conn)) == 1
++    alarm.sweep(conn, now=1601.125)
++    alarm.sweep(conn, now=5201.125)
++    assert len(cards(conn)) == 1 and len(comments(conn)) == 1
++
++
++def test_enabled_timer_does_not_monitor_named_profile(tmp_path, monkeypatch):
++    monkeypatch.setattr(alarm.sys, 'platform', 'linux')
++    account = tmp_path / 'account'
++    monkeypatch.setattr(alarm.Path, 'home', lambda: account)
++    monkeypatch.setenv('XDG_CONFIG_HOME', str(account / '.config'))
++    unit = account / '.config/systemd/user/timers.target.wants/hermes-turn-urgency.timer'
++    unit.parent.mkdir(parents=True)
++    unit.write_text('[Timer]')
++    monkeypatch.setattr(alarm, '_home', lambda: account / '.hermes')
++    assert alarm._enabled()
++    monkeypatch.setattr(alarm, '_home', lambda: account / '.hermes/profiles/work')
++    assert not alarm._enabled()
++    monkeypatch.setattr(alarm, '_home', lambda: account / '.hermes')
++    unit.unlink()
++    assert not alarm._enabled()
++
++
++@pytest.mark.parametrize('gate', ['timer', 'board', 'mode'])
++def test_disabled_foreign_unsynced_do_not_file(rig, monkeypatch, gate):
++    conn, home = rig
++    status(home, 1000.125)
++    if gate == 'timer':
++        monkeypatch.setattr(alarm, '_enabled', lambda: False)
++    elif gate == 'board':
++        monkeypatch.setattr(alarm, '_default_board', lambda conn: False)
++    else:
++        monkeypatch.setattr('hermes_cli.kanban_db_sync.board_mode', lambda conn: 'off')
++    assert alarm.sweep(conn, now=2000) is None
++    assert cards(conn) == []
+-- 
+2.43.0
+

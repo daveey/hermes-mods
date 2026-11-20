@@ -1,0 +1,338 @@
+From c451a8cfbefcac6f4ca91501ccf59bfdfc2a8d74 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 01:33:37 +0000
+Subject: [PATCH] [daveey] Revoke native origin receipts on task replacement
+ and fence primary custody
+
+---
+ hermes_cli/kanban_origin_native.py            |  84 +++++++++--
+ tests/hermes_cli/test_origin_native.py        |  20 ++-
+ .../test_origin_native_lifecycle.py           | 133 ++++++++++++++++++
+ 3 files changed, 219 insertions(+), 18 deletions(-)
+ create mode 100644 tests/hermes_cli/test_origin_native_lifecycle.py
+
+diff --git a/hermes_cli/kanban_origin_native.py b/hermes_cli/kanban_origin_native.py
+index d141a6e967db2ee6b1a7ad1985c01f6a446260f7..cdb2c8f1c1b63980a0868556659e854f6e4b0cab 100644
+--- a/hermes_cli/kanban_origin_native.py
++++ b/hermes_cli/kanban_origin_native.py
+@@ -35,6 +35,62 @@ def capture(creator_task_id, *, courier=False):
+     return {"origin": {"gateway": gateway, "profile": profile, "session": sid}}
+ 
+ 
++def _primary_scope(conn):
++    """Require the canonical board file and a current local primary identity."""
++    from pathlib import Path
++    from hermes_cli.kanban_db import board_own_db_path, kanban_home
++    from hermes_cli.kanban_db_sync import _db_key, sync_config, board_selected
++    from hermes_cli.kanban_execution_observations import board_owner_profile
++    from hermes_cli.kanban_placement_forward import opened_board
++    from hermes_cli.kanban_origin import gateway_names
++    key = _db_key(conn)
++    if not key:
++        return None
++    board, gateway = opened_board(conn), gateway_names()[0]
++    if not board or not gateway:
++        return None
++    expected = board_own_db_path(board)
++    # Resolve the profile home, not a board/DB symlink into another store.
++    expected = kanban_home().resolve() / expected.relative_to(kanban_home())
++    if Path(key) != expected or expected.resolve() != expected:
++        return None
++    config = sync_config()
++    if not config.get("enabled") or not board_selected(key, config):
++        return None
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_sync_state'").fetchone():
++        return None
++    row = conn.execute("SELECT board_id, gateway_id, mode FROM kanban_sync_state").fetchall()
++    if len(row) != 1 or tuple(row[0]) != (board, gateway, "primary"):
++        return None
++    profile = board_owner_profile(expected)
++    return (gateway, profile, board) if profile else None
++
++
++def _install_revocation(conn):
++    """Local triggers also cover sync deletes and SQLite REPLACE with recursion off."""
++    conn.execute("CREATE TABLE IF NOT EXISTS origin_native_receipts (task_id TEXT PRIMARY KEY, "
++                 "binding_json TEXT NOT NULL, inherited_from TEXT, created_at INTEGER NOT NULL)")
++    for name, event, key, condition in (
++        ("delete", "DELETE", "OLD.id", ""),
++        ("insert", "INSERT", "NEW.id", ""),
++        ("destination", "UPDATE OF id", "NEW.id", "WHEN OLD.id IS NOT NEW.id"),
++        ("identity", "UPDATE OF id, created_at, created_on", "OLD.id",
++         "WHEN OLD.id IS NOT NEW.id OR OLD.created_at IS NOT NEW.created_at "
++         "OR (OLD.created_on IS NOT NEW.created_on AND NOT (OLD.created_on IS NULL "
++         "AND NEW.created_on IS (SELECT json_extract(binding_json, '$.owner.gateway') "
++         "FROM origin_native_receipts WHERE task_id=OLD.id)))"),
++    ):
++        conn.execute(f"CREATE TRIGGER IF NOT EXISTS origin_native_revoke_{name} AFTER {event} "
++                     f"ON tasks {condition} BEGIN DELETE FROM origin_native_receipts WHERE task_id={key}; END")
++    conn.execute("CREATE TRIGGER IF NOT EXISTS origin_native_revoke_store_update "
++                 "AFTER UPDATE OF board_id, gateway_id, mode ON kanban_sync_state "
++                 "WHEN OLD.board_id IS NOT NEW.board_id OR OLD.gateway_id IS NOT NEW.gateway_id "
++                 "OR OLD.mode IS NOT NEW.mode BEGIN DELETE FROM origin_native_receipts; END")
++    for event in ("INSERT", "DELETE"):
++        conn.execute(f"CREATE TRIGGER IF NOT EXISTS origin_native_revoke_store_{event.lower()} "
++                     f"AFTER {event} ON kanban_sync_state BEGIN DELETE FROM origin_native_receipts; END")
++
++
+ def _receipt(conn, task_id):
+     if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='origin_native_receipts'").fetchone():
+         return None
+@@ -43,6 +99,9 @@ def _receipt(conn, task_id):
+         return None
+     binding = json.loads(row[0])
+     validate_binding(binding)
++    if not conn.execute("SELECT 1 FROM tasks WHERE id=? AND (created_on IS NULL OR created_on=?)",
++                        (task_id, binding["owner"]["gateway"])).fetchone():
++        return None
+     return binding
+ 
+ 
+@@ -50,14 +109,11 @@ def record(conn, task_id, context, created_at):
+     """Called inside create_task's transaction; no event or sync projection."""
+     if context is None:
+         return
+-    from hermes_cli.kanban_db_sync import _db_key
+-    from hermes_cli.kanban_execution_observations import board_owner_profile
+-    from hermes_cli.kanban_placement_forward import opened_board
+-    from hermes_cli.kanban_origin import gateway_names
+-    gateway = gateway_names()[0]
+-    profile = board_owner_profile(_db_key(conn))
+-    board = opened_board(conn)
+-    if not all((gateway, profile, board)):
++    scope = _primary_scope(conn)
++    if scope is None:
++        return
++    gateway, profile, board = scope
++    if not conn.execute("SELECT 1 FROM tasks WHERE id=? AND (created_on IS NULL OR created_on=?)", (task_id, gateway)).fetchone():
+         return
+     creator = context.get("creator")
+     if creator:
+@@ -75,8 +131,7 @@ def record(conn, task_id, context, created_at):
+                                            "task_id": task_id},
+                "task_record_key": f"{profile}/{board}/{task_id}"}
+     validate_binding(binding)
+-    conn.execute("CREATE TABLE IF NOT EXISTS origin_native_receipts (task_id TEXT PRIMARY KEY, "
+-                 "binding_json TEXT NOT NULL, inherited_from TEXT, created_at INTEGER NOT NULL)")
++    _install_revocation(conn)
+     conn.execute("INSERT INTO origin_native_receipts VALUES (?,?,?,?)",
+                  (task_id, json.dumps(binding, sort_keys=True), creator, created_at))
+ 
+@@ -85,15 +140,14 @@ def lookup(origin, creator, *, gateway):
+     """Read only the qualified local primary board; never a shadow replica."""
+     if creator["gateway"] != gateway:
+         return None
+-    from hermes_cli.kanban_db import kanban_db_path
++    from hermes_cli.kanban_db import board_own_db_path
+     from hermes_cli.kanban_execution_observations import board_owner_profile
+     from hermes_cli import kanban_lockguard
+-    path = kanban_db_path(creator["board"])
++    path = board_own_db_path(creator["board"])
+     if not path.exists() or board_owner_profile(path) != creator["profile"]:
+         return None
+-    with closing(kanban_lockguard.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+-        from hermes_cli.kanban_placement_forward import opened_board
+-        if opened_board(conn) != creator["board"]:
++    with closing(kanban_lockguard.connect(path.absolute().as_uri() + "?mode=ro", uri=True)) as conn:
++        if _primary_scope(conn) != (gateway, creator["profile"], creator["board"]):
+             return None
+         binding = _receipt(conn, creator["task_id"])
+     if binding and binding["owner"] == creator and binding["origin"] == origin:
+diff --git a/tests/hermes_cli/test_origin_native.py b/tests/hermes_cli/test_origin_native.py
+index ae3cbccfe74cff8f7e79f11c2122434cde1a0b31..e9a093b36a01003abb95e943c9774ef2514a4168 100644
+--- a/tests/hermes_cli/test_origin_native.py
++++ b/tests/hermes_cli/test_origin_native.py
+@@ -12,11 +12,22 @@ def scope(monkeypatch):
+     monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("macbook", []))
+     monkeypatch.setattr(kanban_execution_observations, "board_owner_profile", lambda path: "default")
+     monkeypatch.setattr(kanban_placement_forward, "opened_board", lambda conn: "default")
++    monkeypatch.setattr(native, "_primary_scope", lambda conn: (
++        "macbook", kanban_execution_observations.board_owner_profile(None), "default"))
+     return {"origin": {"gateway": "macbook", "profile": "default", "session": "chat-1"}}
+ 
+ 
+-def test_transaction_and_inheritance(scope):
++def memory_tasks():
+     conn = sqlite3.connect(":memory:")
++    conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, created_on TEXT, created_at INTEGER)")
++    conn.execute("CREATE TABLE kanban_sync_state (board_id TEXT, gateway_id TEXT, mode TEXT)")
++    conn.executemany("INSERT INTO tasks VALUES (?, 'macbook', 1)", [("t_root",), ("t_child",)])
++    conn.commit()
++    return conn
++
++
++def test_transaction_and_inheritance(scope):
++    conn = memory_tasks()
+     conn.execute("BEGIN")
+     native.record(conn, "t_root", scope, 1)
+     native.record(conn, "t_child", {"creator": "t_root"}, 2)
+@@ -27,7 +38,7 @@ def test_transaction_and_inheritance(scope):
+ 
+ 
+ def test_missing_receipt_and_synced_ancestry_cannot_authorize(scope):
+-    conn = sqlite3.connect(":memory:")
++    conn = memory_tasks()
+     conn.execute("CREATE TABLE task_chat_links (task_id, chat_gateway, chat_profile, chat_session)")
+     conn.execute("INSERT INTO task_chat_links VALUES ('t_fake','macbook','default','chat-1')")
+     native.record(conn, "t_child", {"creator": "t_fake"}, 2)
+@@ -35,7 +46,7 @@ def test_missing_receipt_and_synced_ancestry_cannot_authorize(scope):
+ 
+ 
+ def test_foreign_parent_namespace_rejected(scope, monkeypatch):
+-    conn = sqlite3.connect(":memory:")
++    conn = memory_tasks()
+     native.record(conn, "t_root", scope, 1)
+     from hermes_cli import kanban_execution_observations
+     monkeypatch.setattr(kanban_execution_observations, "board_owner_profile", lambda path: "other")
+@@ -75,6 +86,9 @@ def test_real_tool_creation_authorizes_native_worker_forward(tmp_path, monkeypat
+     from hermes_cli import kanban_origin, kanban_db_connect as kbc
+     from hermes_cli.kanban_origin_forward import authorize
+     home = fixtures.make_home(tmp_path, monkeypatch)
++    from hermes_cli import kanban_db_sync as sync
++    with kbc.connect_closing() as conn:
++        sync.set_mode(conn, "primary")
+     monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("here", {"here"}))
+     monkeypatch.setenv("HERMES_SESSION_ID", fixtures.CHAT)
+     task = fixtures.create("tool", monkeypatch, capsys)
+diff --git a/tests/hermes_cli/test_origin_native_lifecycle.py b/tests/hermes_cli/test_origin_native_lifecycle.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6fd0bf41012907714fc80d1505ceabadff4b2510
+--- /dev/null
++++ b/tests/hermes_cli/test_origin_native_lifecycle.py
+@@ -0,0 +1,133 @@
++"""Native receipt custody must not outlive a task or its primary store."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_origin_native as native
++from tests.tools import test_kanban_worker_created_chats as fixtures
++
++
++@pytest.fixture
++def store(tmp_path, monkeypatch):
++    from hermes_cli import kanban_origin
++    home = fixtures.make_home(tmp_path, monkeypatch)
++    monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("here", {"here"}))
++    origin = {"gateway": "here", "profile": "default", "session": fixtures.CHAT}
++    with kbc.connect_closing() as conn:
++        from hermes_cli import kanban_db_sync as sync
++        sync.set_mode(conn, "primary")
++        task = kb.create_task(conn, title="native root")
++        assert native._primary_scope(conn) is not None, (sync._db_key(conn), str(kb.board_own_db_path("default")),
++            sync.board_mode(conn), [tuple(r) for r in conn.execute("SELECT board_id,gateway_id,mode FROM kanban_sync_state")])
++        native.record(conn, task, {"origin": origin}, 1)
++        conn.commit()
++        binding = native._receipt(conn, task)
++        assert binding is not None
++        yield home, conn, task, binding
++
++
++def test_deleted_receipt_cannot_authorize_or_inherit(store):
++    _, conn, task, binding = store
++    conn.execute("DELETE FROM tasks WHERE id=?", (task,))
++    conn.commit()
++    assert native._receipt(conn, task) is None
++    assert conn.execute("SELECT COUNT(*) FROM origin_native_receipts WHERE task_id=?", (task,)).fetchone()[0] == 0
++    assert native.lookup(binding["origin"], binding["owner"], gateway="here") is None
++    child = kb.create_task(conn, title="orphan child")
++    native.record(conn, child, {"creator": task}, 2)
++    assert native._receipt(conn, child) is None
++
++
++def test_reused_task_id_does_not_resurrect_receipt(store):
++    _, conn, task, _ = store
++    # REPLACE's implicit delete does not run delete triggers unless recursive_triggers is on.
++    conn.execute("PRAGMA recursive_triggers=OFF")
++    conn.execute("INSERT OR REPLACE INTO tasks SELECT * FROM tasks WHERE id=?", (task,))
++    assert native._receipt(conn, task) is None
++
++
++@pytest.mark.parametrize("column,value", [("created_at", 999), ("created_on", "foreign")])
++def test_identity_change_revokes_receipt(store, column, value):
++    _, conn, task, _ = store
++    conn.execute(f"UPDATE tasks SET {column}=? WHERE id=?", (value, task))
++    assert native._receipt(conn, task) is None
++
++
++def test_update_replace_cannot_transfer_receipt(store):
++    _, conn, task, _ = store
++    other = kb.create_task(conn, title="untrusted replacement")
++    conn.execute("PRAGMA recursive_triggers=OFF")
++    conn.execute("UPDATE OR REPLACE tasks SET id=? WHERE id=?", (task, other))
++    assert native._receipt(conn, task) is None
++
++
++def test_normal_task_update_preserves_receipt(store):
++    _, conn, task, binding = store
++    conn.execute("UPDATE tasks SET title='renamed' WHERE id=?", (task,))
++    assert native._receipt(conn, task) == binding
++
++
++@pytest.mark.parametrize("mode", ["replica", "link", "off"])
++def test_mode_change_refuses_reads_and_new_receipts(store, mode):
++    _, conn, _, binding = store
++    conn.execute("UPDATE kanban_sync_state SET mode=?", (mode,))
++    conn.commit()
++    assert native.lookup(binding["origin"], binding["owner"], gateway="here") is None
++    native.record(conn, "untrusted", {"origin": binding["origin"]}, 2)
++    assert native._receipt(conn, "untrusted") is None
++
++
++def test_shadow_copy_cannot_mint_receipt(store, tmp_path):
++    _, conn, task, binding = store
++    path = tmp_path / "sync-shadow" / "default.db"
++    path.parent.mkdir()
++    with sqlite3.connect(path) as shadow:
++        conn.backup(shadow)
++        shadow.execute("DELETE FROM origin_native_receipts")
++        native.record(shadow, task, {"origin": binding["origin"]}, 2)
++        assert native._receipt(shadow, task) is None
++
++
++def test_pinned_shadow_is_not_native_authority(store, tmp_path, monkeypatch):
++    _, conn, task, binding = store
++    shadow = tmp_path / "shadow.db"
++    with sqlite3.connect(shadow) as other:
++        conn.backup(other)
++    # Only shadow retains the old receipt. Ambient pins cannot turn it into primary authority.
++    conn.execute("DELETE FROM origin_native_receipts")
++    conn.commit()
++    monkeypatch.setenv("HERMES_KANBAN_TASK", task)
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(shadow))
++    assert native.lookup(binding["origin"], binding["owner"], gateway="here") is None
++
++
++def test_symlinked_primary_does_not_authorize(store, tmp_path):
++    home, conn, _, binding = store
++    conn.commit()
++    primary = home / "kanban.db"
++    relocated = tmp_path / "relocated.db"
++    primary.rename(relocated)
++    primary.symlink_to(relocated)
++    assert native.lookup(binding["origin"], binding["owner"], gateway="here") is None
++
++
++def test_local_owner_publication_preserves_receipt(store):
++    _, conn, task, binding = store
++    conn.execute("UPDATE tasks SET created_on='here' WHERE id=?", (task,))
++    assert native._receipt(conn, task) == binding
++
++
++def test_mode_roundtrip_does_not_resurrect_receipt(store):
++    _, conn, task, _ = store
++    conn.execute("UPDATE kanban_sync_state SET mode='shadow'")
++    conn.execute("UPDATE kanban_sync_state SET mode='primary'")
++    assert native._receipt(conn, task) is None
++
++
++def test_readonly_lookup_needs_no_writer_initialization(store, monkeypatch):
++    _, _, _, binding = store
++    from hermes_cli import kanban_db_sync as sync
++    monkeypatch.setattr(sync, "_SYNCED_PATHS", set())
++    assert native.lookup(binding["origin"], binding["owner"], gateway="here") == binding
++
+-- 
+2.43.0
+

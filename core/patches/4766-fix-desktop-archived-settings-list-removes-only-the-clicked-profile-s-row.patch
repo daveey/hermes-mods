@@ -1,0 +1,168 @@
+From db75a525c5e6db198fccc815d1e4706f48b4c6b1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 21:49:36 -0800
+Subject: [PATCH] fix(desktop): archived settings list removes only the clicked
+ profile's row
+
+Review of #3557 (card t_132234303dfda37c): the removed set was keyed by
+connection, profile and id, but the optimistic removal right after an
+unarchive or delete still filtered by bare session id, so another
+profile's row with the same id vanished at once, and with the whole
+archive on one page nothing read it back. The busy flag and the React
+key had the same collision.
+
+Both removal filters, the busy flag and the row key now use the full row
+identity. The element id stays the bare session id: it is the deep-link
+target.
+
+Tests: sessions-settings.test.tsx, same id in two profiles on an
+exhausted page: the sibling stays on screen right after an unarchive and
+right after a delete. Both fail with the bare-id filter.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .../app/settings/sessions-settings.test.tsx   | 55 ++++++++++++++++++-
+ .../src/app/settings/sessions-settings.tsx    | 12 ++--
+ 2 files changed, 60 insertions(+), 7 deletions(-)
+
+diff --git a/apps/desktop/src/app/settings/sessions-settings.test.tsx b/apps/desktop/src/app/settings/sessions-settings.test.tsx
+index 9586bd242d6a2cfdb6775f093487800a8ca01442..5598aa3e40778cb31a15ca62b2c31fe78ede70dd 100644
+--- a/apps/desktop/src/app/settings/sessions-settings.test.tsx
++++ b/apps/desktop/src/app/settings/sessions-settings.test.tsx
+@@ -2,8 +2,9 @@
+ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+-import { setSessionArchived } from '@/hermes'
++import { deleteSession, setSessionArchived } from '@/hermes'
+ import { en } from '@/i18n/en'
++import { confirm } from '@/store/confirm'
+ import { $messagingSessions, $sessions, setMessagingSessions, setSessions } from '@/store/session'
+ import type { SessionInfo } from '@/types/hermes'
+ 
+@@ -13,6 +14,7 @@ vi.mock('@/i18n', () => ({ useI18n: () => ({ t: en }) }))
+ 
+ vi.mock('@/hermes', async importOriginal => ({
+   ...(await importOriginal<Record<string, unknown>>()),
++  deleteSession: vi.fn().mockResolvedValue({ ok: true }),
+   getHermesConfigRecord: vi.fn().mockResolvedValue({ config: {} }),
+   setSessionArchived: vi.fn().mockResolvedValue(undefined)
+ }))
+@@ -26,6 +28,8 @@ vi.mock('@/api/sessions', async importOriginal => ({
+   listAllProfileSessions
+ }))
+ 
++vi.mock('@/store/confirm', () => ({ confirm: vi.fn().mockResolvedValue(true) }))
++
+ const selectDesktopPaths = vi.hoisted(() => vi.fn())
+ 
+ vi.mock('@/lib/desktop-fs', async importOriginal => ({
+@@ -198,6 +202,55 @@ describe('SessionsSettings archived list paging', () => {
+     expect(await screen.findByText('theirs')).toBeTruthy()
+   })
+ 
++  // Hub review of #3557: the row a click removes is one profile's, and with the whole archive
++  // on one page there is no later read to bring a wrongly removed sibling back.
++  describe('same session id in two profiles, whole archive on one page', () => {
++    const mine = { ...archived('same'), profile: 'default', title: 'mine' }
++    const theirs = { ...archived('same'), profile: 'work', title: 'theirs' }
++
++    const rowButtons = (title: string) =>
++      Array.from((screen.getByText(title).closest('#archived-session-same') as HTMLElement).querySelectorAll('button'))
++
++    beforeEach(() => {
++      listAllProfileSessions.mockReset().mockResolvedValue({ sessions: [mine, theirs], total: 2 })
++      vi.mocked(setSessionArchived).mockReset().mockResolvedValue({ ok: true })
++    })
++
++    it("keeps the other profile's row on screen right after an unarchive", async () => {
++      render(<SessionsSettings />)
++      await screen.findByText('mine')
++
++      const unarchive = rowButtons('mine').find(button =>
++        button.textContent?.includes(en.settings.sessions.unarchive)
++      ) as HTMLElement
++
++      await act(async () => fireEvent.click(unarchive))
++
++      await waitFor(() => expect(screen.queryByText('mine')).toBeNull())
++      expect(screen.getByText('theirs')).toBeTruthy()
++      expect(setSessionArchived).toHaveBeenCalledWith('same', false, 'default')
++      expect(screen.queryByRole('button', { name: en.sidebar.loadMore })).toBeNull()
++    })
++
++    it("keeps the other profile's row on screen right after a delete", async () => {
++      vi.mocked(confirm).mockResolvedValue(true)
++      vi.mocked(deleteSession).mockResolvedValue({ ok: true })
++
++      render(<SessionsSettings />)
++      await screen.findByText('theirs')
++
++      const remove = rowButtons('theirs').find(
++        button => button.getAttribute('aria-label') === en.settings.sessions.deletePermanently
++      ) as HTMLElement
++
++      await act(async () => fireEvent.click(remove))
++
++      await waitFor(() => expect(screen.queryByText('theirs')).toBeNull())
++      expect(screen.getByText('mine')).toBeTruthy()
++      expect(deleteSession).toHaveBeenCalledWith('same', 'work')
++    })
++  })
++
+   it('lists automated archived rows too, whatever the sidebar preference', async () => {
+     render(<SessionsSettings />)
+ 
+diff --git a/apps/desktop/src/app/settings/sessions-settings.tsx b/apps/desktop/src/app/settings/sessions-settings.tsx
+index ba14e4e6467f5b63233f563bb1a7a6c3269d04fb..f8edee61f38188dcb6eb3c7e4fefd61b459b17a6 100644
+--- a/apps/desktop/src/app/settings/sessions-settings.tsx
++++ b/apps/desktop/src/app/settings/sessions-settings.tsx
+@@ -151,12 +151,12 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
+ 
+   const unarchive = useCallback(
+     async (session: SessionInfo) => {
+-      setBusyId(session.id)
++      setBusyId(rowIdentity(session))
+ 
+       try {
+         await setSessionArchived(session.id, false, session.profile)
+         paging.removed.add(rowIdentity(session))
+-        setLocalSessions(prev => prev.filter(s => s.id !== session.id))
++        setLocalSessions(prev => prev.filter(s => rowIdentity(s) !== rowIdentity(session)))
+         // Surface it again in the sidebar without waiting for a full refresh, and
+         // lift any optimistic eviction so the grouped tree shows it again too.
+         untombstoneSessions([session.id, session._lineage_root_id])
+@@ -184,7 +184,7 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
+         return
+       }
+ 
+-      setBusyId(session.id)
++      setBusyId(rowIdentity(session))
+ 
+       try {
+         await deleteSession(session.id, session.profile)
+@@ -198,7 +198,7 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
+         // stored id and the row may carry either.
+         purgeInFlightTurnJournals([session.id, session._lineage_root_id])
+         paging.removed.add(rowIdentity(session))
+-        setLocalSessions(prev => prev.filter(s => s.id !== session.id))
++        setLocalSessions(prev => prev.filter(s => rowIdentity(s) !== rowIdentity(session)))
+         triggerHaptic('warning')
+       } catch (err) {
+         notifyError(err, s.deleteFailed)
+@@ -240,10 +240,10 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
+         <div className="grid gap-1">
+           {sessions.map(session => {
+             const label = pathLeaf(session.cwd)
+-            const busy = busyId === session.id
++            const busy = busyId === rowIdentity(session)
+ 
+             return (
+-              <div className="scroll-mt-6 rounded-lg" id={`archived-session-${session.id}`} key={session.id}>
++              <div className="scroll-mt-6 rounded-lg" id={`archived-session-${session.id}`} key={rowIdentity(session)}>
+                 <ListRow
+                   action={
+                     <div className="flex items-center gap-1.5">
+-- 
+2.43.0
+

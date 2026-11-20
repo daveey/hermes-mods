@@ -1,0 +1,412 @@
+From b02da78041fe6b4299d493032b83c0b8440cf7d5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 01:47:00 +0000
+Subject: [PATCH] [daveey] Bind native origin capture to revocable durable turn
+ custody
+
+---
+ agent/origin_turn_custody.py                 |  89 +++++++++++
+ agent/turn_facade.py                         |   3 +-
+ agent/turn_facade_lease.py                   |   1 +
+ hermes_cli/kanban_origin_native.py           |  32 ++--
+ tests/hermes_cli/test_origin_native.py       |  26 +++-
+ tests/hermes_cli/test_origin_turn_custody.py | 152 +++++++++++++++++++
+ 6 files changed, 280 insertions(+), 23 deletions(-)
+ create mode 100644 agent/origin_turn_custody.py
+ create mode 100644 tests/hermes_cli/test_origin_turn_custody.py
+
+diff --git a/agent/origin_turn_custody.py b/agent/origin_turn_custody.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e2631746d81c7235de3f94f1b59cea5b9944257c
+--- /dev/null
++++ b/agent/origin_turn_custody.py
+@@ -0,0 +1,89 @@
++"""In-process native chat custody. Never serialized into subprocess environment."""
++from contextlib import contextmanager
++from contextvars import ContextVar
++import math
++import os
++from pathlib import Path
++import sqlite3
++import time
++
++_current = ContextVar("origin_turn_custody", default=None)
++
++
++@contextmanager
++def scope(lease):
++    """Mask parent custody even for a turn with no durable lease."""
++    from hermes_cli.profiles import get_active_profile_name
++    from hermes_constants import get_hermes_home
++    from hermes_cli.kanban_origin import gateway_names
++    value = None
++    if lease is not None:
++        value = (lease, os.getpid(), Path(get_hermes_home()).resolve(),
++                 get_active_profile_name(), gateway_names()[0])
++    token = _current.set(value)
++    try:
++        yield
++    finally:
++        _current.reset(token)
++
++
++def origin():
++    """Revalidate the exact holder on every capture; a copied context is no lease."""
++    from agent.delegation_context import is_delegated_child_process_context
++    from hermes_cli.profiles import get_active_profile_name
++    from hermes_constants import get_hermes_home
++    from hermes_cli.kanban_origin import gateway_names
++    from hermes_cli.kanban_session_provenance import _INTERACTIVE_SOURCES
++    value = _current.get()
++    if value is None or is_delegated_child_process_context():
++        return None
++    lease, pid, home, profile, gateway = value
++    if (pid != os.getpid() or not gateway or profile == "custom"
++            or home != Path(get_hermes_home()).resolve()
++            or profile != get_active_profile_name() or gateway != gateway_names()[0]):
++        return None
++    agent, db = lease.agent, lease.db
++    if (not lease.is_turn_active() or lease.stop.is_set() or lease.interrupt_message
++            or getattr(agent, "_session_db", None) is not db
++            or getattr(agent, "_active_session_turn_lease_holder", None) != lease.holder
++            or getattr(agent, "_persist_disabled", False)):
++        return None
++    sid = getattr(agent, "session_id", None)
++    try:
++        if Path(db.db_path).resolve() != home / "state.db":
++            return None
++        if not sid or db._session_turn_lease_key(sid) != db._session_turn_lease_key(lease.session_id):
++            return None
++        expires = db.session_turn_lease_expires_at(sid, lease.holder)
++        if not isinstance(expires, (int, float)) or not math.isfinite(expires) or expires <= time.time():
++            return None
++        row = db.get_session(sid)
++    except (AttributeError, OSError, sqlite3.Error, ValueError):
++        return None
++    if not row or row.get("source") not in _INTERACTIVE_SOURCES:
++        return None
++    # Source/lineage reads may block while the turn is revoked. This is the
++    # admission linearization point, not the earlier provenance read.
++    try:
++        expires = db.session_turn_lease_expires_at(sid, lease.holder)
++    except (AttributeError, OSError, sqlite3.Error, ValueError):
++        return None
++    if (not isinstance(expires, (int, float)) or not math.isfinite(expires) or expires <= time.time()
++            or not lease.is_turn_active() or lease.stop.is_set() or lease.interrupt_message
++            or getattr(agent, "_active_session_turn_lease_holder", None) != lease.holder):
++        return None
++    return {"gateway": gateway, "profile": profile, "session": sid}
++
++
++class CapturedOrigin(dict):
++    """Revocable turn snapshot consumed only in the originating in-process scope."""
++
++    def __init__(self, qualified):
++        super().__init__(origin=qualified)
++        self._custody = _current.get()
++
++    def validated(self):
++        if self._custody is not _current.get():
++            return None
++        qualified = origin()
++        return {"origin": qualified} if qualified and qualified == self.get("origin") else None
+diff --git a/agent/turn_facade.py b/agent/turn_facade.py
+index 654dba43ab7718caef3967bd98670eb574785f8d..64ff6a16297bed42fc3f46dd4735adc2a8751dd1 100644
+--- a/agent/turn_facade.py
++++ b/agent/turn_facade.py
+@@ -141,7 +141,8 @@ class TurnFacadeMixin:
+ 
+             # Keep the ContextVar scope local (agent tokens may be observed from another thread).
+             # A host that owns this thread (Hermes Console) may cancel the turn cross-thread.
+-            with bind_subagent_parent(self), scoped_runtime_main({}), track_in_interrupt_scope(self):
++            from agent.origin_turn_custody import scope as origin_custody_scope
++            with bind_subagent_parent(self), scoped_runtime_main({}), track_in_interrupt_scope(self), origin_custody_scope(lease):
+                 try:
+                     if lease is not None:
+                         lease.start()
+diff --git a/agent/turn_facade_lease.py b/agent/turn_facade_lease.py
+index b3d5f4ae9096d8f828b08b4e51bc13510b25a886..11ac1362d293c554b354d37d0723dd410946fd93 100644
+--- a/agent/turn_facade_lease.py
++++ b/agent/turn_facade_lease.py
+@@ -173,6 +173,7 @@ class DurableTurnLease:
+         A DELETE that loses the state.db write lock is not a failure yet: the store marks the holder
+         abandoned (so this process's next turn can take the row) and a daemon thread retries the
+         DELETE until the lease would have expired anyway, so other processes are not kept waiting."""
++        self.stop_refresher()  # Revoke copied in-process custody even if DELETE is deferred.
+         from hermes_state_errors import classify_persistence_error
+         from agent.runtime_session_store import is_retired_generation_error
+         agent = self.agent
+diff --git a/hermes_cli/kanban_origin_native.py b/hermes_cli/kanban_origin_native.py
+index cdb2c8f1c1b63980a0868556659e854f6e4b0cab..1fe2f0774885522e6281078fe91f361638a5ab29 100644
+--- a/hermes_cli/kanban_origin_native.py
++++ b/hermes_cli/kanban_origin_native.py
+@@ -7,32 +7,20 @@ from __future__ import annotations
+ 
+ from contextlib import closing
+ import json
+-import os
+ import sqlite3
+ 
+ from hermes_cli.kanban_origin_ledger import validate_binding
+ 
+ 
+ def capture(creator_task_id, *, courier=False):
+-    """Trusted ambient context, never the tool's session/origin arguments."""
+-    if courier:
++    """Use admitted in-process custody, never environment or tool arguments."""
++    if courier or creator_task_id:
++        # Worker inheritance needs independently verified claim custody. A bare
++        # HERMES_KANBAN_TASK is not a capability; refuse until that seam is bound.
+         return None
+-    worker = os.environ.get("HERMES_KANBAN_TASK")
+-    if worker:
+-        return {"creator": worker} if creator_task_id == worker else None
+-    if creator_task_id:
+-        return None
+-    from gateway.session_context import get_session_env
+-    from hermes_cli.kanban_origin import gateway_names
+-    from hermes_cli.profiles import get_active_profile_name
+-    from hermes_cli.kanban_session_provenance import _local_session_sources, _INTERACTIVE_SOURCES
+-    from hermes_cli.kanban_placement import is_placeholder_session
+-    sid = get_session_env("HERMES_SESSION_ID")
+-    gateway, profile = gateway_names()[0], get_active_profile_name()
+-    if (not gateway or profile == "custom" or not sid or is_placeholder_session(sid)
+-            or _local_session_sources([sid]).get(sid) not in _INTERACTIVE_SOURCES):
+-        return None
+-    return {"origin": {"gateway": gateway, "profile": profile, "session": sid}}
++    from agent.origin_turn_custody import CapturedOrigin, origin
++    qualified = origin()
++    return CapturedOrigin(qualified) if qualified else None
+ 
+ 
+ def _primary_scope(conn):
+@@ -107,6 +95,10 @@ def _receipt(conn, task_id):
+ 
+ def record(conn, task_id, context, created_at):
+     """Called inside create_task's transaction; no event or sync projection."""
++    from agent.origin_turn_custody import CapturedOrigin
++    captured = context if isinstance(context, CapturedOrigin) else None
++    if captured is not None:
++        context = captured.validated()
+     if context is None:
+         return
+     scope = _primary_scope(conn)
+@@ -132,6 +124,8 @@ def record(conn, task_id, context, created_at):
+                "task_record_key": f"{profile}/{board}/{task_id}"}
+     validate_binding(binding)
+     _install_revocation(conn)
++    if captured is not None and captured.validated() is None:
++        return
+     conn.execute("INSERT INTO origin_native_receipts VALUES (?,?,?,?)",
+                  (task_id, json.dumps(binding, sort_keys=True), creator, created_at))
+ 
+diff --git a/tests/hermes_cli/test_origin_native.py b/tests/hermes_cli/test_origin_native.py
+index e9a093b36a01003abb95e943c9774ef2514a4168..b5490ea03b3f88e4fb639eec66aab5430c32e5a8 100644
+--- a/tests/hermes_cli/test_origin_native.py
++++ b/tests/hermes_cli/test_origin_native.py
+@@ -72,13 +72,13 @@ def test_capture_ambient_interactive_only(scope, monkeypatch):
+     monkeypatch.setattr(session_context, "get_session_env", lambda name: "chat-1")
+     monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
+     monkeypatch.setattr(kanban_session_provenance, "_local_session_sources", lambda sids: {"chat-1": "desktop"})
+-    assert native.capture(None) == scope
++    assert native.capture(None) is None  # Classification alone is not custody.
+     assert native.capture(None, courier=True) is None
+     assert native.capture("t_forged") is None
+     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+     assert native.capture(None) is None
+     assert native.capture("t_other") is None
+-    assert native.capture("t_worker") == {"creator": "t_worker"}
++    assert native.capture("t_worker") is None
+ 
+ 
+ def test_real_tool_creation_authorizes_native_worker_forward(tmp_path, monkeypatch, capsys):
+@@ -91,7 +91,27 @@ def test_real_tool_creation_authorizes_native_worker_forward(tmp_path, monkeypat
+         sync.set_mode(conn, "primary")
+     monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("here", {"here"}))
+     monkeypatch.setenv("HERMES_SESSION_ID", fixtures.CHAT)
+-    task = fixtures.create("tool", monkeypatch, capsys)
++    from agent.origin_turn_custody import scope as custody_scope
++    from agent.turn_facade_lease import admit_durable_turn_lease
++    from hermes_state import SessionDB
++    from types import SimpleNamespace
++    db = SessionDB(home / "state.db")
++    agent = SimpleNamespace(_session_db=db, session_id=fixtures.CHAT, _persist_disabled=False,
++                            _interrupt_requested=False, _emit_status=lambda *a: None,
++                            _touch_activity=lambda *a: None)
++    monkeypatch.setattr("agent.turn_liveness.resolve_turn_liveness_settings", lambda cfg: (None, 1.0))
++    lease = admit_durable_turn_lease(agent, session_id=fixtures.CHAT, relay_turn_id="native-create",
++        task_context={"platform": "desktop", "session_id": fixtures.CHAT}, conversation_history=[]).lease
++    assert lease is not None
++    try:
++        lease.start()
++        with custody_scope(lease):
++            task = fixtures.create("tool", monkeypatch, capsys)
++    finally:
++        lease.stop_refresher()
++        lease.join_threads()
++        lease.release()
++        db.close()
+     with kbc.connect_closing() as conn:
+         binding = native._receipt(conn, task)
+     assert binding is not None
+diff --git a/tests/hermes_cli/test_origin_turn_custody.py b/tests/hermes_cli/test_origin_turn_custody.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3fc668a6d9b04fd35e22d9461f215a23045bfd2c
+--- /dev/null
++++ b/tests/hermes_cli/test_origin_turn_custody.py
+@@ -0,0 +1,152 @@
++"""Native origin custody must not be reconstructible from session environment."""
++from contextvars import copy_context
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_origin_native as native
++
++
++def test_environment_is_not_custody(monkeypatch):
++    from hermes_cli import kanban_origin, kanban_session_provenance, profiles
++    monkeypatch.setenv("HERMES_SESSION_ID", "borrowed-chat")
++    monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("macbook", []))
++    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
++    monkeypatch.setattr(kanban_session_provenance, "_local_session_sources",
++                        lambda ids: {"borrowed-chat": "desktop"})
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    assert native.capture(None) is None
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_borrowed")
++    assert native.capture("t_borrowed") is None
++
++
++@pytest.fixture
++def admitted(tmp_path, monkeypatch):
++    from hermes_state import SessionDB
++    from agent.turn_facade_lease import admit_durable_turn_lease
++    from hermes_cli import kanban_origin
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("macbook", []))
++    monkeypatch.setattr("agent.turn_liveness.resolve_turn_liveness_settings", lambda cfg: (None, 1.0))
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session("chat-1", source="desktop")
++    agent = SimpleNamespace(_session_db=db, session_id="chat-1", _persist_disabled=False,
++                            _interrupt_requested=False, _emit_status=lambda *a: None,
++                            _touch_activity=lambda *a: None)
++    admission = admit_durable_turn_lease(agent, session_id="chat-1", relay_turn_id="turn-1",
++        task_context={"platform": "desktop", "session_id": "chat-1"}, conversation_history=[])
++    lease = admission.lease
++    assert lease is not None
++    lease.start()
++    try:
++        yield agent, db, lease
++    finally:
++        lease.stop_refresher()
++        lease.join_threads()
++        lease.release()
++        db.close()
++
++
++def test_admitted_capture_and_copied_thread_context(admitted):
++    from agent.origin_turn_custody import scope
++    from tools.thread_context import propagate_context_to_thread
++    from concurrent.futures import ThreadPoolExecutor
++    _, _, lease = admitted
++    expected = {"origin": {"gateway": "macbook", "profile": "default", "session": "chat-1"}}
++    assert native.capture(None) is None
++    with scope(lease):
++        assert native.capture(None) == expected
++        with ThreadPoolExecutor(max_workers=1) as pool:
++            assert pool.submit(propagate_context_to_thread(native.capture), None).result() == expected
++        copied = copy_context()
++        with scope(None):
++            assert native.capture(None) is None
++        assert native.capture(None) == expected
++    assert native.capture(None) is None
++    lease.stop_refresher()
++    assert copied.run(native.capture, None) is None
++
++
++@pytest.mark.parametrize("change", ["expired", "holder", "session", "db", "released", "pid", "delegated"])
++def test_custody_revalidated(admitted, monkeypatch, change):
++    from agent import origin_turn_custody as custody
++    from agent.delegation_context import delegated_child_context
++    agent, db, lease = admitted
++    with custody.scope(lease):
++        assert native.capture(None) is not None
++        if change == "expired":
++            monkeypatch.setattr(db, "session_turn_lease_expires_at", lambda *a: 0)
++        elif change == "holder":
++            db.release_session_turn_lease("chat-1", lease.holder)
++            db.acquire_session_turn_lease("chat-1", "other", ttl_seconds=60)
++        elif change == "session":
++            db.create_session("other", source="desktop")
++            agent.session_id = "other"
++        elif change == "db":
++            agent._session_db = object()
++        elif change == "released":
++            lease.release()
++        elif change == "pid":
++            monkeypatch.setattr(custody.os, "getpid", lambda: -1)
++        elif change == "delegated":
++            with delegated_child_context():
++                assert native.capture(None) is None
++            assert native.capture(None) is not None
++            return
++        assert native.capture(None) is None
++
++
++def test_release_during_source_read_refuses(admitted, monkeypatch):
++    from agent.origin_turn_custody import scope
++    _, db, lease = admitted
++    read = db.get_session
++    def releasing(sid):
++        row = read(sid)
++        lease.release()
++        return row
++    with scope(lease):
++        monkeypatch.setattr(db, "get_session", releasing)
++        assert native.capture(None) is None
++
++
++def test_captured_authority_revoked_before_record(admitted, monkeypatch):
++    from agent.origin_turn_custody import scope
++    from tests.hermes_cli.test_origin_native import memory_tasks
++    _, _, lease = admitted
++    conn = memory_tasks()
++    monkeypatch.setattr(native, "_primary_scope", lambda conn: ("macbook", "default", "default"))
++    with scope(lease):
++        captured = native.capture(None)
++        assert captured is not None
++        lease.release()
++        native.record(conn, "t_root", captured, 1)
++        assert native._receipt(conn, "t_root") is None
++    conn.close()
++
++
++def test_real_turn_facade_binds_and_releases(tmp_path, monkeypatch):
++    from hermes_state import SessionDB
++    from tests.agent.test_cross_process_turn_lease import _agent_with_db
++    from hermes_cli import kanban_origin
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("macbook", []))
++    monkeypatch.setattr("agent.turn_liveness.resolve_turn_liveness_settings", lambda cfg: (None, 1.0))
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session("chat-facade", source="desktop")
++    agent = _agent_with_db(db, session_id="chat-facade")
++    observed = []
++    def loop(*args, **kwargs):
++        observed.append(native.capture(None))
++        return {"final_response": "ok", "messages": [], "failed": False}
++    monkeypatch.setattr("agent.conversation_loop.run_conversation", loop)
++    monkeypatch.setattr("agent.relay_cwd.resolve_relay_scope_cwds", lambda *a: ("", ""))
++    try:
++        assert agent.run_conversation("test")["final_response"] == "ok"
++        assert observed == [{"origin": {"gateway": "macbook", "profile": "default", "session": "chat-facade"}}]
++        assert native.capture(None) is None
++        assert observed[0].validated() is None
++    finally:
++        db.close()
++
+-- 
+2.43.0
+

@@ -1,0 +1,693 @@
+From 52e8e4f732ff2b61625616d8a0e2f97659540019 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 14:51:22 -0800
+Subject: [PATCH] state: online FTS recovery frees healthy indexes and unlinks
+ only damaged ones; review fixes [daveey]
+
+Review of bc73674b: unlinking a HEALTHY index (the futile-holder case) left pages that every
+whole-file check reads as damage: the Desktop update preflight refuses, doctor/repair escalate to
+drop_fts_vacuum, browse can latch the store corrupt. And a scoped check cannot tell whether an
+index shares pages with another structure, so freeing one is only safe after a whole-file check.
+
+- plan_online_recovery: one read-only whole-file integrity_check. Damage outside the FTS families
+  (or a check that cannot complete) refuses (`hermes sessions recover`). A family named by the
+  check (Tree lines, FTS5 xIntegrity lines) is unlinked; every other family is trashed: vtable row
+  deleted, shadow tables renamed fts_v22_trash_*, drained and dropped by the existing chunked
+  teardown, so a healthy index ends with integrity_check == ok.
+- advance_fts_backfill also runs the trash teardown; tick budget 5 s.
+- _fts_oneshot_failed only on a corrupt-image error (a lock error no longer goes online).
+- CLI --wait stops on no progress and never prints success it did not reach.
+- Futile log line wording; docs: cli-commands, session-storage-recovery.
+
+Tests: hub damage shape (a child page named twice: integrity_check completes with "2nd reference",
+"out of order", "never used") with a resident holder; healthy futile case ends clean and passes
+_db_opens_cleanly, verify_sqlite_integrity and the backup preflight; root-page damage that makes the
+check fail is refused; damage in `sessions` is refused; lock vs corrupt one-shot failure; CLI.
+
+Found while testing, not changed here: on the hub's damage shape the EXISTING one-shot rebuild's
+DROP can succeed and free the shared page twice (a fresh corruption) when no other process holds
+the store.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/sessions_cmd.py                    |  35 ++-
+ hermes_state_fts_online.py                    | 207 +++++++++++++-----
+ hermes_state_schema.py                        |   9 +-
+ .../hermes_state/test_fts_online_recovery.py  | 154 +++++++++++--
+ website/docs/reference/cli-commands.md        |   1 +
+ .../user-guide/session-storage-recovery.md    |  12 +
+ 6 files changed, 331 insertions(+), 87 deletions(-)
+
+diff --git a/hermes_cli/sessions_cmd.py b/hermes_cli/sessions_cmd.py
+index 6c9ad90a5bd42cd79f7e678bcc57036f3e6451f6..2a199d84ddc1318f0f4320b489ef0d7311210e4b 100644
+--- a/hermes_cli/sessions_cmd.py
++++ b/hermes_cli/sessions_cmd.py
+@@ -1122,30 +1122,45 @@ def _cmd_optimize_storage(db, args):
+ 
+ def _cmd_repair_search(db, args):
+     """`hermes sessions repair-search`: the online FTS recovery (hermes_state_fts_online) on this store, now.
+-    Needs no other process to stop. The chunked backfill then runs from the gateway housekeeping tick, or here
+-    with --wait."""
++    Needs no other process to stop. The chunked backfill and old-index teardown then run from the gateway
++    housekeeping tick, or here with --wait."""
+     stale = db.get_meta("fts_stale") is not None
+-    if not stale and not getattr(args, "force", False):
++    force = getattr(args, "force", False)
++    if not stale and not force:
+         status = db.fts_rebuild_status()
+         print("✓ The search index is not stale; nothing to repair."
+-              + (f" Backfill in progress: {status['indexed']:,}/{status['total']:,} ({status['percent']}%)." if status else ""))
++              + (f" Backfill in progress: {status['indexed']:,}/{status['total']:,} ({status['percent']}%)."
++                 if status else ""))
+         return 0
+-    if not db.recover_stale_fts_online(reason="operator: hermes sessions repair-search"):
+-        print("✗ Online search-index recovery did not run (see the log: quarantined store, legacy layout, or another "
+-              "process holds the rebuild lock).")
++    if not db.recover_stale_fts_online(reason="operator: hermes sessions repair-search", force=force):
++        print("✗ Online search-index recovery did not run. See the log: damage outside the search index (use "
++              "`hermes sessions recover`), a quarantined store, the legacy layout, or another process holding the "
++              "rebuild lock.")
+         return 1
+     status = db.fts_rebuild_status() or {}
+     print(f"✓ Search indexes recreated; new messages are indexed from now on. Backfill of "
+           f"{status.get('total', 0):,} existing messages is claimed.")
+-    print("  The old index pages stay allocated until a VACUUM or `hermes sessions recover`.")
+     if not getattr(args, "wait", False):
+-        print("  A running gateway completes the backfill a few seconds per minute; `--wait` runs it here.")
++        print("  A running gateway completes the backfill and frees the old index in short chunks every minute; "
++              "`--wait` runs it here.")
+         return 0
++    last, stuck = None, 0
+     while db.advance_fts_backfill(budget_s=5.0):
+         status = db.fts_rebuild_status()
++        mark = (status or {}).get("indexed"), db.fts_online_work_pending()
++        stuck = stuck + 1 if mark == last else 0
++        last = mark
++        if stuck >= 12:
++            print("✗ No progress for a minute; stopping. The gateway retries; the log names the failing chunk.")
++            return 1
+         if status:
+             print(f"  backfill {status['indexed']:,}/{status['total']:,} ({status['percent']}%)", flush=True)
+-    print("✓ Backfill complete.")
++        else:
++            print("  freeing the old index…", flush=True)
++    if db.get_meta("fts_stale") is not None or db.fts_online_work_pending():
++        print("✗ The backfill stopped before finishing (this handle went stale or was quarantined; see the log).")
++        return 1
++    print("✓ Backfill complete; the old index is freed.")
+     return 0
+ 
+ 
+diff --git a/hermes_state_fts_online.py b/hermes_state_fts_online.py
+index fc7b9e9187b0925f7a6f576f45c9781f1e069363..e2c7030332afcc9994df528f1f3f9d39c30a3aea 100644
+--- a/hermes_state_fts_online.py
++++ b/hermes_state_fts_online.py
+@@ -7,25 +7,32 @@ always held the file (the deferral went "futile" after 30 min and stayed so), an
+ referenced twice, so ``DROP``/``'delete-all'``/``'rebuild'`` all raised "database disk image is malformed".
+ Search ran on the LIKE fallback for hours, and only a whole-store recovery with every holder stopped could fix it.
+ 
+-This path never reads the old index pages and never holds the write lock for long:
+-
+-1. One write transaction (milliseconds): drop the FTS triggers and source views; delete every ``messages_fts*``
+-   table's rows from ``sqlite_master`` (``writable_schema``: the old pages stay allocated but unreachable);
+-   recreate both indexes empty with the shipping DDL; claim the chunked backfill (``fts_rebuild_high_water`` =
+-   MAX(messages.id), ``fts_rebuild_progress`` = 0); clear ``fts_stale``. From the commit on, the triggers index
+-   every new message (their window gate admits ids above the high water).
+-2. :meth:`advance_fts_backfill`, called from the gateway housekeeping tick, runs ``fts_rebuild_step`` chunks for a
+-   bounded time per tick, each chunk one short transaction sized to ``_FTS_REBUILD_CHUNK_TARGET_S``. Until it
+-   finishes, search covers the not-yet-indexed window with the existing LIKE gap supplement.
+-
+-Cost: the unreachable pages are reported by ``PRAGMA integrity_check`` as "Page N: never used" (not structural
+-damage: ``integrity_damage_is_structural`` ignores them) and are reclaimed only by a VACUUM or
+-``hermes sessions recover`` at a planned moment. Unlinking rather than renaming is deliberate: a damaged index
+-renamed aside can later be dropped by the orphan-shadow sweep, and dropping it frees pages that live data may
+-already reuse (the double references); an unlinked one is reachable by nothing.
++This path never holds the write lock for long and never frees a page it cannot prove is unshared:
++
++1. Plan (read-only, no lock): one whole-file ``PRAGMA integrity_check``. A scoped check of one table cannot see a
++   page it shares with another structure, and freeing such a page (DROP, or deleting its rows) would corrupt the
++   other owner. So: errors in a canonical tree or the freelist -> refuse (``hermes sessions recover`` territory);
++   errors only in an index family's trees -> that family is *unlinked*; a family with no error is *trashed*.
++2. One write transaction (milliseconds): drop the FTS triggers and source views; for an unlinked family delete
++   its vtable and shadow-table rows from ``sqlite_master`` (``writable_schema``: its pages are never read and stay
++   allocated, reported by integrity_check as "Page N: never used" until a VACUUM or ``hermes sessions recover``);
++   for a trashed family delete only its vtable row and rename its shadow tables to ``fts_v22_trash_*``, which the
++   existing chunked teardown empties and drops (pages freed normally); recreate both indexes with the shipping
++   DDL; claim the chunked backfill (``fts_rebuild_high_water`` = MAX(messages.id), progress 0); clear
++   ``fts_stale``. From the commit on, the triggers index every new message (their window gate admits ids above
++   the high water).
++3. :meth:`advance_fts_backfill`, from the gateway housekeeping tick, runs ``fts_rebuild_step`` chunks and then the
++   trash teardown for a bounded time per tick, each chunk one short transaction sized to
++   ``_FTS_REBUILD_CHUNK_TARGET_S``. Until it finishes, search covers the not-yet-indexed window with the existing
++   LIKE gap supplement.
++
++A healthy index (the futile-holder case) therefore ends with a clean file. Only an index that integrity_check
++names as damaged leaves unreachable pages, and those stores already failed every whole-file check before the
++recovery. Unlinking rather than renaming a damaged index is deliberate: a damaged index kept under any name can
++later be dropped or drained, and that frees pages that live data may already reuse (the double references).
+ 
+ Used automatically by :meth:`retry_deferred_fts_recovery` once the one-shot rebuild is futile (same holders for
+-``_FTS_HOLDER_FUTILE_SECONDS``) or has failed with a database error, and by ``hermes sessions repair-search``.
++``_FTS_HOLDER_FUTILE_SECONDS``) or failed with a corrupt-image error, and by ``hermes sessions repair-search``.
+ Never on a read-only or quarantined handle, nor on the legacy inline (pre-v23) layout.
+ """
+ 
+@@ -33,32 +40,92 @@ from __future__ import annotations
+ 
+ import contextlib
+ import logging
++import re
+ import sqlite3
+ import time
++from typing import Optional
+ 
+ from hermes_state_common import (FTS_REBUILD_DEFERRAL_KEY, FTS_SQL, FTS_STALE_KEY, FTS_STORAGE_VERSION,
+                                  FTS_TRIGRAM_SQL, _FTS_TRIGGERS, fts_rebuild_admission)
+ 
+ logger = logging.getLogger("hermes_state")
+ 
+-# Every FTS index object: the vtables, their shadow tables and any index on them (``tbl_name`` covers both).
+-# The source views are dropped by name; ``fts_v22_trash_*`` tables are not touched (optimize drains them).
+-_FTS_FAMILY_SQL = ("type IN ('table', 'index') AND (tbl_name IN ('messages_fts', 'messages_fts_trigram') "
+-                   "OR tbl_name LIKE 'messages\\_fts\\_%' ESCAPE '\\')")
+-# Wall time one housekeeping tick may spend on backfill chunks (each chunk is its own short transaction).
+-FTS_BACKFILL_TICK_BUDGET_S = 2.0
+-ONLINE_RECOVERY_EVENT = "fts_online_recovery"
++# Wall time one housekeeping tick may spend on backfill / teardown chunks (each chunk its own short transaction).
++FTS_BACKFILL_TICK_BUDGET_S = 5.0
++FAMILIES = ("messages_fts", "messages_fts_trigram")
++TRASH_PREFIX = "fts_v22_trash_"  # the optimize-storage teardown drains every table with this prefix
++_FTS5_TABLE_RE = re.compile(r'from table "([^"]+)"')
++
++
++def family_of(name: str) -> Optional[str]:
++    """The FTS index family an object name belongs to (``messages_fts_trigram*`` before ``messages_fts*``)."""
++    if name == "messages_fts_trigram" or name.startswith("messages_fts_trigram_"):
++        return "messages_fts_trigram"
++    if name == "messages_fts" or name.startswith("messages_fts_"):
++        return "messages_fts"
++    return None
++
++
++class OnlineRecoveryRefused(Exception):
++    """The plan step found a reason not to touch the store."""
++
++
++def plan_online_recovery(db_path) -> dict:
++    """Step 1: ``{"unlink": [...families], "trash": [...families], "problems": n}`` from one read-only whole-file
++    integrity_check. Raises :class:`OnlineRecoveryRefused` on damage outside the FTS families (or a check that
++    cannot complete), which an index rebuild cannot fix."""
++    from hermes_state_holders import read_only_db_uri
++    from hermes_state_repair import _INTEGRITY_TREE_RE, integrity_damage_is_structural
++
++    try:
++        conn = sqlite3.connect(read_only_db_uri(db_path), uri=True, timeout=30.0)
++    except sqlite3.Error as exc:
++        raise OnlineRecoveryRefused(f"cannot open state.db read-only: {exc}") from exc
++    try:
++        master = [tuple(r) for r in conn.execute("SELECT rootpage, type, name FROM sqlite_master WHERE rootpage > 0")]
++        lines = [line for r in conn.execute("PRAGMA integrity_check(100000)") for line in str(r[0]).splitlines()]
++    except sqlite3.DatabaseError as exc:
++        raise OnlineRecoveryRefused(f"integrity_check could not complete: {exc}") from exc
++    finally:
++        conn.close()
++    problems = [line for line in lines if line not in ("ok", "*** in database main ***")]
++    if integrity_damage_is_structural(problems, master):
++        raise OnlineRecoveryRefused("integrity_check reports damage outside the search indexes: "
++                                    + "; ".join(problems[:3]))
++    by_root = {int(rp): name for rp, _type, name in master}
++    damaged = set()
++    for line in problems:
++        tree = _INTEGRITY_TREE_RE.search(line)
++        named = _FTS5_TABLE_RE.search(line)  # FTS5's own xIntegrity lines name the vtable
++        family = family_of(by_root.get(int(tree.group(1)), "")) if tree else family_of(named.group(1)) if named else None
++        if family:
++            damaged.add(family)
++    return {"unlink": sorted(damaged), "trash": [f for f in FAMILIES if f not in damaged], "problems": len(problems)}
+ 
+ 
+-def online_recovery_script(*, trigram: bool) -> str:
+-    """The single-transaction script of step 1 (see the module docstring)."""
++def _sql_names(names) -> str:
++    return ", ".join("'" + n.replace("'", "''") + "'" for n in names)
++
++
++def online_recovery_script(*, unlink_tables, trash, trash_tables, trigram: bool, stamp: int) -> str:
++    """Step 2 as one transaction (see the module docstring). *unlink_tables*: every table (vtable and shadow) of the
++    unlinked families; their rows and those of any index on them are deleted from sqlite_master. *trash*: the
++    trashed families, whose vtable rows are deleted and whose shadow tables (*trash_tables*) are renamed to
++    ``fts_v22_trash_<name>_<stamp>``."""
+     parts = ["BEGIN IMMEDIATE;"]
+     parts += [f"DROP TRIGGER IF EXISTS {t};" for t in _FTS_TRIGGERS]
+     parts += ["DROP VIEW IF EXISTS messages_fts_trigram_src;", "DROP VIEW IF EXISTS messages_fts_src;",
+-              "PRAGMA writable_schema=ON;", f"DELETE FROM sqlite_master WHERE {_FTS_FAMILY_SQL};",
+-              "PRAGMA writable_schema=RESET;",
+-              # The claim lands before the triggers exist, so no row is ever both trigger-indexed and backfilled.
+-              "INSERT INTO state_meta (key, value) SELECT 'fts_rebuild_high_water', CAST(COALESCE(MAX(id), 0) AS TEXT) "
++              "PRAGMA writable_schema=ON;"]
++    if unlink_tables:
++        parts.append(f"DELETE FROM sqlite_master WHERE type IN ('table', 'index') "
++                     f"AND tbl_name IN ({_sql_names(unlink_tables)});")
++    if trash:
++        parts.append(f"DELETE FROM sqlite_master WHERE type = 'table' AND name IN ({_sql_names(trash)}) "
++                     "AND sql LIKE 'CREATE VIRTUAL TABLE%';")
++    parts.append("PRAGMA writable_schema=RESET;")
++    parts += [f"ALTER TABLE {name} RENAME TO {TRASH_PREFIX}{name}_{stamp};" for name in trash_tables]
++    # The claim lands before the triggers exist, so no row is ever both trigger-indexed and backfilled.
++    parts += ["INSERT INTO state_meta (key, value) SELECT 'fts_rebuild_high_water', CAST(COALESCE(MAX(id), 0) AS TEXT) "
+               "FROM messages WHERE true ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+               "INSERT INTO state_meta (key, value) VALUES ('fts_rebuild_progress', '0') "
+               "ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+@@ -74,9 +141,9 @@ def online_recovery_script(*, trigram: bool) -> str:
+ class SessionFtsOnlineRecoveryMixin:
+     """See the module docstring. Mixed into ``SessionDB``."""
+ 
+-    def recover_stale_fts_online(self, *, reason: str) -> bool:
+-        """Step 1: unlink and recreate both FTS indexes in one short transaction and claim the chunked backfill.
+-        True when done (or already done by a peer). Never raises; False leaves everything as it was."""
++    def recover_stale_fts_online(self, *, reason: str, force: bool = False) -> bool:
++        """Steps 1-2. True when done (or already done by a peer). Never raises; False leaves everything as it was.
++        *force*: run on a store that is not marked stale (operator)."""
+         if getattr(self, "read_only", False) or self._conn is None:
+             return False
+         quarantine = self._quarantine_reason()
+@@ -84,6 +151,20 @@ class SessionFtsOnlineRecoveryMixin:
+             logger.error("Online FTS recovery refused on a quarantined state.db handle (%s).", quarantine)
+             return False
+         try:
++            with self._lock:
++                cursor = self._conn.cursor()
++                if not force and self._adopt_peer_fts_state_locked(cursor):
++                    return True  # not stale (any more): a peer recovered
++                if self._db_has_legacy_inline_fts(cursor):
++                    logger.warning("Online FTS recovery skipped: legacy inline FTS layout (run "
++                                   "`hermes sessions optimize-storage`).")
++                    return False
++            try:
++                plan = plan_online_recovery(self.db_path)
++            except OnlineRecoveryRefused as exc:
++                logger.error("Online FTS recovery refused (%s): %s. `hermes sessions recover` rebuilds the store "
++                             "offline.", reason, exc)
++                return False
+             with fts_rebuild_admission(self.db_path, timeout_seconds=0.0) as admitted:
+                 if not admitted:
+                     return False  # another process holds the rebuild authority; the next tick retries
+@@ -91,18 +172,16 @@ class SessionFtsOnlineRecoveryMixin:
+                     if self._conn is None:
+                         return False
+                     cursor = self._conn.cursor()
+-                    if cursor.execute("SELECT 1 FROM state_meta WHERE key = ?", (FTS_STALE_KEY,)).fetchone() is None \
+-                            and not reason.startswith("operator"):
+-                        self._adopt_peer_fts_state_locked(cursor)
+-                        return True  # a peer already recovered
+-                    if self._db_has_legacy_inline_fts(cursor):
+-                        logger.warning("Online FTS recovery skipped: legacy inline FTS layout (run "
+-                                       "`hermes sessions optimize-storage`).")
+-                        return False
+                     trigram = self._trigram_tokenizer_available(cursor)
++                    tables = [(r[0], (r[1] or "").startswith("CREATE VIRTUAL")) for r in cursor.execute(
++                        "SELECT name, sql FROM sqlite_master WHERE type = 'table' ORDER BY name").fetchall()]
++                    unlink_tables = [n for n, _v in tables if family_of(n) in plan["unlink"]]
++                    trash_tables = [n for n, virtual in tables if family_of(n) in plan["trash"] and not virtual]
+                     started = time.monotonic()
+                     try:
+-                        cursor.executescript(online_recovery_script(trigram=trigram))
++                        cursor.executescript(online_recovery_script(
++                            unlink_tables=unlink_tables, trash=plan["trash"], trash_tables=trash_tables,
++                            trigram=trigram, stamp=int(time.time())))
+                     except sqlite3.Error:
+                         with contextlib.suppress(sqlite3.Error):
+                             self._conn.rollback()
+@@ -117,19 +196,21 @@ class SessionFtsOnlineRecoveryMixin:
+                     self._fts_chunk_rows = self._FTS_REBUILD_CHUNK_ROWS
+                     high_water = cursor.execute(
+                         "SELECT value FROM state_meta WHERE key = 'fts_rebuild_high_water'").fetchone()
+-                logger.warning(
+-                    "Online FTS recovery (%s): search indexes unlinked and recreated in %.3fs; backfilling %s "
+-                    "messages in chunks. The old index pages stay allocated until a VACUUM or `hermes sessions "
+-                    "recover` (integrity_check reports them as never used).",
+-                    reason, time.monotonic() - started, high_water[0] if high_water else "?")
+-                return True
++            logger.warning(
++                "Online FTS recovery (%s): search indexes recreated in %.3fs (unlinked damaged: %s; old pages "
++                "drained in chunks: %s); backfilling %s messages in chunks.%s",
++                reason, time.monotonic() - started, ", ".join(plan["unlink"]) or "none",
++                ", ".join(plan["trash"]) or "none", high_water[0] if high_water else "?",
++                " The damaged index's pages stay allocated until a VACUUM or `hermes sessions recover` "
++                "(integrity_check reports them as never used)." if plan["unlink"] else "")
++            return True
+         except Exception:
+             logger.error("Online FTS recovery failed (%s).", reason, exc_info=True)
+             return False
+ 
+     def _adopt_peer_fts_state_locked(self, cursor: sqlite3.Cursor) -> bool:
+-        """Another process cleared ``fts_stale`` (it rebuilt or ran the online recovery): take its schema as this
+-        handle's state. True when the indexes are usable. Caller holds ``self._lock``."""
++        """No ``fts_stale`` in state_meta: another process rebuilt or recovered the indexes; take its schema as this
++        handle's state. True when the store is not stale. Caller holds ``self._lock``."""
+         if cursor.execute("SELECT 1 FROM state_meta WHERE key = ?", (FTS_STALE_KEY,)).fetchone() is not None:
+             return False
+         base = self._fts_table_exists("messages_fts")
+@@ -137,29 +218,41 @@ class SessionFtsOnlineRecoveryMixin:
+         self._fts_enabled = base
+         self._trigram_available = base and self._fts_table_exists("messages_fts_trigram")
+         self._fts_deferred_holder_pids = None
+-        return base
++        return True
++
++    def fts_online_work_pending(self) -> bool:
++        """A backfill claim or old shadow tables awaiting teardown."""
++        if self.get_meta("fts_rebuild_high_water") is not None:
++            return True
++        with self._read_ctx() as conn:
++            return self._has_fts_trash(conn)
+ 
+     def advance_fts_backfill(self, budget_s: float = FTS_BACKFILL_TICK_BUDGET_S) -> bool:
+-        """Step 2: run chunked backfill steps for up to *budget_s* seconds; True while work remains. Never raises.
+-        No-op without a backfill claim (``fts_rebuild_high_water``), on a stale, read-only or quarantined handle."""
++        """Step 3: backfill chunks, then trash teardown chunks, for up to *budget_s* seconds; True while work remains.
++        Never raises (a failed chunk logs and reports work remaining). No-op on a stale, read-only, quarantined or
++        FTS-disabled handle, and on the legacy inline layout."""
+         if getattr(self, "read_only", False) or self._conn is None or self._fts_stale or not self._fts_enabled:
+             return False
+         if self._quarantine_reason() is not None:
+             return False
+         try:
+-            if self.get_meta("fts_rebuild_high_water") is None:
+-                return False
+             with self._lock:
++                if self._db_has_legacy_inline_fts(self._conn.cursor()):
++                    return False
+                 # A step indexes the trigram half only when this handle believes it exists: re-probe so a handle
+                 # whose flags predate a peer's recovery never advances progress past rows it left out.
+                 self._trigram_available = self._fts_table_exists("messages_fts_trigram")
+             deadline = time.monotonic() + max(float(budget_s), 0.0)
+-            more = True
++            more = self.fts_online_work_pending()
+             while more and time.monotonic() < deadline:
+                 t0 = time.monotonic()
+-                more = self.fts_rebuild_step()
++                if self.get_meta("fts_rebuild_high_water") is not None:
++                    self.fts_rebuild_step()
++                else:
++                    self._fts_teardown_trash_step()
+                 self._fts_chunk_rows = self._next_chunk_rows(
+                     self._fts_chunk_rows, time.monotonic() - t0, self._FTS_REBUILD_CHUNK_TARGET_S)
++                more = self.fts_online_work_pending()
+             return bool(more)
+         except sqlite3.OperationalError as exc:
+             logger.info("FTS backfill chunk deferred (%s); the next tick continues.", exc)
+diff --git a/hermes_state_schema.py b/hermes_state_schema.py
+index 31bade1dc9bfb705e91694324440e35d22b53aa1..d24f53ea25d0eb54d7aa5fe9107e68c15b8f5fd4 100644
+--- a/hermes_state_schema.py
++++ b/hermes_state_schema.py
+@@ -555,7 +555,7 @@ class SessionSchemaMixin:
+             logger.error(
+                 "state.db FTS repair has been blocked by the same holder(s) for %d deferrals over %.0f min "
+                 "(%s); waiting is futile. Stop ONLY the other holder(s) — this process keeps running and its "
+-                "own retry admits the rebuild within %.0fs of the holder leaving — or let its next retry run the "
++                "own retry admits the rebuild within %.0fs of the holder leaving. Meanwhile its retry runs the "
+                 "online recovery, which needs no holder to stop (`hermes sessions repair-search` runs it now). "
+                 "`hermes doctor` shows this.",
+                 holders_attempts, (now - holders_since) / 60.0,
+@@ -717,8 +717,11 @@ class SessionSchemaMixin:
+             # Stale indexes must stay detached even on builds whose DDL transaction behavior differs.
+             self._drop_all_fts_triggers(cursor)
+             self._conn.commit()
+-            # The next in-process retry takes the online path (a damaged index fails this DROP every time).
+-            self._fts_oneshot_failed = True
++            # A corrupt image fails this DROP every time: the next in-process retry takes the online path. A
++            # transient lock or busy error does not (that retry would succeed, and needs no online recovery).
++            from hermes_state_errors import is_malformed_db_error
++            if is_malformed_db_error(exc):
++                self._fts_oneshot_failed = True
+             logger.error(
+                 "Automatic rebuild of stale FTS indexes failed (%s); "
+                 "canonical writes remain enabled with FTS detached.", exc,
+diff --git a/tests/hermes_state/test_fts_online_recovery.py b/tests/hermes_state/test_fts_online_recovery.py
+index 867c711055063bafd777c0494b69087a4515b75e..57d73c29a9d0f06bdae8f0f96f7553d3cb2d2477 100644
+--- a/tests/hermes_state/test_fts_online_recovery.py
++++ b/tests/hermes_state/test_fts_online_recovery.py
+@@ -15,7 +15,7 @@ import pytest
+ 
+ from hermes_state import SessionDB
+ from hermes_state_common import FTS_REBUILD_DEFERRAL_KEY, FTS_STALE_KEY, _FTS_TRIGGERS
+-from hermes_state_fts_online import online_recovery_script
++from hermes_state_fts_online import family_of, online_recovery_script
+ from hermes_state_repair import integrity_damage_is_structural
+ 
+ _OLD_WORDS = ["alphaword", "bravoword", "charlieword", "deltaword", "echoword"]
+@@ -33,7 +33,7 @@ def _meta(path, key):
+     return row[0] if row else None
+ 
+ 
+-def _seed(path, sessions=4, per=60):
++def _seed(path, sessions=4, per=150):
+     db = SessionDB(db_path=path)
+     if not db._fts_enabled:
+         db.close()
+@@ -47,26 +47,45 @@ def _seed(path, sessions=4, per=60):
+     db.close()
+ 
+ 
+-def _break_trigram_btree(path):
+-    """The hub's failure class: the trigram index's b-tree is unreadable at the page level, so DROP / 'delete-all'
+-    / 'rebuild' raise "malformed" (corrupting its FTS blobs, as older tests do, leaves DROP working). Marks the
+-    store stale with triggers detached, as the live fail-open does."""
+-    conn = _raw(path)
+-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+-    root = conn.execute("SELECT rootpage FROM sqlite_master WHERE name = 'messages_fts_trigram_data'").fetchone()[0]
+-    page = conn.execute("PRAGMA page_size").fetchone()[0]
++def _mark_fail_open(conn):
++    """The live fail-open state: fts_stale set, FTS triggers detached."""
+     for t in _FTS_TRIGGERS:
+         conn.execute(f"DROP TRIGGER IF EXISTS {t}")
+     conn.execute("INSERT INTO state_meta (key, value) VALUES (?, '1') ON CONFLICT(key) DO UPDATE SET value = '1'",
+                  (FTS_STALE_KEY,))
++
++
++def _break_trigram_btree(path, where="shared"):
++    """``where="shared"``: the hub's damage shape. The trigram index's root page names one child page twice (and
++    loses another), so integrity_check completes and reports "2nd reference to page", "out of order" and "never
++    used" for that tree only. ``where="root"``: the root page is unreadable, so integrity_check itself fails."""
++    import struct
++
++    conn = _raw(path)
++    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
++    root = conn.execute("SELECT rootpage FROM sqlite_master WHERE name = 'messages_fts_trigram_data'").fetchone()[0]
++    page_size = conn.execute("PRAGMA page_size").fetchone()[0]
++    _mark_fail_open(conn)
+     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+     conn.close()
+     with open(path, "r+b") as fh:
+-        fh.seek((root - 1) * page)
+-        fh.write(b"\x0f" * 64)  # not a b-tree page type
++        fh.seek((root - 1) * page_size)
++        page = bytearray(fh.read(page_size))
++        if where == "root":
++            page[:64] = b"\x0f" * 64
++        else:
++            assert page[0] == 5, "fixture needs a multi-page trigram index (interior table root)"
++            first_cell = struct.unpack(">H", page[12:14])[0]
++            page[8:12] = page[first_cell:first_cell + 4]  # right-most child := cell 0's child
++        fh.seek((root - 1) * page_size)
++        fh.write(page)
+     with _raw(path) as conn:
+-        with pytest.raises(sqlite3.DatabaseError):
+-            conn.execute("DROP TABLE messages_fts_trigram")
++        try:
++            lines = [l for r in conn.execute("PRAGMA quick_check(50)") for l in str(r[0]).splitlines()]
++        except sqlite3.DatabaseError:
++            lines = None
++    if where == "shared":
++        assert any("2nd reference" in l for l in lines)
+ 
+ 
+ def _canonical(path):
+@@ -88,18 +107,27 @@ def _drain(db, limit_s=60.0):
+ 
+ 
+ @pytest.fixture
+-def damaged(tmp_path):
++def damaged(tmp_path, monkeypatch):
++    """The hub on 2026-11-18: a resident holder blocks the one-shot rebuild (and on this damage shape its DROP would
++    free the shared page twice), the trigram index is damaged, search is stale."""
+     path = tmp_path / "state.db"
+     _seed(path)
+     before = _canonical(path)
+     _break_trigram_btree(path)
++    monkeypatch.setattr(SessionDB, "_foreign_state_db_holders", lambda self: [(424242, str(path))])
+     return path, before
+ 
+ 
+ def _open_stale(path):
++    """Open, then age the holder deferral past the futility window (the record is recomputed on each deferral)."""
+     db = SessionDB(db_path=path)
+-    assert db._fts_stale is True  # the one-shot rebuild at open could not drop the damaged index
++    assert db._fts_stale is True
++    with _raw(path) as conn:
++        conn.execute("UPDATE state_meta SET value = json_set(value, '$.holders_since', ?, '$.holders_attempts', 50, "
++                     "'$.first_seen', ?) WHERE key = ?", (time.time() - 7200, time.time() - 7200,
++                                                         FTS_REBUILD_DEFERRAL_KEY))
+     db._fts_stale_retry_after = 0.0
++    db._fts_deferred_holder_pids = None
+     return db
+ 
+ 
+@@ -122,6 +150,8 @@ def test_retry_tick_recovers_a_damaged_index_online_and_backfills(damaged):
+ 
+         _drain(db)
+         assert _meta(path, "fts_rebuild_high_water") is None and _meta(path, "fts_rebuild_progress") is None
++        with _raw(path) as conn:  # the healthy base index went to trash and was drained and dropped
++            assert conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'fts_v22_trash_%'").fetchone()[0] == 0
+         with _raw(path) as conn:
+             assert conn.execute("SELECT COUNT(*) FROM messages_fts_docsize").fetchone()[0] == len(before) + 1
+             eligible = conn.execute("SELECT COUNT(*) FROM messages WHERE role <> 'tool'").fetchone()[0]
+@@ -195,6 +225,17 @@ def test_futile_holder_deferral_goes_online_without_a_failed_rebuild(tmp_path, m
+         assert db.search_messages("alphaword")
+     finally:
+         db.close()
++    # A healthy index is drained, never abandoned: the file is fully clean for every whole-file consumer.
++    from hermes_cli.backup import verify_sqlite_integrity
++    from hermes_cli.backup_sqlite import preflight_state_db
++    from hermes_state_repair import _db_opens_cleanly
++
++    lines, _master = _integrity_lines(path)
++    assert lines == ["ok"]
++    assert _db_opens_cleanly(path) is None
++    assert verify_sqlite_integrity(path)["valid"] is True
++    snapshot = preflight_state_db(path.parent)
++    assert snapshot
+ 
+ 
+ def test_backfill_tick_respects_its_time_budget(tmp_path, monkeypatch):
+@@ -257,7 +298,9 @@ def test_script_unlinks_only_the_fts_family(tmp_path):
+                                              "ESCAPE '\\' OR name = 'messages_ftsnot'")}
+         family = "(name = 'messages_fts' OR name LIKE 'messages\\_fts\\_%' ESCAPE '\\')"
+         roots = dict(conn.execute("SELECT name, rootpage FROM sqlite_master WHERE " + family))
+-        conn.executescript(online_recovery_script(trigram=True))
++        names = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")]
++        conn.executescript(online_recovery_script(
++            unlink_tables=[n for n in names if family_of(n)], trash=[], trash_tables=[], trigram=True, stamp=1))
+         after = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE name NOT LIKE 'messages\\_fts%' "
+                                             "ESCAPE '\\' OR name = 'messages_ftsnot'")}
+         new_roots = dict(conn.execute("SELECT name, rootpage FROM sqlite_master WHERE " + family))
+@@ -308,3 +351,80 @@ def test_gateway_housekeeping_tick_advances_the_backfill(damaged, monkeypatch):
+         assert db.search_messages("bravoword")
+     finally:
+         db.close()
++
++
++def test_damage_outside_the_search_index_is_refused(tmp_path):
++    path = tmp_path / "state.db"
++    _seed(path, sessions=2, per=10)
++    with _raw(path) as conn:
++        for t in _FTS_TRIGGERS:
++            conn.execute(f"DROP TRIGGER IF EXISTS {t}")
++        conn.execute("INSERT INTO state_meta (key, value) VALUES (?, '1')", (FTS_STALE_KEY,))
++        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
++        root = conn.execute("SELECT rootpage FROM sqlite_master WHERE name = 'sessions'").fetchone()[0]
++        page = conn.execute("PRAGMA page_size").fetchone()[0]
++    with open(path, "r+b") as fh:
++        fh.seek((root - 1) * page)
++        fh.write(b"\x0f" * 64)
++    db = SessionDB.__new__(SessionDB)  # a full open would quarantine on the damaged canonical table first
++    from hermes_state_fts_online import OnlineRecoveryRefused, plan_online_recovery
++    with pytest.raises(OnlineRecoveryRefused):
++        plan_online_recovery(path)
++    del db
++    with _raw(path) as conn:
++        assert conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name = 'messages_fts_trigram_data'").fetchone()[0] == 1
++
++
++@pytest.mark.parametrize("message,flag", [("database is locked", False), ("database disk image is malformed", True)])
++def test_only_a_corrupt_image_marks_the_one_shot_as_failed(tmp_path, message, flag):
++    path = tmp_path / "state.db"
++    _seed(path, sessions=1, per=4)
++    db = SessionDB(db_path=path)
++
++    class Cursor:
++        def execute(self, *_a, **_k):
++            return self
++
++        def fetchone(self):
++            return None
++
++        def executescript(self, _sql):
++            raise sqlite3.OperationalError(message) if "locked" in message else sqlite3.DatabaseError(message)
++
++    try:
++        db._fts_oneshot_failed = False
++        with db._lock:
++            assert db._recover_stale_fts_locked(Cursor(), legacy=False) is False
++        assert db._fts_oneshot_failed is flag
++    finally:
++        db.close()
++
++
++def test_cli_wait_never_reports_success_it_did_not_reach(damaged, capsys, monkeypatch):
++    from hermes_cli.sessions_cmd import _cmd_repair_search
++    path, _before = damaged
++    db = _open_stale(path)
++    try:
++        monkeypatch.setattr(db, "advance_fts_backfill", lambda budget_s=5.0: False)  # e.g. the handle went stale
++        assert _cmd_repair_search(db, argparse.Namespace(force=False, wait=True)) == 1
++        assert "stopped before finishing" in capsys.readouterr().out
++    finally:
++        db.close()
++
++
++def test_an_index_damaged_so_badly_that_integrity_check_fails_is_refused(tmp_path, monkeypatch):
++    """Root-page damage makes the whole-file check itself fail: without a complete map of which pages are shared,
++    nothing may be unlinked or freed."""
++    path = tmp_path / "state.db"
++    _seed(path)
++    _break_trigram_btree(path, where="root")
++    monkeypatch.setattr(SessionDB, "_foreign_state_db_holders", lambda self: [(424242, str(path))])
++    db = _open_stale(path)
++    try:
++        assert db.retry_deferred_fts_recovery() is False
++        assert _meta(path, FTS_STALE_KEY) == "1"
++        with _raw(path) as conn:
++            assert conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name = 'messages_fts_trigram_data'"
++                                ).fetchone()[0] == 1
++    finally:
++        db.close()
+diff --git a/website/docs/reference/cli-commands.md b/website/docs/reference/cli-commands.md
+index d132347aa9ea1c7078b4d33a041d5378b46725ce..5d0a3e83a546875f30cae9b7368a8aa04bf08640 100644
+--- a/website/docs/reference/cli-commands.md
++++ b/website/docs/reference/cli-commands.md
+@@ -1852,6 +1852,7 @@ Subcommands:
+ | `optimize` | Reclaim disk space: merge FTS5 index segments + VACUUM. Non-destructive — no session data changes. |
+ | `optimize-storage` | Migrate the full-text search index to the compact v23 external-content layout; on large databases this reclaims a large fraction of `state.db`. |
+ | `repair` | Repair a malformed `state.db` schema (e.g. `table messages_fts already exists`) so hidden sessions reappear; a backup is made first. |
++| `repair-search` | Rebuild a stale or damaged full-text search index while Hermes keeps running: the indexes are recreated in one short transaction and existing messages are backfilled in short chunks (by the gateway, or here with `--wait`). A damaged index is unlinked unread; its pages stay allocated until a `VACUUM` or `hermes sessions recover`. Refuses when `integrity_check` reports damage outside the search index. `--force` runs on a store that is not marked stale. |
+ | `repair-routing` | Re-attach gateway conversations stranded in session rows that lost their routing identity (a chat "jumping back in time" after a restart). Dry-run by default; `--apply` performs the adoptions (stop the gateway first); `--max-gap-seconds N` tunes the contiguity window. Only unambiguous cases are repaired. See [Sessions → Repair Stranded Gateway Sessions](../user-guide/sessions.md#repair-stranded-gateway-sessions). |
+ | `repair-prompts` | Report stored system prompts provably degraded by the pre-#122822 maintenance-compaction bug. Report-only by default; `--apply` clears verified rows so the next turn rebuilds them, `--json` is machine-readable (and non-interactive when combined with `--apply`), and an explicit `session_id` is a destructive override that can clear even a healthy prompt. Rows without a readable tools[] pin, or with a memory-only pin, are reported as unverifiable and left unchanged by the scan (a resumed memory-only session re-pins its full tool surface, after which a scan can clear it). Restart a running gateway after `--apply` so repaired rows take effect. See [Sessions → Repair Degraded Stored Prompts](../user-guide/sessions.md#repair-degraded-stored-prompts). |
+ | `refresh-prompts` | Make continuing sessions rebuild their stored system prompt from the current `SOUL.md`, skills and context files on their next turn, keeping conversation history and session ids. Run it after updating a profile's prompt sources. `--session ID` (id or unique prefix) limits the request to one session, `--json` prints the recorded epoch and the session count, `-p/--profile` targets another profile. Works with the gateway running (no restart needed) and survives restarts. Each refreshed session pays one prompt-cache miss. See [Sessions → Refresh Prompts After a Profile Update](../user-guide/sessions.md#refresh-prompts-after-a-profile-update). |
+diff --git a/website/docs/user-guide/session-storage-recovery.md b/website/docs/user-guide/session-storage-recovery.md
+index 17ee06cdffbe12b389b044a065f1c717cfa5bd3d..7b5b70f677b1048373b105172d1823949087c8bc 100644
+--- a/website/docs/user-guide/session-storage-recovery.md
++++ b/website/docs/user-guide/session-storage-recovery.md
+@@ -97,6 +97,18 @@ no gateway is running and some other process holds the database.
+ | `state.db.corrupt.<timestamp>.bak`, `*.malformed-backup` | Copies of a file Hermes found damaged before it repaired or quarantined it. | Do not restore them over `state.db` — they are the same damage. Keep for a report; safe to delete once you are back to normal. |
+ | `state-snapshots/` | Quick snapshots `hermes update` and `hermes backup` take. | Restore with every Hermes process stopped; see [`hermes backup`](../reference/cli-commands.md#hermes-backup). |
+ 
++## Search stays slow or finds nothing new
++
++When the search index was damaged, or another process kept it from rebuilding, Hermes searches by substring
++until the index is rebuilt. The gateway does that on its own once waiting is futile; to do it now, with
++everything still running:
++
++```bash
++hermes sessions repair-search --wait
++```
++
++It refuses, and points to `hermes sessions recover`, when the damage is outside the search index.
++
+ ## When the three steps do not work
+ 
+ If every Hermes process is stopped, `hermes doctor` no longer lists a holder, and the
+-- 
+2.43.0
+

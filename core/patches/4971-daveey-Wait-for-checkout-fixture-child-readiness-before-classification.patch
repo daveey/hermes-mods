@@ -1,0 +1,112 @@
+From 51791dac6860eb92219fe4afb480c7b25c576c28 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:12:33 +0000
+Subject: [PATCH] [daveey] Wait for checkout fixture child readiness before
+ classification
+
+Why: the running-gateway fixture classified immediately after Popen, when observed Linux cmdline could still be empty. Unknown source follows the existing ancestor path; the fixture therefore occasionally selected its foreign stand-in for restart. Popen completion was incorrectly treated as usable argv readiness, and no controlled startup window covered that assumption.
+
+Fix: acknowledge READY from the owned child before real classification and close its pipe after kill/reap. Preserve own/foreign and manual restart assertions, production policy, deadlines and retries. Regression replays empty argv until READY is consumed.
+
+Proof: canonical controlled regression RED 2 failures (foreign wrong selection plus own missing readiness); full file GREEN 5 passed twice, HERMES_TEST_FILE_RETRIES=0. scripts/check --base origin/main passes. Occurrence56 only; batch50/54/57/58 remain unresolved.
+---
+ .../hermes_cli/test_update_checkout_scope.py  | 70 +++++++++++++++++--
+ 1 file changed, 66 insertions(+), 4 deletions(-)
+
+diff --git a/tests/hermes_cli/test_update_checkout_scope.py b/tests/hermes_cli/test_update_checkout_scope.py
+index 667f0b07f426944dbe5b410b988f55f14405d9d4..6bd689c7fe533fdec451cc199dede7f26aceecdd 100644
+--- a/tests/hermes_cli/test_update_checkout_scope.py
++++ b/tests/hermes_cli/test_update_checkout_scope.py
+@@ -9,6 +9,7 @@ already called that gateway "separate checkout, not updated by this run".
+ from __future__ import annotations
+ 
+ import os
++import selectors
+ import signal
+ import subprocess
+ import sys
+@@ -114,10 +115,20 @@ def test_ancestor_gateway_of_another_checkout_is_never_signalled(tmp_path, monke
+     # argv[0] is an interpreter inside the UPDATER's checkout (a worktree run through the runtime
+     # checkout's venv): the source it runs, not the interpreter, decides the checkout.
+     shared_venv_python = str(_updater_code_root() / ".venv" / "bin" / "python")
+-    gateway = subprocess.Popen([shared_venv_python, "-c", "import time; time.sleep(60)",
+-                                str(code_root / "hermes_cli" / "main.py")], executable=sys.executable)
++    gateway = subprocess.Popen(
++        [shared_venv_python, "-c", "import time; print('READY', flush=True); time.sleep(60)",
++         str(code_root / "hermes_cli" / "main.py")],
++        executable=sys.executable, stdout=subprocess.PIPE,
++    )
+     real_kill = os.kill  # the test records os.kill below; the stand-in gateway still has to die
+     try:
++        # Popen returning does not guarantee that procfs exposes the child's argv yet.
++        # This fixture represents a running gateway, not an unknown process at startup.
++        assert gateway.stdout is not None
++        with selectors.DefaultSelector() as ready:
++            ready.register(gateway.stdout, selectors.EVENT_READ)
++            assert ready.select(timeout=5), "stand-in gateway did not start"
++            assert gateway.stdout.readline() == b"READY\n"
+         signalled: list[int] = []
+         monkeypatch.setattr(gateway_cli, "_is_pid_ancestor_of_current_process", lambda pid: pid == gateway.pid)
+         monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: signalled.append(pid) or True)
+@@ -146,5 +157,56 @@ def test_ancestor_gateway_of_another_checkout_is_never_signalled(tmp_path, monke
+         assert (armed, signalled, killed, out.killed_pids) == (
+             ([gateway.pid], [gateway.pid], [], {gateway.pid}) if own else ([], [], [], set()))
+     finally:
+-        real_kill(gateway.pid, signal.SIGKILL)
+-        gateway.wait()
++        try:
++            if gateway.poll() is None:
++                real_kill(gateway.pid, signal.SIGKILL)
++            gateway.wait()
++        finally:
++            if gateway.stdout is not None:
++                gateway.stdout.close()
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("own", [False, True], ids=["other-checkout", "own-checkout"])
++def test_checkout_fixture_observes_child_startup_before_classification(tmp_path, monkeypatch, own):
++    """Replay the observed empty-argv window until the fixture receives READY."""
++    import psutil
++
++    real_popen = subprocess.Popen
++    real_cmdline = psutil.Process.cmdline
++    started = False
++    children = []
++
++    class StartupOutput:
++        def __init__(self, stream):
++            self.stream = stream
++
++        def fileno(self):
++            return self.stream.fileno()
++
++        def readline(self):
++            nonlocal started
++            line = self.stream.readline()
++            if line == b"READY\n":
++                started = True
++            return line
++
++        def close(self):
++            self.stream.close()
++
++    def spawn(*args, **kwargs):
++        kwargs["stdout"] = subprocess.PIPE
++        proc = real_popen(*args, **kwargs)
++        children.append(proc)
++        monkeypatch.setattr(proc, "stdout", StartupOutput(proc.stdout))
++        return proc
++
++    def cmdline(proc):
++        if any(proc.pid == child.pid for child in children) and not started:
++            return []
++        return real_cmdline(proc)
++
++    monkeypatch.setattr(subprocess, "Popen", spawn)
++    monkeypatch.setattr(psutil.Process, "cmdline", cmdline)
++    test_ancestor_gateway_of_another_checkout_is_never_signalled(tmp_path, monkeypatch, own)
++    assert started, "fixture classified a child before observing startup"
+-- 
+2.43.0
+

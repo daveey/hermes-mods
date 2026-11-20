@@ -1,0 +1,57 @@
+From 312bc6dfa4b4deaab39ec746c67343268de44845 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 04:16:37 +0000
+Subject: [PATCH] test(gateway): watch-notice fixture waits out the inbound
+ turn's drain [daveey]
+
+tests/gateway/test_watch_notification_reset_pin.py::test_notice_pinned_to_a_compression_ancestor_still_admits
+failed in CI (run 43771307563, job 132987778881, slice 5/8) with
+`assert ['started'] == ['queued']`: the notice was admitted, but already claimed.
+
+Five whys:
+1. Why was the admitted row 'started'? A drain claimed it.
+2. Why did a drain run when `_gateway()` patched `SessionAuthority._schedule` to a no-op?
+   The inbound turn's own drain was still alive: patching `_schedule` stops new drains,
+   not the one already running.
+3. Why was it alive after the fixture saw the turn's rows terminal? `_drain_rows` settles
+   the row and then loops to re-read the FIFO (`claim_session_input`, off-loop) before it
+   exits idle; `_settled` only waits for the terminal row.
+4. Why did that re-read take the notice? Its read raced the notice's admission: with
+   `head=None` it saw a new queued row, returned False ("re-read"), and the next pass
+   claimed the notice.
+5. Why only sometimes? On a loaded runner the off-loop re-read was still pending when
+   the test admitted the notice; usually it has finished first.
+
+Fix (test only): after the settle wait, `_gateway()` awaits every live drain task
+(bounded like the settle wait) before patching `_schedule`, so no drain from the
+setup turn can claim what a test admits. Product code unchanged; the
+'admitted and queued' assertion is unchanged. Covers every test in the file using
+`_gateway`.
+
+Proof (worker-7): a scratch probe holds the drain's post-settlement
+`claim_session_input` until the notice is admitted (harness-only bound).
+RED against main's fixture: rows `[(<parent>, 'started')]`, the incident symptom,
+on both of the runner's attempts. GREEN with this fixture: passes. Whole file 9 passed x3
+(11.3-11.7 s, same as main's 11.6 s locally).
+---
+ tests/gateway/test_watch_notification_reset_pin.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/tests/gateway/test_watch_notification_reset_pin.py b/tests/gateway/test_watch_notification_reset_pin.py
+index a4f98a5a97f07ae0c8ab400b15b5c0037f30cf50..53420b3f34df0e1fc3b4c0d996a3db793bef186d 100644
+--- a/tests/gateway/test_watch_notification_reset_pin.py
++++ b/tests/gateway/test_watch_notification_reset_pin.py
+@@ -44,6 +44,10 @@ async def _gateway(monkeypatch):
+     key = runner.session_store._generate_session_key(source)
+     await async_wait_until(lambda: _settled(authority, runner.session_store.peek_session_id(key)),
+                            timeout=15, what='the inbound turn to settle')
++    # The turn's drain outlives its settlement (it re-reads the FIFO before exiting idle): a drain
++    # still alive here would claim the notice a test admits next, whatever ``_schedule`` does.
++    await asyncio.wait_for(asyncio.gather(
++        *[live.task for live in authority.sessions.values() if live.task is not None]), 15)
+     # Admitted notices stay queued from here on: these tests assert the admission, not its turn.
+     monkeypatch.setattr(SessionAuthority, '_schedule', lambda self, ref: None)
+     return runner, authority, runner.session_store.lookup_by_session_key(key)
+-- 
+2.43.0
+

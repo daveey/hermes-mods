@@ -1,0 +1,239 @@
+From 2dce99b5fa08aca6d25c893bfc888fe17a5aed2b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 19:37:21 -0800
+Subject: [PATCH] Move a default-pinned chat off a quota wall when only a
+ minority of the pool returns soon
+
+Hub 11-14 19:17-19:26 PT: every enabled Anthropic account was Opus-capped, six of seven for
+10-156 h and one 5 h-window account for 1.5 h. The wall carried only the nearest reset, so the
+6 h hold kept default-pinned Desktop chats failing at agent build while openai-codex/gpt-6-astra
+in the same class had room.
+
+SubscriptionQuotaUnavailable now also carries pool_resets_at (when at least half the walled
+accounts can serve again); may_reroute and log_not_deferred read it. resets_at, the message and
+every waiter are unchanged. Explicit pins, card pins, and walls where half the pool returns
+inside 6 h still hold.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ agent/model_routing_unavailable.py     |  15 +++-
+ agent/model_routing_walls.py           |  19 +++-
+ tests/agent/test_walled_default_pin.py | 119 +++++++++++++++++++++++++
+ 3 files changed, 147 insertions(+), 6 deletions(-)
+
+diff --git a/agent/model_routing_unavailable.py b/agent/model_routing_unavailable.py
+index 961205f7b10bb154812aa5802989d99ea9810022..e6e27bb7cce3c6e2bdc172df1bcb19c910442774 100644
+--- a/agent/model_routing_unavailable.py
++++ b/agent/model_routing_unavailable.py
+@@ -8,8 +8,13 @@ class SubscriptionQuotaUnavailable(ModelRoutingError):
+ 
+     status_code = 429
+ 
+-    def __init__(self, provider, model, resets_at):
++    def __init__(self, provider, model, resets_at, pool_resets_at=None):
+         self.provider, self.model, self.resets_at = provider, model, resets_at
++        # [daveey] ``resets_at`` is the nearest account's reset (the message, every waiter); ``pool_resets_at``
++        # is when at least half the pool can serve again, which is what hold-or-move decisions read
++        # (``model_routing_walls.decision_reset``). Hub 11-14: one 5 h-window account of seven made a
++        # 10-156 h wall read as a 1.5 h one.
++        self.pool_resets_at = resets_at if pool_resets_at is None else pool_resets_at
+         message = f"Subscription quota unavailable for {provider}/{model}; resets at {resets_at}"
+         self.body = {"error": {"type": "rate_limit_error", "message": message, "resets_at": resets_at}}
+         super().__init__(message)
+@@ -98,10 +103,16 @@ def quota_unavailable(pool, model):
+     """Only a known cooldown is quota evidence; empty/dead OAuth pools are not."""
+     room, waits = _quota_scan(pool, model)
+     if waits and not room:
+-        return SubscriptionQuotaUnavailable(pool.provider, model, min(waits))
++        return SubscriptionQuotaUnavailable(pool.provider, model, min(waits), half_pool_reset(waits))
+     return None
+ 
+ 
++def half_pool_reset(waits):
++    """The reset by which at least half of the walled accounts behind *waits* can serve again."""
++    ordered = sorted(waits)
++    return ordered[(len(ordered) + 1) // 2 - 1]
++
++
+ def quota_room(pool, model):
+     """True only on positive evidence: a live OAuth entry with no quota or bench cooldown on *model* now.
+ 
+diff --git a/agent/model_routing_walls.py b/agent/model_routing_walls.py
+index ec399c33850fc45f25679607ef6f59be62f6175c..2d9e69e46061c1210d18a2eeaa4a1d787645ac27 100644
+--- a/agent/model_routing_walls.py
++++ b/agent/model_routing_walls.py
+@@ -8,7 +8,9 @@ Policy (one place, read by the managed resolver and the gateway's pre-build look
+ - ``explicit`` pins (an honoured switch, a model David named, a Kanban card's pin) never move;
+ - a ``default`` pin (router pick, config default, an echo of either) whose subscription wall resets
+   ``WALL_REROUTE_MIN_SECONDS`` or more away is re-selected in its class (``same-class-failover`` with
+-  ``walled_from``); a shorter wall still holds, since waiting beats a provider switch;
++  ``walled_from``); a shorter wall still holds, since waiting beats a provider switch. "Resets" is when
++  at least half the pool's accounts can serve again (``decision_reset``), not the nearest account: one
++  account on a 5 h window does not make a week-long wall short;
+ - once rerouted, the session follows the reroute even while its stored model still names the walled one.
+ """
+ from __future__ import annotations
+@@ -61,12 +63,20 @@ def follows_reroute(row, model):
+     return row["selected_provider"], row["selected_model"]
+ 
+ 
++def decision_reset(wall):
++    """The reset a hold-or-move decision reads: half the pool back, else the wall's only (nearest) reset."""
++    pool_reset = getattr(wall, "pool_resets_at", None)
++    if isinstance(pool_reset, (int, float)) and not isinstance(pool_reset, bool):
++        return pool_reset
++    return getattr(wall, "resets_at", None)
++
++
+ def may_reroute(wall, row, source, now=None):
+     """True when the quota *wall* on a pin with standing *row* / request *source* should move it."""
+     from agent.model_routing_state import is_explicit_pin
+     if os.environ.get("HERMES_KANBAN_TASK"):
+         return False  # card pins: t_01a19990897b9d9b (David's D1) owns their policy
+-    reset = getattr(wall, "resets_at", None)
++    reset = decision_reset(wall)
+     if not isinstance(reset, (int, float)) or reset - (time.time() if now is None else now) < WALL_REROUTE_MIN_SECONDS:
+         return False
+     if row is not None:
+@@ -118,8 +128,9 @@ def log_not_deferred(wall, reason):
+ 
+     A wall under ``WALL_REROUTE_MIN_SECONDS`` is meant to hold, so it stays quiet; a far one that
+     refuses every turn names why (``key``, ``endpoint``, ``explicit``, ``no-target``, ``no-session``)."""
+-    reset = getattr(wall, "resets_at", None)
+-    if not isinstance(reset, (int, float)) or reset - time.time() < WALL_REROUTE_MIN_SECONDS:
++    reset, held_until = getattr(wall, "resets_at", None), decision_reset(wall)
++    if (not isinstance(reset, (int, float)) or not isinstance(held_until, (int, float))
++            or held_until - time.time() < WALL_REROUTE_MIN_SECONDS):
+         return
+     episode = (getattr(wall, "provider", None), getattr(wall, "model", None), int(reset), reason)
+     if episode in _NOT_DEFERRED_SEEN:
+diff --git a/tests/agent/test_walled_default_pin.py b/tests/agent/test_walled_default_pin.py
+index 0d5c3cdbdbe87d84259414deaba408ec09c681d4..c10699d53b58818b1bba19a218545aa6db3689bb 100644
+--- a/tests/agent/test_walled_default_pin.py
++++ b/tests/agent/test_walled_default_pin.py
+@@ -501,3 +501,122 @@ def test_make_agent_resolves_under_the_session_it_builds():
+     from tui_gateway import server
+     source = inspect.getsource(server._make_agent)
+     assert '_resolve_agent_model_runtime(model_override, provider_override, session_id or key)' in source
++
++
++# --- One account's near reset is not the pool's reset -----------------------------------------------------------
++# Hub, 11-14 19:17-19:26 PT: every enabled Anthropic account was Opus-capped, six of seven for 10-156 h and one
++# (a 5 h window) for 1.5 h. The wall carried only the nearest reset, so it read as "under 6 h: hold", and
++# default-pinned Desktop chats 0a6a8567, cefbf1cf, 7c352424 and c1807332 failed at agent build while
++# openai-codex/gpt-6-astra in the same class had room. That one account had come back at 16:00 and was drained
++# again by 18:49. The hold-or-move decision now reads the reset by which at least half the pool can serve.
++
++HUB_1114_HOURS = (1.5, 10.5, 57.5, 70.5, 87.5, 129.5, 156.5)
++OPUS_ROW = {'model': OPUS, 'provider': 'anthropic'}
++
++
++def _write_anthropic_pool(home, hours, model=OPUS):
++    """An Anthropic OAuth pool with one account per entry of *hours*, each Opus-capped for that long."""
++    now = time.time()
++    store = json.loads((home / 'auth.json').read_text(encoding='utf-8'))
++    store['credential_pool']['anthropic'] = [
++        {'id': f'sub{i}', 'label': f'sub{i}', 'priority': i, 'auth_type': 'oauth', 'source': 'manual',
++         'access_token': f'sk-ant-oat-fixture-{i}', 'model_cooldowns': {model: now + h * HOUR}}
++        for i, h in enumerate(hours)]
++    (home / 'auth.json').write_text(json.dumps(store), encoding='utf-8')
++    return now + min(hours) * HOUR
++
++
++def test_wall_names_the_nearest_reset_and_the_reset_of_half_the_pool(home):
++    from agent.credential_pool import load_pool
++    from agent.model_routing_unavailable import quota_unavailable
++    nearest = _write_anthropic_pool(home, HUB_1114_HOURS)
++    wall = quota_unavailable(load_pool('anthropic', allowed_auth_types={'oauth'}), OPUS)
++    assert wall.resets_at == pytest.approx(nearest, abs=1)  # the message and every waiter keep the nearest
++    assert wall.pool_resets_at == pytest.approx(nearest + (70.5 - 1.5) * HOUR, abs=1)  # 4 of 7 back
++    assert str(nearest)[:8] in str(wall) and 'pool' not in str(wall)
++
++
++def test_single_account_wall_reads_its_own_reset_as_the_pools(home):
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    assert SubscriptionQuotaUnavailable('anthropic', OPUS, 123.0).pool_resets_at == 123.0
++
++
++def test_config_default_moves_when_only_one_account_returns_soon(home, caplog):
++    nearest = _write_anthropic_pool(home, HUB_1114_HOURS)
++    with caplog.at_level(logging.WARNING):
++        moved = _resolve(OPUS, 'anthropic', session='default-opus')
++    assert (moved['provider'], moved['model']) == ('openai-codex', ASTRA)
++    walled = _state(home).peek('default-opus', 'deep')['walled_from']
++    assert walled['model'] == OPUS and walled['resets_at'] == pytest.approx(nearest, abs=1)
++    assert [r.getMessage() for r in caplog.records
++            if r.getMessage().startswith(f'routing: walled default pin rerouted anthropic/{OPUS}→openai-codex/')]
++
++
++def test_desktop_default_session_moves_when_only_one_account_returns_soon(home):
++    from tui_gateway.server import _resolve_agent_model_runtime  # agent_factory binds into the server namespace
++    _write_anthropic_pool(home, HUB_1114_HOURS)
++    model, runtime = _resolve_agent_model_runtime(OPUS_ROW, None, SID)
++    assert model == OPUS and runtime['provider'] == 'auto' and not runtime['api_key'], runtime
++    notice = runtime.pop('_fallback_notice')
++    assert 'quota is out until' in notice and ASTRA in notice, notice
++    built = _resolve(model, runtime['provider'])  # the agent build's resolution, under the session id
++    assert (built['provider'], built['model']) == ('openai-codex', ASTRA)
++    assert built['model_routing']['walled_from']['model'] == OPUS
++    # The next build follows the reroute without announcing it again.
++    assert '_fallback_notice' not in _resolve_agent_model_runtime(OPUS_ROW, None, SID)[1]
++
++
++def test_gateway_default_turn_moves_when_only_one_account_returns_soon(home, monkeypatch):
++    from gateway.session_policy import build_policy
++    from hermes_cli.config import load_config
++    _write_anthropic_pool(home, HUB_1114_HOURS)
++    policy = build_policy({'model': OPUS, 'provider': 'anthropic', 'source': 'cli', 'cwd': str(home)},
++                          load_config(), private_secrets={})
++    monkeypatch.setattr('gateway.session_policy.route_launch_key', lambda *a: None)
++    runner, (model, kwargs) = _gateway_turn(monkeypatch, policy)
++    assert model == OPUS and kwargs['provider'] == 'auto' and not kwargs['api_key'], kwargs
++    notice = runner._pre_agent_fallback_notice
++    assert notice and 'quota is out until' in notice and ASTRA in notice, notice
++
++
++@pytest.mark.parametrize('hours', [(1.5, 2, 3, 4, 57.5, 70.5, 87.5), (1.5, 5.5), (2,)],
++                         ids=['four-of-seven-soon', 'one-of-two-soon', 'sole-account'])
++def test_wall_still_holds_when_half_the_pool_returns_inside_six_hours(home, hours):
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    from tui_gateway.server import _resolve_agent_model_runtime
++    _write_anthropic_pool(home, hours)
++    with pytest.raises(SubscriptionQuotaUnavailable):
++        _resolve(OPUS, 'anthropic', session='default-opus')
++    with pytest.raises(SubscriptionQuotaUnavailable):
++        _resolve_agent_model_runtime(OPUS_ROW, None, SID)
++    assert _state(home).peek('default-opus', 'deep') is None
++
++
++def test_explicit_pin_still_holds_when_only_one_account_returns_soon(home):
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    from tui_gateway.server import _resolve_agent_model_runtime
++    explicit = dict(LEGACY_ECHO, selected_provider='anthropic', selected_model=OPUS, reason='explicit-switch')
++    _legacy_row(home, explicit)
++    _write_anthropic_pool(home, HUB_1114_HOURS)
++    with pytest.raises(SubscriptionQuotaUnavailable):
++        _resolve(OPUS, 'anthropic')
++    with pytest.raises(SubscriptionQuotaUnavailable):
++        _resolve_agent_model_runtime(OPUS_ROW, None, SID)
++    assert _state(home).peek(SID, 'deep')['selected_model'] == OPUS
++
++
++def test_kanban_card_pin_still_holds_when_only_one_account_returns_soon(home, monkeypatch):
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    monkeypatch.setenv('HERMES_KANBAN_TASK', 't_card')
++    _write_anthropic_pool(home, HUB_1114_HOURS)
++    with pytest.raises(SubscriptionQuotaUnavailable):
++        _resolve(OPUS, 'anthropic', session='card-opus')
++
++
++def test_minority_reset_wall_with_no_other_route_still_refuses(home):
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    from tui_gateway.server import _resolve_agent_model_runtime
++    _write_anthropic_pool(home, HUB_1114_HOURS)
++    _wall(home, 'openai-codex', ASTRA, 33)
++    with pytest.raises(SubscriptionQuotaUnavailable):
++        _resolve_agent_model_runtime(OPUS_ROW, None, SID)
+-- 
+2.43.0
+

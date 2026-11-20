@@ -1,0 +1,369 @@
+From 4a07eb2b3364b6a83a08001e58fbf6491c9850f2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 10:05:29 +0000
+Subject: [PATCH] fix(kanban): preserve adopted origin work across replica gaps
+ [daveey]
+
+---
+ hermes_cli/kanban_chat_links.py               |  11 +-
+ hermes_cli/kanban_origin_obligations.py       |  60 +++++++
+ hermes_cli/kanban_session_activity.py         |  12 +-
+ .../kanban_session_activity_revalidate.py     |   2 +-
+ .../test_kanban_replica_origin_obligations.py | 170 ++++++++++++++++++
+ 5 files changed, 246 insertions(+), 9 deletions(-)
+ create mode 100644 hermes_cli/kanban_origin_obligations.py
+ create mode 100644 tests/hermes_cli/test_kanban_replica_origin_obligations.py
+
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index b313b43eb4d225079851e7930465d56e6f177c15..897deddce055899145cb711872ab6c9e3449211a 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -582,14 +582,15 @@ def _ledger_owners(stale_ok: bool = False) -> dict[tuple[str, str], list[tuple[s
+     return _ledger_index(stale_ok)[0]
+ 
+ 
+-def _ledger_index(stale_ok: bool = False) -> tuple[dict[tuple[str, str], list[tuple[str, str, str, bool]]],
++def _ledger_index(stale_ok: bool = False, cards: Optional[list[dict[str, Any]]] = None) -> tuple[dict[tuple[str, str], list[tuple[str, str, str, bool]]],
+                                                    list[dict[str, Any]]]:
+     """``(_ledger_owners, the ledger's profile-board cards)`` from one origin-ledger projection; ``({}, [])`` when it
+     cannot be read (both are additions to the replica's answer, never a reason to hide it)."""
+     from hermes_cli.kanban_session_activity import _remote_links
+     global _owners_memo
+     try:
+-        cards = _remote_links(stale_ok=True) if stale_ok else _remote_links()
++        if cards is None:
++            cards = _remote_links(stale_ok=True) if stale_ok else _remote_links()
+     except Exception as exc:  # health: allow BLE001 -- the profile is a label; a failed ledger read must not hide cards
+         _log.info("kanban chat links: owner profiles unavailable (%s: %s)", type(exc).__name__, exc)
+         return {}, []
+@@ -738,7 +739,7 @@ def _released_closed(card: dict[str, Any], statuses: tuple[str, ...]) -> bool:
+ def replica_cards(session_ids: Optional[Iterable[str]], gateway: str, statuses: tuple[str, ...] = OPEN_STATUSES,
+                   replicas: Optional[list[tuple[str, Path]]] = None, *, now: Optional[float] = None,
+                   ledger_fallback: bool = True, unreadable_out: Optional[list[str]] = None,
+-                  stale_ok: bool = False) -> list[dict[str, Any]]:
++                  stale_ok: bool = False, origin_cards: Optional[list[dict[str, Any]]] = None) -> list[dict[str, Any]]:
+     """This gateway's chats' (``session_ids``, one lineage; ``None`` = every chat) unreleased links to cards created
+     on OTHER gateways, from every board's replica, shaped like the origin-ledger rows ``session_tasks`` appends.
+ 
+@@ -794,7 +795,7 @@ def replica_cards(session_ids: Optional[Iterable[str]], gateway: str, statuses:
+             rows, pulled, runs = hit
+             stale = True
+         if index is None and rows:
+-            index = _ledger_index(stale_ok)
++            index = _ledger_index(stale_ok) if origin_cards is None else _ledger_index(stale_ok, origin_cards)
+         owners = index[0] if index is not None else None
+         for r in rows:
+             if ids is not None and r["chat_session"] not in ids:
+@@ -837,7 +838,7 @@ def replica_cards(session_ids: Optional[Iterable[str]], gateway: str, statuses:
+         for r in _released_links(path, board, gateway, profile, ids, statuses):
+             tid = str(r["id"])
+             if index is None:
+-                index = _ledger_index(stale_ok)
++                index = _ledger_index(stale_ok) if origin_cards is None else _ledger_index(stale_ok, origin_cards)
+             owner, owner_profile, _named = _owner_of(index[0].get((board, tid), []), r["created_on"],
+                                                      r["chat_session"])
+             key = f"{owner or '?'}/{owner_profile}/{board}/{tid}"
+diff --git a/hermes_cli/kanban_origin_obligations.py b/hermes_cli/kanban_origin_obligations.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bbe55829d2bded34e532d2cd5075a5bbf27ce95e
+--- /dev/null
++++ b/hermes_cli/kanban_origin_obligations.py
+@@ -0,0 +1,60 @@
++"""Preserve qualified origin custody when a Board replica lacks its chat link.
++
++A readable replica is not proof that the origin ledger has no obligations. This
++adapter only adds missing obligations; it neither releases custody nor upgrades
++unknown terminal evidence. Source timestamps and human requests are unchanged.
++"""
++from typing import Any, Iterable
++
++
++def selected_remote_cards(ids: list[str] | None, gateway: str, statuses: tuple[str, ...],
++                          stale_ok: bool) -> list[dict[str, Any]]:
++    """Read custody once; retain replica evidence and requests if custody is unreadable."""
++    from hermes_cli import kanban_chat_links as links, kanban_session_activity as activity
++    from hermes_cli.profiles import get_active_profile_name
++
++    try:
++        origin = activity._remote_links(stale_ok=True) if stale_ok else activity._remote_links()
++    except Exception:  # health: allow BLE001 -- partial evidence retained; no rows re-raises rather than fresh zero
++        selected = links.replica_cards(ids, gateway, statuses, stale_ok=stale_ok, origin_cards=[])
++        # An all-chat count read cannot bound which absent chats the unreadable
++        # ledger owns. Fail that scope closed; per-chat lists retain known rows.
++        if ids is None or not selected:
++            raise
++        return [{**c, "stale": True, "partial_source_unknown": "origin_ledger_unavailable"} for c in selected]
++    selected = links.replica_cards(ids, gateway, statuses, stale_ok=stale_ok, origin_cards=origin)
++    return preserve_origin_obligations(selected, origin, gateway=gateway,
++                                       profile=get_active_profile_name(), ids=ids, statuses=statuses)
++
++
++def preserve_origin_obligations(selected: list[dict[str, Any]], ledger: Iterable[dict[str, Any]], *,
++                                gateway: str, profile: str, ids: list[str] | None,
++                                statuses: tuple[str, ...]) -> list[dict[str, Any]]:
++    from hermes_cli.kanban_db_notify import is_machine_session
++    from hermes_cli.kanban_placement import is_placeholder_session
++
++    out = list(selected)
++    seen = {(c.get("session"), c.get("gateway"), c.get("profile"), c.get("board"), c.get("id")) for c in out}
++    for card in ledger:
++        if card.get("origin_gateway") != gateway or card.get("origin_profile") != profile:
++            continue
++        fields = ("session", "gateway", "profile", "board", "id")
++        if not all(isinstance(card.get(k), str) and card[k].strip() for k in fields):
++            continue
++        if card["gateway"] == gateway or card.get("released") or not card.get("unfinished"):
++            continue
++        if ids is not None and card["session"] not in ids and card.get("origin_session") not in ids:
++            continue
++        if card.get("status") not in statuses and card.get("status") != "unknown":
++            continue
++        identity = tuple(card[k] for k in fields)
++        if identity in seen:
++            continue
++        # Same rule as ``kanban_chat_links._ledger_links``: no chat custody for placeholder or machine
++        # (worker/cron/one-shot/subagent) transcripts, so their ledger rows are not chat obligations.
++        if is_placeholder_session(card["session"]) or is_machine_session(
++                gateway, card["session"], local_gateway=gateway, profile=card.get("origin_profile")):
++            continue
++        seen.add(identity)
++        out.append({**card, "session_id": card["session"], "remote": True, "source": "origin-obligation"})
++    return out
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index b7ee5cbd81066cff3369f2ff6df3730f791a7694..2030634dc0c172c519b460ca37318ff7fbd743f1 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -797,6 +797,7 @@ def _activity_fingerprint(*, include_shadows: bool = True) -> tuple:
+     signature.extend((str(db), _board_content_key(db)) for db in _board_db_paths())
+     if include_shadows:
+         signature.extend(_shadow_fingerprint())
++        signature.extend(_origin_ledger_fingerprint())
+     return tuple(signature)
+ 
+ 
+@@ -861,10 +862,15 @@ _LINKS_MAX_AGE_S = 15.0
+ 
+ def _links_fingerprint() -> tuple:
+     """Every store the remote inventory reads except state.db (alias tips), which the TTL bounds instead."""
++    return (*_activity_fingerprint(include_shadows=False), *_origin_ledger_fingerprint())
++
++
++def _origin_ledger_fingerprint() -> tuple:
++    """Origin custody changes invalidate both link projection and cached zero counts."""
+     from hermes_constants import get_hermes_home
+ 
+     ledger = get_hermes_home() / 'kanban' / 'origin-ledger.db'
+-    signature = list(_activity_fingerprint(include_shadows=False))
++    signature = []
+     for path in (ledger, Path(str(ledger) + '-wal')):
+         try:
+             st = path.stat()
+@@ -1578,14 +1584,14 @@ def _remote_cards(ids: list[str] | None, statuses: tuple[str, ...], stale_ok: bo
+     The sidebar counts and ``session_tasks`` both read this, so they are one projection in either mode. [daveey]"""
+     from hermes_cli import kanban_db_sync as _sync
+     if _sync.sync_config().get("links_reader") == "replica":
+-        from hermes_cli import kanban_chat_links as _links
++        from hermes_cli.kanban_origin_obligations import selected_remote_cards
+         from hermes_cli import kanban_sync_client as _ksc
+         try:
+             gateway = _ksc.load_identity().gateway
+         except _ksc.SyncUnavailable:
+             gateway = None
+         if gateway:
+-            return _links.replica_cards(ids, gateway, statuses, stale_ok=stale_ok)
++            return selected_remote_cards(ids, gateway, statuses, stale_ok)
+     return _remote_links(stale_ok=True) if stale_ok else _remote_links()
+ 
+ 
+diff --git a/hermes_cli/kanban_session_activity_revalidate.py b/hermes_cli/kanban_session_activity_revalidate.py
+index a65b098a0a193a36ef387de75f49704de9df451c..9a7bc69f5d1e78c19e577373f70d976acac4d4ea 100644
+--- a/hermes_cli/kanban_session_activity_revalidate.py
++++ b/hermes_cli/kanban_session_activity_revalidate.py
+@@ -116,7 +116,7 @@ def unchanged_inputs(scope: tuple[str, ...]) -> tuple[float, tuple] | None:
+     read_at = time.time()
+     mono = time.monotonic()
+     local = _ksa._activity_fingerprint(include_shadows=False)
+-    full = local + _ksa._shadow_fingerprint()  # one read of each board serves both keys
++    full = local + _ksa._shadow_fingerprint() + _ksa._origin_ledger_fingerprint()  # one board read for both keys
+     with _ksa._cache_lock:
+         if not counts_fresh(scope, full, mono):
+             return None
+diff --git a/tests/hermes_cli/test_kanban_replica_origin_obligations.py b/tests/hermes_cli/test_kanban_replica_origin_obligations.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1c0f850aff3020054add1505e94f6e8746291bf9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replica_origin_obligations.py
+@@ -0,0 +1,170 @@
++"""A readable empty Board replica cannot erase an adopted origin obligation."""
++import time
++
++import pytest
++
++from hermes_cli import kanban_session_activity as activity
++from tests.hermes_cli import test_kanban_chat_links_parity as parity
++
++env = parity.env
++
++
++def obligation(**changes):
++    row = dict(id="t_adopted", gateway="hub", profile="worker", board="build",
++               key="hub/worker/build/t_adopted", session="chat", origin_gateway="macbook",
++               origin_profile="default", via="origin", status="running", unfinished=True,
++               released=False, stale=False, synced_at=time.time(), title="Adopted work")
++    return {**row, **changes}
++
++
++@pytest.mark.parametrize("status,via", [("running", "origin"), ("ready", "shepherd"),
++                                      ("unknown", "origin")])
++def test_readable_replica_missing_adopted_link_keeps_count_and_task(env, status, via):
++    parity.replica(env, [], [])
++    env["ledger"].append(obligation(status=status, via=via))
++    row, cards = parity.assert_parity("chat", expect=1)
++    assert cards[0]["key"] == "hub/worker/build/t_adopted"
++    assert cards[0]["status"] == status
++    assert cards[0]["synced_at"] == env["ledger"][0]["synced_at"]
++    assert row.get("kanban_active") == 1
++
++
++@pytest.mark.parametrize("change", [{"released": True, "status": "done", "unfinished": False},
++                                   {"origin_gateway": "foreign"}, {"origin_profile": "other"},
++                                   {"session": "other"}, {"profile": ""}, {"gateway": "macbook"},
++                                   {"unfinished": False}, {"status": "done"}, {"status": "archived"}])
++def test_no_foreign_or_released_origin_obligation(env, change):
++    parity.replica(env, [], [])
++    env["ledger"].append(obligation(**change))
++    parity.assert_parity("chat", expect=0)
++
++
++@pytest.mark.parametrize("session,source", [("20261027_011805_fe895a", "kanban"), ("cron_abc_1", None),
++                                            ("20261027_011805_fe895b", "subagent")])
++def test_machine_session_released_replica_link_is_not_readded_from_ledger(env, session, source):
++    # Live shape: a worker transcript whose replica link is released, with a stale unreleased ledger row.
++    from hermes_state import SessionDB
++    if source is not None:
++        with SessionDB(db_path=env["home"] / "state.db") as db:
++            db.create_session(session, source=source)
++    parity.replica(env, [("t_adopted", "archived", "hub")],
++                   [("t_adopted", session, "created", 1)], board="build")
++    env["ledger"].append(obligation(session=session, status="unknown", stale=True, synced_at=1000))
++    parity.assert_parity(session, expect=0)
++    assert activity.session_tasks([session], stale_ok=True) == []
++
++
++def test_interactive_session_with_same_shape_keeps_obligation(env):
++    from hermes_state import SessionDB
++    with SessionDB(db_path=env["home"] / "state.db") as db:
++        db.create_session("20261027_011805_fe895c", source="desktop")
++    parity.replica(env, [], [])
++    env["ledger"].append(obligation(session="20261027_011805_fe895c"))
++    parity.assert_parity("20261027_011805_fe895c", expect=1)
++
++
++def test_placeholder_session_obligation_is_not_added(env, monkeypatch):
++    from hermes_cli import kanban_placement
++    monkeypatch.setattr(kanban_placement, "is_placeholder_session", lambda s: s == "placeholder")
++    parity.replica(env, [], [])
++    env["ledger"].append(obligation(session="placeholder"))
++    parity.assert_parity("placeholder", expect=0)
++
++
++def test_replica_and_ledger_same_qualified_card_not_double_counted(env):
++    parity.replica(env, [("t_adopted", "running", "hub")],
++                   [("t_adopted", "chat", "created", 0)], board="build")
++    env["ledger"].append(obligation())
++    parity.assert_parity("chat", expect=1)
++
++
++def test_missing_link_keeps_source_uncertainty(env):
++    parity.replica(env, [], [])
++    env["ledger"].append(obligation(status="unknown", stale=True, synced_at=1000))
++    row, cards = parity.assert_parity("chat", expect=1)
++    assert row["kanban_remote_stale"] == 1
++    assert cards[0]["synced_at"] == 1000
++    assert cards[0]["status"] == "unknown"
++
++
++def test_task_strip_stale_ok_keeps_origin_obligation(env):
++    parity.replica(env, [], [])
++    env["ledger"].append(obligation())
++    cards = activity.session_tasks(["chat"], stale_ok=True)
++    assert len(cards) == 1
++    assert cards[0]["key"] == "hub/worker/build/t_adopted"
++
++
++def test_post_turn_outcome_is_waiting_without_declared_containment(env):
++    import hermes_state_outcome as outcome
++    from hermes_state import SessionDB
++
++    parity.replica(env, [], [])
++    env["ledger"].append(obligation(status="ready", via="shepherd"))
++    outcome._reset_hooks_for_tests()
++    with SessionDB(db_path=env["tmp"] / "state.db") as db:
++        db.create_session("chat", source="desktop")
++        db.append_message("chat", role="user", content="Build the agreed suite")
++        derived = outcome.derive_outcome("chat", db=db, ignore_live_turn=True,
++                                        pending_reply="No. The requested suite is not built yet.")
++        assert derived["kind"] == "waiting", derived
++    outcome._reset_hooks_for_tests()
++
++
++def test_origin_ledger_change_invalidates_count_fingerprint(env):
++    parity.replica(env, [], [])
++    before = activity._activity_fingerprint()
++    path = env["home"] / "kanban" / "origin-ledger.db"
++    path.parent.mkdir(exist_ok=True)
++    path.write_bytes(b"synthetic revision marker")
++    assert activity._activity_fingerprint() != before
++    before = activity._activity_fingerprint()
++    path.with_name(path.name + "-wal").write_bytes(b"synthetic WAL revision")
++    assert activity._activity_fingerprint() != before
++
++
++def test_ledger_failure_preserves_replica_rows_and_marks_partial_scope(env, monkeypatch):
++    parity.replica(env, [("t_visible", "running", "hub")], [("t_visible", "chat", "created", 0)])
++    def failed(stale_ok=False):
++        raise RuntimeError("ledger unavailable")
++    monkeypatch.setattr(activity, "_remote_links", failed)
++    _, row = parity.counted("chat")
++    assert row["kanban_unknown"] is True
++    cards = parity.listed("chat")
++    assert len(cards) == 1
++    assert cards[0]["partial_source_unknown"] == "origin_ledger_unavailable"
++    # A different chat's readable row must not conceal this chat's missing custody.
++    _, absent = parity.counted("other-chat")
++    assert absent["kanban_unknown"] is True
++    with pytest.raises(RuntimeError, match="ledger unavailable"):
++        activity.session_tasks(["other-chat"])
++
++
++def test_ledger_failure_without_replica_rows_is_not_empty_success(env, monkeypatch):
++    parity.replica(env, [], [])
++    def failed(stale_ok=False):
++        raise RuntimeError("ledger unavailable")
++    monkeypatch.setattr(activity, "_remote_links", failed)
++    _, row = parity.counted("chat")
++    assert row["kanban_unknown"] is True
++    with pytest.raises(RuntimeError, match="ledger unavailable"):
++        activity.session_tasks(["chat"])
++
++
++def test_replica_release_alone_cannot_release_unverified_origin_custody(env):
++    # The origin receipt guard, not a replicated link bit, owns delivery acceptance.
++    parity.replica(env, [("t_adopted", "done", "hub")],
++                   [("t_adopted", "chat", "created", 1)], board="build")
++    env["ledger"].append(obligation(status="unknown", reported_status="done", stale=True))
++    _, cards = parity.assert_parity("chat", expect=1)
++    assert cards[0]["status"] == "unknown"
++    env["ledger"][0].update(status="done", released=True, unfinished=False)
++    activity._reset_cache_for_tests()
++    parity.assert_parity("chat", expect=0)
++
++
++def test_compressed_alias_deduplicates_qualified_origin_and_replica(env):
++    parity.replica(env, [("t_adopted", "running", "hub")],
++                   [("t_adopted", "root", "created", 0)], board="build")
++    env["ledger"].append(obligation(session="tip", origin_session="root"))
++    parity.assert_parity("root", "tip", expect=1)
+-- 
+2.43.0
+

@@ -1,0 +1,191 @@
+From 8d596d51d901fc75bdba4f6f9e0840c334534af6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 16:55:41 +0000
+Subject: [PATCH] Skip here-document bodies in $(...) frames so they open no
+ case
+
+A here-document body line spelled `case x in` inside a `$(...)` frame fed
+_CaseClauses and opened a phantom case. The `)` closing `$(` was then read
+as a pattern end, so a double-quoted frame hid the following command
+(`echo "${x:-$(cat <<E\ncase x in\nE\n)}"; bash ./r.sh`).
+
+_command_span now tracks `<<`/`<<-` operators (not `<<<`, not arithmetic
+`$((1<<2))`/`((1<<2))`) per frame and, at the newline that ends their
+command, skips the bodies as data: no paren, quote, comment or case word
+in a body moves the frame. A body also ends at a delimiter line followed
+by `)`, as bash does inside `$(...)`. An unterminated body is not skipped.
+Body text stays in the span and its newlines are still reported as breaks,
+so the guard's substitution and line walks still see it.
+
+Tests: 21 here-document RUN rows with clean twins (17 red at c6670be06d,
+all green after); lifecycle-guard + arith-literal suites 30 files / 2326
+passed; a 15060-row heredoc/case sweep against real bash shows 0 fail-open
+regressions vs main (713 rows fixed vs c6670be06d) and 0 clean twins newly
+refused; the 1536-row newline/comment sweep is unchanged (0 regressions).
+---
+ cron/lifecycle_guard_lines.py                 | 87 +++++++++++++++++++
+ .../test_lifecycle_guard_nested_comments.py   | 40 +++++++++
+ 2 files changed, 127 insertions(+)
+
+diff --git a/cron/lifecycle_guard_lines.py b/cron/lifecycle_guard_lines.py
+index cf5fa8b29ea8dea8f4884f0ff9fef07292e6b4f1..ef93a7bc7614ddf74859c3608c25c3cc4eb03cc1 100644
+--- a/cron/lifecycle_guard_lines.py
++++ b/cron/lifecycle_guard_lines.py
+@@ -108,6 +108,86 @@ class _CaseClauses:
+         return True
+ 
+ 
++def _heredoc_delimiter(text: str, pos: int) -> tuple[str, bool] | None:
++    """The delimiter of a ``<<`` / ``<<-`` operator at *pos* (quotes removed), else None."""
++    if not text.startswith("<<", pos) or text.startswith("<<<", pos):
++        return None
++    pos += 2
++    strip_tabs = text.startswith("-", pos)
++    pos += strip_tabs
++    while pos < len(text) and text[pos] in " \t":
++        pos += 1
++    word: list[str] = []
++    while pos < len(text) and text[pos] not in _WORD_BREAKS:
++        char = text[pos]
++        if char in "'\"":
++            end = _quoted_end(text, pos + 1, char, escapes=char == '"')
++            word.append(text[pos + 1:end - 1])
++            pos = end
++            continue
++        if char == "\\":
++            word.append(text[pos + 1:pos + 2])
++            pos += 2
++            continue
++        word.append(char)
++        pos += 1
++    return ("".join(word), strip_tabs) if word else None
++
++
++def _heredoc_bodies_end(text: str, pos: int, delimiters: list[tuple[str, bool]]) -> int:
++    """End of the here-document bodies starting at *pos* (just after their command's newline).
++
++    Inside ``$(...)`` bash also ends a body at a line that starts with the delimiter and has a
++    ``)`` after it (``E)``, ``E )``); the rest of that line is shell again, so stop before it."""
++    for delimiter, strip_tabs in delimiters:
++        while pos < len(text):
++            end = text.find("\n", pos)
++            end = len(text) if end < 0 else end
++            line = text[pos:end].lstrip("\t") if strip_tabs else text[pos:end]
++            start, pos = end - len(line), end + 1
++            if line == delimiter:
++                break
++            if line.startswith(delimiter) and ")" in line[len(delimiter):]:
++                return start + len(delimiter)
++        else:
++            return -1  # unterminated: not skipped, so a misread operator hides nothing
++    return min(pos, len(text))
++
++
++class _HereDocs:
++    """Here-document operators of one ``$(...)`` frame. A body is data to bash: no paren, quote,
++    comment or ``case`` word in it moves the frame. Arithmetic (``$((1<<2))``) opens none."""
++
++    def __init__(self) -> None:
++        self._pending: list[tuple[str, bool]] = []
++        self._arith = -1
++
++    def bodies_end(self, text: str, pos: int, depth: int, *, word_start: bool) -> int:
++        """Advance on the character at *pos*; when it is the newline before complete bodies,
++        return the position after them, else *pos*."""
++        char = text[pos]
++        if char == "(" and self._arith < 0 and text.startswith("((", pos) and (
++                word_start or text[pos - 1] == "$"):
++            self._arith = depth
++        elif char == ")" and depth - 1 == self._arith:
++            self._arith = -1
++        elif char == "<" and self._arith < 0 and text[pos - 1] != "<":
++            delimiter = _heredoc_delimiter(text, pos)
++            if delimiter is not None:
++                self._pending.append(delimiter)
++        elif char == "\n" and self._pending:
++            end = _heredoc_bodies_end(text, pos + 1, self._pending)
++            self._pending = []
++            return max(end, pos)
++        return pos
++
++
++def _newline_breaks(breaks: list[int] | None, text: str, start: int, end: int,
++                    offset: int) -> None:
++    if breaks is not None:
++        breaks.extend(offset + i - start for i in range(start, end) if text[i] == "\n")
++
++
+ def _command_span(text: str, start: int, *, shlex_quotes: bool,
+                   breaks: list[int] | None = None) -> tuple[int, str]:
+     """Find a substitution's closing parenthesis in its own shell comment frame.
+@@ -119,9 +199,16 @@ def _command_span(text: str, start: int, *, shlex_quotes: bool,
+     word_start = True
+     parts = ["$("]
+     cases = _CaseClauses()
++    docs = _HereDocs()
+     at_command = True
+     while pos < len(text):
+         char = text[pos]
++        end = docs.bodies_end(text, pos, depth, word_start=word_start)
++        if end > pos:
++            _newline_breaks(breaks, text, pos, end, _out_len(parts) + pos - copied)
++            pos = end
++            at_command = word_start = True
++            continue
+         if char == "#" and word_start:
+             end = text.find("\n", pos)
+             end = len(text) if end < 0 else end
+diff --git a/tests/cron/test_lifecycle_guard_nested_comments.py b/tests/cron/test_lifecycle_guard_nested_comments.py
+index b4394365cc71a18c8cf3c13aabd1a7091193866b..f065d0698228f783796273b50beb00b51b7c3d92 100644
+--- a/tests/cron/test_lifecycle_guard_nested_comments.py
++++ b/tests/cron/test_lifecycle_guard_nested_comments.py
+@@ -129,6 +129,46 @@ CASE_PATTERN_FRAMES = [
+ ]
+ 
+ 
++# A here-document body is data: a body line spelled `case x in` (or `;;`, `x)`) moves no case
++# state, so the `)` after the body still closes the substitution and the next command is read.
++HEREDOC_FRAMES = [
++    'echo "${x:-$(cat <<E\ncase x in\nE\n)}"; {cmd}',
++    'echo "${x:-$(cat <<\'E\'\ncase x in\nE\n)}"; {cmd}',
++    'echo "${x:-$(cat <<"E"\ncase x in\nE\n)}"; {cmd}',
++    'echo "${x:-$(cat <<-E\n\tcase x in\n\tE\n)}"; {cmd}',
++    'echo "${x:-$(cat << E\ncase x in\nE\n)}"; {cmd}',
++    'echo ${x:-"$(cat <<E\ncase x in\nE\n)"}; {cmd}',
++    'x="${y:-$(cat <<E\ncase x in\nE\n)}"; {cmd}',
++    'echo "${x:-$(cat <<E\ncase x in\nE\n)}" && {cmd}',
++    'echo "${x:-$(cat <<A <<B\na\nA\ncase x in\nB\n)}"; {cmd}',
++    'echo "${x:-$(cat <<E; case x in x) true;; esac\ncase x in\nE\n)}"; {cmd}',
++    'echo "${x:-$(case x in x) cat <<E\n;;\nx)\nE\n;; esac)}"; {cmd}',
++    # Nor does a paren, quote or comment in the body move the frame.
++    'echo "${x:-$(cat <<E\n(\nE\n)}"; {cmd}',
++    'echo "${x:-$(cat <<E\nit\'s\nE\n)}"; {cmd}',
++    'echo "${x:-$(cat <<\'E\'\nsay "hi\nE\n)}"; {cmd}',
++    'echo "${x:-$(cat <<E\n`\nE\n)}"; {cmd}',
++    # Inside `$(...)` a body also ends at a delimiter line followed by `)`.
++    'echo "${x:-$(cat <<E\ncase x in\nE)}"; {cmd}',
++    'echo "${x:-$(cat <<E\n(\nE )}"; {cmd}',
++    'echo "${x:-$(cat <<-E\ncase x in\n\tE)}"; {cmd}',
++    # `<<<` and arithmetic `<<` open no here-document; case tracking stays on.
++    'echo "${x:-$(cat <<<y; case x in (case) true;; esac)}"; {cmd}',
++    'echo "${x:-$(echo $((1<<2)); case x in (case) true;; esac)}"; {cmd}',
++    'echo "${x:-$(((1<<2)); case x in (case) true;; esac)}"; {cmd}',
++]
++
++
++@pytest.mark.parametrize("frame", HEREDOC_FRAMES)
++@pytest.mark.parametrize("dangerous", [True, False], ids=["RUN", "clean"])
++def test_heredoc_body_does_not_open_case(tmp_path, frame, dangerous):
++    helpers._tree(tmp_path)
++    command = frame.replace("{cmd}", "bash ./r.sh" if dangerous else "python3 ./clean.py")
++    assert helpers._bash_runs(tmp_path, command) is dangerous
++    refused, reason = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert refused is dangerous, reason
++
++
+ @pytest.mark.parametrize("frame", CASE_PATTERN_FRAMES)
+ @pytest.mark.parametrize("dangerous", [True, False], ids=["RUN", "clean"])
+ def test_case_word_as_pattern_does_not_hide_following_command(tmp_path, frame, dangerous):
+-- 
+2.43.0
+

@@ -1,0 +1,203 @@
+From 2b94ff749a5e85be21d9a28f98ddaadbc616f502 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 19:54:14 +0000
+Subject: [PATCH] [daveey] kanban: a far-hold reroute never names a peer this
+ host cannot serve
+
+#3301 rebased onto ed899d12ff (#3362, the resolver's far-hold reroute) went
+red: with Codex and Claude both held 9 h, kanban_paced_reroute moved a
+default route to Grok (xai-oauth) even on a host with no xai-oauth
+credential, so the card launched on a provider it cannot authenticate. The
+governor's own pace alternate already requires live_pool_serving; the
+resolver's move did not.
+
+Rule: kanban_paced_reroute._probe takes a peer only when
+kanban_provider_walls.live_pool_serving(provider, model) holds; a refused
+peer is excluded and the next one probed (bounded), else the route stays
+and the governor holds the card as before.
+
+Tests: test_kanban_pace_reroute judges the governor's claim-time move with
+the resolver move disabled (reroute_after_s huge) and adds two
+resolver-first composition tests (far-held default card starts on Grok with
+default+paced:openai-codex; with no Grok credential it stays held and
+pickup_hold names the Codex hold). test_kanban_model_tier_paced_reroute
+stubs live serving and adds test_a_peer_with_no_live_pool_on_this_host_is_skipped
+(default / pinned / review). The 4 new tests fail without the fix; 49
+importer files (973 tests) pass with it.
+
+Task: t_d943a79dd2b3889f
+---
+ hermes_cli/kanban_paced_reroute.py            | 31 ++++++++++----
+ .../test_kanban_model_tier_paced_reroute.py   | 33 +++++++++++++++
+ tests/hermes_cli/test_kanban_pace_reroute.py  | 40 ++++++++++++++++++-
+ 3 files changed, 95 insertions(+), 9 deletions(-)
+
+diff --git a/hermes_cli/kanban_paced_reroute.py b/hermes_cli/kanban_paced_reroute.py
+index 147fbcf555be102daa84de19649811d34e419dcb..6f8bc7f077611638d47d528caf43e2dbfa57324d 100644
+--- a/hermes_cli/kanban_paced_reroute.py
++++ b/hermes_cli/kanban_paced_reroute.py
+@@ -15,7 +15,8 @@ Rule (:func:`paced_route`); anything else keeps the route, as before:
+    far-wall rule of ``kanban_pin_reroute``). Mandatory pins, class selectors and ``require_model: true`` cards keep
+    their route;
+ 3. the peer comes from the same eligibility the wall reroutes use (``alternate_route``, the review resolver's
+-   independent routes, the pin's class peers) and its provider is neither held nor walled. With none, the route
++   independent routes, the pin's class peers) and its provider is neither held nor walled, and serves on this
++   host's live pool (``live_pool_serving``: never a provider this host holds no credential for). With none, the route
+    stays and the governor holds it as before; a moved route is judged by the governor on its new provider.
+ 
+ The move lives on the in-memory claimed task only (as every tier decision does); ``run_route.tier_reason`` names it
+@@ -33,6 +34,7 @@ logger = logging.getLogger(__name__)
+ 
+ REASON = "paced"
+ DEFAULT_REROUTE_AFTER_S = 3600.0
++_MAX_PEER_PROBES = 8  # peers refused for no live pool on this host before the route stays
+ 
+ 
+ def _section(cfg: Optional[dict]) -> Any:
+@@ -109,13 +111,26 @@ def _probe(conn, task, base, cfg, now):
+     held = _held(cfg, now)
+     if held.get(provider, -math.inf) - now <= reroute_after_seconds(cfg):
+         return None  # not held (a class selector's ``auto`` never is), or its reset is near
+-    if reason == "pinned":
+-        moved = _pinned_peer(task, model, held, now)
+-    elif reason == "default":
+-        moved = _default_peer(conn, task, base, held, now)
+-    else:
+-        moved = _review_peer(conn, task, cfg or {}, held, now)
+-    return (*moved, provider) if moved else None
++    # The peer must serve on this host's live pool: a registry route with no credential here (xai-oauth on a worker
++    # the hub relay has not minted it to) would launch a run that cannot authenticate. Each refusal excludes one more
++    # provider, so the walk is bounded. (t_d943a79dd2b3889f)
++    excluded = dict(held)
++    for _ in range(_MAX_PEER_PROBES):
++        if reason == "pinned":
++            moved = _pinned_peer(task, model, excluded, now)
++        elif reason == "default":
++            moved = _default_peer(conn, task, base, excluded, now)
++        else:
++            moved = _review_peer(conn, task, cfg or {}, excluded, now)
++        if not moved:
++            return None
++        target = pw._norm(moved[1])
++        if target in excluded:
++            return None  # the peer pick ignored its exclusions: never trust it
++        if pw.live_pool_serving(target, moved[0]):
++            return (*moved, provider)
++        excluded[target] = math.inf
++    return None
+ 
+ 
+ def paced_route(conn: sqlite3.Connection, task: Any, base: tuple, *, lane: str,
+diff --git a/tests/hermes_cli/test_kanban_model_tier_paced_reroute.py b/tests/hermes_cli/test_kanban_model_tier_paced_reroute.py
+index 3514edff8f1763ace283c9df5fff00ef9ae6d4af..62664163bdc7f2277b0e07673a5f64a67018e629 100644
+--- a/tests/hermes_cli/test_kanban_model_tier_paced_reroute.py
++++ b/tests/hermes_cli/test_kanban_model_tier_paced_reroute.py
+@@ -30,9 +30,14 @@ def clock(monkeypatch):
+     monkeypatch.setattr(paced.time, 'time', lambda: clock[0])
+     monkeypatch.setattr(lpd.time, 'time', lambda: clock[0])
+     monkeypatch.setattr(lpd, '_CACHE', {})
++    monkeypatch.setattr(walls, 'live_pool_serving', lambda provider, model=None: provider not in UNSERVED)
++    UNSERVED.clear()
+     return clock
+ 
+ 
++UNSERVED: set = set()  # providers this host holds no live pool (credential) for, per test
++
++
+ def _pools(clock, **states):
+     """Store ``provider=(state, until_offset or None)`` paces in this home's ``llm_pacing.json``, read just now."""
+     data = {}
+@@ -157,6 +162,34 @@ def test_no_unheld_unwalled_peer_keeps_the_base_route(board, clock, monkeypatch,
+         assert _route(conn, pin_tests._pinned_card(conn)) == (None, None, 'pinned')
+ 
+ 
++@pytest.mark.parametrize('route', ['default', 'pinned', 'review'])
++def test_a_peer_with_no_live_pool_on_this_host_is_skipped(board, clock, monkeypatch, route):
++    """t_d943a79dd2b3889f: a registry peer this host holds no credential for (xai-oauth before the hub relay mints it
++    to a worker) would launch a run that cannot authenticate. The move skips it to the next serving peer, else keeps
++    the route for the governor to hold."""
++    _deep(monkeypatch, {'llm_pacing': {'providers': ['anthropic', 'openai-codex', 'xai-oauth']}}, grok=True)
++    _pools(clock, openai_codex=('held', HELD_FAR))
++    with kbc.connect() as conn:
++        if route == 'review':
++            tid, lane, reason = pin_tests._review_card(conn), 'review', 'review_unpinned'
++            base = PIN
++        elif route == 'pinned':
++            tid, lane, reason = pin_tests._pinned_card(conn), 'ready', 'pinned'
++            base = (None, None)
++        else:
++            tid, lane, reason = kb.create_task(conn, title='d', assignee='a'), 'ready', 'default'
++            base = PIN
++        first = _route(conn, tid, lane)
++        assert first[2] == f'{reason}+paced:openai-codex' and first[1] in ('anthropic', 'xai-oauth')
++        UNSERVED.add(first[1])
++        moved = _route(conn, tid, lane)
++        assert moved[1] != first[1]
++        if moved[2] != reason:
++            assert moved[1] in ('anthropic', 'xai-oauth') and moved[2] == f'{reason}+paced:openai-codex'
++        UNSERVED.update({'anthropic', 'xai-oauth'})
++        assert _route(conn, tid, lane) == (*base, reason)
++
++
+ def test_review_unpinned_on_a_held_provider_moves_to_a_free_independent_reviewer(board, clock, monkeypatch):
+     _deep(monkeypatch, {'llm_pacing': {'providers': ['anthropic', 'openai-codex', 'xai-oauth']}}, grok=True)
+     with kbc.connect() as conn:
+diff --git a/tests/hermes_cli/test_kanban_pace_reroute.py b/tests/hermes_cli/test_kanban_pace_reroute.py
+index 95775c0e34ed38316a7c84d117e89d872031a183..af9545f4d39ce0f3e18a6cbef8ae080bb0474658 100644
+--- a/tests/hermes_cli/test_kanban_pace_reroute.py
++++ b/tests/hermes_cli/test_kanban_pace_reroute.py
+@@ -19,8 +19,12 @@ from tests.hermes_cli.test_kanban_quota_episode import board as board, routing
+ 
+ HOUR = 3600.0
+ GROK = ("grok-4.7", "xai-oauth")
++# The governor's claim-time move is judged here on its own: the resolver's far-hold move (kanban_paced_reroute, a
++# pool held with its reset more than reroute_after_s away) would otherwise move these cards first. The two composed are
++# covered by the ``resolver_first`` tests below.
+ POOL_CFG = {"default_model": "gpt-6-astra", "default_provider": "openai-codex",
+-            "strong_model": "class:deep", "strong_provider": "auto"}
++            "strong_model": "class:deep", "strong_provider": "auto", "llm_pacing": {"reroute_after_s": 1e12}}
++RESOLVER_CFG = {k: v for k, v in POOL_CFG.items() if k != "llm_pacing"}
+ 
+ 
+ def _route(provider, model):
+@@ -258,3 +262,37 @@ def test_stale_offer_is_ignored(monkeypatch):
+     reroute.offer("t1", ("gpt-6-astra", "openai-codex"), ("grok-4.7", "xai-oauth", "openai-codex"))
+     now[0] += reroute.TTL_SECONDS
+     assert reroute.take("t1", ("gpt-6-astra", "openai-codex")) is None
++
++
++@pytest.fixture
++def resolver_first(pool, monkeypatch):
++    """The shipped default: the resolver's far-hold move (reroute_after_s 3600) runs before the governor's."""
++    monkeypatch.setattr(tier, "load_tier_config", lambda: dict(RESOLVER_CFG))
++
++
++def test_resolver_first_far_held_default_card_starts_on_grok(pool, resolver_first, monkeypatch):
++    """Both pools held 9 h: the resolver moves the default route off the held Codex pool to the first serving class
++    peer (Grok: Claude is held too); the governor then judges Grok, which it does not govern, and starts the card."""
++    _pools(monkeypatch, {"anthropic": 99, "openai-codex": 99})
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="routine work", assignee="a")
++        seen, result = _dispatch(conn)
++        receipt = _route_receipt(conn, tid)
++    assert seen == [(tid, *GROK)] and tid not in result.clock_held
++    assert receipt is not None and (receipt["model"], receipt["provider"]) == GROK
++    assert receipt["tier_reason"] == "default+paced:openai-codex"
++
++
++def test_resolver_first_no_grok_credential_keeps_the_hold(pool, resolver_first, monkeypatch):
++    """Neither move names a provider this host cannot serve: with no xai-oauth credential the card stays held."""
++    _, serving = pool
++    serving.discard("xai-oauth")
++    _pools(monkeypatch, {"anthropic": 99, "openai-codex": 99})
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="routine work", assignee="a")
++        for _ in range(2):
++            seen, result = _dispatch(conn)
++            assert seen == [] and result.clock_held[tid][0] == lp.GUARD_REASON
++        assert _route_receipt(conn, tid) is None
++        card = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
++        assert pd.pickup_hold(conn, conn, card) == "openai-codex held"
+-- 
+2.43.0
+

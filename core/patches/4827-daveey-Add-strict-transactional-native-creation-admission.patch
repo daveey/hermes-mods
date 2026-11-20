@@ -1,0 +1,403 @@
+From df02ff9084e0b521c4e04b5af9d8cba500c4e919 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 07:39:05 +0000
+Subject: [PATCH] [daveey] Add strict transactional native creation admission
+
+Prerequisite for the parent-owned CLI bridge, not wired to subprocesses yet. Preserve optional legacy receipts while strict local creation requires receipt-backed replay and atomic rollback. Refuse remote/selfwork/courier side effects and unadmitted overlap success. Proof: 66 focused tests, full scripts/check, four integration-anchor mutants killed. Remaining: full per-condition mutations, CLI bridge lifecycle and foreign-child registration.
+---
+ hermes_cli/kanban_db.py                       |  14 +-
+ hermes_cli/kanban_origin_admission.py         | 109 ++++++++++
+ .../test_origin_native_admission.py           | 194 ++++++++++++++++++
+ tools/kanban_tools.py                         |   2 +
+ 4 files changed, 312 insertions(+), 7 deletions(-)
+ create mode 100644 hermes_cli/kanban_origin_admission.py
+ create mode 100644 tests/hermes_cli/test_origin_native_admission.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 34f2b31de4902f093051488ad3c647a2a8922821..0ed4b17d9fd1979c5e4b5397383cdb5f75c108c9 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1183,7 +1183,7 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
+ 
+ from hermes_cli.kanban_db_creation import default_ready_assignee as _default_ready_assignee
+ from hermes_cli.kanban_selfwork import admitted_contract
+-
++from hermes_cli import kanban_origin_admission as native_admission
+ 
+ @publication_scope
+ def create_task(
+@@ -1233,6 +1233,7 @@ def create_task(
+     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
+     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
+     """
++    native_admission.check_entry(conn, origin_intent)
+     self_work = admitted_contract(conn, self_work)
+     validate_admission_class(admission_class, admission_frees)
+     validate_creation(placement_policy, runs_on=runs_on, workspace_kind=workspace_kind,
+@@ -1295,12 +1296,8 @@ def create_task(
+     parents = tuple(p for p in parents if p)
+     skills_list = _normalize_task_skills(skills)
+ 
+-    # Idempotency check BEFORE the write txn (no lock held); a concurrent-create race may insert twice.
+-    if idempotency_key:
+-        from hermes_cli.kanban_db_creation import existing_creation_key, reject_reserved_key
+-        reject_reserved_key(idempotency_key, created_by)
+-        if row := existing_creation_key(conn, idempotency_key):
+-            return row["id"]
++    if existing := native_admission.early_existing(conn, idempotency_key, created_by):
++        return existing
+ 
+     if validate_workspace and workspace_kind == "worktree" and not project_id:
+         from hermes_cli.kanban_db_workspace import (
+@@ -1332,6 +1329,8 @@ def create_task(
+             # allow_nested: graph builders compose create_task under one outer
+             # commit so the dispatcher never sees a half-built graph.
+             with write_txn(conn, allow_nested=True):
++                if existing := native_admission.existing(conn, idempotency_key):
++                    return existing
+                 run_insert_guard(conn, insert_guard)
+                 task_status, tenant, lane = lane_state(conn, parents, initial_status, triage, tenant, locals())
+                 # Project worktree: fresh dir under the repo + deterministic
+@@ -1376,6 +1375,7 @@ def create_task(
+                 )
+                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
+                 initialize_ownership(conn, task_id, creator_task_id, parents, now, chat_origin, native_origin)
++                native_admission.require_receipt(conn, task_id)
+             return task_id
+         except sqlite3.IntegrityError:
+             if attempt == 1:
+diff --git a/hermes_cli/kanban_origin_admission.py b/hermes_cli/kanban_origin_admission.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c0d1135fa6207ad2022fbef0be01f086ef711112
+--- /dev/null
++++ b/hermes_cli/kanban_origin_admission.py
+@@ -0,0 +1,109 @@
++"""Private strict admission for parent-executed native CLI creation.
++
++This scope is not exposed as a tool option and grants no authority itself: it
++requires the current durable interactive turn, and validates it again in the
++board transaction. Legacy creation intentionally keeps optional receipts.
++"""
++from contextlib import contextmanager
++from contextvars import ContextVar
++from dataclasses import dataclass, field
++from functools import wraps
++import json
++
++from hermes_cli import kanban_origin_native as native
++
++@dataclass
++class _Admission:
++    captured: object
++    admitted: set = field(default_factory=set)
++
++
++_current: ContextVar = ContextVar("strict_native_creation", default=None)
++
++
++class AdmissionRefused(ValueError):
++    """The task cannot be committed with its promised native origin."""
++
++
++@contextmanager
++def strict_local_creation():
++    captured = native.capture(None)
++    if captured is None:
++        raise AdmissionRefused("strict native creation requires a live interactive turn")
++    token = _current.set(_Admission(captured))
++    try:
++        yield
++    finally:
++        _current.reset(token)
++
++
++def active():
++    return _current.get() is not None
++
++
++def check_tool(args, kw):
++    if active() and (args.get("placement") != "local" or args.get("origin_session")
++                     or args.get("requires") or args.get("runs_on") or args.get("placement_policy")
++                     or args.get("self_work") is not None or kw.get("origin_intent") is not None
++                     or kw.get("selfwork_intent") is not None):
++        raise AdmissionRefused("strict native creation supports only local, native-origin cards")
++
++
++def tool_create(fn):
++    """Do not mistake overlap's successful legacy dedup for strict admission."""
++    @wraps(fn)
++    def wrapped(args, **kw):
++        check_tool(args, kw)
++        state = _current.get()
++        if state is not None:
++            state.admitted.clear()
++        result = fn(args, **kw)
++        if state is not None:
++            value = json.loads(result)
++            if value.get("ok") and value.get("task_id") not in state.admitted:
++                raise AdmissionRefused("strict native creation did not admit the returned task")
++        return result
++    return wrapped
++
++
++def check_entry(conn, origin_intent):
++    if active() and (conn.in_transaction or origin_intent is not None):
++        raise AdmissionRefused("strict native creation requires its own local transaction")
++
++
++def require_receipt(conn, task_id):
++    state = _current.get()
++    if state is None:
++        return
++    context = state.captured.validated()
++    scope = native._primary_scope(conn)
++    binding = native._receipt(conn, task_id)
++    if context is None or scope is None or binding is None:
++        raise AdmissionRefused("strict native creation lost custody or its native receipt")
++    gateway, profile, board = scope
++    owner = {"gateway": gateway, "profile": profile, "board": board, "task_id": task_id}
++    if binding["origin"] != context["origin"] or binding["owner"] != owner:
++        raise AdmissionRefused("strict native creation receipt belongs to another origin or board")
++    state.admitted.add(task_id)
++
++
++def existing(conn, idempotency_key):
++    """Strict replays are decided under the same write lock as insertion."""
++    if not active() or not idempotency_key:
++        return None
++    from hermes_cli.kanban_db_creation import existing_creation_key
++    row = existing_creation_key(conn, idempotency_key)
++    if row is not None:
++        require_receipt(conn, row["id"])
++        return row["id"]
++    return None
++
++
++def early_existing(conn, idempotency_key, created_by):
++    """Keep the legacy early replay, but strict replays wait for the write lock."""
++    if not idempotency_key:
++        return None
++    from hermes_cli.kanban_db_creation import existing_creation_key, reject_reserved_key
++    reject_reserved_key(idempotency_key, created_by)
++    row = None if active() else existing_creation_key(conn, idempotency_key)
++    return row["id"] if row is not None else None
+diff --git a/tests/hermes_cli/test_origin_native_admission.py b/tests/hermes_cli/test_origin_native_admission.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..910b5af9d21cd4dbd758d343c560fe38bdbd3b5c
+--- /dev/null
++++ b/tests/hermes_cli/test_origin_native_admission.py
+@@ -0,0 +1,194 @@
++"""Strict local creation must commit custody and the task together."""
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from agent.origin_turn_custody import scope
++from agent.turn_facade_lease import admit_durable_turn_lease
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_origin, kanban_origin_native as native
++from hermes_cli import kanban_origin_admission as admission
++from hermes_state import SessionDB
++from tests.tools import test_kanban_worker_created_chats as fixtures
++from tools import kanban_tools
++
++
++@pytest.fixture
++def turn(tmp_path, monkeypatch):
++    home = fixtures.make_home(tmp_path, monkeypatch)
++    from hermes_cli import kanban_db_sync as sync
++    with kbc.connect_closing() as conn:
++        sync.set_mode(conn, "primary")
++    monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("here", {"here"}))
++    monkeypatch.setenv("HERMES_SESSION_ID", fixtures.CHAT)
++    monkeypatch.setattr("agent.turn_liveness.resolve_turn_liveness_settings", lambda cfg: (None, 1.0))
++    db = SessionDB(home / "state.db")
++    agent = SimpleNamespace(_session_db=db, session_id=fixtures.CHAT, _persist_disabled=False,
++                            _interrupt_requested=False, _emit_status=lambda *a: None,
++                            _touch_activity=lambda *a: None)
++    lease = admit_durable_turn_lease(agent, session_id=fixtures.CHAT, relay_turn_id="strict-create",
++        task_context={"platform": "desktop", "session_id": fixtures.CHAT}, conversation_history=[]).lease
++    assert lease is not None
++    try:
++        lease.start()
++        with scope(lease):
++            yield lease
++    finally:
++        lease.stop_refresher()
++        lease.join_threads()
++        lease.release()
++        db.close()
++
++
++def create(**extra):
++    return json.loads(kanban_tools._handle_create({"title": "strict child", "assignee": "default",
++                                                 "requires": [], "placement": "local", **extra}))
++
++
++def snapshot(conn):
++    return {table: [tuple(row) for row in conn.execute(f"SELECT * FROM {table}")]
++            for table in ("tasks", "task_events", "task_links", "kanban_notify_subs", "task_chat_links")}
++
++
++@pytest.mark.parametrize("revocation", ["before_capture", "at_record", "none"])
++def test_real_tool_create_is_atomic(turn, monkeypatch, revocation):
++    record = native.record
++    def recording(conn, task_id, captured, created_at):
++        if revocation == "at_record":
++            turn.release()
++        return record(conn, task_id, captured, created_at)
++    monkeypatch.setattr(native, "record", recording)
++    with kbc.connect_closing() as conn:
++        before = snapshot(conn)
++    with admission.strict_local_creation():
++        if revocation == "before_capture":
++            turn.release()
++        result = create()
++    with kbc.connect_closing() as conn:
++        if revocation == "none":
++            assert result.get("ok"), result
++            assert native._receipt(conn, result["task_id"])["origin"]["session"] == fixtures.CHAT
++        else:
++            assert not result.get("ok"), result
++            assert snapshot(conn) == before
++
++
++def test_no_ambient_authority(turn):
++    turn.release()
++    with pytest.raises(admission.AdmissionRefused):
++        with admission.strict_local_creation():
++            pytest.fail("admitted dead custody")
++
++
++@pytest.mark.parametrize("mode", ["missing", "foreign", "same"])
++def test_idempotency_requires_matching_receipt(turn, mode):
++    captured = native.capture(None)
++    with kbc.connect_closing() as conn:
++        task = kb.create_task(conn, title="existing", idempotency_key="strict-key",
++                              native_origin=captured if mode != "missing" else None)
++        if mode == "foreign":
++            binding = native._receipt(conn, task)
++            binding["origin"]["session"] = "another-chat"
++            conn.execute("UPDATE origin_native_receipts SET binding_json=? WHERE task_id=?",
++                         (json.dumps(binding), task))
++            conn.commit()
++        before = snapshot(conn)
++        with admission.strict_local_creation():
++            if mode == "same":
++                assert kb.create_task(conn, title="retry", idempotency_key="strict-key",
++                                      native_origin=captured) == task
++            else:
++                with pytest.raises(admission.AdmissionRefused):
++                    kb.create_task(conn, title="retry", idempotency_key="strict-key", native_origin=captured)
++        assert snapshot(conn) == before
++
++
++def test_nested_transaction_is_not_supported(turn):
++    with kbc.connect_closing() as conn, kb.write_txn(conn):
++        with admission.strict_local_creation(), pytest.raises(admission.AdmissionRefused):
++            kb.create_task(conn, title="nested", native_origin=native.capture(None))
++
++
++@pytest.mark.parametrize("field,value", [("placement", "auto"), ("placement", None),
++                                          ("requires", ["gateway:x"]), ("runs_on", ["machine:x"]),
++                                          ("placement_policy", "worker-first-v1"),
++                                          ("origin_session", "@session:default@here/x"),
++                                          ("self_work", {"anything": True})])
++def test_strict_tool_refuses_nonlocal_side_effect_paths(turn, monkeypatch, field, value):
++    def forbidden(*args, **kwargs):
++        pytest.fail("reached placement or origin resolution before strict refusal")
++    monkeypatch.setattr(kanban_tools, "_place_remote", forbidden)
++    monkeypatch.setattr(kanban_origin, "resolve", forbidden)
++    monkeypatch.setattr("hermes_cli.kanban_selfwork_outbound.submit", forbidden)
++    with admission.strict_local_creation():
++        result = create(**{field: value})
++    assert not result.get("ok"), result
++
++
++def test_missing_primary_scope_rolls_back(turn, monkeypatch):
++    monkeypatch.setattr(native, "_primary_scope", lambda conn: None)
++    with kbc.connect_closing() as conn:
++        before = snapshot(conn)
++        with admission.strict_local_creation(), pytest.raises(admission.AdmissionRefused):
++            kb.create_task(conn, title="no primary", native_origin=native.capture(None))
++        assert snapshot(conn) == before
++
++
++def test_legacy_optional_receipt_still_supported(turn):
++    turn.release()
++    result = create()
++    assert result.get("ok"), result
++    with kbc.connect_closing() as conn:
++        assert native._receipt(conn, result["task_id"]) is None
++
++
++@pytest.mark.parametrize("intent", ["origin_intent", "selfwork_intent"])
++def test_courier_inputs_refused_before_preflight(turn, monkeypatch, intent):
++    def forbidden(*args, **kwargs):
++        pytest.fail("courier request reached origin preflight")
++    monkeypatch.setattr(kanban_origin, "resolve", forbidden)
++    with admission.strict_local_creation():
++        result = json.loads(kanban_tools._handle_create(
++            {"title": "courier", "placement": "local"}, **{intent: {"request_id": "x"}}))
++    assert not result.get("ok"), result
++
++
++def test_overlap_success_is_not_native_admission(turn, monkeypatch):
++    with kbc.connect_closing() as conn:
++        task = kb.create_task(conn, title="legacy overlap")
++    monkeypatch.setattr(kanban_tools.kanban_overlap, "check", lambda *a, **kw:
++                        (json.dumps({"ok": True, "task_id": task}), None))
++    with admission.strict_local_creation():
++        result = create()
++    assert not result.get("ok"), result
++
++
++def test_previous_admission_cannot_authorize_later_dedup(turn, monkeypatch):
++    with admission.strict_local_creation():
++        first = create()
++        assert first.get("ok"), first
++        monkeypatch.setattr(kanban_tools.kanban_overlap, "check", lambda *a, **kw:
++                            (json.dumps(first), None))
++        result = create()
++    assert not result.get("ok"), result
++
++
++def test_valid_receipt_with_wrong_owner_is_refused(turn):
++    with kbc.connect_closing() as conn:
++        captured = native.capture(None)
++        task = kb.create_task(conn, title="owner", idempotency_key="owner-key", native_origin=captured)
++        binding = native._receipt(conn, task)
++        binding["owner"]["profile"] = "other"
++        binding["task_record_key"] = f"other/default/{task}"
++        conn.execute("UPDATE origin_native_receipts SET binding_json=? WHERE task_id=?",
++                     (json.dumps(binding), task))
++        conn.commit()
++        with admission.strict_local_creation(), pytest.raises(admission.AdmissionRefused):
++            kb.create_task(conn, title="replay", idempotency_key="owner-key", native_origin=captured)
++
++
++def test_db_origin_intent_refused(turn):
++    with kbc.connect_closing() as conn:
++        with admission.strict_local_creation(), pytest.raises(admission.AdmissionRefused):
++            kb.create_task(conn, title="courier", origin_intent={"request_id": "x"})
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index d00b46a73b830ec284d50452d5e6222f469fbbe8..59a32b7ebf6006fff549c308332f14327b1845f5 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1521,10 +1521,12 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+ 
+ 
+ from hermes_cli.kanban_db_creation import tool_creation_audit as _creation_audit, inherit_tool_priority
++from hermes_cli.kanban_origin_admission import tool_create as _native_tool_create
+ 
+ 
+ @_kanban_handler("kanban_create")
+ @publication_scope
++@_native_tool_create
+ def _handle_create(args: dict, **kw) -> str:
+     """Create a (child) task; orchestrator workers use this to fan out."""
+     # Only an explicitly local create is board-scoped: any other placement or an origin binding can write a
+-- 
+2.43.0
+

@@ -1,0 +1,172 @@
+From 379ed9c306b95b7505cb4e6bf960e657d0a3f795 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 21:49:53 +0000
+Subject: [PATCH] feat(kanban): annotate session cards with blocked ancestors
+ [daveey]
+
+Expose nearest blocked/triage ancestor as optional local-board presentation evidence. Breadth-first traversal guards cycles and caps depth at 20; old schemas fail soft. Replica cards remain unchanged.
+
+Proof: new tests fail on original source; 68 tests pass including session_tasks chain integration and nearest/depth/cycle/status controls. scripts/check --base origin/main passes all 21 checks; health clean.
+---
+ .../kanban_session_activity_card_details.py   | 40 ++++++++++++
+ .../test_kanban_blocked_upstream_details.py   | 63 +++++++++++++++++++
+ .../test_kanban_session_activity.py           | 18 ++++++
+ 3 files changed, 121 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_blocked_upstream_details.py
+
+diff --git a/hermes_cli/kanban_session_activity_card_details.py b/hermes_cli/kanban_session_activity_card_details.py
+index ea184127326c2010355e1ca62b6ae5e0814a931a..849d1abe260310180b156a0fb4a4ff9c9ceadbd5 100644
+--- a/hermes_cli/kanban_session_activity_card_details.py
++++ b/hermes_cli/kanban_session_activity_card_details.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import logging
+ import re
+ import sqlite3
+ from typing import Any
+@@ -63,3 +64,42 @@ def _add_card_details(conn: sqlite3.Connection, found: dict[str, dict[str, Any]]
+     for task_id, (_, url) in prs.items():
+         found[task_id]["pr_url"] = url
+     add_run_machines(conn, found)  # where each card runs: the strip's hub/worker mark
++    _add_blocked_upstream(conn, found)
++
++
++def _nearest_blocked(conn: sqlite3.Connection, task_id: str) -> dict[str, str] | None:
++    """Breadth-first, so the first match is nearest; ties sort by id."""
++    seen = {task_id}
++    frontier = {task_id}
++    for _ in range(20):
++        parents = {}
++        for child in sorted(frontier):
++            for parent, status in conn.execute(
++                "SELECT t.id, t.status FROM task_links l JOIN tasks t ON t.id = l.parent_id "
++                "WHERE l.child_id = ? ORDER BY t.id", (child,),
++            ):
++                if parent not in seen:
++                    parents[parent] = status
++        if not parents:
++            return None
++        for parent in sorted(parents):
++            if parents[parent] in {"blocked", "triage"}:
++                return {"id": parent, "status": parents[parent]}
++        seen.update(parents)
++        frontier = set(parents)
++    return None
++
++
++def _add_blocked_upstream(conn: sqlite3.Connection, found: dict[str, dict[str, Any]]) -> None:
++    """Optional local-board presentation evidence; old schemas remain readable."""
++    for task_id, card in found.items():
++        card.pop("blocked_upstream", None)
++        if card.get("status") in {"done", "archived", "blocked", "triage"}:
++            continue
++        try:
++            ancestor = _nearest_blocked(conn, task_id)
++        except sqlite3.Error:
++            logging.getLogger(__name__).debug("Could not read blocked upstream for %s", task_id, exc_info=True)
++            continue
++        if ancestor is not None:
++            card["blocked_upstream"] = ancestor
+diff --git a/tests/hermes_cli/test_kanban_blocked_upstream_details.py b/tests/hermes_cli/test_kanban_blocked_upstream_details.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0935ca9b869da6a1f1be16195f544c24c045ac1f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_blocked_upstream_details.py
+@@ -0,0 +1,63 @@
++"""Blocked ancestor presentation on local session task rows."""
++import sqlite3
++
++import pytest
++
++from hermes_cli.kanban_session_activity_card_details import _add_card_details
++
++
++@pytest.fixture
++def board():
++    conn = sqlite3.connect(":memory:")
++    conn.row_factory = sqlite3.Row
++    conn.executescript("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT); "
++                       "CREATE TABLE task_links (parent_id TEXT, child_id TEXT);")
++    yield conn
++    conn.close()
++
++
++def details(conn, statuses, links, listed):
++    conn.executemany("INSERT INTO tasks VALUES (?, ?)", statuses)
++    conn.executemany("INSERT INTO task_links VALUES (?, ?)", links)
++    found = {key: {"id": key, "status": dict(statuses)[key]} for key in listed}
++    _add_card_details(conn, found)
++    return found
++
++
++@pytest.mark.parametrize("status", ["blocked", "triage", "running"])
++def test_chain_and_cycle(board, status):
++    rows = details(board, [("a", status), ("b", "todo"), ("c", "todo")],
++                   [("a", "b"), ("b", "c"), ("c", "a")], ["b", "c"])
++    for row in rows.values():
++        if status == "running":
++            assert "blocked_upstream" not in row
++        else:
++            assert row["blocked_upstream"] == {"id": "a", "status": status}
++
++
++def test_nearest_ancestor(board):
++    rows = details(board, [("a", "blocked"), ("b", "triage"), ("c", "todo")],
++                   [("a", "b"), ("b", "c")], ["c"])
++    assert rows["c"]["blocked_upstream"] == {"id": "b", "status": "triage"}
++
++
++@pytest.mark.parametrize("status", ["done", "archived", "blocked", "triage"])
++def test_excluded_card(board, status):
++    rows = details(board, [("a", "blocked"), ("b", status)], [("a", "b")], ["b"])
++    assert "blocked_upstream" not in rows["b"]
++
++
++def test_depth_cap(board):
++    statuses = [(str(i), "blocked" if i == 0 else "todo") for i in range(22)]
++    rows = details(board, statuses, [(str(i), str(i + 1)) for i in range(21)], ["20", "21"])
++    assert rows["20"]["blocked_upstream"]["id"] == "0"
++    assert "blocked_upstream" not in rows["21"]
++
++
++def test_missing_links_fails_soft(board, caplog):
++    board.execute("DROP TABLE task_links")
++    found = {"b": {"id": "b", "status": "todo"}}
++    with caplog.at_level("DEBUG"):
++        _add_card_details(board, found)
++    assert "blocked_upstream" not in found["b"]
++    assert "blocked upstream" in caplog.text.lower()
+diff --git a/tests/hermes_cli/test_kanban_session_activity.py b/tests/hermes_cli/test_kanban_session_activity.py
+index 338ef26f56335c1b125c801de420738bb700a343..c27f7acc65329f7fbab5d3ab46a87d2a89bdcba8 100644
+--- a/tests/hermes_cli/test_kanban_session_activity.py
++++ b/tests/hermes_cli/test_kanban_session_activity.py
+@@ -726,6 +726,24 @@ def _add_links(path: Path, links: list[tuple[str, str]]) -> None:
+         conn.executemany("INSERT INTO task_links VALUES (?, ?)", links)
+ 
+ 
++@pytest.mark.parametrize("ancestor_status", ["blocked", "triage", "running"])
++def test_session_tasks_include_blocked_upstream(kanban_root, ancestor_status):
++    path = kanban_root / "kanban.db"
++    _make_full_board(path, [
++        ("a", "Ancestor", ancestor_status, "default", "other", 100, None, None),
++        ("b", "Parent", "todo", "default", "s_chain", 100, None, None),
++        ("c", "Child", "todo", "default", "s_chain", 100, None, None),
++    ])
++    _add_links(path, [("a", "b"), ("b", "c"), ("c", "a")])
++    rows = {row["id"]: row for row in ksa.session_tasks(["s_chain"])}
++    assert set(rows) == {"b", "c"}
++    for row in rows.values():
++        if ancestor_status == "running":
++            assert "blocked_upstream" not in row
++        else:
++            assert row["blocked_upstream"] == {"id": "a", "status": ancestor_status}
++
++
+ def test_parked_cards_are_counted_apart_from_live_ones(kanban_root):
+     """[daveey] Parked = open but nobody is working it: scheduled on a time/event wake, blocked on a non-human
+     kind, or todo behind an unfinished parent. A todo whose parents are all done is about to be promoted and stays
+-- 
+2.43.0
+

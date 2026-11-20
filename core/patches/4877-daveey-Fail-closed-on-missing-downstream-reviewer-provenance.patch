@@ -1,0 +1,118 @@
+From 3249911ef27c08291838e63d7aec20c130bdac40 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 20:03:13 +0000
+Subject: [PATCH] [daveey] Fail closed on missing downstream reviewer
+ provenance
+
+Review classification must not depend on successful implementer evidence lookup. Evicted creator cards otherwise turn title-marked reviews into ordinary pinned tasks. Refuse missing source cards even when another source yields a partial author set.
+
+Proof: real dispatcher tick regression reproduced an implementer-pin spawn on baseline; missing/partial evidence now refuses. Intact mandatory and nonmandatory pins remain covered. All nine direct consumer suites pass. Three predicate-removal mutants fail the new admission suite. Further shipping validation and live replay are tracked by t_0561b861cd9150b4.
+---
+ hermes_cli/kanban_review_model.py             | 11 ++--
+ .../test_kanban_review_pin_admission.py       | 58 +++++++++++++++++++
+ 2 files changed, 65 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_review_pin_admission.py
+
+diff --git a/hermes_cli/kanban_review_model.py b/hermes_cli/kanban_review_model.py
+index f5f8ad621964f3875e2a3d27adf2127c9b231cf7..41f821b3f883d9e6dce60d264ef2b7792cf5d103 100644
+--- a/hermes_cli/kanban_review_model.py
++++ b/hermes_cli/kanban_review_model.py
+@@ -63,8 +63,9 @@ def implementer_models(conn, task) -> set[str]:
+                 sources.append(creator)
+             for source in sources:
+                 related = kb.get_task(conn, source)
+-                if related is not None:
+-                    models.update(collect(related))
++                if related is None:
++                    raise ReviewModelUnavailable(f"Review implementer evidence is unavailable for source {source}")
++                models.update(collect(related))
+         return models
+ 
+     return collect(task)
+@@ -72,7 +73,7 @@ def implementer_models(conn, task) -> set[str]:
+ 
+ def is_review_run(conn, task, lane) -> bool:
+     return (lane == "review" or "sdlc-review" in (getattr(task, "skills", None) or [])
+-            or (_downstream(task) and bool(implementer_models(conn, task))))
++            or _downstream(task))
+ 
+ 
+ def validate_pace_offer(model, excluded):
+@@ -286,7 +287,9 @@ def resolve_review_model(conn, task, cfg):
+         if why:
+             raise ReviewModelUnavailable(f"Review model {override[0]} is unroutable: {why}")
+     if not excluded:
+-        # Unknown author set: today's behaviour, unchanged (no exclusion evidence to act on).
++        if _downstream(task):
++            raise ReviewModelUnavailable("Downstream review implementer evidence is unavailable")
++        # Legacy same-card reviews may have an explicit handoff but no recorded author.
+         if override and refusal is None:
+             return override
+         if refusal and override:
+diff --git a/tests/hermes_cli/test_kanban_review_pin_admission.py b/tests/hermes_cli/test_kanban_review_pin_admission.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c4ab1a78aa22b11cebb1977b29af363e2f2450f4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_review_pin_admission.py
+@@ -0,0 +1,58 @@
++"""Reviewer pins must pass independence at the actual dispatcher spawn boundary."""
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_review_model as review
++from tests.hermes_cli import test_kanban_review_implementer_set as helpers
++
++board = helpers.board
++clock = helpers.clock
++
++
++@pytest.mark.parametrize('pin,mandatory,expected', [
++    (helpers.OPUS, True, helpers.OPUS),
++    (helpers.ASTRA, True, None),
++    (helpers.ASTRA, False, helpers.OPUS),
++])
++def test_downstream_pin_dispatch(board, clock, monkeypatch, all_assignees_spawnable, pin, mandatory, expected):
++    helpers._routing(monkeypatch)
++    with kbc.connect() as conn:
++        tid = helpers._mandatory_downstream(conn, pin=pin)
++        conn.execute('UPDATE tasks SET model_pin_mandatory=? WHERE id=?', (mandatory, tid))
++        # The implementation is evidence, not another runnable candidate.
++        conn.execute("UPDATE tasks SET status='done' WHERE id<>?", (tid,))
++        conn.commit()
++        spawned = helpers.pin_tests._tick(conn)
++        assert spawned == ([] if expected is None else [(expected, helpers.PROVIDER[expected])])
++        if expected:
++            event = helpers.pin_tests._events(conn, tid, 'model_tier')[-1]
++            assert event['reason'].startswith('review_')
++            assert event['implementer_models'] == [helpers.ASTRA]
++
++
++@pytest.mark.parametrize('pin', [None, helpers.ASTRA])
++@pytest.mark.parametrize('missing', ['empty', 'unreadable', 'evicted_source', 'partial_sources'])
++def test_downstream_missing_evidence_never_spawns_pin(
++        board, clock, monkeypatch, all_assignees_spawnable, missing, pin):
++    helpers._routing(monkeypatch)
++    with kbc.connect() as conn:
++        creator = helpers._card(conn, helpers.ASTRA) if missing in {'evicted_source', 'partial_sources'} else None
++        tid = helpers._card(conn, pin, title='Independent exact-head review', creator=creator)
++        if creator:
++            if missing == 'partial_sources':
++                other = helpers._card(conn, helpers.OPUS)
++                helpers.kb.link_tasks(conn, tid, other)
++            original_get = helpers.kb.get_task
++            monkeypatch.setattr(helpers.kb, 'get_task',
++                                lambda c, key: None if key == creator else original_get(c, key))
++            conn.execute("UPDATE tasks SET status='done' WHERE id<>?", (tid,))
++        conn.execute('UPDATE tasks SET model_pin_mandatory=1 WHERE id=?', (tid,))
++        conn.commit()
++        if missing == 'unreadable':
++            import sqlite3
++
++            def unavailable(*args):
++                raise sqlite3.OperationalError('author evidence unavailable')
++
++            monkeypatch.setattr(review, 'implementer_models', unavailable)
++        assert helpers.pin_tests._tick(conn) == []
+-- 
+2.43.0
+

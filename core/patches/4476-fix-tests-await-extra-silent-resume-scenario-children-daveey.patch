@@ -1,0 +1,140 @@
+From b8063e8f9c902fe6c9ffb487f945bab620d2f1e6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 11:41:35 +0000
+Subject: [PATCH] fix(tests): await extra silent-resume scenario children
+ [daveey]
+
+Three silent-auto-resume scenarios dispatch an ordinary replacement child
+but return without awaiting its completion. In particular, the scenario
+immediately before test_a_stop_while_auto_resume_is_off_still_cancels_a_promised_child
+leaves a writer alive across the per-test HERMES_HOME switch.
+
+Original CI: run 43684534856, job 132722245220, head
+abdfe3e49dfb4b0ca6aec1c9df7216f0e4a6ad98, PR branch wt/lg-stdin-failclosed.
+The first file run failed supersede_for_session == 1 (actual 0), with a
+zero-byte state.db quarantine, record_unit_child readonly-database error,
+and the model receiving session_db=None. The isolated retry passed.
+Async ledger opens resolve the current home, so an unfinished old unit can
+write into a later fixture's new database. Await the replacement's queued
+completion inside the scripted-model patch, before changing config or home.
+The completion queue follows durable persistence; no production semantics
+or cancellation/no-respawn/no-event assertions change.
+
+Add a deterministic held-model regression for all three scenarios. It
+prevents the extra model turn from finishing until the scenario awaits its
+completion, and reaps the executor on both RED and GREEN. Before the fix,
+all three return with an unawaited child; afterwards all three pass. This
+proves the leaked-worker lifetime, not every internal SQLite interleaving
+from the historical failure.
+
+Verification: full silent-auto-resume file plus auto_resume, continue,
+resumable and new lifetime suite: 55 passed across 5 files. Exact original
+stop test also passed alone before the fix; affected source files are
+unchanged between incident head and current main. scripts/check --base
+origin/main: all 20 checks pass. No retries, sleeps or weakened assertions.
+
+Task: t_c6f00a992368d220
+---
+ .../tools/test_delegate_auto_resume_silent.py |  3 +
+ .../test_delegate_silent_fixture_lifetime.py  | 61 +++++++++++++++++++
+ 2 files changed, 64 insertions(+)
+ create mode 100644 tests/tools/test_delegate_silent_fixture_lifetime.py
+
+diff --git a/tests/tools/test_delegate_auto_resume_silent.py b/tests/tools/test_delegate_auto_resume_silent.py
+index 9d658b18a26a5aefba69cce215286f2a6ee6cf58..569190f3b25aa1e62c9417e274559919f61c0cda 100644
+--- a/tests/tools/test_delegate_auto_resume_silent.py
++++ b/tests/tools/test_delegate_auto_resume_silent.py
+@@ -149,6 +149,7 @@ def test_a_spawn_with_a_waiting_childs_exact_goal_is_refused_until_it_is_stopped
+     assert json.loads(delegate_task(action="stop", subagent_id=sid, parent_agent=parent))["status"] == "dismissed"
+     with patch("run_agent.AIAgent", side_effect=_ScriptedModel()):
+         again = json.loads(delegate_task(goal="write the parser", background=True, parent_agent=parent))
++        _until_completion(again["delegation_id"])
+     assert again.get("status") == "dispatched" and sid not in again["subagent_ids"], again
+ 
+ 
+@@ -162,6 +163,7 @@ def test_the_duplicate_guard_is_off_without_auto_resume(tmp_path):
+     (get_hermes_home() / "config.yaml").write_text(json.dumps({"delegation": {"auto_resume": False}}))
+     with patch("run_agent.AIAgent", side_effect=_ScriptedModel()):
+         out = json.loads(delegate_task(goal="write the parser", background=True, parent_agent=parent))
++        _until_completion(out["delegation_id"])
+     assert out.get("status") == "dispatched", out
+ 
+ 
+@@ -274,6 +276,7 @@ def test_turning_auto_resume_off_still_reports_a_promised_child_once_and_the_gua
+                  "WHERE subagent_id=?", (time.time() - 7 * 3600, sid))
+     with patch("run_agent.AIAgent", side_effect=_ScriptedModel()):  # past its deadline, before any tick settled it
+         again = json.loads(delegate_task(goal="write the parser", background=True, parent_agent=parent))
++        _until_completion(again["delegation_id"])
+     assert again.get("status") == "dispatched", again
+     (get_hermes_home() / "config.yaml").write_text(json.dumps({"delegation": {"auto_resume": False}}))
+     dispatched = []
+diff --git a/tests/tools/test_delegate_silent_fixture_lifetime.py b/tests/tools/test_delegate_silent_fixture_lifetime.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..012b59870e55425cd170a15b2be0ca6ac26d6676
+--- /dev/null
++++ b/tests/tools/test_delegate_silent_fixture_lifetime.py
+@@ -0,0 +1,61 @@
++"""Silent-resume scenarios must finish their extra, non-silent background children before returning."""
++import threading
++from unittest.mock import patch
++
++import pytest
++
++from tests.tools import test_delegate_auto_resume_silent as scenarios
++from tests.tools.test_delegate_continue import _ScriptedModel
++from tools import async_delegation
++
++
++@pytest.mark.parametrize("scenario", [
++    scenarios.test_a_spawn_with_a_waiting_childs_exact_goal_is_refused_until_it_is_stopped,
++    scenarios.test_the_duplicate_guard_is_off_without_auto_resume,
++    scenarios.test_turning_auto_resume_off_still_reports_a_promised_child_once_and_the_guard_follows_its_deadline,
++])
++def test_silent_scenario_owns_its_extra_child_until_completion(tmp_path, scenario):
++    """Hold the extra child at its model boundary until its parent explicitly awaits completion.
++
++    Without that wait the scenario returns with a live writer, allowing the next test's
++    HERMES_HOME to become the destination of its late async-ledger writes.
++    """
++    release = threading.Event()
++    entered = threading.Event()
++    finished = threading.Event()
++    awaited = []
++    real_wait = scenarios._until_completion
++
++    class HeldModel(_ScriptedModel):
++        def __call__(self, **kwargs):
++            child = super().__call__(**kwargs)
++            run = child.run_conversation.side_effect
++
++            def held(*args, **kw):
++                entered.set()
++                assert release.wait(10), "scenario never released its extra child"
++                result = run(*args, **kw)
++                finished.set()
++                return result
++
++            child.run_conversation.side_effect = held
++            return child
++
++    def await_extra(unit):
++        assert entered.wait(10), "extra child never reached its model"
++        awaited.append(unit)
++        release.set()
++        return real_wait(unit)
++
++    try:
++        with patch("tests.tools.test_delegate_continue._ScriptedModel", HeldModel), \
++                patch.object(scenarios, "_ScriptedModel", HeldModel), \
++                patch.object(scenarios, "_until_completion", await_extra):
++            scenario(tmp_path)
++            assert awaited and finished.is_set(), "scenario returned with an unawaited background child"
++    finally:
++        release.set()
++        # Both RED and GREEN reap owned work while the fixture's home still exists.
++        if async_delegation._executor is not None:
++            async_delegation._executor.shutdown(wait=True)
++            async_delegation._executor = None
+-- 
+2.43.0
+

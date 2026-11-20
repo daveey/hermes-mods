@@ -1,0 +1,858 @@
+From 7aca1e5fa2a8090438cc6cbfd478b68e9625eac7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 17:31:46 +0000
+Subject: [PATCH] fix(kanban): negotiate containment and expose terminal
+ handoff [daveey]
+
+Require authenticated compatible Board capability before canonical I/O; never fall back locally. Expose both operations to worker tools and the native MCP transport, recognizing only successful own-run containment as terminal. Retain dependency and source-receipt custody.
+
+Proof: canonical containment/site 15 files 290 passed; stop/capability/site 5 files 61 passed; broader exposure consumers initially caught catalog truncation, corrected and rerun green; real isolated workerd/core proof 33 checks passed including restart, replica pages, rehome and producer freshness. Full scripts/check passed. Not deployed, no live lifecycle application. Independent final review, remaining mutation/replay, CI and canonical landing remain required.
+---
+ agent/kanban_stop.py                          |  55 +++--
+ agent/transports/hermes_tools_mcp_server.py   |   2 +-
+ hermes_cli/kanban_containment_lifecycle.py    |   4 +-
+ hermes_cli/kanban_containment_remote.py       | 219 ++++++++++++++----
+ hermes_cli/kanban_sync_hub_routes.py          |  66 +++++-
+ tests/agent/test_kanban_containment_stop.py   |  51 ++++
+ .../test_kanban_containment_capability.py     | 124 ++++++++++
+ .../test_kanban_source_receipt_sites.py       |   7 +
+ tools/kanban_containment_tools.py             |   7 +-
+ toolsets.py                                   |   1 +
+ .../user-guide/features/kanban-containment.md |   8 +-
+ 11 files changed, 472 insertions(+), 72 deletions(-)
+ create mode 100644 tests/agent/test_kanban_containment_stop.py
+ create mode 100644 tests/hermes_cli/test_kanban_containment_capability.py
+
+diff --git a/agent/kanban_stop.py b/agent/kanban_stop.py
+index f37deee26a8819cbfa6d208a504649276f13f912..9041e01b37c203e3880bbf910b75f5fb13a47802 100644
+--- a/agent/kanban_stop.py
++++ b/agent/kanban_stop.py
+@@ -8,6 +8,7 @@ instead of exiting.
+ 
+ from __future__ import annotations
+ 
++import json
+ import os
+ from typing import Any, Iterable, Optional
+ 
+@@ -19,15 +20,17 @@ from agent.delegation_context import owned_kanban_task
+ # finalize prompts tell builders to call it) and ``kanban_request_changes`` returns it to
+ # ``ready`` (the sdlc-review skill tells reviewers to). Nudging after either asks a worker
+ # that did the right thing to ``kanban_complete`` a card it must not close.
+-_TERMINAL_KANBAN_TOOLS = frozenset({
+-    "kanban_complete",
+-    "kanban_block",
+-    "kanban_schedule",
+-    "kanban_continue",
+-    "kanban_move",
+-    "kanban_request_review",
+-    "kanban_request_changes",
+-})
++_TERMINAL_KANBAN_TOOLS = frozenset(
++    {
++        "kanban_complete",
++        "kanban_block",
++        "kanban_schedule",
++        "kanban_continue",
++        "kanban_move",
++        "kanban_request_review",
++        "kanban_request_changes",
++    }
++)
+ 
+ _DEFAULT_MAX_ATTEMPTS = 2
+ 
+@@ -36,7 +39,12 @@ def kanban_stop_nudge_enabled() -> bool:
+     """On when ``HERMES_KANBAN_TASK`` is set for the dispatcher-owned worker, unless
+     ``HERMES_KANBAN_STOP_NUDGE`` disables it. In-process delegate_task children and cron runs
+     inherit the env var but own no board task and carry no kanban toolset."""
+-    if (os.environ.get("HERMES_KANBAN_STOP_NUDGE") or "").strip().lower() in {"0", "false", "no", "off"}:
++    if (os.environ.get("HERMES_KANBAN_STOP_NUDGE") or "").strip().lower() in {
++        "0",
++        "false",
++        "no",
++        "off",
++    }:
+         return False
+     return bool(owned_kanban_task())
+ 
+@@ -47,7 +55,9 @@ def _tool_call_name(tc: Any) -> str:
+         fn = tc.get("function")
+         return str((fn.get("name") if isinstance(fn, dict) else tc.get("name")) or "")
+     fn = getattr(tc, "function", None)
+-    return str((getattr(fn, "name", "") if fn is not None else getattr(tc, "name", "")) or "")
++    return str(
++        (getattr(fn, "name", "") if fn is not None else getattr(tc, "name", "")) or ""
++    )
+ 
+ 
+ def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
+@@ -55,11 +65,26 @@ def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
+     for msg in filter(lambda m: isinstance(m, dict), messages or ()):
+         role = msg.get("role")
+         if role == "assistant" and any(
+-            _tool_call_name(tc) in _TERMINAL_KANBAN_TOOLS for tc in msg.get("tool_calls") or []
++            _tool_call_name(tc) in _TERMINAL_KANBAN_TOOLS
++            for tc in msg.get("tool_calls") or []
+         ):
+             return True
+         if role == "tool" and str(msg.get("name") or "") in _TERMINAL_KANBAN_TOOLS:
+             return True
++        if role == "tool" and msg.get("name") == "kanban_contain":
++            # Attempted stops and descendant stops do not end the actor's run.
++            result = msg.get("content")
++            if isinstance(result, str):
++                try:
++                    result = json.loads(result)
++                except (ValueError, TypeError):
++                    result = None
++            if (
++                isinstance(result, dict)
++                and result.get("ok") is True
++                and result.get("terminal_for_run") is True
++            ):
++                return True
+     return False
+ 
+ 
+@@ -102,4 +127,8 @@ def build_kanban_stop_nudge(
+     )
+ 
+ 
+-__all__ = ["build_kanban_stop_nudge", "kanban_stop_nudge_enabled", "session_called_kanban_terminal"]
++__all__ = [
++    "build_kanban_stop_nudge",
++    "kanban_stop_nudge_enabled",
++    "session_called_kanban_terminal",
++]
+diff --git a/agent/transports/hermes_tools_mcp_server.py b/agent/transports/hermes_tools_mcp_server.py
+index af261f0f9bd8a446be9c012730ae77ace5f4356a..b110a6f8a90a90a213a4233e588c646b987e0c7c 100644
+--- a/agent/transports/hermes_tools_mcp_server.py
++++ b/agent/transports/hermes_tools_mcp_server.py
+@@ -60,7 +60,7 @@ EXPOSED_TOOLS: tuple[str, ...] = (
+     # Kanban handoff tools: stateless (read HERMES_KANBAN_TASK, write kanban.db).
+     # Without them a codex-runtime worker can't report completion and hangs.
+     "kanban_complete", "kanban_block", "kanban_schedule", "kanban_continue", "kanban_move", "kanban_request_review",
+-    "kanban_request_changes", "kanban_comment",
++    "kanban_request_changes", "kanban_comment", "kanban_contain", "kanban_resume_contained",
+     "kanban_heartbeat", "kanban_show", "kanban_list",
+     # A worker's graph-edit request to the non-worker supervisor executor. [daveey]
+     "kanban_supervisor_request",
+diff --git a/hermes_cli/kanban_containment_lifecycle.py b/hermes_cli/kanban_containment_lifecycle.py
+index 614c1c96c7d7d785b02a5f48fb11b2e8ae0d8a85..222952f9f97e7182fc01129324431108cfb2ef03 100644
+--- a/hermes_cli/kanban_containment_lifecycle.py
++++ b/hermes_cli/kanban_containment_lifecycle.py
+@@ -1,7 +1,7 @@
+ """Transaction owner for local non-human containment.
+ 
+-Staged internal API, not registered with CLI/tools yet. Synced boards deliberately
+-refuse: local attestations cannot substitute for authenticated Board custody.
++Shared by CLI/tools through the admitted-agent service. Synced boards deliberately
++refuse this local-only owner: local attestations cannot replace Board custody.
+ """
+ from __future__ import annotations
+ 
+diff --git a/hermes_cli/kanban_containment_remote.py b/hermes_cli/kanban_containment_remote.py
+index 2e9fa61bac934a1af8a7810330908435403b1bb8..7ee6227b3ddeb348823aff406e5e2361d783bc2d 100644
+--- a/hermes_cli/kanban_containment_remote.py
++++ b/hermes_cli/kanban_containment_remote.py
+@@ -3,6 +3,7 @@
+ Preparation is metadata-only and grants no permission. The authenticated Board
+ rechecks the actor lease, ancestry, nominees, frozen baseline and release scope.
+ """
++
+ from __future__ import annotations
+ 
+ import json
+@@ -18,46 +19,107 @@ from hermes_cli.kanban_containment_state import _payload, _stop, _uid, fingerpri
+ def enrolled(conn: sqlite3.Connection):
+     from hermes_cli import kanban_db_sync as sync
+     from hermes_cli import kanban_sync_client as client
++
+     state = sync.sync_state(conn)
+     if not state or state["mode"] != "primary":
+-        raise ContainmentRefused("canonical containment requires an attached primary board")
++        raise ContainmentRefused(
++            "canonical containment requires an attached primary board"
++        )
+     hub = client.Hub(client.load_identity())
+     if state["gateway_id"] != hub.ident.gateway:
+         hub.close()
+         raise ContainmentRefused("enrolled gateway differs from the admitted board")
++    try:
++        require_capability(hub, state["board_id"])
++    except (ContainmentRefused, client.HubError, OSError):
++        hub.close()
++        raise
+     return hub, state["board_id"]
+ 
+ 
++def require_capability(hub, board: str) -> None:
++    data = hub.containment_capability(board)
++    if (
++        not isinstance(data, dict)
++        or type(data.get("containment_protocol")) is not int
++        or data.get("containment_protocol") != 1
++        or data.get("receipt_envelopes") != [1]
++        or any(type(v) is not int for v in data["receipt_envelopes"])
++        or data.get("task_marker") != "containment_episode"
++        or data.get("resume_predicates") != ["authority", "producer"]
++    ):
++        raise ContainmentRefused(
++            "Board protected containment protocol is unavailable or incompatible"
++        )
++
++
+ def context(hub, board: str, task: str, producer: str | None = None) -> dict:
+     data = hub.containment_context(board, task, producer)
+-    if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] != 1 or data.get("board") != board:
++    if (
++        not isinstance(data, dict)
++        or type(data.get("version")) is not int
++        or data["version"] != 1
++        or data.get("board") != board
++    ):
+         raise ContainmentRefused("Board containment context capability is absent")
+     target = identity(data.get("target"))
+-    if target["board"] != board or target["task_id"] != task or type(data.get("held")) is not bool:
++    if (
++        target["board"] != board
++        or target["task_id"] != task
++        or type(data.get("held")) is not bool
++    ):
+         raise ContainmentRefused("Board containment context target changed")
+     return data
+ 
+ 
+-def _replay(conn: sqlite3.Connection, board: str, actor: Actor, task: str, action: str) -> str | None:
++def _replay(
++    conn: sqlite3.Connection, board: str, actor: Actor, task: str, action: str
++) -> str | None:
+     canonical._schema(conn)
+     matches = []
+-    for request, raw in conn.execute("SELECT request_uid,op_json FROM containment_delivery WHERE board=?", (board,)):
++    for request, raw in conn.execute(
++        "SELECT request_uid,op_json FROM containment_delivery WHERE board=?", (board,)
++    ):
+         op = json.loads(raw)
+-        if op.get("actor_task") == actor.task and op.get("actor_run_uid") == actor.run_uid and op.get("task") == task and op.get("op") == action:
++        if (
++            op.get("actor_task") == actor.task
++            and op.get("actor_run_uid") == actor.run_uid
++            and op.get("task") == task
++            and op.get("op") == action
++        ):
+             matches.append(request)
+     if len(matches) > 1:
+-        raise ContainmentRefused("ambiguous containment request history; no replacement may be submitted")
++        raise ContainmentRefused(
++            "ambiguous containment request history; no replacement may be submitted"
++        )
+     return matches[0] if matches else None
+ 
+ 
+-def contain(conn: sqlite3.Connection, *, actor: Actor, task: str, authority: str, producer: str | None) -> dict:
++def contain(
++    conn: sqlite3.Connection,
++    *,
++    actor: Actor,
++    task: str,
++    authority: str,
++    producer: str | None,
++) -> dict:
+     hub, board = enrolled(conn)
+     try:
+         request = _replay(conn, board, actor, task, "contain")
+         if request is not None:
+-            saved = json.loads(conn.execute("SELECT op_json FROM containment_delivery WHERE request_uid=?", (request,)).fetchone()[0])["payload"]["policy"]
+-            if saved["authority"]["task_id"] != authority or saved.get("producer", {}).get("task_id") != producer:
+-                raise ContainmentRefused("recovery cannot replace the frozen containment predicate")
++            saved = json.loads(
++                conn.execute(
++                    "SELECT op_json FROM containment_delivery WHERE request_uid=?",
++                    (request,),
++                ).fetchone()[0]
++            )["payload"]["policy"]
++            if (
++                saved["authority"]["task_id"] != authority
++                or saved.get("producer", {}).get("task_id") != producer
++            ):
++                raise ContainmentRefused(
++                    "recovery cannot replace the frozen containment predicate"
++                )
+         if request is None:
+             data = context(hub, board, task, producer)
+             target = data["target"]
+@@ -66,31 +128,54 @@ def contain(conn: sqlite3.Connection, *, actor: Actor, task: str, authority: str
+                 spec["producer"] = identity(data.get("producer"))
+                 if spec["producer"]["task_id"] != producer:
+                     raise ContainmentRefused("Board producer coordinates changed")
+-            payload = {"version": 1, "target": target, "policy": policy(spec, target=target),
+-                       "producer_baseline": data.get("producer_baseline")}
++            payload = {
++                "version": 1,
++                "target": target,
++                "policy": policy(spec, target=target),
++                "producer_baseline": data.get("producer_baseline"),
++            }
+             request = _stage(conn, hub, board, actor, task, "contain", payload)
+         result = _deliver(conn, hub, request)
+         projected = settle_local(conn, hub, board, result, actor)
+-        return {**result, "status": "triage", "episode": result["event_uid"], "local_projected": projected,
+-                "terminal_for_run": actor.task == task, "dependency_satisfied": False}
++        return {
++            **result,
++            "status": "triage",
++            "episode": result["event_uid"],
++            "local_projected": projected,
++            "terminal_for_run": actor.task == task,
++            "dependency_satisfied": False,
++        }
+     finally:
+         hub.close()
+ 
+ 
+-def resume(conn: sqlite3.Connection, *, actor: Actor, task: str, episode: str, kind: str) -> dict:
++def resume(
++    conn: sqlite3.Connection, *, actor: Actor, task: str, episode: str, kind: str
++) -> dict:
+     if not _uid(episode) or kind not in ("authority", "producer"):
+-        raise ContainmentRefused("resume requires exact episode and authority or producer predicate")
++        raise ContainmentRefused(
++            "resume requires exact episode and authority or producer predicate"
++        )
+     hub, board = enrolled(conn)
+     try:
+         _recover_stop(conn, hub, board, actor, task, episode)
+         request = _replay(conn, board, actor, task, "resume_contained")
+         if request is not None:
+-            saved = json.loads(conn.execute("SELECT op_json FROM containment_delivery WHERE request_uid=?", (request,)).fetchone()[0])["payload"]
++            saved = json.loads(
++                conn.execute(
++                    "SELECT op_json FROM containment_delivery WHERE request_uid=?",
++                    (request,),
++                ).fetchone()[0]
++            )["payload"]
+             if saved["episode"] != episode or saved["evidence"]["kind"] != kind:
+-                raise ContainmentRefused("recovery cannot replace the exact release episode or predicate")
++                raise ContainmentRefused(
++                    "recovery cannot replace the exact release episode or predicate"
++                )
+         if request is None:
+             stop_proof = hub.row_evidence(board, "task_events", episode)
+-            stop = canonical.certified_stop(stop_proof, board=board, task=task, uid=episode)
++            stop = canonical.certified_stop(
++                stop_proof, board=board, task=task, uid=episode
++            )
+             frozen = _stop(stop)
+             if kind == "authority":
+                 who = context(hub, board, actor.task)["target"]
+@@ -101,17 +186,33 @@ def resume(conn: sqlite3.Connection, *, actor: Actor, task: str, episode: str, k
+                     raise ContainmentRefused("episode has no producer predicate")
+                 data = context(hub, board, producer["task_id"], producer["task_id"])
+                 latest = data.get("producer_baseline")
+-                if not isinstance(latest, dict) or not _uid(latest.get("event_uid")) or not _uid(latest.get("run_uid")):
+-                    raise ContainmentRefused("producer has no portable completion evidence")
++                if (
++                    not isinstance(latest, dict)
++                    or not _uid(latest.get("event_uid"))
++                    or not _uid(latest.get("run_uid"))
++                ):
++                    raise ContainmentRefused(
++                        "producer has no portable completion evidence"
++                    )
+                 evidence = {"kind": kind, kind: data["target"], **latest}
+-            payload = {"version": 1, "episode": episode, "containment_sha256": fingerprint(frozen),
+-                       "resume_status": "ready", "evidence": evidence}
++            payload = {
++                "version": 1,
++                "episode": episode,
++                "containment_sha256": fingerprint(frozen),
++                "resume_status": "ready",
++                "evidence": evidence,
++            }
+             request = _stage(conn, hub, board, actor, task, "resume_contained", payload)
+         result = _deliver(conn, hub, request)
+         projected = settle_local(conn, hub, board, result, actor)
+         data = context(hub, board, task)
+-        return {**result, "episode": episode, "status": data["status"], "local_projected": projected,
+-                "dependency_satisfied": False}
++        return {
++            **result,
++            "episode": episode,
++            "status": data["status"],
++            "local_projected": projected,
++            "dependency_satisfied": False,
++        }
+     finally:
+         hub.close()
+ 
+@@ -123,35 +224,61 @@ def _recover_stop(conn, hub, board, actor, task, episode):
+     operation; Board request replay and original-actor admission still apply.
+     """
+     canonical._schema(conn)
+-    for request, raw in conn.execute("SELECT request_uid,op_json FROM containment_delivery WHERE board=? AND confirmed>=0", (board,)):
++    for request, raw in conn.execute(
++        "SELECT request_uid,op_json FROM containment_delivery WHERE board=? AND confirmed>=0",
++        (board,),
++    ):
+         op = json.loads(raw)
+-        if op.get("op") != "contain" or op.get("task") != task or op.get("event_uid") != episode:
++        if (
++            op.get("op") != "contain"
++            or op.get("task") != task
++            or op.get("event_uid") != episode
++        ):
+             continue
+         if op["payload"]["policy"]["authority"]["task_id"] != actor.task:
+             return
+         result = _deliver(conn, hub, request)
+-        settle_local(conn, hub, board, result, Actor(op["actor_task"], op["actor_run_uid"]))
++        settle_local(
++            conn, hub, board, result, Actor(op["actor_task"], op["actor_run_uid"])
++        )
+         return
+ 
+ 
+ def _deliver(conn, hub, request):
+     from hermes_cli.kanban_sync_client import HubError
++
+     try:
+         return canonical.deliver(conn, hub, request=request)
+     except (canonical.DeliveryUnknown, OSError, HubError) as exc:
+-        op = json.loads(conn.execute("SELECT op_json FROM containment_delivery WHERE request_uid=?", (request,)).fetchone()[0])
++        op = json.loads(
++            conn.execute(
++                "SELECT op_json FROM containment_delivery WHERE request_uid=?",
++                (request,),
++            ).fetchone()[0]
++        )
+         episode = op["event_uid"] if op["op"] == "contain" else op["payload"]["episode"]
+-        raise canonical.DeliveryUnknown("Canonical delivery is uncertain; recover the same request, never replace it",
+-                                       request_uid=request, episode=episode) from exc
++        raise canonical.DeliveryUnknown(
++            "Canonical delivery is uncertain; recover the same request, never replace it",
++            request_uid=request,
++            episode=episode,
++        ) from exc
+ 
+ 
+ def _stage(conn, hub, board, actor, task, action, payload):
+     from hermes_cli.kanban_db_sync import uuid7
+     from hermes_cli import kanban_containment_guard as guard
+     from hermes_cli.kanban_containment_connections import verifier
++
+     guard.install(conn, verify_release=lambda r, s: verifier(conn, r, s))
+-    op = {"client_op_id": uuid7(), "event_uid": uuid7(), "op": action, "task": task,
+-          "actor_task": actor.task, "actor_run_uid": actor.run_uid, "payload": payload}
++    op = {
++        "client_op_id": uuid7(),
++        "event_uid": uuid7(),
++        "op": action,
++        "task": task,
++        "actor_task": actor.task,
++        "actor_run_uid": actor.run_uid,
++        "payload": payload,
++    }
+     return canonical.stage(conn, board=board, gateway=hub.ident.gateway, op=op)
+ 
+ 
+@@ -167,17 +294,31 @@ def settle_local(conn, hub, board, result, actor) -> bool:
+     from hermes_cli import kanban_sync_client as client
+     from hermes_cli import kanban_db_sync as sync
+     from hermes_cli import kanban_containment_replica as replica
++
+     event = hub.row_evidence(board, "task_events", result["event_uid"])
+     changes = [client._row_change("task_events", event["row"])]
+     if event["row"]["kind"] == "containment_released":
+         episode = _payload(event["row"])["episode"]
+-        changes.insert(0, client._row_change("task_events", hub.row_evidence(board, "task_events", episode)["row"]))
+-    for table, uid in [("tasks", task), *(([("task_runs", actor.run_uid)]) if actor.task == task else [])]:
++        changes.insert(
++            0,
++            client._row_change(
++                "task_events", hub.row_evidence(board, "task_events", episode)["row"]
++            ),
++        )
++    for table, uid in [
++        ("tasks", task),
++        *(([("task_runs", actor.run_uid)]) if actor.task == task else []),
++    ]:
+         proof = hub.row_evidence(board, table, uid)
+         row = proof.get("row")
+-        if (proof.get("board") != board or proof.get("table") != table or proof.get("uid") != uid
+-                or proof.get("state") != "live" or not isinstance(row, dict)
+-                or row.get("id" if table == "tasks" else "task_id") != task):
++        if (
++            proof.get("board") != board
++            or proof.get("table") != table
++            or proof.get("uid") != uid
++            or proof.get("state") != "live"
++            or not isinstance(row, dict)
++            or row.get("id" if table == "tasks" else "task_id") != task
++        ):
+             raise ContainmentRefused("canonical lifecycle projection changed identity")
+         changes.append(client._row_change(table, {**row, "uid": uid}))
+     replica.certify_page(conn, hub, board, changes)
+diff --git a/hermes_cli/kanban_sync_hub_routes.py b/hermes_cli/kanban_sync_hub_routes.py
+index ce8a71421774f7f5c315463d16aebbc262940c3b..3913c75fbda8fad792d2342be89bf837e6082c4c 100644
+--- a/hermes_cli/kanban_sync_hub_routes.py
++++ b/hermes_cli/kanban_sync_hub_routes.py
+@@ -3,6 +3,7 @@
+ Split out of ``kanban_sync_client`` to keep that module under the file-size cap. ``Hub`` inherits these unchanged and
+ supplies ``_call``; anything with its own error or budget handling (``sessions``, ``report_metrics``) stays there.
+ """
++
+ from __future__ import annotations
+ 
+ from typing import Optional
+@@ -11,26 +12,67 @@ from typing import Optional
+ class HubRoutesMixin:
+     """One ``_call`` per endpoint; no state of its own."""
+ 
++    def containment_capability(self, board: str) -> dict:
++        from urllib.parse import quote
++
++        return self._call(
++            "GET", f"/v2/boards/{quote(board, safe='')}/containment/capability"
++        )
++
+     def leases(self, board: str, body: dict) -> dict:
+         return self._call("POST", f"/v2/boards/{board}/leases", body)
+ 
+-    def repin(self, board: str, *, task_id: str, expected_revision: int, runs_on: list[str]) -> dict:
++    def repin(
++        self, board: str, *, task_id: str, expected_revision: int, runs_on: list[str]
++    ) -> dict:
+         """Explicit rollback/manual pin; caller must pull the authoritative row afterward."""
+-        return self._call("POST", f"/v2/boards/{board}/placement/repin", {
+-            "task_id": task_id, "expected_revision": expected_revision, "runs_on": runs_on})
++        return self._call(
++            "POST",
++            f"/v2/boards/{board}/placement/repin",
++            {
++                "task_id": task_id,
++                "expected_revision": expected_revision,
++                "runs_on": runs_on,
++            },
++        )
+ 
+-    def recover(self, board: str, *, task_id: str, expected_revision: int, mode: str,
+-                candidates: list[str]) -> dict:
++    def recover(
++        self,
++        board: str,
++        *,
++        task_id: str,
++        expected_revision: int,
++        mode: str,
++        candidates: list[str],
++    ) -> dict:
+         """Creator/CAS recovery; pull authoritative state after success or uncertain delivery."""
+-        return self._call("POST", f"/v2/boards/{board}/placement/recover", {
+-            "task_id": task_id, "expected_revision": expected_revision, "mode": mode,
+-            "policy": "worker-first-v1", "candidates": candidates})
++        return self._call(
++            "POST",
++            f"/v2/boards/{board}/placement/recover",
++            {
++                "task_id": task_id,
++                "expected_revision": expected_revision,
++                "mode": mode,
++                "policy": "worker-first-v1",
++                "candidates": candidates,
++            },
++        )
+ 
+-    def reserve(self, board: str, *, task_id: str, expected_revision: int, candidates: list[str]) -> dict:
++    def reserve(
++        self, board: str, *, task_id: str, expected_revision: int, candidates: list[str]
++    ) -> dict:
+         """Atomic Board placement; errors leave the persisted local queue fence intact."""
+-        return self._call("POST", f"/v2/boards/{board}/placement/reserve", {
+-            "task_id": task_id, "expected_revision": expected_revision,
+-            "policy": "worker-first-v1", "candidates": candidates}, replay_safe=True)
++        return self._call(
++            "POST",
++            f"/v2/boards/{board}/placement/reserve",
++            {
++                "task_id": task_id,
++                "expected_revision": expected_revision,
++                "policy": "worker-first-v1",
++                "candidates": candidates,
++            },
++            replay_safe=True,
++        )
+ 
+     def machines(self) -> dict:
+         """The machine registry (RFC "One machine registry"): ``{me, machines: [{name, labels, pinned_only, ...}]}``."""
+diff --git a/tests/agent/test_kanban_containment_stop.py b/tests/agent/test_kanban_containment_stop.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..170bbbc7e24d8267ede6e6446929c7c7d195e12f
+--- /dev/null
++++ b/tests/agent/test_kanban_containment_stop.py
+@@ -0,0 +1,51 @@
++"""Containment must be exposed, without treating a failed/foreign stop as terminal."""
++
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from agent.kanban_stop import session_called_kanban_terminal
++
++
++def test_containment_exposed_in_worker_toolset_and_native_transport():
++    from toolsets import TOOLSETS
++    from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
++
++    for name in ("kanban_contain", "kanban_resume_contained"):
++        assert name in TOOLSETS["kanban"]["tools"]
++        assert name in EXPOSED_TOOLS
++
++
++@pytest.mark.parametrize("encoded", [False, True])
++def test_successful_own_stop_is_terminal(encoded):
++    result = {"ok": True, "terminal_for_run": True}
++    content = json.dumps(result) if encoded else result
++    assert session_called_kanban_terminal(
++        [{"role": "tool", "name": "kanban_contain", "content": content}]
++    )
++
++
++@pytest.mark.parametrize(
++    "role,name,result",
++    [
++        ("assistant", "kanban_contain", {"ok": True, "terminal_for_run": True}),
++        ("tool", "kanban_resume_contained", {"ok": True, "terminal_for_run": True}),
++        ("tool", "other", {"ok": True, "terminal_for_run": True}),
++        ("tool", "kanban_contain", {"ok": False, "terminal_for_run": True}),
++        ("tool", "kanban_contain", {"ok": 1, "terminal_for_run": True}),
++        ("tool", "kanban_contain", {"ok": True, "terminal_for_run": False}),
++        ("tool", "kanban_contain", {"ok": True, "terminal_for_run": 1}),
++        ("tool", "kanban_contain", {}),
++        ("tool", "kanban_contain", None),
++        ("tool", "kanban_contain", "malformed"),
++        ("tool", "kanban_contain", "[]"),
++        ("tool", "kanban_contain", [True]),
++    ],
++)
++def test_nonterminal_result_never_suppresses_nudge(role, name, result):
++    message = {"role": role, "name": name, "content": result}
++    if role == "assistant":
++        message["tool_calls"] = [{"function": {"name": name}}]
++    assert not session_called_kanban_terminal([message])
+diff --git a/tests/hermes_cli/test_kanban_containment_capability.py b/tests/hermes_cli/test_kanban_containment_capability.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6ca368b24a35a80bf8f8df13cb7b0bfa9ae244ed
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_containment_capability.py
+@@ -0,0 +1,124 @@
++"""Protocol advertisement must precede any canonical containment mutation."""
++
++from __future__ import annotations
++
++import copy
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_containment_remote as remote
++from hermes_cli import kanban_sync_client as client
++from hermes_cli.kanban_containment_lifecycle import ContainmentRefused
++
++CAPABILITY = {
++    "containment_protocol": 1,
++    "receipt_envelopes": [1],
++    "task_marker": "containment_episode",
++    "resume_predicates": ["authority", "producer"],
++}
++
++
++@pytest.mark.parametrize(
++    "field,value",
++    [
++        ("containment_protocol", None),
++        ("containment_protocol", True),
++        ("containment_protocol", 2),
++        ("receipt_envelopes", None),
++        ("receipt_envelopes", [True]),
++        ("receipt_envelopes", [2]),
++        ("task_marker", None),
++        ("task_marker", "other"),
++        ("resume_predicates", None),
++        ("resume_predicates", ["authority"]),
++    ],
++)
++def test_incompatible_advertisement_refuses(field, value):
++    data = {**copy.deepcopy(CAPABILITY), field: value}
++    hub = SimpleNamespace(containment_capability=lambda board: data)
++    with pytest.raises(ContainmentRefused, match="incompatible"):
++        remote.require_capability(hub, "fixture")
++
++
++@pytest.mark.parametrize("data", [None, [], "unsupported"])
++def test_nonmapping_advertisement_refuses(data):
++    with pytest.raises(ContainmentRefused):
++        remote.require_capability(
++            SimpleNamespace(containment_capability=lambda board: data), "fixture"
++        )
++
++
++def test_exact_capability_and_real_client_route(monkeypatch):
++    hub = client.Hub(client.Identity("http://127.0.0.1:1", "fixture-key", "fixture"))
++    calls = []
++
++    def called(*args):
++        calls.append(args)
++        return copy.deepcopy(CAPABILITY)
++
++    monkeypatch.setattr(hub, "_call", called)
++    try:
++        remote.require_capability(hub, "fixture/encoded")
++    finally:
++        hub.close()
++    assert calls == [("GET", "/v2/boards/fixture%2Fencoded/containment/capability")]
++
++
++@pytest.mark.parametrize("failure", ["incompatible", "http", "os"])
++def test_enrolled_capability_failure_closes_without_fallback(monkeypatch, failure):
++    from hermes_cli import kanban_db_sync as sync
++
++    closed = []
++
++    def capability(board):
++        assert board == "fixture"
++        if failure == "http":
++            raise client.HubError(404, "old Board")
++        if failure == "os":
++            raise OSError("offline fixture")
++        return {**CAPABILITY, "containment_protocol": 0}
++
++    hub = SimpleNamespace(
++        ident=SimpleNamespace(gateway="fixture"),
++        containment_capability=capability,
++        close=lambda: closed.append(True),
++    )
++    monkeypatch.setattr(
++        sync,
++        "sync_state",
++        lambda conn: {
++            "mode": "primary",
++            "board_id": "fixture",
++            "gateway_id": "fixture",
++        },
++    )
++    monkeypatch.setattr(client, "load_identity", lambda: None)
++    monkeypatch.setattr(client, "Hub", lambda identity: hub)
++    with pytest.raises((ContainmentRefused, client.HubError, OSError)):
++        remote.enrolled(None)
++    assert closed == [True]
++
++
++def test_enrolled_exact_capability_keeps_connection(monkeypatch):
++    from hermes_cli import kanban_db_sync as sync
++
++    closed = []
++    hub = SimpleNamespace(
++        ident=SimpleNamespace(gateway="fixture"),
++        containment_capability=lambda board: copy.deepcopy(CAPABILITY),
++        close=lambda: closed.append(True),
++    )
++    monkeypatch.setattr(
++        sync,
++        "sync_state",
++        lambda conn: {
++            "mode": "primary",
++            "board_id": "fixture",
++            "gateway_id": "fixture",
++        },
++    )
++    monkeypatch.setattr(client, "load_identity", lambda: None)
++    monkeypatch.setattr(client, "Hub", lambda identity: hub)
++    assert remote.enrolled(None) == (hub, "fixture")
++    assert closed == []
+diff --git a/tests/hermes_cli/test_kanban_source_receipt_sites.py b/tests/hermes_cli/test_kanban_source_receipt_sites.py
+index 900add7432cd4a4f60450614bc3774d8c29ee5c9..7bf4f6f858db1ca1bcad49765890c7ecfa3c8345 100644
+--- a/tests/hermes_cli/test_kanban_source_receipt_sites.py
++++ b/tests/hermes_cli/test_kanban_source_receipt_sites.py
+@@ -296,6 +296,11 @@ WRAPPED = {
+     "hermes_cli/kanban_awaiting.py::escalate",  # Q2: reuses the enclosing ending's staged receipt
+ }
+ INVOLUNTARY = {  # no receipt: custody becomes ``retained`` (fail closed)
++    # Containment is a retained-source stop, not completion/publication. The
++    # local-only path never syncs a portable source claim; replica restoration
++    # projects canonical containment and must not manufacture a publish receipt.
++    "hermes_cli/kanban_containment_lifecycle.py::contain_local",
++    "hermes_cli/kanban_containment_replica.py::restore_page",
+     "hermes_cli/kanban_failure_accounting.py::_record_task_failure",
+     "hermes_cli/kanban_manual_reclaim.py::_reclaim",
+     "hermes_cli/kanban_db.py::release_stale_claims",
+@@ -311,6 +316,8 @@ INVOLUNTARY = {  # no receipt: custody becomes ``retained`` (fail closed)
+ }
+ # Sites the scan cannot prove off-``running`` from SQL text alone, each checked by hand.
+ NOT_FROM_RUNNING = {
++    "hermes_cli/kanban_containment_lifecycle.py::resume_local": "requires unclaimed triage under the writer transaction",
++    "hermes_cli/kanban_containment_replica.py::_restore_released": "only restores unclaimed non-human triage projections",
+     "hermes_cli/kanban_assignment_routing.py::route": "runs inside block_task after apply_block_update left running",
+     "hermes_cli/kanban_db.py::recompute_ready": "re-promotes todo/blocked/scheduled cards only",
+     "hermes_cli/kanban_terminal_guard.py::enforce_after_apply": "puts a held card back to done/archived; skips running",
+diff --git a/tools/kanban_containment_tools.py b/tools/kanban_containment_tools.py
+index ece7b775d0f2d1a7affa83c6ef73cf55ba26f026..21b2d30611e3d3ad335455f136f94ad4e5a5e8da 100644
+--- a/tools/kanban_containment_tools.py
++++ b/tools/kanban_containment_tools.py
+@@ -16,15 +16,16 @@ def _schema(name, description, properties, required):
+ 
+ 
+ CONTAIN_SCHEMA = _schema("kanban_contain",
+-    "End an admitted agent run in protected NON-HUMAN triage without completing work, satisfying dependencies, "
+-    "dispatching review or asking a human. Can also contain an unclaimed descendant. Resume requires the exact "
++    "Contain an admitted run without satisfying dependencies. Protected NON-HUMAN triage preserves all open edges "
++    "without dispatching review or asking a human. Can also contain an unclaimed descendant. Resume requires the exact "
+     "episode and a live scoped authority or genuinely new producer completion; generic unblock cannot release it. "
+     "Synced boards refuse until canonical containment capability is installed. After terminal_for_run=true, stop.",
+     {"task_id": {"type": "string"}, "authority": {"type": "string"},
+      "producer": {"type": "string"}, "summary": {"type": "string", "minLength": 1, "maxLength": 2000}},
+     ["authority", "summary"])
+ RESUME_SCHEMA = _schema("kanban_resume_contained",
+-    "Explicit episode-bound resume by an admitted live authority run or genuinely new completed producer run. "
++    "Resume an exact contained episode with authenticated evidence. Requires a live scoped authority "
++    "or genuinely new completed producer run. "
+     "Preserves independent spend/human holds and every dependency edge; does not complete the task.",
+     {"task_id": {"type": "string"}, "episode": {"type": "string"},
+      "kind": {"type": "string", "enum": ["authority", "producer"]}}, ["task_id", "episode"])
+diff --git a/toolsets.py b/toolsets.py
+index a4ae938d5e258802b6f6f844ee8688b8f57dea98..8232b3962e36197324ea831c2902e7f790fb176b 100644
+--- a/toolsets.py
++++ b/toolsets.py
+@@ -27,6 +27,7 @@ _HERMES_CORE_TOOLS = [
+     "cronjob_manage",
+     "kanban_show", "kanban_list",
+     "kanban_complete", "kanban_block", "kanban_request_review",
++    "kanban_contain", "kanban_resume_contained",
+     "kanban_request_changes",
+     "kanban_heartbeat",
+     "kanban_comment", "kanban_create", "kanban_link", "kanban_unlink",
+diff --git a/website/docs/user-guide/features/kanban-containment.md b/website/docs/user-guide/features/kanban-containment.md
+index 0b3979da8007c215298c26b49f232100360805b1..faf468efa72e10ea602792955591f3ab3bc8f3a9 100644
+--- a/website/docs/user-guide/features/kanban-containment.md
++++ b/website/docs/user-guide/features/kanban-containment.md
+@@ -51,8 +51,12 @@ receipt and run closure. Persisted Board membership prevents an enrolled board
+ from falling back to local authority when configuration changes or networking
+ fails.
+ 
+-An enrolled board requires the authenticated Board containment context protocol
+-(version 1) and matching canonical containment operations. Preparation reads only
++An enrolled board first requires authenticated GET-only
++`/v2/boards/<board>/containment/capability`: protocol `1`, receipt envelopes `[1]`,
++task marker `containment_episode`, and resume predicates `["authority", "producer"]`.
++Missing, unreadable or incompatible advertisements refuse before mutation, never
++falling back locally. It also requires containment context protocol version 1 and
++matching canonical containment operations. Preparation reads only
+ lifecycle coordinates and a producer baseline. The Board rechecks authorization;
+ replica fields, a claimed origin or an ordinary sync-applying flag never grant
+ release authority. Upgrade and verify both components before live application.
+-- 
+2.43.0
+

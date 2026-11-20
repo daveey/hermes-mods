@@ -1,0 +1,452 @@
+From b5cee6e30125957891e9493bfac9b944fd8ff4ff Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 14:47:53 +0000
+Subject: [PATCH] fix(kanban): carry admission-bound session models in run
+ evidence [daveey]
+
+A class-routed author run could terminate without worker_result, leaving only
+selector evidence on the Board. Ship then could not establish independence.
+Local state.db fallback repaired single-host runs but could not prove runs
+spread across workers. The root gap was terminal evidence publication depending
+on one best-effort process-exit event; tests covered only local recovery.
+
+Stamp every terminal run event with concrete models read from the admitting
+host's managed state.db. Require every admission, local origin, managed path
+and in-run session start. Omit unknown evidence rather than guess. Add an
+idempotent attest-run-models CLI for history, including evicted foreign copies;
+append testimony without waking or altering closed tasks.
+
+Proof: initial baseline had 15 expected regression failures. Forward and
+historical regressions now pass including real continue/review/dependency,
+CLI registration, dead-pid finalizer, and cross-Board replay. 34 model tests,
+58 finalizer/reconciliation tests, 31 pickup/sync consumers pass. Full
+scripts/check --base origin/main passes. Companion state gate verifies all
+admission origins before using portable models; independent review and CI
+remain mandatory. Task t_873214a6f9f5556f.
+---
+ hermes_cli/kanban.py                       |   4 +-
+ hermes_cli/kanban_db_events.py             |   8 +-
+ hermes_cli/kanban_parser.py                |   2 +
+ hermes_cli/kanban_run_models.py            |  90 ++++++++++
+ hermes_cli/kanban_run_models_cli.py        |  51 ++++++
+ tests/hermes_cli/test_kanban_run_models.py | 192 +++++++++++++++++++++
+ 6 files changed, 345 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/kanban_run_models.py
+ create mode 100644 hermes_cli/kanban_run_models_cli.py
+ create mode 100644 tests/hermes_cli/test_kanban_run_models.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 4d807a5c04dda6384d7ad38b42be51a8d2856ffd..6bea68f806661aa98b67a47cba50fb36ea5784e0 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -57,6 +57,7 @@ from hermes_cli.kanban_ops import (
+ from hermes_cli.kanban_parser import build_parser, cmd_resume as _cmd_resume, cmd_quota_release as _cmd_quota_release
+ from hermes_cli.kanban_claim_cli import cmd_claim as _cmd_claim  # moved; re-exported for callers
+ from hermes_cli.kanban_source_cli import cmd_source_release as _cmd_source_release
++from hermes_cli.kanban_run_models_cli import command as _cmd_attest_run_models
+ from hermes_cli.kanban_sync_cli import cmd_sync as _cmd_sync
+ from hermes_cli.kanban_admission_explain import cmd_queue as _cmd_queue
+ from hermes_cli.kanban_lanes import cli_creator as _lane_creator
+@@ -267,7 +268,7 @@ def _profile_author() -> str:
+ 
+ 
+ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
+-    "init", "create", "swarm", "assign", "reclaim", "move", "reassign", "link", "unlink",
++    "init", "attest-run-models", "create", "swarm", "assign", "reclaim", "move", "reassign", "link", "unlink",
+     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
+     "schedule", "unblock", "contain", "resume-contained", "promote", "archive", "dispatch", "daemon", "repair", "recover",
+     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
+@@ -1847,6 +1848,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
+ 
+ 
+ _HANDLERS = {
++    "attest-run-models": _cmd_attest_run_models,
+     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
+     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show, "wait-check": _cmd_wait_check,
+     "wait-comment": _cmd_wait_comment,
+diff --git a/hermes_cli/kanban_db_events.py b/hermes_cli/kanban_db_events.py
+index 8acf496ec3e625fda375623510a8a4ba06fb3d76..5e5f054c1be407de53db51ef69b5921e56f3b1aa 100644
+--- a/hermes_cli/kanban_db_events.py
++++ b/hermes_cli/kanban_db_events.py
+@@ -11,7 +11,13 @@ def append_event(conn: sqlite3.Connection, task_id: str, kind: str, payload: dic
+     from hermes_cli.kanban_recovery_history import stamp
+     from hermes_cli import kanban_wake_episode as episode
+ 
+-    payload, evidence = episode.snapshot_event(conn, task_id, kind, payload)
++    from hermes_cli.kanban_run_models import stamp as stamp_models
++
++    payload = stamp_models(conn, task_id, kind, payload, run_id)
++    # Historical testimony is not a new lifecycle/wake observation.
++    evidence = None
++    if kind != 'run_models_attested':
++        payload, evidence = episode.snapshot_event(conn, task_id, kind, payload)
+     if evidence is not None:  # precedes the primary event, which stays the latest
+         cur = conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)", (
+             task_id, run_id, episode.EVIDENCE_EVENT, json.dumps(evidence), int(time.time())))
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 686d0776112c00a6cf7cfd30774894263d668656..c27e5e9bd696db1f89b751d84dff88dd805c9318 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -859,6 +859,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
+                                     "HERMES_KANBAN_BOARD env var). Use `hermes kanban boards "
+                                     "list` to see all boards.")
+     actions = kanban_parser.add_subparsers(dest="kanban_action")
++    _add_commands(actions, [_cmd('attest-run-models', (
++        _arg('task_ids', nargs='+'), _json_flag()), help='Attest locally admitted run models from managed state.db')])
+     _add_commands(actions, _SPECS)
+     from hermes_cli.kanban_containment_cli import add_parsers
+     add_parsers(actions)
+diff --git a/hermes_cli/kanban_run_models.py b/hermes_cli/kanban_run_models.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b55f51bd8be07075471787d1b46405a37f34cd05
+--- /dev/null
++++ b/hermes_cli/kanban_run_models.py
+@@ -0,0 +1,90 @@
++"""Host-local, admission-bound model evidence carried by portable run events."""
++from __future__ import annotations
++
++import json
++import math
++import sqlite3
++from contextlib import closing
++from pathlib import Path
++
++from hermes_constants import get_hermes_home
++from hermes_cli.sqlite_safe_read import connect_tracked
++
++TERMINAL_KINDS = frozenset({'completed', 'blocked', 'continued', 'review_requested', 'scheduled',
++                            'dependency_wait', 'worker_result', 'crashed', 'timed_out', 'reclaimed',
++                            'stale', 'reconciled', 'protocol_violation', 'rate_limited', 'owner_restart_lost',
++                            'owner_unavailable', 'host_reboot', 'oom_killed', 'signaled'})
++
++
++def _finite(value):
++    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
++
++
++def _concrete(value):
++    return isinstance(value, str) and bool(value.strip()) and not value.strip().casefold().startswith('class:')
++
++
++def local_gateway(conn):
++    row = conn.execute('SELECT gateway_id FROM kanban_sync_state LIMIT 1').fetchone()
++    return row[0] if row and isinstance(row[0], str) and row[0] else None
++
++
++def evidence(conn, task_id, run_id):
++    """Prove every admission against this host's managed store, opened read-only.
++
++    Imported integer run ids are intentionally not compared with request ids.
++    Local event origins are NULL until capture; replayed origins must match us.
++    Unknown or unreadable evidence grants nothing and never blocks a lifecycle.
++    """
++    if run_id is None:
++        return None
++    try:
++        gateway = local_gateway(conn)
++        if not gateway:
++            return None
++        run = conn.execute('SELECT uid, started_at, ended_at FROM task_runs WHERE task_id=? AND id=?',
++                           (task_id, run_id)).fetchone()
++        if not run or not run[0] or not _finite(run[1]):
++            return None
++        admissions = conn.execute("SELECT payload, created_at, origin_gateway FROM task_events "
++                                  "WHERE task_id=? AND run_id=? AND kind='owner_admitted'",
++                                  (task_id, run_id)).fetchall()
++        if not admissions:
++            return None
++        expected = (get_hermes_home() / 'state.db').resolve()
++        sessions, models = set(), set()
++        with closing(connect_tracked(expected.as_uri() + '?mode=ro', uri=True, timeout=2)) as db:
++            for raw, admitted, origin in admissions:
++                payload = json.loads(raw or '{}')
++                if not isinstance(payload, dict) or (origin is not None and origin != gateway):
++                    return None
++                path, session = payload.get('db'), payload.get('session_id')
++                if (not isinstance(path, str) or not Path(path).is_absolute()
++                        or Path(path).resolve() != expected or not isinstance(session, str) or not session
++                        or not _finite(admitted) or admitted < run[1]):
++                    return None
++                row = db.execute('SELECT model, started_at FROM sessions WHERE id=?', (session,)).fetchone()
++                if (not row or not _finite(row[1]) or not run[1] <= row[1] < admitted + 1
++                        or (run[2] is not None and (not _finite(run[2]) or row[1] >= run[2] + 1))):
++                    return None
++                usage = db.execute('SELECT model FROM session_model_usage WHERE session_id=?', (session,))
++                names = {m.strip() for m in [row[0], *(r[0] for r in usage)] if _concrete(m)}
++                if not names:
++                    return None
++                models.update(names)
++                sessions.add(session)
++        return {'run_uid': run[0], 'session_ids': sorted(sessions), 'session_models': sorted(models),
++                'source': 'managed_state_db'}
++    except (sqlite3.Error, OSError, ValueError, TypeError):
++        return None
++
++
++def stamp(conn, task_id, kind, payload, run_id):
++    if kind not in TERMINAL_KINDS:
++        return payload
++    result = dict(payload or {})
++    result.pop('session_models', None)  # Never accept caller-supplied model testimony.
++    receipt = evidence(conn, task_id, run_id)
++    if receipt:
++        result['session_models'] = receipt['session_models']
++    return result
+diff --git a/hermes_cli/kanban_run_models_cli.py b/hermes_cli/kanban_run_models_cli.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..561a46215f5f3022eadda525b0def1b20aa1c6e3
+--- /dev/null
++++ b/hermes_cli/kanban_run_models_cli.py
+@@ -0,0 +1,51 @@
++"""Historical local-store attestation, including evicted foreign task copies."""
++from __future__ import annotations
++
++import json
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli.kanban_run_models import evidence, local_gateway
++
++
++def attest(conn, task_id):
++    """Hydrate history without authoring it; capture only our new attestation."""
++    if not conn.execute('SELECT 1 FROM tasks WHERE id=?', (task_id,)).fetchone():
++        from hermes_cli.kanban_worker_node import import_cards, open_replica
++        replica = open_replica(conn)
++        if replica is not None:
++            try:
++                import_cards(conn, replica, [task_id])
++            finally:
++                replica.close()
++    results = []
++    with kb.write_txn(conn):
++        gateway = local_gateway(conn)
++        runs = conn.execute('SELECT id, uid FROM task_runs WHERE task_id=?', (task_id,)).fetchall()
++        for run_id, uid in runs:
++            receipt = evidence(conn, task_id, run_id)
++            status = 'unknown_or_foreign'
++            if receipt:
++                prior = conn.execute("SELECT payload, origin_gateway FROM task_events "
++                                     "WHERE task_id=? AND run_id=? AND kind='run_models_attested'",
++                                     (task_id, run_id)).fetchall()
++                exists = any(origin in (None, gateway) and json.loads(raw or '{}') == receipt
++                             for raw, origin in prior)
++                status = 'unchanged' if exists else 'conflicting_attestation' if prior else 'attested'
++                if not prior:
++                    kb._append_event(conn, task_id, 'run_models_attested', receipt, run_id=run_id)
++            results.append({'task_id': task_id, 'run_uid': uid, 'status': status,
++                            **(receipt or {})})
++    return results or [{'task_id': task_id, 'status': 'missing_history'}]
++
++
++def command(args):
++    with kbc.connect() as conn:
++        rows = [row for task_id in args.task_ids for row in attest(conn, task_id)]
++    if args.json:
++        print(json.dumps(rows, sort_keys=True))
++    else:
++        for row in rows:
++            print(f"{row['task_id']} {row.get('run_uid', '-')} {row['status']} "
++                  + ', '.join(row.get('session_models', [])))
++    return 0
+diff --git a/tests/hermes_cli/test_kanban_run_models.py b/tests/hermes_cli/test_kanban_run_models.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..be49cbcae4adc1efb01f937a7b693083eaa264ba
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_run_models.py
+@@ -0,0 +1,192 @@
++"""Portable model evidence is authored by the admitting host, not the reader."""
++import json
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.test_kanban_completion_refs_sync import replay
++
++
++@pytest.fixture
++def admitted(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    with kbc.connect(home / 'worker.db') as conn, kbc.connect(home / 'peer.db') as peer:
++        tid = kb.create_task(conn, title='model evidence', assignee='dev')
++        run = kb.claim_task(conn, tid).current_run_id
++        now = int(time.time())
++        with sqlite3.connect(home / 'state.db') as db:
++            db.execute('CREATE TABLE sessions (id TEXT, model TEXT, started_at REAL)')
++            db.execute('CREATE TABLE session_model_usage (session_id TEXT, model TEXT)')
++            db.execute('INSERT INTO sessions VALUES (?, ?, ?)', ('session', 'class:deep', now))
++            db.executemany('INSERT INTO session_model_usage VALUES (?, ?)',
++                           [('session', 'model-b'), ('session', 'model-a'), ('session', '')])
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, 'owner_admitted',
++                             {'session_id': 'session', 'db': str(home / 'state.db')}, run_id=run)
++        yield conn, peer, tid, run, home
++
++
++@pytest.mark.parametrize('kind', ['completed', 'blocked', 'continued', 'review_requested', 'scheduled',
++                                  'dependency_wait', 'worker_result', 'crashed', 'timed_out', 'reclaimed',
++                                  'stale', 'reconciled', 'protocol_violation', 'rate_limited',
++                                  'owner_restart_lost', 'owner_unavailable', 'host_reboot',
++                                  'oom_killed', 'signaled'])
++def test_terminal_evidence_survives_board_replay(admitted, kind):
++    conn, peer, tid, run, _ = admitted
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, kind, {'reason': 'fixture'}, run_id=run)
++    replay(conn, peer)
++    row = peer.execute('SELECT payload FROM task_events WHERE task_id=? AND kind=?', (tid, kind)).fetchone()
++    assert json.loads(row[0])['session_models'] == ['model-a', 'model-b']
++
++
++@pytest.mark.parametrize('bad', ['foreign', 'path', 'time', 'missing', 'extra_admission'])
++def test_unknown_or_foreign_evidence_is_omitted(admitted, bad):
++    conn, _, tid, run, home = admitted
++    with kb.write_txn(conn):
++        if bad == 'foreign':
++            conn.execute("UPDATE task_events SET origin_gateway='elsewhere' WHERE kind='owner_admitted'")
++        elif bad == 'path':
++            conn.execute("UPDATE task_events SET payload=? WHERE kind='owner_admitted'",
++                         (json.dumps({'session_id': 'session', 'db': str(home / 'copy.db')}),))
++        elif bad == 'extra_admission':
++            kb._append_event(conn, tid, 'owner_admitted',
++                             {'session_id': 'absent', 'db': str(home / 'state.db')}, run_id=run)
++        else:
++            with sqlite3.connect(home / 'state.db') as db:
++                db.execute('UPDATE sessions SET started_at=0' if bad == 'time' else 'DELETE FROM sessions')
++        kb._append_event(conn, tid, 'continued', {'session_models': ['untrusted']}, run_id=run)
++    row = conn.execute("SELECT payload FROM task_events WHERE kind='continued'").fetchone()
++    assert 'session_models' not in json.loads(row[0])
++
++
++@pytest.mark.parametrize('action,kind', [('continue', 'continued'), ('review', 'review_requested'),
++                                        ('dependency', 'dependency_wait')])
++def test_real_lifecycle_transition_carries_models(admitted, action, kind):
++    from hermes_cli.kanban_continuation import continue_task
++    conn, peer, tid, run, _ = admitted
++    if action == 'continue':
++        assert continue_task(conn, tid, checkpoint='continue implementation', expected_run_id=run)
++    elif action == 'review':
++        assert kb.request_review(conn, tid, summary='verified implementation', expected_run_id=run)
++    else:
++        parent = kb.create_task(conn, title='prerequisite implementation', assignee='dev')
++        kb.link_tasks(conn, parent, tid, expected_child_run_id=run)
++        assert kb.block_task(conn, tid, kind='dependency', reason='prerequisite', expected_run_id=run)
++    replay(conn, peer)
++    row = peer.execute('SELECT payload FROM task_events WHERE task_id=? AND kind=?', (tid, kind)).fetchone()
++    assert json.loads(row[0])['session_models'] == ['model-a', 'model-b']
++
++
++@pytest.mark.parametrize('status', ['done', 'blocked', 'archived'])
++def test_historical_attestation_does_not_reset_wake_episode(admitted, status):
++    from hermes_cli.kanban_run_models_cli import attest
++    from hermes_cli import kanban_db_sync as sync
++    conn, _, tid, _, _ = admitted
++    with kb.write_txn(conn):
++        conn.execute('UPDATE tasks SET status=? WHERE id=?', (status, tid))
++        conn.execute('INSERT INTO task_wake_episodes(task_id, cmd, first_at, checks) VALUES (?, ?, ?, ?)',
++                     (tid, 'true', 123, 2))
++    before = list(conn.execute('SELECT * FROM task_wake_episodes'))
++    count = conn.execute('SELECT count(*) FROM task_events').fetchone()[0]
++    outbox = len(sync.outbox(conn))
++    assert attest(conn, tid)[0]['status'] == 'attested'
++    assert list(conn.execute('SELECT * FROM task_wake_episodes')) == before
++    assert conn.execute('SELECT count(*) FROM task_events').fetchone()[0] == count + 1
++    assert len(sync.outbox(conn)) == outbox + 1
++
++
++def test_attestation_is_local_readonly_and_idempotent(admitted):
++    from hermes_cli.kanban_run_models_cli import attest
++    conn, peer, tid, run, home = admitted
++    before = (home / 'state.db').read_bytes()
++    first = attest(conn, tid)
++    second = attest(conn, tid)
++    assert first[0]['status'] == 'attested'
++    assert second[0]['status'] == 'unchanged'
++    assert first[0]['session_models'] == ['model-a', 'model-b']
++    assert first[0]['run_uid'] == conn.execute('SELECT uid FROM task_runs WHERE id=?', (run,)).fetchone()[0]
++    assert (home / 'state.db').read_bytes() == before
++    replay(conn, peer, origin='different-host')
++    assert attest(peer, tid)[0]['status'] == 'unknown_or_foreign'
++    assert conn.execute("SELECT count(*) FROM task_events WHERE kind='run_models_attested'").fetchone()[0] == 1
++
++
++def test_evicted_copy_is_hydrated_without_republishing_history(admitted, monkeypatch):
++    from hermes_cli import kanban_worker_node as node
++    from hermes_cli.kanban_run_models_cli import attest
++    from hermes_cli import kanban_db_sync as sync
++    conn, replica, tid, _, _ = admitted
++    gateway = conn.execute('SELECT gateway_id FROM kanban_sync_state').fetchone()[0]
++    replay(conn, replica, origin=gateway)
++    # Keep the durable replica open while exercising the real import path.
++    class Replica:
++        def __getattr__(self, name):
++            return getattr(replica, name)
++        def close(self):
++            pass
++    monkeypatch.setattr(node, 'open_replica', lambda _: Replica())
++    with kb.write_txn(conn):
++        conn.execute('UPDATE kanban_sync_state SET applying=1')
++        conn.execute('UPDATE tasks SET current_run_id=NULL WHERE id=?', (tid,))
++        conn.execute('DELETE FROM task_events WHERE task_id=?', (tid,))
++        conn.execute('DELETE FROM task_runs WHERE task_id=?', (tid,))
++        conn.execute('DELETE FROM tasks WHERE id=?', (tid,))
++        conn.execute('UPDATE kanban_sync_state SET applying=0')
++    before = len(sync.outbox(conn))
++    rows = attest(conn, tid)
++    assert rows[0]['status'] == 'attested'
++    assert len(sync.outbox(conn)) == before + 1
++    assert attest(conn, tid)[0]['status'] == 'unchanged'
++
++
++def test_cli_parser_and_command_attest_admitted_models(admitted, monkeypatch, capsys):
++    import argparse
++    from contextlib import contextmanager
++    from hermes_cli import kanban
++    from hermes_cli.kanban_parser import build_parser
++    from hermes_cli.kanban_run_models_cli import command
++    conn, peer, tid, run, _ = admitted
++    parser = argparse.ArgumentParser()
++    build_parser(parser.add_subparsers())
++    args = parser.parse_args(['kanban', 'attest-run-models', tid, '--json'])
++    assert args.kanban_action == 'attest-run-models' and args.task_ids == [tid] and args.json
++    assert kanban._HANDLERS['attest-run-models'] is command
++    @contextmanager
++    def opened(*_a, **_k):
++        yield conn
++    monkeypatch.setattr('hermes_cli.kanban_run_models_cli.kbc.connect', opened)
++    assert command(args) == 0
++    rows = json.loads(capsys.readouterr().out)
++    assert rows[0]['status'] == 'attested' and rows[0]['session_models'] == ['model-a', 'model-b']
++    assert rows[0]['run_uid'] == conn.execute('SELECT uid FROM task_runs WHERE id=?', (run,)).fetchone()[0]
++    replay(conn, peer)
++    row = peer.execute("SELECT payload FROM task_events WHERE kind='run_models_attested'").fetchone()
++    assert json.loads(row[0])['session_models'] == ['model-a', 'model-b']
++
++
++def test_dead_run_finalizer_stamps_models_through_replay(admitted):
++    import subprocess, sys
++    from hermes_cli.kanban_db_dispatch_dead_worker import _DeadWorker
++    from hermes_cli.kanban_run_finalizer import close_dead_run
++    conn, peer, tid, run, _ = admitted
++    proc = subprocess.Popen([sys.executable, '-c', 'pass'])
++    proc.wait()
++    with kb.write_txn(conn):
++        conn.execute('UPDATE tasks SET worker_pid=? WHERE id=?', (proc.pid, tid))
++    row = conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()
++    dead = _DeadWorker('unknown', None, f'pid {proc.pid} not alive', 'crashed',
++                       {'pid': proc.pid, 'claimer': row['claim_lock']})
++    with kb.write_txn(conn):
++        assert close_dead_run(conn, row, dead) is not None
++    replay(conn, peer)
++    payload = json.loads(peer.execute('SELECT payload FROM task_events WHERE task_id=? AND kind=?',
++                                      (tid, 'crashed')).fetchone()[0])
++    assert payload['session_models'] == ['model-a', 'model-b']
++    assert payload['pid'] == proc.pid
++    assert conn.execute('SELECT ended_at FROM task_runs WHERE id=?', (run,)).fetchone()[0] is not None
+-- 
+2.43.0
+

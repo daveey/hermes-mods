@@ -1,0 +1,161 @@
+From 06ff7f95492d9f44c1def0529be484853b6b00d0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 15:46:20 +0000
+Subject: [PATCH] fix(kanban): include recursive descendant models in run
+ evidence [daveey]
+
+---
+ hermes_cli/kanban_run_models.py            | 31 +++++++++---
+ tests/hermes_cli/test_kanban_run_models.py | 58 ++++++++++++++++++++--
+ 2 files changed, 78 insertions(+), 11 deletions(-)
+
+diff --git a/hermes_cli/kanban_run_models.py b/hermes_cli/kanban_run_models.py
+index e8452e5a58d7c4e57a4f9f7f862dac067dd0ae4c..2dc9b169e1bf6f0068ddc197e583e53a22f11008 100644
+--- a/hermes_cli/kanban_run_models.py
++++ b/hermes_cli/kanban_run_models.py
+@@ -35,6 +35,13 @@ def evidence(conn, task_id, run_id):
+     Imported integer run ids are intentionally not compared with request ids.
+     Local event origins are NULL until capture; replayed origins must match us.
+     Unknown or unreadable evidence grants nothing and never blocks a lifecycle.
++    Each admitted root includes all transitive parent_session_id descendants,
++    without applying the root's admission-time window to later child sessions.
++    A session with no concrete model in either sessions or usage invalidates the
++    whole receipt; selectors/blanks may be resolved by concrete usage as usual.
++    Missing admitted/reached session rows fail closed. Orphan usage whose session
++    row is missing has no recoverable parent linkage: it cannot be assigned to a
++    run (nor can children behind a deleted intermediate row). No lineage is invented.
+     """
+     if run_id is None:
+         return None
+@@ -55,6 +62,7 @@ def evidence(conn, task_id, run_id):
+         sessions, models = set(), set()
+         uri = expected.as_uri() + '?mode=ro'
+         with closing(connect_tracked(uri, uri=True, timeout=2, wait_for_tracking=False)) as db:
++            db.execute('BEGIN')  # One coherent read-only lineage/model snapshot.
+             for raw, admitted, origin in admissions:
+                 payload = json.loads(raw or '{}')
+                 if not isinstance(payload, dict) or (origin is not None and origin != gateway):
+@@ -68,12 +76,23 @@ def evidence(conn, task_id, run_id):
+                 if (not row or not _finite(row[1]) or not run[1] <= row[1] < admitted + 1
+                         or (run[2] is not None and (not _finite(run[2]) or row[1] >= run[2] + 1))):
+                     return None
+-                usage = db.execute('SELECT model FROM session_model_usage WHERE session_id=?', (session,))
+-                names = {m.strip() for m in [row[0], *(r[0] for r in usage)] if _concrete(m)}
+-                if not names:
+-                    return None
+-                models.update(names)
+-                sessions.add(session)
++                pending, visited = [session], set()
++                while pending:
++                    current = pending.pop()
++                    if current in visited:
++                        return None  # A parent cycle cannot establish a trustworthy tree.
++                    visited.add(current)
++                    current_row = db.execute('SELECT model FROM sessions WHERE id=?', (current,)).fetchone()
++                    if not current_row:
++                        return None
++                    usage = db.execute('SELECT model FROM session_model_usage WHERE session_id=?', (current,))
++                    names = {m.strip() for m in [current_row[0], *(r[0] for r in usage)] if _concrete(m)}
++                    if not names:
++                        return None
++                    models.update(names)
++                    sessions.add(current)
++                    pending.extend(r[0] for r in db.execute(
++                        'SELECT id FROM sessions WHERE parent_session_id=?', (current,)))
+         return {'run_uid': run[0], 'session_ids': sorted(sessions), 'session_models': sorted(models),
+                 'source': 'managed_state_db'}
+     except (sqlite3.Error, OSError, ValueError, TypeError):
+diff --git a/tests/hermes_cli/test_kanban_run_models.py b/tests/hermes_cli/test_kanban_run_models.py
+index d32c53f968c357f349f858a4f6a2493c189fceef..5b44682af115ee0d85ce0235409cce7f454cc782 100644
+--- a/tests/hermes_cli/test_kanban_run_models.py
++++ b/tests/hermes_cli/test_kanban_run_models.py
+@@ -20,9 +20,9 @@ def admitted(tmp_path, monkeypatch):
+         run = kb.claim_task(conn, tid).current_run_id
+         now = int(time.time())
+         with sqlite3.connect(home / 'state.db') as db:
+-            db.execute('CREATE TABLE sessions (id TEXT, model TEXT, started_at REAL)')
++            db.execute('CREATE TABLE sessions (id TEXT, model TEXT, started_at REAL, parent_session_id TEXT)')
+             db.execute('CREATE TABLE session_model_usage (session_id TEXT, model TEXT)')
+-            db.execute('INSERT INTO sessions VALUES (?, ?, ?)', ('session', 'class:deep', now))
++            db.execute('INSERT INTO sessions VALUES (?, ?, ?, NULL)', ('session', 'class:deep', now))
+             db.executemany('INSERT INTO session_model_usage VALUES (?, ?)',
+                            [('session', 'model-b'), ('session', 'model-a'), ('session', '')])
+         with kb.write_txn(conn):
+@@ -31,6 +31,51 @@ def admitted(tmp_path, monkeypatch):
+         yield conn, peer, tid, run, home
+ 
+ 
++def test_descendant_models_include_recursive_sessions_and_usage(admitted):
++    from hermes_cli import kanban_run_models as models
++    from hermes_cli.kanban_run_models_cli import attest
++    conn, _, tid, run, home = admitted
++    with sqlite3.connect(home / 'state.db') as db:
++        db.executemany('INSERT INTO sessions VALUES (?, ?, ?, ?)', [
++            ('child', 'child-model', 9999999999, 'session'),
++            ('grandchild', 'grandchild-model', 9999999999, 'child'),
++            ('unrelated', 'unrelated-model', 0, None),
++        ])
++        db.executemany('INSERT INTO session_model_usage VALUES (?, ?)', [
++            ('child', 'child-usage'), ('grandchild', 'grandchild-usage')])
++    before = (home / 'state.db').read_bytes()
++    receipt = models.evidence(conn, tid, run)
++    assert receipt['session_ids'] == ['child', 'grandchild', 'session']
++    expected = ['child-model', 'child-usage', 'grandchild-model', 'grandchild-usage', 'model-a', 'model-b']
++    assert receipt['session_models'] == expected
++    assert attest(conn, tid)[0]['session_models'] == expected
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, 'continued', {}, run_id=run)
++    payload = json.loads(conn.execute("SELECT payload FROM task_events WHERE kind='continued'").fetchone()[0])
++    assert payload['session_models'] == expected
++    assert (home / 'state.db').read_bytes() == before
++
++
++@pytest.mark.parametrize('defect', ['unknown_child', 'cycle', 'missing_admitted_root'])
++def test_descendant_uncertainty_omits_all_evidence(admitted, defect):
++    from hermes_cli import kanban_run_models as models
++    from hermes_cli.kanban_run_models_cli import attest
++    conn, _, tid, run, home = admitted
++    with sqlite3.connect(home / 'state.db') as db:
++        db.execute('INSERT INTO sessions VALUES (?, ?, ?, ?)',
++                   ('child', 'class:unknown' if defect == 'unknown_child' else 'child-model', 0, 'session'))
++        if defect == 'cycle':
++            db.execute("UPDATE sessions SET parent_session_id='child' WHERE id='session'")
++        elif defect == 'missing_admitted_root':
++            db.execute("DELETE FROM sessions WHERE id='session'")
++    assert models.evidence(conn, tid, run) is None
++    assert attest(conn, tid)[0]['status'] == 'unknown_or_foreign'
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, 'continued', {'session_models': ['untrusted']}, run_id=run)
++    payload = json.loads(conn.execute("SELECT payload FROM task_events WHERE kind='continued'").fetchone()[0])
++    assert 'session_models' not in payload
++
++
+ @pytest.mark.parametrize('kind', ['completed', 'blocked', 'continued', 'review_requested', 'scheduled',
+                                   'dependency_wait', 'worker_result', 'crashed', 'timed_out', 'reclaimed',
+                                   'stale', 'reconciled', 'protocol_violation', 'rate_limited',
+@@ -211,7 +256,10 @@ def test_evidence_never_waits_on_tracking_reservation(admitted):
+     def read():  # sqlite connections are thread-bound: reopen the board in the reader thread.
+         with kbc.connect(home / 'worker.db') as own:
+             assert models.local_gateway(own)
+-            result.append(models.evidence(own, tid, run))
++            with kb.write_txn(own):
++                kb._append_event(own, tid, 'continued', {'session_models': ['untrusted']}, run_id=run)
++            row = own.execute("SELECT payload FROM task_events WHERE kind='continued'").fetchone()
++            result.append(json.loads(row[0]))
+ 
+     worker = threading.Thread(target=read, daemon=True)
+     worker.start()
+@@ -220,8 +268,8 @@ def test_evidence_never_waits_on_tracking_reservation(admitted):
+     finished.set()  # Release before asserting so a RED run does not leak a blocked thread.
+     worker.join(5)
+     holder.join(5)
+-    assert not blocked, 'evidence() waited for the SQLite tracking reservation'
+-    assert result == [None]
++    assert not blocked, '_append_event() waited for the SQLite tracking reservation'
++    assert len(result) == 1 and 'session_models' not in result[0]
+     with kbc.connect(home / 'worker.db') as own:  # Released reservation: evidence is available again.
+         assert models.evidence(own, tid, run)['session_models'] == ['model-a', 'model-b']
+ 
+-- 
+2.43.0
+

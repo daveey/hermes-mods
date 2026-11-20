@@ -1,0 +1,165 @@
+From cd3d21ef91b9b2ea1ecba2ef2affe2561b7afecf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 16:05:48 +0000
+Subject: [PATCH] Extract case-clause tracking from _command_span into
+ _CaseClauses
+
+The pattern-position tracking pushed _command_span to cyclomatic
+complexity 26 (health target 20). Move it into a small _CaseClauses
+helper (word / clause_end / pattern_paren). No behaviour change: a
+200k-input differential against the previous _command_span gives
+identical spans and line breaks; lifecycle-guard suites 29 files /
+2230 passed; scripts/check --only health ok.
+---
+ cron/lifecycle_guard_lines.py | 107 +++++++++++++++++++++-------------
+ 1 file changed, 68 insertions(+), 39 deletions(-)
+
+diff --git a/cron/lifecycle_guard_lines.py b/cron/lifecycle_guard_lines.py
+index b8c8094db1f62cae6b1f55171df39241c5579934..cf5fa8b29ea8dea8f4884f0ff9fef07292e6b4f1 100644
+--- a/cron/lifecycle_guard_lines.py
++++ b/cron/lifecycle_guard_lines.py
+@@ -51,6 +51,63 @@ def _double_span(text: str, start: int, *, shlex_quotes: bool) -> tuple[int, str
+     return pos, "".join(parts)
+ 
+ 
++class _CaseClauses:
++    """Open ``case`` statements of one ``$(...)`` frame, as ``[depth, phase]``.
++
++    In a pattern list a bare ``)`` ends the pattern, not the substitution
++    (``$(case x in x) true;; esac)``), and no word but a leading ``esac`` is reserved there
++    (``(case)`` is a pattern, not a nested ``case``). Phases: "subject" and "in" before the
++    clauses, "pattern" at a clause start, "pattern-word" inside a pattern list (after ``(``,
++    ``|`` or a word), "body" in a clause's command list.
++    """
++
++    def __init__(self) -> None:
++        self._open: list[list] = []
++
++    def _top(self, depth: int) -> list:
++        return self._open[-1] if self._open and self._open[-1][0] == depth else [depth, ""]
++
++    def word(self, word: str | None, depth: int, *, at_command: bool) -> bool:
++        """Advance on a word at *depth*; return whether the next word is in command position."""
++        top = self._top(depth)
++        phase = top[1]
++        if phase == "subject":
++            top[1] = "in"
++        elif phase == "in":
++            if word == "in":
++                top[1] = "pattern"
++        elif phase == "pattern" and word == "esac":
++            self._open.pop()
++        elif phase in ("pattern", "pattern-word"):
++            top[1] = "pattern-word"
++        elif word == "case" and at_command:
++            self._open.append([depth, "subject"])
++        elif word == "esac" and phase == "body" and at_command:
++            self._open.pop()
++        return phase in ("", "body") and word in _COMMAND_PREFIX_WORDS
++
++    def clause_end(self, text: str, pos: int, depth: int) -> int:
++        """Length of a ``;;``, ``;&`` or ``;;&`` ending a clause at *pos*, else 0.
++
++        After it a pattern list (or ``esac``) follows."""
++        top = self._top(depth)
++        if text[pos] != ";" or top[1] != "body" or text[pos + 1:pos + 2] not in (";", "&"):
++            return 0
++        top[1] = "pattern"
++        return 3 if text.startswith(";;&", pos) else 2
++
++    def pattern_paren(self, char: str, depth: int) -> bool:
++        """Consume a pattern list's optional leading ``(`` or its closing ``)``."""
++        top = self._top(depth)
++        if char == "(" and top[1] == "pattern":
++            top[1] = "pattern-word"
++        elif char == ")" and top[1] in ("pattern", "pattern-word"):
++            top[1] = "body"
++        else:
++            return False
++        return True
++
++
+ def _command_span(text: str, start: int, *, shlex_quotes: bool,
+                   breaks: list[int] | None = None) -> tuple[int, str]:
+     """Find a substitution's closing parenthesis in its own shell comment frame.
+@@ -61,12 +118,7 @@ def _command_span(text: str, start: int, *, shlex_quotes: bool,
+     depth = 1
+     word_start = True
+     parts = ["$("]
+-    # Open `case` statements as [depth, phase]. In a pattern list a bare `)` ends the pattern,
+-    # not the substitution (`$(case x in x) true;; esac)`), and no word but a leading `esac`
+-    # is reserved there (`(case)` is a pattern, not a nested `case`). Phases: "subject" and
+-    # "in" before the clauses, "pattern" at a clause start, "pattern-word" inside a pattern
+-    # list (after `(`, `|` or a word), "body" in a clause's command list.
+-    cases: list[list] = []
++    cases = _CaseClauses()
+     at_command = True
+     while pos < len(text):
+         char = text[pos]
+@@ -81,23 +133,7 @@ def _command_span(text: str, start: int, *, shlex_quotes: bool,
+             pos = copied = end
+             continue
+         if word_start and char not in _WORD_BREAKS:
+-            word = _plain_word(text, pos)
+-            top = cases[-1] if cases and cases[-1][0] == depth else [depth, ""]
+-            phase = top[1]
+-            if phase == "subject":
+-                top[1] = "in"
+-            elif phase == "in":
+-                if word == "in":
+-                    top[1] = "pattern"
+-            elif phase == "pattern" and word == "esac":
+-                cases.pop()
+-            elif phase in ("pattern", "pattern-word"):
+-                top[1] = "pattern-word"
+-            elif word == "case" and at_command:
+-                cases.append([depth, "subject"])
+-            elif word == "esac" and phase == "body" and at_command:
+-                cases.pop()
+-            at_command = phase in ("", "body") and word in _COMMAND_PREFIX_WORDS
++            at_command = cases.word(_plain_word(text, pos), depth, at_command=at_command)
+         if char == "\\":
+             if text[pos + 1:pos + 2] != "\n":
+                 word_start = False
+@@ -122,29 +158,22 @@ def _command_span(text: str, start: int, *, shlex_quotes: bool,
+             pos = copied = end
+             word_start = False
+             continue
+-        top = cases[-1] if cases and cases[-1][0] == depth else [depth, ""]
+-        phase = top[1]
+-        if char == ";" and phase == "body" and text[pos + 1:pos + 2] in (";", "&"):
+-            # `;;`, `;&` or `;;&` ends a clause: a pattern list (or `esac`) follows.
+-            pos += 3 if text.startswith(";;&", pos) else 2
+-            top[1] = "pattern"
++        skip = cases.clause_end(text, pos, depth)
++        if skip:
++            pos += skip
+             at_command = word_start = True
+             continue
+         if char == "\n" and breaks is not None:
+             breaks.append(_out_len(parts) + pos - copied)
+-        elif char == "(" and phase == "pattern":
+-            top[1] = "pattern-word"  # a pattern list's optional leading parenthesis
++        elif char in "()" and cases.pattern_paren(char, depth):
++            at_command = True  # after a pattern's `)` its command list follows
+         elif char == "(":
+             depth += 1
+         elif char == ")":
+-            if phase in ("pattern", "pattern-word"):
+-                top[1] = "body"
+-                at_command = True  # a case pattern ends; its command list follows
+-            else:
+-                depth -= 1
+-                if not depth:
+-                    pos += 1
+-                    break
++            depth -= 1
++            if not depth:
++                pos += 1
++                break
+         if char in _COMMAND_BREAKS:
+             at_command = True
+         word_start = char in _WORD_BREAKS
+-- 
+2.43.0
+

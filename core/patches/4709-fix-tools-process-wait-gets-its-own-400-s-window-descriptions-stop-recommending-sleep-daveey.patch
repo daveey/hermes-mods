@@ -1,0 +1,507 @@
+From ca8e9eb361914d4868f27308fda74d18ccc7ee2d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 17:02:46 -0800
+Subject: [PATCH] fix(tools): process wait gets its own 400 s window,
+ descriptions stop recommending sleep [daveey]
+
+Measured on the hub over 7 days: 52 h of agent time in 2,838 terminal calls
+shaped like `sleep 540; tail run.log`; half waited on a background process the
+same session had started. The tools steered agents there:
+- process_manage(action="wait") was clamped to TERMINAL_TIMEOUT (180 s default,
+  60 s in the hub's .env), shorter than a foreground sleep.
+- The terminal description said "To wait a fixed time, run the wait in the
+  foreground".
+
+Changes:
+- tools/process_wait_limit.py: the wait's own limit, TERMINAL_MAX_WAIT, default
+  the larger of 400 s and TERMINAL_TIMEOUT, kept 20 s under the executor's
+  per-call deadline (420 s) so the wait ends by itself before the executor
+  abandons the call. ProcessRegistry.wait and foreign_wait both use it; an
+  omitted timeout waits the full window (the call still returns the moment the
+  process exits).
+- Terminal and process_manage descriptions point at the wait instead of a
+  foreground sleep; prompt-surface snapshot re-rendered (+50 tool tokens).
+- TERMINAL_MAX_WAIT documented in .env.example and the env-var reference.
+
+test_process_wait_clarity: the clamp test now sets TERMINAL_MAX_WAIT, since
+TERMINAL_TIMEOUT no longer clamps the wait, and also asserts the clamp note.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .env.example                                  |   3 +
+ tests/fixtures/prompt_surface/surfaces.json   |  18 +-
+ .../prompt_surface/tools/terminal.json        |   2 +-
+ tests/tools/test_process_wait_clarity.py      |   3 +-
+ tests/tools/test_process_wait_limit.py        | 177 ++++++++++++++++++
+ tools/process_registry.py                     |  14 +-
+ tools/process_registry_foreign.py             |   6 +-
+ tools/process_wait_limit.py                   |  58 ++++++
+ tools/terminal_tool.py                        |   2 +-
+ .../docs/reference/environment-variables.md   |   1 +
+ 10 files changed, 261 insertions(+), 23 deletions(-)
+ create mode 100644 tests/tools/test_process_wait_limit.py
+ create mode 100644 tools/process_wait_limit.py
+
+diff --git a/.env.example b/.env.example
+index c111f8df60209dd81ee5115384d542dada506cd0..4e5b5092dafd1998acec1e7528a0d9b8bb89eed8 100644
+--- a/.env.example
++++ b/.env.example
+@@ -246,6 +246,9 @@ TERMINAL_MODAL_IMAGE=nikolaik/python-nodejs:python3.11-nodejs20
+ 
+ # Default command timeout in seconds
+ TERMINAL_TIMEOUT=60
++# Longest one process_manage(action="wait") call may block (default 400; kept under the
++# 420 s per-tool-call deadline). The wait returns as soon as the process exits.
++# TERMINAL_MAX_WAIT=400
+ 
+ # Cleanup inactive environments after this many seconds
+ TERMINAL_LIFETIME_SECONDS=300
+diff --git a/tests/fixtures/prompt_surface/surfaces.json b/tests/fixtures/prompt_surface/surfaces.json
+index f9a3964657253ecf06df1adf908b2adf4e2840cc..cdb0ea7003698785d363b9f999126300b3d3f576 100644
+--- a/tests/fixtures/prompt_surface/surfaces.json
++++ b/tests/fixtures/prompt_surface/surfaces.json
+@@ -5,7 +5,7 @@
+       "stable": 1829,
+       "volatile": 1297
+     },
+-    "tool_tokens": 10062,
++    "tool_tokens": 10112,
+     "tools": [
+       "browser_cdp",
+       "browser_dialog",
+@@ -37,7 +37,7 @@
+       "stable": 1225,
+       "volatile": 1297
+     },
+-    "tool_tokens": 10062,
++    "tool_tokens": 10112,
+     "tools": [
+       "browser_cdp",
+       "browser_dialog",
+@@ -69,7 +69,7 @@
+       "stable": 1646,
+       "volatile": 1296
+     },
+-    "tool_tokens": 10062,
++    "tool_tokens": 10112,
+     "tools": [
+       "browser_cdp",
+       "browser_dialog",
+@@ -101,7 +101,7 @@
+       "stable": 2420,
+       "volatile": 1293
+     },
+-    "tool_tokens": 10218,
++    "tool_tokens": 10268,
+     "tools": [
+       "browser_cdp",
+       "browser_dialog",
+@@ -133,7 +133,7 @@
+       "stable": 1225,
+       "volatile": 1297
+     },
+-    "tool_tokens": 10062,
++    "tool_tokens": 10112,
+     "tools": [
+       "browser_cdp",
+       "browser_dialog",
+@@ -165,7 +165,7 @@
+       "stable": 1211,
+       "volatile": 1297
+     },
+-    "tool_tokens": 10062,
++    "tool_tokens": 10112,
+     "tools": [
+       "browser_cdp",
+       "browser_dialog",
+@@ -197,7 +197,7 @@
+       "stable": 1605,
+       "volatile": 1298
+     },
+-    "tool_tokens": 10718,
++    "tool_tokens": 10768,
+     "tools": [
+       "browser_cdp",
+       "browser_dialog",
+@@ -230,7 +230,7 @@
+       "stable": 1244,
+       "volatile": 1298
+     },
+-    "tool_tokens": 10062,
++    "tool_tokens": 10112,
+     "tools": [
+       "browser_cdp",
+       "browser_dialog",
+@@ -262,7 +262,7 @@
+       "stable": 1330,
+       "volatile": 1298
+     },
+-    "tool_tokens": 10062,
++    "tool_tokens": 10112,
+     "tools": [
+       "browser_cdp",
+       "browser_dialog",
+diff --git a/tests/fixtures/prompt_surface/tools/terminal.json b/tests/fixtures/prompt_surface/tools/terminal.json
+index e33c209defd6a5a8d7385ecfe746e1c480bdb25b..4798e3cb367489cbcc84e3e5e87a0945b07fa577 100644
+--- a/tests/fixtures/prompt_surface/tools/terminal.json
++++ b/tests/fixtures/prompt_surface/tools/terminal.json
+@@ -1,5 +1,5 @@
+ {
+-  "description": "Run shell commands on the OS/shell/backend named in your environment section. The working directory, files and exported variables persist between calls: activate a virtualenv or export once, not before every command.\n\nUse read_file, search_files, patch and write_file instead of cat/head/tail, grep/find/ls, sed/awk and echo/heredoc. Output is auto-truncated with the full text saved to a file; never pipe through head/tail to shorten it.\n\nForeground (default) returns as soon as the command finishes. To wait a fixed time, run the wait in the foreground; never background a sleep or polling loop. Health-check a background server in a separate call and manage jobs with process_manage. When a command changes directory, trust the result's \"cwd\" instead of prefixing later commands with cd.",
++  "description": "Run shell commands on the OS/shell/backend named in your environment section. The working directory, files and exported variables persist between calls: activate a virtualenv or export once, not before every command.\n\nUse read_file, search_files, patch and write_file instead of cat/head/tail, grep/find/ls, sed/awk and echo/heredoc. Output is auto-truncated with the full text saved to a file; never pipe through head/tail to shorten it.\n\nForeground (default) returns as soon as the command finishes. To wait for a background process, call process_manage(action=\"wait\"): it returns the moment the process exits, where a sleep followed by a log read costs a turn per check. A foreground sleep is only for a fixed delay with no process or card behind it; never background a sleep or polling loop. Health-check a background server in a separate call and manage jobs with process_manage. When a command changes directory, trust the result's \"cwd\" instead of prefixing later commands with cd.",
+   "name": "terminal",
+   "parameters": {
+     "properties": {
+diff --git a/tests/tools/test_process_wait_clarity.py b/tests/tools/test_process_wait_clarity.py
+index fed1d69f82eccab68f83221a93872e30dfd02ee0..b3dd9791df95c17702985c8d528eee9d93c31ddc 100644
+--- a/tests/tools/test_process_wait_clarity.py
++++ b/tests/tools/test_process_wait_clarity.py
+@@ -25,12 +25,13 @@ class TestWaitTimeoutClarity:
+             registry.kill_process(sid)
+ 
+     def test_clamped_wait_keeps_clamp_note_and_running_semantics(self, registry, monkeypatch):
+-        monkeypatch.setenv("TERMINAL_TIMEOUT", "1")
++        monkeypatch.setenv("TERMINAL_MAX_WAIT", "1")  # the wait's own limit; TERMINAL_TIMEOUT no longer clamps it
+         sid = _spawn_sleeper(registry)
+         try:
+             r = registry.wait(sid, timeout=600)
+             assert r["status"] == "timeout"
+             assert r["process_running"] is True
++            assert "clamped to configured limit of 1s" in r["timeout_note"]
+         finally:
+             registry.kill_process(sid)
+ 
+diff --git a/tests/tools/test_process_wait_limit.py b/tests/tools/test_process_wait_limit.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ed022d8057dde1ba87b57f45780ef433e4812f67
+--- /dev/null
++++ b/tests/tools/test_process_wait_limit.py
+@@ -0,0 +1,177 @@
++"""process_manage wait has its own limit (TERMINAL_MAX_WAIT), kept under the executor deadline."""
++
++import sys
++import time
++import types
++
++import pytest
++
++from tools import process_wait_limit as pwl
++from tools.process_registry import ProcessRegistry
++
++
++@pytest.fixture
++def registry(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
++    monkeypatch.delenv("TERMINAL_MAX_WAIT", raising=False)
++    return ProcessRegistry()
++
++
++@pytest.fixture
++def no_executor(monkeypatch):
++    monkeypatch.delitem(sys.modules, "agent.tool_executor", raising=False)
++
++
++def _fake_executor(monkeypatch, deadline):
++    mod = types.ModuleType("agent.tool_executor")
++    if callable(deadline):
++        mod._resolve_sequential_tool_timeout = deadline
++    else:
++        mod._resolve_sequential_tool_timeout = lambda: deadline
++    monkeypatch.setitem(sys.modules, "agent.tool_executor", mod)
++
++
++class TestMaxWaitSeconds:
++    def test_default_is_400_and_ignores_terminal_timeout(self, monkeypatch, no_executor):
++        monkeypatch.delenv("TERMINAL_MAX_WAIT", raising=False)
++        monkeypatch.setenv("TERMINAL_TIMEOUT", "60")  # the hub's value; it used to clamp the wait
++        assert pwl.max_wait_seconds() == 400
++
++    def test_env_override(self, monkeypatch, no_executor):
++        monkeypatch.setenv("TERMINAL_MAX_WAIT", "90")
++        assert pwl.max_wait_seconds() == 90
++
++    @pytest.mark.parametrize("raw", ["", "abc", "0", "-5"])
++    def test_invalid_override_falls_back_to_default(self, monkeypatch, no_executor, raw):
++        monkeypatch.setenv("TERMINAL_MAX_WAIT", raw)
++        assert pwl.max_wait_seconds() == 400
++
++    def test_stays_under_the_executor_deadline(self, monkeypatch):
++        monkeypatch.setenv("TERMINAL_MAX_WAIT", "900")
++        _fake_executor(monkeypatch, 420.0)
++        assert pwl.max_wait_seconds() == 400  # 420 - 20 s margin
++
++    def test_lower_configured_executor_deadline_lowers_the_wait(self, monkeypatch):
++        monkeypatch.delenv("TERMINAL_MAX_WAIT", raising=False)
++        _fake_executor(monkeypatch, 120.0)
++        assert pwl.max_wait_seconds() == 100
++
++    def test_tiny_executor_deadline_never_reaches_zero(self, monkeypatch):
++        monkeypatch.delenv("TERMINAL_MAX_WAIT", raising=False)
++        _fake_executor(monkeypatch, 5.0)
++        assert pwl.max_wait_seconds() == 1
++
++    @pytest.mark.parametrize("deadline", [None, 0, -1])
++    def test_disabled_executor_deadline_leaves_the_limit(self, monkeypatch, deadline):
++        monkeypatch.setenv("TERMINAL_MAX_WAIT", "900")
++        _fake_executor(monkeypatch, deadline)
++        assert pwl.max_wait_seconds() == 900
++
++    def test_failing_executor_resolver_leaves_the_limit(self, monkeypatch):
++        monkeypatch.delenv("TERMINAL_MAX_WAIT", raising=False)
++
++        def boom():
++            raise RuntimeError("config unreadable")
++
++        _fake_executor(monkeypatch, boom)
++        assert pwl.max_wait_seconds() == 400
++
++    def test_raised_terminal_timeout_still_buys_a_longer_wait(self, monkeypatch, no_executor):
++        """An install that set TERMINAL_TIMEOUT high to get long waits keeps them."""
++        monkeypatch.delenv("TERMINAL_MAX_WAIT", raising=False)
++        monkeypatch.setenv("TERMINAL_TIMEOUT", "1200")
++        assert pwl.max_wait_seconds() == 1200
++        monkeypatch.setenv("TERMINAL_MAX_WAIT", "300")  # the explicit limit wins either way
++        assert pwl.max_wait_seconds() == 300
++
++    def test_real_executor_clamps_the_wait(self, monkeypatch):
++        """Through the real agent.tool_executor: its default deadline (420 s) holds a 900 s request
++        to 400 s. Fails if the resolver this module reads is renamed or the defaults drift apart."""
++        monkeypatch.setenv("TERMINAL_MAX_WAIT", "900")
++        monkeypatch.delenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", raising=False)
++        import agent.tool_executor as te
++
++        monkeypatch.setitem(sys.modules, "agent.tool_executor", te)
++        deadline = te._resolve_sequential_tool_timeout()
++        assert deadline == te._DEFAULT_CONCURRENT_TOOL_TIMEOUT_S == 420.0
++        assert pwl._executor_deadline_seconds() == deadline
++        assert pwl.max_wait_seconds() == 400
++        monkeypatch.delenv("TERMINAL_MAX_WAIT")
++        assert pwl.max_wait_seconds() == pwl.DEFAULT_MAX_WAIT_SECONDS == 400
++
++
++class TestRegistryWaitUsesTheLimit:
++    def test_wait_outlasts_terminal_timeout(self, registry, monkeypatch, no_executor):
++        """TERMINAL_TIMEOUT=1 used to cut every wait at 1 s; the process here exits after 2 s."""
++        monkeypatch.setenv("TERMINAL_TIMEOUT", "1")
++        session = registry.spawn_local("sleep 2", cwd="/tmp", task_id="t-waitlimit")
++        r = registry.wait(session.id)
++        assert r["status"] == "exited"
++        assert "timeout_note" not in r
++
++    def test_wait_returns_as_soon_as_the_process_exits(self, registry, no_executor):
++        session = registry.spawn_local("sleep 1", cwd="/tmp", task_id="t-waitlimit")
++        started = time.monotonic()
++        r = registry.wait(session.id)  # default window 400 s
++        assert r["status"] == "exited"
++        assert time.monotonic() - started < 30
++
++    def test_requested_timeout_above_the_limit_is_clamped(self, registry, monkeypatch, no_executor):
++        monkeypatch.setenv("TERMINAL_MAX_WAIT", "1")
++        session = registry.spawn_local("sleep 30", cwd="/tmp", task_id="t-waitlimit")
++        try:
++            started = time.monotonic()
++            r = registry.wait(session.id, timeout=600)
++            assert r["status"] == "timeout"
++            assert time.monotonic() - started < 10
++            assert "clamped to configured limit of 1s" in r["timeout_note"]
++        finally:
++            registry.kill_process(session.id)
++
++    def test_default_window_is_the_limit(self, registry, monkeypatch, no_executor):
++        monkeypatch.setenv("TERMINAL_MAX_WAIT", "1")
++        session = registry.spawn_local("sleep 30", cwd="/tmp", task_id="t-waitlimit")
++        try:
++            r = registry.wait(session.id)
++            assert r["status"] == "timeout"
++            assert "Wait window of 1s elapsed" in r["timeout_note"]
++        finally:
++            registry.kill_process(session.id)
++
++
++class TestForeignWaitUsesTheLimit:
++    """process_manage wait on a process another gateway process supervises (foreign_wait)."""
++
++    def _wait(self, monkeypatch, timeout):
++        from tools import process_registry_foreign as pf
++
++        monkeypatch.setattr(pf, "_settled", lambda registry, sid: None)
++        monkeypatch.setattr(pf, "_running", lambda registry, entry: True)
++        monkeypatch.setattr(pf, "_log_text", lambda entry: "")
++        started = time.monotonic()
++        result = pf.foreign_wait(object(), {"session_id": "proc_foreign", "command": "sleep 999"}, timeout)
++        return result, time.monotonic() - started
++
++    def test_default_window_is_the_wait_limit_not_terminal_timeout(self, monkeypatch, no_executor):
++        monkeypatch.setenv("TERMINAL_MAX_WAIT", "1")
++        monkeypatch.setenv("TERMINAL_TIMEOUT", "600")  # the old clamp: this call would block 600 s
++        result, elapsed = self._wait(monkeypatch, None)
++        assert result["status"] == "timeout" and result["process_running"] is True
++        assert "Wait window of 1s elapsed" in result["timeout_note"]
++        assert elapsed < 10
++
++    def test_requested_timeout_is_clamped_to_the_limit(self, monkeypatch, no_executor):
++        monkeypatch.setenv("TERMINAL_MAX_WAIT", "1")
++        result, elapsed = self._wait(monkeypatch, 600)
++        assert "Wait window of 1s elapsed" in result["timeout_note"]
++        assert elapsed < 10
++
++
++class TestDescriptions:
++    def test_descriptions_no_longer_recommend_a_foreground_wait(self):
++        from tools import terminal_tool as tt
++        from tools.process_registry import PROCESS_SCHEMA
++
++        assert "run the wait in the foreground" not in tt.TERMINAL_TOOL_DESCRIPTION
++        assert 'process_manage(action="wait")' in tt.TERMINAL_TOOL_DESCRIPTION
++        assert "instead of a terminal sleep" in PROCESS_SCHEMA["description"]
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index 46f1760f8893def31ed632cfc319e841e970b2f5..0402018c71496a5c5a6d135ec463b9f2ecb367a2 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -2008,14 +2008,13 @@ class ProcessRegistry(ProcessObligationMixin, ProcessTerminationMixin, ProcessCh
+     def wait(self, session_id: str, timeout: int | None = None) -> dict:
+         """Block until the process exits, the timeout elapses, the user interrupts, or a
+         mid-turn user message (steer/redirect → ``request_yield``) releases the wait.
+-        ``timeout`` defaults to (and is clamped by) TERMINAL_TIMEOUT. Returns a dict
++        ``timeout`` defaults to (and is clamped by) ``process_wait_limit.max_wait_seconds``
++        (TERMINAL_MAX_WAIT, 400 s, under the executor's per-call deadline). Returns a dict
+         with status exited|timeout|interrupted|not_found|error and an output snapshot."""
+         from tools.interrupt import consume_yield as _consume_yield, is_interrupted as _is_interrupted
++        from tools.process_wait_limit import max_wait_seconds
+ 
+-        try:
+-            max_timeout = int(os.getenv("TERMINAL_TIMEOUT", "180"))
+-        except (ValueError, TypeError):
+-            max_timeout = 180
++        max_timeout = max_wait_seconds()
+         # The schema says minimum=1 but not every caller enforces it; timeout=0 is
+         # falsy and would silently fall through to the default wait.
+         if timeout is not None and timeout <= 0:
+@@ -2525,7 +2524,8 @@ PROCESS_SCHEMA = {
+         "Completed results remain retrievable by session_id when resuming their owning conversation "
+         "(up to 7 days, newest 64 results per profile; rolling output tail). "
+         "poll: status + new output. log: full output, paged. wait: block "
+-        "until exit or timeout (partial output on timeout). write vs "
++        "until exit or timeout (partial output on timeout); it returns the moment the process exits, "
++        "so use it instead of a terminal sleep followed by a log read. write vs "
+         "submit: submit appends Enter — use it to answer prompts; write "
+         "sends raw bytes, no newline. close: EOF stdin. kill: terminate. "
+         "handoff (subagents only): transfer a running process you started to your parent agent, which then "
+@@ -2549,7 +2549,7 @@ PROCESS_SCHEMA = {
+             },
+             "timeout": {
+                 "type": "integer",
+-                "description": "Max seconds for 'wait'.",
++                "description": "Max seconds for 'wait'. Default: the longest allowed window (400 unless configured). The call returns as soon as the process exits, so leave it unset unless you need a shorter check.",
+                 "minimum": 1
+             },
+             "offset": {
+diff --git a/tools/process_registry_foreign.py b/tools/process_registry_foreign.py
+index a564491bd55f4a5e75630712e05ca91ae732800c..6ad39a7f351d1f4524cba61a4fa600bbe545fa14 100644
+--- a/tools/process_registry_foreign.py
++++ b/tools/process_registry_foreign.py
+@@ -142,10 +142,8 @@ def foreign_log(registry, entry: dict[str, Any], offset: Optional[int], limit: i
+ 
+ def foreign_wait(registry, entry: dict[str, Any], timeout: Optional[int]) -> dict[str, Any]:
+     from tools.interrupt import consume_yield, is_interrupted
+-    try:
+-        max_timeout = int(os.getenv("TERMINAL_TIMEOUT", "180"))
+-    except (TypeError, ValueError):
+-        max_timeout = 180
++    from tools.process_wait_limit import max_wait_seconds
++    max_timeout = max_wait_seconds()  # same window as ProcessRegistry.wait
+     if timeout is not None and timeout <= 0:
+         return {"status": "error", "error": f"timeout must be positive (got {timeout})"}
+     effective = min(timeout or max_timeout, max_timeout)
+diff --git a/tools/process_wait_limit.py b/tools/process_wait_limit.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b1924a72d857947da8f747c4e8120ffb64f08ab2
+--- /dev/null
++++ b/tools/process_wait_limit.py
+@@ -0,0 +1,58 @@
++"""How long one ``process_manage(action="wait")`` call may block. [daveey]
++
++The wait used to be clamped to ``TERMINAL_TIMEOUT`` (180 s by default), which made it SHORTER than a
++foreground ``sleep``: agents waiting on their own background job ran ``sleep 540; tail log`` instead
++(measured on the hub over 7 days: 52 h in 2,838 sleep calls, half of them behind a tracked background
++process). The wait returns the moment the process exits, so a longer window only removes turns.
++
++The ceiling is the tool executor's per-call deadline (420 s by default): a call that outlives it is
++abandoned and reported as a tool timeout, so the wait must end by itself first.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++import sys
++
++logger = logging.getLogger(__name__)
++
++DEFAULT_MAX_WAIT_SECONDS = 400
++# Leave the executor room to collect the result before its own deadline fires.
++_EXECUTOR_MARGIN_SECONDS = 20
++
++
++def _executor_deadline_seconds() -> float | None:
++    """The executor's per-call deadline when this process runs one; ``None`` when it does not (a
++    direct registry caller) or the deadline is disabled. Read through ``sys.modules`` so a tool
++    module never imports the agent loop."""
++    executor = sys.modules.get("agent.tool_executor")
++    resolve = getattr(executor, "_resolve_sequential_tool_timeout", None)
++    if resolve is None:
++        return None
++    try:
++        deadline = resolve()
++    except Exception:  # a config read failure must not break a wait; the limit then stands alone
++        logger.debug("executor deadline unavailable for the wait limit", exc_info=True)
++        return None
++    return deadline if deadline and deadline > 0 else None
++
++
++def _positive_int(raw) -> int | None:
++    try:
++        value = int(raw)
++    except (ValueError, TypeError):
++        return None
++    return value if value > 0 else None
++
++
++def max_wait_seconds() -> int:
++    """``TERMINAL_MAX_WAIT``, else the larger of 400 s and ``TERMINAL_TIMEOUT`` (an install that
++    raised TERMINAL_TIMEOUT to get long waits keeps them), kept under the executor's per-call deadline."""
++    limit = _positive_int(os.getenv("TERMINAL_MAX_WAIT"))
++    if limit is None:
++        limit = max(DEFAULT_MAX_WAIT_SECONDS, _positive_int(os.getenv("TERMINAL_TIMEOUT")) or 0)
++    deadline = _executor_deadline_seconds()
++    if deadline is not None:
++        limit = min(limit, max(1, int(deadline) - _EXECUTOR_MARGIN_SECONDS))
++    return limit
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index 2c11ae56227d19c370db0febeec8776ef0d06dd7..e22bedff5c93ffd1b6b92993b311a44b4d0f4694 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -181,7 +181,7 @@ TERMINAL_TOOL_DESCRIPTION = """Run shell commands on the OS/shell/backend named
+ 
+ Use read_file, search_files, patch and write_file instead of cat/head/tail, grep/find/ls, sed/awk and echo/heredoc. Output is auto-truncated with the full text saved to a file; never pipe through head/tail to shorten it.
+ 
+-Foreground (default) returns as soon as the command finishes. To wait a fixed time, run the wait in the foreground; never background a sleep or polling loop. Health-check a background server in a separate call and manage jobs with process_manage. When a command changes directory, trust the result's "cwd" instead of prefixing later commands with cd."""
++Foreground (default) returns as soon as the command finishes. To wait for a background process, call process_manage(action="wait"): it returns the moment the process exits, where a sleep followed by a log read costs a turn per check. A foreground sleep is only for a fixed delay with no process or card behind it; never background a sleep or polling loop. Health-check a background server in a separate call and manage jobs with process_manage. When a command changes directory, trust the result's "cwd" instead of prefixing later commands with cd."""
+ 
+ # Environment lifecycle state.
+ _active_environments: dict[str, Any] = {}
+diff --git a/website/docs/reference/environment-variables.md b/website/docs/reference/environment-variables.md
+index 64afaefeda72c489daba2707f3f87d141d3a0b03..0c39c2deb74212d4dd2aeb3405c1a4ecf1545e9b 100644
+--- a/website/docs/reference/environment-variables.md
++++ b/website/docs/reference/environment-variables.md
+@@ -254,6 +254,7 @@ These variables configure the [Tool Gateway](../user-guide/features/tool-gateway
+ | `TERMINAL_DAYTONA_IMAGE` | Daytona sandbox image |
+ | `TERMINAL_VERCEL_RUNTIME` | Vercel Sandbox runtime (`node24`, `node22`, `python3.13`) |
+ | `TERMINAL_TIMEOUT` | Command timeout in seconds |
++| `TERMINAL_MAX_WAIT` | Longest one `process_manage` wait may block, in seconds (default: the larger of 400 and `TERMINAL_TIMEOUT`; always kept under the per-tool-call deadline) |
+ | `TERMINAL_LIFETIME_SECONDS` | Max lifetime for terminal sessions in seconds |
+ | `TERMINAL_CWD` | Deprecated direct override for gateway/cron terminal sessions. Prefer `terminal.cwd` in `config.yaml`; CLI still uses the launch directory. |
+ | `SUDO_PASSWORD` | Enable sudo without interactive prompt. Sent to the backend that runs the command; see [Sudo Support](../user-guide/features/tools.md#sudo-support) |
+-- 
+2.43.0
+

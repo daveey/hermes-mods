@@ -1,0 +1,108 @@
+From 90a60139a37d8bf7236198b4aff2559117b94f20 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 08:12:15 +0000
+Subject: [PATCH] [daveey] kanban chat waits: every chat wait has the 2 h
+ deadline; comment probes recognised however spelled
+
+Adversarial review of the previous head: the deadline only matched a stored
+probe starting with "hermes kanban wait-comment ", so `nice hermes ...`,
+`VAR=... hermes ...`, an absolute path, or any probe the worker named instead
+got no deadline; with a wake that did not start, the card slept to its own
+deadline.
+
+Every chat wait now has the deadline. is_comment_probe parses the command and
+finds `hermes kanban wait-comment` anywhere (after env, VAR=, nice, a path);
+such a probe just said "not yet" and is trusted. A chat wait that named
+another producer (CI, a probe) escalates only when no answer has arrived since
+the park: answered, it is waiting on that producer.
+
+Tests: 7 probe spellings; a CI-probe chat wait escalates when unanswered and
+not when answered. 70 tests.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_decision_ask.py            | 21 ++++++++++++---
+ tests/hermes_cli/test_kanban_decision_ask.py | 28 +++++++++++++++++---
+ 2 files changed, 41 insertions(+), 8 deletions(-)
+
+diff --git a/hermes_cli/kanban_decision_ask.py b/hermes_cli/kanban_decision_ask.py
+index 43f1a2c0cc983f0aae14f5339402755047d7f94c..8cf4e9d85d4a0c59768e97cce645640fb2c2b326 100644
+--- a/hermes_cli/kanban_decision_ask.py
++++ b/hermes_cli/kanban_decision_ask.py
+@@ -121,10 +121,23 @@ def escalate_if_overdue(conn, task_id: str, *, now: int | None = None) -> bool:
+     record, _reason, cmd, at = _latest_chat_park(conn, task_id)
+     if record is None or at is None:
+         return False
+-    if not str(cmd or "").startswith("hermes kanban wait-comment "):
+-        return False  # it waits on another producer it named (CI, a probe): the answer may be in; not a stuck ask
++    # Every chat wait has the deadline. The card's own comment probe (however spelled: nice, VAR=, a path) just said
++    # "not yet", so it is trusted; a probe naming another producer counts an answer since the park as "answered,
++    # now waiting on that producer" (adversarial review of #3647).
++    trust = is_comment_probe(cmd)
+     now = int(time.time()) if now is None else int(now)
+     if now - at < ASK_OVERDUE_S:
+         return False
+-    return escalate(conn, task_id, f"its wake check has seen no answer for {ASK_OVERDUE_S // 3600} h",
+-                    trust_probe=True)
++    return escalate(conn, task_id, f"it has had no answer for {ASK_OVERDUE_S // 3600} h", trust_probe=trust)
++
++
++def is_comment_probe(cmd) -> bool:
++    """``hermes kanban wait-comment ...`` anywhere in the command's words (after env, VAR=, nice, a full path)."""
++    import os
++    import shlex
++    try:
++        words = shlex.split(str(cmd or ""))
++    except ValueError:
++        return False
++    return any(os.path.basename(words[i]) == "hermes" and words[i + 1] == "kanban" and words[i + 2] == "wait-comment"
++               for i in range(len(words) - 2))
+diff --git a/tests/hermes_cli/test_kanban_decision_ask.py b/tests/hermes_cli/test_kanban_decision_ask.py
+index ec70306b2945fa1bf34e58b0da2ff73e332d00f9..5ddcab005b0bade1f553a6431445a76c01020dcb 100644
+--- a/tests/hermes_cli/test_kanban_decision_ask.py
++++ b/tests/hermes_cli/test_kanban_decision_ask.py
+@@ -635,8 +635,11 @@ def test_unanswered_chat_wait_goes_to_david_after_two_hours(kanban_home, monkeyp
+         assert kb.get_task(conn, tid).status == "blocked"
+ 
+ 
+-def test_a_chat_wait_on_its_own_named_probe_has_no_deadline(kanban_home, monkeypatch) -> None:
+-    """Review of #3647: a chat wait that brought a CI probe may already be answered and waiting on CI."""
++@pytest.mark.parametrize("answered", [False, True])
++def test_a_chat_wait_on_its_own_named_probe_has_the_deadline_until_answered(kanban_home, monkeypatch,
++                                                                             answered) -> None:
++    """Every chat wait has the deadline (adversarial review of #3647); one that named a CI probe and has its answer
++    is waiting on CI, not on the orchestrator (review of #3647)."""
+     from hermes_cli import kanban_decision_ask as kda
+     with kbc.connect_closing() as conn:
+         tid = _running(conn)
+@@ -645,8 +648,25 @@ def test_a_chat_wait_on_its_own_named_probe_has_no_deadline(kanban_home, monkeyp
+         out = _tool("schedule", {"reason": LIVE_REASON, "awaiting": LIVE_AWAITING,
+                                  "wake_check": "gh run view 40443505012 --json status | grep -q completed"})
+         assert out.get("status") == "scheduled", out
+-        assert not kda.escalate_if_overdue(conn, tid, now=int(time.time()) + kda.ASK_OVERDUE_S + 60)
+-        assert kb.get_task(conn, tid).status == "scheduled"
++        if answered:
++            _orchestrator_comment(monkeypatch, conn, tid, "Go with premise A; then wait for the CI run.")
++        result = kda.escalate_if_overdue(conn, tid, now=int(time.time()) + kda.ASK_OVERDUE_S + 60)
++        assert result is (not answered)
++        assert kb.get_task(conn, tid).status == ("scheduled" if answered else "blocked")
++
++
++@pytest.mark.parametrize("cmd,expected", [
++    ("hermes kanban wait-comment t_1 --after-id 3 --skip-system", True),
++    ("nice hermes kanban wait-comment t_1 --after-id 3", True),
++    ("HERMES_HOME=/root/.hermes hermes kanban wait-comment t_1", True),
++    ("/usr/local/bin/hermes kanban wait-comment t_1 --contains APPROVED", True),
++    ("hermes kanban wait-check task t_1", False),
++    ("gh run view 404 --json status | grep -q completed", False),
++    ("", False),
++])
++def test_comment_probe_is_recognised_however_spelled(cmd, expected) -> None:
++    from hermes_cli.kanban_decision_ask import is_comment_probe
++    assert is_comment_probe(cmd) is expected
+ 
+ 
+ def test_answered_since_uses_times_not_local_ids(kanban_home, monkeypatch) -> None:
+-- 
+2.43.0
+

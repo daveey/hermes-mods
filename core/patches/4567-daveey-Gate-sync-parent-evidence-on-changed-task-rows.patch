@@ -1,0 +1,1952 @@
+From bf0c2667d17fd1417d402df146d70aa1e6758cfb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 07:20:21 +0000
+Subject: [PATCH] [daveey] Gate sync parent evidence on changed task rows
+
+Reuse trusted local and shadow P2 cursors for the foreign-parent mirror.
+Update affected rows and children of changed parents, retaining fail-closed
+full reads and a 30-second mirror recovery floor. Keep all existing repair
+and heal passes, freshness stamps and attachment due-time selection.
+Batch attachment retry stamps and avoid unchanged metadata transactions;
+preserve first-transfer and failed-retry priority ordering.
+
+Proof: RED real-round idle/floor and changed task/run/event assertions, then
+GREEN focused integration, scope, attachment and repair suites. Code-health
+check passes. Prior checkpoint/endpoint experiments and benchmark harnesses
+are intentionally not in this narrowed change. CPU budget is NOT claimed:
+exact-head review/CI, updater deployment and same-PID P1 remain required.
+---
+ hermes_cli/kanban_db_sync.py                  |   8 +-
+ hermes_cli/kanban_move_parent_evidence.py     | 108 +++++--
+ hermes_cli/kanban_move_parent_scope.py        | 184 +++++++++++
+ hermes_cli/kanban_sync_attachments.py         |  20 +-
+ hermes_cli/kanban_sync_client.py              |  14 +-
+ hermes_cli/kanban_sync_parent_refresh.py      | 166 ++++++++++
+ .../test_kanban_move_parent_evidence.py       |   8 +-
+ .../test_kanban_move_parent_scope.py          | 235 ++++++++++++++
+ .../test_kanban_move_parent_scope_queued.py   | 243 +++++++++++++++
+ ...est_kanban_sync_attachment_transactions.py | 201 ++++++++++++
+ .../test_kanban_sync_local_integration.py     | 236 ++++++++++++++
+ .../test_kanban_sync_parent_refresh.py        | 290 ++++++++++++++++++
+ .../test_kanban_sync_repair_content.py        |  10 +-
+ 13 files changed, 1680 insertions(+), 43 deletions(-)
+ create mode 100644 hermes_cli/kanban_move_parent_scope.py
+ create mode 100644 hermes_cli/kanban_sync_parent_refresh.py
+ create mode 100644 tests/hermes_cli/test_kanban_move_parent_scope.py
+ create mode 100644 tests/hermes_cli/test_kanban_move_parent_scope_queued.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_attachment_transactions.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_local_integration.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_parent_refresh.py
+
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index b976a7339182935710c608d56225a0ffead81167..de7555c7020eb4bc35ac42bbc2823d5d15d30aec 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -361,10 +361,12 @@ def has_remote_parents(conn: sqlite3.Connection) -> bool:
+                         (REMOTE_PARENTS_TABLE,)).fetchone() is not None
+ 
+ 
+-def refresh_remote_parents(live: sqlite3.Connection, replica: sqlite3.Connection) -> list[str]:
++def refresh_remote_parents(live: sqlite3.Connection, replica: sqlite3.Connection, *,
++                           scoped=None) -> list[str]:
+     """Copy the replica's status of every foreign parent the live file's links name into the mirror; drop rows no
+     link needs and rows the replica no longer has. Returns the parents whose status changed (the caller wakes the
+-    dispatcher so a released child is promoted on the next tick, not the next sweep)."""
++    dispatcher so a released child is promoted on the next tick, not the next sweep). ``scoped``: the evidence scope
++    the caller already read (the P2 gate stamps exactly the scope the mirror was built from)."""
+     if not has_remote_parents(live):
+         return []
+     wanted = [r[0] for r in live.execute(
+@@ -381,7 +383,7 @@ def refresh_remote_parents(live: sqlite3.Connection, replica: sqlite3.Connection
+             chunk = wanted[i:i + 500]
+             found.update({r[0]: r[1] for r in replica.execute(
+                 f"SELECT id, status FROM tasks WHERE id IN ({','.join('?' * len(chunk))})", chunk)})
+-        values, evidence_changed = evidence.prepare(live, replica, wanted)
++        values, evidence_changed = evidence.prepare(live, replica, wanted, scoped=scoped)
+     finally:
+         replica.execute("RELEASE move_parent_snapshot")
+     current = {r[0]: r[1] for r in live.execute(f"SELECT parent_id, status FROM {REMOTE_PARENTS_TABLE}")}
+diff --git a/hermes_cli/kanban_move_parent_evidence.py b/hermes_cli/kanban_move_parent_evidence.py
+index 2a774f3f8b959e6a36677e8e02171885a2471de4..ca3351729426a369e8fc15b64aef6063780e0c98 100644
+--- a/hermes_cli/kanban_move_parent_evidence.py
++++ b/hermes_cli/kanban_move_parent_evidence.py
+@@ -36,6 +36,13 @@ def _parked_review_checkpoint(conn, task_id, run):
+ 
+ 
+ def _parked_scope(live):
++    """Incremental memo (``kanban_move_parent_scope``); the uncached query is ``_parked_scope_uncached``."""
++    from hermes_cli import kanban_move_parent_scope as scope
++
++    return scope.parked_scope(live)
++
++
++def _parked_scope_uncached(live):
+     """Foreign parents an orderly owner park named in its review checkpoint. [daveey]
+ 
+     A worker that parks on a review it created on its own gateway leaves that
+@@ -60,32 +67,87 @@ def _parked_scope(live):
+     return scoped
+ 
+ 
+-def prepare(live, replica, wanted):
++_QUEUED = (
++    "SELECT e.task_id, e.payload FROM tasks t JOIN task_events e ON e.id = "
++    "(SELECT MAX(m.id) FROM task_events m WHERE m.task_id = t.id AND m.kind = 'moved') "
++    "WHERE t.status NOT IN ('done', 'archived')"
++)
++
++
++def _queued_checkpoint(payload):
+     from hermes_cli import kanban_db as kb
+ 
+-    # Do not copy arbitrary foreign histories: only dependencies of cards whose
+-    # operator explicitly supplied a queued-move checkpoint, or that an owner's
+-    # authenticated review park names, need this evidence.
+-    scoped = _parked_scope(live)
+-    for event in live.execute(
+-        "SELECT e.task_id, e.payload FROM tasks t JOIN task_events e ON e.id = "
+-        "(SELECT MAX(m.id) FROM task_events m WHERE m.task_id = t.id AND m.kind = 'moved') "
+-        "WHERE t.status NOT IN ('done', 'archived')"
+-    ):
+-        payload = kb._json_dict(event["payload"])
+-        checkpoint = payload.get("checkpoint")
+-        if payload.get("queued") is True and isinstance(checkpoint, str) and checkpoint.strip():
++    payload = kb._json_dict(payload)
++    checkpoint = payload.get("checkpoint")
++    return payload.get("queued") is True and isinstance(checkpoint, str) and bool(checkpoint.strip())
++
++
++def _queued_scope_uncached(live):
++    from hermes_cli import kanban_db as kb
++
++    scoped = set()
++    for event in live.execute(_QUEUED):
++        if _queued_checkpoint(event["payload"]):
+             scoped.update(kb.parent_ids(live, event["task_id"]))
++    return scoped
++
++
++def _evidence_scope_uncached(live):
++    return _parked_scope_uncached(live) | _queued_scope_uncached(live)
++
++
++def _evidence_scope(live):
++    from hermes_cli import kanban_move_parent_scope as scope
++
++    return scope.evidence_scope(live)
++
++
++def payload(replica, parent):
++    """The mirrored result of ``parent`` (its latest replica run), or None when the replica has none. Bookkeeping
++    run columns (claims, heartbeats, sync version) are left out: no reader uses them and the P2 cursor never marks
++    them, so keeping them would make the mirror differ from the keyed refresh until the next floor."""
++    from hermes_cli.kanban_activity_revision import BOOKKEEPING_COLUMNS
++
++    row = replica.execute(
++        "SELECT r.*, t.status AS parent_status, EXISTS (SELECT 1 FROM task_events e "
++        "WHERE e.task_id = r.task_id AND e.run_id = r.id AND e.kind = 'claimed') AS was_claimed "
++        "FROM task_runs r JOIN tasks t ON t.id = r.task_id WHERE t.id = ? "
++        "ORDER BY r.id DESC LIMIT 1", (parent,),
++    ).fetchone()
++    if row is None:
++        return None
++    skip = BOOKKEEPING_COLUMNS["task_runs"]
++    return json.dumps({k: row[k] for k in row.keys() if k not in skip})
++
++
++def stored(live, parents):
++    """Current mirrored payloads of ``parents`` (absent when the table or the row is missing)."""
++    if not live.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (_TABLE,)).fetchone():
++        return {}
++    out = {}
++    parents = list(parents)
++    for i in range(0, len(parents), 500):
++        chunk = parents[i:i + 500]
++        out.update(live.execute(
++            f"SELECT parent_id, payload FROM {_TABLE} WHERE parent_id IN ({','.join('?' * len(chunk))})", chunk))
++    return out
++
++
++def apply_rows(live, rows):
++    """Row-keyed ``apply``: ``rows`` maps parent -> payload, None deletes. Caller owns the transaction."""
++    live.execute(f"CREATE TABLE IF NOT EXISTS {_TABLE} (parent_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
++    live.executemany(f"DELETE FROM {_TABLE} WHERE parent_id = ?", [(p,) for p in rows])
++    live.executemany(f"INSERT INTO {_TABLE} VALUES (?, ?)", [(p, v) for p, v in rows.items() if v is not None])
++
++
++def prepare(live, replica, wanted, scoped=None):
++    # Only explicit queued-move checkpoints and authenticated owner parks scope evidence.
++    scoped = _evidence_scope(live) if scoped is None else scoped
+     values = []
+     for parent in sorted(set(wanted) & scoped):
+-        row = replica.execute(
+-            "SELECT r.*, t.status AS parent_status, EXISTS (SELECT 1 FROM task_events e "
+-            "WHERE e.task_id = r.task_id AND e.run_id = r.id AND e.kind = 'claimed') AS was_claimed "
+-            "FROM task_runs r JOIN tasks t ON t.id = r.task_id WHERE t.id = ? "
+-            "ORDER BY r.id DESC LIMIT 1", (parent,),
+-        ).fetchone()
+-        if row is not None:
+-            values.append((parent, json.dumps(dict(row))))
++        value = payload(replica, parent)
++        if value is not None:
++            values.append((parent, value))
+     exists = live.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (_TABLE,)).fetchone()
+     current = dict(live.execute(f"SELECT parent_id, payload FROM {_TABLE}")) if exists else {}
+     updated = dict(values)
+@@ -109,9 +171,7 @@ def _checkpointed_move_after(conn, task_id, ended):
+     ).fetchone()
+     if move is None:
+         return False
+-    payload = kb._json_dict(move["payload"])
+-    checkpoint = payload.get("checkpoint")
+-    if payload.get("queued") is not True or not isinstance(checkpoint, str) or not checkpoint.strip():
++    if not _queued_checkpoint(move["payload"]):
+         return False
+     moved = kb._to_epoch(move["created_at"])
+     return moved is not None and moved >= ended
+diff --git a/hermes_cli/kanban_move_parent_scope.py b/hermes_cli/kanban_move_parent_scope.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fd790bb4435a5f617e8f7200fffe64278b45c43d
+--- /dev/null
++++ b/hermes_cli/kanban_move_parent_scope.py
+@@ -0,0 +1,184 @@
++"""Incremental parked and queued evidence scopes (card t_6afd82858e11ca8c). [daveey]
++
++The scope is the union, over active children of a missing (foreign) parent whose latest started run ended ``blocked``,
++of the parents named by that run's authenticated review checkpoint. Children can share parents, so the memo keeps each
++child's own contribution (``child -> frozenset(parents)``) plus a per-parent reference count; the union is rebuilt only
++when a count crosses zero, so a keyed round costs O(changed), not O(scope).
++
++``kanban_task_change.changed_since`` (P2) names the tasks written since the memoized cursor. The affected children are
++those tasks themselves plus every child linked from them (a parent that appears, vanishes or changes flips its
++children's foreign-parent membership; link writes mark both ends). Only those are recomputed.
++Queued contributions include all parents of active tasks with a checkpointed latest moved event;
++only changed tasks are refreshed, without the parked scope's child expansion.
++
++Fail-closed rules:
++- a connection already inside a transaction bypasses the memo (its uncommitted rows may roll back and must not poison it);
++- ``FULL``/no cursor/in-memory database recompute everything and re-arm from the fresh cursor (or drop the memo);
++- the memo stores (cursor, parked, queued) atomically from one snapshot, bounded to ``_MAX`` paths; file
++  identity, ``-shm`` and schema fences live in the P2 cursor.
++"""
++from __future__ import annotations
++
++import sqlite3
++import threading
++
++from hermes_cli import kanban_task_change as tc
++
++_MAX = 32
++_CHUNK = 400
++_LOCK = threading.Lock()
++_MEMO: dict[tuple, tuple] = {}  # (connection, main path) -> (Cursor, parked map, queued map)
++
++_MEMBER = ("SELECT DISTINCT t.id FROM tasks t JOIN task_links l ON l.child_id = t.id "
++           "LEFT JOIN tasks p ON p.id = l.parent_id "
++           "WHERE p.id IS NULL AND t.status NOT IN ('done', 'archived')")
++
++
++def _contribution(conn, task_id) -> frozenset:
++    from hermes_cli.kanban_move_parent_evidence import _parked_review_checkpoint
++    from hermes_cli.kanban_unused_grant import latest_started_run
++
++    run = latest_started_run(conn, task_id)
++    if run is None or run["outcome"] != "blocked":
++        return frozenset()
++    evidence = _parked_review_checkpoint(conn, task_id, run)
++    return frozenset(evidence["parents"]) if evidence else frozenset()
++
++
++def _full(conn) -> dict:
++    out = {}
++    for (task_id,) in conn.execute(_MEMBER).fetchall():
++        parents = _contribution(conn, task_id)
++        if parents:
++            out[task_id] = parents
++    return out
++
++
++def _chunks(ids):
++    ids = sorted(ids)
++    for i in range(0, len(ids), _CHUNK):
++        yield ids[i:i + _CHUNK]
++
++
++class _Scope:
++    """One scope's per-task contributions plus a reference count per parent, so a keyed round costs O(changed),
++    not O(scope): the union is rebuilt only when a parent's count crosses zero. Mutated in place only while the
++    memo entry is checked out (popped); an exception drops the entry, so the next call recomputes in full."""
++
++    __slots__ = ("by_task", "counts", "union")
++
++    def __init__(self, by_task: dict) -> None:
++        self.by_task = by_task
++        self.counts: dict = {}
++        for parents in by_task.values():
++            for p in parents:
++                self.counts[p] = self.counts.get(p, 0) + 1
++        self.union = frozenset(self.counts)
++
++    def set(self, updates: dict) -> bool:
++        """``updates`` maps task -> its new contribution (empty drops it). True when the union's membership moved."""
++        touched = set()
++        for task_id, parents in updates.items():
++            for p in self.by_task.pop(task_id, ()):
++                n = self.counts[p] - 1
++                if n:
++                    self.counts[p] = n
++                else:
++                    del self.counts[p]
++                    touched.add(p)
++            if parents:
++                self.by_task[task_id] = parents
++                for p in parents:
++                    n = self.counts.get(p, 0)
++                    if not n:
++                        touched.add(p)
++                    self.counts[p] = n + 1
++        if any((p in self.counts) != (p in self.union) for p in touched):
++            self.union = frozenset(self.counts)
++            return True
++        return False
++
++
++def _refresh(conn, changed) -> dict:
++    """New contributions of every task the change can affect (empty frozenset: no longer a member)."""
++    affected = set(changed)
++    for part in _chunks(changed):
++        marks = ",".join("?" * len(part))
++        affected.update(r[0] for r in conn.execute(
++            f"SELECT child_id FROM task_links WHERE parent_id IN ({marks})", part))
++    updates = dict.fromkeys(affected, frozenset())
++    for part in _chunks(affected):
++        marks = ",".join("?" * len(part))
++        for (task_id,) in conn.execute(f"{_MEMBER} AND t.id IN ({marks})", part).fetchall():
++            updates[task_id] = _contribution(conn, task_id)
++    return updates
++
++
++def _union(contributions: dict) -> frozenset:
++    out: set = set()
++    for parents in contributions.values():
++        out.update(parents)
++    return frozenset(out)
++
++
++def _queued(conn, changed=None) -> dict:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_move_parent_evidence import _QUEUED, _queued_checkpoint
++
++    out = {}
++    parts = [None] if changed is None else _chunks(changed)
++    for part in parts:
++        query = _QUEUED if part is None else f"{_QUEUED} AND t.id IN ({','.join('?' * len(part))})"
++        for event in conn.execute(query, () if part is None else part).fetchall():
++            if _queued_checkpoint(event["payload"]):
++                parents = frozenset(kb.parent_ids(conn, event["task_id"]))
++                if parents:
++                    out[event["task_id"]] = parents
++    return out
++
++
++def parked_scope(conn) -> frozenset:
++    return _scope(conn, include_queued=False)
++
++
++def evidence_scope(conn) -> frozenset:
++    return _scope(conn, include_queued=True)
++
++
++def _scope(conn, *, include_queued) -> frozenset:
++    path = tc._main_path(conn)
++    if path is None or conn.in_transaction:
++        return _union(_full(conn)) | (_union(_queued(conn)) if include_queued else frozenset())
++    key = (conn, path)  # do not reuse a pathname stamp collected through an older open handle
++    with _LOCK:
++        held = _MEMO.pop(key, None)  # checked out: mutated in place below, put back only on success
++    conn.execute("BEGIN")  # one snapshot for the cursor and every row read below
++    try:
++        try:
++            changed, cursor = tc.changed_since(conn, held[0] if held else None)
++        except sqlite3.Error:
++            changed, cursor = tc.FULL, None
++        if changed is tc.FULL or cursor is None or held is None:
++            parked, queued = _Scope(_full(conn)), _Scope(_queued(conn))
++            both = parked.union | queued.union
++        else:
++            _, parked, queued, both = held
++            moved = parked.set(_refresh(conn, changed)) if changed else False
++            if changed:
++                fresh = _queued(conn, changed)
++                moved = queued.set({k: fresh.get(k, frozenset()) for k in changed}) or moved
++            if moved:
++                both = parked.union | queued.union
++    finally:
++        conn.execute("COMMIT")
++    if cursor is not None:
++        with _LOCK:
++            while key not in _MEMO and len(_MEMO) >= _MAX:
++                _MEMO.pop(next(iter(_MEMO)))
++            _MEMO[key] = (cursor, parked, queued, both)
++    return both if include_queued else parked.union
++
++
++def _reset_for_tests() -> None:
++    with _LOCK:
++        _MEMO.clear()
+diff --git a/hermes_cli/kanban_sync_attachments.py b/hermes_cli/kanban_sync_attachments.py
+index 9ab295db3d29f36903456c962b39c6233ea87279..0c70a702c382746e3d1f9e61f23371ca8b962858 100644
+--- a/hermes_cli/kanban_sync_attachments.py
++++ b/hermes_cli/kanban_sync_attachments.py
+@@ -25,6 +25,9 @@ _COMPONENT = re.compile(r"[A-Za-z0-9_-]+\Z")
+ 
+ 
+ def _setup(conn):
++    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
++                    "AND name='kanban_attachment_retry'").fetchone():
++        return
+     with write_txn(conn):
+         conn.execute("CREATE TABLE IF NOT EXISTS kanban_attachment_retry ("
+                      "uid TEXT PRIMARY KEY, blob_key TEXT, attempts INTEGER NOT NULL, "
+@@ -83,6 +86,13 @@ def _publish_file(path, data):
+ def _record_local(conn, row, path, key):
+     # stored_path is local-only. Suppress echo of the service's verified receipt.
+     # A deleted/rebound row must not be resurrected after network I/O.
++    # Read current metadata, not the pre-I/O snapshot: another writer may have
++    # cleared the path while these bytes were being verified.
++    current = conn.execute("SELECT stored_path,blob_key FROM task_attachments WHERE uid=? "
++                           "AND task_id=? AND size=? AND blob_key IS ?",
++                           (row["uid"], row["task_id"], row["size"], row["blob_key"])).fetchone()
++    if current is None or (current["stored_path"] == str(path) and current["blob_key"] == key):
++        return
+     with write_txn(conn):
+         previous = conn.execute("SELECT applying FROM kanban_sync_state").fetchone()[0]
+         conn.execute("UPDATE kanban_sync_state SET applying=1")
+@@ -149,6 +159,7 @@ def transfer_pending(conn, hub, board, *, limit=2):
+         "OR (r.error IS NOT NULL AND (a.blob_key IS NOT NULL OR a.stored_path <> '')) THEN 0 ELSE 1 END, "
+         "coalesce(r.retry_at,0),a.id LIMIT ?", (now, limit)).fetchall()
+     transferred = 0
++    stamps = []
+     for raw in rows:
+         row, error, done = dict(raw), None, False
+         try:
+@@ -157,9 +168,10 @@ def transfer_pending(conn, hub, board, *, limit=2):
+         except (OSError, ValueError, HubError) as exc:
+             error = type(exc).__name__  # no remote response bodies/credentials in durable state
+             _log.warning("kanban attachment %s transfer pending (%s)", row["uid"], error)
++        stamps.append((row["uid"], row["blob_key"], now + (600 if done else 30), error))
++    if stamps:
+         with write_txn(conn):
+-            conn.execute("INSERT INTO kanban_attachment_retry(uid,blob_key,attempts,retry_at,error) "
+-                         "VALUES (?,?,1,?,?) ON CONFLICT(uid) DO UPDATE SET blob_key=excluded.blob_key, "
+-                         "attempts=attempts+1,retry_at=excluded.retry_at,error=excluded.error",
+-                         (row["uid"], row["blob_key"], now + (600 if done else 30), error))
++            conn.executemany("INSERT INTO kanban_attachment_retry(uid,blob_key,attempts,retry_at,error) "
++                             "VALUES (?,?,1,?,?) ON CONFLICT(uid) DO UPDATE SET blob_key=excluded.blob_key, "
++                             "attempts=attempts+1,retry_at=excluded.retry_at,error=excluded.error", stamps)
+     return transferred
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 74e2194703a9f4bf2b73a7a8317fa9f56a3f967a..52eac024895ca8ba4209da20d5afe870f4471764 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1053,7 +1053,8 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+             applies = None if applies is None else steps
+             key = str(path)
+             outcome = "unchanged"
+-            if inputs is None or _REPAIRED.get(key) != inputs:
++            repair_changed = inputs is None or _REPAIRED.get(key) != inputs
++            if repair_changed:
+                 outcome = "rebuilt" if rebuilt else decide(key, inputs, applies, _repair_clock(), REPLICA_REPAIR_MIN_S)
+                 deferred = outcome == "deferred"
+                 from hermes_cli.kanban_sync_partition_repair import repair_partition_chat_links, repair_partition_links
+@@ -1063,11 +1064,10 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+                     if not decision.skip:
+                         repair_partition_links(live, replica, gateway)
+                         repair_partition_chat_links(live, replica, gateway)
+-                # The remote-parent mirror is cheap and gates child promotion, so a deferral never delays it.
+-                with credited(live):  # copied from the replica (already an input), not a local edit
+-                    moved = mode == "primary" and sync.refresh_remote_parents(live, replica)
+-                if moved:
+-                    sync.wake_dispatcher()  # a foreign parent moved: re-gate its children now
++            from hermes_cli.kanban_sync_parent_refresh import refresh_and_wake
++            # Independent P2 gate and 30s recovery floor; retain mirror-before-repair ordering.
++            refresh_and_wake(live, replica, board=slug, mode=mode, rebuilt=rebuilt)
++            if repair_changed:
+                 if deferred:
+                     result.repair_deferred = True
+                 else:
+@@ -1082,7 +1082,7 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+                     _REPAIR_CREDIT.pop(key, None)
+             note_round(slug, outcome, _repair_clock())
+             if mode == "primary":
+-                # The mirror matches this round's pull (refreshed above, or inputs unchanged since the last refresh)
++                # The mirror now matches this round's pull, including skipped unchanged rows.
+                 sync.mark_mirrored(replica, slug)  # only then can a parent be missing (kanban_replica_freshness)
+                 from hermes_cli.kanban_sync_divergence import heal_clobbered_completions, heal_running_over_ended_run
+                 heal_clobbered_completions(live)
+diff --git a/hermes_cli/kanban_sync_parent_refresh.py b/hermes_cli/kanban_sync_parent_refresh.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c69817e1e6d3a1ee1a7d6b73a721986f87603b6e
+--- /dev/null
++++ b/hermes_cli/kanban_sync_parent_refresh.py
+@@ -0,0 +1,166 @@
++"""P2 gate for the sync round's foreign-parent mirror. [daveey]
++
++The shadow cursor covers the pull's applied task/run/event rows, not its feed
++position (heartbeat/bookkeeping-only pages must not run the mirror). The live
++cursor covers local parks and links, including children of a deleted parent.
++Unknown coverage runs the original path. Repairs and heals have separate gates;
++this gate must never enclose them. A 30s fallback also repairs local mirror-table
++clobbers, which intentionally are not task-content changes.
++"""
++from __future__ import annotations
++
++from collections import OrderedDict
++import sqlite3
++import threading
++import time
++
++from hermes_cli import kanban_task_change as changes
++from hermes_cli.loop_accounting import pass_
++
++MAX_AGE_S = 30.0
++_LIMIT = 32
++_done: OrderedDict[tuple, tuple] = OrderedDict()
++_lock = threading.Lock()
++_clock = time.monotonic
++
++
++def reset() -> None:
++    with _lock:
++        _done.clear()
++
++
++def refresh_and_wake(live, replica, *, board: str, mode: str, rebuilt: bool) -> None:
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli.kanban_sync_own_writes import credited
++
++    if mode != "primary":
++        return
++    with credited(live):
++        moved = refresh(live, replica, board=board, rebuilt=rebuilt)
++    if moved:
++        sync.wake_dispatcher()
++
++
++def refresh(live, replica, *, board: str, rebuilt: bool = False) -> list[str]:
++    from hermes_cli import kanban_db_sync as sync
++
++    # Connection identity prevents a replaced pathname from pairing old-handle
++    # rows with the new file's identity; P2 fences normal reopen/restore changes.
++    key = (live, replica)
++    with _lock:
++        previous = _done.pop(key, None)
++    began = _clock()
++    with pass_(f"sync.parents/{board}") as accounting:
++        left = right = None
++        local = remote = changes.FULL
++        if not live.in_transaction and not replica.in_transaction:
++            try:
++                local, left = changes.changed_since(live, previous[0] if previous else None)
++                remote, right = changes.changed_since(replica, previous[1] if previous else None)
++            except (sqlite3.Error, OSError):
++                left = right = None
++        trusted = left is not None and right is not None
++        fallback = not trusted or local is changes.FULL or remote is changes.FULL
++        due = previous is None or not 0 <= began - previous[2] < MAX_AGE_S
++        skip = trusted and not fallback and not local and not remote and not rebuilt and not due
++        # Row-keyed: only rows named by either cursor, plus parents whose evidence-scope membership moved since the
++        # scope the previous round read, can differ from the mirror. Wanted membership is re-derived per target
++        # (link writes mark both ends; a parent appearing or vanishing locally marks its own id).
++        used = previous[3] if previous is not None else None
++        if skip:
++            accounting.skip()
++            result = []
++            stamp = previous
++        elif (trusted and not fallback and not rebuilt and not due and previous is not None and used is not None
++              and isinstance(local, frozenset) and isinstance(remote, frozenset)):
++            accounting.change(True)
++            scoped = _scope(live)
++            # The scope memo returns the same frozenset while its membership holds: no O(scope) difference then.
++            moved = frozenset() if scoped is used else scoped ^ used
++            result = _refresh_rows(live, replica, local | remote | moved, scoped)
++            accounting.rows(len(result))
++            # Keep the full refresh's time: the 30s floor (clobber repair) stays anchored to the last full path.
++            stamp = (left, right, previous[2], scoped)
++        else:
++            accounting.fallback(fallback or due or rebuilt)
++            accounting.change(bool(local or remote))
++            # Build the mirror from exactly the scope it stamps: next round's difference is then against what was applied.
++            scoped = _scope(live) if trusted else None
++            result = sync.refresh_remote_parents(live, replica, scoped=scoped)
++            accounting.rows(len(result))
++            # Pre-read cursors: a write during the refresh re-arms the next call.
++            stamp = (left, right, began, scoped) if trusted else None
++        if stamp is not None:
++            with _lock:
++                _done[key] = stamp
++                while len(_done) > _LIMIT:
++                    _done.popitem(last=False)
++        return result
++
++
++def _scope(live) -> frozenset:
++    from hermes_cli import kanban_move_parent_evidence as evidence
++
++    return frozenset(evidence._evidence_scope(live))
++
++
++def _chunks(ids):
++    ids = sorted(ids)
++    for i in range(0, len(ids), 500):
++        part = ids[i:i + 500]
++        yield part, ",".join("?" * len(part))
++
++
++def _wanted(live, targets) -> set:
++    """The targets ``foreign_parents`` would name: linked as a parent and not a local card."""
++    out: set = set()
++    for part, marks in _chunks(targets):
++        out.update(r[0] for r in live.execute(
++            "SELECT DISTINCT l.parent_id FROM task_links l LEFT JOIN tasks p ON p.id = l.parent_id "
++            f"WHERE p.id IS NULL AND l.parent_id IN ({marks})", part))
++    return out
++
++
++def _refresh_rows(live, replica, targets, scoped) -> list[str]:
++    """``refresh_remote_parents`` restricted to ``targets``: every other parent's rows already match it.
++
++    Same snapshot, values and write-lock rules as the full path, applied per row: a target that is no longer wanted,
++    that the replica lost, or (for evidence) that left the scope loses its mirror row. Rows of other parents are left
++    as earlier rounds wrote them; the 30s floor rewrites everything, so a local clobber still heals without a pull.
++    """
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_move_parent_evidence as evidence
++    from hermes_cli.kanban_db_connect import write_txn
++
++    targets = sorted(targets)
++    if not targets or not sync.has_remote_parents(live):
++        return []
++    wanted = _wanted(live, targets)
++    replica.execute("SAVEPOINT move_parent_snapshot")
++    try:
++        found: dict[str, str] = {}
++        for part, marks in _chunks(wanted):
++            found.update({r[0]: r[1] for r in replica.execute(
++                f"SELECT id, status FROM tasks WHERE id IN ({marks})", part)})
++        values = {p: (evidence.payload(replica, p) if p in wanted and p in scoped else None) for p in targets}
++    finally:
++        replica.execute("RELEASE move_parent_snapshot")
++    current: dict[str, str] = {}
++    for part, marks in _chunks(targets):
++        current.update({r[0]: r[1] for r in live.execute(
++            f"SELECT parent_id, status FROM {sync.REMOTE_PARENTS_TABLE} WHERE parent_id IN ({marks})", part)})
++    stored = evidence.stored(live, targets)
++    changed = [p for p in targets if current.get(p) != found.get(p)]
++    evidence_changed = {p: values[p] for p in targets if stored.get(p) != values[p]}
++    if not changed and not evidence_changed:
++        return []  # An unchanged sync round must not acquire a primary write lock.
++    with write_txn(live):
++        if evidence_changed:
++            evidence.apply_rows(live, evidence_changed)
++        if changed:
++            now = int(time.time())
++            live.executemany(f"DELETE FROM {sync.REMOTE_PARENTS_TABLE} WHERE parent_id = ?", [(p,) for p in changed])
++            live.executemany(
++                f"INSERT INTO {sync.REMOTE_PARENTS_TABLE} (parent_id, status, refreshed_at) VALUES (?, ?, ?)",
++                [(p, found[p], now) for p in changed if p in found])
++    return sorted(set(changed) | set(evidence_changed))
+diff --git a/tests/hermes_cli/test_kanban_move_parent_evidence.py b/tests/hermes_cli/test_kanban_move_parent_evidence.py
+index 02b6d7dd00ff25bc350952a8948386efeb4d29c6..17edc952b190351ba51f2dc53caaa89f8e29d953 100644
+--- a/tests/hermes_cli/test_kanban_move_parent_evidence.py
++++ b/tests/hermes_cli/test_kanban_move_parent_evidence.py
+@@ -115,7 +115,9 @@ def test_unchanged_sync_does_not_write_and_removed_parent_drops_evidence(moved_p
+         assert sync.refresh_remote_parents(worker.conn, hub.conn) == []
+     finally:
+         worker.conn.set_trace_callback(None)
+-    assert not any(s.startswith(("BEGIN", "CREATE", "DELETE", "INSERT", "UPDATE")) for s in statements)
++    # A deferred BEGIN is the scope memo's read snapshot (kanban_move_parent_scope); no write lock is taken.
++    assert not any(s.startswith(("BEGIN IMMEDIATE", "BEGIN EXCLUSIVE", "CREATE", "DELETE", "INSERT", "UPDATE"))
++                   for s in statements)
+     hub.conn.execute("DELETE FROM task_runs WHERE task_id = ?", (parent,))
+     assert sync.refresh_remote_parents(worker.conn, hub.conn) == [parent]
+     assert evidence.result(worker.conn, task, parent) is None
+@@ -187,7 +189,7 @@ def test_refresh_reads_status_and_result_in_one_snapshot(moved_parent, monkeypat
+     assert hub.conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+     original = evidence.prepare
+ 
+-    def change_between_reads(live, replica, wanted):
++    def change_between_reads(live, replica, wanted, scoped=None):
+         other = sqlite3.connect(path, isolation_level=None)
+         try:
+             other.execute("BEGIN IMMEDIATE")
+@@ -196,7 +198,7 @@ def test_refresh_reads_status_and_result_in_one_snapshot(moved_parent, monkeypat
+             other.commit()
+         finally:
+             other.close()
+-        return original(live, replica, wanted)
++        return original(live, replica, wanted, scoped=scoped)
+ 
+     monkeypatch.setattr(evidence, "prepare", change_between_reads)
+     sync.refresh_remote_parents(worker.conn, hub.conn)
+diff --git a/tests/hermes_cli/test_kanban_move_parent_scope.py b/tests/hermes_cli/test_kanban_move_parent_scope.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5918046984fd21df45266bfafeca98fbf06d71b2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_move_parent_scope.py
+@@ -0,0 +1,235 @@
++"""Incremental ``_parked_scope`` memo over the P2 change cursor (card t_6afd82858e11ca8c).
++
++Every step is checked against the uncached reference query on a real sqlite board.
++"""
++from __future__ import annotations
++
++import dataclasses
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_move_parent_evidence as evidence
++from hermes_cli import kanban_move_parent_scope as scope
++from hermes_cli import kanban_task_change as tc
++from hermes_cli import kanban_unused_grant
++from tests.hermes_cli import kanban_sync_support as support
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    tc._reset_for_tests()
++    scope._reset_for_tests()
++    conn = kbc.connect(home / "kanban.db")
++    try:
++        yield conn
++    finally:
++        conn.close()
++        tc._reset_for_tests()
++        scope._reset_for_tests()
++
++
++@pytest.fixture
++def evaluated(monkeypatch):
++    """Task ids whose run/checkpoint was evaluated (the expensive per-child step)."""
++    seen: list[str] = []
++    real = kanban_unused_grant.latest_started_run
++
++    def spy(conn, task_id):
++        seen.append(task_id)
++        return real(conn, task_id)
++
++    monkeypatch.setattr(kanban_unused_grant, "latest_started_run", spy)
++    return seen
++
++
++def _write(conn, sql, params=()):
++    with kbc.write_txn(conn):
++        conn.execute(sql, params)
++
++
++def _child(conn, title, parents, *, park=None):
++    """A child linked to ``parents`` (ids absent from this file are foreign); ``park`` names its checkpoint."""
++    task = kb.create_task(conn, title=title, assignee="w")
++    with kbc.write_txn(conn):
++        for parent in parents:
++            conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (parent, task))
++        if park is not None:
++            _park(conn, task, park)
++    return task
++
++
++def _park(conn, task, named):
++    run = conn.execute(
++        "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) VALUES (?, 'blocked', 'blocked', 1, 2)",
++        (task,)).lastrowid
++    payload = {"kind": "dependency", "review_checkpoint": {"run_id": run, "parents": list(named)}}
++    conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES "
++                 "(?, ?, 'dependency_wait', ?, 2)", (task, run, json.dumps(payload)))
++
++
++def _check(conn, expected):
++    actual = evidence._parked_scope(conn)
++    assert actual == set(expected)
++    assert actual == evidence._parked_scope_uncached(conn)
++    return actual
++
++
++def test_unchanged_board_skips_the_expensive_query(board, evaluated):
++    _child(board, "a", ["f1"], park=["f1"])
++    _child(board, "b", ["f2"], park=["f2"])
++    _check(board, {"f1", "f2"})
++    assert len(evaluated) >= 2
++    evaluated.clear()
++    for _ in range(3):
++        assert evidence._parked_scope(board) == {"f1", "f2"}
++    assert evaluated == []
++
++
++def test_one_changed_child_recomputes_only_that_child(board, evaluated):
++    a = _child(board, "a", ["f1"], park=["f1"])
++    _child(board, "b", ["f2"], park=["f2"])
++    _check(board, {"f1", "f2"})
++    evaluated.clear()
++    _write(board, "UPDATE task_events SET payload = ? WHERE task_id = ? AND kind = 'dependency_wait'",
++           (json.dumps({"kind": "dependency", "review_checkpoint": {
++               "run_id": board.execute("SELECT id FROM task_runs WHERE task_id = ?", (a,)).fetchone()[0],
++               "parents": ["f3"]}}), a))
++    assert evidence._parked_scope(board) == {"f2", "f3"}
++    assert evaluated == [a]
++    assert evidence._parked_scope(board) == evidence._parked_scope_uncached(board)
++
++
++def test_run_change_and_event_change_are_seen(board):
++    a = _child(board, "a", ["f1"], park=["f1"])
++    _check(board, {"f1"})
++    _write(board, "UPDATE task_runs SET outcome = 'completed' WHERE task_id = ?", (a,))
++    _check(board, set())
++    _write(board, "UPDATE task_runs SET outcome = 'blocked' WHERE task_id = ?", (a,))
++    _check(board, {"f1"})
++    _write(board, "DELETE FROM task_events WHERE task_id = ? AND kind = 'dependency_wait'", (a,))
++    _check(board, set())
++    _write(board, "UPDATE tasks SET status = 'done' WHERE id = ?", (a,))
++    _check(board, set())
++
++
++def test_parent_imported_then_deleted_updates_child_membership(board, evaluated):
++    _child(board, "a", ["t_remote"], park=["t_remote"])
++    _child(board, "other", ["f9"], park=["f9"])
++    _check(board, {"t_remote", "f9"})
++    evaluated.clear()
++    # The foreign parent is imported: the child no longer has a missing parent.
++    _write(board, "INSERT INTO tasks (id, title, status, created_at) VALUES ('t_remote', 'p', 'todo', 1)")
++    evaluated.clear()
++    assert evidence._parked_scope(board) == {"f9"}
++    assert evaluated == []  # no longer a member: nothing to evaluate, and nothing else was touched
++    _check(board, {"f9"})
++    # ...and deleted again: the child's membership returns without any write to the child itself.
++    _write(board, "DELETE FROM tasks WHERE id = 't_remote'")
++    _check(board, {"t_remote", "f9"})
++
++
++def test_link_deletion_drops_the_child(board):
++    a = _child(board, "a", ["f1"], park=["f1"])
++    _check(board, {"f1"})
++    _write(board, "DELETE FROM task_links WHERE child_id = ?", (a,))
++    _check(board, set())
++    _write(board, "INSERT INTO task_links (parent_id, child_id) VALUES ('f1', ?)", (a,))
++    _check(board, {"f1"})
++
++
++def test_shared_parents_survive_one_child_leaving(board):
++    a = _child(board, "a", ["f1"], park=["f1", "shared"])
++    b = _child(board, "b", ["f2"], park=["f2", "shared"])
++    _check(board, {"f1", "f2", "shared"})
++    _write(board, "UPDATE tasks SET status = 'archived' WHERE id = ?", (a,))
++    _check(board, {"f2", "shared"})
++    _write(board, "UPDATE tasks SET status = 'archived' WHERE id = ?", (b,))
++    _check(board, set())
++
++
++def test_rollback_cannot_poison_the_memo(board):
++    a = _child(board, "a", ["f1"], park=["f1"])
++    _check(board, {"f1"})
++    board.execute("BEGIN IMMEDIATE")
++    board.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (a,))
++    assert evidence._parked_scope(board) == set()  # inside the transaction: bypass, sees its own write
++    board.execute("ROLLBACK")
++    assert evidence._parked_scope(board) == {"f1"}
++    # A first-ever call inside a transaction stores nothing either.
++    scope._reset_for_tests()
++    board.execute("BEGIN IMMEDIATE")
++    board.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (a,))
++    assert evidence._parked_scope(board) == set()
++    board.execute("ROLLBACK")
++    assert scope._MEMO == {}
++    _check(board, {"f1"})
++
++
++@pytest.mark.parametrize("tamper", ["schema", "ino", "revision_ahead", "dropped"])
++def test_untrusted_cursor_falls_back_to_full_recompute(board, evaluated, tamper):
++    _child(board, "a", ["f1"], park=["f1"])
++    _child(board, "b", ["f2"], park=["f2"])
++    _check(board, {"f1", "f2"})
++    (path, (cursor, *_rest)), = scope._MEMO.items()
++    if tamper == "schema":
++        cursor = dataclasses.replace(cursor, schema_version=cursor.schema_version + 1)
++    elif tamper == "ino":
++        cursor = dataclasses.replace(cursor, ino=cursor.ino + 1)
++    elif tamper == "revision_ahead":
++        cursor = dataclasses.replace(cursor, revision=cursor.revision + 100)
++    if tamper == "dropped":
++        board.execute("DROP TRIGGER IF EXISTS {}".format(board.execute(
++            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE '%task_events_insert'").fetchone()[0]))
++    else:
++        # A stale map the cursor can no longer vouch for must not be served.
++        scope._MEMO[path] = (cursor, scope._Scope({"ghost": frozenset({"stale"})}), scope._Scope({}),
++                             frozenset({"stale"}))
++    evaluated.clear()
++    _check(board, {"f1", "f2"})
++    assert len(set(evaluated)) >= 2  # every child re-evaluated, not just the changed ones
++
++
++def test_memo_is_bounded(board, monkeypatch):
++    monkeypatch.setattr(scope, "_MAX", 2)
++    for name in ("p1", "p2", "p3"):
++        scope._MEMO[name] = (None, {})
++    _child(board, "a", ["f1"], park=["f1"])
++    evidence._parked_scope(board)
++    assert len(scope._MEMO) <= 2
++
++
++def test_refcounted_union_keeps_shared_parents_and_reuses_the_union():
++    s = scope._Scope({"a": frozenset({"p", "q"}), "b": frozenset({"p"})})
++    first = s.union
++    assert first == {"p", "q"}
++    assert s.set({"b": frozenset()}) is False  # "a" still names p: membership unchanged
++    assert s.union is first  # same object, so callers can skip an O(scope) difference
++    assert s.set({"a": frozenset({"q"})}) is True  # last reference to p gone
++    assert s.union == {"q"}
++    assert s.set({"c": frozenset({"q"}), "a": frozenset()}) is False  # c takes over q before a drops it
++    assert s.set({"c": frozenset({"r"})}) is True
++    assert s.union == {"r"} and s.counts == {"r": 1}
++
++
++def test_refcounted_union_matches_a_fresh_union_under_random_updates():
++    import random
++
++    rng = random.Random(7)
++    parents = [f"p{i}" for i in range(6)]
++    s = scope._Scope({})
++    model: dict = {}
++    for _ in range(2000):
++        updates = {f"t{rng.randrange(8)}": frozenset(rng.sample(parents, rng.randrange(3)))
++                   for _ in range(rng.randrange(1, 4))}
++        before = s.union
++        moved = s.set(updates)
++        model.update(updates)
++        expected = scope._union({k: v for k, v in model.items() if v})
++        assert s.union == expected
++        assert moved == (expected != before)
++        assert s.by_task == {k: v for k, v in model.items() if v}
+diff --git a/tests/hermes_cli/test_kanban_move_parent_scope_queued.py b/tests/hermes_cli/test_kanban_move_parent_scope_queued.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..36bf1d86f18ec42cc2b3d524f3950cf5ea10a8f6
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_move_parent_scope_queued.py
+@@ -0,0 +1,243 @@
++"""Queued evidence scope stays differential with the uncached SQL reference."""
++from __future__ import annotations
++
++import json
++import sqlite3
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_move_parent_evidence as evidence
++from hermes_cli import kanban_move_parent_scope as scope
++from tests.hermes_cli import test_kanban_move_parent_scope as helpers
++
++board = helpers.board
++
++
++def _move(conn, task, payload=None):
++    with helpers.kbc.write_txn(conn):
++        return conn.execute(
++            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'moved', ?, 1)",
++            (task, json.dumps(payload if payload is not None else {"queued": True, "checkpoint": "ok"})),
++        ).lastrowid
++
++
++def test_queued_scope_includes_local_and_foreign_parents_without_a_park(board):
++    local = helpers.kb.create_task(board, title="local")
++    task = helpers._child(board, "queued", [local, "foreign"])
++    _move(board, task)
++    assert scope.parked_scope(board) == set()
++    assert scope.evidence_scope(board) == {local, "foreign"}
++    assert scope.evidence_scope(board) == evidence._evidence_scope_uncached(board)
++
++
++def _check(conn, expected):
++    actual = scope.evidence_scope(conn)
++    assert actual == set(expected)
++    assert actual == evidence._evidence_scope_uncached(conn)
++    return actual
++
++
++def test_moved_task_id_update_invalidates_both_tasks(board):
++    a = helpers._child(board, "a", ["a-parent"])
++    b = helpers._child(board, "b", ["b-parent"])
++    event = _move(board, a)
++    _check(board, {"a-parent"})
++    helpers._write(board, "UPDATE task_events SET task_id = ? WHERE id = ?", (b, event))
++    _check(board, {"b-parent"})
++
++
++def test_lower_id_insert_cannot_supersede_latest_moved(board):
++    task = helpers._child(board, "a", ["foreign"])
++    event = _move(board, task, {"queued": False, "checkpoint": "ok"})
++    _check(board, set())
++    helpers._write(board, "INSERT INTO task_events (id, task_id, kind, payload, created_at) "
++                   "VALUES (-100, ?, 'moved', ?, 999)",
++                   (task, json.dumps({"queued": True, "checkpoint": "ok"})))
++    _check(board, set())
++    helpers._write(board, "DELETE FROM task_events WHERE id = ?", (event,))
++    _check(board, {"foreign"})
++
++
++def test_moved_mutation_sequence_uses_max_id_and_old_and_new_task_ids(board):
++    a = helpers._child(board, "a", ["a-parent"])
++    b = helpers._child(board, "b", ["b-parent"])
++    lower = _move(board, a)
++    _check(board, {"a-parent"})
++    latest = _move(board, a, {"queued": False, "checkpoint": "ok"})
++    _check(board, set())
++    helpers._write(board, "UPDATE task_events SET created_at = 999 WHERE id = ?", (lower,))
++    _check(board, set())  # timestamps/lower-id changes do not override MAX(id)
++    helpers._write(board, "UPDATE task_events SET payload = ? WHERE id = ?",
++                   (json.dumps({"queued": True, "checkpoint": " ok "}), latest))
++    _check(board, {"a-parent"})
++    helpers._write(board, "UPDATE task_events SET task_id = ? WHERE id = ?", (b, latest))
++    _check(board, {"a-parent", "b-parent"})
++    helpers._write(board, "UPDATE task_events SET kind = 'comment' WHERE id = ?", (lower,))
++    _check(board, {"b-parent"})
++    helpers._write(board, "UPDATE task_events SET kind = 'moved' WHERE id = ?", (lower,))
++    _check(board, {"a-parent", "b-parent"})
++    helpers._write(board, "DELETE FROM task_events WHERE id = ?", (latest,))
++    _check(board, {"a-parent"})
++    helpers._write(board, "DELETE FROM task_events WHERE id = ?", (lower,))
++    _check(board, set())
++
++
++@pytest.mark.parametrize("raw,valid", [
++    ('{"queued":true,"checkpoint":" ok "}', True),
++    ('{"queued":1,"checkpoint":"ok"}', False),
++    ('{"queued":"true","checkpoint":"ok"}', False),
++    ('{"checkpoint":"ok"}', False),
++    ('{"queued":true,"checkpoint":" \\t\\n"}', False),
++    ('{"queued":true,"checkpoint":1}', False),
++    ('{"queued":true,"checkpoint":null}', False),
++    ('{"queued":true}', False), ('[]', False), ('null', False), ('invalid', False),
++])
++def test_queued_payload_predicate(board, raw, valid):
++    task = helpers._child(board, "a", ["foreign"])
++    event = _move(board, task)
++    _check(board, {"foreign"})
++    helpers._write(board, "UPDATE task_events SET payload = ? WHERE id = ?", (raw, event))
++    _check(board, {"foreign"} if valid else set())
++
++
++def test_queued_status_links_parent_and_child_lifecycle(board):
++    task = helpers._child(board, "a", ["remote"])
++    _move(board, task)
++    _check(board, {"remote"})
++    for status in ("done", "ready", "archived", "blocked", "todo"):
++        helpers._write(board, "UPDATE tasks SET status = ? WHERE id = ?", (status, task))
++        _check(board, set() if status in ("done", "archived") else {"remote"})
++    helpers._write(board, "INSERT INTO tasks (id, title, status, created_at) VALUES ('remote', 'p', 'todo', 1)")
++    _check(board, {"remote"})  # queued includes local parents too
++    helpers._write(board, "DELETE FROM tasks WHERE id = 'remote'")
++    _check(board, {"remote"})
++    helpers._write(board, "UPDATE task_links SET parent_id = 'other' WHERE child_id = ?", (task,))
++    _check(board, {"other"})
++    helpers._write(board, "DELETE FROM task_links WHERE child_id = ?", (task,))
++    _check(board, set())
++    helpers._write(board, "INSERT INTO task_links (parent_id, child_id) VALUES ('new', ?)", (task,))
++    _check(board, {"new"})
++    helpers._write(board, "DELETE FROM tasks WHERE id = ?", (task,))
++    _check(board, set())
++
++
++def test_changed_row_and_parent_do_not_rescan_queued_children(board, monkeypatch):
++    parent = helpers.kb.create_task(board, title="parent")
++    a = helpers._child(board, "a", [parent, "foreign"])
++    b = helpers._child(board, "b", ["other"])
++    _move(board, a)
++    _move(board, b)
++    _check(board, {parent, "foreign", "other"})
++    seen = []
++    real = evidence._queued_checkpoint
++    monkeypatch.setattr(evidence, "_queued_checkpoint", lambda payload: (seen.append(payload), real(payload))[1])
++    queries = []
++    board.set_trace_callback(queries.append)
++    try:
++        helpers._write(board, "UPDATE tasks SET title = 'changed' WHERE id = ?", (parent,))
++        assert scope.evidence_scope(board) == {parent, "foreign", "other"}
++        assert seen == []  # parked expands children of changed parents; queued must not
++        helpers._write(board, "UPDATE tasks SET title = 'changed' WHERE id = ?", (a,))
++        assert scope.evidence_scope(board) == {parent, "foreign", "other"}
++        assert len(seen) == 1
++        moved_queries = [q for q in queries if "SELECT e.task_id, e.payload" in q]
++        assert moved_queries and all("AND t.id IN (" in q for q in moved_queries)
++        seen.clear()
++        assert scope.evidence_scope(board) == {parent, "foreign", "other"}
++        assert evidence.prepare(board, board, []) == ([], [])
++        assert seen == []
++    finally:
++        board.set_trace_callback(None)
++
++
++def test_queued_rollback_and_fresh_return_value(board):
++    a = helpers._child(board, "a", ["foreign"])
++    event = _move(board, a)
++    returned = _check(board, {"foreign"})
++    assert isinstance(returned, frozenset)  # callers cannot mutate the memo's union through the return value
++    assert scope.evidence_scope(board) == {"foreign"}
++    held = dict(scope._MEMO)
++    board.execute("BEGIN IMMEDIATE")
++    board.execute("DELETE FROM task_events WHERE id = ?", (event,))
++    assert scope.evidence_scope(board) == set()
++    assert scope._MEMO == held
++    board.execute("ROLLBACK")
++    _check(board, {"foreign"})
++
++
++def test_both_scopes_share_snapshot_and_catch_up_after_concurrent_write(board, monkeypatch):
++    task = helpers._child(board, "a", ["parked"], park=["parked"])
++    event = _move(board, task)
++    writer = helpers.kbc.connect(Path(helpers.tc._main_path(board)))
++    real = scope._full
++    def racing(conn):
++        result = real(conn)
++        helpers._write(writer, "UPDATE task_events SET payload = '{}' WHERE id = ?", (event,))
++        return result
++    monkeypatch.setattr(scope, "_full", racing)
++    try:
++        assert scope.evidence_scope(board) == {"parked"}
++        # Inspect each half: the queued rows must belong to the same old snapshot.
++        held = next(iter(scope._MEMO.values()))
++        assert held[2].by_task == {task: frozenset({"parked"})}
++        monkeypatch.setattr(scope, "_full", real)
++        assert scope.evidence_scope(board) == {"parked"}
++        assert next(iter(scope._MEMO.values()))[2].by_task == {}
++    finally:
++        writer.close()
++
++
++def test_exception_does_not_publish_either_half(board, monkeypatch):
++    task = helpers._child(board, "a", ["foreign"])
++    _move(board, task)
++    _check(board, {"foreign"})
++    assert scope._MEMO
++    helpers._write(board, "UPDATE tasks SET title = 'changed' WHERE id = ?", (task,))
++    def fail(*args):
++        raise sqlite3.OperationalError("queued read failed")
++    real = scope._queued
++    monkeypatch.setattr(scope, "_queued", fail)
++    with pytest.raises(sqlite3.OperationalError, match="queued read failed"):
++        scope.evidence_scope(board)
++    # The entry is checked out while it is updated in place: a failure drops it (nothing half-updated is
++    # published), and the next call recomputes in full.
++    assert scope._MEMO == {}
++    assert not board.in_transaction
++    monkeypatch.setattr(scope, "_queued", real)
++    _check(board, {"foreign"})
++
++
++def test_queued_null_status_uses_sql_not_in_semantics():
++    # Production schema rejects NULL, but legacy nullable boards retain SQL's exclusion.
++    conn = sqlite3.connect(":memory:")
++    conn.row_factory = sqlite3.Row
++    try:
++        conn.executescript("CREATE TABLE tasks (id TEXT, status TEXT); "
++                           "CREATE TABLE task_links (parent_id TEXT, child_id TEXT); "
++                           "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);")
++        conn.execute("INSERT INTO tasks VALUES ('a', NULL)")
++        conn.execute("INSERT INTO task_links VALUES ('foreign', 'a')")
++        conn.execute("INSERT INTO task_events VALUES (1, 'a', 'moved', ?)",
++                     (json.dumps({"queued": True, "checkpoint": "ok"}),))
++        assert scope._queued(conn) == {}
++        assert evidence._queued_scope_uncached(conn) == set()
++    finally:
++        conn.close()
++
++
++@pytest.mark.parametrize("fallback", ["full", "no_cursor", "error"])
++def test_queued_cursor_fallback_recomputes_and_drops_untrusted_memo(board, monkeypatch, fallback):
++    task = helpers._child(board, "a", ["foreign"])
++    event = _move(board, task)
++    _check(board, {"foreign"})
++    helpers._write(board, "DELETE FROM task_events WHERE id = ?", (event,))
++    real = helpers.tc.changed_since
++    def changed(conn, cursor):
++        if fallback == "error":
++            raise sqlite3.OperationalError("no cursor")
++        _, fresh = real(conn, cursor)
++        return (helpers.tc.FULL, fresh) if fallback == "full" else (set(), None)
++    monkeypatch.setattr(helpers.tc, "changed_since", changed)
++    _check(board, set())
++    assert bool(scope._MEMO) == (fallback == "full")
+diff --git a/tests/hermes_cli/test_kanban_sync_attachment_transactions.py b/tests/hermes_cli/test_kanban_sync_attachment_transactions.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3755f63a2b8f19e9833725b95343605efa55bcf9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_attachment_transactions.py
+@@ -0,0 +1,201 @@
++"""Attachment retry scheduling keeps byte verification without idle write churn."""
++from __future__ import annotations
++
++from contextlib import contextmanager
++import hashlib
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_sync_attachments as attachments
++from tests.hermes_cli import test_kanban_sync_attachments as helpers
++
++stores = helpers.stores
++
++
++def test_empty_transfer_with_existing_retry_table_is_read_only(stores):
++    _, _, _, conn, service, _, _ = stores
++    attachments._setup(conn)
++    statements = []
++    conn.set_trace_callback(statements.append)
++    try:
++        assert attachments.transfer_pending(conn, service.hub("worker"), "default") == 0
++    finally:
++        conn.set_trace_callback(None)
++    assert not [s for s in statements if s.upper().startswith("BEGIN")]
++
++
++def _verified_row(conn, tid, data=b"proof"):
++    aid = kb.store_attachment_bytes(conn, tid, "receipt", data)
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE task_attachments SET blob_key=? WHERE id=?",
++                     ("sha256:" + hashlib.sha256(data).hexdigest(), aid))
++    return dict(conn.execute("SELECT * FROM task_attachments WHERE id=?", (aid,)).fetchone())
++
++
++def test_unchanged_valid_file_is_hashed_without_record_transaction(stores, monkeypatch):
++    _, _, _, conn, service, tid, _ = stores
++    row = _verified_row(conn, tid)
++    hashed = []
++    valid = attachments._valid
++
++    def observe(data, key):
++        hashed.append((data, key))
++        valid(data, key)
++
++    monkeypatch.setattr(attachments, "_valid", observe)
++    monkeypatch.setattr(helpers.BlobHub, "get_attachment_blob",
++                        lambda *args: pytest.fail("valid bytes must not be downloaded"))
++    statements = []
++    conn.set_trace_callback(statements.append)
++    try:
++        assert attachments._transfer(conn, service.hub("worker"), "default", row)
++    finally:
++        conn.set_trace_callback(None)
++    assert hashed == [(b"proof", row["blob_key"])]
++    assert not [s for s in statements if s.upper().startswith("BEGIN")]
++
++
++def test_retry_stamps_share_one_transaction_for_mixed_results(stores, monkeypatch):
++    _, _, _, conn, service, tid, _ = stores
++    verified = _verified_row(conn, tid)
++    pending_id = kb.store_attachment_bytes(conn, tid, "pending", b"proof")
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE task_attachments SET stored_path='' WHERE id=?", (pending_id,))
++    failed = _verified_row(conn, tid, b"other")
++    Path(failed["stored_path"]).unlink()
++    attachments._setup(conn)
++    monkeypatch.setattr(attachments, "_now", lambda: 1000)
++
++    def offline(*args):
++        raise OSError("offline")
++
++    monkeypatch.setattr(helpers.BlobHub, "get_attachment_blob", offline)
++    statements = []
++    conn.set_trace_callback(statements.append)
++    try:
++        assert attachments.transfer_pending(conn, service.hub("worker"), "default", limit=3) == 1
++    finally:
++        conn.set_trace_callback(None)
++    receipts = {r["uid"]: dict(r) for r in conn.execute("SELECT * FROM kanban_attachment_retry")}
++    pending_uid = conn.execute("SELECT uid FROM task_attachments WHERE id=?", (pending_id,)).fetchone()[0]
++    assert set(receipts) == {verified["uid"], pending_uid, failed["uid"]}
++    assert receipts[verified["uid"]]["retry_at"] == 1600
++    assert receipts[pending_uid]["retry_at"] == receipts[failed["uid"]]["retry_at"] == 1030
++    assert receipts[failed["uid"]]["error"] == "OSError"
++    assert receipts[pending_uid]["error"] is None
++    assert {r["attempts"] for r in receipts.values()} == {1}
++    assert len([s for s in statements if s.upper().startswith("BEGIN")]) == 1
++    statements.clear()
++    conn.set_trace_callback(statements.append)
++    try:
++        assert attachments.transfer_pending(conn, service.hub("worker"), "default", limit=3) == 0
++    finally:
++        conn.set_trace_callback(None)
++    assert not [s for s in statements if s.upper().startswith("BEGIN")]
++
++
++def test_record_rereads_metadata_cleared_after_snapshot(stores):
++    _, worker, _, conn, service, tid, _ = stores
++    row = _verified_row(conn, tid)
++    other = kbc.connect(worker / "kanban.db")
++    try:
++        with kbc.write_txn(other):
++            other.execute("UPDATE task_attachments SET stored_path='' WHERE uid=?", (row["uid"],))
++        assert attachments._transfer(conn, service.hub("worker"), "default", row)
++    finally:
++        other.close()
++    current = conn.execute("SELECT * FROM task_attachments WHERE uid=?", (row["uid"],)).fetchone()
++    assert current["stored_path"] == row["stored_path"]
++    assert current["blob_key"] == row["blob_key"]
++    assert conn.execute("SELECT applying FROM kanban_sync_state").fetchone()[0] == 0
++
++
++@pytest.mark.parametrize("change", ["deleted", "task_id", "size", "blob_key"])
++@pytest.mark.parametrize("timing", ["before_read", "before_write"])
++def test_record_never_overwrites_deleted_or_rebound_row(stores, monkeypatch, change, timing):
++    _, worker, _, conn, _, tid, _ = stores
++    row = _verified_row(conn, tid)
++    other_tid = kb.create_task(conn, title="other owner", assignee="worker")
++    replacement = {"task_id": other_tid, "size": row["size"] + 1,
++                   "blob_key": "sha256:" + "0" * 64}
++    other = kbc.connect(worker / "kanban.db")
++
++    def change_row():
++        with kbc.write_txn(other):
++            if change == "deleted":
++                other.execute("DELETE FROM task_attachments WHERE uid=?", (row["uid"],))
++            else:
++                other.execute(f"UPDATE task_attachments SET {change}=? WHERE uid=?",
++                              (replacement[change], row["uid"]))
++
++    @contextmanager
++    def race_before_write(target):
++        change_row()
++        with kbc.write_txn(target):
++            yield
++
++    try:
++        if timing == "before_read":
++            change_row()
++        else:
++            monkeypatch.setattr(attachments, "write_txn", race_before_write)
++        # A different path requires a write, allowing the race after the read.
++        attachments._record_local(conn, row, Path(row["stored_path"]).with_name("new"), row["blob_key"])
++    finally:
++        other.close()
++    current = conn.execute("SELECT * FROM task_attachments WHERE uid=?", (row["uid"],)).fetchone()
++    if change == "deleted":
++        assert current is None
++    else:
++        assert current[change] == replacement[change]
++        assert current["stored_path"] == row["stored_path"]
++    assert conn.execute("SELECT applying FROM kanban_sync_state").fetchone()[0] == 0
++
++
++@pytest.mark.parametrize("damage", ["deleted", "corrupted"])
++def test_due_retry_repairs_without_feed_and_not_before_deadline(stores, monkeypatch, damage):
++    _, _, _, conn, service, tid, _ = stores
++    row = _verified_row(conn, tid)
++    hub = service.hub("worker")
++    clock = [1000]
++    monkeypatch.setattr(attachments, "_now", lambda: clock[0])
++    assert attachments.transfer_pending(conn, hub, "default") == 1
++    path = Path(row["stored_path"])
++    if damage == "deleted":
++        path.unlink()
++    else:
++        path.write_bytes(b"xxxxx")  # same size: rehashing is necessary
++    fetched = []
++
++    def download(_hub, _board, uid):
++        fetched.append(uid)
++        return b"proof"
++
++    monkeypatch.setattr(helpers.BlobHub, "get_attachment_blob", download)
++    cursor = conn.execute("SELECT * FROM kanban_sync_state").fetchone()
++    clock[0] = 1599
++    assert attachments.transfer_pending(conn, hub, "default") == 0
++    assert fetched == []
++    clock[0] = 1600
++    assert attachments.transfer_pending(conn, hub, "default") == 1
++    assert fetched == [row["uid"]]
++    repaired_path = conn.execute("SELECT stored_path FROM task_attachments WHERE uid=?", (row["uid"],)).fetchone()[0]
++    assert Path(repaired_path).read_bytes() == b"proof"
++    assert tuple(conn.execute("SELECT * FROM kanban_sync_state").fetchone()) == tuple(cursor)
++    stamp = conn.execute("SELECT * FROM kanban_attachment_retry WHERE uid=?", (row["uid"],)).fetchone()
++    assert stamp["attempts"] == 2
++    assert stamp["retry_at"] == 2200
++
++
++def test_default_limit_keeps_remaining_row_immediately_eligible(stores, monkeypatch):
++    _, _, _, conn, service, tid, _ = stores
++    rows = [_verified_row(conn, tid, data) for data in (b"first", b"other", b"third")]
++    monkeypatch.setattr(attachments, "_now", lambda: 1000)
++    assert attachments.transfer_pending(conn, service.hub("worker"), "default") == 2
++    assert {r[0] for r in conn.execute("SELECT uid FROM kanban_attachment_retry")} == {
++        row["uid"] for row in rows[:2]}
++    assert attachments.transfer_pending(conn, service.hub("worker"), "default") == 1
++    assert conn.execute("SELECT count(*) FROM kanban_attachment_retry").fetchone()[0] == 3
+diff --git a/tests/hermes_cli/test_kanban_sync_local_integration.py b/tests/hermes_cli/test_kanban_sync_local_integration.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fff675072074481c6d7cb1215e918331824e60b8
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_local_integration.py
+@@ -0,0 +1,236 @@
++"""Production sync-round composition keeps local recovery while idle rounds skip remote-parent work.
++
++These drive ``ksc.sync_board`` (the real ``_sync_board_locked`` primary path), not the standalone gate: a local
++clobber that no pull causes must still be healed by the round itself (design C13), and a settled board must do no
++remote-parent mirror work until the 30 s floor (which also repairs a local mirror-table clobber).
++"""
++from __future__ import annotations
++
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_sync_parent_refresh as gate
++from tests.hermes_cli import test_kanban_move_parent_evidence as helpers
++from tests.hermes_cli import test_kanban_sync_terminal_regress as base
++
++kanban_home, svc, live = base.kanban_home, base.svc, base.live
++moved_parent = helpers.moved_parent
++gws = helpers.gws
++ME, OTHER, BOARD = base.ME, base.OTHER, base.BOARD
++PLACEHOLDER = "card left running (done)"  # kanban_sync_divergence._LEASE_END_PLACEHOLDER
++
++
++def _uncaptured(live, sql, params=()):
++    """A local clobber no pull and no capture trigger accounts for."""
++    with kbc.write_txn(live):
++        live.execute("UPDATE kanban_sync_state SET applying = 1")
++        live.execute(sql, params)
++        live.execute("UPDATE kanban_sync_state SET applying = 0")
++
++
++@pytest.fixture
++def board_input(monkeypatch):
++    """Record what each round's pull read from the Board and what it applied to the replica.
++
++    ``RoundResult.pulled`` is a ``Pulled`` (an ``int``, default 0), so ``is not None`` holds even for a pull that
++    applied a heal. The pull contract is: count of feed changes read, ``more``/``busy`` flags, ``status_changed``
++    (every status the pull applied), and the replica cursor it advanced; an idle poll applies nothing. Only applies
++    made inside a pull count: the round's own heal applies replica rows to the live file through the same function."""
++    pulls, applied, inside = [], [], []
++    real_pull, real_apply = ksc.pull, sync.apply_remote_changes
++
++    def pull(conn, *a, **k):
++        before = (sync.sync_state(conn) or {}).get("cursor")
++        inside.append(True)
++        try:
++            out = real_pull(conn, *a, **k)
++        finally:
++            inside.pop()
++        pulls.append({"n": int(out), "more": out.more, "busy": out.busy, "status_changed": dict(out.status_changed),
++                      "cursor": (before, (sync.sync_state(conn) or {}).get("cursor"))})
++        return out
++
++    def apply(conn, changes, *a, **k):
++        if inside:
++            applied.append(list(changes))
++        return real_apply(conn, changes, *a, **k)
++
++    monkeypatch.setattr(ksc, "pull", pull)
++    monkeypatch.setattr(sync, "apply_remote_changes", apply)
++    return pulls, applied
++
++
++def _assert_no_board_input(result, pulls, applied):
++    assert int(result.pulled) == 0 and not result.pulled.more and not result.pulled.busy
++    assert result.pulled.status_changed == {}
++    assert pulls, "the round must have polled the Board"  # a round may poll more than once; every poll must be idle
++    for one in pulls:
++        assert one["n"] == 0 and one["status_changed"] == {} and one["cursor"][0] == one["cursor"][1], one
++        assert not one["more"] and not one["busy"], one
++    assert not any(applied), f"the round's pull applied Board changes: {applied}"
++
++
++def _settled_completed_card(live, kanban_home, svc):
++    tid, run_uid = base._running_card(live, kanban_home, svc)
++    run_id = live.execute("SELECT id FROM task_runs WHERE uid = ?", (run_uid,)).fetchone()[0]
++    with kbc.write_txn(live):
++        kb._append_event(live, tid, "completed", {"summary": "done"}, run_id=run_id)
++    base._worker_ends(svc, tid, run_uid, status="done", outcome="completed", completed_at=int(time.time()))
++    for _ in range(4):  # pull the end, then idle: nothing left to move
++        base._round(kanban_home, svc)
++    row = live.execute("SELECT status, current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()
++    assert (row[0], row[1]) == ("done", None)
++    return tid, run_id
++
++
++def test_running_over_ended_run_clobber_healed_by_round_without_pull(live, kanban_home, svc, board_input):
++    tid, run_id = _settled_completed_card(live, kanban_home, svc)
++    pulls, applied = board_input
++    pulls.clear()
++    applied.clear()
++    _uncaptured(live, "UPDATE tasks SET status = 'running', completed_at = NULL, current_run_id = ? WHERE id = ?",
++                (run_id, tid))
++    assert live.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == "running"
++    result = base._round(kanban_home, svc)  # the Board has nothing new: only the round's own heal can repair it
++    _assert_no_board_input(result, pulls, applied)
++    row = live.execute("SELECT status, current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()
++    assert (row[0], row[1]) == ("done", None)
++    assert live.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'status_healed'",
++                        (tid,)).fetchone()[0] == 1, "the heal sweep itself must have run"
++
++
++def test_placeholder_run_end_clobber_healed_by_round_without_pull(live, kanban_home, svc, board_input):
++    _tid, run_id = _settled_completed_card(live, kanban_home, svc)
++    pulls, applied = board_input
++    pulls.clear()
++    applied.clear()
++    _uncaptured(live, "UPDATE task_runs SET status = 'released', outcome = 'released', error = ?, summary = NULL "
++                      "WHERE id = ?", (PLACEHOLDER, run_id))
++    result = base._round(kanban_home, svc)
++    _assert_no_board_input(result, pulls, applied)
++    row = live.execute("SELECT status, outcome, error FROM task_runs WHERE id = ?", (run_id,)).fetchone()
++    assert tuple(row) == ("done", "completed", None)
++
++
++@pytest.fixture
++def mirrored(moved_parent, monkeypatch):
++    hub, worker, task, parent = moved_parent
++    gate.reset()
++    now = [1000.0]
++    monkeypatch.setattr(gate, "_clock", lambda: now[0])
++    calls = []
++    original = sync.refresh_remote_parents
++
++    def spy(*args, **kwargs):
++        calls.append(True)
++        return original(*args, **kwargs)
++
++    monkeypatch.setattr(sync, "refresh_remote_parents", spy)
++    # The production sync loop runs every round inside one connection scope; the gate keys on the kept handles.
++    with ksc.connection_scope():
++        for _ in range(3):
++            worker.round()  # settle: the gate's first pass is the full path
++        calls.clear()
++        yield hub, worker, task, parent, now, calls
++    gate.reset()
++
++
++FLOOR_S = 30.0  # literal: the stated floor, not the constant under test (as the links pass's 300 s below)
++
++
++def test_unchanged_board_rounds_do_no_remote_parent_work(mirrored):
++    _hub, worker, _task, _parent, now, calls = mirrored
++    base_t = now[0]  # the settle rounds' full pass stamped this time
++    for _ in range(4):
++        now[0] += 1.0
++        worker.round()
++    assert calls == [], "an unchanged board's rounds must not re-run the remote-parent mirror"
++    now[0] = base_t + FLOOR_S - 0.001
++    worker.round()
++    assert calls == [], "re-verified before the stated 30 s floor"
++    now[0] = base_t + FLOOR_S
++    worker.round()
++    assert calls == [True], "the stated 30 s floor must still re-verify"
++
++
++def test_local_mirror_clobber_recovers_at_floor_through_real_rounds(mirrored):
++    _hub, worker, task, parent, now, calls = mirrored
++    base_t = now[0]
++    assert helpers.evidence.result(worker.conn, task, parent)
++    worker.conn.execute("DELETE FROM kanban_move_parent_results")
++    now[0] += 1.0
++    worker.round()
++    assert calls == [] and helpers.evidence.result(worker.conn, task, parent) is None
++    now[0] = base_t + FLOOR_S - 0.001
++    worker.round()
++    assert calls == [] and helpers.evidence.result(worker.conn, task, parent) is None
++    now[0] = base_t + FLOOR_S
++    worker.round()
++    assert calls == [True]
++    assert helpers.evidence.result(worker.conn, task, parent)
++
++
++@pytest.mark.parametrize("table", ["tasks", "task_runs", "task_events"])
++def test_pulled_parent_rows_refresh_only_changed_parent(mirrored, monkeypatch, table):
++    hub, worker, _task, parent, now, full_calls = mirrored
++    row_calls = []
++    real = gate._refresh_rows
++
++    def rows(live, replica, targets, scoped):
++        row_calls.append(frozenset(targets))
++        return real(live, replica, targets, scoped)
++
++    monkeypatch.setattr(gate, "_refresh_rows", rows)
++    hub.enter()
++    with kbc.write_txn(hub.conn):
++        if table == "tasks":
++            hub.conn.execute("UPDATE tasks SET title='parent edited' WHERE id=?", (parent,))
++        elif table == "task_runs":
++            hub.conn.execute("UPDATE task_runs SET summary='new review evidence' WHERE task_id=?", (parent,))
++        else:
++            hub.conn.execute("UPDATE task_events SET kind='note' WHERE task_id=? AND kind='claimed'", (parent,))
++    hub.round()  # publish through the real fake-Board transport, not a direct gate call
++    full_calls.clear()  # the source gateway's first refresh is not the target's keyed pull
++    row_calls.clear()
++    now[0] += 1
++    result = worker.round()
++    assert int(result.pulled) > 0
++    assert row_calls and parent in set().union(*row_calls), "the pull-applied parent must take the keyed path"
++    assert full_calls == [], "changed rows must not enumerate every foreign parent"
++    payload = json.loads(helpers.evidence.stored(worker.conn, [parent])[parent])
++    if table == "task_runs":
++        assert payload["summary"] == "new review evidence"
++    elif table == "task_events":
++        assert not payload["was_claimed"]
++    row_calls.clear()
++    worker.round()
++    assert row_calls == [] and full_calls == [], "settled follow-up must skip both mirror paths"
++
++
++def test_links_pass_keeps_its_300s_floor(live, kanban_home, monkeypatch):
++    from hermes_cli import kanban_chat_links
++    from hermes_cli import kanban_session_activity as ksa
++    sync.set_mode(live, "primary")
++    monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: [])
++    ksc._LINKS_DONE.clear()
++    now = [5000.0]
++    monkeypatch.setattr(ksc, "_links_clock", lambda: now[0])
++    calls = []
++    real = kanban_chat_links.reconcile
++    monkeypatch.setattr(kanban_chat_links, "reconcile", lambda *a, **k: (calls.append(1), real(*a, **k))[1])
++    boards = [(BOARD, kanban_home / "kanban.db")]
++    for _ in range(3):
++        ksc.reconcile_links(boards, ME, skip_unchanged=True)
++    assert len(calls) == 1
++    now[0] += 299.0  # literal: the stated floor, not the constant under test
++    ksc.reconcile_links(boards, ME, skip_unchanged=True)
++    assert len(calls) == 1
++    now[0] += 1
++    ksc.reconcile_links(boards, ME, skip_unchanged=True)
++    assert len(calls) == 2
+diff --git a/tests/hermes_cli/test_kanban_sync_parent_refresh.py b/tests/hermes_cli/test_kanban_sync_parent_refresh.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f8c47cfa2c3b94908860ae1f5addfced9f8e9971
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_parent_refresh.py
+@@ -0,0 +1,290 @@
++"""Foreign-parent mirror skips content-unchanged rounds, never recovery work."""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_parent_refresh as gate
++from tests.hermes_cli import test_kanban_move_parent_evidence as helpers
++
++svc = helpers.svc
++gws = helpers.gws
++moved_parent = helpers.moved_parent
++original_refresh = sync.refresh_remote_parents
++
++
++@pytest.fixture
++def mirror(moved_parent, monkeypatch):
++    hub, worker, task, parent = moved_parent
++    gate.reset()
++    now = [100.0]
++    monkeypatch.setattr(gate, "_clock", lambda: now[0])
++    calls = []
++    original = sync.refresh_remote_parents
++
++    def refresh(*args, **kwargs):
++        calls.append(True)
++        return original(*args, **kwargs)
++
++    monkeypatch.setattr(sync, "refresh_remote_parents", refresh)
++    def run(**kwargs):
++        return gate.refresh(worker.conn, hub.conn, board="default", **kwargs)
++    run()
++    calls.clear()
++    yield hub, worker, task, parent, now, calls, run
++    gate.reset()
++
++
++def test_unchanged_and_bookkeeping_do_not_refresh(mirror):
++    hub, worker, task, parent, _now, calls, run = mirror
++    assert run() == []
++    worker.conn.execute("UPDATE tasks SET last_heartbeat_at=123 WHERE id=?", (task,))
++    hub.conn.execute("UPDATE tasks SET last_heartbeat_at=124 WHERE id=?", (parent,))
++    assert run() == []
++    assert calls == []
++
++
++@pytest.mark.parametrize("table,column,value", [
++    ("tasks", "status", "ready"),
++    ("task_runs", "outcome", "crashed"),
++])
++def test_remote_changes_rearm(mirror, table, column, value):
++    hub, worker, _task, parent, _now, calls, run = mirror
++    key = "id" if table == "tasks" else "task_id"
++    hub.conn.execute(f"UPDATE {table} SET {column}=? WHERE {key}=?", (value, parent))
++    assert parent in run()
++    assert calls == []  # row-keyed: only the moved parent is re-read, not the whole wanted set
++    assert original_refresh(worker.conn, hub.conn) == []  # the full path agrees: nothing left to change
++
++
++def test_replica_deleted_parent_drops_rows_on_row_path(mirror):
++    hub, worker, task, parent, _now, calls, run = mirror
++    hub.conn.execute("DELETE FROM task_runs WHERE task_id=?", (parent,))
++    hub.conn.execute("DELETE FROM tasks WHERE id=?", (parent,))
++    assert parent in run()
++    assert calls == []
++    assert worker.conn.execute(f"SELECT 1 FROM {sync.REMOTE_PARENTS_TABLE} WHERE parent_id=?", (parent,)).fetchone() is None
++    assert helpers.evidence.result(worker.conn, task, parent) is None
++    assert original_refresh(worker.conn, hub.conn) == []
++
++
++def test_local_unrelated_change_takes_row_path(mirror):
++    hub, worker, task, parent, _now, calls, run = mirror
++    hub.conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
++    worker.conn.execute("UPDATE tasks SET title='edited' WHERE id=?", (task,))
++    assert parent in run()
++    assert calls == []
++    assert original_refresh(worker.conn, hub.conn) == []
++
++
++def _mirrored(worker, parent):
++    status = worker.conn.execute(
++        f"SELECT 1 FROM {sync.REMOTE_PARENTS_TABLE} WHERE parent_id=?", (parent,)).fetchone()
++    return status is not None, worker.conn.execute(
++        "SELECT 1 FROM kanban_move_parent_results WHERE parent_id=?", (parent,)).fetchone() is not None
++
++
++def test_imported_then_deleted_parent_moves_child_scope_on_row_path(mirror):
++    from hermes_cli import kanban_move_parent_evidence as evidence
++
++    hub, worker, task, parent, _now, calls, run = mirror
++    assert _mirrored(worker, parent) == (True, True)
++    assert parent in evidence._parked_scope_uncached(worker.conn)
++    # Imported: the parent becomes a local card, so its child leaves the foreign-parent scope (p.id IS NULL).
++    worker.conn.execute("INSERT INTO tasks (id, title, status, created_at) VALUES (?, 'imported', 'todo', 1)",
++                        (parent,))
++    assert parent in run()
++    assert calls == []
++    assert parent not in evidence._parked_scope_uncached(worker.conn)
++    assert _mirrored(worker, parent) == (False, False)
++    assert original_refresh(worker.conn, hub.conn) == []
++    # Deleted again: the child is back under a foreign parent, and both mirror rows return without a full pass.
++    worker.conn.execute("DELETE FROM tasks WHERE id=?", (parent,))
++    assert parent in run()
++    assert calls == []
++    assert parent in evidence._parked_scope_uncached(worker.conn)
++    assert _mirrored(worker, parent) == (True, True)
++    assert helpers.evidence.result(worker.conn, task, parent)
++    assert original_refresh(worker.conn, hub.conn) == []
++
++
++def test_local_link_to_new_foreign_parent_on_row_path(mirror):
++    hub, worker, _task, _parent, _now, calls, run = mirror
++    other = "t_newforeignparent"
++    hub.conn.execute("INSERT INTO tasks (id, title, status, created_at) VALUES (?, 'p', 'running', 1)", (other,))
++    run()
++    calls.clear()
++    worker.conn.execute("INSERT INTO tasks (id, title, status, created_at) VALUES ('t_newchild', 'c', 'todo', 1)")
++    worker.conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, 't_newchild')", (other,))
++    assert other in run()
++    assert calls == []
++    assert _mirrored(worker, other) == (True, False)  # wanted, but no park or queued move scopes its evidence
++    assert original_refresh(worker.conn, hub.conn) == []
++    worker.conn.execute("DELETE FROM task_links WHERE child_id='t_newchild'")
++    assert other in run()
++    assert calls == []
++    assert _mirrored(worker, other) == (False, False)
++    assert original_refresh(worker.conn, hub.conn) == []
++
++
++def test_row_path_keeps_unscoped_parent_out_of_evidence(mirror):
++    hub, worker, _task, _parent, _now, calls, run = mirror
++    other = "t_unscopedparent"
++    hub.conn.execute("INSERT INTO tasks (id, title, status, created_at) VALUES (?, 'p', 'done', 1)", (other,))
++    hub.conn.execute("INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
++                     "VALUES (?, 'done', 'completed', 1, 2)", (other,))
++    worker.conn.execute("INSERT INTO tasks (id, title, status, created_at) VALUES ('t_unparkedchild', 'c', 'todo', 1)")
++    worker.conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, 't_unparkedchild')", (other,))
++    assert other in run()  # local link: the row path learns the new wanted parent
++    calls.clear()
++    hub.conn.execute("UPDATE task_runs SET outcome='crashed' WHERE task_id=?", (other,))
++    hub.conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (other,))
++    assert other in run()
++    assert calls == []
++    assert worker.conn.execute("SELECT 1 FROM kanban_move_parent_results WHERE parent_id=?", (other,)).fetchone() is None
++    assert original_refresh(worker.conn, hub.conn) == []
++
++
++def test_row_path_keeps_floor_anchor(mirror):
++    hub, worker, task, parent, now, calls, run = mirror
++    worker.conn.execute("DELETE FROM kanban_move_parent_results")
++    now[0] += gate.MAX_AGE_S - 10
++    hub.conn.execute("UPDATE tasks SET title='unrelated' WHERE id=?", (task,))
++    assert run() == []  # a replica row outside the wanted set: nothing to re-read
++    assert calls == []
++    now[0] += 10  # 30s after the last FULL path, not after the row-keyed round
++    assert parent in run()
++    assert calls == [True]
++    assert helpers.evidence.result(worker.conn, task, parent)
++
++
++def test_local_park_event_rearms_without_feed(mirror):
++    hub, worker, task, parent, _now, calls, run = mirror
++    worker.conn.execute("DELETE FROM task_events WHERE task_id=? AND kind IN ('dependency_wait','moved')", (task,))
++    assert parent in run()
++    assert calls == []  # row path: the parent left the evidence scope the previous round read
++    assert _mirrored(worker, parent) == (True, False)
++    assert original_refresh(worker.conn, hub.conn) == []
++
++
++def test_mirror_clobber_recovers_at_floor_without_pull(mirror):
++    _hub, worker, task, parent, now, calls, run = mirror
++    worker.conn.execute("DELETE FROM kanban_move_parent_results")
++    assert run() == []
++    assert calls == []
++    now[0] += gate.MAX_AGE_S
++    assert parent in run()
++    assert calls == [True]
++    assert helpers.evidence.result(worker.conn, task, parent)
++
++
++def test_failure_does_not_publish_skip(mirror, monkeypatch):
++    _hub, _worker, _task, _parent, now, calls, run = mirror
++    now[0] += gate.MAX_AGE_S
++    original = sync.refresh_remote_parents
++    monkeypatch.setattr(sync, "refresh_remote_parents",
++                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("failure")))
++    with pytest.raises(RuntimeError, match="failure"):
++        run()
++    monkeypatch.setattr(sync, "refresh_remote_parents", original)
++    run()
++    assert calls == [True]
++
++
++def test_transaction_bypasses_memo_and_rollback_does_not_poison(mirror):
++    _hub, worker, task, parent, _now, calls, run = mirror
++    worker.conn.execute("BEGIN")
++    worker.conn.execute("DELETE FROM task_events WHERE task_id=? AND kind IN ('dependency_wait','moved')", (task,))
++    with pytest.raises(RuntimeError, match="already inside a transaction"):
++        run()  # underlying writer keeps its no-nesting contract; no memo is published
++    worker.conn.execute("ROLLBACK")
++    run()
++    assert calls == [True, True]
++    assert helpers.evidence.result(worker.conn, task, parent)
++
++
++_PARK_KINDS = "('dependency_wait','moved')"
++
++
++def _park_rows(conn, task):
++    return conn.execute(f"SELECT * FROM task_events WHERE task_id=? AND kind IN {_PARK_KINDS} ORDER BY id",
++                        (task,)).fetchall()
++
++
++def _restore(conn, rows):
++    for r in rows:
++        cols = list(r.keys())
++        conn.execute(f"INSERT INTO task_events ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})", tuple(r))
++
++
++def test_full_path_stamps_the_scope_it_applied(mirror, monkeypatch):
++    """A scope that drops a parent while the full path runs, then regains it, still re-reads that parent."""
++    hub, worker, task, parent, now, calls, run = mirror
++    saved = _park_rows(worker.conn, task)
++    now[0] += gate.MAX_AGE_S
++    real = helpers.evidence._evidence_scope
++    reads = [0]
++
++    def scope(live):
++        reads[0] += 1
++        if reads[0] == 2:  # a second read inside the full path would see the child's park gone
++            live.execute(f"DELETE FROM task_events WHERE task_id=? AND kind IN {_PARK_KINDS}", (task,))
++        return real(live)
++
++    monkeypatch.setattr(helpers.evidence, "_evidence_scope", scope)
++    run()
++    monkeypatch.setattr(helpers.evidence, "_evidence_scope", real)
++    assert calls == [True]
++    deleted = reads[0] >= 2
++    if deleted:
++        _restore(worker.conn, saved)
++    assert reads[0] == 1  # the full path builds the mirror from the very scope the gate stamps
++    calls.clear()
++    run()
++    assert calls == []
++    assert _mirrored(worker, parent) == (True, True)
++    assert original_refresh(worker.conn, hub.conn) == []
++
++
++def test_parent_reenters_scope_on_row_path(mirror):
++    hub, worker, task, parent, _now, calls, run = mirror
++    saved = _park_rows(worker.conn, task)
++    worker.conn.execute(f"DELETE FROM task_events WHERE task_id=? AND kind IN {_PARK_KINDS}", (task,))
++    run()
++    assert _mirrored(worker, parent) == (True, False)
++    _restore(worker.conn, saved)
++    assert parent in run()
++    assert calls == []
++    assert _mirrored(worker, parent) == (True, True)
++    assert original_refresh(worker.conn, hub.conn) == []
++
++
++def test_child_done_leaves_scope_on_row_path(mirror):
++    hub, worker, task, parent, _now, calls, run = mirror
++    worker.conn.execute("UPDATE tasks SET status='done' WHERE id=?", (task,))
++    assert parent in run()
++    assert calls == []
++    assert _mirrored(worker, parent) == (True, False)
++    assert original_refresh(worker.conn, hub.conn) == []
++
++
++def test_replica_claimed_event_on_row_path(mirror):
++    hub, worker, _task, parent, _now, calls, run = mirror
++    rid = hub.conn.execute("SELECT MAX(id) FROM task_runs WHERE task_id=?", (parent,)).fetchone()[0]
++    hub.conn.execute("DELETE FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed'", (parent, rid))
++    assert parent in run()
++    assert calls == []
++    assert original_refresh(worker.conn, hub.conn) == []
++
++
++def test_replica_run_bookkeeping_is_not_mirrored(mirror):
++    """The P2 cursor never marks bookkeeping run columns, so the mirror must not carry them either."""
++    hub, worker, task, parent, now, calls, run = mirror
++    hub.conn.execute("UPDATE task_runs SET last_heartbeat_at=999, worker_pid=4242 WHERE task_id=?", (parent,))
++    assert run() == []
++    assert original_refresh(worker.conn, hub.conn) == []
++    now[0] += gate.MAX_AGE_S
++    assert run() == []  # the floor's full path finds nothing either: no spurious dispatcher wake
++    assert calls == [True]
++    mirrored = helpers.evidence.result(worker.conn, task, parent)
++    assert mirrored and "last_heartbeat_at" not in mirrored and "worker_pid" not in mirrored
+diff --git a/tests/hermes_cli/test_kanban_sync_repair_content.py b/tests/hermes_cli/test_kanban_sync_repair_content.py
+index 90ca2d5d48bead1365f78ed3b1702acbd23ccf58..deb06b229c09494f798eb27d5335f25dca8e3455 100644
+--- a/tests/hermes_cli/test_kanban_sync_repair_content.py
++++ b/tests/hermes_cli/test_kanban_sync_repair_content.py
+@@ -49,10 +49,16 @@ def test_event_only_feed_skips_content_and_partition_repairs(
+         assert not any(calls.values())  # Warm unchanged ticks also do no scans.
+         refreshes = []
+         refresh = window.sync.refresh_remote_parents
+-        def refreshed(*args):
++        def refreshed(*args, **kwargs):
+             refreshes.append(True)
+-            return refresh(*args)
++            return refresh(*args, **kwargs)
+         monkeypatch.setattr(window.sync, "refresh_remote_parents", refreshed)
++        from hermes_cli import kanban_sync_parent_refresh as parent_gate
++        rows = parent_gate._refresh_rows
++        def row_refreshed(*args, **kwargs):
++            refreshes.append(True)  # the keyed path re-reads just the moved parent
++            return rows(*args, **kwargs)
++        monkeypatch.setattr(parent_gate, "_refresh_rows", row_refreshed)
+         clock[0] += ksc.REPLICA_REPAIR_MIN_S + 1
+         window._remote(svc, table="task_events", uid="event-foreign", fields={
+             "task_id": parent, "kind": "commented", "created_at": 1, "payload": "{}",
+-- 
+2.43.0
+

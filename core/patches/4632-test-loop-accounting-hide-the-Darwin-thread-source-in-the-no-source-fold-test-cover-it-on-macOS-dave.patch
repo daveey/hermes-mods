@@ -1,0 +1,117 @@
+From bdf66183254cf6a641371b1998310640626b00d0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 17:05:57 +0000
+Subject: [PATCH] test(loop-accounting): hide the Darwin thread source in the
+ no-source fold test; cover it on macOS [daveey]
+
+Problem: on every Mac since 80c0c4c277e6 (#3350, merged 2026-11-15),
+test_without_procfs_snapshot_folds_exited_threads fails at its first assertion,
+`all(row["cpu_s"] is None for row in snap["threads"])` (test_loop_accounting.py:343).
+`hermes-core-wt test --local tests/hermes_cli/test_loop_accounting.py` on main
+9b85c0d0590 (macOS 26, Python 3.14): 1 failed, 47 passed, 2 skipped. Linux CI
+is green.
+
+Why 1: hiding /proc on a Mac does not remove every per-thread CPU source:
+  thread_cpu() falls through to `if not tids and sys.platform == "darwin":`
+  ... `_darwin_thread_cpu()`, so every row carries a measured cpu_s
+  (hermes_cli/loop_accounting.py, thread_cpu()).
+Why 2: the test (1cd1ecc706b) predates that branch and equated "no /proc" with
+  "macOS, no per-thread source". 80c0c4c277e6 added the branch and a macOS test
+  in test_loop_accounting_residual.py but left this test alone (`git show --stat
+  80c0c4c277e6`: aux_provider_handoff.py, loop_accounting.py,
+  test_loop_accounting_residual.py).
+Root (happened): the test modelled "no per-thread source" by hiding one source,
+  so a second source on that OS silently changed what it tests.
+Root (not caught): unmarked tests never run on macOS. macos-os-tests.yml (and
+  tests-os.yml's macOS row) import the files list_os_marked_tests.py lists and
+  run only `-m "platforms and ..."`; Linux CI has /proc, so the Darwin branch is
+  dead there; Mac hosts are admitted only for single-file `test --local` checks,
+  and #3350's reviews ran on Linux hosts.
+Recurrence: first occurrence found. The earlier macOS-lane failures (#3113,
+  test_sudo_askpass_delivery) were caught by the lane itself. Open PR #3328
+  stubs this test differently, as part of a separate design that never landed.
+
+Countermeasures:
+- symptom: the no-source test stubs both sources (/proc and _darwin_thread_cpu),
+  so it tests the no-source fold path on every host. proof: M1 below.
+- detection: the new @pytest.mark.platforms("macos") test
+  test_darwin_thread_source_rows_carry_cpu_and_exited_threads_fold keeps the
+  real Darwin source covered in the macOS lane (rows carry CPU, the
+  exited/unaccounted split is computed, exited threads still fold): the Mac
+  coverage the stubbed test stops giving. proof: M2 and M3 below.
+- root (deferred): t_7b1a094b9b4137ed widens the macOS lane to the unmarked
+  tests of the files it already imports.
+
+Proof (Mac-native `hermes-core-wt test --local`, macOS 26, Python 3.14):
+- main 9b85c0d0590: 1 failed, 47 passed, 2 skipped (RED; the retry still fails).
+- this change: 49 passed, 0 failed, 2 skipped (GREEN).
+- M1, stub removed (= the original bug): no-source test FAILED, Darwin test passed.
+- M2, Darwin rows lose cpu_s: Darwin test FAILED, no-source test passed.
+- M3, exit-queue fold and live-id sweep disabled: both FAILED (7 failed in the file).
+On Linux the new test is skipped by its platforms marker, and the no-source test
+runs exactly as before.
+---
+ tests/hermes_cli/test_loop_accounting.py | 33 +++++++++++++++++++++++-
+ 1 file changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/tests/hermes_cli/test_loop_accounting.py b/tests/hermes_cli/test_loop_accounting.py
+index 7fe5280831beeb74022c092c62f06e8547b92937..de0012d9461ff144cfab78fbc0587dd5ccc92ddf 100644
+--- a/tests/hermes_cli/test_loop_accounting.py
++++ b/tests/hermes_cli/test_loop_accounting.py
+@@ -316,7 +316,9 @@ def test_per_thread_cpu_covers_each_thread():
+ 
+ 
+ def test_without_procfs_snapshot_folds_exited_threads(monkeypatch):
+-    """macOS has no /proc and never reuses native thread ids: exited threads must still fold, or the map grows."""
++    """With no per-thread CPU source (no /proc, no Darwin proc_pidinfo) rows carry no CPU and native thread ids are
++    never reused: exited threads must still fold, or the map grows. Both sources are hidden, so the test means the
++    same on every host; macOS's real proc_pidinfo source is covered by the platforms("macos") test below. [daveey]"""
+     real_listdir = os.listdir
+ 
+     def no_procfs(path="."):
+@@ -325,6 +327,8 @@ def test_without_procfs_snapshot_folds_exited_threads(monkeypatch):
+         return real_listdir(path)
+ 
+     monkeypatch.setattr(la.os, "listdir", no_procfs)
++    # Hiding /proc alone leaves macOS's proc_pidinfo source live (80c0c4c277e6), so its rows carry CPU.
++    monkeypatch.setattr(la, "_darwin_thread_cpu", list)
+ 
+     def worker():
+         with la.pass_("short-lived"):
+@@ -349,6 +353,33 @@ def test_without_procfs_snapshot_folds_exited_threads(monkeypatch):
+     assert la._state["exited_accounted"] >= 100 * 0.002 * 0.5
+ 
+ 
++@pytest.mark.platforms("macos")
++def test_darwin_thread_source_rows_carry_cpu_and_exited_threads_fold():
++    """Real macOS: no /proc, so per-thread CPU comes from proc_pidinfo (80c0c4c277e6). Live rows carry measured CPU,
++    the exited/unaccounted split is computed, and exited threads still fold out of the map. [daveey]"""
++    assert not os.path.isdir("/proc/self/task")
++
++    def worker():
++        with la.pass_("short-lived"):
++            _burn(0.002)
++
++    for _ in range(5):
++        threads = [threading.Thread(target=worker) for _ in range(20)]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join()
++        with la._lock:
++            accounted_before_fold = sum(la._thread_accounted.values()) + la._state.get("exited_accounted", 0.0)
++        snap = la.snapshot()
++        assert snap["threads"] and all(row["cpu_s"] is not None for row in snap["threads"])
++        assert len(la._thread_accounted) <= threading.active_count()
++        assert snap["process"]["accounted_cpu_s"] == pytest.approx(accounted_before_fold, abs=1e-5)
++        assert snap["process"]["exited_threads_cpu_s"] is not None
++        assert snap["process"]["unaccounted_live_cpu_s"] is not None
++    assert la._state["exited_accounted"] >= 100 * 0.002 * 0.5
++
++
+ def test_snapshot_file_is_atomic_json_with_role_pid_and_counters(tmp_path):
+     with la.pass_("loop") as p:
+         p.rows(2)
+-- 
+2.43.0
+

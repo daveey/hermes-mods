@@ -1,0 +1,122 @@
+From adcf9a6099eacf8278e22145c21f2791bb8556f5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:40:37 +0000
+Subject: [PATCH] [daveey] Carry qualified forwarding authority through
+ placement CLI arguments
+
+---
+ hermes_cli/kanban_placement.py                | 18 +++++--
+ .../hermes_cli/test_placement_forward_argv.py | 49 +++++++++++++++++++
+ 2 files changed, 64 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_placement_forward_argv.py
+
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 03071d92b4d6f1d74f306ecefcbef95836456241..6da4cfe02ce0465f2bb3a86c8111cec5366cdda7 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -1274,9 +1274,13 @@ def remote_body(args: dict, *, self_gw: str, target: str, carried: bool = False)
+ 
+ def create_remote(args: dict, *, target: str, origin_session: Optional[str], origin_profile: str,
+                   self_gw: str, cfg: Optional[dict] = None, hub_cli: str = "hermes-hub",
+-                  transport_key: Optional[str] = None) -> dict:
++                  transport_key: Optional[str] = None, origin_gateway: Optional[str] = None,
++                  creator: Optional[dict] = None, run_uid: Optional[str] = None) -> dict:
+     """Queue on ``target``; a fatal refusal must not fall back to a second local card."""
+     c = _Cfg(config() if cfg is None else cfg)
++    foreign_origin = bool(origin_gateway and origin_gateway != self_gw)
++    if foreign_origin and (not origin_session or not creator or not run_uid):
++        return {"ok": False, "fatal": True, "error": "foreign origin requires creator owner and run authority"}
+     carried = hub_carries_options(hub_cli)
+     if not carried and any(args.get(k) not in (None, "", []) for k in (*IDENTITY_OPTIONS, "self_work")):
+         return {"ok": False, "fatal": True, "error": "create identity requires hermes-hub create-task --option"}
+@@ -1287,7 +1291,7 @@ def create_remote(args: dict, *, target: str, origin_session: Optional[str], ori
+     transport_args = {**args, "idempotency_key": transport_key} if transport_key else args
+     rid = request_id(self_gw, transport_args, origin_session or "", options)
+     prior = remote_state(rid)
+-    if prior in ("queued", "sent", "done") and not options.get("idempotency_key"):
++    if prior in ("queued", "sent", "done") and not options.get("idempotency_key") and not foreign_origin:
+         # Content-addressed retries need no send. Explicit keys must let the courier compare
+         # the complete envelope: the same key can also name changed or formerly dropped metadata.
+         return {"ok": True, "request_id": rid, "queued_only": False, "retry": True}
+@@ -1299,6 +1303,14 @@ def create_remote(args: dict, *, target: str, origin_session: Optional[str], ori
+     if origin_session:
+         argv += ["--origin-session", origin_session, "--origin-profile", origin_profile,
+                  "--creator-session", c.creator_session(target)]
++        if foreign_origin:
++            argv += ["--origin-gateway", origin_gateway, "--creator-run", run_uid]
++            for field, flag in (("gateway", "gateway"), ("profile", "profile"),
++                                ("board", "board"), ("task_id", "task")):
++                value = creator.get(field)
++                if not isinstance(value, str) or not value:
++                    return {"ok": False, "fatal": True, "error": "foreign origin creator identity incomplete"}
++                argv += ["--creator-" + flag, value]
+     else:
+         argv += ["--origin-session", ""]
+     rc, out, err = hub_runner(argv)
+@@ -1306,7 +1318,7 @@ def create_remote(args: dict, *, target: str, origin_session: Optional[str], ori
+         return {"ok": True, "request_id": rid, "queued_only": False, "retry": prior is not None}
+     if rc == 3:  # hub unreachable after the liveness check: queued, sent on the next sync (durable)
+         return {"ok": True, "request_id": rid, "queued_only": prior != "done", "retry": prior is not None}
+-    return {"ok": False, "request_id": rid, "rc": rc, "fatal": "request_id_conflict" in (err or out),
++    return {"ok": False, "request_id": rid, "rc": rc, "fatal": foreign_origin or "request_id_conflict" in (err or out),
+             "error": (err or out)[-400:]}
+ 
+ 
+diff --git a/tests/hermes_cli/test_placement_forward_argv.py b/tests/hermes_cli/test_placement_forward_argv.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..317cb7689c4e2807c21df6f2a953948abe0d77a1
+--- /dev/null
++++ b/tests/hermes_cli/test_placement_forward_argv.py
+@@ -0,0 +1,49 @@
++"""Foreign placement origins retain qualified authority at the CLI boundary."""
++import pytest
++
++from hermes_cli import kanban_placement as kp
++
++
++@pytest.fixture
++def transport(monkeypatch):
++    calls = []
++    monkeypatch.setattr(kp, "hub_carries_options", lambda cli: True)
++    monkeypatch.setattr(kp, "remote_state", lambda rid: "queued")
++    monkeypatch.setattr(kp, "hub_runner", lambda argv: calls.append(argv) or (0, "", ""))
++    return calls
++
++
++def send(**overrides):
++    kwargs = {"target": "hub", "self_gw": "worker-7", "origin_session": "chat-one",
++              "origin_profile": "default", "origin_gateway": "macbook", "run_uid": "run-one",
++              "creator": {"gateway": "hub", "profile": "default", "board": "default", "task_id": "t_parent"},
++              "cfg": {"creator_session": "worker-session"}}
++    return kp.create_remote({"title": "Build", "assignee": "default"}, **{**kwargs, **overrides})
++
++
++def test_foreign_retry_rechecks_full_envelope_at_real_cli_boundary(transport):
++    assert send()["ok"]
++    argv = transport[0]
++    for flag, value in {"origin-gateway": "macbook", "origin-session": "chat-one",
++                        "origin-profile": "default", "creator-gateway": "hub", "creator-profile": "default",
++                        "creator-board": "default", "creator-task": "t_parent", "creator-run": "run-one"}.items():
++        assert argv[argv.index("--" + flag) + 1] == value
++
++
++@pytest.mark.parametrize("override", [{"creator": None}, {"run_uid": None}, {"origin_session": None},
++                                      {"creator": {"gateway": "hub"}}])
++def test_missing_foreign_authority_is_fatal_without_send(transport, override):
++    result = send(**override)
++    assert not result["ok"] and result["fatal"]
++    assert not transport
++
++
++def test_old_courier_refusal_cannot_fall_back_to_local(transport, monkeypatch):
++    monkeypatch.setattr(kp, "hub_runner", lambda argv: (2, "", "unknown --origin-gateway"))
++    result = send()
++    assert not result["ok"] and result["fatal"]
++
++
++def test_same_gateway_retry_keeps_existing_behavior(transport):
++    assert send(origin_gateway="worker-7")["retry"]
++    assert not transport
+-- 
+2.43.0
+

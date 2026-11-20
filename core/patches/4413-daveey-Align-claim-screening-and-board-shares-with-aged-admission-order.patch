@@ -1,0 +1,451 @@
+From aedb2a23013693ecb9d682d810be1fb6e0ec43d9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 06:36:22 +0000
+Subject: [PATCH] [daveey] Align claim screening and board shares with aged
+ admission order
+
+Follow-up to #3191 (t_a3dd31b927bb0457). The dispatcher now ranks ready and
+review together by the aged admission score; two consumers that promise "the
+dispatcher's own order" did not:
+
+1. kanban_hub_admission_claim._candidates walked the ready lane, then appended
+   review. A review card the claim pass reaches first could be deferred while
+   lower-ranked ready cards spent the 3-call judge budget and were claimed.
+   It now ranks the frozen ready+review lanes with
+   order_with_remote_waiters (review only when review dispatch is on).
+
+2. kanban_board_share.candidates ordered by raw SQL DISPATCH_ORDER with LIMIT
+   and Candidate.rank compared priority only, so cross-board quotas ignored
+   readiness aging (only the 2 h STARVE_SECONDS guard helped). Every eligible
+   card is now scored with kanban_admission_score.rank before the cut, with
+   one shared tick timestamp. Across boards a card's age counts from the later
+   of its ready/review entry and its board's latest worker start, so a head
+   the claim loop keeps skipping cannot age into every tick's first pick.
+   STARVE_SECONDS stays as an independent per-board minimum-service guard.
+   An unreadable score falls back to raw priority (dispatcher's fallback).
+
+Tests: 4-card judge-budget review-first case + review-dispatch-off control;
+cross-board aged-below-LIMIT winner, served-board age floor, score fallback.
+---
+ hermes_cli/kanban_board_share.py              | 101 +++++++++++++-----
+ hermes_cli/kanban_hub_admission_claim.py      |  33 ++++--
+ .../gateway/test_kanban_cross_board_slots.py  |  50 +++++++++
+ .../test_kanban_hub_admission_claim.py        |  40 +++++++
+ .../test_kanban_hub_claim_wake_race.py        |  15 ++-
+ 5 files changed, 195 insertions(+), 44 deletions(-)
+
+diff --git a/hermes_cli/kanban_board_share.py b/hermes_cli/kanban_board_share.py
+index f2bb05d65bb255730ae01e94c27a14c4b4dc5f49..9ea0db5244fbabc9fd7e84fa92424ae58031f2f1 100644
+--- a/hermes_cli/kanban_board_share.py
++++ b/hermes_cli/kanban_board_share.py
+@@ -9,23 +9,32 @@ cards, so a freed slot went to whichever board's turn came first, not to the bes
+ 60320, which could not help (effective priority is capped at ``kanban_priority.PRIORITY_CAP``, 1000, anyway).
+ 
+ When the free slots are fewer than the dispatchable cards on all boards, :func:`shares` ranks every board's cards
+-in the dispatcher's own order (effective priority, then cards others wait on, then age) and gives each board a
+-spawn quota: how many of the top ``free`` cards are its own. :func:`run` ticks the boards with a quota first and
+-hands a quota a board could not spend (a claim refused at spawn time) to the next board. Without contention it
+-returns None and every board ticks as before.
+-
+-Starvation guard (deliberate per-board minimum): priorities are set per board by different owners, so pure
+-priority would let one board's flood of high numbers hold another board's cards forever. A board whose top card
+-has been ready :data:`STARVE_SECONDS` or longer, while the board started no card, takes the first pick (oldest wait
+-first), so no board waits much longer than that plus one worker turnover, and a head that can never start wins
+-its board at most one starvation pick per window. Ranking is advisory: guards and refusals decided at claim time
+-are not modelled, and the host cap check in each board's tick stays authoritative.
++in the dispatcher's own order and gives each board a spawn quota: how many of the top ``free`` cards are its own.
++:func:`run` ticks the boards with a quota first and hands a quota a board could not spend (a claim refused at spawn
++time) to the next board. Without contention it returns None and every board ticks as before.
++
++The order is the dispatcher's aged admission score (``kanban_admission_score.rank``: effective priority, class,
++cards waiting on it, minutes waiting, failures), computed over every eligible card before the per-board cut, so a
++long-waiting low-priority card on another board outranks fresh higher-priority work after (priority gap / age
++weight) minutes instead of only through the starvation guard (t_a3dd31b927bb0457). One difference: across boards a
++card's age counts from the later of its ready/review entry and its board's latest worker start. A board that keeps
++starting cards is being served, and its own tick spends a quota in its own aged order; without the floor, a head
++the claim loop keeps skipping (respawn guard, per-profile cap, pacing) would age into every tick's first pick and
++hand its board's slots to lower cards there. Its board wins again only once it has started nothing for that long.
++
++Starvation guard (deliberate per-board minimum, kept alongside aging): priorities are set per board by different
++owners, so a board whose top card has been ready :data:`STARVE_SECONDS` or longer, while the board started no card,
++takes the first pick (oldest wait first) whatever the scores, so no board waits much longer than that plus one
++worker turnover, and a head that can never start wins its board at most one starvation pick per window. Ranking is
++advisory: guards and refusals decided at claim time are not modelled, and the host cap check in each board's tick
++stays authoritative.
+ """
+ from __future__ import annotations
+ 
+ import contextlib
+ import heapq
+ import logging
++import sqlite3
+ import threading
+ import time
+ from pathlib import Path
+@@ -42,33 +51,67 @@ class Candidate(NamedTuple):
+     priority: int
+     waited_on: bool
+     created_at: float
+-    ready_since: float
++    ready_since: float  # the starvation clock, set on a board's head only (:func:`_starve_clock`)
++    score: Optional[float] = None  # cross-board aged admission score; None: raw effective priority (fallback)
++    since: float = 0.0  # the score's age clock: its first tie-break, as in ``kanban_admission_score.rank``
+ 
+     def rank(self) -> tuple:
+-        return (-self.priority, not self.waited_on, self.created_at, self.task_id)
++        if self.score is None:
++            return (-self.priority, self.since, not self.waited_on, self.created_at, self.task_id)
++        return (-self.score, self.since, False, self.created_at, self.task_id)
+ 
+ 
+-def candidates(conn, limit: int) -> list[Candidate]:
+-    """Up to ``limit`` unclaimed ready (and review, when review dispatch is on) cards this host could start, in
+-    dispatch order; cards this gateway cannot lease (``dispatch_refusals``) are left out."""
++def candidates(conn, limit: int, *, now: Optional[float] = None) -> list[Candidate]:
++    """Up to ``limit`` unclaimed ready (and review, when review dispatch is on) cards this host could start, best
++    first; cards this gateway cannot lease (``dispatch_refusals``) are left out. Every eligible card is scored
++    before the cut, so an aged card below a priority-ordered ``LIMIT`` is not dropped unseen."""
+     from hermes_cli.kanban_db_dispatch import review_dispatch_enabled
+     from hermes_cli.kanban_db_dispatch_queries import _WAITERS, DISPATCH_ORDER, EFFECTIVE_PRIORITY
+     from hermes_cli.kanban_worker_node import dispatch_refusals
+-    found: list[Candidate] = []
++    now = time.time() if now is None else now
++    rows: list = []
+     for status in ("ready", "review") if review_dispatch_enabled() else ("ready",):
+         refused = dispatch_refusals(conn, status)
+-        rows = conn.execute(
++        rows += [r for r in conn.execute(
+             f"SELECT id, created_at, {EFFECTIVE_PRIORITY} AS eff, EXISTS (SELECT 1 {_WAITERS}) AS waited "
+-            f"FROM tasks WHERE status = ? AND claim_lock IS NULL ORDER BY {DISPATCH_ORDER} LIMIT ?",
+-            (status, limit + len(refused))).fetchall()
+-        found += [Candidate(r["id"], int(r["eff"] or 0), bool(r["waited"]), float(r["created_at"] or 0), 0.0)
+-                  for r in rows if r["id"] not in refused]
+-    found = sorted(found, key=Candidate.rank)[:limit]
++            f"FROM tasks WHERE status = ? AND claim_lock IS NULL ORDER BY {DISPATCH_ORDER}", (status,)).fetchall()
++                 if r["id"] not in refused]
++    found = sorted(_scored(conn, rows, now), key=Candidate.rank)[:limit]
+     if found:  # only the head's wait decides starvation; one event scan per board
+         found[0] = found[0]._replace(ready_since=_starve_clock(conn, found[0]))
+     return found
+ 
+ 
++def _scored(conn, rows: list, now: float) -> list[Candidate]:
++    """``rows`` as candidates scored by the dispatcher's aged admission score, with the age component counted
++    from the later of the card's ready/review entry and the board's latest worker start (see the module
++    docstring). Raw effective priority when the score cannot be read (the dispatcher's own fallback)."""
++    from hermes_cli.kanban_admission_score import AGE_BUCKET_S, rank
++    plain = [Candidate(r["id"], int(r["eff"] or 0), bool(r["waited"]), float(r["created_at"] or 0), 0.0)
++             for r in rows]
++    try:
++        scored = rank(conn, rows, now_ms=int(now * 1000))
++    except (sqlite3.Error, OSError, ValueError):
++        _log.warning("kanban dispatcher: cross-board admission score unavailable; ranking by priority",
++                     exc_info=True)
++        return plain
++    served = _served_at(conn)
++    by_id = {c.task_id: c for c in plain}
++    out = []
++    for row, parts in scored:
++        since = max(parts.ready_since, served)
++        age = dict(parts.weights)["age"]
++        score = parts.total - age * (parts.age_buckets - max(0, int(now - since)) // AGE_BUCKET_S)
++        out.append(by_id[row["id"]]._replace(priority=parts.effective_priority, score=score, since=float(since)))
++    return out
++
++
++def _served_at(conn) -> int:
++    """The board's latest worker start (0 if none): the floor of its cards' cross-board age."""
++    row = conn.execute("SELECT MAX(started_at) FROM task_runs").fetchone()
++    return int(row[0] or 0) if row is not None else 0
++
++
+ def _starve_clock(conn, head: Candidate) -> float:
+     """When the board's starvation wait began: the head's last entry into ready, or the board's latest worker
+     start if later. A board that starts any card is served, so a head the claim loop keeps skipping (dispatch
+@@ -76,8 +119,7 @@ def _starve_clock(conn, head: Candidate) -> float:
+     :data:`STARVE_SECONDS` instead of the first pick on every tick."""
+     from hermes_cli.kanban_parent_unclaimed import ready_since
+     since = float(ready_since(conn, head.task_id, int(head.created_at)))
+-    row = conn.execute("SELECT MAX(started_at) FROM task_runs").fetchone()
+-    return max(since, float(row[0] or 0)) if row is not None else since
++    return max(since, float(_served_at(conn)))
+ 
+ 
+ def _starved(cands: list[Candidate], now: float) -> bool:
+@@ -130,6 +172,7 @@ def shares(slugs: list[str], cap: Optional[int], *, now: Optional[float] = None)
+     if cap is None or len(slugs) < 2:
+         return None
+     from hermes_cli.kanban_db_dispatch import count_running_tasks
++    now = time.time() if now is None else now
+     heads: dict[str, list[Candidate]] = {}
+     paths: set[str] = set()
+     running = 0
+@@ -141,10 +184,10 @@ def shares(slugs: list[str], cap: Optional[int], *, now: Optional[float] = None)
+                     return None
+                 paths.add(path)
+                 running += count_running_tasks(conn)
+-                heads[slug] = candidates(conn, cap)
++                heads[slug] = candidates(conn, cap, now=now)
+         except Exception:  # health: allow BLE001 -- an unreadable (e.g. quarantined) board only gets unspent quota
+             _log.debug("kanban dispatcher: board %s unreadable for cross-board slot ranking", slug, exc_info=True)
+-    return plan(heads, cap - running, now=time.time() if now is None else now)
++    return plan(heads, cap - running, now=now)
+ 
+ 
+ _tick = threading.local()
+@@ -234,7 +277,7 @@ def ahead_elsewhere(conn, task_id: str, *, now: Optional[float] = None, limit: i
+     the host's), a starved board's head included. 0 when the card is not a candidate or no other board exists."""
+     from hermes_cli import kanban_db as kb
+     now = time.time() if now is None else now
+-    mine = candidates(conn, limit)
++    mine = candidates(conn, limit, now=now)
+     own = next((c for c in mine if c.task_id == task_id), None)
+     if own is None:
+         return 0
+@@ -247,7 +290,7 @@ def ahead_elsewhere(conn, task_id: str, *, now: Optional[float] = None, limit: i
+             with _board_conn(slug) as other:
+                 if _db_path(other) == own_path:
+                     continue
+-                cands = candidates(other, limit)
++                cands = candidates(other, limit, now=now)
+         except Exception:  # health: allow BLE001 -- an unreadable board adds nothing to an advisory count
+             _log.debug("kanban queue position: board %s unreadable", slug, exc_info=True)
+             continue
+diff --git a/hermes_cli/kanban_hub_admission_claim.py b/hermes_cli/kanban_hub_admission_claim.py
+index f996248d77f37f803feb913d7a36d2e0043ee87d..868b0f81a83d40a55131c9fc5878e079a2f01f57 100644
+--- a/hermes_cli/kanban_hub_admission_claim.py
++++ b/hermes_cli/kanban_hub_admission_claim.py
+@@ -95,13 +95,22 @@ def _eligible(conn: sqlite3.Connection, card: sqlite3.Row) -> bool:
+     return bool(prior and prior.get("admit") is False and not prior.get("forced"))
+ 
+ 
+-def _candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
++def _candidates(conn: sqlite3.Connection, lanes: Optional[list] = None) -> list[sqlite3.Row]:
+     """Screenable cards in the claim pass's own dispatch order, so the per-tick judge budget covers the cards the
+-    claims reach first and never lets lower-priority work jump a deferred higher-priority card."""
+-    from hermes_cli.kanban_admission_pools import lane_rows
++    claims reach first and never lets lower-priority work jump a deferred higher-priority card.
++
++    That order is ONE ranking of ready and review together (``kanban_db_dispatch`` ranks its frozen lanes with
++    :func:`kanban_dispatch_priority.order_with_remote_waiters`, the aged admission score), not the ready lane
++    followed by the review lane: there, a review card the claim pass reaches first was deferred while lower ready
++    cards spent the judge budget. ``lanes``: the dispatcher's frozen ready + review rows (review only when review
++    dispatch is on); None reads both lanes now."""
++    from hermes_cli.kanban_dispatch_priority import order_with_remote_waiters
++    if lanes is None:
++        from hermes_cli.kanban_admission_pools import lane_rows
++        lanes = lane_rows(conn, "ready") + lane_rows(conn, "review")
+     rows = {row["id"]: row for row in conn.execute(f"SELECT * FROM tasks WHERE {_SCREENABLE}").fetchall()}
+-    lanes = lane_rows(conn, "ready") + lane_rows(conn, "review")
+-    return [rows[row["id"]] for row in lanes if row["id"] in rows and _eligible(conn, rows[row["id"]])]
++    ordered = order_with_remote_waiters(conn, [row for row in lanes if row["id"] in rows])
++    return [rows[row["id"]] for row in ordered if _eligible(conn, rows[row["id"]])]
+ 
+ 
+ def _current(conn: sqlite3.Connection, tid: str) -> tuple[Optional[sqlite3.Row], int]:
+@@ -164,9 +173,11 @@ def _event_head(conn: sqlite3.Connection, tid: str) -> int:
+     return conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?", (tid,)).fetchone()[0]
+ 
+ 
+-def screen(conn: sqlite3.Connection, *, cfg: Optional[dict] = None, budget: int = MAX_JUDGED_PER_TICK) -> Counts:
++def screen(conn: sqlite3.Connection, *, cfg: Optional[dict] = None, budget: int = MAX_JUDGED_PER_TICK,
++           lanes: Optional[list] = None) -> Counts:
+     """Judge this hub's ready, label-less, unjudged cards before the claim pass; see the module docstring.
+-    The caller must leave ``deferred_ids`` out of this tick's claims."""
++    ``lanes``: the claim pass's frozen candidates (:func:`_candidates`). The caller must leave ``deferred_ids``
++    out of this tick's claims."""
+     from hermes_cli import kanban_db_sync as sync
+     from hermes_cli import kanban_hub_admission as judge
+     from hermes_cli import kanban_hub_admission_pickup as pickup
+@@ -181,7 +192,7 @@ def screen(conn: sqlite3.Connection, *, cfg: Optional[dict] = None, budget: int
+     board = sync.board_slug_for_path(sync._db_key(conn) or "")
+     down = False
+     calls = 0
+-    for tid in [row["id"] for row in _candidates(conn)]:
++    for tid in [row["id"] for row in _candidates(conn, lanes)]:
+         card, event_head = _current(conn, tid)
+         if card is None:
+             continue
+@@ -334,15 +345,15 @@ def screened_lanes(conn: sqlite3.Connection, dry_run: bool, review_enabled: bool
+     review = lane_rows(conn, "review") if review_enabled else []
+     deferred = set(deferred)
+     if not dry_run and board_mode(conn) == "primary":
+-        deferred.update(safe_screen(conn))
++        deferred.update(safe_screen(conn, ready + review))
+     return ([row for row in ready if row["id"] not in deferred],
+             [row for row in review if row["id"] not in deferred], deferred)
+ 
+ 
+-def safe_screen(conn: sqlite3.Connection) -> frozenset:
++def safe_screen(conn: sqlite3.Connection, lanes: Optional[list] = None) -> frozenset:
+     """Dispatcher seam: a failed screen cannot turn an unresolved deny into permission to claim."""
+     try:
+-        return screen(conn).deferred_ids
++        return screen(conn, lanes=lanes).deferred_ids
+     except Exception:  # health: allow BLE001 -- defer the frozen lanes instead of bypassing admission
+         _log.warning("hub admission: claim screen failed; deferring ready/review claims", exc_info=True)
+         return frozenset(row[0] for row in conn.execute(
+diff --git a/tests/gateway/test_kanban_cross_board_slots.py b/tests/gateway/test_kanban_cross_board_slots.py
+index f2fcc95a3da6a82d3d58d13691ebb19dad90d91c..fbb5810b691039d773effaa514c97d5b04ff8fb6 100644
+--- a/tests/gateway/test_kanban_cross_board_slots.py
++++ b/tests/gateway/test_kanban_cross_board_slots.py
+@@ -138,6 +138,56 @@ def test_a_guarded_starved_head_does_not_win_its_board_every_first_pick(home, mo
+     assert place is not None and "ahead_other_boards" not in place, place
+ 
+ 
++def test_an_aged_card_below_the_priority_limit_wins_the_shared_slot(home, monkeypatch):
++    """Cross-board share ranks by the dispatcher's aged admission score, scored before the per-board cut: hermes'
++    p0 card has waited an hour (score 1500), below a fresh p100 card a priority-ordered ``LIMIT 1`` kept, and
++    outranks default's fresh p900 card well inside :data:`STARVE_SECONDS` (t_a3dd31b927bb0457)."""
++    aged = _card("hermes", "hermes p0, waiting an hour", 0, ready_since=time.time() - 3600)
++    _card("hermes", "hermes p100, fresh", 100)
++    _card("default", "default p900, fresh", 900)
++    spawned = []
++    dispatcher = _dispatcher(monkeypatch, spawned, start_board="default")
++
++    dispatcher.tick_once()
++
++    assert spawned == [("hermes", aged)], spawned
++
++
++def test_a_served_board_does_not_age_across_boards(home, monkeypatch):
++    """The age floor is the board's latest worker start: hermes started a card 5 minutes ago, so its hour-old p0
++    card counts 5 minutes (125) across boards and default's p900 card takes the slot."""
++    _card("hermes", "hermes p0, waiting an hour", 0, ready_since=time.time() - 3600)
++    other = _card("hermes", "hermes p100, fresh", 100)
++    top = _card("default", "default p900, fresh", 900)
++    with kbc.connect_closing(board="hermes") as conn:
++        conn.execute("INSERT INTO task_runs (task_id, status, started_at) VALUES (?, 'done', ?)",
++                     (other, int(time.time() - 300)))
++        conn.commit()
++    spawned = []
++    dispatcher = _dispatcher(monkeypatch, spawned, start_board="hermes")
++
++    dispatcher.tick_once()
++
++    assert spawned == [("default", top)], spawned
++
++
++def test_cross_board_ranking_falls_back_to_priority_when_the_score_is_unreadable(home, monkeypatch):
++    import sqlite3
++
++    from hermes_cli import kanban_admission_score as score
++    from hermes_cli import kanban_board_share as share
++    _card("hermes", "hermes p0, waiting an hour", 0, ready_since=time.time() - 3600)
++    fresh = _card("hermes", "hermes p100, fresh", 100)
++
++    def broken(*_a, **_kw):
++        raise sqlite3.OperationalError("database is locked")
++
++    monkeypatch.setattr(score, "rank", broken)
++    with kbc.connect_closing(board="hermes") as conn:
++        [head] = share.candidates(conn, 1)
++    assert head.task_id == fresh and head.score is None and head.priority == 100
++
++
+ def test_board_started_nothing_keeps_the_starvation_pick(home):
+     from hermes_cli import kanban_board_share as share
+     old = time.time() - share.STARVE_SECONDS - 60
+diff --git a/tests/hermes_cli/test_kanban_hub_admission_claim.py b/tests/hermes_cli/test_kanban_hub_admission_claim.py
+index 456a5cef16a9fd74e6ccd5e46d0762a25f5484e0..36544e620a78d25ddce07b6b7d17f3579f82849a 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission_claim.py
++++ b/tests/hermes_cli/test_kanban_hub_admission_claim.py
+@@ -397,6 +397,46 @@ def test_screen_reports_deferred_ids(gws, hub_judge):
+     assert all(tid in counts.line() for tid in tids[1:]) and tids[0] not in counts.line()
+ 
+ 
++def _aged_review_card(hub, minutes):
++    """A review card whose ready/review interval began ``minutes`` ago: the aged admission score ranks it above
++    fresh higher-priority ready cards (25 points per waiting minute)."""
++    tid = _hub_card(hub, title="aged review card")
++    since = int(time.time()) - minutes * 60
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET status = 'review', created_at = ? WHERE id = ?", (since, tid))
++        hub.conn.execute("UPDATE task_events SET created_at = ? WHERE task_id = ?", (since, tid))
++    return tid
++
++
++def test_the_judge_budget_follows_the_combined_ready_and_review_score_order(gws, hub_judge):
++    """PR #3191 ranks ready and review together by the aged score; the screen used to walk the ready lane and then
++    append review, so a review card the claim pass reaches FIRST was deferred while three lower-ranked ready cards
++    spent the judge budget and were claimed (t_a3dd31b927bb0457)."""
++    hub, _worker, _svc = gws
++    ready = [_hub_card(hub, title=f"ready card {i}", priority=100) for i in range(hac.MAX_JUDGED_PER_TICK)]
++    review = _aged_review_card(hub, 60)
++    hub.enter()
++    order = [row["id"] for row in hac._candidates(hub.conn)]
++    assert order[0] == review and set(order[1:]) == set(ready), order
++    _ready, _review, deferred = hac.screened_lanes(hub.conn, False, True)
++    assert hub_judge.calls[0]["card"]["title"] == "aged review card"
++    assert _events(hub.conn, review, "hub_admission") and review not in deferred
++    assert len(deferred) == 1 and deferred <= set(ready)
++
++
++def test_the_screen_skips_review_cards_when_review_dispatch_is_off(gws, hub_judge):
++    """Control: with review dispatch off the claim pass never reaches review cards, so they spend no judge call."""
++    hub, _worker, _svc = gws
++    ready = [_hub_card(hub, title=f"ready card {i}", priority=100) for i in range(hac.MAX_JUDGED_PER_TICK)]
++    review = _aged_review_card(hub, 60)
++    hub.enter()
++    _ready, review_lane, deferred = hac.screened_lanes(hub.conn, False, False)
++    assert review_lane == [] and not deferred
++    assert len(hub_judge.calls) == hac.MAX_JUDGED_PER_TICK
++    assert all(_events(hub.conn, tid, "hub_admission") for tid in ready)
++    assert _events(hub.conn, review, "hub_admission") == []
++
++
+ def test_deferred_ids_appear_in_the_dispatch_result(gws, hub_judge, monkeypatch, caplog):
+     """A card deferred every tick (kept edited, or a long backlog) must be visible in the tick's diagnostics:
+     ``lane_candidates`` leaves it out, so the result and the log line name it (review of #1811)."""
+diff --git a/tests/hermes_cli/test_kanban_hub_claim_wake_race.py b/tests/hermes_cli/test_kanban_hub_claim_wake_race.py
+index 91399bb72756ba5d7e0578379764431bee727765..a5d0573139c412d0cedb09fd207448f389ffc69a 100644
+--- a/tests/hermes_cli/test_kanban_hub_claim_wake_race.py
++++ b/tests/hermes_cli/test_kanban_hub_claim_wake_race.py
+@@ -54,8 +54,8 @@ def test_wake_after_screen_waits_for_next_judged_pass(gws, hub_judge, monkeypatc
+             kb._append_event(hub.conn, tid, "hub_admission", {"admit": True, "entry": "claim"})
+     real_screen = hac.safe_screen
+ 
+-    def screen_then_wake(conn):
+-        deferred = real_screen(conn)
++    def screen_then_wake(conn, lanes=None):
++        deferred = real_screen(conn, lanes)
+         _deliver(conn, tid, state, now, kind)
+         return deferred
+ 
+@@ -87,16 +87,22 @@ def test_screened_lanes_preserves_dispatch_controls(monkeypatch, dry_run, mode,
+         calls.append(lane)
+         return [{"id": lane}, {"id": "prior"}, {"id": "new"}]
+ 
+-    def screen(conn):
++    def screen(conn, lanes=None):
+         calls.append("screen")
++        screened_rows.append(lanes)
+         return frozenset({"new"})
+ 
++    screened_rows = []
+     monkeypatch.setattr(queries, "lane_rows", rows)
+     monkeypatch.setattr(sync, "board_mode", lambda conn: mode)
+     monkeypatch.setattr(hac, "safe_screen", screen)
+     ready, review, deferred = hac.screened_lanes(None, dry_run, review_enabled, {"prior"})
+     screened = not dry_run and mode == "primary"
+     assert calls == ["ready"] + (["review"] if review_enabled else []) + (["screen"] if screened else [])
++    # The screen judges the frozen lanes in the claim pass's combined order: review only when it dispatches.
++    frozen = [{"id": "ready"}, {"id": "prior"}, {"id": "new"}]
++    frozen += [{"id": "review"}, {"id": "prior"}, {"id": "new"}] if review_enabled else []
++    assert screened_rows == ([frozen] if screened else [])
+     assert deferred == ({"prior", "new"} if screened else {"prior"})
+     assert ready == [{"id": "ready"}] + ([] if screened else [{"id": "new"}])
+     assert review == ([{"id": "review"}] + ([] if screened else [{"id": "new"}]) if review_enabled else [])
+@@ -116,7 +122,8 @@ def test_review_wake_preserves_screen_outcomes(gws, hub_judge, monkeypatch, outc
+     elif outcome == "unavailable":
+         monkeypatch.setattr(judge, "admit", lambda card: judge.Verdict())
+     elif outcome == "budget":
+-        monkeypatch.setattr(hac, "safe_screen", lambda conn: hac.screen(conn, budget=0).deferred_ids)
++        monkeypatch.setattr(hac, "safe_screen", lambda conn, lanes=None: hac.screen(
++            conn, budget=0, lanes=lanes).deferred_ids)
+     result = helpers._tick(hub)
+     assert (helpers._holder(svc, tid) == helpers.HUB) == (outcome == "keep")
+     verdicts = helpers._events(hub.conn, tid, "hub_admission")
+-- 
+2.43.0
+

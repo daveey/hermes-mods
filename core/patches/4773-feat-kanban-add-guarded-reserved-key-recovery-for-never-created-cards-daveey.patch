@@ -1,0 +1,2956 @@
+From 9c5d8c3093d0f3b9f627c698cc1ed2d436a911c4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 05:28:35 +0000
+Subject: [PATCH] feat(kanban): add guarded reserved-key recovery for
+ never-created cards [daveey]
+
+Introduce preview-default, single-card reserved-key correction with authenticated
+never-existed evidence, owner and worker fences, exact local CAS, replacement-key
+uniqueness, and immutable supersession receipts. Publish current corrected parent
+intent before original child identities, retaining audit payloads and preventing
+other-parent synthesis or compatibility downgrades. Track transient retry op IDs.
+Prevent ordinary creation with detector-reserved keys without relaxing provenance.
+
+Why: ordinary callers could create a detector-reserved key locally, then Board
+correctly rejected its provenance. Existing reconciliation could neither edit that
+identity nor safely retire never-created operations. A scoped audited correction
+is required instead of weakening the detector or resetting rejection queues.
+
+Proof: canonical focused suite (7 files) 880 passed; expanded recovery suite
+173 passed. Broad 959-file consumer run: 17600 passed, 24 skipped, two file
+timeouts; focused retry including both timeout files: 265 passed, exit 0.
+Isolated exact-anchor mutation sweeps exercised custody, CAS, evidence, ordering,
+creation, retry and compatibility boundaries; survivor tests added and killed.
+Redundant predicates and crash-only mutants documented, not claimed assertion kills.
+Read-only guard replay across 25 hub DBs: 555 reserved occurrences, exactly one
+newly refused ordinary-invalid target; no detector regressions found.
+New conflict, retry custody, repeat-intent, endpoint synthesis and compatibility
+tests were observed RED before fixes. No production repair executed; operational
+owner retains application and convergence.
+---
+ hermes_cli/kanban_db.py                       |   6 +-
+ hermes_cli/kanban_db_creation.py              |  11 +
+ hermes_cli/kanban_parser.py                   |  11 +
+ hermes_cli/kanban_pickup_alarm_identity.py    |  13 +-
+ hermes_cli/kanban_sync_cli.py                 |  32 +-
+ hermes_cli/kanban_sync_client.py              |  11 +-
+ hermes_cli/kanban_sync_compat.py              |   3 +
+ hermes_cli/kanban_sync_rejections.py          |  18 +-
+ hermes_cli/kanban_sync_reserved_key.py        | 713 ++++++++++++++++++
+ tests/hermes_cli/test_kanban_lanes.py         |   6 +-
+ .../hermes_cli/test_kanban_priority_audit.py  |   3 +-
+ .../test_kanban_sync_reserved_key.py          | 511 +++++++++++++
+ ...est_kanban_sync_reserved_key_boundaries.py | 304 ++++++++
+ .../test_kanban_sync_reserved_key_extra.py    |  98 +++
+ .../test_kanban_sync_reserved_key_extra2.py   | 210 ++++++
+ .../test_kanban_sync_reserved_key_safety.py   | 639 ++++++++++++++++
+ .../features/kanban-reserved-key-recovery.md  |  67 ++
+ website/sidebars.ts                           |   1 +
+ 18 files changed, 2643 insertions(+), 14 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_reserved_key.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_reserved_key.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_reserved_key_boundaries.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_reserved_key_extra.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_reserved_key_extra2.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_reserved_key_safety.py
+ create mode 100644 website/docs/user-guide/features/kanban-reserved-key-recovery.md
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 509cf63ba529efc02a575dfa34a20b695ea3dc70..34f2b31de4902f093051488ad3c647a2a8922821 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1295,10 +1295,10 @@ def create_task(
+     parents = tuple(p for p in parents if p)
+     skills_list = _normalize_task_skills(skills)
+ 
+-    # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
+-    # race may insert twice, the next lookup stabilises on the newest.
++    # Idempotency check BEFORE the write txn (no lock held); a concurrent-create race may insert twice.
+     if idempotency_key:
+-        from hermes_cli.kanban_db_creation import existing_creation_key
++        from hermes_cli.kanban_db_creation import existing_creation_key, reject_reserved_key
++        reject_reserved_key(idempotency_key, created_by)
+         if row := existing_creation_key(conn, idempotency_key):
+             return row["id"]
+ 
+diff --git a/hermes_cli/kanban_db_creation.py b/hermes_cli/kanban_db_creation.py
+index bbd55294cd78afe9d03ac3e496612ec1c0a24971..37723b161c0257abc5e3708ae11c4baa97bd1002 100644
+--- a/hermes_cli/kanban_db_creation.py
++++ b/hermes_cli/kanban_db_creation.py
+@@ -10,6 +10,17 @@ def existing_creation_key(conn, key):
+     ).fetchone()
+ 
+ 
++def reject_reserved_key(key, created_by) -> None:
++    """Refuse a detector-namespace idempotency key from an ordinary creator, before any lookup or write.
++
++    The Board fences ``pickup-stall:``/``worker-resources-unknown:`` keys to the pickup-stall detector and rejects
++    the whole never-created card (and every child op) otherwise. The detector itself is unchanged. Existing bad
++    cards are corrected only by ``hermes kanban sync reserved-key`` (``kanban_sync_reserved_key``)."""
++    from hermes_cli.kanban_pickup_alarm_identity import DETECTOR, reserved
++    if reserved(key) and created_by != DETECTOR:
++        raise ValueError(f"idempotency_key {key!r} is reserved for the pickup-stall detector; choose another key")
++
++
+ def default_ready_assignee() -> str:
+     """``kanban.default_assignee`` (config) or the ``default`` profile."""
+     try:
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 01d96687734db1af4075adca09d04dda22286b74..4edbbc741be530360daf9df0f1356901caecd655 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -789,6 +789,17 @@ _SPECS = [
+                                                    help="Cards to refill (default: every open copied card)")],
+              help="Refill events an older pickup cut off local copies of other gateways' cards, from the replica "
+                   "(by uid; never invents rows; safe on running cards)"),
++        _cmd("reserved-key", [_json_flag(), _arg("task_id", metavar="TASK_ID"),
++                              _arg("--new-key", required=True, metavar="KEY",
++                                   help="Replacement idempotency key (non-empty, not pickup-stall:/worker-resources-unknown:)"),
++                              _arg("--reason", required=True, metavar="TEXT",
++                                   help="Why this card is corrected (required, non-blank; bound to the token and recorded)"),
++                              _arg("--apply", action="store_true",
++                                   help="Apply the correction (default: read-only preview)"),
++                              _arg("--expect", metavar="TOKEN", default=None,
++                                   help="The preview's token; --apply refuses if the card, its rows or its outbox changed")],
++             help="Correct a never-created local card's reserved idempotency key (preview by default; see "
++                  "hermes_cli/kanban_sync_reserved_key.py)"),
+     ]), help="Central Kanban sync (kanban.sync.*): attach, import, status, diff"),
+     _cmd("recover", [
+         _json_flag(help="Emit the recovery report as JSON"),
+diff --git a/hermes_cli/kanban_pickup_alarm_identity.py b/hermes_cli/kanban_pickup_alarm_identity.py
+index 88420fb9fc32302bc89eae856393ee6654718e66..2380b4ac5b98370f891265a311c1f47ade157e4d 100644
+--- a/hermes_cli/kanban_pickup_alarm_identity.py
++++ b/hermes_cli/kanban_pickup_alarm_identity.py
+@@ -14,11 +14,20 @@ _KEY = re.compile(r"(?:pickup-stall:([a-z0-9][a-z0-9-]{0,63}):[A-Za-z0-9._-]+|"
+                   r"worker-resources-unknown:([a-z0-9][a-z0-9-]{0,63})):([1-9][0-9]*)")
+ 
+ 
++RESERVED_PREFIXES = ("pickup-stall:", "worker-resources-unknown:")
++DETECTOR = "pickup-stall-detector"
++
++
++def reserved(key: Any) -> bool:
++    """True for an idempotency key in the detector-only namespace (the Board fences it to the detector)."""
++    return isinstance(key, str) and key.startswith(RESERVED_PREFIXES)
++
++
+ def refusal(card: Mapping[str, Any], machine: str) -> str | None:
+     """Refuse the source or malformed detector-like rows; ordinary cards are unchanged."""
+     key = card.get("idempotency_key")
+-    detector = card.get("created_by") == "pickup-stall-detector"
+-    if not detector and not (isinstance(key, str) and key.startswith(("pickup-stall:", "worker-resources-unknown:"))):
++    detector = card.get("created_by") == DETECTOR
++    if not detector and not reserved(key):
+         return None
+     match = _KEY.fullmatch(key) if isinstance(key, str) else None
+     source = (match[1] or match[2]) if match else None
+diff --git a/hermes_cli/kanban_sync_cli.py b/hermes_cli/kanban_sync_cli.py
+index 9df3e95ec53b9b125980fe92d9512066f011b9d6..a486119981e1da05121810ecc1663e0980240ffa 100644
+--- a/hermes_cli/kanban_sync_cli.py
++++ b/hermes_cli/kanban_sync_cli.py
+@@ -7,6 +7,9 @@
+ - ``run``     one sync round now (the gateway runs it continuously while ``kanban.sync.enabled`` is on).
+ - ``reconcile`` after the board file lost rows: upload what the service lacks, restore this gateway's rows the
+   file lost, then diff (``hermes kanban recover`` runs it after a rebuild).
++- ``reserved-key`` one-card correction of a never-created local card whose ``pickup-stall:``/``worker-resources-unknown:``
++  idempotency key the Board refused: preview by default, ``--apply --expect TOKEN`` to apply (contract and limits in
++  ``kanban_sync_reserved_key``).
+ """
+ 
+ from __future__ import annotations
+@@ -232,16 +235,41 @@ def _refill_history(args: argparse.Namespace) -> int:
+     return 1 if any(r["unresolved"] or r.get("reason") for r in report.values()) else 0
+ 
+ 
++def _reserved_key(args: argparse.Namespace) -> int:
++    """Preview (default) or apply (``--apply --expect TOKEN``) one reserved-key correction; exit 1 when refused."""
++    from hermes_cli import kanban_sync_reserved_key as rk
++    reason = (getattr(args, "reason", None) or "").strip()
++    if not reason:
++        print("kanban sync: --reason TEXT is required (non-blank)")
++        return 2
++    if args.apply and not args.expect:
++        print("kanban sync: --apply needs --expect TOKEN from the preview")
++        return 2
++    slug = _board(args)
++    hub = ksc.Hub(ksc.load_identity())
++    conn = kbc.connect(_path(slug))
++    try:
++        if args.apply:
++            report = rk.apply(conn, hub, slug, args.task_id, args.new_key, args.expect, reason)
++        else:
++            report = rk.plan(conn, hub, slug, args.task_id, args.new_key, reason)
++    finally:
++        conn.close()
++    _print(report, args.json)
++    return 0 if report.get("action") in ("applied", "already_applied") or (
++        report.get("action") == "preview" and report.get("eligible")) else 1
++
++
+ _ACTIONS = {"status": _status, "attach": _attach, "import": _import, "diff": _diff, "run": _run,
+             "links": _links, "links-diff": _links_diff, "reconcile": _reconcile, "machine-links": _machine_links,
+-            "refill-history": _refill_history}
++            "refill-history": _refill_history, "reserved-key": _reserved_key}
+ 
+ 
+ def cmd_sync(args: argparse.Namespace) -> int:
+     action = getattr(args, "sync_action", None)
+     if action not in _ACTIONS:
+         print("usage: hermes kanban sync {status,attach,import,diff,run,links,links-diff,reconcile,machine-links,"
+-              "refill-history} [--board B]")
++              "refill-history,reserved-key} [--board B]")
+         return 2
+     try:
+         return _ACTIONS[action](args)
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index ad29e5352aa511b0a4b987c7217e958510acfc47..d70693bedbfbfa4861140523bf48c5a402be297c 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -629,9 +629,11 @@ def _unacked_parents(conn: sqlite3.Connection, rows: list[dict], gateway: str) -
+     # Only omission custody suppresses resynthesis; ordinary parent backoff retains its old path.
+     in_batch.update(r[0] for r in conn.execute(
+         "SELECT row_uid FROM kanban_sync_omissions WHERE table_name='tasks' AND state!='delivered'"))
++    from hermes_cli.kanban_sync_reserved_key import replacement_children
++    recovering = replacement_children(conn)
+     wanted: list[str] = []
+     for r in rows:
+-        if r["table_name"] == "tasks":
++        if r["table_name"] == "tasks" or r["op_id"] in recovering:
+             continue
+         if r["table_name"] == "task_links":
+             if r["op"] != "upsert":
+@@ -752,6 +754,8 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+                     from hermes_cli.kanban_sync_omissions import remap
+                     new_id = sync.uuid7()
+                     remap(conn, op_id, new_id)
++                    from hermes_cli.kanban_sync_reserved_key import remap as remap_key_recovery
++                    remap_key_recovery(conn, op_id, new_id)
+                     conn.execute("UPDATE kanban_sync_outbox SET op_id = ?, attempts = attempts + 1, last_error = ?, "
+                                  "retry_after = ? WHERE op_id = ?",
+                                  (new_id, f"retrying: {reason}"[:500], int(time.time()) + _backoff_s(row["attempts"]), op_id))
+@@ -1130,6 +1134,11 @@ def _send(live: sqlite3.Connection, hub: Hub, slug: str, gateway: str, mode: str
+         from hermes_cli.kanban_sync_attachments import transfer_pending
+         transfer_pending(live, hub, slug)
+     from hermes_cli.kanban_sync_rejections import resolve_rejections
++    from hermes_cli.kanban_sync_reserved_key import advance
++    try:  # children of a corrected reserved-key card follow its accepted parent (no-op without a receipt)
++        advance(live, hub, slug)
++    except (HubError, SyncUnavailable, OSError) as exc:
++        _log.info("kanban sync: %s reserved-key advance deferred (%s)", slug, exc)
+     result.rejection_resolutions += resolve_rejections(live, hub, slug)
+ 
+ 
+diff --git a/hermes_cli/kanban_sync_compat.py b/hermes_cli/kanban_sync_compat.py
+index 5ccc33bc0fab05d202e0245c602f944fbbeef262..d552abba71b0cb74bf10f0ac2a20a2e0a4a0fea9 100644
+--- a/hermes_cli/kanban_sync_compat.py
++++ b/hermes_cli/kanban_sync_compat.py
+@@ -53,6 +53,9 @@ def enqueue_retry(conn: sqlite3.Connection, row: dict, wire: dict, result: dict)
+     protects the local value while allowing unrelated fields to converge; a fresh authoritative
+     field appearance can queue a current-value restore, never replay the rejected historical row.
+     """
++    from hermes_cli.kanban_sync_reserved_key import is_replacement
++    if is_replacement(conn, row["op_id"]):
++        return False  # keep the exact recovery refusal visible; never omit an approved recovery field
+     if result.get("reason") != "forbidden_field" or row["op"] not in ("upsert", "import"):
+         return False
+     match = re.fullmatch(r"not writable on ([a-z_]+): ([a-z_]+(?:, [a-z_]+)*)", str(result.get("detail") or ""))
+diff --git a/hermes_cli/kanban_sync_rejections.py b/hermes_cli/kanban_sync_rejections.py
+index ac2eb6ea7e7b6cde967a5602bdce4eb263a6d03d..a6eeb1171caeea42c08f82533d2e31e7d8897a15 100644
+--- a/hermes_cli/kanban_sync_rejections.py
++++ b/hermes_cli/kanban_sync_rejections.py
+@@ -5,7 +5,9 @@ import json
+ import sqlite3
+ 
+ from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_reserved_key as reserved_key
+ from hermes_cli.kanban_db_connect import write_txn
++from hermes_cli.kanban_pickup_alarm_identity import reserved
+ 
+ 
+ def _local(conn, table, uid):
+@@ -35,7 +37,8 @@ def _inputs(conn, rejected):
+     row = _local(conn, table, uid)
+     fields = client._row_fields(conn, table, row) if row else None
+     original = json.loads(rejected["fields"])
+-    task = uid if table == "tasks" else (fields or original).get("task_id")
++    task = (uid if table == "tasks" else uid.partition(">")[2] if table == "task_links"
++            else (fields or original).get("task_id"))
+     identities = {(table, uid)}
+     if task:
+         identities.add(("tasks", task))
+@@ -55,7 +58,8 @@ def _inputs(conn, rejected):
+         "SELECT * FROM kanban_sync_outbox WHERE table_name='tasks' AND row_uid=?", (task,))] if task else []
+     return {"row": dict(row) if row else None, "fields": fields, "task": task,
+             "parent": dict(parent) if parent else None, "parent_ops": parent_ops,
+-            "pending": pending, "tombstones": tombs, "run": dict(run_row) if run_row else None}
++            "pending": pending, "tombstones": tombs, "run": dict(run_row) if run_row else None,
++            "receipt": reserved_key.receipt_for_op(conn, rejected["op_id"])}
+ 
+ 
+ def _evidence(hub, board, table, uid):
+@@ -88,11 +92,18 @@ def _classify(op, before, evidence, parent_evidence, run_evidence=None):
+     from hermes_cli import kanban_sync_client as client
+     if before["pending"] or before["tombstones"]:
+         return "unresolved", "pending local work or local tombstone"
++    gate = reserved_key.receipt_resolution(op, before, evidence, parent_evidence)
++    if gate and gate[0] != "conservative":  # a receipt names this op: it retires through the receipt or not at all
++        return gate
+     if op["op"] == "release":
+         if _moot_release(op, before, evidence, run_evidence):
+             return "moot", "authoritative run already ended and does not hold the card's lease; nothing to release"
+         return "unresolved", "no proof the released run already ended off this card's lease"
+     fields = client._wire_fields(op["table_name"], json.loads(op["fields"]))
++    if reserved(fields.get("idempotency_key")) and fields["idempotency_key"] != (before["fields"] or {}).get("idempotency_key"):
++        # The card's key was rewritten after this write was refused: equality of the *current* values proves nothing
++        # about the original key. Only a verified supersession receipt (above) may retire it.
++        return "unresolved", "rejected write carries a reserved key the card no longer has; needs a verified receipt"
+     remote, local = evidence.get("row"), before["row"]
+     if op["op"] in ("upsert", "import") and evidence.get("state") == "live" and remote and local:
+         version = remote.get("version")
+@@ -138,7 +149,8 @@ def resolve_rejections(conn: sqlite3.Connection, hub, board: str) -> list[dict]:
+         try:
+             evidence = _evidence(hub, board, op["table_name"], op["row_uid"])
+             parent = _evidence(hub, board, "tasks", before["task"]) if (
+-                op["table_name"] == "task_chat_links" and before["task"]) else None
++                before["task"] and op["table_name"] != "tasks"
++                and (op["table_name"] == "task_chat_links" or before["receipt"])) else None
+             run_uid = _release_run(op)
+             run = _evidence(hub, board, "task_runs", run_uid) if run_uid else None
+         except (HubError, SyncUnavailable, OSError, AttributeError, ValueError) as exc:
+diff --git a/hermes_cli/kanban_sync_reserved_key.py b/hermes_cli/kanban_sync_reserved_key.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5bfa6a22c47b7c59116421b30b6cb36a74b14af7
+--- /dev/null
++++ b/hermes_cli/kanban_sync_reserved_key.py
+@@ -0,0 +1,713 @@
++"""Explicit one-task correction of a reserved idempotency key on a card the Board never created. [daveey]
++
++The Board fences ``pickup-stall:`` / ``worker-resources-unknown:`` keys to the pickup-stall detector. An ordinary
++local card that carries such a key was refused as a whole (``pickup_stall_provenance``), every child op behind it
++was refused ``not_found``, and the rejected ops stay visible forever: the conservative resolver
++(``kanban_sync_rejections``) cannot retire them because the Board never held the card. New creates are now refused
++(``kanban_db_creation.reject_reserved_key``); this module repairs the cards that already exist.
++
++Contract (``hermes kanban sync reserved-key TASK_ID --new-key KEY [--apply --expect TOKEN]``)
++
++* **Preview is the default and writes nothing.** ``--reason TEXT`` (non-blank) is required for preview and apply. It
++  prints a ``token`` (a digest of the exact task, child rows, outbox rows, tombstones, replacement key, reason, board
++  and a nonsecret endpoint+gateway fingerprint). ``--apply`` needs that token (compare-and-set). The hub's enrolled
++  gateway must be present and equal this file's sync gateway, and the file's board id must equal the board.
++* **Eligible card only**: a local, non-detector card with ``created_on`` and ``sync_version`` NULL whose key is
++  reserved and whose ops on the Board were rejected; no run, claim, lease or worker pid; every outbox row of the card
++  and its child rows is a ``rejected`` upsert/import for an included identity (no pending op, tombstone, release,
++  delete, unaccounted rejection, outgoing link or event older than the service retention: those refuse instead of
++  being dropped). The replacement key is non-empty, unreserved, unused locally and differs from the old one.
++* **Fresh authenticated Board reads**: ``Hub.row_evidence`` for the card and *every* child identity must be
++  ``never_existed`` at floor 0 with no row and no tombstone, and an exhaustive paged ``Hub.snapshot_page('tasks')``
++  must show no live Board card with the replacement key (an incomplete, malformed or failed scan refuses). Reads run
++  with no write transaction open; the whole interval from the first read to the in-transaction veto, writer-lock wait
++  included, is bounded on the monotonic clock (``EVIDENCE_MAX_AGE_S``). The exact local inputs are re-read and
++  compared inside the write transaction that applies.
++* **Apply** (one transaction): inserts the receipt (reason, endpoint fingerprint) and a byte copy of every rejected op it supersedes, rewrites only
++  ``tasks.idempotency_key`` (capture triggers are suppressed, so no partial trigger op is minted) and enqueues one
++  ordinary full ``import`` op for the corrected card. Nothing else changes: rejected ops are not deleted, reset or
++  edited, and no historical event payload is rewritten (no event is appended either).
++* **Children follow the accepted parent.** ``advance`` (run by every sync round and by a repeated apply) enqueues the
++  child rows as normal ``upsert`` ops only once the parent op left the outbox, the local card carries the Board's
++  version and fresh evidence shows it live under the corrected key created on this gateway; it records the
++  replacement op ids (state ``children_queued``). The receipt becomes ``complete`` only when every recorded child op
++  left the outbox (none rejected) and the Board holds each child row live. Each step re-validates identity and
++  endpoint, is idempotent, and commits with the ops it describes.
++* **The old rejections retire only through the receipt.** ``kanban_sync_rejections._classify`` stays conservative; a
++  ``complete`` receipt that names an op (bytes unchanged, task bound, corrected parent live on the Board) retires the
++  original *task* op only if every other rejected wire field equals the Board's and the local card, with the key
++  compared as the replacement key; child ops then go through the unchanged field-equality classifier. A receipt that
++  names an op but cannot vouch for it leaves it unresolved (no fallback to the conservative rules).
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import sqlite3
++import time
++from urllib.parse import urlsplit
++from typing import Any, Optional
++
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli.kanban_db_connect import write_txn
++from hermes_cli.kanban_pickup_alarm_identity import DETECTOR, reserved
++
++MAX_KEY_LEN = 200
++MAX_CHILDREN = 2000
++MAX_SNAPSHOT_PAGES = 500
++EVIDENCE_MAX_AGE_S = 30.0  # monotonic bound from the first Board read to the transactional veto (lock wait included)
++_mono = time.monotonic
++_CHILD_TABLES = ("task_runs", "task_comments", "task_events", "task_attachments", "task_chat_links")
++_ORDER = ("task_links", "task_runs", "task_comments", "task_events", "task_attachments", "task_chat_links")
++
++SCHEMA_SQL = """
++CREATE TABLE IF NOT EXISTS kanban_sync_key_supersessions (
++    receipt_id   TEXT PRIMARY KEY,
++    task_id      TEXT NOT NULL UNIQUE,
++    board        TEXT NOT NULL,
++    gateway_id   TEXT NOT NULL,
++    old_key      TEXT NOT NULL,
++    new_key      TEXT NOT NULL,
++    plan_token   TEXT NOT NULL,
++    reason       TEXT NOT NULL,
++    endpoint     TEXT NOT NULL,
++    parent_op_id TEXT NOT NULL,
++    children     TEXT NOT NULL,
++    state        TEXT NOT NULL,
++    created_at   INTEGER NOT NULL,
++    completed_at INTEGER
++);
++CREATE TABLE IF NOT EXISTS kanban_sync_key_supersession_ops (
++    old_op_id  TEXT PRIMARY KEY,
++    receipt_id TEXT NOT NULL,
++    table_name TEXT NOT NULL,
++    row_uid    TEXT NOT NULL,
++    op_json    TEXT NOT NULL,
++    op_sha256  TEXT NOT NULL
++);
++CREATE TABLE IF NOT EXISTS kanban_sync_key_supersession_children (
++    op_id      TEXT PRIMARY KEY,
++    receipt_id TEXT NOT NULL,
++    table_name TEXT NOT NULL,
++    row_uid    TEXT NOT NULL
++);
++"""
++
++
++def ensure_schema(conn: sqlite3.Connection) -> None:
++    for stmt in SCHEMA_SQL.split(";"):
++        if stmt.strip():
++            conn.execute(stmt)
++
++
++def _has_tables(conn: sqlite3.Connection) -> bool:
++    return conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN "
++                        "('kanban_sync_key_supersessions','kanban_sync_key_supersession_ops',"
++                        "'kanban_sync_key_supersession_children')").fetchone()[0] == 3
++
++
++def _default(value: Any) -> Any:
++    if isinstance(value, bytes):
++        return {"$blob": value.hex()}
++    raise TypeError(type(value).__name__)
++
++
++def _canon(obj: Any) -> str:
++    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=_default)
++
++
++def _sha(obj: Any) -> str:
++    return hashlib.sha256(_canon(obj).encode()).hexdigest()
++
++
++class _Veto(Exception):
++    """A transactional revalidation failed; nothing was written."""
++
++
++def _fresh(started: Any) -> bool:
++    """The whole evidence interval (first Board read .. now, writer-lock wait included) is on the monotonic clock."""
++    if not isinstance(started, (int, float)):
++        return False
++    return 0 <= _mono() - started <= EVIDENCE_MAX_AGE_S
++
++
++# --- identity ---------------------------------------------------------------------------------------
++
++def _hub_gateway(hub: Any) -> Optional[str]:
++    gateway = getattr(getattr(hub, "ident", None), "gateway", None)
++    return gateway if isinstance(gateway, str) and gateway.strip() else None
++
++
++def _endpoint(hub: Any) -> str:
++    """Nonsecret fingerprint of the enrolled Board endpoint and gateway name (never the key)."""
++    ident = getattr(hub, "ident", None)
++    parts = urlsplit(str(getattr(ident, "url", "") or ""))
++    where = f"{parts.scheme}://{parts.hostname or ''}:{parts.port or ''}{parts.path.rstrip('/')}"
++    return _sha({"endpoint": where, "gateway": _hub_gateway(hub)})
++
++
++def _identity_refusal(conn: sqlite3.Connection, hub: Any, board: str) -> Optional[str]:
++    """The hub's enrolled gateway, this file's sync identity and the requested board must all be one identity."""
++    state = sync.sync_state(conn)
++    if sync.board_mode(conn) == "off" or not state:
++        return "sync_off"
++    gateway = _hub_gateway(hub)
++    if gateway is None or state.get("gateway_id") != gateway:
++        return "foreign_gateway_identity"
++    if state.get("board_id") != board:
++        return "foreign_board_identity"
++    return None
++
++
++# --- local inputs -----------------------------------------------------------------------------------
++
++def _row_uid(table: str, row: dict) -> str:
++    return f"{row['parent_id']}>{row['child_id']}" if table == "task_links" else row["uid"]
++
++
++def _snapshot(conn: sqlite3.Connection, task_id: str) -> dict:
++    """Every local input the correction depends on, as plain data (compared whole, before and inside the write)."""
++    task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
++    snap: dict[str, Any] = {"task": dict(task) if task else None, "children": {}, "outbox": [], "tombstones": [],
++                            "outgoing_links": []}
++    if task is None:
++        return snap
++    snap["outgoing_links"] = [dict(r) for r in conn.execute(
++        "SELECT * FROM task_links WHERE parent_id=? ORDER BY child_id", (task_id,))]
++    snap["children"]["task_links"] = [dict(r) for r in conn.execute(
++        "SELECT * FROM task_links WHERE child_id=? ORDER BY parent_id", (task_id,))]
++    for table in _CHILD_TABLES:
++        snap["children"][table] = [dict(r) for r in conn.execute(f"SELECT * FROM {table} WHERE task_id=? ORDER BY id",
++                                                                 (task_id,))]
++    uids = {("tasks", task_id)} | {(t, _row_uid(t, r)) for t, rows in snap["children"].items() for r in rows
++                                   if t == "task_links" or r.get("uid")}
++    rows = {tuple(r) for r in conn.execute(
++        "SELECT op_id FROM kanban_sync_outbox WHERE row_uid=? OR json_extract(fields,'$.task_id')=? "
++        "OR substr(row_uid, -(length(?)+1))='>'||? OR substr(row_uid, 1, length(?)+1)=?||'>'",
++        (task_id, task_id, task_id, task_id, task_id, task_id))}
++    uid_list = sorted(u for _t, u in uids)
++    for i in range(0, len(uid_list), 500):
++        part = uid_list[i:i + 500]
++        rows |= {tuple(r) for r in conn.execute(
++            f"SELECT op_id FROM kanban_sync_outbox WHERE row_uid IN ({','.join('?' * len(part))})", part)}
++        snap["tombstones"] += [dict(r) for r in conn.execute(
++            f"SELECT * FROM kanban_sync_tombstones WHERE row_uid IN ({','.join('?' * len(part))}) "
++            "ORDER BY table_name, row_uid", part)]
++    for (op_id,) in sorted(rows):
++        snap["outbox"].append(dict(conn.execute("SELECT * FROM kanban_sync_outbox WHERE op_id=?", (op_id,)).fetchone()))
++    snap["outbox"].sort(key=lambda r: r["op_id"])
++    return snap
++
++
++def _identities(snap: dict) -> list[tuple[str, str]]:
++    """(table, uid) of the card and every child row that travels with it (all events included: none is skipped)."""
++    out = [("tasks", snap["task"]["id"])]
++    for table in _ORDER:
++        out += [(table, _row_uid(table, row)) for row in snap["children"].get(table, [])]
++    return out
++
++
++def _unsupported(snap: dict) -> Optional[str]:
++    """Shapes the correction cannot carry over whole: refuse them rather than silently drop them."""
++    from hermes_cli.kanban_sync_client import EVENT_IMPORT_WINDOW_S
++    cutoff = int(time.time()) - EVENT_IMPORT_WINDOW_S
++    for row in snap["children"].get("task_events", []):
++        if (row.get("created_at") or 0) < cutoff:
++            return f"unsupported_old_event: {row.get('uid')}"  # the service would not keep it: it cannot be re-sent
++    if snap["outgoing_links"]:
++        return f"unsupported_outgoing_link: {snap['outgoing_links'][0]['child_id']}"  # belongs to another card
++    included = set(_identities(snap))
++    for op in snap["outbox"]:
++        if op["op"] not in ("upsert", "import"):
++            return f"unsupported_outbox_op: {op['op']} {op['table_name']} {op['row_uid']}"
++        if (op["table_name"], op["row_uid"]) not in included:
++            return f"unaccounted_rejection: {op['table_name']} {op['row_uid']}"
++    return None
++
++
++def _refusal(conn: sqlite3.Connection, hub: Any, board: str, snap: dict, new_key: Any) -> Optional[str]:
++    """Local eligibility; the first failing rule, as a short code."""
++    task = snap["task"]
++    if task is None:
++        return "no_such_task"
++    why = _identity_refusal(conn, hub, board)
++    if why:
++        return why
++    if task["created_on"] is not None or task["sync_version"] is not None:
++        return "not_locally_owned"  # the Board stamped or acknowledged it: another process owns the identity
++    if task["created_by"] == DETECTOR:
++        return "detector_card"
++    old = task["idempotency_key"]
++    if not reserved(old):
++        return "key_not_reserved"
++    if (task["status"] == "running" or any(task[c] is not None for c in (
++            "claim_lock", "claim_expires", "worker_pid", "worker_started_at", "lease_holder", "lease_expires",
++            "lease_version", "current_run_id"))
++            or any(r["ended_at"] is None for r in snap["children"]["task_runs"])):
++        return "active_run_or_lease"
++    if not isinstance(new_key, str) or not new_key or new_key != new_key.strip() or len(new_key) > MAX_KEY_LEN:
++        return "bad_replacement_key"
++    if reserved(new_key) or new_key == old:
++        return "bad_replacement_key"
++    if conn.execute("SELECT 1 FROM tasks WHERE idempotency_key=? AND id!=?", (new_key, task["id"])).fetchone():
++        return "replacement_key_in_use"
++    if sum(len(r) for r in snap["children"].values()) > MAX_CHILDREN:
++        return "too_many_children"
++    if any(t != "task_links" and not r.get("uid") for t, rows in snap["children"].items() for r in rows):
++        return "child_without_uid"
++    if snap["tombstones"]:
++        return "local_tombstone"
++    if any(op["state"] != "rejected" for op in snap["outbox"]):
++        return "pending_outbox"
++    why = _unsupported(snap)
++    if why:
++        return why
++    if not any(op["table_name"] == "tasks" and op["row_uid"] == task["id"]
++               and json.loads(op["fields"] or "{}").get("idempotency_key") == old for op in snap["outbox"]):
++        return "no_rejected_op_carrying_the_key"
++    return None
++
++
++def _never_existed(e: dict) -> bool:
++    return (e.get("state") == "never_existed" and e.get("floor") == 0 and e.get("row") is None
++            and e.get("tombstone") is None)
++
++
++def _token(board: str, hub: Any, new_key: str, reason: str, snap: dict) -> str:
++    return _sha({"v": 2, "board": board, "endpoint": _endpoint(hub), "new_key": new_key, "reason": reason,
++                 "snapshot": snap})
++
++
++def _clean_reason(reason: Any) -> Optional[str]:
++    return reason.strip() if isinstance(reason, str) and reason.strip() else None
++
++
++def _remote_key_refusal(hub: Any, board: str, new_key: str) -> Optional[str]:
++    """Authenticated, exhaustive ``hub.snapshot_page`` scan of every live Board card for a duplicate replacement key."""
++    from hermes_cli.kanban_sync_client import HubError, SyncUnavailable
++    incomplete = "authoritative_snapshot_incomplete"
++    after = ""
++    for _ in range(MAX_SNAPSHOT_PAGES):
++        try:
++            page = hub.snapshot_page(board, "tasks", after)
++        except (HubError, SyncUnavailable, OSError, AttributeError, ValueError) as exc:
++            return f"authoritative_snapshot_unavailable: {exc}"
++        if (not isinstance(page, dict) or not isinstance(page.get("rows"), list) or not isinstance(page.get("head"), int)
++                or not isinstance(page.get("more"), bool) or not all(isinstance(r, dict) for r in page["rows"])):
++            return incomplete + ": malformed page"
++        if any(r.get("idempotency_key") == new_key for r in page["rows"]):
++            return "replacement_key_in_remote_use"
++        if not page["more"]:
++            return None
++        nxt = page.get("next")
++        if not isinstance(nxt, str) or nxt <= after:
++            return incomplete + ": page cursor does not advance"
++        after = nxt
++    return incomplete + ": page cap reached"
++
++
++# --- receipts ----------------------------------------------------------------------------------------
++
++def receipt_for_task(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
++    if not _has_tables(conn):
++        return None
++    row = conn.execute("SELECT * FROM kanban_sync_key_supersessions WHERE task_id=?", (task_id,)).fetchone()
++    return dict(row) if row else None
++
++
++def receipt_for_op(conn: sqlite3.Connection, op_id: str) -> Optional[dict]:
++    """The receipt (with this op's recorded bytes) that names ``op_id``, or None."""
++    if not _has_tables(conn):
++        return None
++    row = conn.execute(
++        "SELECT r.*, o.op_sha256, o.table_name AS op_table, o.row_uid AS op_row_uid, EXISTS(SELECT 1 FROM "
++        "kanban_sync_key_supersession_ops k WHERE k.receipt_id=r.receipt_id AND k.table_name='tasks' AND "
++        "json_extract(json_extract(k.op_json,'$.fields'),'$.idempotency_key')=r.old_key) AS old_key_recorded, "
++        "r.gateway_id=(SELECT gateway_id FROM kanban_sync_state LIMIT 1) AS gateway_bound "
++        "FROM kanban_sync_key_supersession_ops o "
++        "JOIN kanban_sync_key_supersessions r ON r.receipt_id=o.receipt_id WHERE o.old_op_id=?", (op_id,)).fetchone()
++    return dict(row) if row else None
++
++
++def _receipt_flaw(op: dict, before: dict, evidence: dict, receipt: dict) -> Optional[str]:
++    """Why a receipt that names this op cannot vouch for it (the caller then never falls back to the old rules)."""
++    table, uid = op["table_name"], op["row_uid"]
++    if receipt["state"] != "complete":
++        return "key-supersession receipt is not complete"
++    if _sha(op) != receipt["op_sha256"] or (table, uid) != (receipt["op_table"], receipt["op_row_uid"]):
++        return "rejected op differs from the receipt's recorded bytes"
++    if evidence.get("state") != "live" or (evidence.get("row") or {}).get("uid") != uid:
++        return "Board does not hold this row live"
++    task_id = receipt["task_id"]
++    owner = uid.partition(">")[2] if table == "task_links" else before.get("task") if table != "tasks" else uid
++    if owner != task_id:
++        return "rejected op is not bound to the receipt's task"
++    parent = before.get("parent") or {}
++    if parent.get("idempotency_key") != receipt["new_key"] or parent.get("id") != task_id:
++        return "local card does not carry the corrected key"
++    if not receipt["gateway_bound"] or not receipt["old_key_recorded"]:
++        return "receipt gateway or old key is not the one the Board and the rejected ops carry"
++    if table != "tasks" and [table, uid] not in json.loads(receipt["children"]):
++        return "row is not one of the receipt's children"
++    return None
++
++
++def _task_proof(op: dict, before: dict, evidence: dict, receipt: dict) -> Optional[str]:
++    """The original task op retires only when the Board's card is the corrected one and every *other* wire field agrees."""
++    from hermes_cli.kanban_sync_client import _wire_fields
++    remote, local = evidence["row"], before.get("row") or {}
++    sent = _wire_fields("tasks", json.loads(op["fields"] or "{}"))
++    if sent.get("idempotency_key", receipt["old_key"]) != receipt["old_key"]:
++        return "rejected op carries a key other than the receipt's old key"
++    current = before.get("fields") or {}
++    if (remote.get("idempotency_key") != receipt["new_key"] or current.get("idempotency_key") != receipt["new_key"]
++            or local.get("idempotency_key") != receipt["new_key"]
++            or remote.get("created_on") != receipt["gateway_id"]):
++        return "Board card is not the corrected card created by this gateway"
++    version = remote.get("version")
++    if not isinstance(version, int) or version < (op.get("base_version") or 0) or local.get("sync_version") != version:
++        return "local card has not settled at the Board's version"
++    expected = {**sent, "idempotency_key": receipt["new_key"]}
++    if not all(k in current and k in remote and current[k] == remote[k] for k in expected):
++        return "Board card differs from the local card in a rejected wire field"
++    return None
++
++
++def _parent_flaw(receipt: dict, parent_evidence: Optional[dict]) -> Optional[str]:
++    """A child op is vouched for only while the Board holds the corrected card, created by this gateway."""
++    remote = (parent_evidence or {}).get("row") or {}
++    if not (parent_evidence and parent_evidence.get("state") == "live" and remote.get("uid") == receipt["task_id"]
++            and remote.get("idempotency_key") == receipt["new_key"]
++            and remote.get("created_on") == receipt["gateway_id"]):
++        return "Board does not hold the corrected card created by this gateway"
++    return None
++
++
++def receipt_resolution(op: dict, before: dict, evidence: dict,
++                       parent_evidence: Optional[dict] = None) -> Optional[tuple[str, str]]:
++    """How a *complete* receipt treats this rejected op.
++
++    ``None``: no receipt names it (the conservative rules apply). ``("unresolved", why)``: a receipt names it but cannot
++    vouch for it; the caller must not fall back. ``("conservative", "")``: a child op the receipt vouches for; the
++    caller's existing field-equality classifier decides. ``("superseded", proof)``: the original task op."""
++    receipt = before.get("receipt")
++    if not receipt:
++        return None
++    flaw = _receipt_flaw(op, before, evidence, receipt)
++    if flaw:
++        return "unresolved", f"receipt {receipt['receipt_id']}: {flaw}"
++    flaw = (_parent_flaw(receipt, parent_evidence) if op["table_name"] != "tasks"
++            else _task_proof(op, before, evidence, receipt))
++    if flaw:
++        return "unresolved", f"receipt {receipt['receipt_id']}: {flaw}"
++    if op["table_name"] != "tasks":
++        return "conservative", ""
++    return "superseded", (f"key-supersession receipt {receipt['receipt_id']}: the Board holds the corrected "
++                          "card and every rejected wire field matches")
++
++
++# --- preview / apply ----------------------------------------------------------------------------------
++
++def _report(task_id: str, new_key: Any, board: str) -> dict:
++    return {"task_id": task_id, "board": board, "new_key": new_key, "eligible": False, "action": "preview"}
++
++
++def _read_board(hub: Any, board: str, ids: list, new_key: str) -> Optional[str]:
++    """Fresh Board reads: never-existed evidence for every identity, then replacement-key uniqueness."""
++    from hermes_cli.kanban_sync_client import HubError, SyncUnavailable
++    from hermes_cli.kanban_sync_rejections import _evidence
++    try:
++        for table, uid in ids:
++            if not _never_existed(_evidence(hub, board, table, uid)):
++                return f"board_history_not_proven_never_existed: {table} {uid}"
++    except (HubError, SyncUnavailable, OSError, AttributeError, ValueError) as exc:
++        return f"authoritative_evidence_unavailable: {exc}"
++    return _remote_key_refusal(hub, board, new_key)
++
++
++def plan(conn: sqlite3.Connection, hub: Any, board: str, task_id: str, new_key: str, reason: Any = None) -> dict:
++    """Read-only preview: eligibility, fresh Board evidence for the card and every child, and the CAS token."""
++    report = _report(task_id, new_key, board)
++    clean = _clean_reason(reason)
++    if clean is None:
++        report["refusal"] = "reason_required"
++        return report
++    report["reason"] = clean
++    existing = receipt_for_task(conn, task_id)
++    if existing:
++        report.update(action="already_applied" if existing["new_key"] == new_key else "refused",
++                      receipt=existing, token=existing["plan_token"], old_key=existing["old_key"])
++        if existing["new_key"] != new_key:
++            report["refusal"] = "receipt_exists_other_key"
++        return report
++    snap = _snapshot(conn, task_id)
++    why = _refusal(conn, hub, board, snap, new_key)
++    if why:
++        report["refusal"] = why
++        return report
++    started = _mono()
++    ids = _identities(snap)
++    why = _read_board(hub, board, ids, new_key)
++    if why:
++        report["refusal"] = why
++        return report
++    if not _fresh(started):
++        report["refusal"] = "evidence_interval_exceeded"
++        return report
++    if _snapshot(conn, task_id) != snap:
++        report["refusal"] = "local_state_changed_during_evidence_read"
++        return report
++    report.update(eligible=True, old_key=snap["task"]["idempotency_key"], token=_token(board, hub, new_key, clean, snap),
++                  superseded_op_ids=[o["op_id"] for o in snap["outbox"]], children=[list(i) for i in ids[1:]],
++                  evidence_checked=len(ids), evidence_started_monotonic=started)
++    return report
++
++
++def _write_receipt(conn: sqlite3.Connection, hub: Any, board: str, snap: dict, new_key: str, reason: str,
++                   token: str, ids: list) -> None:
++    task_id = snap["task"]["id"]
++    ensure_schema(conn)
++    receipt_id, parent_op = sync.uuid7(), sync.uuid7()
++    old_key = snap["task"]["idempotency_key"]
++    conn.execute("INSERT INTO kanban_sync_key_supersessions (receipt_id, task_id, board, gateway_id, old_key, new_key, "
++                 "plan_token, reason, endpoint, parent_op_id, children, state, created_at) "
++                 "VALUES (?,?,?,?,?,?,?,?,?,?,?, 'parent_queued', ?)",
++                 (receipt_id, task_id, board, _hub_gateway(hub), old_key, new_key, token, reason, _endpoint(hub),
++                  parent_op, json.dumps([list(i) for i in ids[1:]]), int(time.time())))
++    for op in snap["outbox"]:
++        conn.execute("INSERT INTO kanban_sync_key_supersession_ops VALUES (?,?,?,?,?,?)",
++                     (op["op_id"], receipt_id, op["table_name"], op["row_uid"], _canon(op), _sha(op)))
++    previous = conn.execute("SELECT applying FROM kanban_sync_state LIMIT 1").fetchone()[0]
++    conn.execute("UPDATE kanban_sync_state SET applying = 1")  # no trigger op: the import op below is the write
++    try:
++        changed = conn.execute(
++            "UPDATE tasks SET idempotency_key=? WHERE id=? AND idempotency_key=? AND created_on IS NULL "
++            "AND sync_version IS NULL", (new_key, task_id, old_key)).rowcount
++    finally:
++        conn.execute("UPDATE kanban_sync_state SET applying = ?", (previous,))
++    if changed != 1:
++        raise _Veto("task_changed_before_write")
++    from hermes_cli import kanban_sync_client as ksc
++    row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
++    conn.execute(
++        "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, created_at) "
++        "VALUES (?, 'tasks', ?, 'import', ?, NULL, '', ?)",
++        (parent_op, task_id, json.dumps(ksc._row_fields(conn, "tasks", row)), time.time_ns() // 1_000_000))
++
++
++def apply(conn: sqlite3.Connection, hub: Any, board: str, task_id: str, new_key: str, expected: Optional[str],
++          reason: Any = None) -> dict:
++    """Apply the previewed correction when ``expected`` is the preview's token; a repeat continues the receipt."""
++    report = plan(conn, hub, board, task_id, new_key, reason)
++    if report["action"] == "already_applied":
++        receipt = report["receipt"]
++        if (expected != receipt["plan_token"] or report["reason"] != receipt["reason"]
++                or _identity_wait(conn, hub, board, receipt)):
++            report.update(action="refused", refusal="stale_or_missing_expected_intent", eligible=False)
++            return report
++        report["advance"] = advance(conn, hub, board, task_id=task_id)
++        report["receipt"] = receipt_for_task(conn, task_id)
++        return report
++    if not report["eligible"]:
++        report["action"] = "refused"
++        return report
++    if not expected or expected != report["token"]:
++        report.update(action="refused", refusal="stale_or_missing_expected_token", eligible=False)
++        return report
++    snap_ids = [tuple(i) for i in [("tasks", task_id), *report["children"]]]
++    clean, started = report["reason"], report["evidence_started_monotonic"]
++    try:
++        with write_txn(conn):
++            if not _fresh(started):
++                raise _Veto("evidence_interval_exceeded")
++            snap = _snapshot(conn, task_id)
++            if _refusal(conn, hub, board, snap, new_key) or _token(board, hub, new_key, clean, snap) != expected:
++                raise _Veto("local_state_changed_before_write")
++            if [tuple(i) for i in _identities(snap)] != snap_ids:
++                raise _Veto("child_set_changed_before_write")
++            _write_receipt(conn, hub, board, snap, new_key, clean, expected, snap_ids)
++    except _Veto as exc:
++        report.update(action="refused", refusal=str(exc), eligible=False)
++        return report
++    report.update(action="applied", receipt=receipt_for_task(conn, task_id))
++    return report
++
++
++# --- advance -----------------------------------------------------------------------------------------
++
++def _identity_wait(conn: sqlite3.Connection, hub: Any, board: str, receipt: dict) -> Optional[str]:
++    """Why this hub / file may not continue the receipt (identity or endpoint no longer the one it was bound to)."""
++    state = sync.sync_state(conn) or {}
++    if (_hub_gateway(hub) != receipt["gateway_id"] or _endpoint(hub) != receipt["endpoint"]
++            or state.get("gateway_id") != receipt["gateway_id"] or state.get("board_id") != receipt["board"]
++            or receipt["board"] != board):
++        return "identity or endpoint differs from the receipt's"
++    return None
++
++
++def _parent_wait(conn: sqlite3.Connection, hub: Any, board: str, receipt: dict) -> Optional[str]:
++    """Why the corrected parent is not yet proven accepted (None when it is)."""
++    from hermes_cli import kanban_sync_client as ksc
++    from hermes_cli.kanban_sync_rejections import _evidence
++    tid = receipt["task_id"]
++    parent = conn.execute("SELECT state FROM kanban_sync_outbox WHERE op_id=?", (receipt["parent_op_id"],)).fetchone()
++    task = conn.execute("SELECT idempotency_key, sync_version FROM tasks WHERE id=?", (tid,)).fetchone()
++    if parent is not None:
++        return f"parent op {parent[0]}"
++    if task is None or task["sync_version"] is None or task["idempotency_key"] != receipt["new_key"]:
++        return "parent not acknowledged locally"
++    try:
++        e = _evidence(hub, board, "tasks", tid)
++    except (ksc.HubError, ksc.SyncUnavailable, OSError, AttributeError, ValueError) as exc:
++        return f"authoritative evidence unavailable: {exc}"
++    remote = e.get("row") or {}
++    if not (e.get("state") == "live" and remote.get("uid") == tid and remote.get("idempotency_key") == receipt["new_key"]
++            and remote.get("created_on") == receipt["gateway_id"]):
++        return "Board has not accepted the corrected card"
++    return None
++
++
++def _receipt_state(conn: sqlite3.Connection, receipt: dict) -> Optional[str]:
++    row = conn.execute("SELECT state FROM kanban_sync_key_supersessions WHERE receipt_id=?",
++                       (receipt["receipt_id"],)).fetchone()
++    return row[0] if row else None
++
++
++def _queue_children(conn: sqlite3.Connection, receipt: dict) -> Optional[int]:
++    """Inside the write transaction: enqueue the entire manifest, or leave it waiting unchanged."""
++    from hermes_cli import kanban_sync_client as ksc
++    from hermes_cli.kanban_sync_rejections import _local
++    now, queued = time.time_ns() // 1_000_000, 0
++    children = []
++    for table, uid in json.loads(receipt["children"]):
++        row = _local(conn, table, uid)
++        if row is None or conn.execute("SELECT 1 FROM kanban_sync_tombstones WHERE table_name=? AND row_uid=?",
++                                       (table, uid)).fetchone() or conn.execute(
++                "SELECT 1 FROM kanban_sync_outbox WHERE table_name=? AND row_uid=? AND state='pending'",
++                (table, uid)).fetchone():
++            return None
++        children.append((table, uid, row))
++    for table, uid, row in children:
++        op_id = sync.uuid7()
++        conn.execute("INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, "
++                     "created_at) VALUES (?, ?, ?, 'upsert', ?, NULL, '', ?)",
++                     (op_id, table, uid, json.dumps(ksc._row_fields(conn, table, row)), now))
++        conn.execute("INSERT INTO kanban_sync_key_supersession_children VALUES (?,?,?,?)",
++                     (op_id, receipt["receipt_id"], table, uid))
++        queued += 1
++    conn.execute("UPDATE kanban_sync_key_supersessions SET state='children_queued' WHERE receipt_id=?",
++                 (receipt["receipt_id"],))
++    return queued
++
++
++def _queue_step(conn: sqlite3.Connection, hub: Any, board: str, receipt: dict, out: dict) -> None:
++    started = _mono()
++    wait = _parent_wait(conn, hub, board, receipt)
++    if wait:
++        out["waiting"] = wait
++        return
++    with write_txn(conn):
++        if not _fresh(started):
++            out["waiting"] = "evidence_interval_exceeded"
++        elif _receipt_state(conn, receipt) != "parent_queued" or _identity_wait(conn, hub, board, receipt) or (
++                conn.execute("SELECT 1 FROM kanban_sync_outbox WHERE op_id=?", (receipt["parent_op_id"],)).fetchone()):
++            out["waiting"] = "receipt or identity changed during evidence read"
++        else:
++            task = conn.execute("SELECT idempotency_key, sync_version FROM tasks WHERE id=?",
++                                (receipt["task_id"],)).fetchone()
++            if task is None or task["sync_version"] is None or task["idempotency_key"] != receipt["new_key"]:
++                out["waiting"] = "receipt changed during evidence read"
++            else:
++                queued = _queue_children(conn, receipt)
++                if queued is None:
++                    out["waiting"] = "child manifest changed or has pending work"
++                else:
++                    out.update(advanced=True, children_queued=queued)
++
++
++def _delivery_wait(conn: sqlite3.Connection, hub: Any, board: str, receipt: dict) -> Optional[str]:
++    """Why a queued child is not yet proven delivered: still queued, rejected, or absent from the Board."""
++    from hermes_cli import kanban_sync_client as ksc
++    from hermes_cli.kanban_sync_rejections import _evidence
++    kids = [dict(r) for r in conn.execute(
++        "SELECT * FROM kanban_sync_key_supersession_children WHERE receipt_id=? ORDER BY op_id", (receipt["receipt_id"],))]
++    states = {kid["op_id"]: conn.execute("SELECT state FROM kanban_sync_outbox WHERE op_id=?",
++                                         (kid["op_id"],)).fetchone() for kid in kids}
++    for op_id, row in sorted(states.items()):
++        if row is not None and row[0] == "rejected":
++            return f"child op {op_id} rejected"
++    for op_id, row in sorted(states.items()):
++        if row is not None:
++            return f"child op {op_id} still queued ({row[0]})"
++    for kid in kids:
++        try:
++            e = _evidence(hub, board, kid["table_name"], kid["row_uid"])
++        except (ksc.HubError, ksc.SyncUnavailable, OSError, AttributeError, ValueError) as exc:
++            return f"authoritative evidence unavailable: {exc}"
++        if e.get("state") != "live" or (e.get("row") or {}).get("uid") != kid["row_uid"]:
++            return f"child {kid['table_name']} {kid['row_uid']} not delivered: the Board holds no live row"
++    return None
++
++
++def _finish_step(conn: sqlite3.Connection, hub: Any, board: str, receipt: dict, out: dict) -> None:
++    started = _mono()
++    wait = _delivery_wait(conn, hub, board, receipt)
++    if wait:
++        out["waiting"] = wait
++        return
++    with write_txn(conn):
++        if not _fresh(started):
++            out["waiting"] = "evidence_interval_exceeded"
++        elif _receipt_state(conn, receipt) != "children_queued" or _identity_wait(conn, hub, board, receipt) or conn.execute(
++                "SELECT 1 FROM kanban_sync_outbox o JOIN kanban_sync_key_supersession_children c ON c.op_id=o.op_id "
++                "WHERE c.receipt_id=?", (receipt["receipt_id"],)).fetchone():
++            out["waiting"] = "receipt, identity or child ops changed during evidence read"
++        else:
++            conn.execute("UPDATE kanban_sync_key_supersessions SET state='complete', completed_at=? WHERE receipt_id=?",
++                         (int(time.time()), receipt["receipt_id"]))
++            out.update(advanced=True, completed=True)
++
++
++def is_replacement(conn: sqlite3.Connection, op_id: str) -> bool:
++    """A recovery requires its complete approved payload; an older Board cannot silently downgrade it."""
++    if not _has_tables(conn):
++        return False
++    return conn.execute("SELECT 1 FROM kanban_sync_key_supersessions WHERE parent_op_id=? UNION ALL "
++                        "SELECT 1 FROM kanban_sync_key_supersession_children WHERE op_id=?", (op_id, op_id)).fetchone() is not None
++
++
++def replacement_children(conn: sqlite3.Connection) -> set[str]:
++    """Recovery child ops never authorize synthesis of another task (including a deleted original parent)."""
++    if not _has_tables(conn):
++        return set()
++    return {r[0] for r in conn.execute("SELECT op_id FROM kanban_sync_key_supersession_children")}
++
++
++def remap(conn: sqlite3.Connection, old_id: str, new_id: str) -> None:
++    """Keep replacement custody when normal transient retry rotates an outbox id, in its writer transaction."""
++    if not _has_tables(conn):
++        return
++    conn.execute("UPDATE kanban_sync_key_supersessions SET parent_op_id=? WHERE parent_op_id=?",
++                 (new_id, old_id))
++    conn.execute("UPDATE kanban_sync_key_supersession_children SET op_id=? WHERE op_id=?", (new_id, old_id))
++
++
++def advance(conn: sqlite3.Connection, hub: Any, board: str, *, task_id: Optional[str] = None) -> list[dict]:
++    """Step every open receipt: parent accepted -> children queued -> children delivered (``complete``). Idempotent."""
++    if not _has_tables(conn):
++        return []
++    where, args = ("WHERE state IN ('parent_queued','children_queued') AND board=?", [board])
++    if task_id:
++        where, args = where + " AND task_id=?", args + [task_id]
++    reports = []
++    for receipt in [dict(r) for r in conn.execute(f"SELECT * FROM kanban_sync_key_supersessions {where}", args)]:
++        out = {"task_id": receipt["task_id"], "receipt_id": receipt["receipt_id"], "advanced": False}
++        reports.append(out)
++        wait = _identity_wait(conn, hub, board, receipt)
++        if wait:
++            out["waiting"] = wait
++        elif receipt["state"] == "parent_queued":
++            _queue_step(conn, hub, board, receipt, out)
++        else:
++            _finish_step(conn, hub, board, receipt, out)
++    return reports
+diff --git a/tests/hermes_cli/test_kanban_lanes.py b/tests/hermes_cli/test_kanban_lanes.py
+index 810eba748874ce795c7c80b545c1c6f3da95ce50..a26c957ba3da1195db06437bce9749ab490ada90 100644
+--- a/tests/hermes_cli/test_kanban_lanes.py
++++ b/tests/hermes_cli/test_kanban_lanes.py
+@@ -108,6 +108,8 @@ def test_alarm_and_urgent_cards_skip_the_gate(conn, configured, extra):
+     parent = _hermes_parent(conn)
+     if extra.get("admission_class"):
+         extra = {"admission_class": "urgent"}
++    else:
++        extra = {**extra, "created_by": "pickup-stall-detector"}  # the key namespace is the detector's alone
+     tid = kb.create_task(conn, title="now", assignee="default", creator_task_id=parent,
+                          workspace_path="/src/hermes-agent", **extra)
+     assert _task(conn, tid)["status"] == "ready"
+@@ -376,8 +378,8 @@ def test_capacity_and_alarm_cards_go_ahead_of_lane_picks(conn, configured):
+     normal = _ready_in(conn, "myapp", "bb", priority=900)
+     capacity = kb.create_task(conn, title="free a slot", assignee="default", tenant="hermes", created_by="user",
+                               admission_class="capacity", admission_frees="frees: one worker slot")
+-    alarm = kb.create_task(conn, title="stalled", assignee="default", tenant="hermes", created_by="user",
+-                           idempotency_key="pickup-stall:t_1")
++    alarm = kb.create_task(conn, title="stalled", assignee="default", tenant="hermes",
++                           created_by="pickup-stall-detector", idempotency_key="pickup-stall:t_1")
+     order = _order(conn)
+     assert set(order[:2]) == {capacity, alarm} and order[2] == normal
+ 
+diff --git a/tests/hermes_cli/test_kanban_priority_audit.py b/tests/hermes_cli/test_kanban_priority_audit.py
+index d60163512c5d29b1bd8ca16905a5a82672666588..821622bd3907ff0cd2406e3c28fc19b835aa7f8d 100644
+--- a/tests/hermes_cli/test_kanban_priority_audit.py
++++ b/tests/hermes_cli/test_kanban_priority_audit.py
+@@ -30,7 +30,8 @@ def test_created_event_records_actual_stored_priority(conn, requested, stored):
+ def test_decomposed_child_inherits_effective_priority_and_audits(conn, priority, key, expected):
+     from hermes_cli.kanban_db_graph import _insert_decomposed_child
+ 
+-    root = kb.create_task(conn, title='root', priority=priority, idempotency_key=key)
++    root = kb.create_task(conn, title='root', priority=priority, idempotency_key=key,
++                          created_by='pickup-stall-detector' if key else None)
+     row = conn.execute('SELECT * FROM tasks WHERE id=?', (root,)).fetchone()
+     child = _insert_decomposed_child(conn, root, row, {'title': 'child'}, 'test', 1800000000)
+     assert conn.execute('SELECT priority FROM tasks WHERE id=?', (child,)).fetchone()[0] == expected
+diff --git a/tests/hermes_cli/test_kanban_sync_reserved_key.py b/tests/hermes_cli/test_kanban_sync_reserved_key.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..23baa88174e1f928a95a4a84d89feab3e9cad267
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_reserved_key.py
+@@ -0,0 +1,511 @@
++"""Explicit reserved-idempotency-key correction of a never-created local card (kanban_sync_reserved_key)."""
++import json
++from argparse import Namespace
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_creation as creation
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_sync_reserved_key as rk
++from hermes_cli.kanban_pickup_alarm_identity import DETECTOR, reserved
++from hermes_cli.kanban_sync_rejections import resolve_rejections
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++BOARD, ME, OTHER = "default", "macbook", "mini"
++BAD, GOOD = "pickup-stall:mini:disk:1", "ordinary-key-1"
++REASON = "operator fixes never-created card"
++
++
++class StrictService(FakeService):
++    """The Board's fence: a reserved key from a non-detector refuses the card; its children have no card."""
++
++    def row_op(self, b, op, gw):
++        table, f = op["table"], op.get("fields") or {}
++        if op["op"] != "delete":
++            if table == "tasks" and reserved(f.get("idempotency_key")) and f.get("created_by") != DETECTOR:
++                return {"status": "rejected", "reason": "invalid", "detail": "pickup_stall_provenance"}
++            ends = [f.get("parent_id"), f.get("child_id")] if table == "task_links" else [f.get("task_id")]
++            if table != "tasks" and any(e and e not in b["rows"].get("tasks", {}) for e in ends):
++                return {"status": "rejected", "reason": "not_found", "detail": "parent card is missing"}
++        return super().row_op(b, op, gw)
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def svc():
++    return StrictService()
++
++
++@pytest.fixture
++def live(kanban_home):
++    support.write_sync_config(kanban_home, True)
++    conn = kbc.connect(kanban_home / "kanban.db")
++    client.ensure_identity(conn, BOARD, ME)
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def quiet(conn, sql, args=()):
++    """A local write the capture triggers do not see (fixture state, not an ordinary edit)."""
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE kanban_sync_state SET applying=1")
++        conn.execute(sql, args)
++        conn.execute("UPDATE kanban_sync_state SET applying=0")
++
++
++def bad_card(live, svc, monkeypatch, *, key=BAD, created_by="user", title="ordinary work", push=True):
++    """A card created with a reserved key before the create-time refusal existed, whose ops the Board refused."""
++    with monkeypatch.context() as m:
++        m.setattr(creation, "reject_reserved_key", lambda *a, **k: None)
++        other = kb.create_task(live, title="unrelated", assignee="worker")
++        tid = kb.create_task(live, title=title, assignee="worker", created_by=created_by, idempotency_key=key)
++    kb.add_comment(live, tid, "user", "a comment that must survive")
++    with kbc.write_txn(live):
++        live.execute("INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome) "
++                     "VALUES (?, 'worker', 'done', 1, 2, 'completed')", (tid,))
++        live.execute("INSERT INTO task_chat_links (task_id, chat_gateway, chat_session, kind, created_at) "
++                     "VALUES (?, ?, 's1', 'created', 1)", (tid, ME))
++        live.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (other, tid))
++    if push:
++        client.push(live, svc.hub(ME), BOARD, ME, primary=False)
++        assert svc.board(BOARD)["rows"].get("tasks", {}).get(tid) is None
++    else:  # nothing was sent: no op is rejected yet, so mark them as a refused push would
++        quiet(live, "UPDATE kanban_sync_outbox SET state='rejected', last_error='invalid: pickup_stall_provenance' "
++                    "WHERE state='pending'")
++    return tid, other
++
++
++def rejected_ops(conn, tid=None):
++    return [dict(r) for r in conn.execute("SELECT * FROM kanban_sync_outbox WHERE state='rejected' ORDER BY op_id")]
++
++
++def key_op(conn, key=BAD):
++    return next(o["op_id"] for o in rejected_ops(conn) if o["table_name"] == "tasks"
++                and json.loads(o["fields"]).get("idempotency_key") == key)
++
++
++def dump(conn):
++    return list(conn.iterdump())
++
++
++def preview(live, svc, tid, key=GOOD):
++    return rk.plan(live, svc.hub(ME), BOARD, tid, key, REASON)
++
++
++def apply(live, svc, tid, token, key=GOOD):
++    return rk.apply(live, svc.hub(ME), BOARD, tid, key, token, REASON)
++
++
++def rounds(live, svc, kanban_home, n=5):
++    for _ in range(n):
++        client.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(ME), ME)
++
++
++# --- creation refusal ---------------------------------------------------------------------------------
++
++def test_ordinary_create_refuses_reserved_key_before_any_write_but_detector_works(live):
++    before = dump(live)
++    for key in ("pickup-stall:mini:x:1", "worker-resources-unknown:mini:1", "pickup-stall:"):
++        with pytest.raises(ValueError, match="reserved"):
++            kb.create_task(live, title="t", assignee="worker", created_by="user", idempotency_key=key)
++    assert dump(live) == before
++    d1 = kb.create_task(live, title="d1", assignee="worker", created_by=DETECTOR, idempotency_key="pickup-stall:mini:disk:7")
++    d2 = kb.create_task(live, title="d2", assignee="worker", created_by=DETECTOR,
++                        idempotency_key="worker-resources-unknown:mini:9")
++    assert d1 != d2
++    assert kb.create_task(live, title="ok", assignee="worker", idempotency_key="my-key")
++
++
++# --- preview ----------------------------------------------------------------------------------------
++
++def test_preview_is_read_only_and_names_exact_old_ops(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    old = rejected_ops(live)
++    assert old
++    before = dump(live)
++    report = preview(live, svc, tid)
++    assert report["eligible"] and report["action"] == "preview" and report["token"]
++    assert sorted(report["superseded_op_ids"]) == sorted(o["op_id"] for o in old)
++    kinds = {t for t, _u in report["children"]}
++    assert {"task_comments", "task_events", "task_runs", "task_chat_links", "task_links"} <= kinds
++    assert dump(live) == before  # nothing written, not even the receipt tables
++
++
++# --- apply -------------------------------------------------------------------------------------------
++
++def test_apply_corrects_key_keeps_rejections_and_history_then_children_follow_parent(live, svc, monkeypatch, kanban_home):
++    tid, other = bad_card(live, svc, monkeypatch)
++    old = {o["op_id"]: o for o in rejected_ops(live)}
++    events_before = [tuple(r) for r in live.execute("SELECT * FROM task_events WHERE task_id=? ORDER BY id", (tid,))]
++    other_before = [tuple(r) for r in live.execute("SELECT * FROM tasks WHERE id=?", (other,))]
++    token = preview(live, svc, tid)["token"]
++    result = apply(live, svc, tid, token)
++    assert result["action"] == "applied"
++    assert live.execute("SELECT idempotency_key FROM tasks WHERE id=?", (tid,)).fetchone()[0] == GOOD
++    # Immutable: every rejected op byte-identical, same ids, nothing deleted or reset.
++    assert {o["op_id"]: o for o in rejected_ops(live)} == old
++    assert [tuple(r) for r in live.execute("SELECT * FROM task_events WHERE task_id=? ORDER BY id", (tid,))] == events_before
++    # Exactly one new pending op: the corrected parent; children wait for its acceptance.
++    pending = [dict(r) for r in live.execute("SELECT * FROM kanban_sync_outbox WHERE state='pending'")]
++    assert [(p["table_name"], p["row_uid"], p["op"]) for p in pending] == [("tasks", tid, "import")]
++    assert json.loads(pending[0]["fields"])["idempotency_key"] == GOOD
++    receipt = rk.receipt_for_task(live, tid)
++    assert receipt["state"] == "parent_queued" and receipt["old_key"] == BAD and receipt["new_key"] == GOOD
++    mapped = {r[0] for r in live.execute("SELECT old_op_id FROM kanban_sync_key_supersession_ops")}
++    assert mapped == set(old)
++    assert [tuple(r) for r in live.execute("SELECT * FROM tasks WHERE id=?", (other,))] == other_before
++
++    calls_before = len(svc.calls)
++    rounds(live, svc, kanban_home)
++    ops_sent = [(i, o) for i, (kind, _b, body) in enumerate(svc.calls[calls_before:]) if kind == "ops" for o in body]
++    parent_at = next(i for i, o in ops_sent if o["table"] == "tasks" and o["uid"] == tid
++                     and o["fields"].get("idempotency_key") == GOOD)
++    child_at = [i for i, o in ops_sent if o["table"] != "tasks" and o["uid"] not in old]
++    assert child_at and all(i > parent_at for i in child_at)  # children only after the accepted parent round
++    board = svc.board(BOARD)["rows"]
++    assert board["tasks"][tid]["idempotency_key"] == GOOD and board["tasks"][tid]["created_on"] == ME
++    assert board["task_comments"] and board["task_chat_links"] and board["task_runs"]
++    assert rk.receipt_for_task(live, tid)["state"] == "complete"
++    assert not [r for r in live.execute("SELECT 1 FROM kanban_sync_outbox WHERE state='pending'")]
++    # The old rejections retire only through the receipt, which keeps their exact bytes.
++    assert client.status(live)["rejected"] == 0
++    kept = {r[0]: json.loads(r[1]) for r in live.execute("SELECT old_op_id, op_json FROM kanban_sync_key_supersession_ops")}
++    assert kept == old
++    assert [tuple(r) for r in live.execute("SELECT * FROM task_events WHERE task_id=? ORDER BY id", (tid,))][:len(events_before)] \
++        == events_before
++
++
++def test_repeated_apply_is_idempotent_and_continues_receipt(live, svc, monkeypatch, kanban_home):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    token = preview(live, svc, tid)["token"]
++    assert apply(live, svc, tid, token)["action"] == "applied"
++    outbox = dump(live)
++    again = apply(live, svc, tid, token)
++    assert again["action"] == "already_applied" and again["advance"][0]["advanced"] is False
++    assert dump(live) == outbox
++    assert apply(live, svc, tid, token, key="another-key")["refusal"] == "receipt_exists_other_key"
++    client.push(live, svc.hub(ME), BOARD, ME, primary=False)
++    client._pull_replica(BOARD, svc.hub(ME), ME)
++    third = apply(live, svc, tid, token)  # a repeat after acceptance performs the child step
++    assert third["action"] == "already_applied" and third["advance"][0]["advanced"]
++    count = live.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE state='pending'").fetchone()[0]
++    assert apply(live, svc, tid, token)["advance"][0]["advanced"] is False  # children queued, not yet delivered
++    assert live.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE state='pending'").fetchone()[0] == count
++
++
++def test_crash_inside_apply_leaves_no_partial_state(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    token = preview(live, svc, tid)["token"]
++    before = dump(live)
++
++    def boom(*a, **k):
++        raise RuntimeError("crash after the key rewrite")
++
++    monkeypatch.setattr(client, "_row_fields", boom)
++    with pytest.raises(RuntimeError):
++        apply(live, svc, tid, token)
++    monkeypatch.undo()
++    assert dump(live) == before
++    assert apply(live, svc, tid, token)["action"] == "applied"  # the same token still applies after the crash
++
++
++def test_crash_between_accepted_parent_and_children_resumes(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    apply(live, svc, tid, preview(live, svc, tid)["token"])
++    client.push(live, svc.hub(ME), BOARD, ME, primary=False)
++    real = sync.uuid7
++    state = {"n": 0}
++
++    def flaky():
++        state["n"] += 1
++        if state["n"] == 2:
++            raise RuntimeError("crash while queueing children")
++        return real()
++
++    monkeypatch.setattr(sync, "uuid7", flaky)
++    with pytest.raises(RuntimeError):
++        rk.advance(live, svc.hub(ME), BOARD)
++    monkeypatch.setattr(sync, "uuid7", real)
++    assert rk.receipt_for_task(live, tid)["state"] == "parent_queued"
++    assert not live.execute("SELECT 1 FROM kanban_sync_outbox WHERE state='pending'").fetchone()
++    assert rk.advance(live, svc.hub(ME), BOARD)[0]["advanced"]
++    assert rk.receipt_for_task(live, tid)["state"] == "children_queued"
++    pending = [tuple(r) for r in live.execute("SELECT table_name, row_uid FROM kanban_sync_outbox WHERE state='pending'")]
++    assert len(pending) == len(set(pending)) > 0
++
++
++def test_children_wait_while_board_has_not_accepted_parent(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    apply(live, svc, tid, preview(live, svc, tid)["token"])
++    assert "parent op" in rk.advance(live, svc.hub(ME), BOARD)[0]["waiting"]  # still queued
++    quiet(live, "DELETE FROM kanban_sync_outbox WHERE state='pending'")  # op gone but nothing acknowledged it
++    assert "not acknowledged" in rk.advance(live, svc.hub(ME), BOARD)[0]["waiting"]
++    quiet(live, "UPDATE tasks SET sync_version=5 WHERE id=?", (tid,))
++    assert "has not accepted" in rk.advance(live, svc.hub(ME), BOARD)[0]["waiting"]  # Board never saw the card
++    assert rk.receipt_for_task(live, tid)["state"] == "parent_queued"
++
++
++# --- refusals ---------------------------------------------------------------------------------------
++
++def assert_refused(live, svc, tid, code, key=GOOD):
++    before = dump(live)
++    report = preview(live, svc, tid, key)
++    assert not report["eligible"] and report["refusal"].startswith(code), report
++    result = apply(live, svc, tid, "anything", key)
++    assert result["action"] == "refused" and dump(live) == before
++
++
++def test_detector_card_is_never_corrected(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch, key="pickup-stall:macbook:disk:3", created_by=DETECTOR, push=False)
++    assert_refused(live, svc, tid, "detector_card")
++
++
++def test_ordinary_key_card_refused(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch, key="plain", push=False)
++    assert_refused(live, svc, tid, "key_not_reserved")
++
++
++def test_foreign_or_acknowledged_card_refused(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    quiet(live, "UPDATE tasks SET created_on=? WHERE id=?", (OTHER, tid))
++    assert_refused(live, svc, tid, "not_locally_owned")
++    quiet(live, "UPDATE tasks SET created_on=NULL, sync_version=3 WHERE id=?", (tid,))
++    assert_refused(live, svc, tid, "not_locally_owned")
++
++
++def test_foreign_gateway_identity_refused(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    report = rk.plan(live, svc.hub(OTHER), BOARD, tid, GOOD, REASON)
++    assert report["refusal"] == "foreign_gateway_identity"
++
++
++@pytest.mark.parametrize("fixture", ["running", "claim", "lease", "open_run", "current_run", "worker_pid"])
++def test_running_or_leased_card_refused(live, svc, monkeypatch, fixture):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    sql = {"running": "UPDATE tasks SET status='running' WHERE id=?",
++           "claim": "UPDATE tasks SET claim_lock='h:1' WHERE id=?",
++           "lease": "UPDATE tasks SET lease_holder='mini', lease_expires=9999999999999 WHERE id=?",
++           "worker_pid": "UPDATE tasks SET worker_pid=77 WHERE id=?",
++           "current_run": "UPDATE tasks SET current_run_id=(SELECT id FROM task_runs WHERE task_id=tasks.id) WHERE id=?",
++           "open_run": "UPDATE task_runs SET ended_at=NULL WHERE task_id=?"}[fixture]
++    quiet(live, sql, (tid,))
++    assert_refused(live, svc, tid, "active_run_or_lease")
++
++
++def test_claim_racing_the_evidence_read_is_refused_by_transactional_revalidation(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    token = preview(live, svc, tid)["token"]
++    hub = svc.hub(ME)
++    original = hub.row_evidence
++    calls = []
++
++    def read(*a):
++        out = original(*a)
++        if not calls:  # a worker claims the card after the first evidence read, before the write
++            calls.append(1)
++            quiet(live, "UPDATE tasks SET status='running', claim_lock='w:1' WHERE id=?", (tid,))
++        return out
++
++    monkeypatch.setattr(hub, "row_evidence", read)
++    result = rk.apply(live, hub, BOARD, tid, GOOD, token, REASON)
++    assert result["action"] == "refused" and "local_state_changed" in result["refusal"]
++    assert live.execute("SELECT idempotency_key FROM tasks WHERE id=?", (tid,)).fetchone()[0] == BAD
++    assert rk.receipt_for_task(live, tid) is None
++
++
++def test_write_window_race_vetoed_inside_transaction(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    token = preview(live, svc, tid)["token"]
++    # Another process edits the card after plan finished and before the write transaction opens.
++    other = kbc.connect(Path(live.execute("PRAGMA database_list").fetchone()[2]))
++    real_plan = rk.plan
++
++    def plan_then_edit(*a, **k):
++        out = real_plan(*a, **k)
++        with kbc.write_txn(other):  # untracked edit: only the token can notice it (no outbox op appears)
++            other.execute("UPDATE kanban_sync_state SET applying=1")
++            other.execute("UPDATE tasks SET title='edited after plan' WHERE id=?", (tid,))
++            other.execute("UPDATE kanban_sync_state SET applying=0")
++        return out
++
++    monkeypatch.setattr(rk, "plan", plan_then_edit)
++    try:
++        result = rk.apply(live, svc.hub(ME), BOARD, tid, GOOD, token, REASON)
++    finally:
++        other.close()
++    assert result["action"] == "refused" and result["refusal"] == "local_state_changed_before_write"
++    assert live.execute("SELECT idempotency_key FROM tasks WHERE id=?", (tid,)).fetchone()[0] == BAD
++    assert rk.receipt_for_task(live, tid) is None
++
++
++@pytest.mark.parametrize("mutate", ["title", "comment", "outbox_state"])
++def test_stale_cas_refused_without_writing(live, svc, monkeypatch, mutate):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    token = preview(live, svc, tid)["token"]
++    if mutate == "title":
++        quiet(live, "UPDATE tasks SET title='moved on' WHERE id=?", (tid,))
++    elif mutate == "comment":
++        quiet(live, "INSERT INTO task_comments (task_id, author, body, created_at, uid) VALUES (?, 'u', 'new', 5, 'c-new')",
++              (tid,))
++    else:
++        quiet(live, "UPDATE kanban_sync_outbox SET last_error='changed' WHERE state='rejected'")
++    before = dump(live)
++    result = apply(live, svc, tid, token)
++    assert result["action"] == "refused" and result["refusal"] == "stale_or_missing_expected_token"
++    assert dump(live) == before
++    assert apply(live, svc, tid, None)["refusal"] == "stale_or_missing_expected_token"
++
++
++@pytest.mark.parametrize("fixture", ["pending", "tombstone", "child_pending"])
++def test_pending_outbox_or_tombstone_refused(live, svc, monkeypatch, fixture):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    with kbc.write_txn(live):
++        if fixture == "pending":
++            live.execute("INSERT INTO kanban_sync_outbox (op_id,table_name,row_uid,op,fields,hlc,created_at) "
++                         "VALUES ('p1','tasks',?,'upsert','{}','',2)", (tid,))
++        elif fixture == "child_pending":
++            live.execute("INSERT INTO kanban_sync_outbox (op_id,table_name,row_uid,op,fields,hlc,created_at) "
++                         "VALUES ('p1','task_comments','c-x','upsert',?,'',2)", (json.dumps({"task_id": tid}),))
++        else:
++            comment = live.execute("SELECT uid FROM task_comments WHERE task_id=?", (tid,)).fetchone()[0]
++            live.execute("INSERT INTO kanban_sync_tombstones VALUES ('task_comments',?,1)", (comment,))
++            live.execute("INSERT INTO kanban_sync_outbox (op_id,table_name,row_uid,op,fields,hlc,created_at,state) "
++                         "VALUES ('d1','task_comments',?,'delete',?,'',2,'rejected')", (comment, json.dumps({})))
++    assert_refused(live, svc, tid, "pending_outbox" if fixture != "tombstone" else "local_tombstone")
++
++
++@pytest.mark.parametrize("veto", ["pruned", "live_task", "live_child", "deleted_child", "offline", "identity", "tombstone"])
++def test_board_evidence_must_prove_never_existed(live, svc, monkeypatch, veto):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    rows = svc.board(BOARD)["rows"]
++    comment = live.execute("SELECT uid FROM task_comments WHERE task_id=?", (tid,)).fetchone()[0]
++    hub = svc.hub(ME)
++    original = hub.row_evidence
++    veto_table = {
++        "pruned": lambda: svc.board(BOARD).__setitem__("floor", 1),
++        "live_task": lambda: rows.setdefault("tasks", {}).__setitem__(tid, {"uid": tid, "version": 1}),
++        "live_child": lambda: rows.setdefault("task_comments", {}).__setitem__(comment, {"uid": comment, "version": 1}),
++        "deleted_child": lambda: rows.setdefault("task_comments", {}).__setitem__(
++            comment, {"uid": comment, "deleted_at": 4}),
++        "offline": lambda: setattr(svc, "offline", True),
++        "identity": lambda: monkeypatch.setattr(hub, "row_evidence", lambda *a: {**original(*a), "uid": "another"}),
++        "tombstone": lambda: monkeypatch.setattr(hub, "row_evidence",
++                                                 lambda *a: {**original(*a), "tombstone": {"deleted_at": 1}}),
++    }
++    veto_table[veto]()
++    before = dump(live)
++    report = rk.plan(live, hub, BOARD, tid, GOOD, REASON)
++    assert not report["eligible"] and report["refusal"].split(":")[0] in (
++        "board_history_not_proven_never_existed", "authoritative_evidence_unavailable")
++    assert rk.apply(live, hub, BOARD, tid, GOOD, "x", REASON)["action"] == "refused"
++    assert dump(live) == before
++
++
++@pytest.mark.parametrize("key", ["", " padded ", "pickup-stall:mini:x:2", "worker-resources-unknown:mini:2", "x" * 201,
++                                 BAD, None])
++def test_replacement_key_must_be_nonreserved_nonempty_and_distinct(live, svc, monkeypatch, key):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    assert_refused(live, svc, tid, "bad_replacement_key", key)
++
++
++def test_replacement_key_must_be_unique_even_archived(live, svc, monkeypatch):
++    tid, other = bad_card(live, svc, monkeypatch)
++    quiet(live, "UPDATE tasks SET idempotency_key=?, status='archived' WHERE id=?", (GOOD, other))
++    assert_refused(live, svc, tid, "replacement_key_in_use")
++
++
++def test_unrelated_cards_and_rejections_are_untouched(live, svc, monkeypatch):
++    tid, other = bad_card(live, svc, monkeypatch)
++    bystander, _ = bad_card(live, svc, monkeypatch, key="pickup-stall:mini:disk:2", title="bystander")
++    rows_other = [tuple(r) for r in live.execute("SELECT * FROM tasks WHERE id IN (?, ?)", (other, bystander))]
++    bystander_ops = [dict(r) for r in live.execute("SELECT * FROM kanban_sync_outbox WHERE row_uid=?", (bystander,))]
++    apply(live, svc, tid, preview(live, svc, tid)["token"])
++    assert [tuple(r) for r in live.execute("SELECT * FROM tasks WHERE id IN (?, ?)", (other, bystander))] == rows_other
++    assert [dict(r) for r in live.execute("SELECT * FROM kanban_sync_outbox WHERE row_uid=?", (bystander,))] == bystander_ops
++    assert live.execute("SELECT COUNT(*) FROM kanban_sync_key_supersessions").fetchone()[0] == 1
++
++
++# --- conservative resolution -----------------------------------------------------------------------
++
++def test_without_receipt_old_key_op_never_matches_corrected_remote(live, svc, monkeypatch, kanban_home):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    key_id = key_op(live)
++    apply(live, svc, tid, preview(live, svc, tid)["token"])
++    client.push(live, svc.hub(ME), BOARD, ME, primary=False)
++    quiet(live, "DELETE FROM kanban_sync_key_supersession_ops")  # no verified mapping: only the old rules apply
++    reports = resolve_rejections(live, svc.hub(ME), BOARD)
++    task_op = next(r for r in reports if r["op_id"] == key_id)
++    assert task_op["classification"] == "unresolved" and task_op["action"] == "retained"
++    assert any(o["table_name"] == "tasks" for o in rejected_ops(live))
++
++
++@pytest.mark.parametrize("tamper", ["state", "bytes", "remote_key", "local_key", "remote_owner"])
++def test_receipt_resolution_requires_complete_untampered_receipt_and_remote_proof(live, svc, monkeypatch, tamper):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    key_id = key_op(live)
++    apply(live, svc, tid, preview(live, svc, tid)["token"])
++    client.push(live, svc.hub(ME), BOARD, ME, primary=False)
++    rk.advance(live, svc.hub(ME), BOARD)
++    client.push(live, svc.hub(ME), BOARD, ME, primary=False)
++    client._pull_replica(BOARD, svc.hub(ME), ME)
++    assert rk.advance(live, svc.hub(ME), BOARD)[0].get("completed")  # the receipt is complete before it is tampered
++    board_tasks = svc.board(BOARD)["rows"]["tasks"]
++    tampers = {
++        "state": lambda: quiet(live, "UPDATE kanban_sync_key_supersessions SET state='parent_queued'"),
++        "bytes": lambda: quiet(live, "UPDATE kanban_sync_outbox SET last_error='edited' WHERE state='rejected' "
++                                     "AND table_name='tasks'"),
++        "remote_key": lambda: board_tasks[tid].__setitem__("idempotency_key", "somebody-else"),
++        "local_key": lambda: quiet(live, "UPDATE tasks SET idempotency_key='local-edit' WHERE id=?", (tid,)),
++        "remote_owner": lambda: board_tasks[tid].__setitem__("created_on", OTHER),
++    }
++    tampers[tamper]()
++    reports = resolve_rejections(live, svc.hub(ME), BOARD)
++    task_op = next(r for r in reports if r["op_id"] == key_id)
++    assert task_op["classification"] == "unresolved", task_op
++
++
++def test_receipt_resolution_retires_exactly_the_receipt_ops(live, svc, monkeypatch, kanban_home):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    foreign = {"op_id": "foreign-op", "table_name": "tasks", "row_uid": tid, "op": "upsert",
++               "fields": json.dumps({"idempotency_key": BAD}), "hlc": "", "created_at": 9, "state": "rejected",
++               "last_error": "invalid", "attempts": 1}
++    apply(live, svc, tid, preview(live, svc, tid)["token"])
++    with kbc.write_txn(live):  # a rejected op the receipt does not name (appeared afterwards)
++        live.execute("INSERT INTO kanban_sync_outbox (op_id,table_name,row_uid,op,fields,hlc,created_at,state,last_error,"
++                     "attempts) VALUES (:op_id,:table_name,:row_uid,:op,:fields,:hlc,:created_at,:state,:last_error,"
++                     ":attempts)", foreign)
++    rounds(live, svc, kanban_home)
++    left = [o["op_id"] for o in rejected_ops(live)]
++    assert left == ["foreign-op"]
++
++
++# --- CLI ----------------------------------------------------------------------------------------------
++
++def test_cli_preview_then_apply_requires_expect(live, svc, monkeypatch, kanban_home, capsys):
++    from hermes_cli import kanban_sync_cli as cli
++    tid, _ = bad_card(live, svc, monkeypatch)
++    monkeypatch.setattr(cli, "_board", lambda args: BOARD)
++    monkeypatch.setattr(cli, "_path", lambda slug: kanban_home / "kanban.db")
++    monkeypatch.setattr(client, "load_identity", lambda: svc.hub(ME).ident)
++    monkeypatch.setattr(client, "Hub", lambda ident: svc.hub(ME))
++    args = Namespace(task_id=tid, new_key=GOOD, apply=False, expect=None, json=True, reason=REASON)
++    assert cli._reserved_key(args) == 0
++    token = json.loads(capsys.readouterr().out)["token"]
++    assert live.execute("SELECT idempotency_key FROM tasks WHERE id=?", (tid,)).fetchone()[0] == BAD
++    assert cli._reserved_key(Namespace(**{**vars(args), "apply": True})) == 2
++    assert cli._reserved_key(Namespace(**{**vars(args), "apply": True, "expect": "wrong"})) == 1
++    capsys.readouterr()
++    assert cli._reserved_key(Namespace(**{**vars(args), "apply": True, "expect": token})) == 0
++    assert json.loads(capsys.readouterr().out)["action"] == "applied"
++    assert live.execute("SELECT idempotency_key FROM tasks WHERE id=?", (tid,)).fetchone()[0] == GOOD
+diff --git a/tests/hermes_cli/test_kanban_sync_reserved_key_boundaries.py b/tests/hermes_cli/test_kanban_sync_reserved_key_boundaries.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0a16f9d096ea8b827ceea642ef81ff67229324b2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_reserved_key_boundaries.py
+@@ -0,0 +1,304 @@
++"""Isolated recovery boundaries from mutation-plan.md; no synthetic receipt inputs."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_sync_reserved_key as rk
++from hermes_cli.kanban_sync_rejections import resolve_rejections
++from tests.hermes_cli import test_kanban_sync_reserved_key as base
++from tests.hermes_cli import test_kanban_sync_reserved_key_safety as safety
++
++# Register the existing fixtures without importing their test functions into this module.
++kanban_home = base.kanban_home
++svc = base.svc
++live = base.live
++clock = safety.clock
++
++
++def _op(conn, op_id):
++    row = conn.execute("SELECT * FROM kanban_sync_outbox WHERE op_id=?", (op_id,)).fetchone()
++    return dict(row) if row else None
++
++
++def _reinsert(conn, row, state="pending"):
++    """Restore a real previously queued op, retaining its tracked identity and payload."""
++    row = {**row, "state": state}
++    columns = list(row)
++    with base.kbc.write_txn(conn):
++        conn.execute(
++            f"INSERT INTO kanban_sync_outbox ({','.join(columns)}) "
++            f"VALUES ({','.join('?' for _ in columns)})", [row[c] for c in columns])
++    return row
++
++
++def _delivered_children(conn, service, tid):
++    """Stop just before finish, with every manifest row delivered and no tracked op left."""
++    safety.accepted_parent(conn, service, tid)
++    queued = rk.advance(conn, service.hub(base.ME), base.BOARD)[0]
++    assert queued["advanced"] and queued["children_queued"] > 0
++    children = [dict(r) for r in conn.execute(
++        "SELECT o.* FROM kanban_sync_outbox o JOIN kanban_sync_key_supersession_children c "
++        "ON c.op_id=o.op_id ORDER BY o.op_id")]
++    assert children
++    base.client.push(conn, service.hub(base.ME), base.BOARD, base.ME, primary=False)
++    assert all(_op(conn, child["op_id"]) is None for child in children)
++    for child in children:
++        remote = service.board(base.BOARD)["rows"][child["table_name"]][child["row_uid"]]
++        assert remote["uid"] == child["row_uid"] and not remote.get("deleted_at")
++    _assert_unfinished(conn, tid)
++    return children
++
++
++def _assert_unfinished(conn, tid):
++    receipt = rk.receipt_for_task(conn, tid)
++    assert receipt["state"] == "children_queued"
++    assert receipt["completed_at"] is None
++
++
++def _assert_parent_waiting(conn, tid):
++    assert rk.receipt_for_task(conn, tid)["state"] == "parent_queued"
++    assert conn.execute("SELECT count(*) FROM kanban_sync_key_supersession_children").fetchone()[0] == 0
++    assert not conn.execute(
++        "SELECT 1 FROM kanban_sync_outbox WHERE state='pending' AND table_name!='tasks'").fetchone()
++
++
++def _assert_retained(conn, service, original_ops):
++    reports = {r["op_id"]: r for r in resolve_rejections(conn, service.hub(base.ME), base.BOARD)}
++    for original in original_ops:
++        report = reports[original["op_id"]]
++        assert report["classification"] == "unresolved", report
++        assert report["action"] == "retained", report
++        assert _op(conn, original["op_id"]) == original
++
++
++def test_file_gateway_only_tamper_retains_task_and_child_bytes(live, svc, monkeypatch):
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    old = base.rejected_ops(live)
++    task = next(o for o in old if o["op_id"] == base.key_op(live))
++    comment = next(o for o in old if o["table_name"] == "task_comments")
++    safety.completed(live, svc, tid)
++    base.quiet(live, "UPDATE kanban_sync_state SET gateway_id=?", (base.OTHER,))
++    receipt = rk.receipt_for_task(live, tid)
++    assert receipt["gateway_id"] == base.ME
++    assert svc.hub(base.ME).ident.gateway == base.ME
++    assert svc.board(base.BOARD)["rows"]["tasks"][tid]["created_on"] == base.ME
++    _assert_retained(live, svc, [task, comment])
++
++
++@pytest.mark.parametrize("column,value", [("table_name", "task_events"), ("row_uid", "another-comment")])
++def test_receipt_identity_metadata_custody_without_byte_changes(live, svc, monkeypatch, column, value):
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    comment = next(o for o in base.rejected_ops(live) if o["table_name"] == "task_comments")
++    safety.completed(live, svc, tid)
++    base.quiet(live, f"UPDATE kanban_sync_key_supersession_ops SET {column}=? WHERE old_op_id=?",
++               (value, comment["op_id"]))
++    _assert_retained(live, svc, [comment])
++
++
++def test_child_removed_only_from_receipt_manifest_cannot_retire(live, svc, monkeypatch):
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    comment = next(o for o in base.rejected_ops(live) if o["table_name"] == "task_comments")
++    safety.completed(live, svc, tid)
++    receipt = rk.receipt_for_task(live, tid)
++    identity = ["task_comments", comment["row_uid"]]
++    children = json.loads(receipt["children"])
++    assert identity in children
++    children.remove(identity)
++    base.quiet(live, "UPDATE kanban_sync_key_supersessions SET children=? WHERE receipt_id=?",
++               (json.dumps(children), receipt["receipt_id"]))
++    assert rk.receipt_for_op(live, comment["op_id"]) is not None
++    _assert_retained(live, svc, [comment])
++
++
++def test_child_retirement_checks_corrected_remote_parent_key(live, svc, monkeypatch):
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    comment = next(o for o in base.rejected_ops(live) if o["table_name"] == "task_comments")
++    safety.completed(live, svc, tid)
++    svc.board(base.BOARD)["rows"]["tasks"][tid]["idempotency_key"] = "another-key"
++    _assert_retained(live, svc, [comment])
++
++
++@pytest.mark.parametrize("column", ["claim_expires", "worker_started_at", "lease_expires", "lease_version"])
++def test_each_active_column_alone_refuses_without_writes(live, svc, monkeypatch, column):
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    active = ("claim_lock", "claim_expires", "worker_pid", "worker_started_at", "lease_holder",
++              "lease_expires", "lease_version", "current_run_id")
++    row = live.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
++    assert all(row[c] is None for c in active)
++    assert base.preview(live, svc, tid)["eligible"]
++    base.quiet(live, f"UPDATE tasks SET {column}=? WHERE id=?", (1, tid))
++    base.assert_refused(live, svc, tid, "active_run_or_lease")
++
++
++@pytest.mark.parametrize("contradiction", [{"floor": 1}, {"row": {"uid": "contradictory-live-row"}}],
++                         ids=["positive-floor", "nonnull-row"])
++def test_never_existed_requires_zero_floor_and_no_row(live, svc, monkeypatch, contradiction):
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    token = base.preview(live, svc, tid)["token"]
++    hub = svc.hub(base.ME)
++    original = hub.row_evidence
++
++    def contradictory(*args):
++        evidence = original(*args)
++        assert evidence["state"] == "never_existed"
++        return {**evidence, **contradiction}
++
++    monkeypatch.setattr(hub, "row_evidence", contradictory)
++    before = base.dump(live)
++    report = rk.plan(live, hub, base.BOARD, tid, base.GOOD, base.REASON)
++    assert not report["eligible"]
++    assert report["refusal"].startswith("board_history_not_proven_never_existed")
++    result = rk.apply(live, hub, base.BOARD, tid, base.GOOD, token, base.REASON)
++    assert result["action"] == "refused"
++    assert base.dump(live) == before
++
++
++def test_finish_writer_wait_expires_without_completion_or_writes(live, svc, monkeypatch, clock):
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    _delivered_children(live, svc, tid)
++    safety.slow_lock(monkeypatch, clock, rk.EVIDENCE_MAX_AGE_S + 1)
++    before = base.dump(live)
++    report = rk.advance(live, svc.hub(base.ME), base.BOARD)[0]
++    assert not report["advanced"] and report["waiting"] == "evidence_interval_exceeded"
++    _assert_unfinished(live, tid)
++    assert base.dump(live) == before
++
++
++@pytest.mark.parametrize("race", ["board_identity", "child_outbox"])
++def test_finish_rechecks_identity_and_child_ops_after_delivery_evidence(live, svc, monkeypatch, race):
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    children = _delivered_children(live, svc, tid)
++    hub = svc.hub(base.ME)
++    original = hub.row_evidence
++    after_race = []
++
++    def read(*args):
++        evidence = original(*args)
++        if not after_race:
++            assert evidence["state"] == "live"
++            if race == "board_identity":
++                base.quiet(live, "UPDATE kanban_sync_state SET board_id='moved-board'")
++            else:
++                _reinsert(live, children[0])
++            after_race.append(base.dump(live))
++        return evidence
++
++    monkeypatch.setattr(hub, "row_evidence", read)
++    report = rk.advance(live, hub, base.BOARD)[0]
++    assert after_race, "the race must occur during finish evidence, not at its entry veto"
++    assert not report["advanced"] and "changed during evidence read" in report["waiting"]
++    _assert_unfinished(live, tid)
++    assert base.dump(live) == after_race[0]
++
++
++@pytest.mark.parametrize("state", ["pending", "rejected"])
++def test_acknowledged_parent_reinsert_blocks_children(live, svc, monkeypatch, state):
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    assert base.apply(live, svc, tid, base.preview(live, svc, tid)["token"])["action"] == "applied"
++    parent = _op(live, rk.receipt_for_task(live, tid)["parent_op_id"])
++    base.client.push(live, svc.hub(base.ME), base.BOARD, base.ME, primary=False)
++    base.client._pull_replica(base.BOARD, svc.hub(base.ME), base.ME)
++    assert live.execute("SELECT sync_version FROM tasks WHERE id=?", (tid,)).fetchone()[0] is not None
++    assert svc.board(base.BOARD)["rows"]["tasks"][tid]["idempotency_key"] == base.GOOD
++    restored = _reinsert(live, parent, state)
++    before = base.dump(live)
++    report = rk.advance(live, svc.hub(base.ME), base.BOARD)[0]
++    assert not report["advanced"] and report["waiting"] == f"parent op {state}"
++    _assert_parent_waiting(live, tid)
++    assert _op(live, parent["op_id"]) == restored
++    assert base.dump(live) == before
++
++
++@pytest.mark.parametrize("race", ["parent_outbox", "parent_key", "lost_ack"])
++def test_queue_rechecks_parent_after_remote_acceptance_read(live, svc, monkeypatch, race):
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    assert base.apply(live, svc, tid, base.preview(live, svc, tid)["token"])["action"] == "applied"
++    parent = _op(live, rk.receipt_for_task(live, tid)["parent_op_id"])
++    base.client.push(live, svc.hub(base.ME), base.BOARD, base.ME, primary=False)
++    base.client._pull_replica(base.BOARD, svc.hub(base.ME), base.ME)
++    hub = svc.hub(base.ME)
++    original = hub.row_evidence
++    after_race = []
++
++    def read(*args):
++        evidence = original(*args)
++        if not after_race:
++            assert evidence["state"] == "live"
++            if race == "parent_outbox":
++                _reinsert(live, parent)
++            elif race == "parent_key":
++                base.quiet(live, "UPDATE tasks SET idempotency_key='racing-key' WHERE id=?", (tid,))
++            else:
++                base.quiet(live, "UPDATE tasks SET sync_version=NULL WHERE id=?", (tid,))
++            after_race.append(base.dump(live))
++        return evidence
++
++    monkeypatch.setattr(hub, "row_evidence", read)
++    report = rk.advance(live, hub, base.BOARD)[0]
++    assert after_race and not report["advanced"]
++    assert "changed during evidence read" in report["waiting"]
++    _assert_parent_waiting(live, tid)
++    assert base.dump(live) == after_race[0]
++
++
++def test_parent_creator_is_checked_before_queueing_children(live, svc, monkeypatch):
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    safety.accepted_parent(live, svc, tid)
++    svc.board(base.BOARD)["rows"]["tasks"][tid]["created_on"] = base.OTHER
++    before = base.dump(live)
++    report = rk.advance(live, svc.hub(base.ME), base.BOARD)[0]
++    assert not report["advanced"] and report["waiting"] == "Board has not accepted the corrected card"
++    _assert_parent_waiting(live, tid)
++    assert base.dump(live) == before
++
++
++@pytest.mark.parametrize("state", ["pending", "rejected"])
++def test_delivered_child_reinsert_still_blocks_completion(live, svc, monkeypatch, state):
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    children = _delivered_children(live, svc, tid)
++    restored = _reinsert(live, children[0], state)
++    before = base.dump(live)
++    report = rk.advance(live, svc.hub(base.ME), base.BOARD)[0]
++    assert not report["advanced"]
++    assert ("rejected" if state == "rejected" else "still queued (pending)") in report["waiting"]
++    _assert_unfinished(live, tid)
++    assert _op(live, restored["op_id"]) == restored
++    assert base.dump(live) == before
++
++
++def test_queued_child_forbidden_field_never_downgrades_approved_payload(live, svc, monkeypatch):
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    safety.accepted_parent(live, svc, tid)
++    assert rk.advance(live, svc.hub(base.ME), base.BOARD)[0]["advanced"]
++    child = dict(live.execute(
++        "SELECT o.* FROM kanban_sync_outbox o JOIN kanban_sync_key_supersession_children c "
++        "ON c.op_id=o.op_id WHERE o.table_name='task_comments' LIMIT 1").fetchone())
++    assert "body" in json.loads(child["fields"])
++    hub = svc.hub(base.ME)
++    original = hub.ops
++    sent = []
++
++    def refuse_child(board, ops):
++        sent.extend(ops)
++        results = []
++        for op in ops:
++            if op["client_op_id"] == child["op_id"]:
++                assert "body" in op["fields"]
++                results.append({"client_op_id": op["client_op_id"], "status": "rejected",
++                                "reason": "forbidden_field", "detail": "not writable on task_comments: body"})
++            else:
++                results.extend(original(board, [op])["results"])
++        return {"results": results}
++
++    monkeypatch.setattr(hub, "ops", refuse_child)
++    base.client.push(live, hub, base.BOARD, base.ME, primary=False, max_batches=1)
++    assert any(op["client_op_id"] == child["op_id"] for op in sent)
++    kept = _op(live, child["op_id"])
++    assert kept["state"] == "rejected" and kept["fields"] == child["fields"]
++    assert live.execute("SELECT count(*) FROM kanban_sync_omissions").fetchone()[0] == 0
++    assert not live.execute("SELECT 1 FROM kanban_sync_outbox WHERE op IN ('compat','compat_import')").fetchone()
++    assert live.execute("SELECT op_id FROM kanban_sync_key_supersession_children WHERE op_id=?",
++                        (child["op_id"],)).fetchone()[0] == child["op_id"]
++    report = rk.advance(live, svc.hub(base.ME), base.BOARD)[0]
++    assert not report["advanced"] and "rejected" in report["waiting"]
++    _assert_unfinished(live, tid)
+diff --git a/tests/hermes_cli/test_kanban_sync_reserved_key_extra.py b/tests/hermes_cli/test_kanban_sync_reserved_key_extra.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..629537e341c7a35aa8f8c4e1516d9f29e08c67b9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_reserved_key_extra.py
+@@ -0,0 +1,98 @@
++"""Candidate extra boundary tests for mutants that survived the existing three recovery files."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_sync_reserved_key as rk
++from tests.hermes_cli import test_kanban_sync_reserved_key as base
++from tests.hermes_cli import test_kanban_sync_reserved_key_boundaries as bnd
++from tests.hermes_cli import test_kanban_sync_reserved_key_safety as safety
++
++kanban_home = base.kanban_home
++svc = base.svc
++live = base.live
++
++
++def test_preview_itself_rechecks_local_snapshot_after_evidence_read(live, svc, monkeypatch):
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    hub = svc.hub(base.ME)
++    original = hub.row_evidence
++    calls = []
++
++    def read(*a):
++        out = original(*a)
++        if not calls:
++            calls.append(1)
++            base.quiet(live, "UPDATE tasks SET status='running', claim_lock='w:1' WHERE id=?", (tid,))
++        return out
++
++    monkeypatch.setattr(hub, "row_evidence", read)
++    report = rk.plan(live, hub, base.BOARD, tid, base.GOOD, base.REASON)
++    assert calls
++    assert report.get("refusal") == "local_state_changed_during_evidence_read", report
++    assert not report.get("eligible") and not report.get("token")
++
++
++def test_queue_requires_remote_parent_to_hold_corrected_key(live, svc, monkeypatch):
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    safety.accepted_parent(live, svc, tid)
++    svc.board(base.BOARD)["rows"]["tasks"][tid]["idempotency_key"] = "another-key"
++    before = base.dump(live)
++    report = rk.advance(live, svc.hub(base.ME), base.BOARD)[0]
++    assert not report["advanced"] and report["waiting"] == "Board has not accepted the corrected card"
++    bnd._assert_parent_waiting(live, tid)
++    assert base.dump(live) == before
++
++
++def test_delivery_proof_checks_row_uid_of_each_child(live, svc, monkeypatch):
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    children = bnd._delivered_children(live, svc, tid)
++    child = children[0]
++    svc.board(base.BOARD)["rows"][child["table_name"]][child["row_uid"]]["uid"] = "someone-else"
++    before = base.dump(live)
++    report = rk.advance(live, svc.hub(base.ME), base.BOARD)[0]
++    assert not report["advanced"], report
++    bnd._assert_unfinished(live, tid)
++    assert base.dump(live) == before
++
++
++def test_task_op_retained_when_local_version_has_not_settled_at_board_version(live, svc, monkeypatch):
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    task = next(o for o in base.rejected_ops(live) if o["op_id"] == base.key_op(live))
++    safety.completed(live, svc, tid)
++    remote_v = svc.board(base.BOARD)["rows"]["tasks"][tid]["version"]
++    base.quiet(live, "UPDATE tasks SET sync_version=? WHERE id=?", (remote_v + 7, tid))
++    bnd._assert_retained(live, svc, [task])
++
++
++def test_second_rejected_task_op_with_other_old_key_is_not_retired(live, svc, monkeypatch):
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    first = next(o for o in base.rejected_ops(live) if o["op_id"] == base.key_op(live))
++    other_key = "pickup-stall:mini:disk:2"
++    fields = json.loads(first["fields"])
++    fields["idempotency_key"] = other_key
++    extra = {**first, "op_id": "00-extra-other-key-op", "fields": json.dumps(fields)}
++    bnd._reinsert(live, extra, "rejected")
++    assert base.preview(live, svc, tid).get("eligible"), base.preview(live, svc, tid)
++    safety.completed(live, svc, tid)
++    extra_now = bnd._op(live, extra["op_id"])
++    assert extra_now == extra
++    reports = {r["op_id"]: r for r in base.resolve_rejections(live, svc.hub(base.ME), base.BOARD)}
++    assert reports[extra["op_id"]]["classification"] == "unresolved", reports[extra["op_id"]]
++    assert bnd._op(live, extra["op_id"]) == extra
++
++
++def test_child_count_limit_is_inclusive(live, svc, monkeypatch):
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    n = sum(len(v) for v in rk._snapshot(live, tid)["children"].values())
++    assert n > 0
++    monkeypatch.setattr(rk, "MAX_CHILDREN", n)
++    assert base.preview(live, svc, tid).get("eligible")
++    monkeypatch.setattr(rk, "MAX_CHILDREN", n - 1)
++    assert "children" in (base.preview(live, svc, tid).get("refusal") or "")
++
++
++def test_key_length_limit_is_inclusive(live, svc, monkeypatch):
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    assert base.preview(live, svc, tid, key="k" * rk.MAX_KEY_LEN).get("eligible")
++    assert not base.preview(live, svc, tid, key="k" * (rk.MAX_KEY_LEN + 1)).get("eligible")
+diff --git a/tests/hermes_cli/test_kanban_sync_reserved_key_extra2.py b/tests/hermes_cli/test_kanban_sync_reserved_key_extra2.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..16dba7b8eefefcb93e87c036703b885793e2de64
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_reserved_key_extra2.py
+@@ -0,0 +1,210 @@
++"""Candidate tests for the remaining guarded-recovery mutation inventory (mutation-run2).
++
++Each test names the mutant it kills; see mutation-run2/REPORT.md.
++"""
++import json
++import time as _time
++import types
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_sync_reserved_key as rk
++from tests.hermes_cli import test_kanban_sync_reserved_key as base
++from tests.hermes_cli import test_kanban_sync_reserved_key_boundaries as bnd
++from tests.hermes_cli import test_kanban_sync_reserved_key_safety as safety
++
++kanban_home = base.kanban_home
++svc = base.svc
++live = base.live
++
++
++# --- _refusal -----------------------------------------------------------------------------------------
++
++def test_lease_holder_alone_refuses_without_writes(live, svc, monkeypatch):
++    """col_lease_holder: the existing lease case sets holder AND expiry together, so expiry masked a dropped holder."""
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    assert base.preview(live, svc, tid)["eligible"]
++    base.quiet(live, "UPDATE tasks SET lease_holder='mini' WHERE id=?", (tid,))
++    base.assert_refused(live, svc, tid, "active_run_or_lease")
++
++
++@pytest.mark.parametrize("key", [123, b"ordinary-bytes-key"], ids=["int", "bytes"])
++def test_replacement_key_must_be_a_string(live, svc, monkeypatch, key):
++    """newkey_type: truthy, stripped, short, non-reserved non-strings are refused only by the isinstance clause."""
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    before = base.dump(live)
++    report = base.preview(live, svc, tid, key)
++    assert not report["eligible"] and report["refusal"] == "bad_replacement_key", report
++    assert base.dump(live) == before
++
++
++def test_child_without_uid_refused(live, svc, monkeypatch):
++    """child_without_uid: a legacy NULL-uid child (written without capture triggers) cannot travel."""
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    assert base.preview(live, svc, tid)["eligible"]
++    base.quiet(live, "UPDATE task_comments SET uid=NULL WHERE task_id=?", (tid,))
++    before = base.dump(live)
++    report = base.preview(live, svc, tid)
++    assert not report["eligible"] and report["refusal"] == "child_without_uid", report
++    assert base.apply(live, svc, tid, "x")["action"] == "refused" and base.dump(live) == before
++
++
++@pytest.mark.parametrize("shape", ["key_removed", "other_key"])
++def test_refuses_without_rejected_task_op_carrying_the_old_key(live, svc, monkeypatch, shape):
++    """no_carrying_all / carrying_key: the rejected task op must itself carry the card's reserved key."""
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    op_id = base.key_op(live)
++    fields = json.loads(live.execute("SELECT fields FROM kanban_sync_outbox WHERE op_id=?", (op_id,)).fetchone()[0])
++    if shape == "key_removed":
++        fields.pop("idempotency_key")
++    else:
++        fields["idempotency_key"] = "pickup-stall:mini:disk:99"
++    base.quiet(live, "UPDATE kanban_sync_outbox SET fields=? WHERE op_id=?", (json.dumps(fields), op_id))
++    before = base.dump(live)
++    report = base.preview(live, svc, tid)
++    assert not report["eligible"] and report["refusal"] == "no_rejected_op_carrying_the_key", report
++    assert base.apply(live, svc, tid, "x")["action"] == "refused" and base.dump(live) == before
++
++
++class _FrozenClock:
++    def __init__(self, now):
++        self.now = now
++
++    def time(self):
++        return self.now
++
++    def __getattr__(self, name):
++        return getattr(_time, name)
++
++
++def test_event_retention_cutoff_is_inclusive(live, svc, monkeypatch):
++    """retention_cutoff: an event exactly at the service retention cutoff is still kept; one second older is not."""
++    from hermes_cli.kanban_sync_client import EVENT_IMPORT_WINDOW_S
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    now = int(_time.time())
++    monkeypatch.setattr(rk, "time", _FrozenClock(now))
++    oldest = "UPDATE task_events SET created_at=? WHERE id=(SELECT MIN(id) FROM task_events WHERE task_id=?)"
++    base.quiet(live, oldest, (now - EVENT_IMPORT_WINDOW_S, tid))
++    assert base.preview(live, svc, tid)["eligible"], base.preview(live, svc, tid)
++    base.quiet(live, oldest, (now - EVENT_IMPORT_WINDOW_S - 1, tid))
++    report = base.preview(live, svc, tid)
++    assert not report["eligible"] and report["refusal"].startswith("unsupported_old_event"), report
++
++
++# --- creation ordering ---------------------------------------------------------------------------------
++
++def test_reserved_key_refused_before_existing_card_lookup(live, svc, monkeypatch):
++    """create_lookup_first: an ordinary create must raise even when a card already holds that reserved key."""
++    _tid, _ = base.bad_card(live, svc, monkeypatch, push=False)
++    before = base.dump(live)
++    with pytest.raises(ValueError, match="reserved for the pickup-stall detector"):
++        kb.create_task(live, title="again", assignee="worker", created_by="user", idempotency_key=base.BAD)
++    assert base.dump(live) == before
++
++
++# --- snapshot envelope: one clause at a time --------------------------------------------------------------
++
++class _Cursor:
++    """A non-string cursor that a bare ``nxt <= after`` would happily accept."""
++
++    def __le__(self, other):
++        return False
++
++
++@pytest.mark.parametrize("page_factory", [
++    lambda: types.MappingProxyType({"head": 1, "rows": [], "more": False}),
++    lambda: {"head": 1, "rows": {}, "more": False},
++    lambda: {"head": 1, "rows": [types.MappingProxyType({"uid": "a"})], "more": False},
++    lambda: {"head": 1, "rows": [], "more": 0},
++], ids=["page_not_dict", "rows_not_list", "row_not_dict", "more_not_bool"])
++def test_snapshot_envelope_each_clause_refuses(live, svc, monkeypatch, page_factory):
++    """snap_page_dict / snap_rows_list / snap_row_dict / snap_more_bool: shapes that only one clause rejects."""
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    hub = svc.hub(base.ME)
++    monkeypatch.setattr(hub, "snapshot_page", lambda *a, **k: page_factory())
++    report = rk.plan(live, hub, base.BOARD, tid, base.GOOD, base.REASON)
++    assert not report["eligible"], report
++    assert report["refusal"] == "authoritative_snapshot_incomplete: malformed page", report
++
++
++def test_snapshot_next_cursor_must_be_a_string(live, svc, monkeypatch):
++    """snap_next_str: a non-string cursor refuses; it must not be accepted and followed to a clean second page."""
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    hub = svc.hub(base.ME)
++    pages = [{"head": 1, "rows": [], "more": True, "next": _Cursor()}, {"head": 1, "rows": [], "more": False}]
++    monkeypatch.setattr(hub, "snapshot_page", lambda *a, **k: pages.pop(0))
++    report = rk.plan(live, hub, base.BOARD, tid, base.GOOD, base.REASON)
++    assert not report["eligible"], report
++    assert report["refusal"] == "authoritative_snapshot_incomplete: page cursor does not advance", report
++
++
++# --- queue / finish: receipt state revalidated inside the writer transaction ------------------------------------
++
++def _settle_receipt_externally(live, tid):
++    with base.kbc.write_txn(live):
++        live.execute("UPDATE kanban_sync_key_supersessions SET state='complete', completed_at=123 WHERE task_id=?", (tid,))
++
++
++def test_queue_step_vetoes_receipt_state_change_inside_transaction(live, svc, monkeypatch):
++    """queue_state: another advancer completes the receipt after our parent evidence read; do not re-queue children."""
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    safety.accepted_parent(live, svc, tid)
++    hub = svc.hub(base.ME)
++    original, hits = hub.row_evidence, []
++
++    def read(*args):
++        evidence = original(*args)
++        if not hits:
++            hits.append(1)
++            _settle_receipt_externally(live, tid)
++        return evidence
++
++    monkeypatch.setattr(hub, "row_evidence", read)
++    report = rk.advance(live, hub, base.BOARD)[0]
++    assert hits and not report["advanced"] and "changed during evidence read" in report["waiting"], report
++    receipt = rk.receipt_for_task(live, tid)
++    assert receipt["state"] == "complete" and receipt["completed_at"] == 123
++    assert live.execute("SELECT count(*) FROM kanban_sync_key_supersession_children").fetchone()[0] == 0
++
++
++def test_finish_step_vetoes_receipt_state_change_inside_transaction(live, svc, monkeypatch):
++    """finish_state: another advancer completes the receipt during delivery evidence; do not overwrite completed_at."""
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    bnd._delivered_children(live, svc, tid)
++    hub = svc.hub(base.ME)
++    original, hits = hub.row_evidence, []
++
++    def read(*args):
++        evidence = original(*args)
++        if not hits:
++            hits.append(1)
++            _settle_receipt_externally(live, tid)
++        return evidence
++
++    monkeypatch.setattr(hub, "row_evidence", read)
++    report = rk.advance(live, hub, base.BOARD)[0]
++    assert hits and not report["advanced"] and "changed during evidence read" in report["waiting"], report
++    receipt = rk.receipt_for_task(live, tid)
++    assert receipt["state"] == "complete" and receipt["completed_at"] == 123
++
++
++def test_queue_step_vetoes_card_removed_inside_transaction(live, svc, monkeypatch):
++    """queue_task_none: the corrected card vanishes after the parent evidence read; waiting, not a crash."""
++    tid, _ = base.bad_card(live, svc, monkeypatch)
++    safety.accepted_parent(live, svc, tid)
++    hub = svc.hub(base.ME)
++    original, hits = hub.row_evidence, []
++
++    def read(*args):
++        evidence = original(*args)
++        if not hits:
++            hits.append(1)
++            base.quiet(live, "DELETE FROM tasks WHERE id=?", (tid,))
++        return evidence
++
++    monkeypatch.setattr(hub, "row_evidence", read)
++    report = rk.advance(live, hub, base.BOARD)[0]
++    assert hits and not report["advanced"], report
++    assert report["waiting"] in ("receipt changed during evidence read", "receipt or identity changed during evidence read")
++    assert live.execute("SELECT count(*) FROM kanban_sync_key_supersession_children").fetchone()[0] == 0
+diff --git a/tests/hermes_cli/test_kanban_sync_reserved_key_safety.py b/tests/hermes_cli/test_kanban_sync_reserved_key_safety.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..eede587da442978191308766b8a0f790a321ccc9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_reserved_key_safety.py
+@@ -0,0 +1,639 @@
++"""Safety gates of the reserved-key correction: identity binding, reason, full evidence, child delivery, uniqueness,
++evidence interval (kanban_sync_reserved_key)."""
++import argparse
++import contextlib
++import dataclasses
++import json
++from argparse import Namespace
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_sync_reserved_key as rk
++from hermes_cli.kanban_sync_rejections import resolve_rejections
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli import test_kanban_sync_reserved_key as base
++from tests.hermes_cli.test_kanban_sync_reserved_key import (
++    BOARD, GOOD, ME, OTHER, REASON, apply, bad_card, dump, key_op, preview, quiet, rejected_ops)
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def svc():
++    return base.StrictService()
++
++
++@pytest.fixture
++def live(kanban_home):
++    support.write_sync_config(kanban_home, True)
++    conn = kbc.connect(kanban_home / "kanban.db")
++    client.ensure_identity(conn, BOARD, ME)
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++class HubView:
++    """The same Board connection presented with another enrolled identity (gateway / endpoint)."""
++
++    def __init__(self, hub, **ident):
++        self._hub, self.ident = hub, dataclasses.replace(hub.ident, **ident)
++
++    def __getattr__(self, name):
++        return getattr(self._hub, name)
++
++
++def plan_with(live, hub, tid, key=GOOD, reason=REASON):
++    return rk.plan(live, hub, BOARD, tid, key, reason)
++
++
++def accepted_parent(live, svc, tid):
++    """Apply, send the corrected parent, and let the local card learn the Board's version."""
++    token = preview(live, svc, tid)["token"]
++    assert apply(live, svc, tid, token)["action"] == "applied"
++    client.push(live, svc.hub(ME), BOARD, ME, primary=False)
++    client._pull_replica(BOARD, svc.hub(ME), ME)
++    return token
++
++
++@pytest.mark.parametrize("conflict", ["missing", "tombstone", "pending"])
++def test_child_conflict_cannot_complete_partial_manifest(live, svc, monkeypatch, conflict):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    accepted_parent(live, svc, tid)
++    uid = live.execute("SELECT uid FROM task_comments WHERE task_id=? LIMIT 1", (tid,)).fetchone()[0]
++    if conflict == "missing":
++        quiet(live, "DELETE FROM task_comments WHERE uid=?", (uid,))
++    elif conflict == "tombstone":
++        quiet(live, "INSERT INTO kanban_sync_tombstones VALUES ('task_comments',?,1)", (uid,))
++    else:
++        quiet(live, "INSERT INTO kanban_sync_outbox (op_id,table_name,row_uid,op,fields,hlc,created_at) "
++              "VALUES ('conflict','task_comments',?,'upsert','{}','',1)", (uid,))
++    rk.advance(live, svc.hub(ME), BOARD)
++    assert rk.receipt_for_task(live, tid)["state"] == "parent_queued"
++    assert live.execute("SELECT count(*) FROM kanban_sync_key_supersession_children").fetchone()[0] == 0
++
++
++@pytest.mark.parametrize("stage", ["parent", "children"])
++def test_transient_retry_keeps_replacement_op_custody(live, svc, monkeypatch, stage):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    if stage == "parent":
++        apply(live, svc, tid, preview(live, svc, tid)["token"])
++    else:
++        accepted_parent(live, svc, tid)
++        rk.advance(live, svc.hub(ME), BOARD)
++    hub = svc.hub(ME)
++    monkeypatch.setattr(hub, "ops", lambda board, ops: {"results": [
++        {"client_op_id": op["client_op_id"], "status": "rejected", "reason": "storage_error"} for op in ops]})
++    old = {r[0] for r in live.execute("SELECT op_id FROM kanban_sync_outbox WHERE state='pending'")}
++    client.push(live, hub, BOARD, ME, primary=False)
++    pending = {r[0] for r in live.execute("SELECT op_id FROM kanban_sync_outbox WHERE state='pending'")}
++    assert pending and not pending.intersection(old)
++    receipt = rk.receipt_for_task(live, tid)
++    tracked = ({receipt["parent_op_id"]} if stage == "parent" else {r[0] for r in live.execute(
++        "SELECT op_id FROM kanban_sync_key_supersession_children")})
++    assert tracked == pending
++
++
++@pytest.mark.parametrize("token,reason", [(None, REASON), ("stale", REASON), ("valid", "different reason")])
++def test_repeat_apply_still_requires_expected_intent(live, svc, monkeypatch, token, reason):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    original = accepted_parent(live, svc, tid)
++    before = dump(live)
++    result = rk.apply(live, svc.hub(ME), BOARD, tid, GOOD, original if token == "valid" else token, reason)
++    assert result["action"] == "refused"
++    assert dump(live) == before
++
++
++def test_recovery_never_synthesizes_other_link_endpoint(live, svc, monkeypatch):
++    tid, other = bad_card(live, svc, monkeypatch)
++    accepted_parent(live, svc, tid)
++    rk.advance(live, svc.hub(ME), BOARD)
++    quiet(live, "UPDATE tasks SET sync_version=NULL WHERE id=?", (other,))
++    rows = [dict(r) for r in live.execute("SELECT * FROM kanban_sync_outbox WHERE state='pending'")]
++    assert rows
++    assert client._unacked_parents(live, rows, ME) == []
++
++
++@pytest.mark.parametrize("field", ["priority", "workspace_kind"])
++def test_recovery_refuses_compatibility_downgrades(live, svc, monkeypatch, field):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    apply(live, svc, tid, preview(live, svc, tid)["token"])
++    hub = svc.hub(ME)
++    monkeypatch.setattr(hub, "ops", lambda board, ops: {"results": [
++        {"client_op_id": op["client_op_id"], "status": "rejected", "reason": "forbidden_field",
++         "detail": f"not writable on tasks: {field}"} for op in ops]})
++    client.push(live, hub, BOARD, ME, primary=False, max_batches=1)
++    assert live.execute("SELECT count(*) FROM kanban_sync_omissions").fetchone()[0] == 0
++    receipt = rk.receipt_for_task(live, tid)
++    assert live.execute("SELECT state FROM kanban_sync_outbox WHERE op_id=?",
++                        (receipt["parent_op_id"],)).fetchone()[0] == "rejected"
++
++
++# --- 1: strict hub identity, board identity, endpoint binding -------------------------------------------
++
++@pytest.mark.parametrize("gateway", [None, "", "   ", OTHER])
++def test_hub_gateway_must_be_present_and_equal(live, svc, monkeypatch, gateway):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    before = dump(live)
++    report = plan_with(live, HubView(svc.hub(ME), gateway=gateway), tid)
++    assert not report["eligible"] and report["refusal"] == "foreign_gateway_identity"
++    result = rk.apply(live, HubView(svc.hub(ME), gateway=gateway), BOARD, tid, GOOD, "x", REASON)
++    assert result["action"] == "refused" and dump(live) == before
++
++
++def test_hub_without_identity_refused(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++
++    class Bare:
++        def __getattr__(self, name):
++            if name == "ident":
++                raise AttributeError(name)
++            return getattr(svc.hub(ME), name)
++    assert plan_with(live, Bare(), tid)["refusal"] == "foreign_gateway_identity"
++
++
++def test_state_board_id_must_equal_requested_board(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    quiet(live, "UPDATE kanban_sync_state SET board_id='another-board'")
++    report = plan_with(live, svc.hub(ME), tid)
++    assert not report["eligible"] and report["refusal"] == "foreign_board_identity"
++
++
++def test_token_binds_endpoint_and_gateway(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    first = plan_with(live, svc.hub(ME), tid)["token"]
++    assert plan_with(live, svc.hub(ME), tid)["token"] == first  # deterministic
++    moved = HubView(svc.hub(ME), url="https://other-endpoint.test")
++    assert plan_with(live, moved, tid)["token"] != first
++    before = dump(live)
++    result = rk.apply(live, moved, BOARD, tid, GOOD, first, REASON)
++    assert result["action"] == "refused" and result["refusal"] == "stale_or_missing_expected_token"
++    assert dump(live) == before
++    receipt = apply(live, svc, tid, first) and rk.receipt_for_task(live, tid)
++    assert receipt["endpoint"] and "key" not in receipt["endpoint"] and receipt["gateway_id"] == ME
++
++
++def test_token_does_not_leak_or_depend_on_secret_key(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    first = plan_with(live, svc.hub(ME), tid)["token"]
++    assert plan_with(live, HubView(svc.hub(ME), key="another-secret"), tid)["token"] == first
++
++
++@pytest.mark.parametrize("change", [{"url": "https://elsewhere.test"}, {"gateway": OTHER}])
++def test_advance_revalidates_identity_and_endpoint(live, svc, monkeypatch, change):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    accepted_parent(live, svc, tid)
++    waiting = rk.advance(live, HubView(svc.hub(ME), **change), BOARD)[0]
++    assert not waiting["advanced"] and waiting["waiting"].startswith("identity or endpoint differs")
++    assert rk.receipt_for_task(live, tid)["state"] == "parent_queued"
++    assert rk.advance(live, svc.hub(ME), BOARD)[0]["advanced"]
++
++
++def test_advance_vetoes_identity_change_inside_transaction(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    accepted_parent(live, svc, tid)
++    hub = svc.hub(ME)
++    original = hub.row_evidence
++
++    def read(*a):
++        out = original(*a)
++        quiet(live, "UPDATE kanban_sync_state SET board_id='moved-board'")
++        return out
++
++    monkeypatch.setattr(hub, "row_evidence", read)
++    report = rk.advance(live, hub, BOARD)[0]
++    assert not report["advanced"]
++    assert rk.receipt_for_task(live, tid)["state"] == "parent_queued"
++    assert not live.execute("SELECT 1 FROM kanban_sync_outbox WHERE state='pending'").fetchone()
++
++
++# --- 2: reason -----------------------------------------------------------------------------------------
++
++@pytest.mark.parametrize("reason", [None, "", "   \n", 5])
++def test_reason_required_for_preview_and_apply(live, svc, monkeypatch, reason):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    token = preview(live, svc, tid)["token"]
++    before = dump(live)
++    report = plan_with(live, svc.hub(ME), tid, reason=reason)
++    assert not report["eligible"] and report["refusal"] == "reason_required"
++    result = rk.apply(live, svc.hub(ME), BOARD, tid, GOOD, token, reason)
++    assert result["action"] == "refused" and result["refusal"] == "reason_required" and dump(live) == before
++
++
++def test_reason_is_bound_to_token_and_persisted_trimmed(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    token = preview(live, svc, tid)["token"]
++    assert plan_with(live, svc.hub(ME), tid, reason="a different reason")["token"] != token
++    before = dump(live)
++    stale = rk.apply(live, svc.hub(ME), BOARD, tid, GOOD, token, "a different reason")
++    assert stale["refusal"] == "stale_or_missing_expected_token" and dump(live) == before
++    assert rk.apply(live, svc.hub(ME), BOARD, tid, GOOD, token, f"  {REASON}  ")["action"] == "applied"
++    assert rk.receipt_for_task(live, tid)["reason"] == REASON
++
++
++@pytest.mark.parametrize("flags", [[], ["--reason", "  "], ["--apply", "--expect", "t"],
++                                   ["--apply", "--expect", "t", "--reason", ""]])
++def test_cli_reason_is_required_and_nonblank(live, svc, monkeypatch, kanban_home, capsys, flags):
++    from hermes_cli import kanban as kc
++    from hermes_cli import kanban_sync_cli as cli
++    tid, _ = bad_card(live, svc, monkeypatch)
++    monkeypatch.setattr(cli, "_board", lambda args: BOARD)
++    monkeypatch.setattr(cli, "_path", lambda slug: kanban_home / "kanban.db")
++    monkeypatch.setattr(client, "load_identity", lambda: svc.hub(ME).ident)
++    monkeypatch.setattr(client, "Hub", lambda ident: svc.hub(ME))
++    parser = argparse.ArgumentParser()
++    kc.build_parser(parser.add_subparsers(dest="cmd"))
++    before = dump(live)
++    try:
++        args = parser.parse_args(["kanban", "sync", "reserved-key", tid, "--new-key", GOOD, *flags])
++    except SystemExit as exc:  # argparse: the flag is required
++        assert exc.code == 2
++    else:
++        assert cli._reserved_key(args) == 2
++    assert dump(live) == before
++
++
++def test_cli_reason_reaches_receipt(live, svc, monkeypatch, kanban_home, capsys):
++    from hermes_cli import kanban_sync_cli as cli
++    tid, _ = bad_card(live, svc, monkeypatch)
++    monkeypatch.setattr(cli, "_board", lambda args: BOARD)
++    monkeypatch.setattr(cli, "_path", lambda slug: kanban_home / "kanban.db")
++    monkeypatch.setattr(client, "load_identity", lambda: svc.hub(ME).ident)
++    monkeypatch.setattr(client, "Hub", lambda ident: svc.hub(ME))
++    args = Namespace(task_id=tid, new_key=GOOD, apply=False, expect=None, json=True, reason="because")
++    assert cli._reserved_key(args) == 0
++    token = json.loads(capsys.readouterr().out)["token"]
++    assert cli._reserved_key(Namespace(**{**vars(args), "apply": True, "expect": token})) == 0
++    assert rk.receipt_for_task(live, tid)["reason"] == "because"
++
++
++# --- 3: every identity is evidenced; unsupported shapes fail closed ------------------------------------
++
++def test_evidence_covers_every_identity_exactly(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    hub, seen = svc.hub(ME), []
++    original = hub.row_evidence
++    monkeypatch.setattr(hub, "row_evidence", lambda b, t, u: seen.append((t, u)) or original(b, t, u))
++    report = plan_with(live, hub, tid)
++    assert report["eligible"]
++    expected = {("tasks", tid)} | {tuple(c) for c in report["children"]}
++    events = [r[0] for r in live.execute("SELECT uid FROM task_events WHERE task_id=?", (tid,))]
++    assert events and {("task_events", e) for e in events} <= expected
++    assert sorted(seen) == sorted(expected) and report["evidence_checked"] == len(expected)
++
++
++def test_old_event_fails_closed_instead_of_being_dropped(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    quiet(live, "UPDATE task_events SET created_at=1 WHERE id=(SELECT MIN(id) FROM task_events WHERE task_id=?)", (tid,))
++    before = dump(live)
++    report = plan_with(live, svc.hub(ME), tid)
++    assert not report["eligible"] and report["refusal"].startswith("unsupported_old_event")
++    assert apply(live, svc, tid, "x")["action"] == "refused" and dump(live) == before
++
++
++def test_fresh_events_remain_supported(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    assert any(c[0] == "task_events" for c in plan_with(live, svc.hub(ME), tid)["children"])
++
++
++def test_outgoing_link_fails_closed(live, svc, monkeypatch):
++    tid, other = bad_card(live, svc, monkeypatch)
++    quiet(live, "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (tid, other))
++    report = plan_with(live, svc.hub(ME), tid)
++    assert not report["eligible"] and report["refusal"].startswith("unsupported_outgoing_link")
++
++
++@pytest.mark.parametrize("shape", ["delete", "release", "ghost", "deleted_identity", "other_op"])
++def test_unaccounted_or_unsupported_rejected_ops_refuse(live, svc, monkeypatch, shape):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    comment = live.execute("SELECT uid FROM task_comments WHERE task_id=?", (tid,)).fetchone()[0]
++    row = {"table": "task_comments", "uid": comment, "op": "upsert", "fields": {"task_id": tid}}
++    shapes = {"delete": {"op": "delete"},
++              "release": {"table": "tasks", "uid": tid, "op": "release", "fields": {"run_uid": "r"}},
++              "ghost": {"uid": "ghost-comment"}, "other_op": {"op": "compat_import"}, "deleted_identity": {}}
++    row.update(shapes[shape])
++    if shape != "deleted_identity":
++        with kbc.write_txn(live):
++            live.execute("INSERT INTO kanban_sync_outbox (op_id,table_name,row_uid,op,fields,hlc,created_at,state,"
++                         "last_error,attempts) VALUES ('x1',?,?,?,?,'',3,'rejected','invalid',1)",
++                         (row["table"], row["uid"], row["op"], json.dumps(row["fields"])))
++    else:  # the identity the rejected op names is gone locally: nothing can carry it
++        quiet(live, "DELETE FROM task_comments WHERE uid=?", (comment,))
++        with kbc.write_txn(live):
++            live.execute("INSERT INTO kanban_sync_outbox (op_id,table_name,row_uid,op,fields,hlc,created_at,state,"
++                         "last_error,attempts) VALUES ('x1','task_comments',?,'upsert',?,'',3,'rejected','invalid',1)",
++                         (comment, json.dumps({"task_id": tid})))
++    before = dump(live)
++    report = plan_with(live, svc.hub(ME), tid)
++    assert not report["eligible"] and report["refusal"].split(":")[0] in (
++        "unsupported_outbox_op", "unaccounted_rejection"), report
++    assert apply(live, svc, tid, "x")["action"] == "refused" and dump(live) == before
++
++
++# --- 4: child delivery tracked; proof-bound retirement -------------------------------------------------
++
++def test_children_are_queued_then_delivered_before_complete(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    accepted_parent(live, svc, tid)
++    report = rk.advance(live, svc.hub(ME), BOARD)[0]
++    assert report["advanced"] and report["children_queued"] > 0
++    receipt = rk.receipt_for_task(live, tid)
++    assert receipt["state"] == "children_queued" and receipt["completed_at"] is None
++    pending = {r[0] for r in live.execute("SELECT op_id FROM kanban_sync_outbox WHERE state='pending'")}
++    recorded = {r[0] for r in live.execute("SELECT op_id FROM kanban_sync_key_supersession_children")}
++    assert pending == recorded and len(recorded) == report["children_queued"]
++    assert "queued" in rk.advance(live, svc.hub(ME), BOARD)[0]["waiting"]  # still undelivered
++    assert rk.receipt_for_task(live, tid)["state"] == "children_queued"
++    client.push(live, svc.hub(ME), BOARD, ME, primary=False)
++    done = rk.advance(live, svc.hub(ME), BOARD)[0]
++    assert done["advanced"] and rk.receipt_for_task(live, tid)["state"] == "complete"
++    assert {r[0] for r in live.execute("SELECT op_id FROM kanban_sync_key_supersession_children")} == recorded
++
++
++def test_rejected_child_op_blocks_completion(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    accepted_parent(live, svc, tid)
++    rk.advance(live, svc.hub(ME), BOARD)
++    quiet(live, "UPDATE kanban_sync_outbox SET state='rejected', last_error='invalid' WHERE state='pending' "
++                "AND table_name='task_comments'")
++    report = rk.advance(live, svc.hub(ME), BOARD)[0]
++    assert not report["advanced"] and "rejected" in report["waiting"]
++    assert rk.receipt_for_task(live, tid)["state"] == "children_queued"
++
++
++def test_vanished_child_op_without_delivery_is_not_complete(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    accepted_parent(live, svc, tid)
++    rk.advance(live, svc.hub(ME), BOARD)
++    quiet(live, "DELETE FROM kanban_sync_outbox WHERE state='pending' AND table_name='task_comments'")
++    client.push(live, svc.hub(ME), BOARD, ME, primary=False)  # every other child reaches the Board
++    assert "delivered" in rk.advance(live, svc.hub(ME), BOARD)[0]["waiting"]  # the Board never saw that child
++    assert rk.receipt_for_task(live, tid)["state"] == "children_queued"
++
++
++def completed(live, svc, tid):
++    accepted_parent(live, svc, tid)
++    rk.advance(live, svc.hub(ME), BOARD)
++    client.push(live, svc.hub(ME), BOARD, ME, primary=False)
++    rk.advance(live, svc.hub(ME), BOARD)
++    assert rk.receipt_for_task(live, tid)["state"] == "complete"
++    client._pull_replica(BOARD, svc.hub(ME), ME)
++
++
++def classes(live, svc):
++    return {r["op_id"]: r["classification"] for r in resolve_rejections(live, svc.hub(ME), BOARD)}
++
++
++def test_complete_receipt_retires_every_old_op_with_matching_rows(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    old = [o["op_id"] for o in rejected_ops(live)]
++    completed(live, svc, tid)
++    assert set(old) == {k for k, v in classes(live, svc).items() if v != "unresolved"}
++
++
++def test_task_op_with_remote_field_difference_is_not_retired(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    key_id = key_op(live)
++    completed(live, svc, tid)
++    svc.board(BOARD)["rows"]["tasks"][tid]["title"] = "somebody else's title"
++    assert classes(live, svc)[key_id] == "unresolved"
++    assert any(o["op_id"] == key_id for o in rejected_ops(live))
++
++
++def test_task_op_with_local_field_difference_is_not_retired(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    key_id = key_op(live)
++    completed(live, svc, tid)
++    quiet(live, "UPDATE tasks SET title='locally edited later' WHERE id=?", (tid,))
++    assert classes(live, svc)[key_id] == "unresolved"
++
++
++def test_child_op_uses_conservative_equality_even_with_receipt(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    comment = next(o for o in rejected_ops(live) if o["table_name"] == "task_comments")
++    completed(live, svc, tid)
++    svc.board(BOARD)["rows"]["task_comments"][comment["row_uid"]]["body"] = "different on the Board"
++    assert classes(live, svc)[comment["op_id"]] == "unresolved"
++
++
++@pytest.mark.parametrize("tamper", ["state_children_queued", "state_parent_queued", "bytes", "task_id", "old_key",
++                                    "gateway"])
++def test_receipt_covered_op_never_falls_back_to_conservative_rules(live, svc, monkeypatch, tamper):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    comment = next(o for o in rejected_ops(live) if o["table_name"] == "task_comments")
++    completed(live, svc, tid)
++    sql = {"state_children_queued": "UPDATE kanban_sync_key_supersessions SET state='children_queued'",
++           "state_parent_queued": "UPDATE kanban_sync_key_supersessions SET state='parent_queued'",
++           "bytes": f"UPDATE kanban_sync_outbox SET last_error='edited' WHERE op_id='{comment['op_id']}'",
++           "task_id": "UPDATE kanban_sync_key_supersessions SET task_id='someone-else'",
++           "old_key": "UPDATE kanban_sync_key_supersessions SET old_key='pickup-stall:x:y:9'",
++           "gateway": "UPDATE kanban_sync_key_supersessions SET gateway_id='mini'"}[tamper]
++    quiet(live, sql)
++    result = classes(live, svc)
++    covered = {o["op_id"] for o in rejected_ops(live)}
++    assert covered and comment["op_id"] in covered
++    # without the receipt gate the (equal) comment op would have been retired by the conservative rules
++    assert result[comment["op_id"]] == "unresolved", tamper
++
++
++def test_receipt_covered_op_with_remote_task_not_owned_by_gateway_not_retired(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    comment = next(o for o in rejected_ops(live) if o["table_name"] == "task_comments")
++    completed(live, svc, tid)
++    svc.board(BOARD)["rows"]["tasks"][tid]["created_on"] = OTHER
++    assert classes(live, svc)[comment["op_id"]] == "unresolved"
++
++
++# --- 5: replacement-key uniqueness against the Board ---------------------------------------------------
++
++def test_remote_duplicate_key_refused(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    svc.board(BOARD)["rows"].setdefault("tasks", {})["someone"] = {"uid": "someone", "version": 1,
++                                                                  "idempotency_key": GOOD, "created_on": OTHER}
++    before = dump(live)
++    report = plan_with(live, svc.hub(ME), tid)
++    assert not report["eligible"] and report["refusal"] == "replacement_key_in_remote_use"
++    assert apply(live, svc, tid, "x")["action"] == "refused" and dump(live) == before
++
++
++def test_remote_snapshot_is_authenticated_exhaustive_and_paged(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    hub, calls = svc.hub(ME), []
++    pages = {"": {"head": 1, "table": "tasks", "rows": [{"uid": "a", "idempotency_key": "x"}], "next": "a", "more": True},
++             "a": {"head": 1, "table": "tasks", "rows": [{"uid": "b", "idempotency_key": GOOD}], "next": "b", "more": False}}
++    monkeypatch.setattr(hub, "snapshot_page", lambda board, table, after="", *a: calls.append((board, table, after))
++                        or pages[after])
++    report = plan_with(live, hub, tid)
++    assert calls == [(BOARD, "tasks", ""), (BOARD, "tasks", "a")]
++    assert report["refusal"] == "replacement_key_in_remote_use"
++
++
++@pytest.mark.parametrize("page", [
++    {"head": 1, "rows": [], "next": "", "more": True},          # claims more but cannot advance
++    {"head": 1, "rows": []},                                      # no completeness flag
++    {"head": 1, "rows": "nope", "more": False},                   # malformed
++    {"rows": [], "more": False},                                  # no head
++    {"head": 1, "rows": [{"uid": "a"}], "more": True, "next": "a"},  # never ends (cap)
++    {"head": 1, "rows": [], "more": "no", "next": ""},            # non-boolean flag
++])
++def test_incomplete_or_malformed_snapshot_refuses(live, svc, monkeypatch, page):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    monkeypatch.setattr(rk, "MAX_SNAPSHOT_PAGES", 3)
++    hub = svc.hub(ME)
++    monkeypatch.setattr(hub, "snapshot_page", lambda *a, **k: page)
++    report = plan_with(live, hub, tid)
++    assert not report["eligible"] and report["refusal"].startswith("authoritative_snapshot_incomplete"), report
++
++
++@pytest.mark.parametrize("exc", [client.HubError(404, "no route"), client.SyncUnavailable("down"), OSError("net")])
++def test_snapshot_failure_refuses(live, svc, monkeypatch, exc):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    hub = svc.hub(ME)
++
++    def boom(*a, **k):
++        raise exc
++    monkeypatch.setattr(hub, "snapshot_page", boom)
++    report = plan_with(live, hub, tid)
++    assert not report["eligible"] and report["refusal"].startswith("authoritative_snapshot_unavailable")
++
++
++def test_hub_without_snapshot_route_refuses(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++
++    class NoSnapshot:
++        ident = svc.hub(ME).ident
++
++        def row_evidence(self, *a):
++            return svc.hub(ME).row_evidence(*a)
++    report = plan_with(live, NoSnapshot(), tid)
++    assert not report["eligible"] and report["refusal"].startswith("authoritative_snapshot_unavailable")
++
++
++def test_snapshot_cursor_must_advance(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    hub = svc.hub(ME)
++    monkeypatch.setattr(hub, "snapshot_page", lambda *a, **k: {"head": 1, "rows": [], "next": "", "more": True})
++    assert "cursor" in plan_with(live, hub, tid)["refusal"]
++
++
++def test_snapshot_page_cap_is_incomplete_even_when_cursor_advances(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    monkeypatch.setattr(rk, "MAX_SNAPSHOT_PAGES", 3)
++    hub = svc.hub(ME)
++    monkeypatch.setattr(hub, "snapshot_page", lambda b, t, after="", *a: {
++        "head": 1, "rows": [{"uid": after + "a"}], "next": after + "a", "more": True})
++    assert "page cap" in plan_with(live, hub, tid)["refusal"]
++
++
++def test_preview_itself_enforces_evidence_interval(live, svc, monkeypatch, clock):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    hub = svc.hub(ME)
++    original = hub.snapshot_page
++
++    def slow(*a, **k):
++        clock.now += rk.EVIDENCE_MAX_AGE_S + 1
++        return original(*a, **k)
++    monkeypatch.setattr(hub, "snapshot_page", slow)
++    report = plan_with(live, hub, tid)
++    assert not report["eligible"] and report["refusal"] == "evidence_interval_exceeded"
++
++
++def test_complete_receipt_bound_to_task_of_the_op(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    key_id = key_op(live)
++    completed(live, svc, tid)
++    quiet(live, "UPDATE kanban_sync_key_supersessions SET task_id='someone-else'")
++    assert classes(live, svc)[key_id] == "unresolved"
++
++
++# --- 6: evidence interval --------------------------------------------------------------------------------
++
++class Clock:
++    def __init__(self):
++        self.now = 1000.0
++
++    def __call__(self):
++        return self.now
++
++
++@pytest.fixture
++def clock(monkeypatch):
++    c = Clock()
++    monkeypatch.setattr(rk, "_mono", c)
++    return c
++
++
++def slow_lock(monkeypatch, clock, seconds):
++    real = rk.write_txn
++
++    @contextlib.contextmanager
++    def slow(conn):
++        with real(conn):
++            clock.now += seconds  # the writer lock wait counts toward the evidence age
++            yield
++    monkeypatch.setattr(rk, "write_txn", slow)
++
++
++def test_evidence_interval_includes_writer_lock_wait(live, svc, monkeypatch, clock):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    token = preview(live, svc, tid)["token"]
++    slow_lock(monkeypatch, clock, rk.EVIDENCE_MAX_AGE_S + 0.01)
++    before = dump(live)
++    result = apply(live, svc, tid, token)
++    assert result["action"] == "refused" and result["refusal"] == "evidence_interval_exceeded"
++    assert dump(live) == before
++
++
++def test_evidence_interval_boundary_is_inclusive(live, svc, monkeypatch, clock):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    token = preview(live, svc, tid)["token"]
++    slow_lock(monkeypatch, clock, rk.EVIDENCE_MAX_AGE_S)
++    assert apply(live, svc, tid, token)["action"] == "applied"
++
++
++@pytest.mark.parametrize("call", ["row_evidence", "snapshot_page"])
++def test_evidence_interval_covers_every_remote_read(live, svc, monkeypatch, clock, call):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    token = preview(live, svc, tid)["token"]
++    hub = svc.hub(ME)
++    original = getattr(hub, call)
++
++    def slow(*a, **k):
++        clock.now += rk.EVIDENCE_MAX_AGE_S + 1
++        return original(*a, **k)
++    monkeypatch.setattr(hub, call, slow)
++    result = rk.apply(live, hub, BOARD, tid, GOOD, token, REASON)
++    assert result["action"] == "refused" and result["refusal"] == "evidence_interval_exceeded"
++    assert rk.receipt_for_task(live, tid) is None
++
++
++def test_clock_going_backwards_fails_closed(live, svc, monkeypatch, clock):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    token = preview(live, svc, tid)["token"]
++    slow_lock(monkeypatch, clock, -5)
++    assert apply(live, svc, tid, token)["refusal"] == "evidence_interval_exceeded"
++
++
++def test_wall_clock_jump_does_not_affect_interval(live, svc, monkeypatch, clock):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    token = preview(live, svc, tid)["token"]
++    import time as time_module
++    real = time_module.time
++    monkeypatch.setattr(rk.time, "time", lambda: real() + 10 ** 6)  # NTP step: only the monotonic clock counts
++    assert apply(live, svc, tid, token)["action"] == "applied"
++
++
++def test_advance_evidence_interval_vetoes_inside_transaction(live, svc, monkeypatch, clock):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    accepted_parent(live, svc, tid)
++    slow_lock(monkeypatch, clock, rk.EVIDENCE_MAX_AGE_S + 1)
++    report = rk.advance(live, svc.hub(ME), BOARD)[0]
++    assert not report["advanced"] and "evidence_interval_exceeded" in report["waiting"]
++    assert rk.receipt_for_task(live, tid)["state"] == "parent_queued"
++    assert not live.execute("SELECT 1 FROM kanban_sync_outbox WHERE state='pending'").fetchone()
+diff --git a/website/docs/user-guide/features/kanban-reserved-key-recovery.md b/website/docs/user-guide/features/kanban-reserved-key-recovery.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..108807b63265fd05b5820c095e1fdacabdddd711
+--- /dev/null
++++ b/website/docs/user-guide/features/kanban-reserved-key-recovery.md
+@@ -0,0 +1,67 @@
++---
++title: "Kanban: recovering a card with a reserved idempotency key"
++description: "Correct a local card whose pickup-stall:/worker-resources-unknown: key the Board refused, with `hermes kanban sync reserved-key`"
++---
++
++# Recovering a card with a reserved idempotency key
++
++The Board fences idempotency keys that start with `pickup-stall:` or `worker-resources-unknown:` to the pickup-stall
++detector. An ordinary local card that carries such a key is refused whole, every op behind it (comments, runs, events,
++links, chat links) is refused `not_found`, and the rejected ops stay visible under `hermes kanban sync status`.
++New creates with a reserved key from any other creator now fail immediately. `hermes kanban sync reserved-key`
++repairs cards that already exist, one card at a time.
++
++```bash
++# 1. Preview (read-only). Prints eligibility, the exact rejected ops it will supersede, and a token.
++hermes kanban sync reserved-key TASK_ID --new-key my-new-key --reason "why this card is corrected"
++
++# 2. Apply with the preview's token (compare-and-set).
++hermes kanban sync reserved-key TASK_ID --new-key my-new-key --reason "why this card is corrected" \
++    --apply --expect TOKEN
++```
++
++`--reason` is required and must not be blank. It is bound into the token and stored in the receipt.
++Add `--json` for machine output. Re-running the same apply is safe: it continues the receipt.
++
++## What is checked
++
++- The card is local and never acknowledged by the Board (`created_on` and `sync_version` empty), is not a detector
++  card, carries a reserved key, has no run, claim, lease or worker, and every outbox row for it and its children is a
++  **rejected** upsert/import for an identity that travels with the card. Pending ops, tombstones, rejected
++  releases/deletes, rejections for other identities, links where the card is the *parent* and events older than the
++  Board's retention make the command **refuse** instead of silently dropping them.
++- The hub's enrolled gateway is present and equals this board file's sync gateway, and the file's board id equals
++  the board. The token also binds a nonsecret fingerprint of the Board endpoint and gateway name; it never contains
++  the hub key. Every later step re-validates it.
++- Fresh authenticated Board reads: `never_existed` history evidence for the card and **every** child row, and an
++  exhaustive paged scan of the Board's live cards showing nobody holds the replacement key. A legacy Board without
++  the routes, an unreachable one, an incomplete scan or a pruned history floor refuse. The whole read interval, up
++  to the in-transaction veto and including the wait for the writer lock, must stay within 30 seconds on the
++  monotonic clock, or nothing is written.
++
++## What apply writes
++
++One transaction inserts the receipt (reason, endpoint fingerprint, exact bytes of every superseded rejected op),
++rewrites only `tasks.idempotency_key`, and enqueues one full `import` op for the corrected card. Apply does not edit,
++reset or delete rejected ops. Original event payloads and audit rows remain unchanged; all original ids are preserved.
++The normal selective resolver may later retire exactly the proven superseded outbox entries, retaining their complete
++original bytes in the receipt ledger.
++
++Each sync round then advances the receipt: once the Board accepted the corrected card, the child rows are queued as
++ordinary upserts (`children_queued`, with the replacement op ids recorded). The receipt becomes `complete` only when
++every child op was delivered (not merely queued) and the Board holds each child row. A child deleted or tombstoned
++locally, or carrying competing pending work, holds the whole child manifest instead of completing a partial recovery.
++Recovery child ops never synthesize another task from an incoming link. Normal transient retries retain their
++replacement-operation linkage. A Board that refuses a recovery field as `forbidden_field` is explicitly unsupported:
++the exact replacement remains rejected and visible, without compatibility downgrade or a false completion. Inspect
++that refusal and upgrade/reconcile the service through its supported process; do not reset the rejected operation.
++
++## How the old rejections retire
++
++Only through a `complete` receipt, and only for the exact recorded op ids with unchanged bytes. The original task op
++retires when the Board's card is the corrected card created by this gateway and every other rejected wire field matches
++the Board and the local card (the key is compared as the replacement key). Child ops go through the normal
++field-equality rules with the corrected parent as proof. If a receipt names an op but cannot vouch for it, the op stays
++rejected; it never falls back to a looser rule.
++
++Implementation and contract: `hermes_cli/kanban_sync_reserved_key.py`.
+diff --git a/website/sidebars.ts b/website/sidebars.ts
+index 7a7a9074441567f523d91014663fe28c83138009..1db6e9f987de2708f7ba1a4d59a7c4651cd0b504 100644
+--- a/website/sidebars.ts
++++ b/website/sidebars.ts
+@@ -115,6 +115,7 @@ const sidebars: SidebarsConfig = {
+             'user-guide/features/kanban-tutorial',
+             'user-guide/features/kanban-worker-lanes',
+             'user-guide/features/kanban-multi-gateway',
++            'user-guide/features/kanban-reserved-key-recovery',
+             'user-guide/features/goals',
+             'user-guide/features/heartbeat',
+             'user-guide/features/loops',
+-- 
+2.43.0
+

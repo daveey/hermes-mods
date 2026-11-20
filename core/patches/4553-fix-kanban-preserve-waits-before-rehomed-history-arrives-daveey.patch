@@ -1,0 +1,175 @@
+From a0fe7e285a63b6ca1ef53f27bb8220bd5b2b8480 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 10:17:14 +0000
+Subject: [PATCH] fix(kanban): preserve waits before rehomed history arrives
+ [daveey]
+
+Task rows become visible before history pages during owner rehome. Recovery relied exclusively on blocked events, so an unanswered human_request could promote; first-park absence also looked like a legacy missing wake. Read stored asks as sticky, and anchor missing-first-park grace on the existing local restore receipt rather than old imported event clocks. Existing explicit unblock clears the ask; imported park deadlines and bounded missing-park recovery remain intact.
+
+Proof: actual remote apply between task/history pages reproduces 2 human promotion failures and 2 scheduled-state failures before fixes. New tests plus remote-repark controls pass; scripts/check --base origin/main passes. Full Kanban regression and independent canonical review/CI required before landing. Live containment remains separate; no human answers or acceptance waivers inferred.
+---
+ hermes_cli/kanban_block_routing.py            |  5 +
+ hermes_cli/kanban_continuation.py             |  7 +-
+ hermes_cli/kanban_restore_chat_subs.py        |  9 ++
+ tests/hermes_cli/test_kanban_rehomed_waits.py | 93 +++++++++++++++++++
+ 4 files changed, 112 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_rehomed_waits.py
+
+diff --git a/hermes_cli/kanban_block_routing.py b/hermes_cli/kanban_block_routing.py
+index 4592f814ffcd68daf854530d61a5a0b28a21fafd..fafa05ec564cdb0a98393859c8cff970c6c4834e 100644
+--- a/hermes_cli/kanban_block_routing.py
++++ b/hermes_cli/kanban_block_routing.py
+@@ -53,6 +53,11 @@ def latest_block_reason(conn: sqlite3.Connection, task_id: str) -> str | None:
+ def has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
+     """Explicit blocks and policy breakers need resolution, not a higher retry limit."""
+     from hermes_cli.kanban_db import _json_dict
++    # Task rows arrive before their event history during rehome/snapshot imports.
++    # An outstanding ask is authoritative on the row; unblock_task clears it.
++    task = conn.execute("SELECT human_request FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    if task and task["human_request"]:
++        return True
+     row = conn.execute(
+         "SELECT kind FROM task_events "
+         "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index b4fa7c4b6aeafec2e7b6780efc0932296d0362b9..25cc705da9a8ebdaa01badc789ba5f38cb2db330 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -266,10 +266,13 @@ def park_state(conn: sqlite3.Connection, task_id: str) -> dict:
+     if event is None or _park_spent(conn, task_id, int(event[3]), event[4]):
+         # No park, or only a spent one: a feed page can bring a remote run's ``scheduled`` row before the
+         # ``continued`` event that carries its wake (t_00d7ca7eed7bf381). [daveey]
++        from hermes_cli.kanban_restore_chat_subs import restored_at
++        restored = restored_at(conn, task_id)
+         last = conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id = ?", (task_id,)).fetchone()
+-        parked_at = int(last[0]) if last and last[0] else int(time.time())
++        parked_at = max(int(last[0] or 0), restored or 0) if last else restored
++        parked_at = parked_at or int(time.time())
+         return {"payload": {}, "parked_at": parked_at, "timed": False, "event_id": None,
+-                "superseded": event is not None}
++                "superseded": event is not None or restored is not None}
+     timed = pending_wake_payload(event[0], event[1])
+     return {"payload": timed if timed is not None else kb._json_dict(event[1]),
+             "parked_at": int(event[2]), "timed": timed is not None, "event_id": int(event[3]),
+diff --git a/hermes_cli/kanban_restore_chat_subs.py b/hermes_cli/kanban_restore_chat_subs.py
+index 43e1ef049ff83a10c6e8a78b682633af5de3ab60..8fa4f9cf462ff1540394cf0d50bb2af73dbe00a9 100644
+--- a/hermes_cli/kanban_restore_chat_subs.py
++++ b/hermes_cli/kanban_restore_chat_subs.py
+@@ -67,6 +67,15 @@ def note_restored_task(conn: sqlite3.Connection, task_id: str, created_on: Any,
+ _NAME = re.compile(r"[A-Za-z0-9_.-]{1,128}")
+ 
+ 
++def restored_at(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
++    """Local import time, not a historical event clock; absent on ordinary local cards."""
++    if not conn.execute(
++            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_restored_cards'").fetchone():
++        return None
++    row = conn.execute("SELECT restored_at FROM kanban_restored_cards WHERE task_id = ?", (task_id,)).fetchone()
++    return int(row[0]) if row else None
++
++
+ def _safe(part: Any) -> bool:
+     """One ``<gw>/<profile>/<session>`` segment the hermes-hub collector accepts (its ``parse_shepherd``)."""
+     return isinstance(part, str) and bool(_NAME.fullmatch(part))
+diff --git a/tests/hermes_cli/test_kanban_rehomed_waits.py b/tests/hermes_cli/test_kanban_rehomed_waits.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..38b7da3743cf2a5f4e39bbe8bcc6bf3904006ba3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_rehomed_waits.py
+@@ -0,0 +1,93 @@
++"""A rehomed human stop is authoritative before its history page arrives."""
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from tests.hermes_cli import test_kanban_remote_repark as helpers
++
++kanban_home = helpers.kanban_home
++
++
++@pytest.fixture
++def home(kanban_home):
++    for conn in helpers.support.synced_conn(kanban_home):
++        conn.execute("UPDATE kanban_sync_state SET gateway_id = 'hub', mode = 'primary'")
++        conn.commit()
++        yield conn
++
++
++ASK = {
++    "action": "Reply A or B. Unblock = apply your choice; archive = drop this work.",
++    "why_human": "Only the user can authorize the additional spend.",
++    "interaction": "reply",
++    "scope": "One additional paid run.",
++    "evidence": "The approved budget is exhausted.",
++}
++
++
++@pytest.mark.parametrize("history", ["absent", "older-unblock"])
++def test_rehomed_human_block_waits_for_answer_not_history(home, history):
++    now = int(time.time())
++    feed, tid = helpers.Feed(home), "t_50cda880d3759b34"
++    feed.apply(feed.row(tid, title="budget decision", status="blocked", created_on="hub",
++                        created_at=now - 10000, workspace_kind="scratch", assignee="default",
++                        block_kind="needs_input", human_request=json.dumps(ASK)))
++    if history == "older-unblock":
++        feed.apply(feed.event(tid, "unblocked", now - 1000, {}))
++    assert kb.recompute_ready(home) == 0
++    assert kb.get_task(home, tid).status == "blocked"
++    assert kb.get_task(home, tid).human_request == ASK
++    feed.apply(feed.event(tid, "blocked", now - 500, {"kind": "needs_input", "human_request": ASK}))
++    assert kb.recompute_ready(home) == 0
++    assert kb.unblock_task(home, tid)
++    assert kb.get_task(home, tid).status == "ready"
++    assert kb.get_task(home, tid).human_request is None
++
++
++@pytest.mark.parametrize("stale_kind", [None, "needs_input"])
++def test_rehomed_schedule_keeps_wait_while_first_park_is_imported(home, stale_kind):
++    from hermes_cli import kanban_continuation as kc
++
++    now = int(time.time())
++    feed, tid = helpers.Feed(home), "t_165da604658ea7f6"
++    feed.apply(feed.row(tid, title="future wait", status="scheduled", created_on="hub",
++                        created_at=now - 10000, workspace_kind="scratch", assignee="default",
++                        block_kind=stale_kind))
++    # The initial history page can contain only old metadata, not the park yet.
++    feed.apply(feed.event(tid, "created", now - 200000, {}))
++    assert kc.wake_due_continuations(home, now=now) == []
++    assert kb.get_task(home, tid).status == "scheduled"
++    wake_at = now + 86400
++    feed.apply(feed.event(tid, "scheduled", now - 1000, {"wake_at": wake_at}))
++    assert kc.wake_due_continuations(home, now=now) == []
++    assert kb.get_task(home, tid).status == "scheduled"
++    assert kc.wake_due_continuations(home, now=wake_at) == [tid]
++
++
++def test_missing_imported_park_has_a_stable_bounded_backstop(home):
++    from hermes_cli import kanban_continuation as kc
++    from hermes_cli.kanban_restore_chat_subs import restored_at
++
++    now = int(time.time())
++    feed, tid = helpers.Feed(home), "t_9e9211f2e15032a3"
++    feed.apply(feed.row(tid, title="lost park", status="scheduled", created_on="hub",
++                        created_at=now - 200000, workspace_kind="scratch", assignee="default"))
++    receipt = restored_at(home, tid)
++    assert receipt is not None
++    feed.apply(feed.event(tid, "created", now - 200000, {}))
++    deadline = receipt + kc.SUPERSEDED_PARK_GRACE_SECONDS
++    assert kc.park_state(home, tid)["parked_at"] == receipt
++    assert kc.wake_due_continuations(home, now=deadline - 1) == []
++    assert kc.wake_due_continuations(home, now=deadline) == [tid]
++    assert helpers._woken(home, tid)[-1]["park_missing"] is True
++
++
++def test_unheld_imported_failure_can_still_recover(home):
++    feed, tid = helpers.Feed(home), "t_2b70a65cdcd16595"
++    feed.apply(feed.row(tid, title="retry", status="blocked", created_on="hub",
++                        created_at=int(time.time()), workspace_kind="scratch", assignee="default",
++                        block_kind="transient"))
++    assert kb.recompute_ready(home) == 1
++    assert kb.get_task(home, tid).status == "ready"
+-- 
+2.43.0
+

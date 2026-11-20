@@ -1,0 +1,737 @@
+From f6a495578c33880cf1fc51ae23e254e358b85262 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 15:47:37 +0000
+Subject: [PATCH] feat(loop-accounting): per-family residual,
+ executor/aux/plugin scopes, loop callback attribution
+
+---
+ agent/auxiliary_client.py                     |  12 +
+ hermes_cli/loop_accounting.py                 | 346 +++++++++++++++++-
+ .../test_loop_accounting_residual.py          | 271 ++++++++++++++
+ 3 files changed, 628 insertions(+), 1 deletion(-)
+ create mode 100644 tests/hermes_cli/test_loop_accounting_residual.py
+
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index 2a3989c68371a726761dc2664f235f9aee23ca8a..85182992c32a6bca445a3d852e80a9d5e6ee55bd 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -435,6 +435,15 @@ def aux_stream_deadline(deadline: float | Callable[[], float | None] | None):
+         _aux_stream_deadline.value = previous
+ 
+ 
++def _loop_accounting_scope(name: str):
++    """Residual CPU scope for ``name`` (a no-op context if loop accounting cannot import)."""
++    try:
++        from hermes_cli import loop_accounting
++        return loop_accounting.scope(name)
++    except Exception:  # health: allow BLE001 -- accounting must never fail a provider call
++        return contextlib.nullcontext()
++
++
+ def _run_protected_sync_provider_call(callback: Callable[[dict[str, Any]], Any], kwargs: dict[str, Any]) -> Any:
+     """Run one protected provider callback in an attempt-isolated daemon thread.
+ 
+@@ -461,9 +470,12 @@ def _run_protected_sync_provider_call(callback: Callable[[dict[str, Any]], Any],
+     provider_context = contextvars.copy_context()
+     done, outcome, attempt = threading.Event(), {}, ProviderAttempt()
+ 
++    operation = str((_RELAY_AUX_CALL_CONTEXT.get() or {}).get("task") or "unknown")[:48]  # initiating operation only
++
+     def _provider_worker() -> None:
+         try:
+             with (
++                _loop_accounting_scope(f"aux_provider/{operation}"),
+                 aux_progress_hook(progress_hook),
+                 _aux_thread_local_hook(_aux_dispatch, dispatch_hook),
+                 _aux_thread_local_hook(_aux_provider_response, provider_response_hook),
+diff --git a/hermes_cli/loop_accounting.py b/hermes_cli/loop_accounting.py
+index 9cee4b1632817dff4addaf2008e8bfe0fd1f99be..12270d3d0a75bd425317ade274f41e12cf765319 100644
+--- a/hermes_cli/loop_accounting.py
++++ b/hermes_cli/loop_accounting.py
+@@ -64,6 +64,8 @@ import functools
+ import json
+ import logging
+ import os
++import re
++import sys
+ import threading
+ import time
+ from pathlib import Path
+@@ -386,6 +388,58 @@ def _proc_stat_cpu(path: str, hz: float) -> Optional[tuple[str, float]]:
+     return comm, (int(fields[11]) + int(fields[12])) / hz
+ 
+ 
++_FAMILY_SUFFIX = re.compile(r"([_\-\s]\d+|[_\-\s]?0x[0-9a-fA-F]+|[_\-\s][0-9a-fA-F]{8,})+$")
++_FAMILY_TARGET = re.compile(r"\s*\(.*\)\s*$")
++
++
++def family_of(name: Optional[str]) -> str:
++    """Thread-name family: trailing ``_N`` / ``-N`` / `` N`` / hex handle suffixes and a ``(target)`` tail are
++    stripped (``asyncio_3`` -> ``asyncio``, ``Thread-7 (run)`` -> ``Thread``, ``AnyIO worker thread`` stays)."""
++    name = (name or "?").strip() or "?"
++    name = _FAMILY_TARGET.sub("", name) or name
++    return _FAMILY_SUFFIX.sub("", name) or name
++
++
++def _darwin_thread_cpu() -> list[tuple[int, str, float]]:
++    """(native id, name, CPU seconds) of every thread of this process via ``proc_pidinfo`` (libproc). [] on any
++    failure; a total above the process CPU (a time-unit surprise) is discarded rather than reported."""
++    try:
++        import ctypes
++        import ctypes.util
++        lib = ctypes.CDLL(ctypes.util.find_library("proc") or "/usr/lib/libproc.dylib", use_errno=True)
++        libc = ctypes.CDLL(None)
++
++        class _ThreadInfo(ctypes.Structure):
++            _fields_ = [("user", ctypes.c_uint64), ("system", ctypes.c_uint64), ("cpu_usage", ctypes.c_int32),
++                        ("policy", ctypes.c_int32), ("run_state", ctypes.c_int32), ("flags", ctypes.c_int32),
++                        ("sleep_time", ctypes.c_int32), ("curpri", ctypes.c_int32), ("priority", ctypes.c_int32),
++                        ("maxpriority", ctypes.c_int32), ("name", ctypes.c_char * 64)]
++
++        class _Timebase(ctypes.Structure):
++            _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
++
++        tb = _Timebase()
++        libc.mach_timebase_info(ctypes.byref(tb))
++        scale = (tb.numer / tb.denom if tb.denom else 1.0) / 1e9
++        pid = os.getpid()
++        ids = (ctypes.c_uint64 * 1024)()
++        got = lib.proc_pidinfo(pid, 6, 0, ids, ctypes.sizeof(ids))  # PROC_PIDLISTTHREADS
++        if got <= 0:
++            return []
++        out = []
++        for i in range(got // 8):
++            info = _ThreadInfo()
++            if lib.proc_pidinfo(pid, 15, ids[i], ctypes.byref(info), ctypes.sizeof(info)) <= 0:  # THREADID64INFO
++                continue
++            out.append((int(ids[i]), info.name.decode("utf-8", "replace"), (info.user + info.system) * scale))
++        total = sum(c for _, _, c in out)
++        if total > (os.times().user + os.times().system) * 1.25 + 1.0:
++            return []
++        return out
++    except Exception:  # health: allow BLE001 -- best effort; no per-thread counters is a documented state
++        return []
++
++
+ def thread_cpu() -> list[dict[str, Any]]:
+     """Every live thread of this process: native id, name and CPU seconds (user + system), plus the CPU its
+     outermost accounted passes took. Linux reads ``/proc/self/task``; elsewhere only live accounted threads are
+@@ -408,7 +462,12 @@ def thread_cpu() -> list[dict[str, Any]]:
+         comm, cpu = got
+         out.append({"tid": tid, "name": names.get(tid, comm), "cpu_s": round(cpu, 3),
+                     "accounted_cpu_s": round(accounted_by.get(tid, 0.0), 6)})
+-    if not tids:  # no procfs: list live accounted threads only (exited ones fold in snapshot())
++    if not tids and sys.platform == "darwin":
++        for tid, name, cpu in _darwin_thread_cpu():
++            out.append({"tid": tid, "name": names.get(tid) or name or "?", "cpu_s": round(cpu, 3),
++                        "accounted_cpu_s": round(accounted_by.get(tid, 0.0), 6)})
++        tids = [t["tid"] for t in out]
++    if not tids:  # no per-thread counters: list live accounted threads only (exited ones fold in snapshot())
+         for tid, acc in sorted(accounted_by.items()):
+             if tid not in names:
+                 continue
+@@ -462,10 +521,43 @@ def snapshot() -> dict[str, Any]:
+             "unaccounted_live_cpu_s": round(max(0.0, live - accounted_live), 3) if procfs else None,
+         },
+         "threads": threads,
++        "residual": _residual(threads, process_cpu, accounted_total, procfs),
+         "loops": counters(),
+     }
+ 
+ 
++def _residual(threads: list[dict[str, Any]], process_cpu: float, accounted_total: float,
++              have_cpu: bool) -> dict[str, Any]:
++    """CPU no accounting scope owns, per thread-name family. ``families[f].unaccounted_cpu_s`` is that family's
++    thread CPU minus the CPU its outermost scopes accounted (clamped at 0, so never negative); ``exited`` holds
++    the threads gone since start (process CPU not on a live thread, against the accounted CPU they folded in)."""
++    out: dict[str, Any] = {"available": have_cpu, "families": {}, "exited": None,
++                           "process_unaccounted_cpu_s": round(max(0.0, process_cpu - accounted_total), 3),
++                           "unaccounted_cpu_s": None}
++    if not have_cpu:
++        return out
++    fams: dict[str, dict[str, Any]] = {}
++    live = 0.0
++    for t in threads:
++        cpu = t["cpu_s"] or 0.0
++        live += cpu
++        f = fams.setdefault(family_of(t["name"]), {"threads": 0, "cpu_s": 0.0, "accounted_cpu_s": 0.0})
++        f["threads"] += 1
++        f["cpu_s"] += cpu
++        f["accounted_cpu_s"] += t["accounted_cpu_s"]
++    with _lock:
++        exited_acc = _state.get("exited_accounted", 0.0)
++    exited = {"cpu_s": max(0.0, process_cpu - live), "accounted_cpu_s": exited_acc}
++    total = 0.0
++    for f in list(fams.values()) + [exited]:
++        f["unaccounted_cpu_s"] = max(0.0, f["cpu_s"] - f["accounted_cpu_s"])
++        total += f["unaccounted_cpu_s"]
++        for k in ("cpu_s", "accounted_cpu_s", "unaccounted_cpu_s"):
++            f[k] = round(f[k], 6)
++    out.update(families=fams, exited=exited, unaccounted_cpu_s=round(total, 6))
++    return out
++
++
+ def _role_guess() -> str:
+     try:
+         from hermes_cli.observability.shared_metrics_process import current_process_kind
+@@ -562,6 +654,7 @@ def _writer(stop: threading.Event, period: float) -> None:
+     writes = 0
+     while not stop.wait(period):
+         try:
++            instrument_plugins()
+             write_snapshot()
+             if writes % 10 == 0:
+                 prune()
+@@ -578,6 +671,10 @@ def start(role: str) -> bool:
+     if not enabled():
+         return False
+     period = interval_s()  # a config read: never under _lock, which every pass exit on every thread takes
++    try:
++        instrument()
++    except Exception:  # health: allow BLE001 -- accounting must never be what ends a boot
++        logger.debug("loop accounting: instrumentation failed", exc_info=True)
+     with _lock:
+         thread = _state.get("thread")
+         if thread is not None and thread.is_alive() and _state.get("pid") == os.getpid():
+@@ -621,14 +718,261 @@ def reset() -> None:
+         _stats.clear()
+         _thread_accounted.clear()
+         _exited_tids.clear()
++        _cb_keys.clear()
+         _state.pop("exited_accounted", None)
+ 
+ 
++# -- residual scopes and instrumentation ----------------------------------------------------------------------
++
++MAX_CALLBACK_KEYS = 64  # distinct main-loop callback names; later ones fold into ``loop_cb/other``
++CALLBACK_OTHER = "loop_cb/other"
++
++
++class Scope:
++    """A residual scope (a context manager): books the CPU this thread spent inside it that no pass or scope
++    nested in it already accounted, under ``name``. Unlike :class:`Pass` it never hides a nested pass: the
++    nested pass keeps its own name and CPU, this scope gets only the rest, and the thread's ``accounted_cpu_s``
++    gets the sum once (so a route running inside an AnyIO worker scope is not counted twice)."""
++
++    __slots__ = ("_acc0", "_c0", "_gen", "_tid", "_w0", "name", "skipped")
++
++    def __init__(self, name: str) -> None:
++        self.name = name
++        self.skipped = False
++
++    def skip(self) -> None:
++        self.skipped = True
++
++    def __enter__(self) -> Scope:
++        self._tid = _own_tid()
++        self._acc0 = _thread_accounted.get(self._tid, 0.0)
++        self._gen = _fork["gen"]
++        self._w0 = _perf()
++        self._c0 = _thread_time()
++        return self
++
++    def __exit__(self, exc_type, exc, tb) -> None:
++        if self._gen == _fork["gen"]:
++            cpu = _thread_time() - self._c0
++            wall = _perf() - self._w0
++        else:
++            cpu = _thread_time() - _fork["c0"]
++            wall = _perf() - _fork["w0"]
++        tid = self._tid
++        with _lock:
++            inner = max(0.0, _thread_accounted.get(tid, 0.0) - self._acc0)
++            own = max(0.0, cpu - inner)
++            st = _stat(self.name)
++            st.runs += 1
++            st.skips += bool(self.skipped)
++            if exc_type is not None:
++                st.error(getattr(exc_type, "__name__", None))
++            st.cpu_s += own
++            st.cpu_max_s = max(st.cpu_max_s, own)
++            st.wall_s += wall
++            st.last_at = time.time()
++            if getattr(_local, "depth", 0) <= 0:
++                _add_accounted(tid, own)
++
++
++def scope(name: str) -> Scope:
++    """A residual scope of ``name``; see :class:`Scope`."""
++    return Scope(name)
++
++
++def _callable_name(fn: Any) -> str:
++    """``module.qualname`` of what a thread pool will run (``partial`` / ``Context.run`` unwrapped)."""
++    for _ in range(6):
++        if isinstance(fn, functools.partial):
++            inner = fn.func
++            is_ctx_run = (getattr(inner, "__name__", None) == "run"
++                          and type(getattr(inner, "__self__", None)).__name__ == "Context")
++            fn = fn.args[0] if is_ctx_run and fn.args else inner
++            continue
++        break
++    qual = getattr(fn, "__qualname__", None) or type(fn).__name__
++    mod = getattr(fn, "__module__", None) or ""
++    return f"{mod}.{qual}" if mod else str(qual)
++
++
++def _run_scoped(name: str, fn: Callable, *args: Any, **kwargs: Any) -> Any:
++    with Scope(name):
++        return fn(*args, **kwargs)
++
++
++def scoped_call(prefix: str, fn: Callable) -> Callable:
++    """``fn`` wrapped so each call is one :class:`Scope` named ``<prefix>/<fn qualname>``."""
++    return functools.partial(_run_scoped, f"{prefix}/{_callable_name(fn)}", fn)
++
++
++def _callback_key(cb: Any) -> str:
++    owner = getattr(cb, "__self__", None)
++    get_coro = getattr(owner, "get_coro", None)
++    if get_coro is not None:
++        try:
++            coro = get_coro()
++            return f"loop_cb/{getattr(coro, '__qualname__', None) or type(coro).__name__}"
++        except Exception:  # health: allow BLE001 -- a label only
++            pass
++    return "loop_cb/" + _callable_name(cb)
++
++
++_cb_keys: set = set()
++
++
++def _book_callback(key: str, cpu: float, wall: float, tid: int, acc0: float) -> None:
++    with _lock:
++        own = max(0.0, cpu - max(0.0, _thread_accounted.get(tid, 0.0) - acc0))
++        if key not in _cb_keys:
++            if len(_cb_keys) >= MAX_CALLBACK_KEYS:
++                key = CALLBACK_OTHER
++            else:
++                _cb_keys.add(key)
++        st = _stat(key)
++        st.runs += 1
++        st.cpu_s += own
++        st.cpu_max_s = max(st.cpu_max_s, own)
++        st.wall_s += wall
++        st.last_at = time.time()
++        if own > 0.0 and getattr(_local, "depth", 0) <= 0:
++            _add_accounted(tid, own)
++
++
++_instrumented: dict[str, Any] = {}
++
++
++def instrument_executors() -> bool:
++    """Name the submitted function of every ``loop.run_in_executor`` (so ``asyncio.to_thread``) and
++    ``anyio.to_thread.run_sync`` call as a residual scope ``thread/<qualname>``. Idempotent."""
++    if _instrumented.get("executors"):
++        return False
++    _instrumented["executors"] = True
++    import asyncio.base_events as be
++    orig = be.BaseEventLoop.run_in_executor
++
++    def run_in_executor(self, executor, func, *args):
++        return orig(self, executor, scoped_call("thread", func), *args)
++
++    run_in_executor._la_orig = orig  # type: ignore[attr-defined]
++    be.BaseEventLoop.run_in_executor = run_in_executor  # type: ignore[method-assign]
++    try:
++        import anyio.to_thread as at
++        a_orig = at.run_sync
++
++        async def run_sync(func, *args, **kwargs):
++            return await a_orig(scoped_call("thread", func), *args, **kwargs)
++
++        run_sync._la_orig = a_orig  # type: ignore[attr-defined]
++        at.run_sync = run_sync
++    except Exception:  # health: allow BLE001 -- no anyio: only the asyncio executors are named
++        logger.debug("loop accounting: anyio not instrumented", exc_info=True)
++    return True
++
++
++def instrument_callbacks() -> bool:
++    """Attribute event-loop callback CPU outside any pass/scope to the callback or task coroutine that burned
++    it (``loop_cb/<qualname>``, at most ``MAX_CALLBACK_KEYS`` names then ``loop_cb/other``). Idempotent."""
++    if _instrumented.get("callbacks"):
++        return False
++    _instrumented["callbacks"] = True
++    import asyncio.events as ev
++    orig = ev.Handle._run
++
++    def _run(self):
++        tid = _native_id()
++        acc0 = _thread_accounted.get(tid, 0.0)
++        w0 = _perf()
++        c0 = _thread_time()
++        try:
++            return orig(self)
++        finally:
++            cpu = _thread_time() - c0
++            try:
++                _book_callback(_callback_key(self._callback), cpu, _perf() - w0, tid, acc0)
++            except Exception:  # health: allow BLE001 -- accounting must never break a loop callback
++                pass
++
++    _run._la_orig = orig  # type: ignore[attr-defined]
++    ev.Handle._run = _run  # type: ignore[method-assign]
++    return True
++
++
++def uninstrument() -> None:
++    """Undo :func:`instrument_executors` / :func:`instrument_callbacks` (tests)."""
++    if _instrumented.pop("executors", None):
++        import asyncio.base_events as be
++        be.BaseEventLoop.run_in_executor = be.BaseEventLoop.run_in_executor._la_orig  # type: ignore[attr-defined]
++        try:
++            import anyio.to_thread as at
++            at.run_sync = at.run_sync._la_orig  # type: ignore[attr-defined]
++        except Exception:  # health: allow BLE001
++            pass
++    if _instrumented.pop("callbacks", None):
++        import asyncio.events as ev
++        ev.Handle._run = ev.Handle._run._la_orig  # type: ignore[attr-defined]
++
++
++# Plugin call sites (hermes-mods plugins; core cannot import them): found in ``sys.modules`` by file suffix and
++# wrapped in place. (file suffix, class or None, function, scope name)
++_PLUGIN_SITES = (
++    ("plugins/user-terminal/__init__.py", None, "sweep_jobs", "plugin/user-terminal.sweep_jobs"),
++    ("plugins/loop-watch/watch.py", "LoopWatch", "check_once", "plugin/loop-watch.check_once"),
++)
++
++
++def wrap_function(owner: Any, attr: str, name: str) -> bool:
++    """Replace ``owner.attr`` (module or class) with a wrapper running each call in :class:`Scope` ``name``.
++    False when already wrapped or missing."""
++    fn = getattr(owner, attr, None)
++    if fn is None or getattr(fn, "_la_scope", None) == name:
++        return False
++
++    @functools.wraps(fn)
++    def wrapped(*args: Any, **kwargs: Any) -> Any:
++        with Scope(name):
++            return fn(*args, **kwargs)
++
++    wrapped._la_scope = name  # type: ignore[attr-defined]
++    setattr(owner, attr, wrapped)
++    return True
++
++
++def instrument_plugins() -> int:
++    """Wrap the known plugin call sites in every loaded plugin module (re-run by the snapshot writer, so a
++    plugin loaded after boot is picked up). Returns how many were wrapped now."""
++    n = 0
++    for mod in list(sys.modules.values()):
++        path = (getattr(mod, "__file__", None) or "").replace(os.sep, "/")
++        if not path:
++            continue
++        for suffix, cls, fn, name in _PLUGIN_SITES:
++            if path.endswith(suffix):
++                try:
++                    n += wrap_function(getattr(mod, cls) if cls else mod, fn, name)
++                except Exception:  # health: allow BLE001 -- a plugin without the symbol is simply not named
++                    logger.debug("loop accounting: plugin site %s not wrapped", name, exc_info=True)
++    return n
++
++
++def instrument() -> None:
++    """Install the residual instrumentation: ``loop_accounting.scopes`` (default on: executor and plugin
++    scopes) and ``loop_accounting.callbacks`` (main-loop callback attribution; default per the hub A/B)."""
++    if _setting("scopes", True):
++        instrument_executors()
++        instrument_plugins()
++    if _setting("callbacks", CALLBACKS_DEFAULT):
++        instrument_callbacks()
++
++
++CALLBACKS_DEFAULT = True
++
++
+ def _after_fork_child() -> None:
+     global _lock, _started_at
+     _lock = threading.Lock()
+     _stats.clear()
+     _thread_accounted.clear()
++    _cb_keys.clear()
+     _started_at = time.time()
+     _state.pop("exited_accounted", None)
+     _state.update(thread=None, stop=None, pid=os.getpid(), role=None)
+diff --git a/tests/hermes_cli/test_loop_accounting_residual.py b/tests/hermes_cli/test_loop_accounting_residual.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..687dc9659214d0b63aac8968115c6b570e51ab26
+--- /dev/null
++++ b/tests/hermes_cli/test_loop_accounting_residual.py
+@@ -0,0 +1,271 @@
++"""Loop accounting residual: per-thread-family unaccounted CPU and named call-site scopes (t_f7d0cc07f75cd099)."""
++
++from __future__ import annotations
++
++import asyncio
++import sys
++import threading
++import time
++import types
++
++import pytest
++
++from hermes_cli import loop_accounting as la
++
++linux_procfs = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="per-thread CPU needs procfs here")
++
++
++@pytest.fixture(autouse=True)
++def _fresh(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
++    la.stop()
++    la.reset()
++    yield
++    la.uninstrument()
++    la.stop()
++    la.reset()
++
++
++def _burn(seconds: float) -> None:
++    end = time.thread_time() + seconds
++    while time.thread_time() < end:
++        pass
++
++
++def _hold(name: str, work) -> tuple[threading.Thread, threading.Event]:
++    """A live thread ``name`` that runs ``work`` then stays alive until the returned event is set."""
++    done, release = threading.Event(), threading.Event()
++
++    def body() -> None:
++        work()
++        done.set()
++        release.wait(30)
++
++    th = threading.Thread(target=body, name=name, daemon=True)
++    th.start()
++    assert done.wait(30)
++    return th, release
++
++
++def test_family_of_strips_suffixes():
++    assert la.family_of("asyncio_3") == "asyncio"
++    assert la.family_of("Thread-7 (run)") == "Thread"
++    assert la.family_of("AnyIO worker thread") == "AnyIO worker thread"
++    assert la.family_of("hermes-gateway-default") == "hermes-gateway-default"
++    assert la.family_of("MainThread") == "MainThread"
++    assert la.family_of("worker_0x7f3a9c") == "worker"
++
++
++@linux_procfs
++def test_unscoped_thread_cpu_is_that_familys_unaccounted_and_scoped_is_not():
++    def unscoped():
++        _burn(0.4)
++
++    def scoped():
++        with la.pass_("scoped.pass"):
++            _burn(0.4)
++
++    _t1, r1 = _hold("unscoped-fam_1", unscoped)
++    _t2, r2 = _hold("scoped-fam_1", scoped)
++    try:
++        fams = la.snapshot()["residual"]["families"]
++    finally:
++        r1.set()
++        r2.set()
++    assert abs(fams["unscoped-fam"]["unaccounted_cpu_s"] - 0.4) <= 0.04
++    assert fams["scoped-fam"]["unaccounted_cpu_s"] <= 0.04
++    assert fams["scoped-fam"]["accounted_cpu_s"] >= 0.35
++
++
++@linux_procfs
++def test_family_unaccounted_sums_to_process_residual():
++    la.reset()
++    def work():
++        _burn(0.3)
++    _t1, r1 = _hold("sumfam_1", work)
++    _t2, r2 = _hold("sumfam_2", lambda: la.record("rec", cpu_s=0.0))
++    try:
++        with la.pass_("main.scoped"):
++            _burn(0.2)
++        snap = la.snapshot()
++    finally:
++        r1.set()
++        r2.set()
++    res, proc = snap["residual"], snap["process"]
++    want = proc["cpu_s"] - proc["accounted_cpu_s"]
++    assert want > 0.25
++    assert res["unaccounted_cpu_s"] == pytest.approx(want, rel=0.05)
++    assert res["process_unaccounted_cpu_s"] == pytest.approx(want, abs=0.001)
++    assert res["families"]["sumfam"]["threads"] == 2
++
++
++@linux_procfs
++def test_exited_thread_lands_in_exited_bucket_never_negative():
++    def short():
++        _burn(0.3)
++
++    th = threading.Thread(target=short, name="gone_1")
++    th.start()
++    th.join()
++    snap = la.snapshot()
++    res = snap["residual"]
++    assert "gone" not in res["families"]
++    assert res["exited"]["cpu_s"] >= 0.25
++    assert res["exited"]["unaccounted_cpu_s"] >= 0.25
++    assert all(f["unaccounted_cpu_s"] >= 0 for f in res["families"].values())
++
++
++def test_nested_scopes_are_not_counted_twice():
++    with la.scope("outer"):
++        _burn(0.05)
++        with la.scope("inner"):
++            _burn(0.05)
++            with la.pass_("pass.inside"):
++                _burn(0.05)
++    c = la.counters()
++    assert c["inner"]["cpu_s"] >= 0.04 and c["pass.inside"]["cpu_s"] >= 0.04
++    # a scope books only what its nested pass/scope did not
++    assert c["inner"]["cpu_s"] < 0.09 and c["outer"]["cpu_s"] < 0.09
++    total = sum(c[k]["cpu_s"] for k in ("outer", "inner", "pass.inside"))
++    assert la.snapshot()["process"]["accounted_cpu_s"] == pytest.approx(total, rel=0.05)
++    assert 0.13 <= total <= 0.2
++
++
++def test_executor_scopes_name_to_thread_and_anyio_functions():
++    la.instrument_executors()
++
++    def asyncio_job():
++        _burn(0.02)
++
++    def anyio_job():
++        _burn(0.02)
++
++    async def main():
++        await asyncio.to_thread(asyncio_job)
++        import anyio.to_thread
++        await anyio.to_thread.run_sync(anyio_job)
++
++    asyncio.run(main())
++    c = la.counters()
++    names = {k: v for k, v in c.items() if k.startswith("thread/")}
++    assert any(k.endswith("asyncio_job") and v["runs"] == 1 and v["cpu_s"] >= 0.015 for k, v in names.items()), names
++    assert any(k.endswith("anyio_job") and v["runs"] == 1 and v["cpu_s"] >= 0.015 for k, v in names.items()), names
++
++
++def test_executor_scope_does_not_double_count_an_accounted_route():
++    la.instrument_executors()
++
++    def route():
++        with la.pass_("route/x"):
++            _burn(0.03)
++
++    async def main():
++        await asyncio.to_thread(route)
++
++    asyncio.run(main())
++    c = la.counters()
++    scope_key = next(k for k in c if k.startswith("thread/") and k.endswith("route"))
++    assert c["route/x"]["cpu_s"] >= 0.025
++    assert c[scope_key]["runs"] == 1 and c[scope_key]["cpu_s"] < 0.02
++    assert la.snapshot()["process"]["accounted_cpu_s"] < 0.06
++
++
++def test_protected_aux_provider_worker_scope_keyed_by_operation(monkeypatch):
++    from agent import auxiliary_client as ac
++
++    token = ac._RELAY_AUX_CALL_CONTEXT.set({"task": "compression"})
++    try:
++        with ac.aux_interrupt_protection(cancel_check=lambda: False):
++            out = ac._run_protected_sync_provider_call(lambda kw: (_burn(0.03), "ok")[1], {})
++    finally:
++        ac._RELAY_AUX_CALL_CONTEXT.reset(token)
++    assert out == "ok"
++    st = la.counters()["aux_provider/compression"]
++    assert st["runs"] == 1 and st["cpu_s"] >= 0.025
++
++
++def _fake_plugin(monkeypatch, name: str, path: str, **attrs):
++    mod = types.ModuleType(name)
++    mod.__file__ = path
++    for k, v in attrs.items():
++        setattr(mod, k, v)
++    monkeypatch.setitem(sys.modules, name, mod)
++    return mod
++
++
++def test_plugin_sites_user_terminal_sweep_jobs_and_loop_watch_subcall(monkeypatch):
++    calls = []
++
++    def sweep_jobs(skip=None):
++        _burn(0.02)
++        calls.append(skip)
++
++    class LoopWatch:
++        def check_once(self):
++            _burn(0.02)
++
++    ut = _fake_plugin(monkeypatch, "fake_ut", "/x/plugins/user-terminal/__init__.py", sweep_jobs=sweep_jobs)
++    lw = _fake_plugin(monkeypatch, "fake_lw", "/x/plugins/loop-watch/watch.py", LoopWatch=LoopWatch)
++    assert la.instrument_plugins() == 2
++    assert la.instrument_plugins() == 0  # idempotent
++    ut.sweep_jobs(skip="s")
++    lw.LoopWatch().check_once()
++    assert calls == ["s"]
++    c = la.counters()
++    assert c["plugin/user-terminal.sweep_jobs"]["runs"] == 1 and c["plugin/user-terminal.sweep_jobs"]["cpu_s"] >= 0.015
++    assert c["plugin/loop-watch.check_once"]["runs"] == 1 and c["plugin/loop-watch.check_once"]["cpu_s"] >= 0.015
++
++
++def test_main_loop_callback_outside_any_scope_is_named():
++    la.instrument_callbacks()
++
++    async def burner_task():
++        _burn(0.05)
++
++    def plain_callback():
++        _burn(0.03)
++
++    async def scoped_task():
++        with la.pass_("scoped.in.loop"):
++            _burn(0.03)
++
++    async def main():
++        asyncio.get_running_loop().call_soon(plain_callback)
++        await asyncio.create_task(burner_task())
++        await asyncio.create_task(scoped_task())
++        await asyncio.sleep(0)
++
++    asyncio.run(main())
++    c = la.counters()
++    keys = {k: v for k, v in c.items() if k.startswith("loop_cb/")}
++    burner = next(v for k, v in keys.items() if k.endswith("burner_task"))
++    plain = next(v for k, v in keys.items() if k.endswith("plain_callback"))
++    assert burner["cpu_s"] >= 0.045 and plain["cpu_s"] >= 0.025
++    # CPU a pass already accounted is not booked again under the callback
++    scoped = next(v for k, v in keys.items() if k.endswith("scoped_task"))
++    assert scoped["cpu_s"] < 0.02 and c["scoped.in.loop"]["cpu_s"] >= 0.025
++
++
++def test_callback_keys_are_capped_with_an_other_bucket():
++    la.instrument_callbacks()
++
++    async def main():
++        loop = asyncio.get_running_loop()
++        for i in range(la.MAX_CALLBACK_KEYS + 20):
++            ns = {}
++            exec(f"def cb_{i}(): pass", ns)
++            loop.call_soon(ns[f"cb_{i}"])
++        await asyncio.sleep(0.05)
++
++    asyncio.run(main())
++    keys = [k for k in la.counters() if k.startswith("loop_cb/")]
++    assert la.CALLBACK_OTHER in keys
++    assert len(keys) <= la.MAX_CALLBACK_KEYS + 1
++
++
++def test_old_snapshot_keys_unchanged():
++    snap = la.snapshot()
++    for key in ("version", "role", "pid", "process", "threads", "loops"):
++        assert key in snap
++    for key in ("cpu_s", "accounted_cpu_s", "unaccounted_live_cpu_s", "exited_threads_cpu_s"):
++        assert key in snap["process"]
+-- 
+2.43.0
+

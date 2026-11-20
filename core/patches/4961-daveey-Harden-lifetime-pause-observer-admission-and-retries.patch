@@ -1,0 +1,145 @@
+From 46075f475f587a41b16799d5aff25312b3562faa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 09:27:47 +0000
+Subject: [PATCH] [daveey] Harden lifetime pause observer admission and retries
+
+Address independent review: reload auto-continue config per iteration, skip skewed runtimes, retain observer after scan/config failures, and exponentially back off unscheduled attempts to 300s with a warning. Existing at-most-once and stop guards remain unchanged. Five new guard cases and all 23 startup-resume consumer files pass; full scripts/check passes.
+---
+ .../test_startup_resume_observer_guards.py    | 57 +++++++++++++++++++
+ tui_gateway/startup_resume.py                 | 40 +++++++++++--
+ 2 files changed, 91 insertions(+), 6 deletions(-)
+ create mode 100644 tests/tui_gateway/test_startup_resume_observer_guards.py
+
+diff --git a/tests/tui_gateway/test_startup_resume_observer_guards.py b/tests/tui_gateway/test_startup_resume_observer_guards.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..db982d7e7433d0fdd50f1b915b44efe8972f23f2
+--- /dev/null
++++ b/tests/tui_gateway/test_startup_resume_observer_guards.py
+@@ -0,0 +1,57 @@
++"""Lifetime observation must survive failures without busy retries or stale admission."""
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from tui_gateway import startup_resume as sr
++
++
++@pytest.mark.parametrize("mode", ["skew", "disabled", "scan_error", "config_error", "refused"])
++def test_observer_refreshes_guards_and_recovers(tmp_path, monkeypatch, caplog, mode):
++    from gateway import code_skew
++    from hermes_cli import config
++
++    stop = threading.Event()
++    tick = [0]
++    calls = []
++    waits = []
++
++    def sleep(seconds):
++        waits.append(seconds)
++        tick[0] += 1
++        if tick[0] == 8:
++            stop.set()
++
++    def load():
++        if mode == "config_error" and tick[0] == 1:
++            raise OSError("temporary config failure")
++        return {"desktop": {"auto_continue": {"enabled": not (mode == "disabled" and tick[0] < 3)}}}
++
++    def pending(*args):
++        if mode == "scan_error" and tick[0] == 1:
++            raise OSError("temporary directory failure")
++        return True
++
++    def resume(*args, **kwargs):
++        assert kwargs == {"paused_only": True}
++        calls.append(tick[0])
++        return [{"ok": False, "scheduled": False}] if mode == "refused" else []
++
++    monkeypatch.setattr(sr, "time", SimpleNamespace(sleep=sleep))
++    monkeypatch.setattr(config, "load_config", load)
++    monkeypatch.setattr(code_skew, "detect_code_skew", lambda: object() if mode == "skew" and tick[0] < 3 else None)
++    monkeypatch.setattr(sr, "_paused_markers_remain", pending)
++    monkeypatch.setattr(sr, "resume_interrupted_sessions", resume)
++    sr._observe_pauses(lambda *a: None, tmp_path, {}, stop)
++    assert calls and calls[-1] == 7
++    if mode in {"skew", "disabled"}:
++        assert min(calls) >= 3
++    if mode.endswith("error"):
++        assert "observer iteration failed" in caplog.text
++    if mode == "config_error":
++        assert 1 not in calls
++    if mode == "refused":
++        assert waits == [5, 10, 20, 40, 80, 160, 300, 300]
++        assert "remain unscheduled" in caplog.text
++    assert 8 not in calls
+diff --git a/tui_gateway/startup_resume.py b/tui_gateway/startup_resume.py
+index beec9eed10a576775c944ff55d5e208a97664142..1e3b4ffa4be4054d09fcca286ce7eac668831ab0 100644
+--- a/tui_gateway/startup_resume.py
++++ b/tui_gateway/startup_resume.py
+@@ -176,6 +176,37 @@ def _paused_markers_remain(home: Path, cfg: dict | None) -> bool:
+                if (entry := read_turn_marker(h, key)) is not None)
+ 
+ 
++def _observe_pauses(handler: Callable, home: Path, cfg: dict, stopped: threading.Event) -> None:
++    """Passive lifetime observer; refusals back off, but never retire the observer."""
++    from gateway.code_skew import detect_code_skew
++    from hermes_cli.config import load_config
++
++    retry_delay = 5.0
++    while not stopped.is_set():
++        try:
++            wait = retry_delay if _paused_markers_remain(home, cfg) else 30.0
++        except Exception:
++            logger.exception("startup resume observer iteration failed")
++            wait = 30.0
++        time.sleep(wait)
++        if stopped.is_set():
++            break
++        try:
++            cfg = load_config()
++            if not _settings(cfg)[0] or detect_code_skew() is not None:
++                retry_delay = 30.0
++                continue
++            done = resume_interrupted_sessions(handler, home, cfg, paused_only=True)
++            if any(not row.get("scheduled") and not row.get("deleted") for row in done):
++                retry_delay = min(300.0, retry_delay * 2)
++                logger.warning("startup resume: paused turns remain unscheduled; retry in %.0fs", retry_delay)
++            else:
++                retry_delay = 5.0
++        except Exception:
++            logger.exception("startup resume observer iteration failed")
++            retry_delay = min(300.0, max(30.0, retry_delay * 2))
++
++
+ def start_startup_resume_sweep(*, stop: threading.Event | None = None) -> threading.Thread | None:
+     """Backend boot hook: run the sweep on a daemon thread after a short settle delay (no-op unless enabled)."""
+     from hermes_cli.proof_home import recovery_home_allowed
+@@ -197,6 +228,7 @@ def start_startup_resume_sweep(*, stop: threading.Event | None = None) -> thread
+ 
+     def _run() -> None:
+         time.sleep(delay)
++        handler = None
+         try:
+             from tui_gateway import server
+             handler = server._methods.get("session.resume")
+@@ -209,14 +241,10 @@ def start_startup_resume_sweep(*, stop: threading.Event | None = None) -> thread
+             # A warm successor may boot before the old writer continues and pauses again.
+             # An empty scan (or a fixed boot deadline) is not a completed handoff.
+             # Keep observing PAUSES only; ordinary crash recovery remains boot-only.
+-            stopped = stop or threading.Event()
+-            while not stopped.is_set():
+-                time.sleep(5.0 if _paused_markers_remain(home, cfg) else 30.0)
+-                if stopped.is_set():
+-                    break
+-                resume_interrupted_sessions(handler, home, cfg, paused_only=True)
+         except Exception:
+             logger.exception("startup resume sweep failed")
++        if handler is not None:
++            _observe_pauses(handler, home, cfg, stop or threading.Event())
+ 
+     from agent.memory_provider import spawn_context_thread
+     t = spawn_context_thread(_run, name="startup-resume-sweep", passive=True)
+-- 
+2.43.0
+

@@ -1,0 +1,396 @@
+From db44edcdc9ec43fd294a9d56dd18c562642545a0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 06:42:47 +0000
+Subject: [PATCH] perf(kanban): reuse commit-fenced board rows and typed
+ overlays [daveey]
+
+---
+ hermes_cli/kanban_diagnostics.py              |  8 +-
+ plugins/kanban/dashboard/board_read.py        |  3 +-
+ plugins/kanban/dashboard/board_rows.py        | 18 +++-
+ plugins/kanban/dashboard/board_run_history.py | 32 ++++---
+ .../plugins/test_kanban_board_commit_reuse.py | 92 +++++++++++++++++++
+ tests/plugins/test_kanban_board_p2.py         |  5 +
+ tests/plugins/test_kanban_projection_cost.py  | 86 +++++++++++++++++
+ tests/plugins/test_kanban_run_history.py      | 12 ++-
+ 8 files changed, 235 insertions(+), 21 deletions(-)
+ create mode 100644 tests/plugins/test_kanban_board_commit_reuse.py
+ create mode 100644 tests/plugins/test_kanban_projection_cost.py
+
+diff --git a/hermes_cli/kanban_diagnostics.py b/hermes_cli/kanban_diagnostics.py
+index 498d577fbf4be189a8f3cfd3f9072a95a6e69367..48fc621aefd1a11cd9d310cd05064c1c9bc847f2 100644
+--- a/hermes_cli/kanban_diagnostics.py
++++ b/hermes_cli/kanban_diagnostics.py
+@@ -10,6 +10,7 @@ recovery action and auto-clears when the failure mode resolves.
+ 
+ from __future__ import annotations
+ 
++from types import MappingProxyType
+ from dataclasses import asdict, dataclass, field
+ from typing import Any, Callable, Iterable, Optional
+ import json
+@@ -72,7 +73,12 @@ def _task_field(task, name, default=None):
+     if task is None:
+         return default
+     try:
+-        if hasattr(task, "keys") and name in task.keys():
++        # Immutable history mappings and ordinary dictionaries already have O(1)
++        # membership; Row.keys() allocates and linearly scans all task columns.
++        if isinstance(task, (dict, MappingProxyType)):
++            if name in task:
++                return task[name]
++        elif hasattr(task, "keys") and name in task.keys():
+             return task[name]
+     except Exception:
+         pass
+diff --git a/plugins/kanban/dashboard/board_read.py b/plugins/kanban/dashboard/board_read.py
+index c2e6c1cb05e84e791dc7ee1b9757d9c712cfbc9e..71f47bc905255a4c0f23a53a474451a6caecf381 100644
+--- a/plugins/kanban/dashboard/board_read.py
++++ b/plugins/kanban/dashboard/board_read.py
+@@ -129,7 +129,8 @@ def diagnostics_from_inputs(inputs: Optional[tuple]) -> dict[str, list[dict]]:
+     for r in rows:
+         tid = r["id"]
+         diags = kd.compute_task_diagnostics(
+-            r, events_by_task[tid], list(runs_by_task[tid]), config=diag_config,
++            dict(zip(r.keys(), r)) if isinstance(r, sqlite3.Row) else r,
++            events_by_task[tid], list(runs_by_task[tid]), config=diag_config,
+             graph=fresh(graph_by_task.get(tid)), wake_check=fresh(wake_by_task.get(tid)))
+         if diags:
+             out[tid] = [d.to_dict() for d in diags]
+diff --git a/plugins/kanban/dashboard/board_rows.py b/plugins/kanban/dashboard/board_rows.py
+index 8e8bfb173c4501bf7e7c50c280d53b6d65ffb447..e7fc12265124a344a66d02f7417a48400ec22f68 100644
+--- a/plugins/kanban/dashboard/board_rows.py
++++ b/plugins/kanban/dashboard/board_rows.py
+@@ -290,15 +290,27 @@ def incremental(key: tuple, path: str, build: Callable, fallback: Callable) -> d
+         conn.row_factory = sqlite3.Row
+         try:
+             conn.execute("BEGIN")
+-            changed, cursor = kanban_task_change.changed_since(conn, hit[0] if hit else None)
+-            rows = build(conn, hit[1] if hit else None, changed)
++            # Sample while holding this observer's refresh lock and snapshot. A
++            # version captured by version() before the lock can predate another
++            # refresh. This key includes bookkeeping commits, unlike P2.
++            commit_key = (obs.gen, *obs.ident,
++                          conn.execute("PRAGMA schema_version").fetchone()[0],
++                          conn.execute("PRAGMA data_version").fetchone()[0])
++            if hit is not None and len(hit) > 2 and hit[0] is not None and hit[2] == commit_key:
++                from hermes_cli import loop_accounting
++                with loop_accounting.pass_("kanban.board.rows", skipped=True):
++                    rows = hit[1]
++                cursor = hit[0]
++            else:
++                changed, cursor = kanban_task_change.changed_since(conn, hit[0] if hit else None)
++                rows = build(conn, hit[1] if hit else None, changed)
+         finally:
+             if conn.in_transaction:
+                 conn.rollback()
+             conn.row_factory = factory
+         with _lock:
+             if _observers.get(str(path)) is obs:
+-                _entries[cache_key] = (cursor, rows)
++                _entries[cache_key] = (cursor, rows, commit_key)
+                 _entries.move_to_end(cache_key)
+                 while len(_entries) > MAX_ENTRIES:
+                     _entries.popitem(last=False)
+diff --git a/plugins/kanban/dashboard/board_run_history.py b/plugins/kanban/dashboard/board_run_history.py
+index 75ffbf2d2ad211bfddd7664d9126076fabd707fd..f0dc2c366e49e04d3662bab4b605598a0a00481e 100644
+--- a/plugins/kanban/dashboard/board_run_history.py
++++ b/plugins/kanban/dashboard/board_run_history.py
+@@ -1,4 +1,5 @@
+ """P2-retained run snapshots with an exact per-read bookkeeping overlay."""
++import marshal
+ from types import MappingProxyType
+ 
+ # P2 excludes these run columns. Even historical terminal runs need the overlay:
+@@ -47,9 +48,10 @@ def retained_runs(conn, ids, prev, changed, load):
+             continue
+         rows = []
+         for original, row in zip(before, overlay):
+-            # Type-exact: 1 -> 1.0 or 0 -> False is a change the retained row must show.
++            # Same typed encoding as the signature, including signed floating zero
++            # on legacy untyped columns. Never stamp bytes for values not retained.
+             updates = {key: value for key, value in zip(columns, row[2:])
+-                       if (prior := original[key]) != value or type(prior) is not type(value)}
++                       if marshal.dumps(original[key], 2) != marshal.dumps(value, 2)}
+             rows.append(MappingProxyType({**original, **updates}) if updates else original)
+         # Read before these values, so a later write can only make the next compare miss.
+         result[tid] = RunHistory(rows, signatures.get(tid, ""))
+@@ -59,9 +61,9 @@ def retained_runs(conn, ids, prev, changed, load):
+ 
+ 
+ class RunHistory(tuple):
+-    """Retained runs of one task plus the SQL signature of their ids and bookkeeping values."""
++    """Retained runs plus the packed signature of their ids and bookkeeping values."""
+ 
+-    signature: str
++    signature: bytes | str
+ 
+     def __new__(cls, rows, signature):
+         self = super().__new__(cls, rows)
+@@ -70,12 +72,20 @@ class RunHistory(tuple):
+ 
+ 
+ def _signatures(conn, task_ids, columns) -> dict:
+-    """``{task_id: text}`` naming every run id and bookkeeping value, ``quote``d so type and
+-    NULL-ness are exact, built in SQLite rather than by comparing each run in Python."""
++    """Exact typed run values, packed in C instead of SQL quote/concatenation.
++
++    These bytes are only compared in-process, never persisted or unmarshalled.
++    Version 2 avoids reference-identity encoding: equal values must encode equally
++    regardless of Python object sharing. It preserves SQLite NULL/int/float/text/blob,
++    including embedded NULs that SQLite quote(text) truncates.
++    """
+     if not task_ids:
+         return {}
+-    fields = "||','||".join(f"quote({c})" for c in ("id", *columns))
+-    return {r[0]: r[1] for r in conn.execute(
+-        f"SELECT task_id, group_concat(sig, ';') FROM (SELECT task_id, {fields} AS sig FROM task_runs "
+-        f"WHERE task_id IN ({','.join('?' for _ in task_ids)}) ORDER BY task_id, id) GROUP BY task_id",
+-        tuple(task_ids))}
++    selected = ", ".join(("task_id", "id", *columns))
++    grouped = {}
++    for row in conn.execute(
++            f"SELECT {selected} FROM task_runs "
++            f"WHERE task_id IN ({','.join('?' for _ in task_ids)}) ORDER BY task_id, id",
++            tuple(task_ids)):
++        grouped.setdefault(row[0], []).append(tuple(row)[1:])
++    return {tid: marshal.dumps(rows, 2) for tid, rows in grouped.items()}
+diff --git a/tests/plugins/test_kanban_board_commit_reuse.py b/tests/plugins/test_kanban_board_commit_reuse.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..15c1d49d3092b289480ed31b74c521db48f40bea
+--- /dev/null
++++ b/tests/plugins/test_kanban_board_commit_reuse.py
+@@ -0,0 +1,92 @@
++"""Commit-fenced row reuse must still project live values on every GET."""
++from hermes_cli import kanban_db_connect as kbc
++from plugins.kanban.dashboard import board_read as br
++from plugins.kanban.dashboard import board_rows
++from tests.plugins import test_kanban_board_incremental as helpers
++
++board = helpers.board
++
++
++def test_write_free_get_skips_materialize_but_projects(board, monkeypatch):
++    helpers._seed()
++    first = helpers._read(board)
++    calls = []
++    real = br.materialize
++    monkeypatch.setattr(br, "materialize", lambda *a, **k: calls.append(1) or real(*a, **k))
++    projected = []
++    real_project = br.project
++    monkeypatch.setattr(br, "project", lambda *a, **k: projected.append(1) or real_project(*a, **k))
++    second = helpers._read(board)
++    assert helpers._stable(first) == helpers._stable(second)
++    assert not calls, "unchanged observer generation+commit must reuse SQL rows"
++    assert projected == [1], "clock/config/replica projection must never be memoized"
++
++
++def test_bookkeeping_commit_rearms_overlay(board, monkeypatch):
++    ids, run_id = helpers._seed()
++    helpers._read(board)
++    calls = []
++    real = br.materialize
++    monkeypatch.setattr(br, "materialize", lambda *a, **k: calls.append(1) or real(*a, **k))
++    conn = kbc.connect()
++    try:
++        conn.execute("UPDATE tasks SET last_heartbeat_at=12345 WHERE id=?", (ids[0],))
++        conn.execute("UPDATE task_runs SET worker_pid=987 WHERE id=?", (run_id,))
++        conn.commit()
++    finally:
++        conn.close()
++    after = helpers._stable(helpers._read(board))
++    assert calls == [1]
++    assert next(t for c in after['columns'] for t in c['tasks'] if t['id'] == ids[0])['last_heartbeat_at'] == 12345
++    assert after == helpers._cold(board)
++
++
++def test_observer_reset_never_reuses_prior_generation(board, monkeypatch):
++    helpers._seed()
++    helpers._read(board)
++    board_rows.clear()
++    calls = []
++    real = br.materialize
++    monkeypatch.setattr(br, "materialize", lambda *a, **k: calls.append(k.get('prev')) or real(*a, **k))
++    helpers._read(board)
++    assert calls == [None]
++
++
++def test_write_free_reuse_keeps_clock_and_profiles_live(board, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    helpers._seed()
++    clock = [10000000000]
++    monkeypatch.setattr(br.time, "time", lambda: clock[0])
++    monkeypatch.setattr(kb, "list_profiles_on_disk", lambda: ["first-profile"])
++    first = helpers._read(board)
++    calls = []
++    real = br.materialize
++    monkeypatch.setattr(br, "materialize", lambda *a, **k: calls.append(1) or real(*a, **k))
++    clock[0] += 60
++    monkeypatch.setattr(kb, "list_profiles_on_disk", lambda: ["second-profile"])
++    second = helpers._read(board)
++    assert not calls
++    assert second["now"] == first["now"] + 60
++    assert "second-profile" in second["assignees"]
++    assert "first-profile" not in second["assignees"]
++    old = {t["id"]: t for c in first["columns"] for t in c["tasks"]}
++    for col in second["columns"]:
++        for task in col["tasks"]:
++            assert task["age"]["created_age_seconds"] == old[task["id"]]["age"]["created_age_seconds"] + 60
++
++
++def test_schema_change_forces_materialize(board, monkeypatch):
++    helpers._seed()
++    helpers._read(board)
++    calls = []
++    real = br.materialize
++    monkeypatch.setattr(br, "materialize", lambda *a, **k: calls.append(1) or real(*a, **k))
++    conn = kbc.connect()
++    try:
++        conn.execute("CREATE TABLE commit_reuse_schema_test (value)")
++        conn.commit()
++    finally:
++        conn.close()
++    result = helpers._read(board)
++    assert calls == [1]
++    assert helpers._stable(result) == helpers._cold(board)
+diff --git a/tests/plugins/test_kanban_board_p2.py b/tests/plugins/test_kanban_board_p2.py
+index 1b283103e0b0ef41a91efe153378670e18509569..da01ea4c5de19c0b67f001fbd7d61ca3971d7b4b 100644
+--- a/tests/plugins/test_kanban_board_p2.py
++++ b/tests/plugins/test_kanban_board_p2.py
+@@ -104,7 +104,12 @@ def test_cursor_and_rows_share_a_snapshot(board, monkeypatch):
+         return result
+ 
+     monkeypatch.setattr(changes, 'changed_since', racing)
++    # Ensure the materializer runs: an unchanged commit now reuses its SQL rows.
++    with closing(kbc.connect()) as writer:
++        writer.execute('UPDATE tasks SET last_heartbeat_at=321 WHERE id=?', (child,))
++        writer.commit()
+     assert get(client)[1][child]['title'] == 'child'
++    assert committed, 'the snapshot race must actually execute'
+     assert get(client)[1][child]['title'] == 'raced'
+ 
+ 
+diff --git a/tests/plugins/test_kanban_projection_cost.py b/tests/plugins/test_kanban_projection_cost.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..862bd906b98054d36546161567bc7fa10504dd34
+--- /dev/null
++++ b/tests/plugins/test_kanban_projection_cost.py
+@@ -0,0 +1,86 @@
++"""Representation costs must not change diagnostic or bookkeeping semantics."""
++import sqlite3
++from types import MappingProxyType
++
++import pytest
++
++from hermes_cli import kanban_diagnostics as kd
++from plugins.kanban.dashboard import board_read as br
++from plugins.kanban.dashboard import board_run_history as rh
++
++
++class KeyScanDict(dict):
++    def keys(self):
++        pytest.fail("mapping fields must not enumerate columns")
++
++
++def test_mapping_field_lookup_does_not_enumerate_columns():
++    for row in (KeyScanDict(status="ready", nullable=None),
++                MappingProxyType(KeyScanDict(status="ready", nullable=None))):
++        assert kd._task_field(row, "status") == "ready"
++        assert kd._task_field(row, "nullable", "default") is None
++        assert kd._task_field(row, "absent", "default") == "default"
++
++
++def test_board_normalizes_diagnostic_task_lookup(monkeypatch):
++    conn = sqlite3.connect(":memory:")
++    conn.row_factory = sqlite3.Row
++    row = conn.execute("SELECT 't' AS id, 'ready' AS status").fetchone()
++    seen = []
++    def compute(task, *args, **kwargs):
++        seen.append(task)
++        assert type(task) is dict
++        return []
++    monkeypatch.setattr(kd, "compute_task_diagnostics", compute)
++    br.diagnostics_from_inputs(((row,), {"t": ()}, {"t": ()}, {}, {}))
++    assert seen[0] == dict(row)
++    conn.close()
++
++
++@pytest.fixture
++def runs():
++    conn = sqlite3.connect(":memory:")
++    conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, worker_pid)")
++    conn.execute("INSERT INTO task_runs VALUES (1, 't', 1)")
++    yield conn
++    conn.close()
++
++
++def test_run_overlay_does_not_build_sql_text_per_field(runs):
++    statements = []
++    runs.set_trace_callback(statements.append)
++    assert rh._signatures(runs, ["t"], ["worker_pid"])
++    assert not any("quote(" in s.lower() or "group_concat(" in s.lower() for s in statements)
++
++
++@pytest.mark.parametrize("before,after", [(1, 1.0), (None, 0), ("1", 1),
++    (b"a", "a"), ("a\x00b", "a\x00c"), ("a,b;c", "a,b;d")])
++def test_run_signature_preserves_storage_type_and_full_value(runs, before, after):
++    runs.execute("UPDATE task_runs SET worker_pid=?", (before,))
++    first = rh._signatures(runs, ["t"], ["worker_pid"])
++    assert first == rh._signatures(runs, ["t"], ["worker_pid"])
++    runs.execute("UPDATE task_runs SET worker_pid=?", (after,))
++    assert first != rh._signatures(runs, ["t"], ["worker_pid"])
++
++
++def test_run_signature_empty_order_and_row_factory(runs):
++    first = rh._signatures(runs, ["t", "empty"], ["worker_pid"])
++    runs.row_factory = sqlite3.Row
++    assert first == rh._signatures(runs, ["empty", "t"], ["worker_pid"])
++    runs.execute("INSERT INTO task_runs VALUES (2, 't', NULL)")
++    assert first != rh._signatures(runs, ["t"], ["worker_pid"])
++    assert rh._signatures(runs, [], ["worker_pid"]) == {}
++
++
++@pytest.mark.parametrize('values', [(1, 1.0, None, 0), ('a\x00b', 'a\x00c'), (-0.0, 0.0, -0.0)])
++def test_retained_overlay_matches_fresh_typed_values(runs, values):
++    import marshal
++    runs.row_factory = sqlite3.Row
++    prev = {}
++    for value in values:
++        runs.execute('UPDATE task_runs SET worker_pid=?', (value,))
++        for _ in range(2):
++            got = rh.retained_runs(runs, ['t'], prev, frozenset(), br._rows_by_task)
++            expected = br._rows_by_task(runs, 'task_runs', ['t'])
++            assert marshal.dumps(dict(got['t'][0]), 2) == marshal.dumps(dict(expected['t'][0]), 2)
++            prev = {'t': (None, None, None, None, got['t'])}
+diff --git a/tests/plugins/test_kanban_run_history.py b/tests/plugins/test_kanban_run_history.py
+index 37ee11805770c2104af7bf8819f652d4bfc5ecf4..d3f0d9c7919b5fd94de1e4a9962746eda3a0ab12 100644
+--- a/tests/plugins/test_kanban_run_history.py
++++ b/tests/plugins/test_kanban_run_history.py
+@@ -123,17 +123,19 @@ def test_untrusted_run_path_reloads(source, monkeypatch):
+     assert 'task_runs' in loaded
+ 
+ 
+-def test_unchanged_run_bookkeeping_is_compared_in_sql(source):
+-    """Retained runs whose ids and bookkeeping are unchanged are kept without fetching and
+-    comparing each run's values in Python; a bookkeeping write still reaches the run."""
++def test_unchanged_run_bookkeeping_keeps_decoded_rows(source):
++    """Only the narrow signature query runs; no second overlay/history load."""
+     old = memo(source)
+     _, old = refresh(source, old)  # first trusted refresh records the signature
++    retained = old['t'][4]
+     statements = []
+     source.set_trace_callback(statements.append)
+     got, old = refresh(source, old)
+     source.set_trace_callback(None)
+-    overlay = [s for s in statements if 'FROM task_runs' in s and 'quote(' not in s]
+-    assert overlay == [], 'unchanged bookkeeping must not be re-read value by value'
++    reads = [s for s in statements if 'FROM task_runs' in s]
++    assert len(reads) == 1
++    assert reads[0].startswith('SELECT task_id, id, ')
++    assert got[2]['t'] is retained
+     source.execute("UPDATE task_runs SET worker_pid = 42")
+     got, old = refresh(source, old)
+     assert got[2]['t'][0]['worker_pid'] == 42
+-- 
+2.43.0
+

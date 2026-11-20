@@ -1,0 +1,377 @@
+From 348ba7f6a94c9900c1916161491d90427f60dc93 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 02:58:24 +0000
+Subject: [PATCH] [daveey] fix(kanban): pickup counts its own picks against a
+ provider's pacing limit
+
+Found on worker-3, 2026-11-15 ~21:30Z (t_3b968070eaa23b18, fixed in t_af7d8fd97219c888).
+
+Defect: `_evaluate` asked `pickup_hold()` once per candidate, and each call compared the provider's admit
+limit with this machine's *running* count only. The cards the same pass had already picked were not
+counted. With anthropic paced at limit 1, running 0, every anthropic candidate looked runnable, so one pass
+copied a full batch of 10. Local dispatch started one and pace-held nine, which were evicted and copied
+again the next tick (agent.log: `picked up 10 card(s)` every tick beside `dispatcher stuck ... llm_pacing=9`).
+A card pinned to the machine below that batch was then recorded `budget_exhausted` ("pickup batch full
+this tick") although spawn slots were free, so the pickup-stall alarm filed "Pickup queue full" and sent
+diagnosis the wrong way.
+
+Five whys:
+1. Why was the pinned card budget_exhausted? The batch was full of anthropic copies.
+2. Why was the batch full of them? Every one passed the pacing prediction.
+3. Why did every one pass? Each was compared against running=0 < limit=1.
+4. Why running=0 for the tenth card? The count reads running runs only; the nine picks earlier in the
+   same pass are not runs yet.
+5. Why was that not counted? `pickup_hold` had no notion of a pass; it predicted one card in isolation.
+
+Fix: `_evaluate` keeps `provider -> cards picked this pass` and passes it to `_paced` -> `pickup_hold` ->
+`_verdicts`, which compares `running + picked` with the limit. `_verdicts` reports which limited provider
+admitted a card; once the card is actually picked (not guard-held, not skipped), that provider's count
+goes up. A further card of a spent provider is skipped as `other` / `llm_paced: anthropic paced (limit 1,
+running 0, 1 picked this pass)`, takes no batch room, and a pinned card below it reads `llm_paced`, never
+`budget_exhausted`. An unlimited provider (admit limit None) reserves nothing. The claim-time `hold()`
+path is unchanged (no `picked` argument).
+
+Policy decision (card asked to decide, not hard-partition): no extra preference for machine-pinned cards
+over pool cards for the paced slot in this change. The existing ranking deliberately lets explicit pool
+urgency beat a fresh pin while age protects pins (test_kanban_pickup_pinned_first), and a score bonus here
+would override that intent. With the mislabel fixed the pinned card's wait now reads as pacing, which is
+the gate that actually holds it.
+
+Tests:
+- New tests/hermes_cli/test_kanban_pickup_pacing_headroom.py: limit 1 / running 0 with 5 same-provider pool
+  cards and a pinned one below copies exactly one; the pinned one is `other`/`llm_paced`, never
+  `budget_exhausted` (also with a full batch); spent headroom leaves batch room for other providers; a
+  running card shares the limit; `pickup()` copies only the one card. RED before (4 fail: 5-6 copies).
+- test_kanban_pickup_paced_window: its "open" anthropic pool used factor 1.0, which is the open ramp
+  (limit 1 on an idle host), so its 11-card window only passed because of this bug. It now uses
+  OPEN_RAMP_FACTOR (no limit), matching the fixture's stated intent.
+---
+ hermes_cli/kanban_llm_pacing_dispatch.py      |  48 +++++--
+ hermes_cli/kanban_worker_node.py              |  17 ++-
+ .../test_kanban_pickup_paced_window.py        |   4 +-
+ .../test_kanban_pickup_pacing_headroom.py     | 135 ++++++++++++++++++
+ 4 files changed, 185 insertions(+), 19 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_pickup_pacing_headroom.py
+
+diff --git a/hermes_cli/kanban_llm_pacing_dispatch.py b/hermes_cli/kanban_llm_pacing_dispatch.py
+index 797300f2955ed366eaa36f199fd57ac4f42db05e..34b111ad601b5688bd6b0ca9d6224300c78ad75e 100644
+--- a/hermes_cli/kanban_llm_pacing_dispatch.py
++++ b/hermes_cli/kanban_llm_pacing_dispatch.py
+@@ -254,10 +254,12 @@ def is_deferrable(conn: sqlite3.Connection, task: Any, lane: str) -> bool:
+     return row is not None and row[0] == CONTINUATION_WOKEN_EVENT
+ 
+ 
+-def _verdicts(conn, task, providers, lane, cfg, host=None) -> Optional[list[dict]]:
++def _verdicts(conn, task, providers, lane, cfg, host=None, picked=None, admitted=None) -> Optional[list[dict]]:
+     """One verdict per governed candidate pool at its pace limit; None when none is (the card starts as routed).
+     ``host``: the connection whose running cards count (default ``conn``): pickup judges a replica card against
+-    this machine's own board.
++    this machine's own board. ``picked`` counts this pass's reservations. ``admitted`` receives all limited
++    candidates with room: without a reroute the class allocator can choose any of them, so pickup conservatively
++    reserves each. When rerouting, pickup instead reserves only the chosen target.
+ 
+     A class route (several candidate pools) is judged pool by pool: ONE pool at its limit is enough, because the class
+     allocator is weighted round-robin, not pace-aware, and would hand the card to that pool on its turn. The caller
+@@ -272,9 +274,13 @@ def _verdicts(conn, task, providers, lane, cfg, host=None) -> Optional[list[dict
+         pace = pace_for(host, provider, cfg, now)
+         limit = lp.admit_limit(pace, avg_running(provider, now, cfg), deferrable=deferrable, cfg=cfg)
+         running = local_running(host, provider)
+-        if limit is None or running < limit:
++        taken = int((picked or {}).get(provider, 0))
++        if limit is None or running + taken < limit:
++            if limit is not None and admitted is not None:
++                admitted.append(provider)
+             continue
+-        verdicts.append({**pace.as_dict(), "limit": limit, "running": running, "deferrable": deferrable})
++        verdicts.append({**pace.as_dict(), "limit": limit, "running": running, "deferrable": deferrable,
++                         **({"picked": taken} if taken else {})})
+     return verdicts or None
+ 
+ 
+@@ -321,7 +327,7 @@ def _governed(conn: sqlite3.Connection, task_id: str, lane: str, cfg: lp.PacingC
+ 
+ 
+ def _pace_alternate(conn: sqlite3.Connection, task: Any, lane: str, cfg: lp.PacingConfig,
+-                    host: sqlite3.Connection, verdicts: list[dict]) -> Optional[tuple[str, str, str, tuple]]:
++                    host: sqlite3.Connection, verdicts: list[dict], *, picked=None) -> Optional[tuple[str, str, str, tuple]]:
+     """``(model, provider, paced, judged)``: a route of the card's own class on a pool that is NOT ahead of pace, for a
+     card a candidate pool holds (``verdicts``: the pools at their limit); ``judged`` is the ``(model, provider)`` route
+     it moves from. None keeps the hold. [daveey]
+@@ -339,13 +345,13 @@ def _pace_alternate(conn: sqlite3.Connection, task: Any, lane: str, cfg: lp.Paci
+         route = candidate_route(conn, task, lane)[0]
+         if route is None:
+             return None  # a pin/profile fallback route is launched as is: holding is the only safe answer
+-        return _pace_alternate_route(conn, task, route, lane, cfg, host, verdicts)
++        return _pace_alternate_route(conn, task, route, lane, cfg, host, verdicts, picked=picked)
+     except Exception as exc:  # health: allow BLE001 -- a failed probe keeps today's hold, never starts a paced card
+         _warn("alternate", "kanban pacing: pace alternate probe failed (%s: %s); holding", type(exc).__name__, exc)
+         return None
+ 
+ 
+-def _pace_alternate_route(conn, task, route, lane, cfg, host, verdicts):
++def _pace_alternate_route(conn, task, route, lane, cfg, host, verdicts, *, picked=None):
+     from hermes_cli import kanban_provider_walls as pw
+     from hermes_cli.kanban_quota_episode import alternate_route
+     if pw.requires_model(task):
+@@ -371,7 +377,7 @@ def _pace_alternate_route(conn, task, route, lane, cfg, host, verdicts):
+         if target in cfg.providers:
+             pace = pace_for(host, target, cfg, now)
+             limit = lp.admit_limit(pace, avg_running(target, now, cfg), deferrable=deferrable, cfg=cfg)
+-            if limit is not None and local_running(host, target) >= limit:
++            if limit is not None and local_running(host, target) + int((picked or {}).get(target, 0)) >= limit:
+                 paced[target] = float(pace.until or now + cfg.read_interval)
+                 continue
+         return moved[0], target, ",".join(sorted(paced)), (model, provider)
+@@ -488,21 +494,35 @@ def hold(conn: sqlite3.Connection, row: Any, lane: str, result: Any, *, dry_run:
+         return False
+ 
+ 
+-def pickup_hold(local: sqlite3.Connection, replica: sqlite3.Connection, card: Any) -> Optional[str]:
++def pickup_hold(local: sqlite3.Connection, replica: sqlite3.Connection, card: Any, *,
++                picked: Optional[dict[str, int]] = None, admitted: Optional[list[str]] = None) -> Optional[str]:
+     """Pickup's read-only twin of :func:`hold`: ``"<provider> <state>, ..."`` when this machine's dispatcher would
+     pace-hold the foreign ``card`` right now, else None. The card is judged on the replica's copy, the running
+     count on ``local`` (this machine's board), so a copy that only pacing would hold is never taken into the pickup
+     window (worker-6 2026-11-15: 9 paced codex cards hid a runnable anthropic card at rank 16). Records nothing;
+-    any fault returns None (fail open: the local dispatcher still decides after the copy)."""
++    any fault returns None (fail open: the local dispatcher still decides after the copy).
++
++    ``picked``/``admitted``: the pass's own spend (:func:`_verdicts`). The cards a pass already took count against
++    the limit, so a pass copies no more cards of a provider than it can start (worker-3 2026-11-15: limit 1, running
++    0, a batch of 10 anthropic copies, 9 pace-held and evicted each tick, t_af7d8fd97219c888)."""
+     try:
+         cfg = load_config()
+         judged = _governed(replica, card["id"], card["status"], cfg) if cfg.enabled else None
+         if judged is None:
+             return None
+-        verdicts = _verdicts(replica, judged[0], judged[1], card["status"], cfg, host=local)
+-        if verdicts is not None and _pace_alternate(replica, judged[0], card["status"], cfg, local, verdicts):
+-            return None  # the local claim starts it on a pool with room (hold)
+-        return None if verdicts is None else ", ".join(f"{v['provider']} {v['state']}" for v in verdicts)
++        pools: list[str] = []
++        verdicts = _verdicts(replica, judged[0], judged[1], card["status"], cfg, host=local, picked=picked,
++                             admitted=pools)
++        if verdicts is not None:
++            moved = _pace_alternate(replica, judged[0], card["status"], cfg, local, verdicts, picked=picked)
++            if moved is not None:
++                pools = [moved[1]]
++                verdicts = None
++        if verdicts is None and admitted is not None:
++            admitted.extend(pools)
++        return None if verdicts is None else ", ".join(
++            f"{v['provider']} {v['state']}" + (f" (limit {v['limit']}, running {v['running']}, {v['picked']} picked "
++                                               "this pass)" if v.get("picked") else "") for v in verdicts)
+     except Exception as exc:  # health: allow BLE001 -- a hold prediction must never stop a pickup
+         _warn("pickup", "kanban pacing: pickup hold check failed (%s: %s); copying ungoverned", type(exc).__name__, exc)
+         return None
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index f97d72cd70ceef2ced4652dbf8ba45d435586a68..3af9b403ad91b338390e28ae225d574ea8012cae 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -594,6 +594,7 @@ def _evaluate(conn: sqlite3.Connection, replica: sqlite3.Connection, own: str, *
+         tid: ("parents_incomplete", "a parent is not done") for tid in mine - {c["id"] for c in listed}}
+     picked: list[str] = []
+     free = 0  # guard-held copies take no budget: they `continue` before room.take
++    paced: dict[str, int] = {}  # provider -> cards this pass took against its pacing limit (_paced)
+     from hermes_cli.kanban_admission_pools import PoolBudget, row_class
+     room = PoolBudget(limit.regular, limit.priority, limit.limit) if isinstance(limit, PoolBudget) else \
+         PoolBudget(limit, 0)  # an int is a classless budget; a hub's pool budget never copies unstartable work
+@@ -605,8 +606,9 @@ def _evaluate(conn: sqlite3.Connection, replica: sqlite3.Connection, own: str, *
+                               profile_exists=profile_exists)
+         if reason is None:
+             reason = _quota_held(replica, card)
++        admitted: list[str] = []
+         if reason is None:
+-            reason = _paced(conn, replica, card)
++            reason = _paced(conn, replica, card, paced, admitted)
+         hold = kph.board_hold(replica, card) if reason is None else None
+         if hold is not None:
+             if held is not None and free < kph.FREE_PER_TICK and not kph.recently_copied(card["id"], hold[1]):
+@@ -620,18 +622,25 @@ def _evaluate(conn: sqlite3.Connection, replica: sqlite3.Connection, own: str, *
+         if reason is None:
+             picked.append(card["id"])
+             room.take(row_class(card))
++            for provider in admitted:
++                paced[provider] = paced.get(provider, 0) + 1
+         elif reason[0] and card["id"] in mine:
+             skips[card["id"]] = reason
+     return picked, skips
+ 
+ 
+-def _paced(conn: sqlite3.Connection, replica: sqlite3.Connection, card: sqlite3.Row) -> Optional[tuple[str, Optional[str]]]:
++def _paced(conn: sqlite3.Connection, replica: sqlite3.Connection, card: sqlite3.Row,
++           picked: Optional[dict[str, int]] = None, admitted: Optional[list[str]] = None,
++           ) -> Optional[tuple[str, Optional[str]]]:
+     """[daveey] ``("other", detail)`` when this machine's dispatcher would pace-hold ``card`` (provider at or over its
+     ``kanban.llm_pacing`` limit here) right now. Such a card is not offered, so it takes no pickup budget and the
+     window fills with the next cards that can run; it is offered again on the tick its limit frees
+-    (t_ce15faa434176d77: 9 paced codex cards hid a runnable anthropic card)."""
++    (t_ce15faa434176d77: 9 paced codex cards hid a runnable anthropic card). ``picked`` counts the cards this pass
++    already took per provider against that limit; ``admitted`` receives the limited provider that admits ``card``
++    (t_af7d8fd97219c888: limit 1, running 0, one pass copied 10 anthropic cards and a card pinned here below them
++    read ``budget_exhausted``)."""
+     from hermes_cli.kanban_llm_pacing_dispatch import pickup_hold
+-    held = pickup_hold(conn, replica, card)
++    held = pickup_hold(conn, replica, card, picked=picked, admitted=admitted)
+     if held is not None:
+         return "other", f"llm_paced: {held} (local dispatch would hold it)"
+     from hermes_cli.kanban_start_gate import hold as start_gate_hold  # a plugin holds this machine's card starts
+diff --git a/tests/hermes_cli/test_kanban_pickup_paced_window.py b/tests/hermes_cli/test_kanban_pickup_paced_window.py
+index 6b3063e346d51e2432c0c1c88739879284fb9ed7..04970e0a06a9586d02b520c8373ccaae685ab3c9 100644
+--- a/tests/hermes_cli/test_kanban_pickup_paced_window.py
++++ b/tests/hermes_cli/test_kanban_pickup_paced_window.py
+@@ -25,7 +25,9 @@ def pools(monkeypatch):
+     def pace_for(conn, provider, cfg, now):
+         if provider == "openai-codex":
+             return lp.PoolPace(provider, state["codex"], 0.0 if state["codex"] == lp.HELD else 1.0)
+-        return lp.PoolPace(provider, lp.OPEN, 1.0)
++        # At the ramp factor an open pool has no limit (``lp.admit_limit``); below it an idle host may start one
++        # card, and a pass counts its own picks against that (t_af7d8fd97219c888).
++        return lp.PoolPace(provider, lp.OPEN, lp.OPEN_RAMP_FACTOR)
+     monkeypatch.setattr(pd, "pace_for", pace_for)
+     return state
+ 
+diff --git a/tests/hermes_cli/test_kanban_pickup_pacing_headroom.py b/tests/hermes_cli/test_kanban_pickup_pacing_headroom.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..606a3b2b8f143f017cda4feaa40d93318c5f70d9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pickup_pacing_headroom.py
+@@ -0,0 +1,135 @@
++"""One pickup pass spends a paced provider's headroom once (t_af7d8fd97219c888).
++
++worker-3 2026-11-15 ~21:30Z: anthropic paced at limit 1, running 0. Each candidate was judged against the
++provider's running count alone, so every anthropic card looked runnable and the pass copied a full batch of 10.
++Local dispatch started one and pace-held nine, which were evicted and copied again the next tick. A card pinned
++to the machine below that batch was recorded ``budget_exhausted`` although spawn slots were free and the real
++gate was pacing, so the pickup-stall alarm filed "Pickup queue full".
++"""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_llm_pacing as lp
++from hermes_cli import kanban_llm_pacing_dispatch as pd
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli import test_kanban_worker_node as support
++from tests.hermes_cli import test_kanban_pace_reroute as routing_support
++
++svc = support.svc
++gws = support.gws
++board = routing_support.board
++pool = routing_support.pool
++strong_pattern = routing_support.strong_pattern
++PIN = [f"machine:{support.WORKER}"]
++BATCH = 10
++
++
++@pytest.fixture
++def anthropic_paced(monkeypatch):
++    """anthropic PACED with no recent concurrency: admit limit 1 for a ready card (``lp.admit_limit``)."""
++    monkeypatch.setattr(pd, "pace_for", lambda conn, provider, cfg, now: lp.PoolPace(
++        provider, lp.PACED, 0.5) if provider == "anthropic" else lp.PoolPace(provider, lp.OPEN, lp.OPEN_RAMP_FACTOR))
++    monkeypatch.setattr(pd, "avg_running", lambda provider, now, cfg: 0.0)
++
++
++def _card(hub, title, priority, runs_on, provider="anthropic"):
++    model = "claude-sonnet-5-5" if provider == "anthropic" else "gpt-5.5"
++    return support._hub_card(hub, title=title, priority=priority, runs_on=runs_on, model_override=model,
++                             provider_override=provider)
++
++
++def _evaluate(worker, limit=BATCH):
++    replica = wn.open_replica(worker.conn)
++    assert replica is not None
++    try:
++        return wn._evaluate(worker.conn, replica, support.WORKER, mode="all", limit=limit, profile_exists=None,
++                            full_detail="pickup batch full this tick")
++    finally:
++        replica.close()
++
++
++def test_a_pass_copies_one_card_per_unit_of_provider_headroom(gws, anthropic_paced):
++    hub, worker = gws
++    pool = [_card(hub, f"pool {i}", 1000 - i, ["linux"]) for i in range(5)]
++    pinned = _card(hub, "pinned below the pool", 0, PIN)
++    worker.round()
++    worker.enter()
++    picked, skips = _evaluate(worker)
++    assert picked == [pool[0]]  # RED before: all 6 anthropic cards copied against one slot
++    reason, detail = skips[pinned]
++    assert reason == "other" and detail.startswith("llm_paced: anthropic paced")
++    assert "1 picked this pass" in detail
++
++
++def test_the_pinned_card_is_paced_not_budget_exhausted_when_the_batch_also_fills(gws, anthropic_paced):
++    hub, worker = gws
++    [_card(hub, f"pool {i}", 1000 - i, ["linux"]) for i in range(3)]
++    pinned = _card(hub, "pinned below the pool", 0, PIN)
++    worker.round()
++    worker.enter()
++    picked, skips = _evaluate(worker, limit=1)
++    assert len(picked) == 1
++    assert skips[pinned][0] == "other" and skips[pinned][1].startswith("llm_paced:")  # never budget_exhausted
++
++
++def test_spent_headroom_leaves_batch_room_for_other_providers(gws, anthropic_paced):
++    hub, worker = gws
++    pool = [_card(hub, f"anthropic {i}", 1000 - i, ["linux"]) for i in range(4)]
++    codex = [_card(hub, f"codex {i}", 10 - i, ["linux"], provider="openai-codex") for i in range(2)]
++    worker.round()
++    worker.enter()
++    picked, _ = _evaluate(worker, limit=3)
++    assert picked == [pool[0], *codex]
++
++
++def test_running_cards_and_this_pass_share_the_limit(gws, anthropic_paced, monkeypatch):
++    hub, worker = gws
++    [_card(hub, f"pool {i}", 1000 - i, ["linux"]) for i in range(3)]
++    worker.round()
++    worker.enter()
++    monkeypatch.setattr(pd, "local_running", lambda conn, provider: 1 if provider == "anthropic" else 0)
++    picked, _ = _evaluate(worker)
++    assert picked == []  # the slot is already taken by a run here: nothing to copy
++
++
++def test_pickup_copies_only_what_the_provider_can_start(gws, anthropic_paced):
++    hub, worker = gws
++    pool = [_card(hub, f"pool {i}", 1000 - i, ["linux"]) for i in range(5)]
++    worker.round()
++    worker.enter()
++    assert wn.pickup(worker.conn, budget=BATCH) == [pool[0]]  # RED before: 5 copies, 4 pace-held then evicted
++    assert [tid for tid in pool if kb.get_task(worker.conn, tid) is not None] == [pool[0]]
++
++
++@pytest.mark.parametrize("title", ["routine work", "security work"])
++def test_alternate_target_spends_headroom_and_claim_remains_unreserved(pool, strong_pattern, monkeypatch, title):
++    """Main's class reroute must use pickup reservations without changing claim-time accounting."""
++    monkeypatch.setattr(pd, "pace_for", lambda conn, provider, cfg, now: lp.PoolPace(
++        provider, lp.PACED, 0.5) if provider == "xai-oauth" else lp.PoolPace(provider, lp.HELD, 0.0))
++    monkeypatch.setattr(pd, "avg_running", lambda *args: 0.0)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title=title, assignee="a")
++        card = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
++        admitted = []
++        assert pd.pickup_hold(conn, conn, card, picked={}, admitted=admitted) is None
++        assert admitted == ["xai-oauth"]
++        admitted = []
++        assert pd.pickup_hold(conn, conn, card, picked={"xai-oauth": 1}, admitted=admitted) is not None
++        assert admitted == []
++        # Reservations are per pickup pass, not persisted into the later real claim.
++        seen, result = routing_support._dispatch(conn)
++        assert seen == [(tid, *routing_support.GROK)]
++        assert tid not in result.clock_held
++
++
++def test_class_reserves_each_limited_candidate_without_forcing_an_alternate(pool, strong_pattern, monkeypatch):
++    monkeypatch.setattr(pd, "pace_for", lambda conn, provider, cfg, now: lp.PoolPace(provider, lp.PACED, 0.5))
++    monkeypatch.setattr(pd, "avg_running", lambda *args: 0.0)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="security work", assignee="a")
++        card = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
++        admitted = []
++        assert pd.pickup_hold(conn, conn, card, admitted=admitted) is None
++        assert set(admitted) == {"anthropic", "openai-codex", "xai-oauth"}
++        assert pd.pickup_hold(conn, conn, card, picked=dict.fromkeys(admitted, 1)) is not None
+-- 
+2.43.0
+

@@ -1,0 +1,108 @@
+From 7b99692cb71ece46c4357c124691b85f55e3cceb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 15:41:50 -0800
+Subject: [PATCH] fix(kanban): lanes admit only moves a card out of triage;
+ admissions name their caller [daveey]
+
+CI's status-leaving-site guard flagged admit's unpinned UPDATE. Also: the outage fallback reads the kept
+policy once, and an agent's lanes admit records itself as the actor.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_lanes.py                 | 6 ++++--
+ hermes_cli/kanban_lanes_cli.py             | 3 ++-
+ hermes_cli/kanban_lanes_plan.py            | 7 ++++---
+ tests/hermes_cli/test_kanban_lanes_plan.py | 4 ++++
+ 4 files changed, 14 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_lanes.py b/hermes_cli/kanban_lanes.py
+index ee82d0877b46f962c0abe450053b5785ba025926..97b23295cf136814f655739fe96f0cf6c3f214f5 100644
+--- a/hermes_cli/kanban_lanes.py
++++ b/hermes_cli/kanban_lanes.py
+@@ -204,7 +204,8 @@ def safe_policy() -> Optional[Policy]:
+     # ConfigBackendUnavailable is a SystemExit, so ``Exception`` alone would let a config outage stop creation.
+     except (Exception, ConfigBackendUnavailable) as exc:  # health: allow BLE001 -- config must never stop creation
+         _warn(exc)
+-        return _LAST_GOOD[0] if _LAST_GOOD else None
++        kept = list(_LAST_GOOD)  # one read: another thread may clear the list between a check and an index
++        return kept[0] if kept else None
+     _LAST_GOOD[:] = [pol]
+     return pol
+ 
+@@ -455,7 +456,8 @@ def admit(conn, task_id: str, *, actor: str, reason: str, budget: bool = True) -
+         if row is None:
+             return False
+         waiting = any(state not in ("done", "archived") for _pid, state in kb.parent_states(conn, task_id))
+-        conn.execute("UPDATE tasks SET status = ?, block_kind = NULL WHERE id = ?",
++        # Pinned to triage: an admit only ever moves a parked card, never a running one.
++        conn.execute("UPDATE tasks SET status = ?, block_kind = NULL WHERE id = ? AND status = 'triage'",
+                      ("todo" if waiting else "ready", task_id))
+         pol = safe_policy()
+         lane = row["tenant"] if pol is None else pol.lane_of(row["tenant"])  # the lane whose budget this spends
+diff --git a/hermes_cli/kanban_lanes_cli.py b/hermes_cli/kanban_lanes_cli.py
+index 6ef40473c36a8c3950ec1dee279099df56c83166..2d0c123b5ff6173aa2197d21ac9c88a97dacc639 100644
+--- a/hermes_cli/kanban_lanes_cli.py
++++ b/hermes_cli/kanban_lanes_cli.py
+@@ -124,8 +124,9 @@ def _admit(args) -> int:
+         else:
+             from hermes_cli import kanban_lanes_plan as plan
+ 
++            actor = cli_actor()
+             result = plan.apply(conn, [{"action": "admit", "card": args.task_id,
+-                                        "reason": reason or f"admitted by {cli_actor()}"}])
++                                        "reason": reason or f"admitted by {actor}"}], actor=actor)
+             if result["rejected"]:
+                 print(f"{args.task_id}: {result['rejected'][0]['why']}")
+                 return 1
+diff --git a/hermes_cli/kanban_lanes_plan.py b/hermes_cli/kanban_lanes_plan.py
+index b4ee2d3f58ac515cf01d1112fdd03a51b4bf8852..58fad41b81dde8f3c085d04ef63110445c0b5f58 100644
+--- a/hermes_cli/kanban_lanes_plan.py
++++ b/hermes_cli/kanban_lanes_plan.py
+@@ -78,7 +78,7 @@ def _admit(conn, pol, action, row, state) -> Optional[str]:
+     used = state["used"].setdefault(lane.name, lanes.admitted_today(conn, lane.name, now=state["now"]))
+     if lane.admit_per_day is not None and used >= lane.admit_per_day:
+         return f"lane {lane.name} admit budget spent ({used}/{lane.admit_per_day} today)"
+-    lanes.admit(conn, row["id"], actor=ACTOR, reason=action["reason"])
++    lanes.admit(conn, row["id"], actor=state["actor"], reason=action["reason"])
+     state["used"][lane.name] = used + 1
+     return None
+ 
+@@ -130,9 +130,10 @@ def _relane(conn, pol, action, row, _state) -> Optional[str]:
+ _HANDLERS = {"admit": _admit, "merge": _merge, "reprioritize": _reprioritize, "relane": _relane}
+ 
+ 
+-def apply(conn, actions, *, now: Optional[float] = None, dry_run: bool = False) -> dict:
++def apply(conn, actions, *, now: Optional[float] = None, dry_run: bool = False, actor: str = ACTOR) -> dict:
+     """Apply a planner's ``actions``; returns ``{"applied": [...], "rejected": [{..., "why"}], "notes": [...]}``.
+ 
++    ``actor`` is recorded on admissions (the planner by default; an agent's own ``lanes admit`` names itself).
+     ``dry_run`` validates the shape only (budget and card checks need the writes of earlier actions): its
+     ``applied`` list is what passed that check, and ``dry_run`` is true in the result.
+     """
+@@ -142,7 +143,7 @@ def apply(conn, actions, *, now: Optional[float] = None, dry_run: bool = False)
+     if not isinstance(actions, list):
+         raise ValueError("actions must be a list")
+     out: dict = {"applied": [], "rejected": [], "notes": [], "dry_run": dry_run}
+-    state: dict = {"now": time.time() if now is None else now, "used": {}}
++    state: dict = {"now": time.time() if now is None else now, "used": {}, "actor": actor}
+     for index, action in enumerate(actions):
+         why = _refusal(conn, pol, action, index, state, out, dry_run)
+         if why:
+diff --git a/tests/hermes_cli/test_kanban_lanes_plan.py b/tests/hermes_cli/test_kanban_lanes_plan.py
+index 3f3be0aca7142dbb54a63af456b9174d4f61423e..11d893848fa919f3c6541fe8cc5f7ac03fbc9cea 100644
+--- a/tests/hermes_cli/test_kanban_lanes_plan.py
++++ b/tests/hermes_cli/test_kanban_lanes_plan.py
+@@ -230,6 +230,10 @@ def test_an_agents_cli_admit_is_limited_like_the_planners_and_a_typed_one_is_the
+     monkeypatch.setattr(lanes, "_human_shell", lambda: False)  # every call below runs in an agent-marked process
+     assert cli("lanes", "admit", guard) == 1  # never_admit
+     assert cli("lanes", "admit", cards[0]) == 0 and cli("lanes", "admit", cards[1]) == 0
++    event = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
++                                    (cards[0], lanes.ADMITTED)).fetchone()[0])
++    assert event["actor"].startswith("agent") or event["actor"] == "user"  # the caller, not the planner
++    assert event["actor"] != plan.ACTOR and event["budget"] == 1
+     assert cli("lanes", "admit", cards[2]) == 1  # admit_per_day is 2
+     assert lanes.admitted_today(conn, "hermes") == 2
+     _typed("lanes", "admit", cards[2])  # the person, typing in a chat
+-- 
+2.43.0
+

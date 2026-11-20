@@ -1,0 +1,201 @@
+From 4a9967741ac0aa81e6c035745bd7e5e005139a6e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 03:45:04 +0000
+Subject: [PATCH] [daveey] Preserve nested shell contexts in lifecycle comment
+ scanning
+
+Proof: four original RUN rows fail on ac1098e9cb after real Bash markers; clean twins pass. Expanded suite passes 30 cases, and all 23 lifecycle-importing cron test files pass (1409 tests) through scripts/run_tests.sh -j 1. Preserve parameter/backtick boundaries and normalize ANSI-C strings only for POSIX tokenization.
+---
+ cron/lifecycle_guard_lines.py                 | 89 +++++++++++++++++--
+ cron/lifecycle_guard_tokens.py                |  2 +-
+ .../test_lifecycle_guard_nested_comments.py   | 44 +++++++++
+ 3 files changed, 129 insertions(+), 6 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_nested_comments.py
+
+diff --git a/cron/lifecycle_guard_lines.py b/cron/lifecycle_guard_lines.py
+index 1c9d0205ad9e9733a697e288376e00840c4ec1c9..1c339509956eb3af79090dc6076e4e8a4a5af8f4 100644
+--- a/cron/lifecycle_guard_lines.py
++++ b/cron/lifecycle_guard_lines.py
+@@ -11,6 +11,76 @@ comment ends at its newline even after a backslash (``# x \\`` does not continue
+ from __future__ import annotations
+ 
+ import re
++import shlex
++
++from cron.lifecycle_guard_printf import decode_c_escapes
++
++
++def _quoted_end(text: str, start: int, closer: str, *, escapes: bool = True) -> int:
++    """Backticks close before their contents are parsed (even inside a comment)."""
++    pos = start
++    while pos < len(text):
++        if text[pos] == closer:
++            return pos + 1
++        pos += 2 if escapes and text[pos] == "\\" else 1
++    return len(text)
++
++
++def _parameter_span(text: str, start: int, *, shlex_quotes: bool) -> tuple[int, str]:
++    """Keep parameter words opaque to the OUTER comment/line scanner.
++
++    Nested expansions and quoted closing braces do not end the parameter. Contents
++    remain visible to the guard's separate substitution and referenced-command walks.
++    """
++    stack = ["}"]
++    pos = copied = start
++    parts = [text[start - 2:start]]
++    while pos < len(text) and stack:
++        char = text[pos]
++        if text.startswith("$'", pos):
++            end, span = _expansion(text, pos, in_double=False, shlex_quotes=shlex_quotes)
++            parts.extend((text[copied:pos], span))
++            pos = copied = end
++            continue
++        if char == "\\":
++            pos += 2
++            continue
++        if char in "'\"`":
++            pos = _quoted_end(text, pos + 1, char, escapes=char != "'")
++            continue
++        if text.startswith(("${", "$("), pos):
++            stack.append("}" if text[pos + 1] == "{" else ")")
++            pos += 2
++            continue
++        if char == stack[-1]:
++            stack.pop()
++        elif char == "(" and stack[-1] == ")":
++            stack.append(")")
++        pos += 1
++    parts.append(text[copied:pos])
++    return pos, "".join(parts)
++
++
++def _expansion(text: str, pos: int, *, in_double: bool, shlex_quotes: bool) -> tuple[int, str]:
++    """Return an opaque span, or an empty span when ordinary scanning should proceed."""
++    if text.startswith("${", pos):
++        return _parameter_span(text, pos + 2, shlex_quotes=shlex_quotes)
++    elif text[pos] == "`":
++        end = _quoted_end(text, pos + 1, "`")
++        if shlex_quotes and text[end - 1:end] == "`":
++            # A quote in the inner comment must not poison POSIX tokenization of
++            # the command AFTER this substitution either.
++            body = strip_shell_comments(text[pos + 1:end - 1], shlex_quotes=True)
++            return end, "`" + body + "`"
++    elif not in_double and text.startswith("$'", pos):
++        end = _quoted_end(text, pos + 2, "'")
++        if shlex_quotes and text[end - 1:end] == "'":
++            value = decode_c_escapes(text[pos + 2:end - 1], echo_style=False)
++            # Bash truncates this quoted span at NUL, not the rest of the word.
++            return end, shlex.quote(value.split("\0", 1)[0])
++    else:
++        return pos, ""
++    return end, text[pos:end]
+ 
+ # Characters after which an unquoted `#` starts a word, so a comment (bash's metacharacters).
+ _WORD_BREAKS = frozenset(" \t\n;&|()<>")
+@@ -18,7 +88,7 @@ _WORD_BREAKS = frozenset(" \t\n;&|()<>")
+ _CONTINUATION = re.compile(r"\\\r?\n[ \t]*")
+ 
+ 
+-def _scan(text: str, *, split: bool, keep_comments: bool) -> list[str]:
++def _scan(text: str, *, split: bool, keep_comments: bool, shlex_quotes: bool = False) -> list[str]:
+     """*text* as one string or (*split*) as logical lines: newlines outside quotes separate them
+     (a quoted newline is data). Honors quotes and escapes. Comments are dropped, or with
+     *keep_comments* kept without the backslashes they end with (no continuation)."""
+@@ -27,7 +97,16 @@ def _scan(text: str, *, split: bool, keep_comments: bool) -> list[str]:
+     comment: list[str] = []
+     in_single = in_double = escape = in_comment = False
+     word_start = True
+-    for ch in text:
++    end = 0
++    for pos, ch in enumerate(text):
++        if pos < end:
++            continue
++        if ch in "$`" and not in_comment and not in_single and not escape:
++            end, span = _expansion(text, pos, in_double=in_double, shlex_quotes=shlex_quotes)
++            if span:
++                current.append(span)
++                word_start = False
++                continue
+         if in_comment:
+             if ch != "\n":
+                 comment.append(ch)
+@@ -69,9 +148,9 @@ def _scan(text: str, *, split: bool, keep_comments: bool) -> list[str]:
+     return lines
+ 
+ 
+-def strip_shell_comments(text: str) -> str:
+-    """*text* with each shell comment removed (its newline kept)."""
+-    return _scan(text, split=False, keep_comments=False)[0]
++def strip_shell_comments(text: str, *, shlex_quotes: bool = False) -> str:
++    """Remove comments; optionally render ANSI-C words for POSIX shlex."""
++    return _scan(text, split=False, keep_comments=False, shlex_quotes=shlex_quotes)[0]
+ 
+ 
+ def join_line_continuations(text: str) -> str:
+diff --git a/cron/lifecycle_guard_tokens.py b/cron/lifecycle_guard_tokens.py
+index 8b6673cb22ce9c113d98ae61fc07c13190801868..ba8008a2ac2f2ac8118e648578a47a6730d2b122 100644
+--- a/cron/lifecycle_guard_tokens.py
++++ b/cron/lifecycle_guard_tokens.py
+@@ -16,7 +16,7 @@ from cron.lifecycle_guard_substitutions import (
+ 
+ def _shlex_tokens(line: str) -> list[str]:
+     """POSIX-tokenize with word-start comments and redirection ampersands protected."""
+-    lexer = shlex.shlex(protect_redirection_ampersands(strip_shell_comments(line)),
++    lexer = shlex.shlex(protect_redirection_ampersands(strip_shell_comments(line, shlex_quotes=True)),
+                         posix=True, punctuation_chars=";&|()")
+     lexer.whitespace_split = True
+     lexer.commenters = ""
+diff --git a/tests/cron/test_lifecycle_guard_nested_comments.py b/tests/cron/test_lifecycle_guard_nested_comments.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..993ffe6d885ad9a50af9478b2cb90fc524814947
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_nested_comments.py
+@@ -0,0 +1,44 @@
++"""Nested Bash lexical contexts must not hide a later referenced script."""
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from tests.cron import test_lifecycle_guard_comment_words as helpers
++
++PREFIXES = [
++    "x='a b'; echo ${x// #/y}",
++    "echo ${x:-a #b}",
++    "echo `echo #x`",
++    r"echo $'it\'s'",
++    "echo ${x:-${y:-a #b}}",
++    "echo ${x:-'}' #b}",
++    r"echo ${x:-a\} #b}",
++    'echo "${x:-a #b}"',
++    "echo `echo #it's`",
++    'echo "`echo #x`"',
++    r"echo $'it\'s'#word",
++    r"echo $'it\'s' " + "# it's\ntrue",
++    r"echo ${x:-$'it\'s'}",
++]
++
++
++@pytest.mark.parametrize("prefix", PREFIXES)
++@pytest.mark.parametrize("dangerous", [True, False], ids=["RUN", "clean"])
++def test_nested_context_does_not_hide_following_command(tmp_path, prefix, dangerous):
++    helpers._tree(tmp_path)
++    command = prefix + ("; bash ./r.sh" if dangerous else "; python3 ./clean.py")
++    assert helpers._bash_runs(tmp_path, command) is dangerous
++    refused, reason = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert refused is dangerous, reason
++
++
++@pytest.mark.parametrize("escape", [r"\0", r"\x00"])
++@pytest.mark.parametrize("dangerous", [True, False], ids=["RUN", "clean"])
++def test_ansi_nul_truncates_only_quoted_span(tmp_path, escape, dangerous):
++    helpers._tree(tmp_path)
++    script = "./r" if dangerous else "./clean"
++    suffix = ".sh" if dangerous else ".py"
++    interpreter = "bash" if dangerous else "python3"
++    command = f"{interpreter} $'{script}{escape}ignored'{suffix}"
++    assert helpers._bash_runs(tmp_path, command) is dangerous
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path))[0] is dangerous
+-- 
+2.43.0
+

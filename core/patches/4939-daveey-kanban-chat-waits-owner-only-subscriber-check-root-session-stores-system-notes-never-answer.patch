@@ -1,0 +1,266 @@
+From 8de720cca052a8c806a58e217b87787b68ae3ee2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 06:47:41 +0000
+Subject: [PATCH] [daveey] kanban chat waits: owner-only subscriber check, root
+ session stores, system notes never answer
+
+Third review and adversarial pass of #3647:
+- The subscriber check ran on the parking gateway. A pool worker parking a hub
+  card has neither the hub's notify subscriptions (machine-local) nor its
+  session stores, so every chat wait from a worker was refused. It now runs
+  only where the card is owned (own_gateway == created_on, or an unsynced
+  board); elsewhere the park records the ask, which syncs to the owner.
+- tui_chat_reachable read stores under the caller's HERMES_HOME; a named-
+  profile worker (HERMES_HOME=<root>/profiles/<name>) never saw the launch
+  store. It now reads the root store and every profile store, as the sweeper.
+- The chat probe's --after-id was taken before the park's own 'kanban-park'
+  progress comment, which then fired it. `wait-comment --skip-system` ignores
+  kernel writers (authors kanban-*), and the chat probe uses it; existing
+  probes are unchanged.
+
+Tests: the progress note and a dispatcher note do not fire the probe, an
+answer does (schedule and block); foreign card parks and asks without a local
+subscriber; owned card still needs one; named-profile worker sees the root
+store chat. 6 of 47 fail on the previous head; 34 neighbouring files,
+625 tests pass.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_awaiting.py                | 28 +++++--
+ hermes_cli/kanban_comment_origin.py          | 16 +++-
+ hermes_cli/kanban_parser.py                  |  3 +
+ tests/hermes_cli/test_kanban_decision_ask.py | 84 +++++++++++++++++++-
+ 4 files changed, 120 insertions(+), 11 deletions(-)
+
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index 83566ae7920e3c032bee967106e5a3f3c0f33e95..83752c37dcf5c40f1410ff1d5755fce2e1b3479c 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -518,17 +518,21 @@ def wake_probe(conn: sqlite3.Connection, task_id: str, record: Optional[dict]) -
+     if not record or record.get("kind") != CHAT:
+         return card_probe(record)
+     row = conn.execute("SELECT MAX(id) FROM task_comments WHERE task_id = ?", (task_id,)).fetchone()
+-    return shlex.join(["hermes", "kanban", "wait-comment", task_id, "--after-id", str(int(row[0] or 0))])
++    return shlex.join(["hermes", "kanban", "wait-comment", task_id, "--after-id", str(int(row[0] or 0)),
++                       "--skip-system"])
+ 
+ 
+ _MOVED_PREFIX = "moved_to_gateway:"  # tui_gateway.notice_fanout.MOVED_PREFIX
+ 
+ 
+ def _session_stores() -> list[Path]:
+-    """The launch store, then each named profile's: where the unloaded sweeper looks for a chat."""
+-    from hermes_constants import get_hermes_home
+-    home = get_hermes_home()
+-    return [p for p in (home / "state.db", *sorted((home / "profiles").glob("*/state.db"))) if p.is_file()]
++    """The launch store, then each named profile's, under the ROOT home: where the unloaded sweeper looks for a
++    chat. A worker of a named profile runs with ``HERMES_HOME=<root>/profiles/<name>`` (the dispatcher), and its
++    orchestrator chat usually lives in the root store (adversarial review of #3647)."""
++    from hermes_constants import get_default_hermes_root, get_hermes_home
++    root = get_default_hermes_root()
++    stores = (root / "state.db", *sorted((root / "profiles").glob("*/state.db")), get_hermes_home() / "state.db")
++    return [p for p in dict.fromkeys(stores) if p.is_file()]
+ 
+ 
+ def tui_chat_reachable(chat_id: str) -> bool:
+@@ -555,6 +559,18 @@ def tui_chat_reachable(chat_id: str) -> bool:
+     return False
+ 
+ 
++def _owns_card(conn: sqlite3.Connection, task_id: str) -> bool:
++    """True when this gateway owns the card (or the board does not sync). A pool worker parking a hub card has
++    neither the hub's notify subscriptions (machine-local) nor its session stores, so the subscriber check
++    belongs to the owner; the park's ``decision_requested`` reaches it by sync (review of #3647)."""
++    from hermes_cli.kanban_wake_check import own_gateway
++    own = own_gateway(conn)
++    if not own:
++        return True
++    row = conn.execute("SELECT created_on FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    return not row or not row[0] or row[0] == own
++
++
+ def has_chat_subscriber(conn: sqlite3.Connection, task_id: str) -> bool:
+     """A subscribed chat that ``decision_requested`` can wake.
+ 
+@@ -589,6 +605,8 @@ def _check_chat(conn, task_id, awaiting, text) -> None:
+     wall = text_wall(text)
+     if wall:
+         raise wall_error(task_id, wall, text)
++    if not _owns_card(conn, task_id):
++        return  # subscriptions are machine-local: the owning gateway receives the synced ask and delivers it
+     if not has_chat_subscriber(conn, task_id):
+         raise AwaitingError(NO_CHAT_SUBSCRIBER, (
+             f"{task_id} has no chat subscription that a decision_requested notice can wake (a tui row, or a "
+diff --git a/hermes_cli/kanban_comment_origin.py b/hermes_cli/kanban_comment_origin.py
+index baeef76585875166a0d5b324819d0f6a03c6c59e..31eff8ab6483531d6c0edeb29cc1e719a118b123 100644
+--- a/hermes_cli/kanban_comment_origin.py
++++ b/hermes_cli/kanban_comment_origin.py
+@@ -136,11 +136,15 @@ def _writer_tasks(conn: sqlite3.Connection, task_id: str) -> dict:
+     return out
+ 
+ 
++SYSTEM_AUTHOR_PREFIX = "kanban-"  # kernel writers: kanban-park, kanban-dispatcher, kanban-supervisor, ...
++
++
+ def find_comment(conn: sqlite3.Connection, task_id: str, *, after_id: int = 0, from_gateway: Optional[str] = None,
+-                 contains: Optional[str] = None, from_card: Optional[str] = None) -> Optional[dict]:
++                 contains: Optional[str] = None, from_card: Optional[str] = None,
++                 skip_system: bool = False) -> Optional[dict]:
+     """The first comment on ``task_id`` after ``after_id`` from ``from_gateway`` / ``from_card`` containing
+     ``contains``. ``from_card``: written by that card's worker (the ``writer_task`` on its ``commented`` event)
+-    or authored ``<gateway>/<card>`` by the relay."""
++    or authored ``<gateway>/<card>`` by the relay. ``skip_system``: ignore kernel writers (``kanban-*``)."""
+     if from_card and from_card.strip():
+         card, writers = from_card.strip().lower(), _writer_tasks(conn, task_id)
+         try:
+@@ -155,6 +159,8 @@ def find_comment(conn: sqlite3.Connection, task_id: str, *, after_id: int = 0, f
+             writer = writers.get(str(row[4])) if row[4] else writers.get(("id", int(row[0])))
+             if writer != card and not _from_card(row[1], card):
+                 continue
++            if skip_system and (row[1] or "").lower().startswith(SYSTEM_AUTHOR_PREFIX):
++                continue
+             if gw and gw != (row[2] or "").lower() and gw not in (row[1] or "").lower():
+                 continue
+             if contains and contains.lower() not in (row[3] or "").lower():
+@@ -165,6 +171,9 @@ def find_comment(conn: sqlite3.Connection, task_id: str, *, after_id: int = 0, f
+         return None  # an empty card id matches nothing
+     sql = "SELECT id, author, origin_gateway, body FROM task_comments WHERE task_id = ? AND id > ?"
+     params: list[Any] = [task_id, int(after_id or 0)]
++    if skip_system:
++        sql += " AND substr(lower(author), 1, ?) != ?"
++        params += [len(SYSTEM_AUTHOR_PREFIX), SYSTEM_AUTHOR_PREFIX]
+     if from_gateway:
+         gw = from_gateway.strip().lower()
+         sql += " AND (lower(coalesce(origin_gateway, '')) = ? OR instr(lower(author), ?) > 0)"
+@@ -188,7 +197,8 @@ def run_wait_comment(args) -> int:
+                 print(f"error: no task {args.task_id}")
+                 return 2
+             hit = find_comment(conn, args.task_id, after_id=args.after_id, from_gateway=args.from_gateway,
+-                               contains=args.contains, from_card=getattr(args, "from_card", None))
++                               contains=args.contains, from_card=getattr(args, "from_card", None),
++                               skip_system=bool(getattr(args, "skip_system", False)))
+     except sqlite3.Error as exc:
+         print(f"error: {exc}")
+         return 2
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 189100b87bf63db02fd318ea40f46d970f18fa9b..91ba633ec7f4d7627a9d0b97694847184b42ac1f 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -504,6 +504,9 @@ _SPECS = [
+              help="Only comments written by this card's worker (it commented from inside its run, or the relay "
+                   "authored it <gateway>/<task id>). Use it to wait for another card's answer instead of a phrase "
+                   "the other card has to reproduce"),
++        _arg("--skip-system", action="store_true", default=False,
++             help="Ignore comments by kernel writers (authors 'kanban-*': the park's own progress note, dispatcher, "
++                  "supervisor and spend-budget notes), so only an answer from an agent or a person fires"),
+     ], help="Wake-probe primitive for a reply: exit 0 a matching comment exists, 1 not yet, 2 cannot tell. "
+             "Use it instead of matching task_comments.author (the park guard refuses that: author_probe)"),
+     _cmd("attach", [
+diff --git a/tests/hermes_cli/test_kanban_decision_ask.py b/tests/hermes_cli/test_kanban_decision_ask.py
+index f9fa0cd385c2ffcb0061a9a96fd9638ea87c18be..2314723abe8ff704a98db2df2f7385519fcaeb98 100644
+--- a/tests/hermes_cli/test_kanban_decision_ask.py
++++ b/tests/hermes_cli/test_kanban_decision_ask.py
+@@ -299,15 +299,16 @@ def test_clock_only_chat_wait_wakes_on_the_answering_comment(kanban_home, monkey
+         out = _tool(op, args)
+         assert out.get("ok") is not False and "error" not in out, out
+         cmd = (kwc.get_state(conn, tid) or {}).get("cmd", "")
+-        assert cmd.startswith(f"hermes kanban wait-comment {tid} --after-id "), cmd
+-        after = int(cmd.rsplit(" ", 1)[1])
++        assert cmd.startswith(f"hermes kanban wait-comment {tid} --after-id ") and cmd.endswith(" --skip-system"), cmd
++        after = int(cmd.split("--after-id ", 1)[1].split()[0])
+     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+     monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+     parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+     kcli.build_parser(parser.add_subparsers(dest="command"))
+ 
+     def probe() -> int:
+-        return kcli.kanban_command(parser.parse_args(["kanban", "wait-comment", tid, "--after-id", str(after)]))
++        return kcli.kanban_command(parser.parse_args(["kanban", "wait-comment", tid, "--after-id", str(after),
++                                                      "--skip-system"]))
+ 
+     assert probe() != 0  # the park's own comment and notice do not count as the answer
+     with kbc.connect_closing() as conn:
+@@ -348,3 +349,80 @@ def test_orphan_reaped_desktop_chat_still_counts(kanban_home, monkeypatch) -> No
+         out = _tool("schedule", {"reason": LIVE_REASON, "clock_only": True, "awaiting": LIVE_AWAITING})
+         assert out.get("ok") is not False and "error" not in out, out
+         assert len(_asks(conn, tid)) == 1
++
++
++def test_named_profile_worker_sees_the_root_store_chat(kanban_home, monkeypatch) -> None:
++    """Adversarial review of #3647: a worker for profile 'coder' runs with HERMES_HOME=<root>/profiles/coder; the
++    Desktop orchestrator chat lives in <root>/state.db, which the sweeper reads, so it must count."""
++    import hermes_constants
++    chat = _session()  # in the root (launch) store
++    profile_home = kanban_home / "profiles" / "coder"
++    profile_home.mkdir(parents=True)
++    (profile_home / "config.yaml").write_text("{}\n")
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _subscribe(conn, tid, chat)
++        monkeypatch.setenv("HERMES_HOME", str(profile_home))
++        monkeypatch.setattr(hermes_constants, "_default_hermes_root_memo", None, raising=False)
++        assert hermes_constants.get_hermes_home() == profile_home
++        assert kaw.tui_chat_reachable(chat)
++        assert kaw.has_chat_subscriber(conn, tid)
++
++
++@pytest.mark.parametrize("op", ["schedule", "block"])
++def test_park_progress_note_does_not_fire_the_chat_probe(kanban_home, monkeypatch, capsys, op) -> None:
++    """Review of #3647: a reason announcing finished work makes the park write a 'kanban-park' progress comment
++    after the probe's --after-id was taken; that kernel note must not count as the orchestrator's answer."""
++    from hermes_cli import kanban as kcli
++
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _subscribe(conn, tid)
++        _as_worker(monkeypatch, conn, tid)
++        args = {"reason": LIVE_REASON + " Everything else is done.", "clock_only": True, "awaiting": LIVE_AWAITING}
++        if op == "block":
++            args["kind"] = "time"
++        out = _tool(op, args)
++        assert out.get("ok") is not False and "error" not in out, out
++        assert any(c.author == "kanban-park" for c in kb.list_comments(conn, tid))
++        argv = kwc.get_state(conn, tid)["cmd"].split()[1:]
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
++    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
++    kcli.build_parser(parser.add_subparsers(dest="command"))
++    assert kcli.kanban_command(parser.parse_args(argv)) != 0
++    with kbc.connect_closing() as conn:
++        kb.add_comment(conn, tid, "kanban-dispatcher", "Woken: probe stale", system=True)
++    assert kcli.kanban_command(parser.parse_args(argv)) != 0
++    with kbc.connect_closing() as conn:
++        kb.add_comment(conn, tid, "default", "Decisions: B, authorize, Phase A alone.")
++    assert kcli.kanban_command(parser.parse_args(argv)) == 0
++    capsys.readouterr()
++
++
++def test_foreign_card_parks_without_a_local_subscriber(kanban_home, monkeypatch) -> None:
++    """Review of #3647: a pool worker parking a hub card has no copy of the hub's subscriptions or chat stores.
++    It parks and posts the ask; the owner, which holds the subscriptions, delivers it after sync."""
++    from tests.hermes_cli.test_kanban_release_imported_comments import enable_sync
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++    enable_sync(tid)  # this gateway is "owner"
++    with kbc.connect_closing() as conn:
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET created_on = 'hub' WHERE id = ?", (tid,))
++        _as_worker(monkeypatch, conn, tid)
++        assert not kaw.has_chat_subscriber(conn, tid)
++        out = _tool("schedule", {"reason": LIVE_REASON, "clock_only": True, "awaiting": LIVE_AWAITING})
++        assert out.get("ok") is not False and "error" not in out, out
++        assert _park_payload(conn, tid)["awaiting"]["kind"] == "chat" and len(_asks(conn, tid)) == 1
++
++
++def test_owned_card_still_needs_a_subscriber(kanban_home, monkeypatch) -> None:
++    from tests.hermes_cli.test_kanban_release_imported_comments import enable_sync
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++    enable_sync(tid)  # created_on = this gateway
++    with kbc.connect_closing() as conn:
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": LIVE_REASON, "clock_only": True, "awaiting": LIVE_AWAITING})
++        assert kaw.NO_CHAT_SUBSCRIBER in (out.get("code") or "") + out.get("error", ""), out
+-- 
+2.43.0
+

@@ -1,0 +1,206 @@
+From b6eab18217354db2c8f0c592745b24a6df23d6ae Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 02:09:29 +0000
+Subject: [PATCH] [daveey] kanban move: a queued card pinned to a retired
+ machine can leave it past the move cap
+
+Problem: t_0b716b01a47db7f6 (retention source owner, p1000) sat ready and
+unplaceable on `runs_on=[machine:worker-6]` after worker-6 was terminated and
+its Board gateway revoked (2026-11-15 22:20Z). The supported repair,
+`hermes kanban move <id> --pool`, refused `move_limit`: the card had already
+moved 3 times (kanban.move.max_moves 3). It was rescued only by a one-off
+in-process cap raise; t_b3d8c02fb22c8d60 and t_f8d008a102868611 needed the same,
+and 5 rehomed cards pinned to worker-3/4/6/8 will too (t_11b688eaed0c74cd).
+
+Why-chain:
+1. No machine can lease the card: the Board grants machine:worker-6 only to
+   worker-6's key, which was revoked (live registry readback lists hub,
+   macbook, mini, worker-1/2/5/7 only).
+2. The ordinary repair is `move --pool`, and `check()` applied max_moves to
+   every move, so a move off an impossible pin spent and hit the same budget
+   as a bounce between live machines.
+3. Automatic stale-pin recovery does not reach it either: hermes-hub
+   `mailbox.ts machines()` lists `WHERE state = 'active'`, so revoked rows
+   never reach the client (`recovery_mode` returns None on a missing entry)
+   or the Board's own `staleReason()` (undefined -> null -> pin_not_stale);
+   and `current_portable` rejects any card that has run before.
+Root (happened): the move cap does not distinguish a move off a retired pin
+from a ping-pong move. Root (not caught): no test pairs a capped card with a
+pinned machine that is absent from the registry.
+
+Fix: `check()` keeps the cap for every move except a QUEUED card's move off
+exactly one `machine:<x>` pin when a successful, non-empty registry read
+shows x absent or `revoked` (`dead_pin`; x is never this gateway). The move
+still counts in the history (later moves stay capped), records `dead_pin` in
+the `moved` event, and keeps every other guard (ping-pong, capability,
+capacity-wait, unpushed state, workspace binding, admission). An unreadable
+registry still refuses `registry_unavailable`; held, stale-telemetry and busy
+machines are listed, so their pins stay capped; a running card (live claim)
+stays capped.
+
+Tests (tests/hermes_cli/test_kanban_move.py): RED on origin/main (3 failed:
+absent, revoked, dead_pin evidence), GREEN after. Cases: absent and revoked
+pins move at the cap with move_no 4, `dead_pin`, checkpoint and created_on
+kept, then the next healthy move is refused move_limit; held/stale/busy pins
+refused move_limit; empty registry, two pins, a non-machine label and the
+origin's own pin are not dead; a running card is refused. All 32 test files
+importing kanban_move: 840 passed. scripts/check --base origin/main: ok.
+
+Follow-up outside core: hermes-hub stale-pin recovery cannot see revoked
+machines (point 3).
+---
+ hermes_cli/kanban_move.py            | 39 ++++++++++++---
+ tests/hermes_cli/test_kanban_move.py | 73 ++++++++++++++++++++++++++++
+ 2 files changed, 106 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_move.py b/hermes_cli/kanban_move.py
+index 1a5573d28851d8c464db0aad6f9c815534cfc274..08d23b43ddd580338ca1cb592002eb448c4022f5 100644
+--- a/hermes_cli/kanban_move.py
++++ b/hermes_cli/kanban_move.py
+@@ -13,7 +13,9 @@ Guards:
+   this machine, while a queued card may target it (``machine:<x>`` for an unregistered x never is);
+ * ``machine:<x>`` needs x to advertise pickup (``placement_unavailable`` otherwise: x would never copy the card,
+   :func:`hermes_cli.kanban_worker_node.check_machine_pins`);
+-* ``kanban.move.max_moves`` (default 3) moves per card;
++* ``kanban.move.max_moves`` (default 3) moves per card, except a queued card's move off a retired ``machine:<x>`` pin
++  (:func:`dead_pin`: x absent from, or revoked in, a successful registry read); that move still counts, and its
++  event carries ``dead_pin``;
+ * moving back to a machine the card already left is ping-pong: refused unless ``force``, and it still counts;
+ * ``dir`` workspaces exist only on their creator, so those cards never move; a ``worktree`` card moves only with
+   portable workspace_source custody (published branch, :mod:`hermes_cli.kanban_source_move`);
+@@ -205,11 +207,7 @@ def check(conn: sqlite3.Connection, task_id: str, runs_on: Any, *, force: bool =
+                   me=me, machines={m: pool[m] for m in matches}, exclude_me=exclude_me)
+     except roc.PlacementCapabilityMismatch as exc:
+         raise MoveRefused("capability_mismatch", str(exc)) from exc
+-    past = history(conn, task_id)
+-    limit = max_moves(cfg)
+-    if len(past) >= limit:
+-        raise MoveRefused("move_limit", f"card already moved {len(past)} time(s) (kanban.move.max_moves {limit}); "
+-                                        "finish it here or block it")
++    past, host = _spend_budget(conn, task_id, row, pool, me=me, cfg=cfg, host=host)
+     left = {p.get("from_machine") for p in past}
+     back = [m for m in matches if m in left]
+     if back and len(back) == len(matches) and not force:
+@@ -223,6 +221,35 @@ def check(conn: sqlite3.Connection, task_id: str, runs_on: Any, *, force: bool =
+             "forced": bool(back and force), "me": me, "host": host}
+ 
+ 
++def _spend_budget(conn: sqlite3.Connection, task_id: str, row: Any, pool: Mapping[str, Mapping[str, Any]], *,
++                  me: str, cfg: Optional[dict], host: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
++    """The card's move history and event fields, or ``move_limit``. A queued card pinned to a retired machine can
++    never be leased again: moving it off is not a bounce, and the cap must not strand it (t_0b716b01a47db7f6 on
++    worker-6). That move still counts, so later moves stay capped."""
++    from hermes_cli import kanban_worker_node as wn
++    past = history(conn, task_id)
++    limit = max_moves(cfg)
++    if len(past) < limit:
++        return past, host
++    dead = None if row["status"] == "running" else dead_pin(wn._parse(row["runs_on"]), pool, me=me)
++    if dead is None:
++        raise MoveRefused("move_limit", f"card already moved {len(past)} time(s) (kanban.move.max_moves {limit}); "
++                                        "finish it here or block it")
++    return past, {**host, "dead_pin": dead}
++
++
++def dead_pin(previous: Optional[list[str]], machines: Mapping[str, Mapping[str, Any]], *, me: str) -> Optional[str]:
++    """The retired machine a card is pinned to, or None. Exactly one ``machine:<x>`` label, x not ``me``, and a
++    non-empty registry read in which x is absent or ``revoked``. ``GET /v2/machines`` lists active gateways only, so
++    absence from a successful read is the Board's own word that no key for x can lease the card. Held, stale or busy
++    machines are listed and so never dead; an unreadable registry never gets here (``registry_unavailable``)."""
++    names = [label.removeprefix("machine:") for label in previous or [] if label.startswith("machine:")]
++    if not machines or len(names) != 1 or names[0] == me:
++        return None
++    entry = machines.get(names[0])
++    return names[0] if not entry or entry.get("state") == "revoked" else None
++
++
+ def leaves_here(me: str, matches: list[str]) -> bool:
+     """Whether a move leaves ``me`` (and so takes the unpushed-state guard): no machine that matches it is ``me``.
+     A running move's matches never include ``me``. The one rule :func:`check` and the worker-first repin share."""
+diff --git a/tests/hermes_cli/test_kanban_move.py b/tests/hermes_cli/test_kanban_move.py
+index 124b5807fd0c4226ccd2b41a370e7072c508f272..fd7508ecf5398f9c7e70759cb92fffaf915f10b9 100644
+--- a/tests/hermes_cli/test_kanban_move.py
++++ b/tests/hermes_cli/test_kanban_move.py
+@@ -146,6 +146,79 @@ def test_max_moves_and_ping_pong(gws):
+     assert km.max_moves({"max_moves": 5}) == 5 and km.max_moves({"max_moves": "x"}) == km.DEFAULT_MAX_MOVES
+ 
+ 
++def _capped_card_pinned_to(hub, machine):
++    """A queued card that spent the default 3-move budget, then pinned to ``machine:<machine>`` (as a card whose
++    pinned worker was retired after its last move: t_0b716b01a47db7f6 on worker-6)."""
++    hub.enter()
++    tid = kb.create_task(hub.conn, title="q", assignee="default")
++    machines = {**MACHINES, HUB: {**MACHINES[HUB], "pickup": "explicit"},
++                "w2": {"name": "w2", "state": "active", "labels": ["linux"], "hold": False, "pickup": "all"}}
++    for runs_on, me, force in (("machine:worker-1", HUB, False), ("machine:w2", WORKER, False),
++                               ("machine:hub", "w2", True)):
++        assert km.move_queued(hub.conn, tid, runs_on=[runs_on], host_reason=HR, reason="r", machines=machines,
++                              me=me, force=force)["ok"]
++    with kb.write_txn(hub.conn):
++        wn.set_runs_on(hub.conn, tid, [f"machine:{machine}"])
++    return tid
++
++
++# The registry after worker-6 was revoked: GET /v2/machines lists active gateways only (hermes-hub mailbox.ts
++# ``machines()``: ``WHERE state = 'active'``), so a revoked machine is absent, not a row with state "revoked".
++LIVE = {**MACHINES, "w3": {"name": "w3", "state": "active", "labels": ["linux"], "hold": False, "pickup": "all"}}
++
++
++@pytest.mark.parametrize("registry", [
++    LIVE,  # absent from a successful registry read: no machine can lease machine:worker-6
++    {**LIVE, "worker-6": {"name": "worker-6", "state": "revoked", "labels": ["linux"], "hold": False}},
++], ids=["absent", "revoked"])
++def test_a_capped_move_off_a_retired_pinned_machine_is_allowed_and_audited(gws, registry):
++    hub, _ = gws
++    tid = _capped_card_pinned_to(hub, "worker-6")
++    origin = hub.conn.execute("SELECT created_on FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++    res = km.move_queued(hub.conn, tid, runs_on=["linux"], reason="worker-6 was retired", checkpoint="step 2 next",
++                         machines=registry, me=HUB)
++    assert res["ok"] and res["move_no"] == 4, res
++    ev = _events(hub.conn, tid)[-1]
++    assert ev["dead_pin"] == "worker-6" and ev["previous_runs_on"] == ["machine:worker-6"] and not ev["forced"]
++    assert ev["checkpoint"] == "step 2 next"
++    t = hub.conn.execute("SELECT runs_on, created_on FROM tasks WHERE id = ?", (tid,)).fetchone()
++    assert json.loads(t["runs_on"]) == ["linux"] and t["created_on"] == origin  # the origin is not rehomed
++    # The rescue spent the budget like any move: a later healthy move is still capped.
++    res = km.move_queued(hub.conn, tid, runs_on=["machine:w3"], host_reason=HR, reason="again", machines=registry,
++                         me=HUB)
++    assert res["reason_code"] == "move_limit", res
++
++
++@pytest.mark.parametrize("entry", [
++    {"state": "active", "hold": True},  # held: drains and comes back
++    {"state": "active", "hold": False, "last_seen": 1},  # stale telemetry: maybe asleep, not retired
++    {"state": "active", "hold": False, "max_card_runs": 1},  # busy: a queue, not a dead pin
++], ids=["held", "stale", "busy"])
++def test_a_capped_move_off_a_live_pinned_machine_is_still_refused(gws, entry):
++    hub, _ = gws
++    tid = _capped_card_pinned_to(hub, "worker-6")
++    registry = {**LIVE, "worker-6": {"name": "worker-6", "labels": ["linux"], "pickup": "all", **entry}}
++    res = km.move_queued(hub.conn, tid, runs_on=["linux"], reason="r", machines=registry, me=HUB)
++    assert res["reason_code"] == "move_limit", res
++
++
++def test_a_capped_dead_pin_needs_affirmative_registry_evidence_and_a_queued_card(gws):
++    hub, _ = gws
++    tid = _capped_card_pinned_to(hub, "worker-6")
++    # An unreadable registry refuses before the budget (registry_unavailable); an empty read proves nothing.
++    assert km.dead_pin(["machine:worker-6"], {}, me=HUB) is None
++    assert km.dead_pin(["machine:worker-6", "machine:hub"], LIVE, me=HUB) is None  # not exactly one pin
++    assert km.dead_pin(["pool:worker"], LIVE, me=HUB) is None  # an ordinary capped move stays capped
++    assert km.dead_pin(["machine:hub"], {"w3": LIVE["w3"]}, me=HUB) is None  # the origin's own pin is never dead
++    assert km.dead_pin(["machine:worker-6"], LIVE, me=HUB) == "worker-6"
++    # A live claim is refused: a running card is not stranded, whatever its labels say.
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (tid,))
++    with pytest.raises(km.MoveRefused) as exc:
++        km.check(hub.conn, tid, ["linux"], machines=LIVE, me=HUB, reason="r")
++    assert exc.value.code == "move_limit"
++
++
+ def test_labels_matching_a_machine_it_never_left_are_not_ping_pong(gws):
+     hub, _ = gws
+     hub.enter()
+-- 
+2.43.0
+

@@ -1,0 +1,110 @@
+From 1b318af7b5609338d70f71d2a42046119465340e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 13:22:31 +0000
+Subject: [PATCH] test(gateway): bound outbound image fixture TCP buffering
+ [daveey]
+
+The image-cap regression counts completed server writes, not application reads.
+CI job 132722278726 refused the Mattermost image at 119778 > 65536 bytes,
+while the server queued 18972672 bytes and tripped the unchanged <16MiB
+partial-transfer assertion. The retry passed. Kernel TCP buffering therefore
+invalidated the fixture's assumption that a 32MiB body dwarfs socket capacity.
+The worker tcp_rmem autotuning ceiling is itself 32MiB.
+
+Bound send and receive buffers before connect/listen for fixture-local real
+Internet sockets, retaining both aiohttp and HTTPX, every upload/fallback/cap
+assertion, the 32MiB body, and the original server-completion/partial-transfer
+guards. Close the listener and join its service thread before restoring the
+socket constructor. Production adapters and bounded-reader code are unchanged.
+
+Detection gap: no test established the kernel-buffer premise. Add a real socket
+readback regression: RED on original fixture (131072 <= 65536 fails), GREEN
+with bounded sockets. This is a deterministic buffer-premise regression, not
+a claimed deterministic replay of the historical TCP scheduling. Explicitly
+inflating socket buffers alone did not reproduce the historical failure.
+
+Proof: exact historical b66901d7 full file 9 passed; original failing parameter
+1 passed alone. Current main baseline 9 passed. New full file 11 passed.
+An EOF-then-validate mutation in read_httpx_body_with_limit fails the preserved
+partial-transfer assertion with 33554432 bytes served; mutation removed.
+Seven relevant adapter/media suites: 276 passed, 1 skipped. scripts/check:
+20 checks passed. No threshold widening, sleeps, production retries or weakened
+safety assertions. Independent review and required CI remain required.
+---
+ .../test_outbound_image_download_cap.py       | 39 ++++++++++++++++---
+ 1 file changed, 33 insertions(+), 6 deletions(-)
+
+diff --git a/tests/gateway/test_outbound_image_download_cap.py b/tests/gateway/test_outbound_image_download_cap.py
+index acf7f47a47c71454f456342eda0097ac7df0b6c3..42553581cbaae266e6a7d21ab74ea8d64500d955 100644
+--- a/tests/gateway/test_outbound_image_download_cap.py
++++ b/tests/gateway/test_outbound_image_download_cap.py
+@@ -2,6 +2,7 @@
+ held in memory, so it must honour ``gateway.max_inbound_media_bytes`` like the inbound path:
+ an over-cap body (chunked, no Content-Length) is refused whole, and never uploaded truncated."""
+ 
++import socket
+ import threading
+ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+ from pathlib import Path
+@@ -15,7 +16,7 @@ from gateway.config import PlatformConfig
+ from gateway.platforms.base import SendResult
+ 
+ CAP = 64 * 1024
+-HUGE = CAP * 512  # 32 MiB: far more than socket buffers absorb once the client stops reading
++HUGE = CAP * 512  # 32 MiB: far larger than the fixture's explicitly bounded socket buffers
+ PNG = b"\x89PNG\r\n\x1a\n"
+ 
+ 
+@@ -56,18 +57,44 @@ class _ChunkedImage(BaseHTTPRequestHandler):
+ 
+ 
+ @pytest.fixture
+-def image_host():
++def image_host(monkeypatch):
+     from hermes_constants import get_hermes_home
+     from tools import url_safety
+ 
+     (get_hermes_home() / "config.yaml").write_text(
+         f"gateway:\n  max_inbound_media_bytes: {CAP}\nsecurity:\n  allow_private_urls: true\n")
+     url_safety._reset_allow_private_cache()
++    # sendall() counts queued kernel bytes, not bytes consumed by the adapter.
++    # Linux receive autotuning can exceed HUGE // 2 on loopback. Bound both
++    # endpoints before connect/listen so the partial-transfer oracle measures
++    # early refusal rather than host TCP tuning. Keep the real HTTP clients.
++    class ImageSocket(socket.socket):
++        def __init__(self, *args, **kwargs):
++            super().__init__(*args, **kwargs)
++            if self.family in (socket.AF_INET, socket.AF_INET6) and self.type == socket.SOCK_STREAM:
++                self.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, CAP // 4)
++                self.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, CAP // 4)
++
++    monkeypatch.setattr(socket, "socket", ImageSocket)
+     srv = ThreadingHTTPServer(("127.0.0.1", 0), _ChunkedImage)
+-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+-    yield f"http://127.0.0.1:{srv.server_port}"
+-    srv.shutdown()
+-    url_safety._reset_allow_private_cache()
++    thread = threading.Thread(target=srv.serve_forever, daemon=True)
++    thread.start()
++    try:
++        yield f"http://127.0.0.1:{srv.server_port}"
++    finally:
++        srv.shutdown()
++        srv.server_close()
++        thread.join(10)
++        assert not thread.is_alive()
++        url_safety._reset_allow_private_cache()
++
++
++@pytest.mark.parametrize("option", [socket.SO_SNDBUF, socket.SO_RCVBUF])
++def test_image_host_bounds_kernel_buffering(image_host, option):
++    # Both HTTP stacks create real sockets through this fixture. Read back the
++    # effective kernel limit (Linux doubles the requested value).
++    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
++        assert client.getsockopt(socket.SOL_SOCKET, option) <= CAP
+ 
+ 
+ TEXTS: list[str] = []  # what each adapter's ``send`` (text fallback) carried
+-- 
+2.43.0
+

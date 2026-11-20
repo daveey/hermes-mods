@@ -1,0 +1,122 @@
+From 38b26a4fba530a11f407348520c24bfba1a2e4e4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 01:48:48 +0000
+Subject: [PATCH] fix(gateway): preserve lazy launch-source freezing during
+ claims [daveey]
+
+---
+ gateway/session_claim_publication.py          | 14 +++++---
+ .../test_adversarial_settlement_review.py     |  4 +--
+ tests/gateway/test_owner_loop_claim_read.py   | 34 +++++++++++++++++++
+ 3 files changed, 46 insertions(+), 6 deletions(-)
+
+diff --git a/gateway/session_claim_publication.py b/gateway/session_claim_publication.py
+index 10a7e93ea7d604bd07bfa4e9a59dd207fff48e72..56c45e28915a25f0e035f138bcd2b4df7814fbe8 100644
+--- a/gateway/session_claim_publication.py
++++ b/gateway/session_claim_publication.py
+@@ -3,7 +3,7 @@ import asyncio
+ from dataclasses import asdict
+ 
+ from gateway.session_contract import SessionHandle
+-from gateway.session_queued_controls import _INTERACTIVE_SOURCES
++from gateway.session_queued_controls import _INTERACTIVE_SOURCES, queued_controls
+ from hermes_state_runtime import STEERING, RuntimeStoreError, get_session_admission
+ 
+ 
+@@ -34,8 +34,12 @@ def _prepare(authority, ref, token):
+             pending[admission_id] = row
+     source = token[3] if token[3] is not None else session['source']
+     interactive = source in _INTERACTIVE_SOURCES
+-    return handle, [asdict(authority._pending_receipt(row, interactive=interactive))
+-                    for row in sorted(pending.values(), key=lambda row: row['seq'])]
++    # Match _interactive's lazy cache fill: only a row eligible for controls
++    # consults the source. Return the intent; only the owner may mutate its cache.
++    freeze_source = source if any(queued_controls(authority, row, interactive=True)
++                                  for row in pending.values()) else None
++    return (handle, [asdict(authority._pending_receipt(row, interactive=interactive))
++                     for row in sorted(pending.values(), key=lambda row: row['seq'])]), freeze_source
+ 
+ 
+ async def stamp_claim(authority, ref, live, row):
+@@ -46,12 +50,14 @@ async def stamp_claim(authority, ref, live, row):
+         while True:
+             with live.event_stream.lock:
+                 token = _view_token(authority, ref, live)
+-            prepared = await asyncio.to_thread(_prepare, authority, ref, token)
++            prepared, freeze_source = await asyncio.to_thread(_prepare, authority, ref, token)
+             with live.event_stream.lock:
+                 # A submission/cancel/settlement published while we read: never overwrite
+                 # its newer view. Transfers and settling can change before publication too.
+                 if token != _view_token(authority, ref, live):
+                     continue
++                if freeze_source is not None:
++                    authority.launch_sources.setdefault(ref.session_id, freeze_source)
+                 authority._publish_pending(ref, prepared=prepared)
+                 break
+     return row
+diff --git a/tests/gateway/test_adversarial_settlement_review.py b/tests/gateway/test_adversarial_settlement_review.py
+index c0402d417e0c4a51de43142f7c25265a128a3f31..0bb058a2bd0551cea40b29b5106fc632fe2bdefb 100644
+--- a/tests/gateway/test_adversarial_settlement_review.py
++++ b/tests/gateway/test_adversarial_settlement_review.py
+@@ -119,11 +119,11 @@ async def test_post_commit_cleanup_error_still_publishes_the_committed_completio
+         monkeypatch.setattr(session_ingress_media, 'release_admission_media', unavailable_once)
+     else:
+         original = authority._publish_pending
+-        def unavailable_after_completion(ref):
++        def unavailable_after_completion(ref, **kwargs):
+             if any(frame['params']['type'] == 'message.complete' for frame in frames):
+                 monkeypatch.setattr(authority, '_publish_pending', original)
+                 raise OSError('idle publication temporarily unavailable')
+-            return original(ref)
++            return original(ref, **kwargs)
+         monkeypatch.setattr(authority, '_publish_pending', unavailable_after_completion)
+     with db:
+         receipt = await authority.submit(ACTOR, Submission('cleanup', REF, {'text': 'work'}, 'queue'))
+diff --git a/tests/gateway/test_owner_loop_claim_read.py b/tests/gateway/test_owner_loop_claim_read.py
+index c09803e97637c750eee0ce4d6880572b74c7e089..ba30fa53fd15b44c69ae747d1707108222ec3261 100644
+--- a/tests/gateway/test_owner_loop_claim_read.py
++++ b/tests/gateway/test_owner_loop_claim_read.py
+@@ -57,6 +57,40 @@ async def test_claim_pending_read_keeps_the_owner_loop_ticking(tmp_path, monkeyp
+         db.close()
+ 
+ 
++@pytest.mark.asyncio
++@pytest.mark.parametrize('queued_payload', [None, {'text': 'next'}, {'text': 'next', 'finite': True}])
++@pytest.mark.parametrize('source', ['cli', 'cron'])
++async def test_claim_preserves_lazy_launch_source_freeze(tmp_path, source, queued_payload):
++    import hermes_state_runtime as rt
++    from gateway.session_authority import LiveSession, SessionAuthority
++    from gateway.session_contract import SessionRef
++    from hermes_state import SessionDB
++
++    db = SessionDB(tmp_path / 'state.db')
++    db.create_session('s', source=source)
++    authority = SessionAuthority(SimpleNamespace(_draining=False, adapters={}), profile_id='p', instance_id='t',
++                                 db=db, epoch=rt.begin_runtime_epoch(db, instance_id='t'))
++    live = authority.sessions['s'] = LiveSession(SimpleNamespace(platform=None, user_id='u'), 'route')
++    ref = SessionRef('p', 's')
++    rt.admit_session_input(db, epoch=authority.epoch, principal_id='u', session_id='s',
++                          request_id='first', payload={'text': 'first'})
++    if queued_payload is not None:
++        rt.admit_session_input(db, epoch=authority.epoch, principal_id='u', session_id='s',
++                              request_id='next', payload=queued_payload)
++    try:
++        await authority._claim_next(ref, live)
++        eligible = queued_payload == {'text': 'next'}
++        assert authority.launch_sources == ({'s': source} if eligible else {})
++        db._execute_write(lambda conn: conn.execute(
++            'UPDATE sessions SET source=? WHERE id=?', ('cron' if source == 'cli' else 'cli', 's')))
++        authority._publish_pending(ref)
++        if eligible:
++            pending = authority._pending_receipt(authority._pending_rows(ref)[1])
++            assert pending.controls == (['steer', 'replace'] if source == 'cli' else [])
++    finally:
++        db.close()
++
++
+ @pytest.mark.asyncio
+ @pytest.mark.parametrize('cancel_observer', [False, True])
+ @pytest.mark.parametrize('frozen_source', [None, 'cron'])
+-- 
+2.43.0
+

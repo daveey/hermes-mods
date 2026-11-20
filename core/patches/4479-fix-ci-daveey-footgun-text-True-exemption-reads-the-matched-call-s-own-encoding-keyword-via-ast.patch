@@ -1,0 +1,231 @@
+From 19fc51c46476d44a06c8e5f5bf24b3d70cd0cd31 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 15:49:34 +0000
+Subject: [PATCH] fix(ci): [daveey] footgun text=True exemption reads the
+ matched call's own encoding= keyword via ast
+
+Review of PR #3340 found the paren-walk continuation scan accepted encoding=
+from nested/enclosing calls and triple-quoted string bodies. Attribute the
+keyword from the parsed call instead; adds negative regressions for nested,
+enclosing, multiline-string and **kwargs shapes.
+
+Self-heal other-4df1303e86 (t_4cda207002aa8237).
+---
+ scripts/check-windows-footguns.py             | 107 +++++++-----------
+ ...t_footgun_multiline_subprocess_encoding.py |  44 +++++++
+ 2 files changed, 86 insertions(+), 65 deletions(-)
+
+diff --git a/scripts/check-windows-footguns.py b/scripts/check-windows-footguns.py
+index fb4ba2a030bfa66f55046520e9a5fb80f0cc17ad..97b5e36c5783eb0bc329513f7cb8faa90243b169 100644
+--- a/scripts/check-windows-footguns.py
++++ b/scripts/check-windows-footguns.py
+@@ -34,6 +34,7 @@ Suppress an intentional use (e.g. tests or platform-gated code) with:
+ from __future__ import annotations
+ 
+ import argparse
++import ast
+ import os
+ import re
+ import subprocess
+@@ -138,13 +139,14 @@ class Footgun:
+     # the regex can't fully distinguish (e.g. open() where mode may contain
+     # "b" for binary, or the line may have `encoding=` elsewhere).
+     post_filter: Callable[..., Any] | None = None
+-    # Optional "the rest of this call excuses it" pattern. When the call
+-    # that contains the match is still open at the end of the matched line,
+-    # the scanner reads its continuation lines (paren-balanced, comments and
+-    # string contents ignored) and drops the hit if this pattern matches
+-    # there. Lets a line-based rule see ``encoding=`` passed on a later line
+-    # of the same multi-line call instead of forcing a suppression marker.
+-    call_continuation_exempt: re.Pattern | None = None
++    # Optional (match_keyword, exempt_keyword) pair. When the line-based hit
++    # is a keyword argument ``match_keyword`` of a call (found by parsing the
++    # file), the hit is dropped if that SAME call also passes
++    # ``exempt_keyword`` as a direct keyword, on any of its lines. Lets the
++    # text=True rule see ``encoding=`` on a continuation line of a
++    # multi-line call without a suppression marker; keywords of nested or
++    # enclosing calls, string contents and ``**kwargs`` never excuse a hit.
++    call_keyword_exempt: tuple[str, str] | None = None
+ 
+ 
+ # A real open() mode. The regex stops at the first comma, so
+@@ -454,7 +456,7 @@ FOOTGUNS: list[Footgun] = [
+         ),
+         # encoding= on a continuation line of the same call is not a
+         # footgun (it used to need a `# windows-footgun: ok` marker).
+-        call_continuation_exempt=re.compile(r"\bencoding\s*="),
++        call_keyword_exempt=("text", "encoding"),
+     ),
+     Footgun(
+         name="bare Path.read_text()/write_text() without encoding=",
+@@ -696,63 +698,37 @@ def _call_closes_on_line(line: str, open_paren_end: int) -> bool:
+     return False
+ 
+ 
+-def _paren_walk(segment: str, depth: int) -> tuple[str, int]:
+-    """Walk ``segment`` from paren ``depth``, skipping string contents.
++_UNPARSED = object()
+ 
+-    Returns (code text consumed, depth after). Stops right after the paren
+-    that brings depth to 0. String bodies are dropped from the returned text
+-    so ``"encoding="`` inside a literal never excuses a hit.
+-    """
+-    out: list[str] = []
+-    quote: str | None = None
+-    i, n = 0, len(segment)
+-    while i < n:
+-        c = segment[i]
+-        if quote:
+-            if c == "\\" and i + 1 < n:
+-                i += 2
+-                continue
+-            if c == quote:
+-                quote = None
+-            i += 1
+-            continue
+-        if c in ("'", '"'):
+-            quote = c
+-        elif c == "(":
+-            depth += 1
+-        elif c == ")":
+-            depth -= 1
+-            if depth <= 0:
+-                return "".join(out), 0
+-        out.append(c)
+-        i += 1
+-    return "".join(out), depth
+ 
+-
+-_CALL_CONTINUATION_MAX_LINES = 40
++def _parse_module(text: str) -> ast.AST | None:
++    try:
++        return ast.parse(text)
++    except (SyntaxError, ValueError):
++        return None
+ 
+ 
+-def _call_continuation(lines: list[str], index: int, code: str, match_end: int) -> str:
+-    """Code text of the continuation lines of the call open at ``match_end``.
++def _call_keyword_exempt(tree: ast.AST | None, lineno: int, pair: tuple[str, str]) -> bool:
++    """True when every call passing keyword ``pair[0]`` on line ``lineno``
++    also passes ``pair[1]`` as its own direct keyword (on any line).
+ 
+-    ``index`` is the 0-based position of the matched line in ``lines`` and
+-    ``code`` that line's comment-stripped code. Returns "" when the call
+-    closes on the matched line (nothing continues), so a hit is excused only
+-    by text that really belongs to the same multi-line call.
++    Keyword attribution comes from the parsed call, so an ``encoding=`` of a
++    nested or enclosing call, inside a string, or hidden in ``**kwargs``
++    never excuses a hit. An unparseable file never exempts.
+     """
+-    _, depth = _paren_walk(code[:match_end], 0)
+-    if depth <= 0:
+-        return ""
+-    _, depth = _paren_walk(code[match_end:], depth)
+-    if depth <= 0:
+-        return ""
+-    collected: list[str] = []
+-    for nxt in lines[index + 1 : index + 1 + _CALL_CONTINUATION_MAX_LINES]:
+-        text, depth = _paren_walk(_strip_code(nxt), depth)
+-        collected.append(text)
+-        if depth <= 0:
+-            break
+-    return "\n".join(collected)
++    if tree is None:
++        return False
++    match_kw, exempt_kw = pair
++    found = False
++    for node in ast.walk(tree):
++        if not isinstance(node, ast.Call):
++            continue
++        if not any(k.arg == match_kw and k.value.lineno == lineno for k in node.keywords):
++            continue
++        found = True
++        if not any(k.arg == exempt_kw for k in node.keywords):
++            return False
++    return found
+ 
+ 
+ def _looks_like_string_literal(line: str, match: re.Match) -> bool:
+@@ -870,8 +846,8 @@ def scan_file(path: Path, footguns: list[Footgun]) -> list[tuple[int, str, Footg
+     # triple-quote we see; we don't try to handle nested or f-string cases.
+     in_triple: str | None = None  # None, "'''", or '"""'
+ 
+-    all_lines = text.splitlines()
+-    for i, line in enumerate(all_lines, start=1):
++    tree: Any = _UNPARSED
++    for i, line in enumerate(text.splitlines(), start=1):
+         # Update triple-quote state based on this line's occurrences.
+         code_for_scan = line
+         if in_triple:
+@@ -930,10 +906,11 @@ def scan_file(path: Path, footguns: list[Footgun]) -> list[tuple[int, str, Footg
+                 except (IndexError, AttributeError):
+                     # Post-filter assumed a named group that isn't there — skip.
+                     continue
+-            if fg.call_continuation_exempt is not None and fg.call_continuation_exempt.search(
+-                _call_continuation(all_lines, i - 1, code, match.end())
+-            ):
+-                continue
++            if fg.call_keyword_exempt is not None:
++                if tree is _UNPARSED:
++                    tree = _parse_module(text)
++                if _call_keyword_exempt(tree, i, fg.call_keyword_exempt):
++                    continue
+             matches.append((i, line.rstrip(), fg))
+     return matches
+ 
+diff --git a/tests/scripts/test_footgun_multiline_subprocess_encoding.py b/tests/scripts/test_footgun_multiline_subprocess_encoding.py
+index b437f7f7707f7298cec55e194cdca73c363b3579..a359f91c009a032ea1039492f019d204c06af723 100644
+--- a/tests/scripts/test_footgun_multiline_subprocess_encoding.py
++++ b/tests/scripts/test_footgun_multiline_subprocess_encoding.py
+@@ -91,3 +91,47 @@ def test_no_stale_multiline_suppression_markers():
+                 if "text=True" in line and stale.search(line):
+                     offenders.append(f"{p.relative_to(REPO_ROOT)}:{n}")
+     assert offenders == []
++
++
++# Negative regressions from the exact-head review of PR #3340: an encoding=
++# that is not a direct keyword of the matched subprocess call must not
++# excuse it.
++
++
++def test_encoding_in_nested_call_is_still_flagged(tmp_path):
++    src = (
++        "import subprocess\n"
++        "subprocess.run(['git'], text=True,\n"
++        "               env=dict(encoding='utf-8'))\n"
++    )
++    assert _hits(tmp_path, src) == [2]
++
++
++def test_encoding_of_enclosing_call_is_still_flagged(tmp_path):
++    src = (
++        "import subprocess\n"
++        "consume(subprocess.run(['git'], text=True),\n"
++        "        encoding='utf-8')\n"
++    )
++    assert _hits(tmp_path, src) == [2]
++
++
++def test_encoding_inside_multiline_string_is_still_flagged(tmp_path):
++    src = (
++        "import subprocess\n"
++        "subprocess.run(['git'], text=True,\n"
++        "               input=\"\"\"hello\n"
++        "encoding=utf-8\n"
++        "\"\"\")\n"
++    )
++    assert _hits(tmp_path, src) == [2]
++
++
++def test_encoding_via_kwargs_is_not_trusted(tmp_path):
++    src = (
++        "import subprocess\n"
++        "kw = {'encoding': 'utf-8'}\n"
++        "subprocess.run(['git'], text=True,\n"
++        "               **kw)\n"
++    )
++    assert _hits(tmp_path, src) == [3]
+-- 
+2.43.0
+

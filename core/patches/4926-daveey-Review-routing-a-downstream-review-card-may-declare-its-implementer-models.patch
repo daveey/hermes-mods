@@ -1,0 +1,156 @@
+From db4198ee4e97937bac9ed94d479c203d4e9ca925 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 07:27:22 +0000
+Subject: [PATCH] [daveey] Review routing: a downstream review card may declare
+ its implementer models
+
+Problem: 2026-11-19, review card t_7da7c164e7b1d000 of PR #3633 gave up twice: "Review model resolution failed:
+Downstream review implementer evidence is unavailable". PR #3633 was written in a Claude Code session.
+
+Why 1: since 3249911ef27 `resolve_review_model` refuses a downstream review (title "Independent ... review") when
+`implementer_models` finds no implementer, so a reviewer is never chosen blind and never on the implementer's model.
+Why 2: `implementer_models` reads implementers only from linked source cards (pins and run routes) and the creator
+card.
+Why 3: a change written outside the board (a Claude Code session landing through `hermes-core-wt ship`) has no
+source card; ship files the review card from a CLI with no creator and no links.
+Root (happened): the provenance rule had no input for work that no card performed.
+Root (not caught): the fail-closed tests covered missing and evicted source cards, not reviews of card-less work.
+
+Fix: `declared_implementers(body)` reads one line `<!-- implementer-models: a, b -->` from a downstream review
+card's body; `implementer_models` adds those models for downstream cards. Concrete ids only: a class selector or a
+malformed entry voids the whole declaration (nothing is declared). Linked and declared implementers are both
+excluded. A card that is not a downstream review ignores the line. `hermes-core-wt ship` writes the line from the
+PR commits' Co-Authored-By trailers (state change, separate PR).
+
+Tests: tests/hermes_cli/test_kanban_review_declared_implementers.py (the parser's accepted and void forms; a
+declared review has evidence; an undeclared one with no source still fails closed through resolve_review_model;
+declared and linked models are both excluded; a non-review card's declaration is ignored).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_review_model.py             | 19 +++++
+ ...est_kanban_review_declared_implementers.py | 75 +++++++++++++++++++
+ 2 files changed, 94 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_review_declared_implementers.py
+
+diff --git a/hermes_cli/kanban_review_model.py b/hermes_cli/kanban_review_model.py
+index 41f821b3f883d9e6dce60d264ef2b7792cf5d103..8cb8ed7d91cf1719cdfd5a98116742a18743b2b1 100644
+--- a/hermes_cli/kanban_review_model.py
++++ b/hermes_cli/kanban_review_model.py
+@@ -8,6 +8,23 @@ from typing import Any
+ from agent.model_routing import ModelRoutingError, eligible_routes, is_class_selector, validate_policy
+ 
+ _DOWNSTREAM_REVIEW = re.compile(r"\A\W*independent\b[^\n]*\breview\b", re.IGNORECASE)
++# [daveey] A downstream review card's own declaration of who implemented the change, for work no Kanban card wrote
++# (a Claude Code session landing through ``hermes-core-wt ship``): one line ``<!-- implementer-models: a, b -->``
++# in the card body, written by the filing tool from the commits' Co-Authored-By trailers. Concrete model ids only.
++_DECLARED = re.compile(r"^<!-- implementer-models: ([^>\n]*) -->$", re.MULTILINE)
++_MODEL_ID = re.compile(r"[a-z0-9][a-z0-9._-]{1,79}")
++
++
++def declared_implementers(body) -> set[str]:
++    """Models a review card's body declares as the change's implementers (``_DECLARED``). A malformed entry or a
++    class selector makes the whole declaration void: it then proves nothing, as if absent."""
++    found: set[str] = set()
++    for match in _DECLARED.finditer(body or ""):
++        names = [name.strip() for name in match.group(1).split(",")]
++        if not names or any(not _MODEL_ID.fullmatch(name) or is_class_selector(name) for name in names):
++            return set()
++        found.update(names)
++    return found
+ 
+ 
+ def _downstream(task):
+@@ -54,6 +71,8 @@ def implementer_models(conn, task) -> set[str]:
+                 if model:
+                     models.add(model)
+         if downstream:
++            # Declared provenance counts as evidence of its own: the change came from outside the board.
++            models.update(declared_implementers(getattr(stored, "body", None)))
+             created = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='created' "
+                                    "ORDER BY id LIMIT 1", (card.id,)).fetchone()
+             creator = _payload(created[0] if created else None).get("creator_task_id")
+diff --git a/tests/hermes_cli/test_kanban_review_declared_implementers.py b/tests/hermes_cli/test_kanban_review_declared_implementers.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b6f95ef4aaeccb02a456b76b1338d36eed9250f6
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_review_declared_implementers.py
+@@ -0,0 +1,75 @@
++"""A downstream review card may declare its implementer models in its body. [daveey]
++
++2026-11-19: since 3249911ef27 a downstream review fails closed without implementer evidence, and that evidence came
++only from linked source cards. A change written in a Claude Code session (no Kanban card) could therefore never be
++reviewed: review card t_7da7c164e7b1d000 for PR #3633 gave up twice with "Downstream review implementer evidence is
++unavailable". ``hermes-core-wt ship`` now writes ``<!-- implementer-models: ... -->`` from the commits'
++Co-Authored-By trailers.
++
++Entry paths: ``declared_implementers`` (pure), ``implementer_models`` and ``resolve_review_model`` on a real SQLite
++board (the fixtures of test_kanban_review_implementer_set).
++"""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_review_model as review
++from tests.hermes_cli import test_kanban_review_implementer_set as base
++from tests.hermes_cli.test_kanban_quota_episode import board as board  # noqa: PLC0414 -- pytest fixture
++
++clock = base.clock
++OPUS, ASTRA = base.OPUS, base.ASTRA
++TITLE = 'Independent exact-head review PR #1 @abc (core-wt ship review required)'
++
++
++@pytest.mark.parametrize('body, expected', [
++    ('<!-- implementer-models: claude-opus-5-5 -->', {'claude-opus-5-5'}),
++    ('intro\n<!-- implementer-models: claude-fable-5-2, claude-opus-5-5 -->\nmore', {'claude-fable-5-2', 'claude-opus-5-5'}),
++    ('<!-- implementer-models: a-model -->\n<!-- implementer-models: b-model -->', {'a-model', 'b-model'}),
++    ('', set()),
++    (None, set()),
++    ('implementer-models: claude-opus-5-5', set()),                      # not the marker line
++    ('  <!-- implementer-models: claude-opus-5-5 -->', set()),             # must start the line
++    ('<!-- implementer-models: class:deep -->', set()),                    # a class is no implementer
++    ('<!-- implementer-models: claude-opus-5-5, Bad Name -->', set()),     # one bad entry voids the declaration
++    ('<!-- implementer-models:  -->', set()),
++])
++def test_declared_implementers(body, expected):
++    assert review.declared_implementers(body) == expected
++
++
++def _review(conn, body):
++    tid = kb.create_task(conn, title=TITLE, assignee='a', body=body)
++    conn.commit()
++    return kb.get_task(conn, tid)
++
++
++def test_a_declared_review_has_implementer_evidence(board):
++    with kbc.connect_closing() as conn:
++        task = _review(conn, f'Review it.\n<!-- implementer-models: {OPUS} -->\n')
++        assert review.implementer_models(conn, task) == {OPUS}
++
++
++def test_an_undeclared_review_with_no_source_still_fails_closed(board):
++    with kbc.connect_closing() as conn:
++        task = _review(conn, 'Review it.')
++        assert review.implementer_models(conn, task) == set()
++        with pytest.raises(review.ReviewModelUnavailable, match='Downstream review implementer evidence'):
++            review.resolve_review_model(conn, task, {})
++
++
++def test_declared_and_linked_implementers_are_both_excluded(board):
++    with kbc.connect_closing() as conn:
++        source = base._card(conn, ASTRA)
++        task = _review(conn, f'<!-- implementer-models: {OPUS} -->')
++        kb.link_tasks(conn, task.id, source)
++        conn.commit()
++        assert review.implementer_models(conn, kb.get_task(conn, task.id)) == {OPUS, ASTRA}
++
++
++def test_a_declaration_on_a_card_that_is_not_a_review_is_ignored(board):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title='implement it', assignee='a',
++                             body=f'<!-- implementer-models: {OPUS} -->')
++        conn.commit()
++        assert review.implementer_models(conn, kb.get_task(conn, tid)) == set()
+-- 
+2.43.0
+

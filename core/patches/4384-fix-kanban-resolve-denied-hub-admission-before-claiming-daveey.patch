@@ -1,0 +1,240 @@
+From 2520cb78fc33743b0fa57e69ad813622f29fedec Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:51:11 +0000
+Subject: [PATCH] fix(kanban): resolve denied hub admission before claiming
+ [daveey]
+
+WIP implementation for t_4d807f70795b9218. Five new regressions fail on base and pass with the change. Focused canonical suites pass. Additional detector controls, corpus replay, gate review and deployment proof remain before publication.
+---
+ hermes_cli/kanban_hub_admission_claim.py      | 55 +++++++++++++-----
+ hermes_cli/kanban_hub_admission_placement.py  |  3 +-
+ .../test_kanban_claim_deny_selfcheck.py       |  9 +--
+ .../test_kanban_denied_claim_disposition.py   | 58 +++++++++++++++++++
+ .../test_kanban_hub_admission_claim.py        |  5 +-
+ 5 files changed, 109 insertions(+), 21 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_denied_claim_disposition.py
+
+diff --git a/hermes_cli/kanban_hub_admission_claim.py b/hermes_cli/kanban_hub_admission_claim.py
+index e9ae7dd47568b26c29b5e9a8cd5abf7bad96dbd9..25214d83cba8c8d219c15db8b15d0a570e2cd719 100644
+--- a/hermes_cli/kanban_hub_admission_claim.py
++++ b/hermes_cli/kanban_hub_admission_claim.py
+@@ -242,15 +242,37 @@ def _apply(conn: sqlite3.Connection, own: str, tid: str, audit: dict, target: Op
+ 
+ def _self_check(conn: sqlite3.Connection, card: sqlite3.Row, own: str, cfg: dict, board: str, event_head: int,
+                 counts: Counts) -> None:
+-    """Re-place a judged card an earlier deny left here (``kanban_worker_first_selfcheck.denied_target``). A failure
+-    skips only this card: the screen of the unjudged cards behind it must still run."""
+-    from hermes_cli.kanban_worker_first_selfcheck import denied_target, log_repin
++    """Resolve a prior deny now, not after a stale-ready interval that permits an intervening claim."""
++    from hermes_cli import kanban_hub_admission_pickup as pickup
+     try:
+-        found = denied_target(conn, card, own, cfg, board=board)
+-        if found and _replace(conn, own, card["id"], *found, expected=card, event_head=event_head):
++        prior = pickup.verdict(conn, card["id"])
++        if not prior or prior.get("admit") is not False or prior.get("forced"):
++            return
++        fields = pickup.card_fields(card, board)
++        audit = {k: v for k, v in prior.items() if k not in ("kept", "home")}
++        audit["entry"] = ENTRY
++        kept = keep_reason(conn, card, fields, cfg)
++        target = None if kept else pickup._target(fields, own, cfg, audit)
++        if target is not None:
++            reason = f"hub admission denied before claim: {str(prior.get('why') or '')[:200]}"
++            if prior.get("kept"):
++                reason += f"; kept for '{prior['kept']}', which no longer holds"
++            if not _replace(conn, own, card["id"], target, reason, expected=card, event_head=event_head):
++                counts.defer(card["id"])
++                return
++            from hermes_cli.kanban_worker_first_selfcheck import log_repin
++            log_repin(card["id"], target, reason)
+             counts.repinned += 1
+-            log_repin(card["id"], *found)
+-    except Exception:  # health: allow BLE001 -- a backstop; the card is claimed here as before
++            return
++        audit["kept"] = kept or audit.get("home") or NO_QUEUE
++        applied = _apply(conn, own, card["id"], audit, None, expected=card, event_head=event_head)
++        if applied is None:
++            counts.defer(card["id"])
++        else:
++            counts.kept += 1
++            counts.home += "home" in audit
++    except Exception:  # health: allow BLE001 -- a denied card cannot run without a current disposition
++        counts.defer(card["id"])
+         _log.warning("hub admission: denied-card self-check failed for %s", card["id"], exc_info=True)
+ 
+ 
+@@ -316,16 +338,21 @@ def unjudged_claims(conn: sqlite3.Connection, own: str, *, now: Optional[float]
+     rows = conn.execute(
+         "SELECT e.task_id, e.created_at, e.id FROM task_events e WHERE e.kind = 'claimed' AND e.created_at >= ? "
+         "AND json_valid(e.payload) AND json_extract(e.payload, '$.holder') = ? "
+-        "AND NOT EXISTS (SELECT 1 FROM task_events v WHERE v.task_id = e.task_id AND v.kind = 'hub_admission' "
+-        "AND v.id < e.id) ORDER BY e.id", (max(int(gate), int(now) - window), own)).fetchall()
++        "ORDER BY e.id", (max(int(gate), int(now) - window), own)).fetchall()
+     out = []
+     for task_id, created_at, _id in rows:
+-        created = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created' "
+-                               "ORDER BY id LIMIT 1", (task_id,)).fetchone()
++        prior = conn.execute(
++            "SELECT kind, payload FROM task_events WHERE task_id = ? AND id < ? "
++            "AND (kind = 'hub_admission' OR (kind = 'created' AND json_valid(payload) "
++            "AND json_type(payload, '$.hub_admission') = 'object')) ORDER BY id DESC LIMIT 1",
++            (task_id, _id)).fetchone()
+         try:
+-            audit = (json.loads(created[0]) or {}).get("hub_admission") if created and created[0] else None
+-        except (TypeError, ValueError, AttributeError):
++            audit = json.loads(prior[1]) if prior and prior[1] else None
++            if prior and prior[0] == "created":
++                audit = audit.get("hub_admission") if isinstance(audit, dict) else None
++        except (TypeError, ValueError):
+             audit = None
+-        if not isinstance(audit, dict):
++        if (not isinstance(audit, dict)
++                or (audit.get("admit") is False and not audit.get("kept") and not audit.get("forced"))):
+             out.append((task_id, int(created_at)))
+     return out
+diff --git a/hermes_cli/kanban_hub_admission_placement.py b/hermes_cli/kanban_hub_admission_placement.py
+index 27be68be66adb12320eccba3e244c1db69ce513c..3a5f9b96e52680b8c576fcdbb78732344daa3d15 100644
+--- a/hermes_cli/kanban_hub_admission_placement.py
++++ b/hermes_cli/kanban_hub_admission_placement.py
+@@ -550,7 +550,8 @@ def pool_route(args, cfg, gateway, audit, requires, *, queue=True, machine_ok=No
+         # It stays home; ``requires`` stays as declared (the hub:write the deny route adds is for workers).
+         out = {"where": "local", "why": f"hub admission denied, but the text {coordination.ACTION_REASON} "
+                                         "no pool worker is attested for, so it stays here",
+-               "hub_admission": {**audit, "home": coordination.ACTION_REASON}}
++               "hub_admission": {**audit, "home": coordination.ACTION_REASON,
++                                 "kept": coordination.ACTION_REASON}}
+         declared = args.get("requires")
+         if declared:
+             # The declared list, normalized: a decision card's raw view can carry a bare string.
+diff --git a/tests/hermes_cli/test_kanban_claim_deny_selfcheck.py b/tests/hermes_cli/test_kanban_claim_deny_selfcheck.py
+index 7182d2cc74629b6cc9e09bf678666abccd1b0b1d..5f2126be06e5ace0311ef68280c959553523f507 100644
+--- a/tests/hermes_cli/test_kanban_claim_deny_selfcheck.py
++++ b/tests/hermes_cli/test_kanban_claim_deny_selfcheck.py
+@@ -134,7 +134,7 @@ def test_self_check_repins_a_denied_card_left_ready_on_the_hub(gws, hub_judge, p
+     assert counts.repinned == 1 and hub_judge.calls == []  # no new verdict, no model call
+     assert moved["runs_on"][0] == POOL and moved["previous_runs_on"] is None and moved["queued"] is True
+     assert moved["self_check"] == "hub_admission_denied"
+-    assert moved["reason"].startswith("dispatcher self-check: ready 180 min here after hub admission denied it")
++    assert moved["reason"].startswith("hub admission denied before claim:")
+     assert "a worker with ssh + hub-admin can do it" in moved["reason"]
+     assert ("no longer holds" in moved["reason"]) is (case == "stale_kept")
+     assert f"repinned {tid}" in caplog.text
+@@ -157,7 +157,7 @@ def _linux_only():
+ 
+ # case -> (card kwargs, verdict overrides or a whole verdict, wake_check, waited seconds, cfg override, registry)
+ _STAY = {
+-    "young": ({}, {}, PROBE, 60, None, None),
++
+     "kept_holds": ({}, {}, "test -f ~/.hermes/cache/ready.flag", 3 * 3600, None, None),
+     "dir_workspace": ({"workspace_kind": "dir"}, {"kept": "host workspace"}, PROBE, 3 * 3600, None, None),
+     "host_repo": ({"requires": ["terminal", "host_repo"]}, {"kept": "uncarried requirement"}, PROBE, 3 * 3600,
+@@ -194,17 +194,18 @@ def test_self_check_leaves_other_cards_on_the_hub(gws, hub_judge, portable, monk
+ 
+ def test_a_failed_self_check_still_screens_the_unjudged_cards(gws, hub_judge, portable, monkeypatch, caplog):
+     hub, _worker, _svc = gws
+-    _card(hub, wake_check=PROBE, verdict=STALE_KEPT)
++    denied = _card(hub, wake_check=PROBE, verdict=STALE_KEPT)
+     hub_judge.admit_next = False
+     fresh = _card(hub)
+ 
+     def broken(*args, **kwargs):
+         raise RuntimeError("registry exploded")
+-    monkeypatch.setattr(selfcheck, "denied_target", broken)
++    monkeypatch.setattr(hac, "_replace", broken)
+     with caplog.at_level(logging.WARNING, logger=hac.__name__):
+         counts = hac.screen(hub.conn)
+     assert counts.judged == 1 and counts.moved == 1 and len(_events(hub.conn, fresh, "moved")) == 1
+     assert "denied-card self-check failed" in caplog.text
++    assert denied in counts.deferred_ids
+ 
+ 
+ def test_self_check_repins_a_card_whose_only_verdict_is_in_its_created_payload(gws, hub_judge, portable,
+diff --git a/tests/hermes_cli/test_kanban_denied_claim_disposition.py b/tests/hermes_cli/test_kanban_denied_claim_disposition.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c4a10cccd2b6639668e75285146126bbc448b820
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_denied_claim_disposition.py
+@@ -0,0 +1,58 @@
++"""Previously judged denies require an actionable claim-time disposition."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_hub_admission_claim as hac
++from tests.hermes_cli import test_kanban_hub_admission_claim as support
++
++hub_judge = support.hub_judge
++gws = support.gws
++_claim_screen_first = support._claim_screen_first
++
++
++def deny(hub, tid):
++    with kb.write_txn(hub.conn):
++        kb._append_event(hub.conn, tid, "hub_admission", {"admit": False, "why": "portable"})
++
++
++def test_fresh_prior_deny_moves_before_claim(gws, hub_judge):
++    hub, _worker, svc = gws
++    tid = support._hub_card(hub)
++    deny(hub, tid)
++    support._tick(hub)
++    assert support._holder(svc, tid) != support.HUB
++    assert support._events(hub.conn, tid, "moved")
++    assert hub_judge.calls == []
++
++
++@pytest.mark.parametrize("body,reason", [
++    ("Finish ~/code/_wt/local-only", "hub worktree path in the brief"),
++    ("Run hermes-hub outcomes --id original", "needs home coordination action"),
++])
++def test_prior_deny_records_current_keep(gws, hub_judge, body, reason):
++    hub, _worker, svc = gws
++    tid = support._hub_card(hub, body=body)
++    deny(hub, tid)
++    support._tick(hub)
++    assert support._holder(svc, tid) == support.HUB
++    latest = support._events(hub.conn, tid, "hub_admission")[-1]
++    assert latest.get("kept") == reason
++    assert hub_judge.calls == []
++
++
++def test_detector_counts_denied_claim_without_keep(gws):
++    hub, _worker, _svc = gws
++    tid = support._hub_card(hub)
++    deny(hub, tid)
++    with kb.write_txn(hub.conn):
++        kb._append_event(hub.conn, tid, "claimed", {"holder": support.HUB})
++    assert tid in [t for t, _at in hac.unjudged_claims(hub.conn, support.HUB)]
++
++
++def test_create_home_override_is_explicit_keep():
++    from hermes_cli import kanban_hub_admission_placement as placement
++    result = placement.pool_route(
++        {"title": "Read request", "body": "Run hermes-hub outcomes --id original"},
++        {}, "hub", {"admit": False}, [])
++    assert result["hub_admission"].get("kept") == "needs home coordination action"
++    assert "runs_on" not in result and "placement_policy" not in result
+diff --git a/tests/hermes_cli/test_kanban_hub_admission_claim.py b/tests/hermes_cli/test_kanban_hub_admission_claim.py
+index cfb2d4e0d0073c1b82a14299d6e03b91b7b5aa12..6115d2ab63578357aff33f16ff10f0bc4ffc5c95 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission_claim.py
++++ b/tests/hermes_cli/test_kanban_hub_admission_claim.py
+@@ -254,14 +254,15 @@ def test_a_card_with_any_verdict_makes_no_model_call(gws, hub_judge, prior):
+     with kb.write_txn(hub.conn):
+         kb._append_event(hub.conn, tid, "hub_admission", prior)
+     _tick(hub)
+-    assert hub_judge.calls == [] and _holder(svc, tid) == HUB
++    assert hub_judge.calls == []
++    assert (_holder(svc, tid) == HUB) is bool(prior.get("admit") or prior.get("forced"))
+ 
+ 
+ def test_a_creation_time_verdict_makes_no_model_call(gws, hub_judge):
+     hub, _worker, svc = gws
+     tid = _hub_card(hub, placement_audit={"hub_admission": {"admit": False, "why": "skipped", "entry": "create"}})
+     _tick(hub)
+-    assert hub_judge.calls == [] and _holder(svc, tid) == HUB
++    assert hub_judge.calls == [] and _holder(svc, tid) != HUB
+ 
+ 
+ def test_a_non_hub_gateway_makes_no_model_call(gws, hub_judge):
+-- 
+2.43.0
+

@@ -1,0 +1,368 @@
+From 20efbaa4a37673574775e257be12d8e134e8aa6b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 22:46:32 +0000
+Subject: [PATCH] [daveey] Bound passive timer exemption by observed probe
+ custody
+
+Preserve overdue timer recovery for never-observed local executors and split-custody rows masking remote silence. Recheck memo at observation expiry. Proof: seven custody controls (two reproduced red before fix), 53 predicate cases; mutation audit 43 killed plus one equivalent redundant blank-command guard. Independent prepublication review found no remaining issues. Exact-head CI/review and deployment remain required.
+---
+ hermes_cli/kanban_continuation.py             |   6 +-
+ hermes_cli/kanban_passive_intake.py           |  29 ++++
+ .../hermes_cli/test_kanban_passive_intake.py  |   4 +-
+ .../test_kanban_passive_intake_custody.py     | 104 +++++++++++++
+ .../test_kanban_passive_intake_predicates.py  | 139 ++++++++++++++++++
+ website/docs/user-guide/configuration.md      |   5 +-
+ 6 files changed, 283 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_passive_intake_custody.py
+ create mode 100644 tests/hermes_cli/test_kanban_passive_intake_predicates.py
+
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index 4361bead38c5c3a4a1bcd84145fce4b3341b7e00..9850c8793e112f350e2cabd621728b61b772bc0b 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -348,8 +348,10 @@ def _wake_parks(conn: sqlite3.Connection, now: Optional[int], passive_policy=Non
+                 pending.append(int(info["wake_at"]) if info and info.get("wake_at") is not None else now)
+             continue
+         from hermes_cli import kanban_passive_intake as passive
+-        if passive.current(conn, tid, payload.get("wake_check"), policy=passive_policy, park=park):
+-            continue  # no renewed timestamp or exempt timer in the memo deadline
++        quiet_until = passive.quiet_until(conn, tid, park, now, policy=passive_policy)
++        if quiet_until is not None:
++            pending.append(quiet_until)
++            continue  # recheck custody even if no board content changes
+         wake_at = payload["wake_at"]
+         pending.append(int(wake_at))  # a skipped or stale wake stays due: the next tick retries it
+         if wake_at > now:
+diff --git a/hermes_cli/kanban_passive_intake.py b/hermes_cli/kanban_passive_intake.py
+index ea214a8a160a1d9fba52fc5fa3d05129d7aa6066..9db3d1d7d54c4d7eb51820855673d56d80a60475 100644
+--- a/hermes_cli/kanban_passive_intake.py
++++ b/hermes_cli/kanban_passive_intake.py
+@@ -53,3 +53,32 @@ def current(conn, task_id, cmd, *, policy=None, park=None) -> bool:
+     if not park["timed"] or payload.get("wake_check") != cmd:
+         return False
+     return eligible(task_id, cmd, payload.get("awaiting"), payload.get("blocker_id"), policy=policy)
++
++
++def quiet_until(conn, task_id, park, now, *, policy=None) -> int | None:
++    """Bound timer deferral by observed custody, not by a registration alone."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_wake_check as wc
++
++    payload = park["payload"]
++    cmd = payload.get("wake_check")
++    if not current(conn, task_id, cmd, policy=policy, park=park):
++        return None
++    host, own = payload.get("probe_host"), wc.own_gateway(conn)
++    every = wc.normalize_every(payload.get("check_every"))
++    if host and own and host != own:
++        rows = conn.execute(
++            "SELECT payload, created_at FROM task_events WHERE task_id = ? AND id > ? AND kind = ?",
++            (task_id, park["event_id"], wc.ALIVE_EVENT)).fetchall()
++        observed = max((int(at) for raw, at in rows
++                        if (note := kb._json_dict(raw)).get("host") == host
++                        and note.get("wake_check") == cmd), default=0)
++    else:
++        state = wc.get_state(conn, task_id)
++        if not state or state["cmd"] != cmd or state["last_rc"] != 1 or state["fails"]:
++            return None
++        observed = int(state["last_at"] or 0)
++    if observed < park["parked_at"] or not observed:
++        return None
++    deadline = observed + wc.ALIVE_EVERY + 2 * every + wc.SILENT_GRACE + 1
++    return deadline if deadline > now else None
+diff --git a/tests/hermes_cli/test_kanban_passive_intake.py b/tests/hermes_cli/test_kanban_passive_intake.py
+index bc1ceb4dd5be20e58b34c22a556210a401cd0179..121e3266197560d0a99493a7fa5ba03fcb26a24e 100644
+--- a/tests/hermes_cli/test_kanban_passive_intake.py
++++ b/tests/hermes_cli/test_kanban_passive_intake.py
+@@ -40,7 +40,8 @@ def test_quiet_episode_and_expired_timer(listener):
+     state = wc.get_state(conn, tid)
+     assert state["episode_first_at"] == now
+     assert state["episode_checks"] == 2
+-    assert kc._wake_parks(conn, now + 49 * 3600) == ([], None)
++    assert kc._wake_parks(conn, now + 49 * 3600) == (
++        [], now + 49 * 3600 + wc.ALIVE_EVERY + 2 * state["every"] + wc.SILENT_GRACE + 1)
+     assert kc.park_state(conn, tid) == park
+ 
+ 
+@@ -81,6 +82,7 @@ def test_removal_invalidates_quiet_sweep_memo(listener, monkeypatch):
+     monkeypatch.setattr(wc, "run_due_wake_checks", lambda *a, **kw: None)
+     monkeypatch.setattr(registry, "maybe_refresh_async", lambda: None)
+     now = int(time.time()) + 49 * 3600
++    apply(listener, now)
+     assert kc.wake_due_continuations(conn, now=now) == []
+     assert kc.wake_due_continuations(conn, now=now) == []
+     policy.clear()
+diff --git a/tests/hermes_cli/test_kanban_passive_intake_custody.py b/tests/hermes_cli/test_kanban_passive_intake_custody.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..83af5127120d6ec0c0192a0bc0613ca2f4b36e0d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_passive_intake_custody.py
+@@ -0,0 +1,104 @@
++"""Passive listeners must retain recovery when execution custody is unhealthy."""
++import time
++
++import pytest
++
++from hermes_cli import config
++from hermes_cli import kanban_continuation as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_wake_check as wc
++from tests.hermes_cli import test_kanban_passive_intake as passive_helpers
++from tests.hermes_cli import test_kanban_wake_check as helpers
++from tests.hermes_cli import test_kanban_wake_check_home as custody
++
++kanban_home = helpers.kanban_home
++listener = passive_helpers.listener
++gws = custody.gws
++
++
++def test_passive_local_probe_loss_restores_once_then_wakes(listener):
++    conn, tid, _ = listener
++    custody._lose(conn, tid)
++    assert wc.restore_missing_checks(conn) == {"restored": [tid], "woken": []}
++    assert wc.get_state(conn, tid)["cmd"] == "exit 1"
++    assert wc.restore_missing_checks(conn) == {"restored": [], "woken": []}
++    custody._lose(conn, tid)
++    assert wc.restore_missing_checks(conn) == {"restored": [], "woken": [tid]}
++    assert kb.get_task(conn, tid).status == "ready"
++    assert helpers._events(conn, tid, wc.LOST_EVENT)[-1].payload["reason"] == "lost_again"
++    assert wc.restore_missing_checks(conn) == {"restored": [], "woken": []}
++    assert len(helpers._events(conn, tid, wc.LOST_EVENT)) == 1
++
++
++def _passive_relay(gws, tmp_path, monkeypatch):
++    home, worker = gws
++    policy = {}
++    monkeypatch.setattr(config, "load_config_readonly", lambda: {"kanban": {"passive_intake": policy}})
++    flag = tmp_path / "intake"
++    tid = custody._relayed_park(home, worker, flag)
++    policy[tid] = custody._probe(flag)
++    home.round()
++    home.enter()
++    return home, worker, tid, policy
++
++
++def test_passive_remote_silence_still_wakes_once(gws, tmp_path, monkeypatch):
++    home, _worker, tid, _policy = _passive_relay(gws, tmp_path, monkeypatch)
++    park = kc.park_state(home.conn, tid)
++    deadline = park["parked_at"] + wc.ALIVE_EVERY + 600 + wc.SILENT_GRACE
++    assert wc.restore_missing_checks(home.conn, now=deadline) == {"restored": [], "woken": []}
++    assert wc.get_state(home.conn, tid) is None
++    assert wc.restore_missing_checks(home.conn, now=deadline + 1) == {"restored": [], "woken": [tid]}
++    assert helpers._events(home.conn, tid, wc.LOST_EVENT)[-1].payload["reason"] == "remote_probe_silent"
++    assert wc.restore_missing_checks(home.conn, now=deadline + 2) == {"restored": [], "woken": []}
++    assert len(helpers._events(home.conn, tid, wc.LOST_EVENT)) == 1
++
++
++def test_passive_remote_heartbeat_extends_silence_deadline(gws, tmp_path, monkeypatch):
++    home, worker, tid, _policy = _passive_relay(gws, tmp_path, monkeypatch)
++    parked_at = kc.park_state(home.conn, tid)["parked_at"]
++    heartbeat_at = parked_at + wc.ALIVE_EVERY + 1
++    worker.enter()
++    # Exercise the actual heartbeat producer, then transport its event home.
++    monkeypatch.setattr(wc.time, "time", lambda: heartbeat_at)
++    assert wc.run_due_wake_checks(worker.conn, now=heartbeat_at, wait=True)["submitted"] == [tid]
++    worker.round()
++    home.round()
++    home.enter()
++    assert helpers._events(home.conn, tid, wc.ALIVE_EVENT)
++    old_deadline = parked_at + wc.ALIVE_EVERY + 600 + wc.SILENT_GRACE + 1
++    assert wc.restore_missing_checks(home.conn, now=old_deadline) == {"restored": [], "woken": []}
++    deadline = heartbeat_at + wc.ALIVE_EVERY + 600 + wc.SILENT_GRACE + 1
++    assert wc.restore_missing_checks(home.conn, now=deadline) == {"restored": [], "woken": [tid]}
++
++
++@pytest.mark.parametrize("passive_enabled", [False, True])
++def test_unobserved_local_executor_retains_overdue_timer_recovery(listener, passive_enabled):
++    conn, tid, policy = listener
++    if not passive_enabled:
++        policy.clear()
++    # A registration is not liveness: the executor never produces even one result.
++    state = wc.get_state(conn, tid)
++    assert state["last_at"] is None
++    now = int(time.time()) + 49 * 3600
++    assert wc.restore_missing_checks(conn, now=now) == {"restored": [], "woken": []}
++    woken, _deadline = kc._wake_parks(conn, now)
++    assert woken == [tid], "a never-observed executor must not gain an indefinite timer exemption"
++
++
++@pytest.mark.parametrize("passive_enabled", [False, True])
++def test_split_custody_cannot_hide_remote_silence_and_timer(gws, tmp_path, monkeypatch, passive_enabled):
++    home, worker, tid, policy = _passive_relay(gws, tmp_path, monkeypatch)
++    if not passive_enabled:
++        policy.clear()
++    # A stale local execution row coexists with the park's designated remote owner.
++    # This is not proof that either executor is running.
++    with kb.write_txn(home.conn):
++        wc.set_check(home.conn, tid, custody._probe(tmp_path / "intake"), 300)
++    assert wc.get_state(home.conn, tid) is not None
++    assert wc.get_state(worker.conn, tid) is not None
++    park = kc.park_state(home.conn, tid)
++    now = int(park["payload"]["wake_at"]) + 1
++    recovered = wc.restore_missing_checks(home.conn, now=now)["woken"]
++    woken, _deadline = kc._wake_parks(home.conn, now)
++    assert tid in recovered + woken, "split custody must not disable both silence detection and timer recovery"
+diff --git a/tests/hermes_cli/test_kanban_passive_intake_predicates.py b/tests/hermes_cli/test_kanban_passive_intake_predicates.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..425593c48b42cc96c4bf8e1f964cf29292df90f2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_passive_intake_predicates.py
+@@ -0,0 +1,139 @@
++"""Boundary tests for the fail-closed passive-listener policy and custody clock."""
++import json
++import time
++from typing import Any
++
++import pytest
++
++from hermes_cli import config
++from hermes_cli import kanban_continuation as kc
++from hermes_cli import kanban_passive_intake as passive
++from hermes_cli import kanban_wake_check as wc
++from tests.hermes_cli import test_kanban_passive_intake as helpers
++
++kanban_home = helpers.kanban_home
++listener = helpers.listener
++TID = "t_abc123"
++CMD = "exit 1"
++AWAITING = helpers.AWAITING
++
++
++@pytest.mark.parametrize("cfg", [None, [], True, {"kanban": []}, {"kanban": True},
++    {"kanban": {"passive_intake": []}},
++    *[{"kanban": {"passive_intake": {TID: CMD, key: value}}}
++      for key, value in [(3, CMD), ("t_ABC", CMD), ("t_", CMD), ("t_abc\n", CMD),
++                         ("t_def", None), ("t_def", "  ")]]])
++def test_snapshot_rejects_whole_malformed_mapping(monkeypatch, cfg):
++    monkeypatch.setattr(config, "load_config_readonly", lambda: cfg)
++    assert passive.snapshot() == {}
++
++
++@pytest.mark.parametrize("error", [OSError, ValueError])
++def test_snapshot_read_failure(monkeypatch, error):
++    def fail():
++        raise error("unavailable")
++    monkeypatch.setattr(config, "load_config_readonly", fail)
++    assert passive.snapshot() == {}
++
++
++def test_snapshot_copy_preserves_exact_command(monkeypatch):
++    value = {TID: CMD + " "}
++    monkeypatch.setattr(config, "load_config_readonly", lambda: {"kanban": {"passive_intake": value}})
++    result = passive.snapshot()
++    assert result == value and result is not value
++    assert not passive.eligible(TID, CMD, AWAITING, policy=result)
++
++
++@pytest.mark.parametrize("change", ["policy", "task", "command", "blank", "nonstring", "blocker",
++    "awaiting", "kind", "inferred", "ref_type", "ref_blank", "why_type", "why_blank"])
++def test_eligibility_each_clause(change):
++    tid, cmd, blocker, policy = TID, CMD, None, {TID: CMD}
++    awaiting: Any = dict(AWAITING)
++    if change == "policy": policy = []
++    if change == "task": tid = "t_def"
++    if change == "command": cmd += " "
++    if change == "blank": cmd = "  "; policy = {TID: cmd}
++    if change == "nonstring": cmd = 1; policy = {TID: cmd}
++    if change == "blocker": blocker = ""
++    if change == "awaiting": awaiting = []
++    if change == "kind": awaiting["kind"] = "ci"
++    if change == "inferred": awaiting["inferred"] = True
++    if change.endswith("_type"): awaiting[change.split("_")[0]] = 1
++    if change.endswith("_blank"): awaiting[change.split("_")[0]] = "  "
++    assert not passive.eligible(tid, cmd, awaiting, blocker, policy=policy)
++
++
++@pytest.mark.parametrize("producer", [None, ("task", "t_def"), ("probe", CMD)])
++def test_producer_classification(monkeypatch, producer):
++    from hermes_cli import kanban_wait_info
++    monkeypatch.setattr(kanban_wait_info, "producer_from_wake_check", lambda cmd: producer)
++    assert passive.eligible(TID, CMD, AWAITING, policy={TID: CMD}) is bool(producer and producer[0] == "probe")
++
++
++@pytest.fixture
++def clock(monkeypatch):
++    park = {"timed": True, "event_id": 10, "parked_at": 100,
++            "payload": {"wake_check": CMD, "awaiting": dict(AWAITING), "check_every": 300}}
++    state = {"cmd": CMD, "last_rc": 1, "fails": 0, "last_at": 100}
++    monkeypatch.setattr(wc, "own_gateway", lambda conn: "home")
++    monkeypatch.setattr(wc, "get_state", lambda conn, tid: state)
++    return park, state
++
++
++@pytest.mark.parametrize("change", ["untimed", "policy", "missing", "command", "rc0", "rc2", "fails", "old", "zero", "none"])
++def test_local_custody_each_clause(clock, monkeypatch, change):
++    park, state = clock
++    policy = {TID: CMD}
++    if change == "untimed": park["timed"] = False
++    if change == "policy": policy = {}
++    if change == "missing": monkeypatch.setattr(wc, "get_state", lambda *a: None)
++    if change == "command": state["cmd"] += " "
++    if change.startswith("rc"): state["last_rc"] = int(change[-1])
++    if change == "fails": state["fails"] = 1
++    if change == "old": state["last_at"] = 99
++    if change == "zero": state["last_at"] = 0; park["parked_at"] = 0
++    if change == "none": state["last_at"] = None
++    assert passive.quiet_until(None, TID, park, 100, policy=policy) is None
++
++
++@pytest.mark.parametrize("host,own", [(None, "home"), ("home", "home"), ("remote", None)])
++def test_local_custody_boundary(clock, monkeypatch, host, own):
++    park, _state = clock
++    park["payload"]["probe_host"] = host
++    monkeypatch.setattr(wc, "own_gateway", lambda conn: own)
++    deadline = 100 + wc.ALIVE_EVERY + 600 + wc.SILENT_GRACE + 1
++    assert passive.quiet_until(None, TID, park, deadline - 1, policy={TID: CMD}) == deadline
++    assert passive.quiet_until(None, TID, park, deadline, policy={TID: CMD}) is None
++
++
++@pytest.mark.parametrize("change", ["valid", "host", "command", "before", "old_event", "kind", "task", "absent"])
++def test_remote_heartbeat_identity_and_freshness(clock, listener, change):
++    conn, tid, _ = listener
++    park, _state = clock
++    park["payload"]["probe_host"] = "remote"
++    # Real isolated DB query: enforce the task, event-id and kind filters too.
++    conn.execute("DELETE FROM task_events")
++    note = {"host": "wrong" if change == "host" else "remote",
++            "wake_check": CMD + " " if change == "command" else CMD}
++    if change != "absent":
++        conn.execute("INSERT INTO task_events (id, task_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)",
++                     (9 if change == "old_event" else 11, "t_other" if change == "task" else tid,
++                      "other" if change == "kind" else wc.ALIVE_EVENT, json.dumps(note),
++                      99 if change == "before" else 100))
++    deadline = 100 + wc.ALIVE_EVERY + 600 + wc.SILENT_GRACE + 1
++    assert passive.quiet_until(conn, tid, park, 100, policy={tid: CMD}) == (deadline if change == "valid" else None)
++
++
++def test_custody_deadline_invalidates_sweep_memo(listener, monkeypatch):
++    from hermes_cli import kanban_capability_registry as registry
++    conn, tid, _ = listener
++    monkeypatch.setattr(wc, "run_due_wake_checks", lambda *a, **kw: None)
++    monkeypatch.setattr(registry, "maybe_refresh_async", lambda: None)
++    now = int(time.time()) + 49 * 3600
++    helpers.apply(listener, now)
++    state = wc.get_state(conn, tid)
++    assert state is not None
++    deadline = now + wc.ALIVE_EVERY + 2 * state["every"] + wc.SILENT_GRACE + 1
++    assert kc.wake_due_continuations(conn, now=now) == []
++    assert kc.wake_due_continuations(conn, now=deadline - 1) == []
++    assert kc.wake_due_continuations(conn, now=deadline) == [tid]
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index 0f325c7dffb51f3e125a54affec56fcf28896dd5..d616e60663400a1069ff4f108e1c38fbb3fb6eac 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -33,7 +33,10 @@ with no inferred producer or effective shared `blocker_id`. Card/CI probes do no
+ Malformed configuration fails closed to ordinary wake/re-park guards.
+ 
+ Eligible clean exit-1 probes retain their episode age and check counts but do not
+-wake merely for age; their timer backstop is suppressed without renewing its timestamp.
++wake merely for age. Their timer backstop is suppressed without renewing its timestamp
++only while a current clean local result or matching remote heartbeat proves recent
++probe activity. The timer scan rechecks at that observation's silence deadline;
++registration alone, stale results and unrelated heartbeats do not defer an overdue timer.
+ Only same-premise re-park escalation is exempt: repeated successful-probe/re-park
+ cycles still escalate. Exit 0, broken probes, lost/silent probe recovery and normal
+ probe cadence remain unchanged. Removing the entry reactivates ordinary guards,
+-- 
+2.43.0
+

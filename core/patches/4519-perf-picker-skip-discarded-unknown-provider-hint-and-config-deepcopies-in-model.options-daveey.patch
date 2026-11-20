@@ -1,0 +1,292 @@
+From 9a4bb978ac370918055ba22c5e08e4c8a78243c6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 18:02:45 +0000
+Subject: [PATCH] perf(picker): skip discarded unknown-provider hint and config
+ deepcopies in model.options [daveey]
+
+Warm model.options profile after #3345: is_runtime_provider_routable built a config-validation
+hint (validate_config_structure x5) it threw away; four read-only config probes deep-copied the
+merged config. Same decisions/output; guarded by test_picker_warm_cost_cuts + the 13-case matrix.
+Worker-4 warm thread-CPU median 34.0 -> 27.7 ms.
+---
+ fixture/cache/plugin_hooks.json               |  2 +-
+ hermes_cli/auth.py                            |  9 +-
+ hermes_cli/auth_plugin_providers.py           | 16 ++++
+ hermes_cli/model_catalog.py                   |  7 +-
+ hermes_cli/model_switch_providers.py          |  4 +-
+ .../hermes_cli/test_bare_custom_picker_row.py |  6 +-
+ tests/hermes_cli/test_model_catalog.py        |  4 +-
+ .../hermes_cli/test_picker_warm_cost_cuts.py  | 94 +++++++++++++++++++
+ 8 files changed, 126 insertions(+), 16 deletions(-)
+ create mode 100644 tests/hermes_cli/test_picker_warm_cost_cuts.py
+
+diff --git a/fixture/cache/plugin_hooks.json b/fixture/cache/plugin_hooks.json
+index fc8e63031caaab61b6d3029f936e889f45cfe1ef..e573b708f9b65a8553b58bd5d7d5b91ab478a83c 100644
+--- a/fixture/cache/plugin_hooks.json
++++ b/fixture/cache/plugin_hooks.json
+@@ -1 +1 @@
+-{"version": 1, "fingerprint": "7af0cf1e9bc92b4cc7c8940b7947dad36625f8d6b4b817a9dcce35661e9ba698", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
++{"version": 1, "fingerprint": "30663ffde4ba2fde515cfd40d8ec58f7b50afd3ffdb9e8ba36a5784433787f44", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
+diff --git a/hermes_cli/auth.py b/hermes_cli/auth.py
+index cf0ac57ba4c48225bb7c715b229a294bed36adea..7c4c06142cde618beaffa38b2a5e3561d66db28d 100644
+--- a/hermes_cli/auth.py
++++ b/hermes_cli/auth.py
+@@ -260,7 +260,7 @@ from hermes_cli.config import (
+ # auth_type they declare; the mirror lives in the sibling so it can be re-run after discovery.
+ from hermes_cli.auth_plugin_providers import (
+     canonical_registry_rows as _canonical_registry_rows, get_plugin_oauth_auth_status,
+-    registry_lookup as _registry_lookup, sync_plugin_provider_registry)
++    registry_lookup as _registry_lookup, name_resolves, sync_plugin_provider_registry)
+ 
+ PROVIDER_REGISTRY.sync_before_first_read()  # not at import: listing providers reads config
+ 
+@@ -930,10 +930,9 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
+     if normalized in {"auto", "openrouter", "custom", "moa"} or normalized.startswith("custom:"):
+         return True
+     try:
+-        resolve_provider(normalized)
++        return name_resolves(normalized, _plugin_aliases(), resolve_provider)
+     except AuthError:
+         return False
+-    return True
+ 
+ 
+ def read_credential_pool(provider_id: Optional[str] = None) -> dict[str, Any]:
+@@ -1160,8 +1159,8 @@ def _config_selects_provider(normalized: str) -> bool:
+     Anthropic credentials for that slot even when the main model is another provider; otherwise
+     Claude Code OAuth entries get pruned by ``load_pool("anthropic")`` and MoA advisors fail with
+     "no ANTHROPIC_API_KEY" while the picker says Anthropic is logged in."""
+-    from hermes_cli.config import load_config
+-    cfg = load_config()
++    from hermes_cli.config import load_config_readonly
++    cfg = load_config_readonly()  # read-only probe: skip the defensive deepcopy
+     if _slot_selects(cfg.get("model"), normalized):
+         return True
+     # ``auxiliary.<task>.provider: <id>`` selects the provider for that task the same way a MoA
+diff --git a/hermes_cli/auth_plugin_providers.py b/hermes_cli/auth_plugin_providers.py
+index 3658c209de8fe43bc4e7f73595307c34bd11bb79..ac7c5e1d10cd024b791d3bdba2083a3092c147f1 100644
+--- a/hermes_cli/auth_plugin_providers.py
++++ b/hermes_cli/auth_plugin_providers.py
+@@ -314,6 +314,22 @@ def registry_lookup(provider_id: str) -> Optional[Any]:
+     return pconfig
+ 
+ 
++def name_resolves(normalized: str, aliases: dict[str, str], resolver: Callable[[str], Any]) -> bool:
++    """``resolver(normalized)`` succeeding, decided without the resolver's error path.
++
++    ``resolve_provider`` answers openrouter/custom/registered names (after aliasing) with the name and
++    raises ``Unknown provider`` for any other non-"auto" name only after building a config-validation
++    hint (~15% of a warm ``model.options``). A routability probe discards that text, so settle those
++    cases here; only "auto" still needs the resolver (it may raise ``AuthError``)."""
++    resolved = aliases.get(normalized, normalized)
++    if resolved in ("openrouter", "custom") or registry_lookup(resolved) is not None:
++        return True
++    if resolved != "auto":
++        return False
++    resolver(normalized)
++    return True
++
++
+ def plugin_profile(provider: str) -> Optional[Any]:
+     """The registered ``ProviderProfile`` for *provider*, or None (also when the layer is unavailable)."""
+     try:
+diff --git a/hermes_cli/model_catalog.py b/hermes_cli/model_catalog.py
+index bd4ab13770c578d0a3aa87bc2601162e1d4b1423..2aef93ff5eb2ce0f2e624ff25d643d1e2e7c1252 100644
+--- a/hermes_cli/model_catalog.py
++++ b/hermes_cli/model_catalog.py
+@@ -9,6 +9,7 @@ whose callers fall back to the in-repo lists on ``None``.
+ from __future__ import annotations
+ 
+ import contextvars
++import copy
+ import json
+ import logging
+ import threading
+@@ -86,8 +87,8 @@ def clear_fetch_backoff() -> None:
+ def _load_catalog_config() -> dict[str, Any]:
+     """Load the ``model_catalog`` config block with defaults filled in."""
+     try:
+-        from hermes_cli.config import load_config
+-        cfg = load_config() or {}
++        from hermes_cli.config import load_config_readonly
++        cfg = load_config_readonly() or {}
+     except Exception:
+         cfg = {}
+     raw = cfg.get("model_catalog")
+@@ -113,7 +114,7 @@ def _load_catalog_config() -> dict[str, Any]:
+         "enabled": bool(raw.get("enabled", True)),
+         "url": str(raw.get("url") or DEFAULT_CATALOG_URL),
+         "ttl_hours": ttl_minutes / 60.0,
+-        "providers": raw.get("providers") if isinstance(raw.get("providers"), dict) else {}}
++        "providers": copy.deepcopy(raw["providers"]) if isinstance(raw.get("providers"), dict) else {}}
+ 
+ 
+ def _cache_path() -> Path:
+diff --git a/hermes_cli/model_switch_providers.py b/hermes_cli/model_switch_providers.py
+index 6395af6b3c4415285e74da3ce1892970b7420b38..034834baa75a5a5a4bcb8d8b9884926c91649f1c 100644
+--- a/hermes_cli/model_switch_providers.py
++++ b/hermes_cli/model_switch_providers.py
+@@ -1127,8 +1127,8 @@ def _lap_bare_custom_row(b: _PickerBuild, custom_providers: list | None) -> None
+         default_model = b.current_model
+     else:
+         try:
+-            from hermes_cli.config import load_config
+-            cfg_model = load_config().get("model")
++            from hermes_cli.config import load_config_readonly
++            cfg_model = load_config_readonly().get("model")
+         except Exception:  # health: allow BLE001 -- config.yaml may be user-edited or mid-migration; a read failure must degrade to "no row", never crash the picker
+             cfg_model = None
+         # config.model can be a bare string in older configs (see load_picker_context);
+diff --git a/tests/hermes_cli/test_bare_custom_picker_row.py b/tests/hermes_cli/test_bare_custom_picker_row.py
+index 2b3cffe015d805efb2360ab1b217d524ebf6edc1..6cc5224b18908fc87af02b2a244cd1bb736ba4ca 100644
+--- a/tests/hermes_cli/test_bare_custom_picker_row.py
++++ b/tests/hermes_cli/test_bare_custom_picker_row.py
+@@ -18,7 +18,7 @@ def test_bare_custom_row_survives_switching_away_from_it(monkeypatch):
+     monkeypatch.setattr("agent.models_dev.fetch_models_dev", dict)
+     monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+     monkeypatch.setattr(
+-        "hermes_cli.config.load_config",
++        "hermes_cli.config.load_config_readonly",
+         lambda: {
+             "model": {"default": "gpt-4o", "provider": "custom", "base_url": "https://www.ccsub.net/v1"}
+         },
+@@ -52,7 +52,7 @@ def test_bare_custom_row_config_fallback_defers_to_matching_named_entry(monkeypa
+     monkeypatch.setattr("agent.models_dev.fetch_models_dev", dict)
+     monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+     monkeypatch.setattr(
+-        "hermes_cli.config.load_config",
++        "hermes_cli.config.load_config_readonly",
+         lambda: {
+             "model": {"default": "gpt-4o", "provider": "custom", "base_url": "https://www.ccsub.net/v1"}
+         },
+@@ -76,7 +76,7 @@ def test_bare_custom_row_config_fallback_tolerates_legacy_scalar_model(monkeypat
+     (the ConfigContext loader already tolerates it)."""
+     monkeypatch.setattr("agent.models_dev.fetch_models_dev", dict)
+     monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+-    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"model": "gpt-4o"})
++    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"model": "gpt-4o"})
+ 
+     providers = list_authenticated_providers(
+         current_provider="xai",
+diff --git a/tests/hermes_cli/test_model_catalog.py b/tests/hermes_cli/test_model_catalog.py
+index 5d55f8ed14d911ffcd97f90970f2e30757b07856..08694e1a276c008efc1a8daeb7a2c53a4ad69367 100644
+--- a/tests/hermes_cli/test_model_catalog.py
++++ b/tests/hermes_cli/test_model_catalog.py
+@@ -420,10 +420,10 @@ class TestRefreshCadence:
+     def test_default_ttl_is_twenty_minutes_and_legacy_hours_honoured(self):
+         from hermes_cli import model_catalog
+ 
+-        with patch("hermes_cli.config.load_config", return_value={"model_catalog": {"ttl_minutes": 20}}):
++        with patch("hermes_cli.config.load_config_readonly", return_value={"model_catalog": {"ttl_minutes": 20}}):
+             assert model_catalog.refresh_interval_seconds() == 20 * 60
+         # A user-set legacy ttl_hours still wins while ttl_minutes sits at its default.
+-        with patch("hermes_cli.config.load_config", return_value={"model_catalog": {"ttl_minutes": 20, "ttl_hours": 3}}):
++        with patch("hermes_cli.config.load_config_readonly", return_value={"model_catalog": {"ttl_minutes": 20, "ttl_hours": 3}}):
+             assert model_catalog.refresh_interval_seconds() == 3 * 3600
+ 
+     def test_refresh_catalogs_forces_every_source(self):
+diff --git a/tests/hermes_cli/test_picker_warm_cost_cuts.py b/tests/hermes_cli/test_picker_warm_cost_cuts.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8909040422a3c50817e806bed1cd81a28b335f59
+--- /dev/null
++++ b/tests/hermes_cli/test_picker_warm_cost_cuts.py
+@@ -0,0 +1,94 @@
++"""model.options warm-cost cuts: no work whose result the picker discards or deep-copies for nothing.
++
++Behavior is pinned against reference implementations of the OLD code, so the cuts stay byte-identical.
++"""
++import copy
++
++import pytest
++
++from hermes_cli import auth
++from hermes_cli.auth import AuthError
++
++
++def _old_routable(provider_id):
++    """The pre-cut ``is_runtime_provider_routable`` body."""
++    normalized = (provider_id or "").strip().lower()
++    if not normalized:
++        return False
++    if normalized in {"auto", "openrouter", "custom", "moa"} or normalized.startswith("custom:"):
++        return True
++    try:
++        auth.resolve_provider(normalized)
++    except AuthError:
++        return False
++    return True
++
++
++_IDS = [
++    "", "  ", None, "auto", "openrouter", "custom", "moa", "custom:foo", "OpenRouter", " anthropic ",
++    "anthropic", "claude", "deepseek", "no-such-provider", "opencode-free", "gemini", "google",
++    "nous", "zai", "glm", "codex", "openai-codex", "bedrock", "vertex", "x" * 40,
++]
++
++
++@pytest.mark.parametrize("pid", _IDS)
++def test_routable_matches_old_behavior(pid):
++    assert auth.is_runtime_provider_routable(pid) is _old_routable(pid)
++
++
++def test_unknown_provider_probe_builds_no_error_hint(monkeypatch):
++    """A routability probe discards the error text, so it must not validate the whole config for it."""
++    from hermes_cli import auth_error_copy
++
++    def refuse(*args, **kwargs):
++        raise AssertionError("routability probe built an unknown-provider hint")
++
++    monkeypatch.setattr(auth_error_copy, "unknown_provider_hint", refuse)
++    assert auth.is_runtime_provider_routable("no-such-provider-xyz") is False
++    # The resolver itself still raises the same hinted error for real callers.
++    monkeypatch.undo()
++    with pytest.raises(AuthError) as exc:
++        auth.resolve_provider("no-such-provider-xyz")
++    assert exc.value.code == "invalid_provider"
++    assert "Unknown provider 'no-such-provider-xyz'." in str(exc.value)
++
++
++def test_config_selects_provider_does_not_deepcopy_config(monkeypatch):
++    from hermes_cli import config
++
++    calls = []
++    real = config.load_config
++
++    def counting(*args, **kwargs):
++        calls.append(1)
++        return real(*args, **kwargs)
++
++    monkeypatch.setattr(config, "load_config", counting)
++    auth._config_selects_provider("anthropic")
++    assert calls == [], "pure-read config probe must use load_config_readonly"
++
++
++def test_config_selects_provider_never_mutates_cached_config(home_config):
++    from hermes_cli.config import load_config_readonly
++    before = copy.deepcopy(load_config_readonly())
++    for pid in ("openrouter", "anthropic", "deepseek", "nope"):
++        auth._config_selects_provider(pid)
++    assert load_config_readonly() == before
++
++
++def test_catalog_config_values_unchanged_and_isolated(home_config):
++    from hermes_cli import model_catalog
++    from hermes_cli.config import load_config_readonly
++    cfg = model_catalog._load_catalog_config()
++    raw = load_config_readonly().get("model_catalog") or {}
++    assert cfg["enabled"] is bool(raw.get("enabled", True))
++    cfg["providers"]["__probe__"] = 1  # a caller mutating its copy must not reach the shared cache
++    assert "__probe__" not in (load_config_readonly().get("model_catalog") or {}).get("providers", {})
++
++
++@pytest.fixture
++def home_config():
++    from hermes_constants import get_hermes_home
++    (get_hermes_home() / "config.yaml").write_text(
++        "model:\n  default: x\n  provider: openrouter\nmodel_catalog:\n  providers:\n    acme: {url: u}\n")
++    return get_hermes_home()
+-- 
+2.43.0
+

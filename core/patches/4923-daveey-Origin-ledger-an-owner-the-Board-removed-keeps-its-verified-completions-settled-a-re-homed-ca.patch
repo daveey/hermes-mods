@@ -1,0 +1,284 @@
+From 918bef74073b23b1dca932c0a5acefd6f6bfebea Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 21:16:05 +0000
+Subject: [PATCH] [daveey] Origin ledger: an owner the Board removed keeps its
+ verified completions settled; a re-homed card drops the old binding
+
+Problem: 2026-11-18, after 2a234f4444d. The last stuck rows were origin-ledger obligations (`via: origin`) on
+removed workers 2-8: 29 in MacBook chats, 4 in hub chats. 30 of the 33 were verified completions the ledger had
+already released (`released = 1`); they still projected `unknown` and unfinished. Two hub rows were cards the
+Board had re-homed from worker-3 to the hub (one done, one running).
+
+Why 1: `project` marks a row observed only when it is `current` (the replica holds exactly its stored version) or
+`settled` (current and released, 1b5a0f853f9).
+Why 2: the Board drops a removed machine's records, so no row can ever be current again, and settled needs current.
+Why 3: a re-home moves the card's `created_on` to the new owner; the origin ledger's binding keeps naming the old
+owner, and no rule follows the move.
+Root (happened): the ledger had a case for a quiet owner whose record is still published, none for an owner that
+no longer exists, and none for a re-homed card.
+Root (not caught): no test removed the owner from the replica after the ledger observed its completion.
+
+Fix (`kanban_origin_ledger.project`, fresh replica only, not this gateway's own cards): an owner is removed when
+the replica holds neither an info row nor a task record for it (an offline owner keeps its info row). For such a
+row:
+- another gateway publishing the same card (board, id, non-null created_at, `_published_elsewhere`) owns it now:
+  the binding to the old owner is not projected; the new owner's record speaks for the card;
+- otherwise a stored verified completion is settled (released, done), as for a quiet owner;
+- an archive with owner evidence but no verified completion is closed (`closed_uncompleted`), as when observed;
+- an unverified completion stays unknown, and so does an open card (its last observed status may be out of date).
+`project`'s owner-scope decoding moved unchanged into `_owner_scope` (complexity cap).
+
+Tests: tests/hermes_cli/test_kanban_release_survives_owner_offline.py (verified completion stays released after
+removal; unverified stays unknown; an owner with its info row is offline, not removed; a stale replica proves no
+removal; a removed owner's open card stays unknown; a re-homed card with the same created_at drops the binding
+and one with another created_at does not). 51 origin-ledger test files (935 tests) pass on the hub.
+Dry run of the patched projection on the MacBook's live data: stuck rows 29 -> 0; on the hub's, 4 -> 0.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_origin_ledger.py            | 107 ++++++++++++++----
+ ...t_kanban_release_survives_owner_offline.py |  86 ++++++++++++++
+ 2 files changed, 169 insertions(+), 24 deletions(-)
+
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 233b93d18abd61a82db9af90f680b57872d7a1b2..4e4bba51d3750eb10a0351abf05188b678e2248e 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -407,6 +407,79 @@ def refresh_observations(path: Path, replica: Path, *, timeout: float = 5) -> No
+         source.close()
+ 
+ 
++def _owner_scope(source: sqlite3.Connection, infos: dict, owner: dict) -> tuple:
++    """``(readable, heartbeat, window)`` of the owner's exact (profile, board) scope in its collector's
++    ``gateway/info`` row. Decoded once per owner gateway per projection (``infos``). [daveey]"""
++    gw_info = infos.get(owner['gateway'])
++    if gw_info is None:
++        inventory = source.execute(
++            "SELECT data FROM replica WHERE gw=? AND coll='gateway' AND key='info'",
++            (owner['gateway'],)).fetchone()
++        try:
++            gw_info = infos[owner['gateway']] = (json.loads(inventory[0]) if inventory else {}, None)
++        except (ValueError, TypeError) as exc:
++            gw_info = infos[owner['gateway']] = (None, exc)
++    try:
++        if gw_info[1] is not None:
++            raise gw_info[1]
++        info = gw_info[0]
++        scopes = info.get('task_scopes')
++        if not isinstance(scopes, list):
++            scopes = []
++        matching = [s for s in scopes if isinstance(s, dict)
++                    and (s.get('profile'), s.get('board')) == (owner['profile'], owner['board'])]
++        readable = (info.get('gateway') == owner['gateway'] and len(matching) == 1
++                    and matching[0].get('state') == 'ok')
++        heartbeat = matching[0].get('observed_at') if readable else None
++        return readable, heartbeat, scope_window(info)
++    except (ValueError, TypeError, AttributeError):
++        return False, None, SCOPE_HEARTBEAT_FLOOR_S
++
++
++def _listed_gateways(source: sqlite3.Connection | None) -> frozenset:
++    """Gateways a fresh replica still knows: an info row or any task record. An offline owner keeps its info row; a
++    machine removed from the Board has neither. Empty when there is no fresh replica (nothing counts as removed)."""
++    if source is None:
++        return frozenset()
++    return frozenset(str(r[0]) for r in source.execute(
++        "SELECT DISTINCT gw FROM replica WHERE coll IN ('gateway','tasks')"))
++
++
++def _removed_owner(source, listed: frozenset, owner: dict, task: dict, me: tuple) -> bool | None:
++    """True when this binding's owner is a machine the Board removed and its stored observation of the card is closed
++    (done or archived), so that observation is its final word; None when the card was re-homed and the binding is not
++    projected; False otherwise. [daveey]
++
++    Workers 2-8, 2026-11-18: 29 MacBook and 4 hub obligations stayed unknown for good after the Board dropped their
++    owners with every record; 30 were verified completions this ledger had already released. Another gateway
++    publishing the same card (board, id, created_at) owns it now: its own record speaks for the card. This
++    gateway's own cards and an empty or stale replica (``listed`` empty) never count as removed."""
++    if not listed or owner['gateway'] in listed or (owner['gateway'], owner['profile']) == me:
++        return False
++    if _published_elsewhere(source, owner, task):
++        return None
++    # Only a closed card's last word is final: an open one could have moved on before the removal, so it stays unknown.
++    return task.get('status') in ('done', 'archived')
++
++
++def _published_elsewhere(source: sqlite3.Connection, owner: dict, task: dict) -> bool:
++    """Another gateway's replica record of this card: same board and id, same non-null ``created_at`` (a re-home
++    keeps it; an unrelated card that reuses the id does not). [daveey]"""
++    created = task.get('created_at')
++    if created is None or isinstance(created, bool) or not isinstance(created, (int, float, str)):
++        return False
++    pattern = '*/' + owner['board'] + '/' + owner['task_id']
++    for (data,) in source.execute(
++            "SELECT data FROM replica WHERE coll='tasks' AND gw != ? AND key GLOB ?", (owner['gateway'], pattern)):
++        try:
++            other = json.loads(data)
++        except (TypeError, ValueError):
++            continue
++        if isinstance(other, dict) and other.get('created_at') == created:
++            return True
++    return False
++
++
+ def _lock_busy(exc: sqlite3.Error) -> bool:
+     code = getattr(exc, "sqlite_errorcode", None)
+     if code is not None:
+@@ -456,6 +529,9 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+         fresh = False
+     result = []
+     infos: dict[str, tuple] = {}  # owner gateway -> (decoded gateway/info, or the error decoding it)
++    # [daveey] Gateways the fresh replica still knows (an info row or any task record). An offline owner keeps its
++    # info row; a machine removed from the Board has neither (``removed`` below). Read once per projection.
++    listed = _listed_gateways(source if fresh else None)
+     try:
+         with closing(_ro(path)) as conn:
+             from hermes_cli.kanban_origin_legacy import aliases_for_projection
+@@ -497,36 +573,18 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+                     # inventory; missing/ambiguous inventory is not healthy.
+                     # [daveey] Decoded once per owner gateway per projection, not once per obligation: the info row
+                     # lists every scope the owner collects, and every hub card re-decoded it under ``_links_lock``.
+-                    gw_info = infos.get(owner['gateway'])
+-                    if gw_info is None:
+-                        inventory = source.execute(
+-                            "SELECT data FROM replica WHERE gw=? AND coll='gateway' AND key='info'",
+-                            (owner['gateway'],)).fetchone()
+-                        try:
+-                            gw_info = infos[owner['gateway']] = (json.loads(inventory[0]) if inventory else {}, None)
+-                        except (ValueError, TypeError) as exc:
+-                            gw_info = infos[owner['gateway']] = (None, exc)
+-                    try:
+-                        if gw_info[1] is not None:
+-                            raise gw_info[1]
+-                        info = gw_info[0]
+-                        scopes = info.get('task_scopes')
+-                        if not isinstance(scopes, list):
+-                            scopes = []
+-                        matching = [s for s in scopes if isinstance(s, dict)
+-                                    and (s.get('profile'), s.get('board')) == (owner['profile'], owner['board'])]
+-                        readable = (info.get('gateway') == owner['gateway'] and len(matching) == 1
+-                                    and matching[0].get('state') == 'ok')
+-                        heartbeat = matching[0].get('observed_at') if readable else None
+-                        window = scope_window(info)
+-                    except (ValueError, TypeError, AttributeError):
+-                        readable, heartbeat, window = False, None, SCOPE_HEARTBEAT_FLOOR_S
++                    readable, heartbeat, window = _owner_scope(source, infos, owner)
+                     # Owner liveness: the collector's per-scope heartbeat (one record per sync) proves it read
+                     # this whole board recently, so an unchanged, current task record is still observed. The
+                     # per-task stamp is accepted too, for records published before scope heartbeats existed.
+                     live = (_recent(heartbeat, now, window)
+                             or _recent(_owner_evidence(task).get('observed_at'), now))
+                     current = current and readable and live
++                # [daveey] An owner the Board removed (``_removed_owner``): a re-homed card's binding is dropped, and
++                # otherwise its stored observation is its last word (``final``), as a current record would be.
++                final = _removed_owner(source, listed, owner, task, (gateway, profile))
++                if final is None:
++                    continue
+                 if (owner['gateway'], owner['profile']) == (gateway, profile):
+                     from hermes_cli.kanban_origin_local import observe_local_binding
+                     local = observe_local_binding(binding, profile=profile, now=now)
+@@ -544,6 +602,7 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+                                    'blocked', 'triage', 'done', 'archived')
+                 # [daveey] A currently observed owner archive without a verified completion produces nothing: the
+                 # card is closed, not completed. It neither waits nor counts as done, and never releases as done.
++                current = current or final
+                 observed = current or settled
+                 closed = bool(observed and status == 'archived' and not released and _owner_evidence(task))
+                 if not observed or not known or (status in ('done', 'archived') and not released and not closed):
+diff --git a/tests/hermes_cli/test_kanban_release_survives_owner_offline.py b/tests/hermes_cli/test_kanban_release_survives_owner_offline.py
+index 54b2291b248cb1d9ed6add6dbe848ba078d43ec0..0d953279d53bd1802d9258ba4638054c298c69eb 100644
+--- a/tests/hermes_cli/test_kanban_release_survives_owner_offline.py
++++ b/tests/hermes_cli/test_kanban_release_survives_owner_offline.py
+@@ -111,3 +111,89 @@ def test_origin_bound_settled_completion_needs_a_fresh_hub_sync(world, board):
+     path, replica = _bound_done(world)
+     row = _project(path, replica, 1001 + 37 * 3600)  # this gateway has not pulled for 37 h
+     assert row['status'] == 'unknown' and row['unfinished']
++
++
++# ---------------------------------------------------------------- the Board removed the owner machine
++
++
++def _remove_owner(replica, when, path=None):
++    """The Board drops the owner gateway: its info row and every task record leave the replica. Another gateway
++    keeps publishing, so the replica is not empty. With ``path``, the ledger first observes the owner's last record
++    (as every live projection does), so the removal comes after that observation."""
++    if path is not None:
++        _project(path, replica, 1001)
++    with sqlite3.connect(replica) as db:
++        db.execute("DELETE FROM replica WHERE gw='owner'")
++        db.execute("INSERT OR REPLACE INTO replica VALUES ('other','gateway','info',1,?)",
++                   (json.dumps({'gateway': 'other', 'task_scopes': []}),))
++        db.execute("UPDATE meta SET v=? WHERE k='last_ok'", (str(when),))
++
++
++def test_a_removed_owners_verified_completion_stays_released(world, board):
++    path, replica = _bound_done(world)
++    _remove_owner(replica, 5000, path)
++    row = _project(path, replica, 5001)
++    assert (row['status'], row['unfinished'], row['stale']) == ('done', False, False)
++
++
++def test_a_removed_owners_unverified_completion_stays_unknown(world, board):
++    path, replica = _bound_done(world, verified_completion=False)
++    _remove_owner(replica, 5000, path)
++    row = _project(path, replica, 5001)
++    assert row['status'] == 'unknown' and row['unfinished']
++
++
++def test_an_offline_owner_with_its_info_row_is_not_removed(world, board):
++    """Only a missing info row AND no record means removed: an owner that is merely offline keeps its info row."""
++    path, replica = _bound_done(world, verified_completion=False)
++    with sqlite3.connect(replica) as db:
++        db.execute("DELETE FROM replica WHERE gw='owner' AND coll='tasks'")
++        db.execute("UPDATE meta SET v='5000' WHERE k='last_ok'")
++    row = _project(path, replica, 5001)
++    assert row['status'] == 'unknown' and row['unfinished']
++
++
++def test_a_stale_replica_proves_no_removal(world, board):
++    path, replica = _bound_done(world)
++    _remove_owner(replica, 1000, path)
++    row = _project(path, replica, 1000 + 37 * 3600)  # no pull for 37 h
++    assert row['status'] == 'unknown' and row['unfinished']
++
++
++@pytest.mark.parametrize('same_created', [True, False])
++def test_a_rehomed_card_drops_the_binding_to_the_removed_owner(world, board, same_created):
++    path, replica = _bound_done(world, verified_completion=False)
++    _, _, binding = world
++    with sqlite3.connect(replica) as db:  # the fixture's record has no created_at: give the card one
++        task = json.loads(db.execute("SELECT data FROM replica WHERE coll='tasks' AND gw='owner'").fetchone()[0])
++        task['created_at'] = 1234
++        db.execute("UPDATE replica SET data=?, version=6 WHERE coll='tasks' AND gw='owner'", (json.dumps(task),))
++    _remove_owner(replica, 5000, path)
++    moved = {**{k: v for k, v in task.items() if k != 'origin_observation'}, 'gateway': 'other', 'status': 'running'}
++    if not same_created:
++        moved['created_at'] = (task.get('created_at') or 0) + 1
++    key = '/'.join((binding['owner']['profile'], binding['owner']['board'], binding['owner']['task_id']))
++    with sqlite3.connect(replica) as db:
++        db.execute("INSERT INTO replica VALUES ('other','tasks',?,1,?)", (key, json.dumps(moved)))
++    from hermes_cli import kanban_origin_ledger as ledger
++    rows = ledger.project(path, replica=replica, gateway='origin', profile='default', now=5001)
++    if same_created:
++        assert rows == [], 'the new owner publishes the card: the binding to the removed owner is not projected'
++    else:
++        assert len(rows) == 1 and rows[0]['status'] == 'unknown', 'another card that reuses the id proves nothing'
++
++
++
++def test_a_removed_owners_open_card_stays_unknown(world, board):
++    """Its last observed status could be out of date by the time the machine was removed: never shown as current."""
++    from hermes_cli import kanban_db_connect as kbc
++    from tests.hermes_cli.test_kanban_origin_evidence import create_bound, publish_observed
++    from tests.hermes_cli.test_kanban_origin_ledger import accept
++    path, replica, binding = world
++    with kbc.connect_closing() as conn:
++        create_bound(conn, binding)
++        publish_observed(conn, replica, binding, version=3)
++        accept(world)
++    _remove_owner(replica, 5000, path)
++    row = _project(path, replica, 5001)
++    assert (row['status'], row['unfinished'], row['stale']) == ('unknown', True, True)
+-- 
+2.43.0
+

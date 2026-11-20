@@ -1,0 +1,231 @@
+From f9c0626223811b10e9edf406ae872a44d4bdfd55 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:08:48 +0000
+Subject: [PATCH] Add origin-local forwarding authorization primitives
+
+Require an exact accepted local origin binding and live authoritative creator lease before delegated creation. Add bounded paginated lease reads without replica fallback. This is the first implementation slice; transport integration follows before shipping.
+
+Proof: bash scripts/run_tests.sh tests/hermes_cli/test_origin_forward_authority.py: 29 passed; initial 18 cases failed before module existed.
+---
+ hermes_cli/kanban_origin_forward.py           |  83 ++++++++++++
+ .../test_origin_forward_authority.py          | 118 ++++++++++++++++++
+ 2 files changed, 201 insertions(+)
+ create mode 100644 hermes_cli/kanban_origin_forward.py
+ create mode 100644 tests/hermes_cli/test_origin_forward_authority.py
+
+diff --git a/hermes_cli/kanban_origin_forward.py b/hermes_cli/kanban_origin_forward.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c3a161989a6b5e915593385f65e53d34a8d5d0d7
+--- /dev/null
++++ b/hermes_cli/kanban_origin_forward.py
+@@ -0,0 +1,83 @@
++"""Origin-local admission for worker-delegated creation.
++
++Transport must supply the authenticated sender and a fresh authoritative Board
++lease, never a synced task/run row. This module does not send or enqueue work.
++"""
++from __future__ import annotations
++
++import json
++import re
++import sqlite3
++from contextlib import closing
++from pathlib import Path
++
++from hermes_cli.kanban_origin_ledger import _binding_key, binding_hash, validate_binding
++
++
++def _local_binding(ledger: Path, origin: dict, creator: dict) -> dict:
++    # Do not initialize an empty ledger and mistake it for authenticated custody.
++    with closing(sqlite3.connect(ledger.resolve().as_uri() + "?mode=ro", uri=True)) as db:
++        rows = db.execute("SELECT binding_id,binding_hash,binding_json FROM origin_obligations WHERE released=0")
++        for key, digest, raw in rows:
++            binding = json.loads(raw)
++            validate_binding(binding)
++            if (binding["owner"] == creator and binding["origin"] == origin
++                    and key == _binding_key(binding) and digest == binding_hash(binding)):
++                return binding
++    raise ValueError("origin_forward_binding_missing")
++
++
++def read_lease(hub, board: str, task_id: str) -> dict | None:
++    """Read the server-owned lease table, bounded and without replica fallback.
++
++    A truncated or malformed response is unavailable evidence, never absence.
++    The caller must check expiry against its clock after this network read.
++    """
++    after = ""
++    for _ in range(64):
++        page = hub.snapshot_page(board, "leases", after=after)
++        if (not isinstance(page, dict) or page.get("table") != "leases"
++                or not isinstance(page.get("rows"), list) or type(page.get("more")) is not bool):
++            raise ValueError("origin_forward_lease_unavailable")
++        previous = after
++        found = None
++        for row in page["rows"]:
++            key = row.get("task_id") if isinstance(row, dict) else None
++            if not isinstance(key, str) or key <= previous:
++                raise ValueError("origin_forward_lease_unavailable")
++            previous = key
++            if key == task_id:
++                found = row
++        if found is not None:
++            return found
++        if page["more"] is False:
++            return None
++        if previous == after or page.get("next") != previous:
++            raise ValueError("origin_forward_lease_unavailable")
++        after = previous
++    raise ValueError("origin_forward_lease_unavailable")
++
++
++def authorize(*, ledger: Path, origin: dict, creator: dict, gateway: str,
++              profile: str, sender: str, run_uid: str, lease: dict,
++              now_ms: int, session_exists) -> dict:
++    """Return an accepted local binding, or refuse without modifying any store.
++
++    Authority is admission-time: the transport must freeze a successful decision
++    with the immutable outbound envelope before sending. Replays of that durable
++    decision do not require a still-live lease; new decisions always do.
++    """
++    validate_binding({"binding_id": "validation", "version": 1, "publication_version": 1,
++                      "origin": origin, "owner": creator,
++                      "task_record_key": f"{creator['profile']}/{creator['board']}/{creator['task_id']}"})
++    if (origin["gateway"] != gateway or origin["profile"] != profile
++            or not isinstance(sender, str) or not re.fullmatch(r"gw:[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}", sender)
++            or not isinstance(run_uid, str) or not run_uid
++            or not session_exists(origin["session"])):
++        raise ValueError("origin_forward_identity_invalid")
++    binding = _local_binding(ledger, origin, creator)
++    if (not isinstance(lease, dict) or lease.get("task_id") != creator["task_id"]
++            or lease.get("holder") != sender[3:] or lease.get("run_uid") != run_uid
++            or type(lease.get("expires")) is not int or lease["expires"] <= now_ms):
++        raise ValueError("origin_forward_lease_invalid")
++    return binding
+diff --git a/tests/hermes_cli/test_origin_forward_authority.py b/tests/hermes_cli/test_origin_forward_authority.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c01c642cc3c5d89ab57a212b875f84dcb27b3bde
+--- /dev/null
++++ b/tests/hermes_cli/test_origin_forward_authority.py
+@@ -0,0 +1,118 @@
++"""Admission requires local accepted origin custody and a live server lease."""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli.kanban_origin_ledger import _binding_key, _db, binding_hash
++
++
++@pytest.fixture
++def authority(tmp_path):
++    origin = {"gateway": "macbook", "profile": "default", "session": "chat-1"}
++    owner = {"gateway": "hub", "profile": "default", "board": "default", "task_id": "task-1"}
++    binding = {"binding_id": "binding-1", "version": 1, "publication_version": 1,
++               "owner": owner, "origin": origin, "task_record_key": "default/default/task-1"}
++    path = tmp_path / "origin-ledger.db"
++    with _db(path) as db:
++        db.execute("INSERT INTO origin_obligations VALUES(?,?,?,?,?,?,?)",
++                   (_binding_key(binding), binding_hash(binding), json.dumps(binding), "chat-1", "{}", 1, 0))
++        db.commit()
++    lease = {"task_id": "task-1", "holder": "worker-7", "run_uid": "run-1", "expires": 2000}
++    return path, binding, lease
++
++
++def check(authority, **overrides):
++    from hermes_cli.kanban_origin_forward import authorize
++    path, binding, lease = authority
++    args = dict(ledger=path, origin=binding["origin"], creator=binding["owner"],
++                gateway="macbook", profile="default", sender="gw:worker-7", run_uid="run-1",
++                lease=lease, now_ms=1000, session_exists=lambda session: session == "chat-1")
++    return authorize(**(args | overrides))
++
++
++def test_foreign_worker_uses_origin_local_binding(authority):
++    assert check(authority) == authority[1]
++
++
++@pytest.mark.parametrize("field,value", [("holder", "worker-8"), ("task_id", "other"),
++                                         ("run_uid", "old"), ("expires", 1000),
++                                         ("expires", "2000"), ("expires", True)])
++def test_wrong_or_expired_lease_rejected(authority, field, value):
++    with pytest.raises(ValueError, match="origin_forward_lease_invalid"):
++        check(authority, lease=authority[2] | {field: value})
++
++
++@pytest.mark.parametrize("override", [dict(gateway="worker-7"), dict(profile="other"),
++                                      dict(sender="worker-7"), dict(sender="gw:"),
++                                      dict(run_uid=""), dict(session_exists=lambda _: False)])
++def test_wrong_local_identity_or_session_rejected(authority, override):
++    with pytest.raises(ValueError, match="origin_forward_"):
++        check(authority, **override)
++
++
++@pytest.mark.parametrize("column,value", [("released", 1), ("binding_hash", "forged"),
++                                         ("binding_id", "unqualified")])
++def test_untrusted_or_released_binding_rejected(authority, column, value):
++    with sqlite3.connect(authority[0]) as db:
++        db.execute(f"UPDATE origin_obligations SET {column}=?", (value,))
++    with pytest.raises(ValueError, match="origin_forward_binding_missing"):
++        check(authority)
++
++
++def test_unknown_owner_not_authorized_by_matching_chat(authority):
++    with pytest.raises(ValueError, match="origin_forward_binding_missing"):
++        check(authority, creator=authority[1]["owner"] | {"task_id": "forged"})
++
++
++def test_missing_ledger_not_created(authority, tmp_path):
++    path = tmp_path / "absent.db"
++    with pytest.raises(sqlite3.OperationalError):
++        check(authority, ledger=path)
++    assert not path.exists()
++
++
++def test_server_lease_reader_pages_without_replica(authority):
++    from hermes_cli.kanban_origin_forward import read_lease
++    from types import SimpleNamespace
++    calls = []
++
++    def snapshot(board, table, after):
++        calls.append((board, table, after))
++        if not after:
++            return {"table": "leases", "rows": [{"task_id": "earlier"}], "more": True, "next": "earlier"}
++        return {"table": "leases", "rows": [authority[2]], "more": False, "next": "task-1"}
++
++    hub = SimpleNamespace(snapshot_page=snapshot)
++    assert read_lease(hub, "project", "task-1") == authority[2]
++    assert calls == [("project", "leases", ""), ("project", "leases", "earlier")]
++    assert read_lease(hub, "project", "missing") is None
++
++
++@pytest.mark.parametrize("page", [None, {}, {"table": "tasks", "rows": [], "more": False},
++    {"table": "leases", "rows": {}, "more": False},
++    {"table": "leases", "rows": [], "more": 0},
++    {"table": "leases", "rows": [], "more": True, "next": ""},
++    {"table": "leases", "rows": [{"task_id": "a"}], "more": True, "next": "wrong"},
++    {"table": "leases", "rows": [{"task_id": "a"}, {"task_id": "a"}], "more": False},
++    {"table": "leases", "rows": [None], "more": False}])
++def test_malformed_snapshot_not_treated_as_absence(page):
++    from hermes_cli.kanban_origin_forward import read_lease
++    from types import SimpleNamespace
++    with pytest.raises(ValueError, match="origin_forward_lease_unavailable"):
++        read_lease(SimpleNamespace(snapshot_page=lambda *a, **k: page), "default", "missing")
++
++
++def test_unbounded_snapshot_does_not_authorize():
++    from hermes_cli.kanban_origin_forward import read_lease
++    from types import SimpleNamespace
++    calls = []
++
++    def snapshot(*args, after):
++        calls.append(after)
++        key = after + "a"
++        return {"table": "leases", "rows": [{"task_id": key}], "more": True, "next": key}
++
++    with pytest.raises(ValueError, match="origin_forward_lease_unavailable"):
++        read_lease(SimpleNamespace(snapshot_page=snapshot), "default", "missing")
++    assert len(calls) == 64
+-- 
+2.43.0
+

@@ -1,0 +1,807 @@
+From 6663139423bd5bb3615e6e02c170ebd1f99a0738 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 19:47:54 +0000
+Subject: [PATCH] fix(cron): keep monitor changes pending until a successful
+ agent run acknowledges them [daveey]
+
+Five whys (hub cron 6b4342ad83d9, 2026-11-14 14:52:18): a monitor change was
+never reported because (1) the agent never ran: SubscriptionQuotaUnavailable
+refused agent construction; (2) the next ticks saw unchanged output and
+suppressed the agent; (3) check_monitor persisted the new hash + snapshot at
+detection time, BEFORE the agent ran; (4) so detection, not handling, was the
+state boundary; (5) nothing owned redelivery of a detected-but-unhandled change.
+All eight lifecycle=empty warnings in the hub agent logs follow quota errors.
+
+Fix: a durable per-job outbox (cron/monitor_outbox.py) in
+job["monitor_state"] (outbox_version 1):
+- check_monitor runs the source first (a source error stages nothing), then,
+  under the jobs-store lock, queues each changed observation as a generation
+  {id, old, new, hash, first_run, attempts} chained off the acknowledged
+  snapshot (last_output/last_output_hash) and offers the OLDEST pending one with
+  its stable change id. Snapshots live inline in jobs.json, so staging and
+  acknowledgement are one atomic save_jobs write (temp + fsync + replace).
+- Acknowledgement is generation-bound: only the head generation with the same id
+  is consumed, so a late/stale ack can never drop a newer observation (B pending,
+  C observed, B acked -> C offered next with a B->C diff).
+- The owner's run_job acknowledges right after the agent returns, before output
+  save and notification delivery: blank, incomplete (incl. max-iteration
+  handoff), interrupted and [CRON_FAILURE] answers keep it pending; [SILENT]
+  counts as success; a delivery failure never replays a handled change. Every
+  agent path (gateway firer, restart-safe external worker, direct) converges on
+  that owner run_job.
+- _apply_monitor_gate clears any stale _monitor_change_id first, so only the
+  generation offered this tick can be acknowledged.
+- Retries are observable: attempts counter in state, MonitorOutcome.attempt, and
+  a WARNING "re-offering unacknowledged change <id> (attempt N)".
+- discard(job_id, change_id, reason) is a distinct, generation-bound operator
+  path recording last_discard.
+- Corrupt/missing state fails visibly as a monitor source error (schema,
+  version, chain, hashes, ids, types, missing job, missing/undecodable legacy
+  snapshot). Legacy hash-only state migrates from monitor_last_output.txt.
+- Delivery is at-least-once; the change id in the prompt lets consumers dedupe.
+No quota routing policy change.
+
+Tests (RED first, then GREEN): tests/cron/test_monitor_outbox.py (replay after
+restart, successive generations + stale ack, corruption matrix, discard, missing
+job/snapshot, retry observability, crash after staging in a real subprocess,
+failed staging write, stale change-id fence), tests/cron/test_monitor_kind.py
+(real run_job/owner: pre-agent typed quota failure -> source error -> original
+diff retried -> success -> suppressed, for baseline and A->B; unsuccessful
+results retain; success/[SILENT] consume), tests/cron/test_monitor_outbox_worker.py
+(real _run_external_worker_payload -> run_one_job -> owner run_job: quota
+failure keeps A->B, success with failed delivery acknowledges, next fire
+suppressed; killed by a no-ack mutant). Consumers migrated:
+test_gated_tick_clears_gate_streak.py, test_redact_telegram_boundary.py.
+---
+ cron/monitor.py                               |  84 +++----
+ cron/monitor_outbox.py                        | 129 +++++++++++
+ cron/scheduler.py                             |  10 +-
+ tests/agent/test_redact_telegram_boundary.py  |  11 +-
+ .../test_gated_tick_clears_gate_streak.py     |   5 +-
+ tests/cron/test_monitor_kind.py               |  72 ++++++
+ tests/cron/test_monitor_outbox.py             | 207 ++++++++++++++++++
+ tests/cron/test_monitor_outbox_worker.py      |  83 +++++++
+ 8 files changed, 534 insertions(+), 67 deletions(-)
+ create mode 100644 cron/monitor_outbox.py
+ create mode 100644 tests/cron/test_monitor_outbox.py
+ create mode 100644 tests/cron/test_monitor_outbox_worker.py
+
+diff --git a/cron/monitor.py b/cron/monitor.py
+index b5bafca9d429c5dcea01e24dd51880afc2926af1..90647dcdce22ea07b59c0c13ecdc106ae5c6b450 100644
+--- a/cron/monitor.py
++++ b/cron/monitor.py
+@@ -3,11 +3,14 @@
+ A monitor job attaches a cheap source (``monitor_script`` / ``monitor_url``) to an LLM cron job.
+ Each tick runs the source FIRST and hashes its EXACT output bytes (no timestamp/whitespace
+ normalization — scripts must emit stable output) against the hash from the last agent-triggering
+-tick: unchanged → agent run suppressed (silent ``no_change`` run); changed/first run → a "MONITOR
+-CHANGE DETECTED" block (capped unified diff + new output) is injected into the prompt; source
+-failure → an ERROR, never a change, and the stored hash is left untouched. State:
+-``job["monitor_state"]`` in jobs.json (hash + last_changed_at) and
+-``OUTPUT_DIR/<job_id>/monitor_last_output.txt`` (for the diff).
++tick: unchanged → agent run suppressed (silent ``no_change`` run); changed/first run → the
++observation is staged as a pending generation (``cron.monitor_outbox``) and a "MONITOR CHANGE
++DETECTED" block (capped unified diff + new output + stable change id) is injected into the prompt.
++The generation stays pending, and is re-offered with the same diff, until a successful agent run
++acknowledges it (at-least-once). Source failure → an ERROR, never a change, nothing staged.
++State: ``job["monitor_state"]`` in jobs.json (acknowledged snapshot + hash and the pending
++generations, written atomically together). ``OUTPUT_DIR/<job_id>/monitor_last_output.txt`` is
++read only to migrate legacy hash-only state.
+ """
+ 
+ from __future__ import annotations
+@@ -40,6 +43,8 @@ class MonitorOutcome:
+     first_run: bool = False
+     context_block: Optional[str] = None
+     error: Optional[str] = None
++    change_id: Optional[str] = None
++    attempt: int = 0
+ 
+ 
+ def hash_monitor_output(output: str) -> str:
+@@ -65,27 +70,6 @@ def _snapshot_path(job_id: str):
+     return _job_output_dir(job_id) / _SNAPSHOT_FILENAME
+ 
+ 
+-def _read_last_output(job_id: str) -> str:
+-    try:
+-        path = _snapshot_path(job_id)
+-        if path.exists():
+-            return path.read_text(encoding="utf-8-sig")
+-    except Exception as exc:
+-        logger.warning("Monitor: failed to read last output for %r: %s", job_id, exc)
+-    return ""
+-
+-
+-def _write_last_output(job_id: str, output: str) -> None:
+-    try:
+-        from cron.jobs import _ensure_cron_dir
+-
+-        path = _snapshot_path(job_id)
+-        _ensure_cron_dir(path.parent)
+-        path.write_text(output, encoding="utf-8")
+-    except Exception as exc:
+-        logger.warning("Monitor: failed to persist last output for %r: %s", job_id, exc)
+-
+-
+ def _fetch_monitor_url(url: str) -> tuple[bool, str]:
+     """Bounded GET of a monitor URL. Returns (ok, body-or-error).
+ 
+@@ -155,24 +139,29 @@ def job_has_monitor(job: dict) -> bool:
+ def check_monitor(job: dict) -> MonitorOutcome:
+     """Run the monitor source and decide whether the agent should run.
+ 
+-    On change (or first run) the new hash + snapshot are persisted BEFORE the agent runs — detection
+-    time is the state boundary, so a failed agent run doesn't re-alert on the same content forever.
+-    On failure nothing is persisted.
++    A changed observation (or the first baseline) is staged as a pending generation in
++    ``cron.monitor_outbox`` and offered to the agent with a stable change id; it stays pending,
++    and is re-offered unchanged, until a successful agent run acknowledges it. A source failure
++    stages nothing; corrupt or missing outbox state fails visibly as a source error.
+     """
+     job_id = str(job.get("id") or "")
+     ok, output = _run_monitor_source(job)
+     if not ok:
+         return MonitorOutcome(ok=False, error=output)
+ 
+-    new_hash = hash_monitor_output(output)
+-    raw_state = job.get("monitor_state")
+-    last_hash = raw_state.get("last_output_hash") if isinstance(raw_state, dict) else None
++    from cron.monitor_outbox import stage
+ 
+-    if last_hash is not None and new_hash == last_hash:
++    try:
++        pending = stage(job_id, output)
++    except (OSError, ValueError) as exc:
++        return MonitorOutcome(ok=False, error=f"monitor outbox: {exc}")
++    if pending is None:
+         return MonitorOutcome(ok=True, changed=False)
+-
+-    first_run = last_hash is None
+-    old_output = "" if first_run else _read_last_output(job_id)
++    first_run = pending["first_run"]
++    old_output, output = pending["old"], pending["new"]
++    if pending["attempts"] > 1:
++        logger.warning("Monitor %s: re-offering unacknowledged change %s (attempt %d)",
++                       job_id, pending["id"], pending["attempts"])
+ 
+     shown_output = output
+     if len(shown_output) > MAX_OUTPUT_CHARS:
+@@ -193,23 +182,6 @@ def check_monitor(job: dict) -> MonitorOutcome:
+             f"### Diff (previous → current)\n\n```diff\n{diff}\n```\n\n" + current
+         )
+ 
+-    _persist_monitor_state(job_id, new_hash, output)
+-    return MonitorOutcome(ok=True, changed=True, first_run=first_run, context_block=context_block)
+-
+-
+-def _persist_monitor_state(job_id: str, new_hash: str, output: str) -> None:
+-    from cron.jobs import _hermes_now, update_job
+-
+-    _write_last_output(job_id, output)
+-    try:
+-        update_job(
+-            job_id,
+-            {
+-                "monitor_state": {
+-                    "last_output_hash": new_hash,
+-                    "last_changed_at": _hermes_now().isoformat(),
+-                }
+-            },
+-        )
+-    except Exception as exc:
+-        logger.warning("Monitor: failed to persist state for %r: %s", job_id, exc)
++    context_block += f"\n\nMonitor change id: {pending['id']} (at-least-once delivery)."
++    return MonitorOutcome(ok=True, changed=True, first_run=first_run, context_block=context_block,
++                          change_id=pending["id"], attempt=pending["attempts"])
+diff --git a/cron/monitor_outbox.py b/cron/monitor_outbox.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..aab052bb21ba0563741d82b006d47900c7537331
+--- /dev/null
++++ b/cron/monitor_outbox.py
+@@ -0,0 +1,129 @@
++"""Monitor snapshots and pending generations share one atomic jobs-store write."""
++from uuid import uuid4
++
++from cron import jobs
++
++
++def _validate_state(state):
++    from cron.monitor import hash_monitor_output
++    if (not isinstance(state, dict) or state.get("outbox_version") != 1
++            or not isinstance(state.get("pending_changes"), list)
++            or "last_output" not in state or "last_output_hash" not in state):
++        raise ValueError("monitor outbox: corrupt state schema")
++    old, digest = state["last_output"], state["last_output_hash"]
++    if not isinstance(old, str) or (digest is None and old != "") or (
++            digest is not None and digest != hash_monitor_output(old)):
++        raise ValueError("monitor outbox: corrupt baseline snapshot")
++    ids = set()
++    for change in state["pending_changes"]:
++        if (not isinstance(change, dict)
++                or not isinstance(change.get("id"), str) or not change["id"]
++                or change["id"] in ids
++                or change.get("old") != old
++                or not isinstance(change.get("new"), str)
++                or type(change.get("first_run")) is not bool
++                or change["first_run"] != (digest is None)
++                or type(change.get("attempts")) is not int or change["attempts"] < 0
++                or change.get("hash") != hash_monitor_output(change["new"])):
++            raise ValueError("monitor outbox: corrupt pending snapshot")
++        ids.add(change["id"])
++        old, digest = change["new"], change["hash"]
++
++
++def _state(job):
++    from cron.monitor import _snapshot_path, hash_monitor_output
++    state = job.get("monitor_state")
++    if state is None:
++        state = {}
++    if not isinstance(state, dict):
++        raise ValueError("monitor outbox: corrupt state")
++    if "outbox_version" not in state:
++        if "pending_changes" in state or "last_output" in state:
++            raise ValueError("monitor outbox: missing schema version")
++        digest = state.get("last_output_hash")
++        try:
++            old = _snapshot_path(job["id"]).read_bytes().decode("utf-8") if digest is not None else ""
++        except (OSError, UnicodeError) as exc:
++            raise ValueError("monitor outbox: missing or unreadable legacy snapshot") from exc
++        if digest is not None and digest != hash_monitor_output(old):
++            raise ValueError("monitor outbox: corrupt legacy snapshot")
++        state = dict(state, outbox_version=1, last_output=old,
++                     last_output_hash=digest, pending_changes=[])
++        job["monitor_state"] = state
++    _validate_state(state)
++    return state
++
++
++def stage(job_id: str, output: str):
++    """Queue observed changes and return the oldest unacknowledged generation."""
++    from cron.monitor import hash_monitor_output
++
++    def apply(records, index, job):
++        state = _state(job)
++        pending = state["pending_changes"]
++        previous = pending[-1]["hash"] if pending else state["last_output_hash"]
++        digest = hash_monitor_output(output)
++        if previous != digest:
++            old = pending[-1]["new"] if pending else state["last_output"]
++            pending.append({"id": uuid4().hex, "old": old, "new": output,
++                            "hash": digest, "first_run": previous is None, "attempts": 0})
++        if pending:
++            pending[0]["attempts"] += 1  # one more offer to the agent: observable retries
++        jobs.save_jobs(records)
++        return dict(pending[0]) if pending else None
++
++    missing = object()
++    result = jobs._with_job(job_id, apply, missing=missing)
++    if result is missing:
++        raise ValueError("monitor outbox: missing job")
++    return result
++
++
++def acknowledge(job_id: str, change_id: str) -> bool:
++    """Consume only this successful generation, not a newer observation."""
++    return _consume(job_id, change_id)
++
++
++def acknowledge_success(job: dict, result: dict, final_response: str, failure_marker) -> bool:
++    """Acknowledge the run's offered generation iff the agent produced a successful answer.
++
++    Called by the owner's ``run_job`` right after the agent returns and BEFORE output save or
++    notification delivery, so a delivery failure never replays an agent that already handled the
++    change. Blank, incomplete (including a max-iteration handoff), interrupted and
++    ``[CRON_FAILURE]`` answers keep the generation pending; ``[SILENT]`` is a success. A cancel
++    that arrives after the agent returned does not undo this: the agent did handle the change.
++    """
++    change_id = job.get("_monitor_change_id")
++    if (not change_id or not final_response.strip() or result.get("completed") is False
++            or result.get("interrupted") or failure_marker(final_response) is not None):
++        return False
++    return acknowledge(job["id"], change_id)
++
++
++def discard(job_id: str, change_id: str, reason: str) -> bool:
++    """Explicitly abandon one generation, preserving a distinct audit record."""
++    if not isinstance(reason, str) or not reason.strip():
++        raise ValueError("monitor outbox: discard reason required")
++    return _consume(job_id, change_id, reason=reason)
++
++
++def _consume(job_id, change_id, *, reason=None):
++    def apply(records, index, job):
++        state = _state(job)
++        pending = state["pending_changes"]
++        if not pending or pending[0]["id"] != change_id:
++            return False
++        done = pending.pop(0)
++        if reason is not None:
++            state["last_discard"] = {"change_id": change_id, "reason": reason,
++                                     "at": jobs._hermes_now().isoformat()}
++        state.update(last_output=done["new"], last_output_hash=done["hash"],
++                     last_changed_at=jobs._hermes_now().isoformat())
++        jobs.save_jobs(records)
++        return True
++
++    missing = object()
++    result = jobs._with_job(job_id, apply, missing=missing)
++    if result is missing:
++        raise ValueError("monitor outbox: missing job")
++    return result
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 4af56999ab0bb6b7e71e121e3c6c955a87022005..03eadd18ce046eaf1b323bf48385f264396fa88e 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -1628,14 +1628,14 @@ def _apply_monitor_gate(
+     """
+     from cron.monitor import check_monitor, job_has_monitor
+ 
++    job.pop("_monitor_change_id", None)  # only this tick's offered generation may be acknowledged
+     if not job_has_monitor(job):
+         return None, extra_prompt, None
+     _mon = check_monitor(job)
+     _mon_now = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+     header = _job_doc_header(job_name, job_id, _mon_now, "monitor")
+     if not _mon.ok:
+-        # Source failure is an ERROR, never a change: alert so a broken monitor can't silently
+-        # stop watching. Stored hash untouched.
++        # Source failure is an ERROR, never a change: alert (a broken monitor can't go quiet).
+         logger.error("Job '%s': monitor source failed: %s", job_id, _mon.error)
+         # [daveey] Pre-agent: booked last_error_kind="gate", so the next good gate tick (which proves
+         # the source works again) clears a streak made only of these.
+@@ -1657,6 +1657,7 @@ def _apply_monitor_gate(
+         ), extra_prompt, None
+     # Changed (or first run): pass monitor output through the runtime-data seam. Keep any manual
+     # per-run prompt separate: it remains user input and is therefore still strict-scanned.
++    job["_monitor_change_id"] = _mon.change_id
+     return None, extra_prompt, _mon.context_block
+ 
+ 
+@@ -2794,9 +2795,6 @@ def run_job(
+     cancel_event: Optional[_CancelEventLike] = None, execution_id: Optional[str] = None,
+ ) -> tuple[bool, str, str, Optional[str]]:
+     """Execute a single cron job. Returns (success, full_output_doc, final_response, error).
+-    ``defer_agent_teardown``: if a list, the live agent is appended instead of torn down; the caller
+-    MUST call ``_teardown_cron_agent(agent)`` AFTER delivery (a torn-down async client can't
+-    deliver). ``extra_prompt``: per-fire context, never persisted.
+ 
+     ``defer_agent_teardown``: when a caller passes a list, ``run_job`` skips the agent's async-resource
+     teardown (``agent.close()`` + ``cleanup_stale_async_clients()``) in its ``finally`` block and instead
+@@ -2857,6 +2855,8 @@ def run_job(
+             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
+             worker_state=_worker_state)
+         final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
++        from cron.monitor_outbox import acknowledge_success
++        acknowledge_success(job, result, final_response, _cron_failure_marker_error)
+         if (setup.fallback_notice and final_response.strip() and not _is_cron_silence_response(final_response)
+                 and _cron_failure_marker_error(final_response) is None):
+             # Pre-agent provider switch (#74349) rides with the delivered report; silence and the
+diff --git a/tests/agent/test_redact_telegram_boundary.py b/tests/agent/test_redact_telegram_boundary.py
+index 4d73edc26ee1fffc8829e7828cade70982663727..0385177fcc993978d880dda0a1b6d4bde21481fd 100644
+--- a/tests/agent/test_redact_telegram_boundary.py
++++ b/tests/agent/test_redact_telegram_boundary.py
+@@ -101,13 +101,14 @@ def test_cron_stdout_preserves_identity_and_masks_adjacent_token(tmp_path, monke
+     script = scripts / "synthetic_monitor.py"
+     # A real child emits JSON; resolution, capture, redaction and context stay real.
+     script.write_text("import json\nprint(json.dumps(" + repr({"key": identity, "credential": token, "message": "\n" + token}) + "))\n")
+-    snapshots = []
+-    # Only replace persistence: no cron job store or production monitor is touched.
+-    monkeypatch.setattr("cron.monitor._persist_monitor_state", lambda *args: snapshots.append(args))
+-    outcome = check_monitor({"id": "synthetic-monitor", "monitor_script": script.name, "interpreter": sys.executable})
++    from cron import jobs
++    # The job store lives in the isolated home: no production monitor is touched.
++    job = jobs.create_job(prompt="Watch", schedule="every 5m", monitor_script=script.name,
++                          interpreter=sys.executable)
++    outcome = check_monitor(job)
+     assert outcome.ok, outcome.error
+     assert outcome.changed
+-    result = json.loads(snapshots[0][2])
++    result = json.loads(jobs.get_job(job["id"])["monitor_state"]["pending_changes"][0]["new"])
+     assert result["key"] == identity
+     # The JSON key-name pass may mask "credential" first; either way the token body is gone.
+     assert token not in result["credential"]
+diff --git a/tests/cron/test_gated_tick_clears_gate_streak.py b/tests/cron/test_gated_tick_clears_gate_streak.py
+index 201446a2c76af994dc141760052127adea6c4249..ca1078fecc44751660f507865822fc66e293a4cf 100644
+--- a/tests/cron/test_gated_tick_clears_gate_streak.py
++++ b/tests/cron/test_gated_tick_clears_gate_streak.py
+@@ -133,7 +133,10 @@ def test_real_monitor_script_failure_then_recovery_heals_end_to_end(monkeypatch)
+     _bypass_gate(monkeypatch)
+     job_id, _slot = _due_agent_job("watcher")
+     J.update_job(job_id, {"monitor_script": "watch.py"})
+-    assert check_monitor(_stored(job_id)).changed  # first run seeds the stored hash
++    from cron.monitor_outbox import acknowledge
++    seeded = check_monitor(_stored(job_id))
++    assert seeded.changed and seeded.change_id  # first run stages the baseline
++    assert acknowledge(job_id, seeded.change_id)  # as a successful agent run would
+ 
+     from contextlib import asynccontextmanager
+     from hermes_cli import gateway_client
+diff --git a/tests/cron/test_monitor_kind.py b/tests/cron/test_monitor_kind.py
+index acc1fcc948dec691291ceb3e46267c12f4117c49..e27447f74df39d8f0be96a2ba301f0f67639ccb5 100644
+--- a/tests/cron/test_monitor_kind.py
++++ b/tests/cron/test_monitor_kind.py
+@@ -323,6 +323,78 @@ def test_monitor_script_uses_configured_interpreter(hermes_env, monkeypatch):
+     assert "1" in observed["prompts"][0]
+ 
+ 
++@pytest.mark.parametrize("baseline", [True, False])
++def test_pre_agent_quota_failure_retries_then_suppresses(hermes_env, monkeypatch, baseline):
++    import time
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    from cron import jobs, scheduler
++
++    job = _make_monitor_job(hermes_env, "echo 'state A'\n")
++    observed = {}
++    _install_agent_stubs(monkeypatch, observed)
++    if not baseline:
++        assert scheduler.run_job(job)[0]
++        _write_script(hermes_env, "mon.sh", "echo 'state B'\n")
++    construct = scheduler._construct_cron_agent
++
++    def refused(*args, **kwargs):
++        raise SubscriptionQuotaUnavailable("anthropic", "test", time.time() + 3600)
++
++    monkeypatch.setattr(scheduler, "_construct_cron_agent", refused)
++    assert not scheduler.run_job(job)[0]
++    pending = jobs.get_job(job["id"])["monitor_state"]["pending_changes"]
++    assert len(pending) == 1
++    # Source errors cannot acknowledge the pending generation either.
++    _write_script(hermes_env, "mon.sh", "exit 3\n")
++    assert not scheduler.run_job(job)[0]
++    assert jobs.get_job(job["id"])["monitor_state"]["pending_changes"] == pending
++    _write_script(hermes_env, "mon.sh", "echo 'state A'\n" if baseline else "echo 'state B'\n")
++    monkeypatch.setattr(scheduler, "_construct_cron_agent", construct)
++    assert scheduler.run_job(job)[0]
++    assert pending[0]["id"] in observed["prompts"][-1]
++    if not baseline:
++        assert "-state A" in observed["prompts"][-1]
++        assert "+state B" in observed["prompts"][-1]
++    assert "no_change" in scheduler.run_job(job)[1]
++
++
++@pytest.mark.parametrize("result", [
++    {"final_response": "[CRON_FAILURE]\nsource analysis failed", "completed": True},
++    {"final_response": "partial", "completed": False},
++    {"final_response": "partial", "completed": False, "turn_exit_reason": "max_iterations_reached(1/1)"},
++    {"final_response": "partial", "completed": True, "interrupted": True},
++    {"final_response": "", "completed": True},
++    {"final_response": "[SILENT]", "failed": True},
++])
++def test_unsuccessful_agent_retains_original_generation(hermes_env, monkeypatch, result):
++    from cron import jobs, scheduler
++
++    job = _make_monitor_job(hermes_env, "echo 'state A'\n")
++    _install_agent_stubs(monkeypatch, {})
++    monkeypatch.setattr(scheduler, "_run_agent_with_watchdog", lambda *a, **kw: dict(result, messages=[]))
++    scheduler.run_job(job)
++    pending = jobs.get_job(job["id"])["monitor_state"]["pending_changes"]
++    assert len(pending) == 1
++    scheduler.run_job(job)
++    [retained] = jobs.get_job(job["id"])["monitor_state"]["pending_changes"]
++    assert retained == dict(pending[0], attempts=2)  # same generation, re-offered
++
++
++@pytest.mark.parametrize("answer", ["agent done", "[SILENT]"])
++def test_success_consumes_pending_generation(hermes_env, monkeypatch, answer):
++    from cron import jobs, scheduler
++
++    job = _make_monitor_job(hermes_env, "echo 'state A'\n")
++    _install_agent_stubs(monkeypatch, {})
++    monkeypatch.setattr(scheduler, "_run_agent_with_watchdog", lambda *a, **kw: {
++        "final_response": answer, "completed": True, "messages": []})
++    assert scheduler.run_job(job)[0]
++    state = jobs.get_job(job["id"])["monitor_state"]
++    assert state["pending_changes"] == []
++    assert state["last_output_hash"]
++    assert "no_change" in scheduler.run_job(job)[1]
++
++
+ def test_unchanged_output_suppresses_agent_run(hermes_env, monkeypatch):
+     from cron.jobs import get_job
+     from cron.scheduler import SILENT_MARKER, run_job
+diff --git a/tests/cron/test_monitor_outbox.py b/tests/cron/test_monitor_outbox.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..078bdcd448586095b92dc721e03f53fbae7070b7
+--- /dev/null
++++ b/tests/cron/test_monitor_outbox.py
+@@ -0,0 +1,207 @@
++"""Durable at-least-once monitor changes; no production monitor state is touched."""
++from cron import jobs, monitor
++import pytest
++
++
++def test_pending_change_retries_original_diff_after_restart(tmp_path, monkeypatch, cron_owner):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    job = jobs.create_job(prompt="Watch", schedule="every 5m", monitor_url="https://example.com")
++    legacy = monitor._snapshot_path(job["id"])  # what the pre-outbox writer left behind
++    legacy.parent.mkdir(parents=True, exist_ok=True)
++    legacy.write_text("A", encoding="utf-8")
++    jobs.update_job(job["id"], {"monitor_state": {
++        "last_output_hash": monitor.hash_monitor_output("A"), "last_changed_at": "legacy"}})
++    monkeypatch.setattr(monitor, "_run_monitor_source", lambda job: (True, "B"))
++    first = monitor.check_monitor(jobs.get_job(job["id"]))
++    assert first.changed and "-A" in first.context_block and "+B" in first.context_block
++    # No acknowledgement: quota refusal, crash, or incomplete run. Drop the input snapshot.
++    retry = monitor.check_monitor(jobs.get_job(job["id"]))
++    assert retry.changed, "unacknowledged B must not be suppressed"
++    assert retry.context_block == first.context_block
++    assert retry.change_id == first.change_id
++
++
++def test_acknowledgement_preserves_successive_generation(tmp_path, monkeypatch, cron_owner):
++    from cron import monitor_outbox
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    job = jobs.create_job(prompt="Watch", schedule="every 5m", monitor_url="https://example.com")
++    source = ["A"]
++    monkeypatch.setattr(monitor, "_run_monitor_source", lambda job: (True, source[0]))
++    baseline = monitor.check_monitor(job)
++    assert baseline.first_run
++    assert monitor_outbox.acknowledge(job["id"], baseline.change_id)
++    assert not monitor.check_monitor(job).changed  # stale job input cannot resurrect A
++    source[0] = "B"
++    b = monitor.check_monitor(job)
++    source[0] = "C"
++    assert monitor.check_monitor(job).change_id == b.change_id
++    source[0] = "B"  # C was observed while B was pending; a reversion cannot erase C.
++    assert monitor_outbox.acknowledge(job["id"], b.change_id)
++    c = monitor.check_monitor(job)
++    assert c.change_id != b.change_id
++    assert "-B" in c.context_block and "+C" in c.context_block
++    assert not monitor_outbox.acknowledge(job["id"], b.change_id)
++    assert monitor.check_monitor(job).change_id == c.change_id
++    assert monitor_outbox.acknowledge(job["id"], c.change_id)
++    reverted = monitor.check_monitor(job)
++    assert "-C" in reverted.context_block and "+B" in reverted.context_block
++    assert monitor_outbox.acknowledge(job["id"], reverted.change_id)
++    assert not monitor.check_monitor(job).changed
++
++
++def test_missing_legacy_empty_snapshot_is_not_a_valid_baseline(tmp_path, monkeypatch, cron_owner):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    job = jobs.create_job(prompt="Watch", schedule="every 5m", monitor_url="https://example.com")
++    jobs.update_job(job["id"], {"monitor_state": {"last_output_hash": monitor.hash_monitor_output("")}})
++    monkeypatch.setattr(monitor, "_run_monitor_source", lambda job: (True, ""))
++    outcome = monitor.check_monitor(job)
++    assert not outcome.ok
++    assert "snapshot" in outcome.error
++
++
++def test_missing_job_fails_visibly(tmp_path, monkeypatch, cron_owner):
++    from cron import monitor_outbox
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setattr(monitor, "_run_monitor_source", lambda job: (True, "A"))
++    assert not monitor.check_monitor({"id": "missing"}).ok
++    with pytest.raises(ValueError, match="missing job"):
++        monitor_outbox.acknowledge("missing", "generation")
++
++
++def test_discard_requires_generation_and_reason(tmp_path, monkeypatch, cron_owner):
++    from cron import monitor_outbox
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    job = jobs.create_job(prompt="Watch", schedule="every 5m", monitor_url="https://example.com")
++    monkeypatch.setattr(monitor, "_run_monitor_source", lambda job: (True, "A"))
++    first = monitor.check_monitor(job)
++    assert hasattr(monitor_outbox, "discard"), "explicit discard must be distinct from successful ack"
++    with pytest.raises(ValueError, match="reason"):
++        monitor_outbox.discard(job["id"], first.change_id, "")
++    assert not monitor_outbox.discard(job["id"], "stale", "operator accepted baseline")
++    assert monitor_outbox.discard(job["id"], first.change_id, "operator accepted baseline")
++    state = jobs.get_job(job["id"])["monitor_state"]
++    assert state["last_discard"]["change_id"] == first.change_id
++    assert state["last_discard"]["reason"] == "operator accepted baseline"
++    assert not monitor.check_monitor(job).changed
++
++
++@pytest.mark.parametrize("damage", ["queue", "old", "baseline", "version", "entry", "version_deleted"])
++def test_outbox_structure_corruption_refuses(tmp_path, monkeypatch, cron_owner, damage):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    job = jobs.create_job(prompt="Watch", schedule="every 5m", monitor_url="https://example.com")
++    monkeypatch.setattr(monitor, "_run_monitor_source", lambda job: (True, "A"))
++    first = monitor.check_monitor(job)
++    state = jobs.get_job(job["id"])["monitor_state"]
++    mutations = {
++        "queue": lambda: state.pop("pending_changes"),
++        "old": lambda: state["pending_changes"][0].update(old="invented"),
++        "baseline": lambda: state.update(last_output_hash="bad"),
++        "version_deleted": lambda: state.pop("outbox_version"),
++        "version": lambda: state.update(outbox_version=999),
++        "entry": lambda: state["pending_changes"].__setitem__(0, None),
++    }
++    mutations[damage]()
++    jobs.update_job(job["id"], {"monitor_state": state})
++    outcome = monitor.check_monitor(job)
++    assert not outcome.ok
++    assert "monitor outbox" in outcome.error
++    from cron.monitor_outbox import acknowledge
++    with pytest.raises(ValueError, match="monitor outbox"):
++        acknowledge(job["id"], first.change_id)
++
++
++@pytest.mark.parametrize("field,value", [("new", "corrupt"), ("old", None), ("hash", "bad"),
++                                        ("id", ""), ("first_run", "yes"), ("attempts", True),
++                                        ("attempts", -1)])
++def test_corrupt_pending_fails_visibly(tmp_path, monkeypatch, cron_owner, field, value):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    job = jobs.create_job(prompt="Watch", schedule="every 5m", monitor_url="https://example.com")
++    monkeypatch.setattr(monitor, "_run_monitor_source", lambda job: (True, "A"))
++    first = monitor.check_monitor(job)
++    state = jobs.get_job(job["id"])["monitor_state"]
++    state["pending_changes"][0][field] = value
++    jobs.update_job(job["id"], {"monitor_state": state})
++    outcome = monitor.check_monitor(job)
++    assert not outcome.ok
++    assert "monitor outbox" in outcome.error
++    from cron.monitor_outbox import acknowledge
++    with pytest.raises(ValueError, match="monitor outbox"):
++        acknowledge(job["id"], first.change_id)
++
++
++def test_retries_are_observable_with_stable_id(tmp_path, monkeypatch, cron_owner, caplog):
++    import logging
++    from cron import monitor_outbox
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    job = jobs.create_job(prompt="Watch", schedule="every 5m", monitor_url="https://example.com")
++    monkeypatch.setattr(monitor, "_run_monitor_source", lambda job: (True, "A"))
++    first = monitor.check_monitor(job)
++    assert first.attempt == 1
++    with caplog.at_level(logging.WARNING, logger="cron.monitor"):
++        retry = monitor.check_monitor(job)
++    assert retry.attempt == 2 and retry.change_id == first.change_id
++    assert any(first.change_id in r.getMessage() and "attempt 2" in r.getMessage()
++               for r in caplog.records)
++    pending = jobs.get_job(job["id"])["monitor_state"]["pending_changes"][0]
++    assert pending["attempts"] == 2
++    assert monitor_outbox.acknowledge(job["id"], retry.change_id)
++    assert not monitor.check_monitor(job).changed
++
++
++def test_crash_after_staging_reoffers_generation_in_new_process(tmp_path, monkeypatch, cron_owner):
++    """A process that dies between staging and acknowledgement leaves the generation durable."""
++    import os
++    import subprocess
++    import sys
++    from pathlib import Path
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    (tmp_path / "scripts").mkdir()
++    (tmp_path / "scripts" / "mon.sh").write_text("echo 'state B'\n")
++    job = jobs.create_job(prompt="Watch", schedule="every 5m", monitor_script="mon.sh")
++    child = (
++        "import os\nfrom cron import jobs, monitor\n"
++        f"outcome = monitor.check_monitor(jobs.get_job({job['id']!r}))\n"
++        "print(outcome.change_id, flush=True)\n"
++        "os._exit(9)  # crash before any agent ran or acknowledged\n")
++    root = str(Path(__file__).resolve().parents[2])
++    env = dict(os.environ, HERMES_HOME=str(tmp_path), PYTHONPATH=root)
++    proc = subprocess.run([sys.executable, "-c", child], env=env, cwd=root,
++                          capture_output=True, text=True, timeout=120, check=False)
++    assert proc.returncode == 9, proc.stderr
++    staged = proc.stdout.strip().splitlines()[-1]
++    assert len(staged) == 32
++    retry = monitor.check_monitor(jobs.get_job(job["id"]))
++    assert retry.changed and retry.first_run
++    assert retry.change_id == staged and retry.attempt == 2
++
++
++def test_failed_staging_write_is_a_visible_source_error(tmp_path, monkeypatch, cron_owner):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    job = jobs.create_job(prompt="Watch", schedule="every 5m", monitor_url="https://example.com")
++    monkeypatch.setattr(monitor, "_run_monitor_source", lambda job: (True, "A"))
++
++    def disk_full(*_a, **_k):
++        raise OSError(28, "No space left on device")
++
++    with monkeypatch.context() as m:
++        m.setattr(jobs, "save_jobs", disk_full)
++        outcome = monitor.check_monitor(job)
++    assert not outcome.ok and "monitor outbox" in outcome.error
++    assert "pending_changes" not in (jobs.get_job(job["id"]).get("monitor_state") or {})
++    assert monitor.check_monitor(job).attempt == 1
++
++
++@pytest.mark.parametrize("source", [(True, "A"), (False, "boom")])
++def test_gate_never_carries_a_stale_change_id(tmp_path, monkeypatch, cron_owner, source):
++    """A reused job dict must not let a later agent run acknowledge a generation it wasn't offered."""
++    from cron import monitor_outbox, scheduler
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    job = jobs.create_job(prompt="Watch", schedule="every 5m", monitor_url="https://example.com")
++    monkeypatch.setattr(monitor, "_run_monitor_source", lambda job: (True, "A"))
++    first = monitor.check_monitor(job)
++    assert monitor_outbox.acknowledge(job["id"], first.change_id)
++    monkeypatch.setattr(monitor, "_run_monitor_source", lambda job: source)
++    job["_monitor_change_id"] = first.change_id
++    early, _extra, _ctx = scheduler._apply_monitor_gate(job, job["id"], "watch", None)
++    assert early is not None
++    assert "_monitor_change_id" not in job
+diff --git a/tests/cron/test_monitor_outbox_worker.py b/tests/cron/test_monitor_outbox_worker.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ab9a3c61eca784c4dd8146447b1e94d6411a14fd
+--- /dev/null
++++ b/tests/cron/test_monitor_outbox_worker.py
+@@ -0,0 +1,83 @@
++"""The restart-safe external worker keeps a monitor change pending until a successful agent run.
++
++Each fire goes through the real ``_run_external_worker_payload`` -> ``run_one_job`` -> owner
++``run_job`` path in an isolated home; only the agent, its provider and delivery are stubbed.
++"""
++import json
++import time
++
++import pytest
++
++from cron import executions, jobs, scheduler
++from cron.jobs import use_cron_store
++from tests.cron.test_monitor_kind import _install_agent_stubs, _make_monitor_job, _write_script
++
++
++@pytest.fixture
++def worker_home(tmp_path, monkeypatch, cron_owner):
++    home = tmp_path / ".hermes"
++    (home / "scripts").mkdir(parents=True)
++    (home / "cron").mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
++    monkeypatch.setattr("hermes_cli.env_loader.hydrate_profile_secret_sources", lambda *_: None)
++    monkeypatch.setattr("gateway.run_startup.GatewayStartupMixin._register_config_hooks",
++                        lambda *_a, **_k: None)
++    return home
++
++
++def _worker_fire(home, tmp_path, job_id, n):
++    """One gateway-dispatched fire adopted by the external worker."""
++    with use_cron_store(home):
++        jobs.update_job(job_id, {"next_run_at": jobs._hermes_now().isoformat()})
++        assert jobs.claim_job_for_fire(job_id)
++        job = jobs.get_job(job_id)
++        job["execution_id"] = executions.create_execution(job_id, source="cron")["id"]
++        assert executions.mark_execution_handoff_pending(job["execution_id"])
++    payload, ack = tmp_path / f"payload{n}.json", tmp_path / f"ready{n}"
++    payload.write_text(json.dumps({"job": job, "profile_home": str(home)}))
++    assert scheduler._run_external_worker_payload(payload, ack) is True
++    assert ack.exists()
++    with use_cron_store(home):
++        return jobs.get_job(job_id)["monitor_state"]
++
++
++def test_external_worker_quota_retry_then_delivery_failure_does_not_replay(
++        worker_home, tmp_path, monkeypatch):
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++
++    observed = {}
++    _install_agent_stubs(monkeypatch, observed)
++    with use_cron_store(worker_home):
++        job = _make_monitor_job(worker_home, "echo 'state A'\n")
++        assert scheduler.run_job(job)[0]  # baseline A acknowledged by a successful run
++    _write_script(worker_home, "mon.sh", "echo 'state B'\n")
++
++    construct = scheduler._construct_cron_agent
++
++    def refused(*args, **kwargs):
++        raise SubscriptionQuotaUnavailable("anthropic", "test", time.time() + 3600)
++
++    monkeypatch.setattr(scheduler, "_construct_cron_agent", refused)
++    state = _worker_fire(worker_home, tmp_path, job["id"], 1)
++    assert observed["agent_runs"] == 1
++    [pending] = state["pending_changes"]
++    assert pending["old"] == "state A" and pending["new"] == "state B"
++
++    # The agent now succeeds, but delivering its notice fails: that must not replay the agent.
++    monkeypatch.setattr(scheduler, "_construct_cron_agent", construct)
++
++    def delivery_down(d, *_a, **_k):
++        d.should_deliver = d.delivery_attempted = True
++        d.delivery_error = "delivery transport down"
++
++    monkeypatch.setattr(scheduler, "_save_compose_deliver", delivery_down)
++    state = _worker_fire(worker_home, tmp_path, job["id"], 2)
++    assert observed["agent_runs"] == 2
++    assert pending["id"] in observed["prompts"][-1]
++    assert "-state A" in observed["prompts"][-1] and "+state B" in observed["prompts"][-1]
++    assert state["pending_changes"] == []
++    assert state["last_output"] == "state B"
++
++    _worker_fire(worker_home, tmp_path, job["id"], 3)
++    assert observed["agent_runs"] == 2, "an acknowledged change must stay suppressed"
+-- 
+2.43.0
+

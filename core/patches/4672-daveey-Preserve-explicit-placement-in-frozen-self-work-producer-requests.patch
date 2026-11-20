@@ -1,0 +1,298 @@
+From 99c4288981e3d6dda045e56a1ae5c41a31148aad Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 00:48:34 +0000
+Subject: [PATCH] [daveey] Preserve explicit placement in frozen self-work
+ producer requests
+
+Why: state sweep callers require worker placement and terminal/file capabilities. The v1 allowlist rejected them, and dropping them would silently change policy. Permit only these optional string-list fields, validate at prepare and advance with existing create semantics, and advertise additive placement capability without changing v1 replay or receiver authority.
+
+Proof: focused RED 6 failed/30 passed; final canonical producer, receiver and CI receipt suites 100 passed. Seven exact-anchor mutants killed (prepare/validate calls, list/member shape, both existing validators, capability advertisement). Composed authenticated receiver reads back preserved create placement and unchanged owner placement after append; unsynced intake including explicit empty labels stays pending. No state activation or guard changes.
+---
+ docs/ci-flaky-intake.md                       | 42 +++++++-
+ hermes_cli/kanban_selfwork_producer.py        | 25 ++++-
+ .../test_kanban_selfwork_producer.py          | 99 ++++++++++++++++++-
+ 3 files changed, 156 insertions(+), 10 deletions(-)
+
+diff --git a/docs/ci-flaky-intake.md b/docs/ci-flaky-intake.md
+index 8b98c2d299d7c6eb552da9921ff57622c973ec8b..a8226bbe4674014014c407c8b74c96026786e662 100644
+--- a/docs/ci-flaky-intake.md
++++ b/docs/ci-flaky-intake.md
+@@ -18,10 +18,11 @@ Reusable state-adapter contract:
+ 1. Inspect `hermes kanban --help` for `selfwork-producer` before any submission.
+    Absence (including pre-self-work runtimes) permits the old undeclared path only
+    for work not already frozen. `hermes kanban selfwork-producer --operation capabilities`
+-   returns `{"self_work_producer":1}`. A well-formed unsupported version likewise
++   returns `{"self_work_producer":1,"self_work_producer_placement":1}`. A well-formed unsupported version likewise
+    permits the old path before submission; errors/malformed capability replies do not.
+ 2. `hermes kanban selfwork-producer --operation prepare --request-file -` accepts
+-   JSON with exactly `title`, `body`, `assignee`, `idempotency_key`, and `self_work`.
++   JSON with required `title`, `body`, `assignee`, `idempotency_key`, and `self_work`,
++   plus optional `runs_on` and `requires` string lists. No other create fields are allowed.
+    It performs no submission and returns `{version:1,sender,home,body,request_id}`.
+    `home` is `{gateway,profile,board}`; `body.create` freezes those input fields,
+    home board and tenant. Persist this entire snapshot atomically before step 3.
+@@ -36,6 +37,43 @@ Reusable state-adapter contract:
+    omit request_id. Exit 0 alone is not delivery. Never downgrade any attempted
+    declared submission, regenerate it after midnight, or retry via local creation.
+ 
++Placement-aware adapters must require both integer capability values to be `1`
++(not booleans); the older `{"self_work_producer":1}` does not advertise placement.
++Only before preparation or any declared attempt may an adapter choose its legacy
++route for a well-formed unsupported capability reply. Once prepared, retain the
++snapshot and retry only `advance` on a compatible runtime; never strip placement,
++regenerate a request, or fall back after errors. Minimal v1 snapshots remain valid,
++and consumers not needing placement may continue checking just the base capability.
++
++The optional lists use existing create label/capability validation, including empty
++lists; null, scalar strings and non-string members are rejected. Preparation and
++snapshot validation do not normalize, sort, deduplicate or insert omitted fields.
++The trusted receiver still applies normal create normalization and placement gates:
++explicit labels (even `runs_on: []`) need a synced intake board and eligible
++capabilities, not merely a producer capability advertisement. That advertisement
++is local-runtime support, not a health check of the remote intake. Receiver create
++refusals may surface only as `self_work_dispatch_pending`; persistent pending needs
++operator diagnosis of the intake's sync/placement gates, never a legacy fallback.
++Do not re-prepare an existing key with changed placement: courier/intake replay
++binds the original payload. Normalize legacy comma-separated or JSON-list CLI
++syntax into a list before preparation, not inside a saved snapshot. Label whitespace
++is validated using create normalization but retained in the snapshot itself.
++Same-area append preserves the existing owner's
++placement and requirements; requested placement applies only to a newly created task.
++
++State adapters must also account for these existing consumer differences:
++
++- `created_by` is not caller authority: the authenticated gateway supplies it. Put
++  producer attribution in the body rather than forwarding a legacy `--created-by`.
++- The owner is the full gateway/profile/board/task tuple, not necessarily a local
++  default-board task. Local `show` or SQLite lookups are not cross-home readback.
++- Appends can return an owner with another idempotency key. A successful append
++  already includes the submitted body; do not send a second legacy comment.
++- Freeze each evidence batch and key before transport, and mark only that batch
++  consumed after a completed receipt. Pending is not success even with exit zero.
++- CLI `--runs-on` strings must be converted to the equivalent string list before
++  preparation. Keep caller-selected labels and `requires` intact.
++
+ Completion requires a matching frozen envelope, terminal courier `done` state and
+ an authoritative `self_work_accepted` owner receipt (`ok`, `handoff_complete` true,
+ `ownership_pending` false, exact request ID and create/append consistency). Append
+diff --git a/hermes_cli/kanban_selfwork_producer.py b/hermes_cli/kanban_selfwork_producer.py
+index 18aecf3d4b7606ca1c9099df0afc767cc113d4cc..df66266e8253070b38c556472503a35f777c530f 100644
+--- a/hermes_cli/kanban_selfwork_producer.py
++++ b/hermes_cli/kanban_selfwork_producer.py
+@@ -15,7 +15,9 @@ from pathlib import Path
+ 
+ from hermes_cli.kanban_selfwork import SelfWorkError, contract
+ 
+-CAPABILITY = {'self_work_producer': 1}
++CAPABILITY = {'self_work_producer': 1, 'self_work_producer_placement': 1}
++_CREATE_FIELDS = {'title', 'body', 'idempotency_key', 'assignee', 'self_work'}
++_PLACEMENT_FIELDS = {'runs_on', 'requires'}
+ _NAME = re.compile(r'[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}\Z')
+ 
+ 
+@@ -23,18 +25,34 @@ def _digest(value):
+     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+ 
+ 
++def _validate_placement(create):
++    from hermes_cli.kanban_capabilities import _required_capabilities
++    from hermes_cli.kanban_worker_node import normalize_runs_on
++
++    for field in _PLACEMENT_FIELDS & create.keys():
++        value = create[field]
++        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
++            raise SelfWorkError(f'producer {field} must be a string list')
++        # Validate with create semantics, but freeze the original bytes/order.
++        if field == 'runs_on':
++            normalize_runs_on(value)
++        else:
++            _required_capabilities(value, 'scratch')
++
++
+ def prepare(create):
+     """Freeze a declared, non-chat producer request without any external write."""
+     from hermes_cli.kanban_selfwork_owner import _runtime
+ 
+     if os.environ.get('HERMES_KANBAN_TASK') or os.environ.get('HERMES_KANBAN_WORKER_TASK'):
+         raise SelfWorkError('headless producer cannot replace worker origin forwarding')
+-    if not isinstance(create, dict) or set(create) - {'title', 'body', 'idempotency_key', 'assignee', 'self_work'}:
++    if not isinstance(create, dict) or set(create) - (_CREATE_FIELDS | _PLACEMENT_FIELDS):
+         raise SelfWorkError('invalid producer create fields')
+     if contract(create.get('self_work')) is None or not all(
+         isinstance(create.get(k), str) and create[k].strip() for k in ('title', 'body', 'idempotency_key', 'assignee')
+     ):
+         raise SelfWorkError('producer requires declaration and nonempty create fields')
++    _validate_placement(create)
+     config, sender, _, _ = _runtime()
+     home = config.get('kanban', {}).get('self_work', {}).get('home')
+     if (not isinstance(home, dict) or set(home) != {'gateway', 'profile', 'board'}
+@@ -56,12 +74,13 @@ def validate(frozen):
+             or not isinstance(body, dict) or set(body) != {'create'} or not isinstance(body['create'], dict)):
+         raise SelfWorkError('invalid producer snapshot route')
+     create = body['create']
+-    if (set(create) != {'title', 'body', 'idempotency_key', 'assignee', 'self_work', 'board', 'tenant'}
++    if (set(create) - _PLACEMENT_FIELDS != _CREATE_FIELDS | {'board', 'tenant'}
+             or create['board'] != home['board'] or contract(create['self_work']) is None
+             or not all(isinstance(create[k], str) and create[k].strip()
+                        for k in ('title', 'body', 'idempotency_key', 'assignee'))
+             or frozen['request_id'] != 'sw-' + _digest({'sender': sender, 'home': home, 'key': create['idempotency_key']})):
+         raise SelfWorkError('invalid producer snapshot payload')
++    _validate_placement(create)
+ 
+ 
+ def receipt(frozen, row):
+diff --git a/tests/hermes_cli/test_kanban_selfwork_producer.py b/tests/hermes_cli/test_kanban_selfwork_producer.py
+index a62ba1bc3ececf525ff8dca8af58ee7d3827a12a..832056bed4d7b79d08440b439e1597fc67e1fc22 100644
+--- a/tests/hermes_cli/test_kanban_selfwork_producer.py
++++ b/tests/hermes_cli/test_kanban_selfwork_producer.py
+@@ -29,9 +29,22 @@ def create_args(key='page1'):
+             'self_work': {'version': 1, 'repository': 'hermes-core', 'area': 'ci', 'kind': 'ci-flake'}}
+ 
+ 
+-def test_composed_cli_owner_create_append_and_replay(request_envelope, tmp_path, monkeypatch, capsys):
++@pytest.mark.parametrize('placement', [{}, {'runs_on': ['pool:worker'], 'requires': ['terminal', 'file']}])
++def test_composed_cli_owner_create_append_and_replay(request_envelope, tmp_path, monkeypatch, capsys, placement):
+     from hermes_cli import kanban_selfwork_outbound as outbound
+ 
++    from hermes_cli import kanban_db_sync as sync, kanban_worker_node as wn
++    from hermes_cli import kanban_sync_client as client
++    config_path = tmp_path / 'config.yaml'
++    config = json.loads(config_path.read_text(encoding='utf-8'))
++    config['kanban']['sync'] = {'enabled': True}
++    config_path.write_text(json.dumps(config), encoding='utf-8')
++    with kbc.connect_closing() as conn:
++        sync.install_or_remove(conn, str(tmp_path / 'kanban.db'))
++        client.ensure_identity(conn, 'fixture-board', 'owner')
++        sync.set_mode(conn, 'primary')
++    monkeypatch.setattr(wn, 'registry', lambda: {'machines': {
++        'worker': {'state': 'active', 'labels': ['pool:worker', 'linux'], 'pickup': 'all'}}})
+     monkeypatch.delenv('HERMES_KANBAN_WORKER_TASK', raising=False)
+     hub = tmp_path / 'hub'
+     hub.mkdir(exist_ok=True)
+@@ -45,22 +58,42 @@ def test_composed_cli_owner_create_append_and_replay(request_envelope, tmp_path,
+         request = {'id': rid, 'from': 'gw:owner', 'to_gw': home['gateway'], 'coll': 'tasks',
+                    'action': 'selfwork-create', 'key': home['profile'] + '/' + home['board'], 'args': body}
+         result = support.invoke(request, monkeypatch, capsys)
+-        assert result.get('handoff_complete') is True, result
++        assert result.get('handoff_complete') is True, (result, raw_results)
+         requests.append(result)
+         with db:
+             db.execute('INSERT OR REPLACE INTO sent VALUES(?,?,?,?)',
+                        (rid, json.dumps({k: v for k, v in request.items() if k != 'from'}), 'done', json.dumps(result)))
+         return {'code': 'self_work_queued'}
+ 
++    from tools.registry import registry
++    dispatch = registry.dispatch
++    raw_results = []
++
++    def traced_dispatch(*args, **kwargs):
++        raw = dispatch(*args, **kwargs)
++        raw_results.append(raw)
++        return raw
++
++    monkeypatch.setattr(registry, 'dispatch', traced_dispatch)
+     monkeypatch.setattr(outbound, 'send', transport)
+     try:
+-        assert invoke('capabilities', None, monkeypatch, capsys) == {'self_work_producer': 1}
+-        first = invoke('prepare', create_args(), monkeypatch, capsys)
++        assert invoke('capabilities', None, monkeypatch, capsys) == {
++            'self_work_producer': 1, 'self_work_producer_placement': 1}
++        first = invoke('prepare', {**create_args(), **placement}, monkeypatch, capsys)
+         assert not requests
+         result = invoke('advance', first, monkeypatch, capsys)
+         assert result['status'] == 'completed', (result, requests)
+         assert result['disposition'] == 'create'
+-        second = invoke('prepare', create_args('page2'), monkeypatch, capsys)
++        if placement:
++            for field in ('runs_on', 'requires'):
++                changed = json.loads(json.dumps(first))
++                changed['body']['create'][field] = []
++                refused = invoke('advance', changed, monkeypatch, capsys)
++                assert refused['status'] == 'pending'
++                assert 'envelope mismatch' in refused['error']
++            assert len(requests) == 1
++        second = invoke('prepare', {**create_args('page2'), **(
++            {'runs_on': ['linux'], 'requires': []} if placement else {})}, monkeypatch, capsys)
+         appended = invoke('advance', second, monkeypatch, capsys)
+         assert appended['disposition'] == 'append', appended
+         assert appended['owner'] == result['owner']
+@@ -75,6 +108,10 @@ def test_composed_cli_owner_create_append_and_replay(request_envelope, tmp_path,
+             assert len(tasks) == 1
+             assert tasks[0].idempotency_key == 'page1'
+             assert 'immutable manifest page page1' in tasks[0].body
++            if placement:
++                row = conn.execute('SELECT runs_on,requires FROM tasks WHERE id=?', (tasks[0].id,)).fetchone()
++                assert json.loads(row[0]) == ['pool:worker']
++                assert set(json.loads(row[1])) == {'terminal', 'file'}
+             notes = kb.list_comments(conn, tasks[0].id)
+             assert len(notes) == 1
+             assert 'immutable manifest page page2' in notes[0].body
+@@ -82,6 +119,26 @@ def test_composed_cli_owner_create_append_and_replay(request_envelope, tmp_path,
+         db.close()
+ 
+ 
++@pytest.mark.parametrize('labels', [[], ['pool:worker']])
++def test_unsynced_intake_stays_pending_without_local_fallback(request_envelope, monkeypatch, capsys, labels):
++    from hermes_cli import kanban_selfwork_outbound as outbound
++    monkeypatch.delenv('HERMES_KANBAN_WORKER_TASK', raising=False)
++    frozen = producer.prepare({**create_args(), 'runs_on': labels, 'requires': ['terminal', 'file']})
++    pending = {'version': 1, 'status': 'pending', 'request_id': frozen['request_id'], 'owner': None}
++    monkeypatch.setattr(producer, 'read_receipt', lambda snapshot: pending)
++    received = []
++
++    def transport(home, body, rid):
++        request = {**request_envelope, 'id': rid, 'from': 'gw:owner', 'args': body}
++        received.append(support.invoke(request, monkeypatch, capsys))
++
++    monkeypatch.setattr(outbound, 'send', transport)
++    assert producer.advance(frozen) == pending
++    assert received == [{'status': 'pending', 'code': 'self_work_dispatch_pending', 'handoff_complete': False}]
++    with kbc.connect_closing() as conn:
++        assert not kb.list_tasks(conn)
++
++
+ @pytest.mark.parametrize('field,value', [('self_work', None), ('title', ''), ('body', None), ('idempotency_key', ''),
+                                        ('assignee', 1), ('session_id', 'chat')])
+ def test_invalid_prepare_does_not_submit(request_envelope, monkeypatch, capsys, field, value):
+@@ -92,6 +149,38 @@ def test_invalid_prepare_does_not_submit(request_envelope, monkeypatch, capsys,
+     assert result['status'] == 'pending'
+ 
+ 
++@pytest.mark.parametrize('placement', [
++    {'runs_on': []}, {'requires': []},
++    {'runs_on': ['pool:worker', 'linux', 'pool:worker']},
++    {'requires': ['terminal', 'file', 'terminal']},
++])
++def test_optional_placement_frozen_unchanged(request_envelope, monkeypatch, capsys, placement):
++    monkeypatch.delenv('HERMES_KANBAN_WORKER_TASK', raising=False)
++    create = {**create_args(), **placement}
++    frozen = invoke('prepare', create, monkeypatch, capsys)
++    producer.validate(frozen)
++    for field, value in placement.items():
++        assert frozen['body']['create'][field] == value
++        create[field].append('changed')
++        assert frozen['body']['create'][field] != create[field]
++
++
++@pytest.mark.parametrize('field,value', [
++    ('runs_on', None), ('requires', None), ('runs_on', 'pool:worker'), ('requires', 'terminal'),
++    ('runs_on', {}), ('requires', {}), ('runs_on', [1]), ('requires', [1]),
++    ('runs_on', ['INVALID']), ('requires', ['unknown-capability']),
++    ('runs_on', ['']), ('requires', ['']), ('runs_on', ['linux'] * 33),
++    ('created_by', 'caller'), ('origin_intent', {}), ('placement', 'local'),
++])
++def test_placement_validation_at_both_boundaries(request_envelope, monkeypatch, capsys, field, value):
++    monkeypatch.delenv('HERMES_KANBAN_WORKER_TASK', raising=False)
++    frozen = invoke('prepare', create_args(), monkeypatch, capsys)
++    assert invoke('prepare', {**create_args(), field: value}, monkeypatch, capsys)['status'] == 'pending'
++    frozen['body']['create'][field] = value
++    monkeypatch.setattr(producer, 'read_receipt', lambda *a: pytest.fail('invalid snapshot read'))
++    assert invoke('advance', frozen, monkeypatch, capsys)['status'] == 'pending'
++
++
+ @pytest.mark.parametrize('variable', ['HERMES_KANBAN_TASK', 'HERMES_KANBAN_WORKER_TASK'])
+ def test_worker_cannot_use_headless_prepare(request_envelope, monkeypatch, capsys, variable):
+     monkeypatch.setenv(variable, 't_worker')
+-- 
+2.43.0
+

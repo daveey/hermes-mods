@@ -1,0 +1,153 @@
+From 429e1de15b75319e0be68d1e2ebbf52c102808c1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 20:13:41 +0000
+Subject: [PATCH] [daveey] lifecycle guard: past the first hop, python is a
+ data consumer only when stdin is its program
+
+Review 5941029921 B1: python -c/-m/script launchers (python3 -c 'os.execlp("bash", "bash")')
+were allowlisted as stdin data consumers, so a stdin file they hand to bash skipped the
+nested-shell walk. Python now counts as data only for `python [flags] [-]` (no-code flags,
+-W/-X values); -c, -m, long options and script operands fail closed.
+---
+ cron/lifecycle_guard_nested_shells.py         | 38 ++++++++++++--
+ .../test_lifecycle_guard_session_aliases.py   | 51 +++++++++++++++++++
+ 2 files changed, 86 insertions(+), 3 deletions(-)
+
+diff --git a/cron/lifecycle_guard_nested_shells.py b/cron/lifecycle_guard_nested_shells.py
+index 8a7edbb0de066945f1c6751110fb8a5365ccb887..34af62ef95904045e0a6a9ec47aa38586eed0a26 100644
+--- a/cron/lifecycle_guard_nested_shells.py
++++ b/cron/lifecycle_guard_nested_shells.py
+@@ -226,8 +226,39 @@ _HOP_DATA_COMMANDS = frozenset({
+ })
+ 
+ 
+-def _hop_data_command(name: Optional[str]) -> bool:
+-    return name is not None and (name in _HOP_DATA_COMMANDS or bool(_PYTHON_RE.fullmatch(name)))
++_PYTHON_FLAG_RE = re.compile(r"-[bBdEhiIOPqRsSuvVx]+")
++_PYTHON_VALUE_FLAG_RE = re.compile(r"-[bBdEhiIOPqRsSuvVx]*[WX](.*)")
++
++
++def _python_reads_program_from_stdin(arguments: list[str]) -> bool:
++    """Whether ``python <arguments>`` runs its program from stdin (``python3 -``, bare
++    ``python3``, flags that take no code). ``-c``/``-m``/a script operand runs other code
++    that may hand stdin to a shell (``python3 -c 'os.execlp("bash", "bash")'``; review
++    5941029921 B1); unknown and long options fail closed too."""
++    index = 0
++    while index < len(arguments):
++        word = arguments[index]
++        if word == "-":
++            return True
++        if word == "--":
++            return index + 1 >= len(arguments) or arguments[index + 1] == "-"
++        if _PYTHON_FLAG_RE.fullmatch(word):
++            index += 1
++            continue
++        value = _PYTHON_VALUE_FLAG_RE.fullmatch(word)
++        if value is not None:
++            index += 1 if value.group(1) else 2  # `-Wignore` / `-W ignore`
++            continue
++        return False  # -c, -m, --long options, a script operand
++    return index == len(arguments)  # bare `python3` (a value flag missing its value: closed)
++
++
++def _hop_data_command(name: Optional[str], arguments: list[str]) -> bool:
++    if name is None:
++        return False
++    if _PYTHON_RE.fullmatch(name):
++        return _python_reads_program_from_stdin(arguments)
++    return name in _HOP_DATA_COMMANDS
+ 
+ 
+ def _remote_reads_stdin(remote: list[str], hops: int = 1) -> bool:
+@@ -266,7 +297,8 @@ def _remote_reads_stdin(remote: list[str], hops: int = 1) -> bool:
+             return True  # an ssh hop feeding a shell, or a user switch's shell (`su -l`, `sudo -i`)
+         if name in ("sudo", "su", "runuser", "doas"):
+             return True  # a user switch on the remote side: fail closed rather than model it
+-        if hops > 1 and index is not None and name != "ssh" and not _hop_data_command(name):
++        if hops > 1 and index is not None and name != "ssh" and not _hop_data_command(
++                name, _split_redirections(view[index + 1:])[0]):
+             return True  # past the first hop only known data consumers read stdin as data
+     return False
+ 
+diff --git a/tests/cron/test_lifecycle_guard_session_aliases.py b/tests/cron/test_lifecycle_guard_session_aliases.py
+index 719aeabf0e7fb2eb39292b052d7d0260a07810bf..ff489722af56a0d0ff9a8eec44326cd15470a4b6 100644
+--- a/tests/cron/test_lifecycle_guard_session_aliases.py
++++ b/tests/cron/test_lifecycle_guard_session_aliases.py
+@@ -3,6 +3,7 @@ walked text (``alias -p`` + ``shopt -s expand_aliases`` in ``_snapshot_bootstrap
+ every command runs with them. The guard must hear about them from the backend."""
+ 
+ import json
++import os
+ import subprocess
+ from types import SimpleNamespace
+ from typing import Any
+@@ -836,6 +837,12 @@ _MULTI_HOP_DATA_CONSUMERS = [
+     "ssh h1 \"ssh h2 'cd /tmp && python3 -'\" < {py}",
+     "ssh h1 'ssh h2 python3.12 -' < {py}",
+     "ssh h1 'ssh h2 tee /tmp/takeover.py' < {py}",
++    # Python reading its program from stdin, with option flags that take no code (review
++    # 5941029921 B1 keeps these as data; only -c/-m/script launchers fail closed).
++    "ssh h1 'ssh h2 python3' < {py}",
++    "ssh h1 'ssh h2 python3 -u -' < {py}",
++    "ssh h1 'ssh h2 python3 -IB -X utf8 -W ignore -' < {py}",
++    "ssh h1 'ssh h2 python3 -Wignore -Xdev -' < {py}",
+ ]
+ 
+ 
+@@ -902,9 +909,53 @@ _MULTI_HOP_SHELLS = [
+     "ssh h1 'ssh h2 kubectl exec -i p -- bash' < {script}",
+     "ssh h1 'ssh h2 xargs -0 bash' < {script}",
+     "ssh h1 \"ssh h2 'cd /tmp && bash'\" < {script}",
++    # Python is a data consumer only when stdin is its program: a -c/-m/script launcher may
++    # hand stdin to a shell (`python3 -c 'os.execlp("bash", "bash")'`; review 5941029921 B1).
++    "ssh h1 \"ssh h2 'python3 -c x'\" < {script}",
++    "ssh h1 \"ssh h2 'python3 -Ic x'\" < {script}",
++    "ssh h1 \"ssh h2 'python3 -u -c x -'\" < {script}",
++    "ssh h1 \"ssh h2 'python3 -cx'\" < {script}",
++    "ssh h1 'ssh h2 python3 -m pty' < {script}",
++    "ssh h1 'ssh h2 python3 -mpty' < {script}",
++    "ssh h1 'ssh h2 python3 run.py' < {script}",
++    "ssh h1 'ssh h2 python3 -X utf8 run.py' < {script}",
++    "ssh h1 'ssh h2 python3 --check-hash-based-pycs never -' < {script}",
++    "ssh h1 \"bash -c 'python3 -c x'\" < {script}",
++    "ssh h1 \"ssh h2 'bash -c \\\"python3 -m pty\\\"'\" < {script}",
+ ]
+ 
+ 
++@pytest.mark.parametrize("consumer", [
++    "python3 -c 'import os; os.execlp(\"bash\", \"bash\")'",
++    "python3 -c 'import subprocess; subprocess.run([\"bash\"], check=True)'",
++])
++@pytest.mark.parametrize("aliases", [frozenset(), frozenset({"zz"}), None])
++def test_multi_hop_python_launcher_executes_stdin_as_shell(tmp_path, consumer, aliases):
++    """Review 5941029921 B1, executed for real: a `python3 -c` launcher behind a second ssh hop
++    hands the stdin file to bash, so the guard keeps walking it (a script over the scan cap
++    refuses) instead of reading it as Python data."""
++    import shlex
++    import subprocess
++    huge = tmp_path / "huge.sh"
++    huge.write_text("# padding\n" * 130000 + 'printf "REVIEW_MARKER\\n"\n')
++    startup = tmp_path / "startup.sh"
++    startup.write_text("shopt -s expand_aliases\nalias t='true; '\n")
++    script = tmp_path / "input.sh"
++    script.write_text(f"t ( bash {shlex.quote(str(huge))} )\n")
++    with script.open() as stream:
++        ran = subprocess.run(["bash", "-c", consumer], stdin=stream, text=True,
++                             capture_output=True, timeout=10, check=False,
++                             env={**os.environ, "BASH_ENV": str(startup)})
++    assert (ran.returncode, ran.stdout, ran.stderr) == (0, "REVIEW_MARKER\n", "")
++    command = ("ssh h1 " + shlex.quote("ssh h2 " + shlex.quote(consumer))
++               + " < " + shlex.quote(str(script)))
++    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path), session_aliases=aliases)
++    assert unsafe and refusal is not None and "scan cap" in refusal, (command, aliases, refusal)
++    huge.write_text('printf "CLEAN\\n"\n')
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path), session_aliases=aliases) == (
++        False, None)
++
++
+ @pytest.mark.parametrize("shape", _MULTI_HOP_SHELLS)
+ def test_multi_hop_ssh_shell_still_walks_stdin_as_nested_script(tmp_path, live_kanban_db, shape):
+     """Controls: a hop chain that ends in a shell reading stdin (or that the walk cannot model)
+-- 
+2.43.0
+

@@ -1,0 +1,375 @@
+From 3b992220fa565edde240011e15cfe9210fff1e54 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 15:37:08 +0000
+Subject: [PATCH] perf(kanban): move switcher counts per changed task on the P2
+ cursor [daveey]
+
+Card E stage8 (t_78d2b488ee11aa70). The stage7 scale matrix failed one gate:
+a changed board's GET /boards on a 440 MB WAL grew 5.347 -> 8.057 ms from 1k to
+20k tasks (1.507x > 1.5x), because every changed board was re-counted with a
+whole-table GROUP BY status on a fresh connection.
+
+board_counts now keeps each board's task statuses and the P2 cursor they were
+read at. A changed board reads changed_since and the status of only those tasks
+in one snapshot and moves each between buckets (insert, status move, delete).
+FULL (first read, new file/WAL generation, schema, older-writer trigger), more
+than DELTA_MAX changes, or a failed read take the whole-board read; a legacy
+board without a cursor keeps the exact GROUP BY. The entry is unpublished while
+it is updated under a per-board lock, so a failure leaves nothing stale.
+
+Tests: test_kanban_board_counts_delta.py (3 RED on base, 6 GREEN); 16 dashboard
+suites, 181 tests GREEN. Scale matrix (real ASGI, 1k/5.8k/20k, checkpointed and
+440 MB WAL): changed-list 6.1/6.3/5.9 ms on WAL (0.97x), 5.4/5.9/5.9 ms
+checkpointed (1.10x); all ten gated scenarios pass, and the runner now exits
+nonzero on any failed gate (control: stage7 results -> exit 1).
+---
+ plugins/kanban/dashboard/board_counts.py      | 116 ++++++++++--
+ .../plugins/test_kanban_board_counts_delta.py | 174 ++++++++++++++++++
+ 2 files changed, 270 insertions(+), 20 deletions(-)
+ create mode 100644 tests/plugins/test_kanban_board_counts_delta.py
+
+diff --git a/plugins/kanban/dashboard/board_counts.py b/plugins/kanban/dashboard/board_counts.py
+index 2210df46c8bed3332b6f92ee20a74b62b376085b..b7c94d06c293b3dbc79864469de4741f20a70d89 100644
+--- a/plugins/kanban/dashboard/board_counts.py
++++ b/plugins/kanban/dashboard/board_counts.py
+@@ -2,30 +2,99 @@
+ 
+ GET /boards is polled continuously, and every board's count query used to open a
+ fresh guarded connection. The last counts per board file are kept, keyed on
+-``board_rows.version`` (observer generation, file identity, schema_version and
+-``PRAGMA data_version``). Any commit by another connection moves that version, so
+-an unchanged board costs two PRAGMAs on a retained connection and a changed board
+-is read again on the next poll. There is no timer: the key alone decides.
++``board_rows.content_version`` (observer generation plus the P2 change cursor, or the
++commit key on a legacy board without one). An unchanged board costs the key read on a
++retained connection and opens nothing. There is no timer: the key alone decides.
++
++A changed board is updated per task, not re-counted. The entry keeps each task's status
++and the P2 cursor it was read at. The next read takes ``changed_since`` and the status
++of only those tasks in ONE snapshot, then moves each one between buckets. The whole
++table is read only when the cursor declines (FULL: first read, new file or WAL
++generation, schema change, an older writer's trigger) or more than ``DELTA_MAX`` tasks
++moved. A legacy board (no cursor) keeps the exact ``GROUP BY status`` read.
++[daveey] card E stage7 (t_78d2b488ee11aa70): the whole-table count of a changed board
++grew 1.51x from 1k to 20k tasks on a 440 MB WAL.
+ """
+ from collections import OrderedDict
+ from contextlib import closing
+ import sqlite3
+ import threading
++from typing import Optional
+ 
+ from hermes_cli import kanban_db
++from hermes_cli import kanban_task_change
+ from hermes_cli.kanban_generation import open_ro
+ from plugins.kanban.dashboard import board_rows
+ 
+-MAX_CACHED = 64  # board files with remembered counts (one small dict each)
++MAX_CACHED = 64  # board files with remembered counts
++DELTA_MAX = 512  # more changed tasks than this re-reads the board in full
++_CHUNK = 500  # ids per IN list (below SQLite's default 999 host parameters)
+ 
+ _lock = threading.Lock()
+-_cached: "OrderedDict[str, tuple[tuple, dict[str, int]]]" = OrderedDict()
++# path -> (key, counts, state); state is None (legacy board) or (cursor, {task id: status})
++_cached: "OrderedDict[str, tuple[tuple, dict[str, int], Optional[tuple]]]" = OrderedDict()
++_path_locks: dict[str, threading.Lock] = {}
++
++
++def _tally(statuses: dict) -> dict[str, int]:
++    out: dict[str, int] = {}
++    for status in statuses.values():
++        out[status] = out.get(status, 0) + 1
++    return out
+ 
+ 
+-def _query(path) -> dict[str, int]:
++def _query(path, prev: Optional[tuple] = None) -> tuple[dict[str, int], Optional[tuple]]:
++    """``(counts, state)`` of ``path``. ``prev`` is the last ``(counts, state)`` or None.
++
++    Cursor, changed ids and their statuses come from one read snapshot. The caller holds
++    the board's path lock and has unpublished ``prev``: its statuses map is updated in
++    place, and only after every read succeeded.
++    """
+     with closing(open_ro(path)) as conn:
+-        return {status: int(count) for status, count in conn.execute(
+-            "SELECT status, COUNT(*) FROM tasks GROUP BY status")}
++        if conn.in_transaction:  # never hold an older snapshot than this read's own
++            conn.rollback()
++        conn.execute("BEGIN")
++        try:
++            prev_state = prev[1] if prev is not None else None
++            changed, cursor = kanban_task_change.changed_since(
++                conn, prev_state[0] if prev_state is not None else None)
++            if cursor is None:  # legacy board or an unobservable file identity: the exact count
++                return {status: int(n) for status, n in conn.execute(
++                    "SELECT status, COUNT(*) FROM tasks GROUP BY status")}, None
++            if prev is None or prev_state is None or not isinstance(changed, frozenset) \
++                    or len(changed) > DELTA_MAX:  # FULL, or no retained statuses to move
++                statuses = dict(conn.execute("SELECT id, status FROM tasks"))
++                return _tally(statuses), (cursor, statuses)
++            ids = list(changed)
++            now: dict = {}
++            for i in range(0, len(ids), _CHUNK):
++                part = ids[i:i + _CHUNK]
++                now.update(conn.execute(
++                    f"SELECT id, status FROM tasks WHERE id IN ({','.join('?' * len(part))})", part))
++        finally:
++            if conn.in_transaction:
++                conn.rollback()
++    counts, statuses = dict(prev[0]), prev_state[1]
++    for tid in ids:
++        if tid in statuses:
++            before = statuses.pop(tid)
++            left = counts.get(before, 0) - 1
++            if left > 0:
++                counts[before] = left
++            else:
++                counts.pop(before, None)
++        if tid in now:  # absent: deleted
++            after = statuses[tid] = now[tid]
++            counts[after] = counts.get(after, 0) + 1
++    return counts, (cursor, statuses)
++
++
++def _path_lock(key: str) -> threading.Lock:
++    with _lock:
++        lock = _path_locks.get(key)
++        if lock is None:
++            lock = _path_locks[key] = threading.Lock()
++        return lock
+ 
+ 
+ def board_counts(slug: str) -> dict[str, int]:
+@@ -33,30 +102,37 @@ def board_counts(slug: str) -> dict[str, int]:
+ 
+     Use the generation-guarded query-only connection, including its missing WAL
+     sidecar fallback. Writer connect still owns integrity checks and migrations.
+-    The version is read before the query, so a commit that lands during the query
+-    is read again next time. An unobservable board (version None) and a failed
++    The key is read before the query, so a commit that lands during the query
++    is read again next time. An unobservable board (key None) and a failed
+     query store nothing. A hit returns a copy: callers mutate and serialize it.
++    One refresh per board file at a time, under its path lock: the entry is taken out
++    while it is updated, so a failure leaves nothing (the next read is FULL).
+     """
+     try:
+         path = kanban_db.kanban_db_path(board=slug)
+         key = str(path)
+         ver = board_rows.content_version(key)
+-        if ver is not None:
++        if ver is None:
++            with _lock:
++                _cached.pop(key, None)
++            return _query(path)[0]
++        with _path_lock(key):
+             with _lock:
+                 hit = _cached.get(key)
+                 if hit is not None and hit[0] == ver:
+                     _cached.move_to_end(key)
+                     return dict(hit[1])
+-        counts = _query(path)
++                if hit is not None:
++                    del _cached[key]
++            counts, state = _query(path, (hit[1], hit[2]) if hit is not None else None)
++            with _lock:
++                _cached[key] = (ver, counts, state)
++                _cached.move_to_end(key)
++                while len(_cached) > MAX_CACHED:
++                    _cached.popitem(last=False)
++            return dict(counts)
+     except (OSError, ValueError, sqlite3.Error):
+         return {}
+-    if ver is not None:
+-        with _lock:
+-            _cached[key] = (ver, dict(counts))
+-            _cached.move_to_end(key)
+-            while len(_cached) > MAX_CACHED:
+-                _cached.popitem(last=False)
+-    return counts
+ 
+ 
+ def clear() -> None:
+diff --git a/tests/plugins/test_kanban_board_counts_delta.py b/tests/plugins/test_kanban_board_counts_delta.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1ed952881ba4253483dc587f7b0ac9db1e4f76d3
+--- /dev/null
++++ b/tests/plugins/test_kanban_board_counts_delta.py
+@@ -0,0 +1,174 @@
++"""GET /boards counts of a changed board move only the changed tasks (card E stage7).
++
++A changed board used to be re-counted with a whole-table ``GROUP BY status``. The counts now
++follow the P2 change cursor: the next read takes the changed ids and their statuses in one
++snapshot. Every case compares against the exact ``GROUP BY`` of the live file.
++"""
++from contextlib import closing
++from unittest import mock
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_task_change as changes
++from hermes_cli.kanban_generation import open_ro
++from plugins.kanban.dashboard import board_counts, board_rows
++from tests.plugins import test_kanban_board_read_cache as helpers
++
++board = helpers.board
++
++
++@pytest.fixture(autouse=True)
++def reset():
++    board_rows.clear()
++    board_counts.clear()
++    yield
++    board_rows.clear()
++    board_counts.clear()
++
++
++def _exact() -> dict:
++    with closing(open_ro(kb.kanban_db_path())) as conn:
++        return {s: n for s, n in conn.execute("SELECT status, COUNT(*) FROM tasks GROUP BY status")}
++
++
++def _counts(mod) -> dict:
++    return next(b for b in mod.list_boards(include_archived=False)["boards"] if b["slug"] == "default")["counts"]
++
++
++@pytest.fixture
++def statements(monkeypatch):
++    """Every statement a count connection runs."""
++    seen: list[str] = []
++    real = board_counts.open_ro
++
++    def traced(path, *a, **k):
++        conn = real(path, *a, **k)
++        conn.set_trace_callback(lambda q: seen.append(" ".join(q.split())))
++        return conn
++
++    monkeypatch.setattr(board_counts, "open_ro", traced)
++    return seen
++
++
++def _whole_table(seen: list[str]) -> list[str]:
++    return [q for q in seen if q.startswith("SELECT") and "FROM tasks" in q and "WHERE" not in q]
++
++
++def _seed(n: int) -> list[str]:
++    with closing(kbc.connect()) as conn:
++        return [kb.create_task(conn, title=f"t{i}", assignee="w") for i in range(n)]
++
++
++def test_changed_board_reads_only_changed_tasks(board, statements):
++    mod, _client, _reads = board
++    ids = _seed(6)
++    assert _counts(mod) == _exact() == {"ready": 6}
++    statements.clear()
++    with closing(kbc.connect()) as conn:
++        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (ids[0],))
++        conn.commit()
++    assert _counts(mod) == _exact() == {"ready": 5, "blocked": 1}
++    assert statements, "the changed board was read"
++    assert not _whole_table(statements), statements
++
++
++def test_create_delete_status_moves_and_null_status_stay_exact(board):
++    mod, _client, _reads = board
++    ids = _seed(5)
++    _counts(mod)
++    with closing(kbc.connect()) as conn:
++        conn.execute("UPDATE tasks SET status='done' WHERE id IN (?, ?)", (ids[0], ids[1]))
++        conn.execute("DELETE FROM tasks WHERE id=?", (ids[2],))
++        conn.commit()
++        kb.create_task(conn, title="new", assignee="w")
++    assert _counts(mod) == _exact()
++    with closing(kbc.connect()) as conn:
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (ids[0],))  # back again
++        conn.execute("UPDATE tasks SET title='only title' WHERE id=?", (ids[3],))
++        conn.commit()
++    assert _counts(mod) == _exact()
++    with closing(kbc.connect()) as conn:
++        conn.execute("DELETE FROM tasks")
++        conn.commit()
++    assert _counts(mod) == _exact() == {}
++
++
++def test_heartbeat_only_commit_does_not_read_tasks(board, statements):
++    mod, _client, _reads = board
++    ids = _seed(2)
++    _counts(mod)
++    statements.clear()
++    with closing(kbc.connect()) as conn:
++        conn.execute("UPDATE tasks SET last_heartbeat_at=5 WHERE id=?", (ids[0],))
++        conn.commit()
++    assert _counts(mod) == {"ready": 2}
++    assert statements == []
++
++
++def test_full_cursor_rereads_whole_board(board, statements):
++    mod, _client, _reads = board
++    ids = _seed(3)
++    _counts(mod)
++    real = changes.changed_since
++
++    def full(conn, cursor, **kw):
++        _c, fresh = real(conn, cursor, **kw)
++        return changes.FULL, fresh
++
++    with closing(kbc.connect()) as conn:
++        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (ids[1],))
++        conn.commit()
++    statements.clear()
++    with mock.patch.object(changes, "changed_since", full):
++        assert _counts(mod) == _exact() == {"ready": 2, "blocked": 1}
++    assert _whole_table(statements)
++
++
++def test_many_changes_take_the_whole_board_read(board, statements, monkeypatch):
++    mod, _client, _reads = board
++    _seed(4)
++    _counts(mod)
++    monkeypatch.setattr(board_counts, "DELTA_MAX", 2)
++    with closing(kbc.connect()) as conn:
++        conn.execute("UPDATE tasks SET status='done'")
++        conn.commit()
++    statements.clear()
++    assert _counts(mod) == _exact() == {"done": 4}
++    assert _whole_table(statements)
++
++
++def test_failed_delta_read_stores_nothing_and_recovers(board, monkeypatch):
++    mod, _client, _reads = board
++    ids = _seed(3)
++    _counts(mod)
++    with closing(kbc.connect()) as conn:
++        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (ids[0],))
++        conn.commit()
++    real = board_counts.open_ro
++    left = {"n": 1}
++
++    class Failing:
++        def __init__(self, conn):
++            self._conn = conn
++
++        def execute(self, sql, *a):
++            if "WHERE id IN" in sql:
++                raise board_counts.sqlite3.OperationalError("disk I/O error")
++            return self._conn.execute(sql, *a)
++
++        def __getattr__(self, name):
++            return getattr(self._conn, name)
++
++    def flaky(path, *a, **k):
++        conn = real(path, *a, **k)
++        if left["n"]:
++            left["n"] -= 1
++            return Failing(conn)
++        return conn
++
++    monkeypatch.setattr(board_counts, "open_ro", flaky)
++    assert _counts(mod) == {}
++    assert not board_counts._cached
++    assert _counts(mod) == _exact() == {"ready": 2, "blocked": 1}
+-- 
+2.43.0
+

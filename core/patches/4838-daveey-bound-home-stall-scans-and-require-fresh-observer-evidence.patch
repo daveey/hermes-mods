@@ -1,0 +1,214 @@
+From 7a24b9531b09aee3da7cbbe9431a9358eb88f1f0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 09:41:17 +0000
+Subject: [PATCH] [daveey] bound home-stall scans and require fresh observer
+ evidence
+
+Draft validation: 21 home-observer tests pass, including replica freshness, elapsed-time comment dedup, separate homes and closed incidents. Bound event read to recent window and scan once per minute; use canonical backstops. Still requires historical/live acceptance and final review/CI before shipping.
+---
+ hermes_cli/kanban_pickup_stall.py             |  2 +-
+ hermes_cli/kanban_pickup_stall_home.py        | 51 ++++++++++++----
+ .../test_kanban_pickup_stall_home.py          | 60 ++++++++++++++++++-
+ 3 files changed, 101 insertions(+), 12 deletions(-)
+
+diff --git a/hermes_cli/kanban_pickup_stall.py b/hermes_cli/kanban_pickup_stall.py
+index 899fcb982f0bc65cf59b2b95faa31a7ecfcbde02..9cce5a39efae5798e563db6d60d1813878faef79 100644
+--- a/hermes_cli/kanban_pickup_stall.py
++++ b/hermes_cli/kanban_pickup_stall.py
+@@ -636,7 +636,7 @@ def sweep(conn, *, now: Optional[float] = None) -> list[str]:
+     try:
+         resolve_sweep(conn, replica, own, now_ms=_now_ms(now))
+         from hermes_cli import kanban_pickup_stall_home as home_stalls
+-        stranded += home_stalls.sweep(conn, replica, own, now_ms=_now_ms(now))
++        stranded += home_stalls.periodic_sweep(conn, replica, own, now_ms=_now_ms(now))
+         cards = stalled(conn, replica, own, now=now)
+     finally:
+         replica.close()
+diff --git a/hermes_cli/kanban_pickup_stall_home.py b/hermes_cli/kanban_pickup_stall_home.py
+index e9944d42679db83fa81ef6a12002ab1c7e86faf2..34092e9c539360f43a0153e4e385c5cf61f390b9 100644
+--- a/hermes_cli/kanban_pickup_stall_home.py
++++ b/hermes_cli/kanban_pickup_stall_home.py
+@@ -7,6 +7,8 @@ Only the hub files: alarm provenance names the observer, not the stopped home.
+ from __future__ import annotations
+ 
+ import re
++import sqlite3
++import time
+ from types import SimpleNamespace
+ from typing import Any
+ 
+@@ -18,11 +20,7 @@ _LOCAL_WORK = re.compile(
+ 
+ 
+ def _scheduled_since(replica, row) -> int | None:
+-    from hermes_cli.kanban_continuation import park_state
+     from hermes_cli.kanban_wake_summary import wakes
+-    park = park_state(replica, row["id"])
+-    if park.get("event_id") is None or park.get("superseded"):
+-        return None  # no unspent park in this replica: do not invent a deadline
+     summary = wakes(replica, SimpleNamespace(**dict(row)), check_loaded=True)
+     if not summary or summary["blocks_for_human"]:
+         return None
+@@ -53,8 +51,9 @@ def checkpoint_evidence(replica, task_id: str) -> str:
+ 
+ def overdue(replica, machines: dict, *, now: float) -> dict[str, list[dict[str, Any]]]:
+     """Group open scheduled/todo rows by held, revoked, or event-silent home."""
+-    last_events = dict(replica.execute(
+-        "SELECT origin_gateway, MAX(created_at) FROM task_events GROUP BY origin_gateway").fetchall())
++    recent_homes = {r[0] for r in replica.execute(
++        "SELECT DISTINCT origin_gateway FROM task_events WHERE created_at >= ?",
++        (now - GRACE_SECONDS,))}
+     groups: dict[str, list[dict[str, Any]]] = {}
+     for row in replica.execute("SELECT * FROM tasks WHERE status IN ('scheduled', 'todo')"):
+         home = row["created_on"]
+@@ -63,8 +62,7 @@ def overdue(replica, machines: dict, *, now: float) -> dict[str, list[dict[str,
+         entry = machines.get(home) or {}
+         held = bool(entry.get("hold"))
+         revoked = entry.get("state") == "revoked"
+-        seen = last_events.get(home)
+-        silent = seen is None or now - seen > GRACE_SECONDS
++        silent = home not in recent_homes
+         if not (held or revoked or silent):
+             continue
+         since = (_scheduled_since(replica, row) if row["status"] == "scheduled"
+@@ -74,7 +72,7 @@ def overdue(replica, machines: dict, *, now: float) -> dict[str, list[dict[str,
+         groups.setdefault(home, []).append({
+             "id": row["id"], "title": row["title"], "tenant": row["tenant"],
+             "status": row["status"], "since": since,
+-            "home_evidence": f"held={held}, revoked={revoked}, last Board event={seen}",
++            "home_evidence": f"held={held}, revoked={revoked}, no Board event within 30 minutes={silent}",
+             "checkpoint": checkpoint_evidence(replica, row["id"]),
+         })
+     return {home: sorted(cards, key=lambda c: (c["since"], c["id"]))
+@@ -94,12 +92,45 @@ HOWTO = (
+ )
+ 
+ 
++_NEXT_SCAN: dict[tuple, float] = {}
++
++
++def periodic_sweep(conn, replica, own: str, *, now_ms: int) -> list[str]:
++    """Bound the full event aggregation to once a minute per observer board."""
++    from hermes_cli.kanban_sweep_gate import file_identity
++    if own != "hub":
++        return []
++    identity = file_identity(replica)
++    tick = time.monotonic()
++    if identity is not None and tick < _NEXT_SCAN.get(identity, 0):
++        return []
++    result = sweep(conn, replica, own, now_ms=now_ms)
++    if identity is not None:
++        if len(_NEXT_SCAN) >= 128:
++            _NEXT_SCAN.clear()
++        _NEXT_SCAN[identity] = tick + 60
++    return result
++
++
++def _fresh(replica, now: float) -> bool:
++    """Silence is meaningful only after a recent completed Board pull."""
++    try:
++        row = replica.execute("SELECT pulled_at FROM kanban_sync_state LIMIT 1").fetchone()
++    except sqlite3.Error:
++        return False
++    from hermes_cli.kanban_replica_freshness import FRESH_SECONDS
++    # A pull may finish after the dispatcher captured now_ms, before this read.
++    return row is not None and type(row[0]) in (int, float) and -5 <= now - row[0] <= FRESH_SECONDS
++
++
+ def sweep(conn, replica, own: str, *, now_ms: int) -> list[str]:
+     from hermes_cli import kanban_pickup_stall as kps
+     from hermes_cli import kanban_worker_node as wn
+     if own != kps.OPERATOR_LANE:
+         return []  # one observer; source-authenticated keys cannot impersonate a remote home
+-    registry = wn.registry()
++    if not _fresh(replica, now_ms / 1000):
++        return []
++    registry = wn.registry(require_fresh=True)
+     if registry is None:
+         return []  # cannot establish current held/revoked registry evidence
+     ids = []
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall_home.py b/tests/hermes_cli/test_kanban_pickup_stall_home.py
+index dfe38755d270c387f5d81fdd085edc3f0500f57a..1d1523d3c305be55b32c01b166d066efec82b20a 100644
+--- a/tests/hermes_cli/test_kanban_pickup_stall_home.py
++++ b/tests/hermes_cli/test_kanban_pickup_stall_home.py
+@@ -27,6 +27,8 @@ def replica():
+         CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, outcome TEXT,
+                                 summary TEXT, ended_at INTEGER);
+     """)
++    conn.execute("CREATE TABLE kanban_sync_state (pulled_at INTEGER)")
++    conn.execute("INSERT INTO kanban_sync_state VALUES (?)", (NOW,))
+     yield conn
+     conn.close()
+ 
+@@ -113,7 +115,7 @@ def local(tmp_path, monkeypatch):
+     from hermes_cli.kanban_db_connect import connect
+     conn = connect(path)
+     conn.execute("ALTER TABLE tasks ADD COLUMN runs_on TEXT")
+-    monkeypatch.setattr(wn, "registry", lambda: {"machines": {"worker-2": {"hold": True}}})
++    monkeypatch.setattr(wn, "registry", lambda **kw: {"machines": {"worker-2": {"hold": True}}})
+     yield conn
+     conn.close()
+ 
+@@ -139,3 +141,59 @@ def test_observer_is_hub_only(replica, local):
+     card(replica)
+     assert subject.sweep(local, replica, "worker-1", now_ms=NOW * 1000) == []
+     assert local.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
++
++
++@pytest.mark.parametrize("age", [601, -6, None])
++def test_stale_or_unknown_replica_never_vouches_for_silence(replica, local, age):
++    card(replica)
++    replica.execute("UPDATE kanban_sync_state SET pulled_at=?", (None if age is None else NOW - age,))
++    assert subject.sweep(local, replica, "hub", now_ms=NOW * 1000) == []
++
++
++def test_missing_registry_defers(replica, local, monkeypatch):
++    card(replica)
++    monkeypatch.setattr(wn, "registry", lambda **kw: None)
++    assert subject.sweep(local, replica, "hub", now_ms=NOW * 1000) == []
++
++
++def test_periodic_scan_is_bounded_and_restarts_for_replaced_file(replica, local, monkeypatch):
++    from hermes_cli import kanban_sweep_gate
++    subject._NEXT_SCAN.clear()
++    clock = [100.0]
++    identity = [("path", 1, 2)]
++    calls = []
++    monkeypatch.setattr(subject.time, "monotonic", lambda: clock[0])
++    monkeypatch.setattr(kanban_sweep_gate, "file_identity", lambda conn: identity[0])
++    monkeypatch.setattr(subject, "sweep", lambda *a, **kw: calls.append(kw) or ["alarm"])
++    assert subject.periodic_sweep(local, replica, "hub", now_ms=NOW * 1000) == ["alarm"]
++    clock[0] = 159
++    assert subject.periodic_sweep(local, replica, "hub", now_ms=NOW * 1000) == []
++    clock[0] = 160
++    assert subject.periodic_sweep(local, replica, "hub", now_ms=NOW * 1000) == ["alarm"]
++    identity[0] = ("path", 1, 3)
++    assert subject.periodic_sweep(local, replica, "hub", now_ms=NOW * 1000) == ["alarm"]
++    assert len(calls) == 3
++    assert subject.periodic_sweep(local, replica, "worker-1", now_ms=NOW * 1000) == []
++
++
++def test_separate_homes_and_closed_incidents(replica, local):
++    card(replica, "one")
++    card(replica, "two", home="worker-7")
++    first = subject.sweep(local, replica, "hub", now_ms=NOW * 1000)
++    assert len(first) == 2
++    local.execute("UPDATE tasks SET status='done' WHERE id=?", (first[0],))
++    local.commit()
++    again = subject.sweep(local, replica, "hub", now_ms=NOW * 1000)
++    assert first[1] == again[1] and first[0] != again[0]
++
++
++def test_legacy_backstop_and_current_park(replica):
++    from hermes_cli.kanban_timed_park import implied_wake
++    card(replica, wake={})
++    expected = implied_wake({}, NOW - 86400)
++    row = replica.execute("SELECT * FROM tasks WHERE id='one'").fetchone()
++    assert subject._scheduled_since(replica, row) == expected
++    replica.execute("INSERT INTO task_events(task_id,kind,payload,created_at,origin_gateway) "
++                    "VALUES ('one','scheduled',?,?,'worker-2')",
++                    (json.dumps({"wake_at": NOW + 3600}), NOW - 10))
++    assert not subject.overdue(replica, {}, now=NOW)
+-- 
+2.43.0
+

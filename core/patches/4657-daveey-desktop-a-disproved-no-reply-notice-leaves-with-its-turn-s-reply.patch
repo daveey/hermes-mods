@@ -1,0 +1,477 @@
+From e5057461ca505ee69645d44aafbb381c60c79cdf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 12:07:06 -0800
+Subject: [PATCH] [daveey] desktop: a disproved no-reply notice leaves with its
+ turn's reply
+
+The silent-turn check (45 s without events -> session.active_list) read a
+running hub turn as ended and stamped "Hermes ended this turn without a
+reply". The turn then finished and its reply was stored, but the refresh
+kept the stamped bubble as a second one under the reply, with a Retry that
+would have re-run the prompt (chat 20261111_055255_6e01c3, 2026-11-17).
+
+- reconciliation: a no-reply notice whose turn has a stored reply is
+  cleared before local error bubbles are preserved or folded, matched by
+  descriptor or by text (the incident's bubble had lost its descriptor).
+- liveTurnVerdict / liveTurnLastActiveMs: fall back to the row whose
+  session_key is the chat's stored id when no row carries the runtime id.
+- every silent-turn check writes one [silent-turn] line to desktop.log
+  (row matched or not, status, idle seconds); a wrong "ended" left no trace.
+
+Not established: which snapshot answer (row missing vs idle) produced the
+wrong verdict on the hub. The log line is what will name it.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .../lib/chat-messages/no-reply-notice.test.ts | 88 +++++++++++++++++++
+ .../desktop/src/lib/chat-messages/no-reply.ts | 82 +++++++++++++++++
+ .../src/lib/chat-messages/reconciliation.ts   |  4 +-
+ apps/desktop/src/store/session-no-reply.ts    |  2 +-
+ .../src/store/session-states-live-turn.ts     | 61 +++++++++++--
+ apps/desktop/src/store/session-states.ts      | 34 ++++++-
+ .../src/store/session-watchdog.test.ts        | 44 ++++++++++
+ 7 files changed, 304 insertions(+), 11 deletions(-)
+ create mode 100644 apps/desktop/src/lib/chat-messages/no-reply-notice.test.ts
+ create mode 100644 apps/desktop/src/lib/chat-messages/no-reply.ts
+
+diff --git a/apps/desktop/src/lib/chat-messages/no-reply-notice.test.ts b/apps/desktop/src/lib/chat-messages/no-reply-notice.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..f1bd32784d76b09f6439d614f3662dd9ad6a1f74
+--- /dev/null
++++ b/apps/desktop/src/lib/chat-messages/no-reply-notice.test.ts
+@@ -0,0 +1,88 @@
++import { describe, expect, it } from 'vitest'
++
++import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
++import { withNoReplyNotice } from '@/store/session-no-reply'
++import type { SessionMessage } from '@/types/hermes'
++
++/**
++ * The silent-turn check can read a running turn as ended and stamp "Hermes
++ * ended this turn without a reply" on it. When the turn's reply then lands in
++ * the stored transcript, the stamp was wrong: the refresh must not keep it as
++ * a second bubble under the reply, nor fold it onto the reply.
++ */
++
++const at = (id: number) => 1_000 + id
++
++const user = (id: number, text: string): SessionMessage =>
++  ({ id, role: 'user', content: text, timestamp: at(id) }) as SessionMessage
++
++const toolCall = (id: number, call: string): SessionMessage =>
++  ({
++    id,
++    role: 'assistant',
++    content: '',
++    timestamp: at(id),
++    tool_calls: [{ id: call, type: 'function', function: { name: 'terminal', arguments: '{"command":"echo"}' } }]
++  }) as SessionMessage
++
++const toolResult = (id: number, call: string): SessionMessage =>
++  ({ id, role: 'tool', content: 'ok', tool_call_id: call, tool_name: 'terminal', timestamp: at(id) }) as SessionMessage
++
++const answer = (id: number, text: string): SessionMessage =>
++  ({ id, role: 'assistant', content: text, timestamp: at(id) }) as SessionMessage
++
++const storedTurn = (reply: SessionMessage[]): ChatMessage[] =>
++  toChatMessages([user(1, 'resume'), toolCall(2, 'call-1'), toolResult(3, 'call-1'), ...reply])
++
++const errors = (messages: ChatMessage[]) => messages.filter(message => message.error).map(message => message.error)
++
++describe('a no-reply notice on a turn whose reply is stored', () => {
++  const stored = storedTurn([answer(4, 'Queued the next stage.')])
++  const prompt = stored[0]
++
++  it('drops the empty notice bubble', () => {
++    const local = withNoReplyNotice([prompt])
++
++    const merged = preserveLocalAssistantErrors(stored, local)
++
++    expect(errors(merged)).toEqual([])
++    expect(merged.map(message => message.id)).toEqual(stored.map(message => message.id))
++  })
++
++  it('drops a stamped live bubble that only holds the tool rows of the turn', () => {
++    const liveTools = stored
++      .filter(message => message.role === 'assistant')
++      .flatMap(message => message.parts.filter(part => part.type !== 'text'))
++
++    const local = withNoReplyNotice([
++      prompt,
++      { id: 'assistant-stream-live', role: 'assistant', parts: liveTools, pending: false }
++    ])
++
++    const merged = preserveLocalAssistantErrors(stored, local)
++
++    expect(errors(merged)).toEqual([])
++    expect(merged.map(message => message.id)).toEqual(stored.map(message => message.id))
++  })
++
++  it('drops the notice when the descriptor was lost and only the text survives', () => {
++    const local = withNoReplyNotice([prompt]).map(message => {
++      const { errorSurface: _dropped, ...rest } = message
++
++      return rest
++    })
++
++    expect(errors(preserveLocalAssistantErrors(stored, local))).toEqual([])
++  })
++})
++
++describe('a no-reply notice on a turn with no stored reply', () => {
++  it('keeps the notice', () => {
++    const stored = storedTurn([])
++    const local = withNoReplyNotice([stored[0]])
++
++    const merged = preserveLocalAssistantErrors(stored, local)
++
++    expect(errors(merged)).toEqual(['Hermes ended this turn without a reply.'])
++  })
++})
+diff --git a/apps/desktop/src/lib/chat-messages/no-reply.ts b/apps/desktop/src/lib/chat-messages/no-reply.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..bdd1579f4b3432ba7a46bfa23cfc1d329aa8bb85
+--- /dev/null
++++ b/apps/desktop/src/lib/chat-messages/no-reply.ts
+@@ -0,0 +1,82 @@
++import { chatMessageText } from './parts'
++import type { ChatMessage } from './types'
++
++export const NO_REPLY_ERROR = 'Hermes ended this turn without a reply.'
++
++/** The notice the silent-turn check stamps on a turn it read as over with no
++ *  reply (store/session-no-reply.ts). The text also names it: a bubble can
++ *  lose its descriptor on the way through a cache and keep only the string. */
++export function isNoReplyNotice(message: ChatMessage): boolean {
++  return (
++    message.role === 'assistant' && (message.errorSurface?.code === 'no_reply' || message.error === NO_REPLY_ERROR)
++  )
++}
++
++const visible = (messages: ChatMessage[]) => messages.filter(message => !message.hidden)
++const userText = (message: ChatMessage) => chatMessageText(message).replace(/\s+/g, ' ').trim()
++
++function tailUser(messages: ChatMessage[]): ChatMessage | undefined {
++  return visible(messages).findLast(message => message.role === 'user')
++}
++
++function tailTurnHasReply(messages: ChatMessage[]): boolean {
++  for (const message of visible(messages).reverse()) {
++    if (message.role === 'user') {
++      return false
++    }
++
++    if (message.role === 'assistant' && !isNoReplyNotice(message) && chatMessageText(message).trim()) {
++      return true
++    }
++  }
++
++  return false
++}
++
++/** Same prompt row: by id, by stored row, or (an optimistic local row has
++ *  neither in common with its stored twin) by text at the same repeat count. */
++function sameTailPrompt(next: ChatMessage[], current: ChatMessage[]): boolean {
++  const stored = tailUser(next)
++  const local = tailUser(current)
++
++  if (!stored || !local) {
++    return false
++  }
++
++  if (stored.id === local.id || (stored.rowId !== undefined && stored.rowId === local.rowId)) {
++    return true
++  }
++
++  const repeats = (messages: ChatMessage[], text: string) =>
++    visible(messages).filter(message => message.role === 'user' && userText(message) === text).length
++
++  const text = userText(stored)
++
++  return text === userText(local) && repeats(next, text) === repeats(current, text)
++}
++
++/**
++ * The silent-turn check can read a running turn as ended (its liveness
++ * snapshot missed the runtime) and stamp the no-reply notice on it. Once the
++ * refreshed transcript holds that turn's reply the notice is disproved: clear
++ * it, so the refresh neither keeps the stamped bubble as a second one under
++ * the reply nor folds the error onto the reply. A turn with no stored reply
++ * keeps its notice.
++ */
++export function withoutDisprovedNoReplyNotice(next: ChatMessage[], current: ChatMessage[]): ChatMessage[] {
++  if (!current.some(isNoReplyNotice) || !tailTurnHasReply(next) || !sameTailPrompt(next, current)) {
++    return current
++  }
++
++  const turnStart = current.lastIndexOf(tailUser(current) as ChatMessage)
++
++  return current.map((message, index) => {
++    if (index < turnStart || !isNoReplyNotice(message)) {
++      return message
++    }
++
++    const { error: _error, errorSurface: _surface, ...rest } = message
++
++    return rest
++  })
++}
+diff --git a/apps/desktop/src/lib/chat-messages/reconciliation.ts b/apps/desktop/src/lib/chat-messages/reconciliation.ts
+index dc54e5f11d28dd4405017461099264cb664a0b9b..2fd21cf755078954b97dc3fdf481805eca890607 100644
+--- a/apps/desktop/src/lib/chat-messages/reconciliation.ts
++++ b/apps/desktop/src/lib/chat-messages/reconciliation.ts
+@@ -1,4 +1,5 @@
+ import { attachmentTolerantUserText, sameAttachmentTurn } from './attachment-turn'
++import { withoutDisprovedNoReplyNotice } from './no-reply'
+ import { chatMessageText } from './parts'
+ import type { ChatMessage, ChatMessagePart } from './types'
+ 
+@@ -583,8 +584,9 @@ function insertPreservedErrorRuns(
+ 
+ export function preserveLocalAssistantErrors(
+   nextMessages: ChatMessage[],
+-  currentMessages: ChatMessage[]
++  localMessages: ChatMessage[]
+ ): ChatMessage[] {
++  const currentMessages: ChatMessage[] = withoutDisprovedNoReplyNotice(nextMessages, localMessages)
+   const reconciled: ChatMessage[] = reconcileLocalAssistantTimeline(nextMessages, currentMessages)
+   const merged: ChatMessage[] = mergeStoredAssistantErrors(reconciled, currentMessages)
+   const preserveIds: Set<string> = localAssistantErrorIdsToPreserve(merged, currentMessages)
+diff --git a/apps/desktop/src/store/session-no-reply.ts b/apps/desktop/src/store/session-no-reply.ts
+index 420243d08d06a3bd8e35845c2a72839f6527270a..b9a39184ab1fae64c9519dfcaa161553514f5b6e 100644
+--- a/apps/desktop/src/store/session-no-reply.ts
++++ b/apps/desktop/src/store/session-no-reply.ts
+@@ -1,10 +1,10 @@
+ import { type ChatMessage, chatMessageText } from '@/lib/chat-messages'
++import { NO_REPLY_ERROR } from '@/lib/chat-messages/no-reply'
+ import type { ErrorSurface } from '@/lib/error-surface'
+ 
+ // Raised only after the backend confirmed the turn is over and no reply reached
+ // this window, so Retry cannot run the prompt twice.
+ const NO_REPLY_SURFACE: ErrorSurface = { code: 'no_reply', layer: 'runtime', retryable: true }
+-const NO_REPLY_ERROR = 'Hermes ended this turn without a reply.'
+ 
+ export function turnHasReply(messages: ChatMessage[]): boolean {
+   for (let index = messages.length - 1; index >= 0; index -= 1) {
+diff --git a/apps/desktop/src/store/session-states-live-turn.ts b/apps/desktop/src/store/session-states-live-turn.ts
+index 2c426d43a5a451a80a075e545ec7206e586cebf3..6d6129404c7d3c61febe70be605f66dbb19421af 100644
+--- a/apps/desktop/src/store/session-states-live-turn.ts
++++ b/apps/desktop/src/store/session-states-live-turn.ts
+@@ -3,21 +3,47 @@ import type { ClientSessionState } from '@/app/types'
+ export type LiveTurnVerdict = 'ended' | 'running' | 'unknown'
+ 
+ export interface LiveTurnStatusResponse {
+-  sessions?: { id?: string; last_active?: number | null; status?: string }[]
++  sessions?: { id?: string; last_active?: number | null; session_key?: string; status?: string }[]
++}
++
++type LiveTurnRow = NonNullable<LiveTurnStatusResponse['sessions']>[number]
++
++/** The snapshot row for this chat's turn: the one carrying `runtimeId`, else
++ *  the one whose `session_key` is the chat's stored id. A backend that keys
++ *  its rows by stored id (the session authority) has no row under a runtime
++ *  id, and reading that as "reaped" painted the no-reply card on a turn that
++ *  was still running. */
++function liveTurnRow(
++  response: LiveTurnStatusResponse | null | undefined,
++  runtimeId: string,
++  storedSessionId?: null | string
++): { by: 'id' | 'session_key'; row: LiveTurnRow } | null {
++  const sessions = Array.isArray(response?.sessions) ? response.sessions : []
++  const byId = sessions.find(session => session.id?.trim() === runtimeId)
++
++  if (byId) {
++    return { by: 'id', row: byId }
++  }
++
++  const stored = storedSessionId?.trim()
++  const byKey = stored ? sessions.find(session => session.session_key?.trim() === stored) : undefined
++
++  return byKey ? { by: 'session_key', row: byKey } : null
+ }
+ 
+ /** What one `session.active_list` snapshot says about `runtimeId`'s turn. A
+- *  runtime missing from a well-formed list has been reaped: its turn is over.
++ *  chat missing from a well-formed list has been reaped: its turn is over.
+  *  `starting` is an agent build for a turn the backend accepted. */
+ export function liveTurnVerdict(
+   response: LiveTurnStatusResponse | null | undefined,
+-  runtimeId: string
++  runtimeId: string,
++  storedSessionId?: null | string
+ ): LiveTurnVerdict {
+   if (!Array.isArray(response?.sessions)) {
+     return 'unknown'
+   }
+ 
+-  const status = response.sessions.find(session => session.id?.trim() === runtimeId)?.status
++  const status = liveTurnRow(response, runtimeId, storedSessionId)?.row.status
+ 
+   if (status === undefined || status === 'idle') {
+     return 'ended'
+@@ -30,14 +56,37 @@ export function liveTurnVerdict(
+  *  null when the snapshot doesn't say (older backend, runtime absent). */
+ export function liveTurnLastActiveMs(
+   response: LiveTurnStatusResponse | null | undefined,
+-  runtimeId: string
++  runtimeId: string,
++  storedSessionId?: null | string
+ ): null | number {
+-  const lastActive = response?.sessions?.find(session => session.id?.trim() === runtimeId)?.last_active
++  const lastActive = liveTurnRow(response, runtimeId, storedSessionId)?.row.last_active
+   const ms = Number(lastActive) * 1000
+ 
+   return lastActive != null && Number.isFinite(ms) && ms > 0 ? ms : null
+ }
+ 
++/** One desktop.log line per silent-turn check: which row (if any) the verdict
++ *  was read from. A wrong "ended" left no trace before this. */
++export function liveTurnCheckLine(
++  response: LiveTurnStatusResponse | null | undefined,
++  runtimeId: string,
++  storedSessionId: null | string | undefined,
++  nowMs: number
++): string {
++  const rows = Array.isArray(response?.sessions) ? String(response.sessions.length) : '-'
++  const found = liveTurnRow(response, runtimeId, storedSessionId)
++  const head = `[silent-turn] runtime=${runtimeId} stored=${storedSessionId || '-'} verdict=${liveTurnVerdict(response, runtimeId, storedSessionId)} rows=${rows}`
++
++  if (!found) {
++    return `${head} match=none`
++  }
++
++  const lastActiveMs = liveTurnLastActiveMs(response, runtimeId, storedSessionId)
++  const idle = lastActiveMs === null ? '-' : String(Math.max(0, Math.round((nowMs - lastActiveMs) / 1000)))
++
++  return `${head} match=${found.by} row=${found.row.id ?? '-'} status=${found.row.status ?? '-'} idle_s=${idle}`
++}
++
+ /** [daveey] The fields a turn claim is read from. */
+ export type TurnClaimFields = Pick<ClientSessionState, 'awaitingResponse' | 'busy' | 'turnLive'>
+ 
+diff --git a/apps/desktop/src/store/session-states.ts b/apps/desktop/src/store/session-states.ts
+index 80d738ac516529b90e7e000792197be5554190b2..9d4a910caba6bf579daa941a73a7e83865bb29b6 100644
+--- a/apps/desktop/src/store/session-states.ts
++++ b/apps/desktop/src/store/session-states.ts
+@@ -100,6 +100,7 @@ import {
+ import {
+   holdsTurnClaim,
+   isLiveTurnAwaitingEvents,
++  liveTurnCheckLine,
+   liveTurnLastActiveMs,
+   type LiveTurnStatusResponse,
+   type LiveTurnVerdict,
+@@ -402,7 +403,14 @@ function clearEventSilence(runtimeId: string) {
+   }
+ }
+ 
+-export { holdsTurnClaim, isLiveTurnAwaitingEvents, liveTurnLastActiveMs, type LiveTurnVerdict, liveTurnVerdict }
++export {
++  holdsTurnClaim,
++  isLiveTurnAwaitingEvents,
++  liveTurnCheckLine,
++  liveTurnLastActiveMs,
++  type LiveTurnVerdict,
++  liveTurnVerdict
++}
+ 
+ /** [daveey] The backend's activity decides the quiet hint for a running turn.
+  *  The renderer watchdog only measures events reaching THIS window, and a turn
+@@ -456,12 +464,32 @@ async function checkLiveTurn(runtimeId: string): Promise<LiveTurnCheck> {
+       LIVE_TURN_PROBE_TIMEOUT_MS
+     )
+ 
+-    return { lastActiveMs: liveTurnLastActiveMs(response, runtimeId), verdict: liveTurnVerdict(response, runtimeId) }
+-  } catch {
++    const storedSessionId = $sessionStates.get()[runtimeId]?.storedSessionId ?? null
++
++    logSilentTurnCheck(liveTurnCheckLine(response, runtimeId, storedSessionId, Date.now()))
++
++    return {
++      lastActiveMs: liveTurnLastActiveMs(response, runtimeId, storedSessionId),
++      verdict: liveTurnVerdict(response, runtimeId, storedSessionId)
++    }
++  } catch (error) {
++    logSilentTurnCheck(
++      `[silent-turn] runtime=${runtimeId} verdict=unknown request_failed=${error instanceof Error ? error.name : 'error'}`
++    )
++
+     return { lastActiveMs: null, verdict: 'unknown' }
+   }
+ }
+ 
++function logSilentTurnCheck(line: string) {
++  try {
++    console.info(line)
++    window.hermesDesktop?.logLine?.(line)
++  } catch {
++    // logging must never change a verdict
++  }
++}
++
+ /** Write through the wiring cache when it holds the runtime, so the cache,
+  *  the focused view, and tile mirrors agree (#93059); otherwise the mirror. */
+ function writeSessionState(runtimeId: string, updater: (state: ClientSessionState) => ClientSessionState) {
+diff --git a/apps/desktop/src/store/session-watchdog.test.ts b/apps/desktop/src/store/session-watchdog.test.ts
+index e49b4f8f4ca8dc1fc61fda9b65b0ac39be64fc91..b0908f98f414506a98554b41d00c979ae0ce410f 100644
+--- a/apps/desktop/src/store/session-watchdog.test.ts
++++ b/apps/desktop/src/store/session-watchdog.test.ts
+@@ -14,6 +14,7 @@ import {
+   clearAllSessionStates,
+   LIVE_TURN_EVENT_SILENCE_MS,
+   LIVE_TURN_PROBE_TIMEOUT_MS,
++  liveTurnCheckLine,
+   liveTurnVerdict,
+   noteSessionEvent,
+   publishSessionState,
+@@ -487,4 +488,47 @@ describe('liveTurnVerdict', () => {
+     expect(liveTurnVerdict({}, 'a')).toBe('unknown')
+     expect(liveTurnVerdict(null, 'a')).toBe('unknown')
+   })
++
++  // A backend can key its rows by the stored session id while this window
++  // addresses the chat by a runtime id: the chat's turn is still running.
++  it('finds the turn by the stored session id when no row carries the runtime id', () => {
++    const snapshot = {
++      sessions: [
++        { id: '20261111_055255_6e01c3', session_key: '20261111_055255_6e01c3', status: 'working' },
++        { id: 'other', session_key: '20261101_012339_5a8ef0', status: 'idle' }
++      ]
++    }
++
++    expect(liveTurnVerdict(snapshot, '8957fcb7', '20261111_055255_6e01c3')).toBe('running')
++    expect(liveTurnVerdict(snapshot, '8957fcb7', '20261101_012339_5a8ef0')).toBe('ended')
++    expect(liveTurnVerdict(snapshot, '8957fcb7', 'not-listed')).toBe('ended')
++    expect(liveTurnVerdict(snapshot, '8957fcb7')).toBe('ended')
++  })
++
++  it('prefers the row carrying the runtime id over a stored-id match', () => {
++    const snapshot = {
++      sessions: [
++        { id: 'stale', session_key: 'stored', status: 'working' },
++        { id: 'mine', session_key: 'stored', status: 'idle' }
++      ]
++    }
++
++    expect(liveTurnVerdict(snapshot, 'mine', 'stored')).toBe('ended')
++  })
++})
++
++describe('liveTurnCheckLine', () => {
++  it('names the row the verdict was read from, or that none matched', () => {
++    const snapshot = { sessions: [{ id: 'k', session_key: 'stored', status: 'working', last_active: 100 }] }
++
++    expect(liveTurnCheckLine(snapshot, 'rt', 'stored', 130_000)).toBe(
++      '[silent-turn] runtime=rt stored=stored verdict=running rows=1 match=session_key row=k status=working idle_s=30'
++    )
++    expect(liveTurnCheckLine(snapshot, 'rt', 'elsewhere', 130_000)).toBe(
++      '[silent-turn] runtime=rt stored=elsewhere verdict=ended rows=1 match=none'
++    )
++    expect(liveTurnCheckLine(null, 'rt', null, 130_000)).toBe(
++      '[silent-turn] runtime=rt stored=- verdict=unknown rows=- match=none'
++    )
++  })
+ })
+-- 
+2.43.0
+

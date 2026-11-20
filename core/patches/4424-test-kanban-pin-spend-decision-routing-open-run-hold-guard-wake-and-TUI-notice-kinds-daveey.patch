@@ -1,0 +1,177 @@
+From 9a1112a34caa6dd9b51aea20cd3d1acc5dff6c10 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 06:07:50 +0000
+Subject: [PATCH] test(kanban): pin spend-decision routing, open-run hold
+ guard, wake and TUI notice kinds [daveey]
+
+Runtime-15 audit t_a381eb4e537b77d0 found five exact changed-line mutants of #3123
+(6369c6fb7a) that survived its own suite and a widened 14-file corpus. Test-only;
+production semantics unchanged. New file tests/hermes_cli/test_kanban_spend_decision_routing.py:
+
+- headless (local-<64hex>) chat link is not bound; a supervisor card decides (M09)
+- link binding platform: own gateway + active profile -> tui/<session>; own gateway
+  other profile and remote gateway -> hub/<gw>/<profile>/<session> (M11)
+- pending hold leaves a ready/review card with an open run (expired claim) untouched,
+  and takes it to triage once the run closes (M03)
+- wake fold relabels a stale spend_budget_decision_ready wake after a promote; delivered
+  as is while still in triage (M20)
+- TUI poller (_collect_kanban_notifications) delivers the decision notice once (M21)
+
+Proof (hermes-worker-4, scratch HOME, scripts/run_tests.sh):
+- predictions stamped 2026-11-15T06:02:55Z before any run
+- GREEN: new file 8 passed 0 skipped; with spend_budget(_hold), wake_fold and the
+  tree-layout/shadowed-definition guards: 6 files, 94 passed, 0 failed
+- RED via sdlc-review scripts/mutants.py (sha256 502a62d5...54c6), baseline ok, then
+  killed 5/5, each only by its predicted test(s):
+  M03 -> test_pending_hold_leaves_a_card_with_an_open_run_untouched[ready,review]
+  M09 -> test_headless_chat_link_is_not_bound_and_a_supervisor_decides
+  M11 -> test_chat_link_binding_platform[own-gateway-active-profile]
+  M20 -> test_stale_decision_wake_is_relabelled_after_promote
+  M21 -> test_tui_poller_delivers_the_decision_notice
+
+Card: t_969eda65ddaf9bdf
+---
+ .../test_kanban_spend_decision_routing.py     | 131 ++++++++++++++++++
+ 1 file changed, 131 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_spend_decision_routing.py
+
+diff --git a/tests/hermes_cli/test_kanban_spend_decision_routing.py b/tests/hermes_cli/test_kanban_spend_decision_routing.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..641c14dd8d4ebe00199966d7e337cd1d26a8e607
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_spend_decision_routing.py
+@@ -0,0 +1,131 @@
++"""Where a spend stop's decision notice goes, and what keeps it honest downstream. [daveey]
++
++#3123's own suite left five changed lines unpinned (runtime-15 audit t_a381eb4e537b77d0): the open-run guard of
++the pending hold, the headless and local branches of the producer's chat-link binding, the wake fold's premise for
++the decision notice, and the TUI poller's admission of its kind. Each test here fails when its line is mutated.
++"""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as notify
++from hermes_cli import kanban_spend_budget as budget
++from hermes_cli import kanban_spend_decision as decision
++from tests.hermes_cli import test_kanban_spend_budget as helpers
++from tests.hermes_cli import test_kanban_spend_budget_hold as hold_helpers
++
++kanban_home = helpers.kanban_home
++stopped = hold_helpers.stopped
++
++OWN = "own-gw"
++
++
++def _links(conn, tid, *rows):
++    with kb.write_txn(conn):
++        conn.execute("CREATE TABLE IF NOT EXISTS task_chat_links (task_id TEXT, chat_gateway TEXT, "
++                     "chat_profile TEXT, chat_session TEXT, released INTEGER, created_at INTEGER)")
++        for gw, profile, session in rows:
++            conn.execute("INSERT INTO task_chat_links VALUES (?, ?, ?, ?, 0, 0)", (tid, gw, profile, session))
++
++
++def _subs(conn, tid):
++    return sorted((r[0], r[1]) for r in conn.execute(
++        "SELECT platform, chat_id FROM kanban_notify_subs WHERE task_id=?", (tid,)))
++
++
++@pytest.fixture
++def own_gateway(monkeypatch):
++    from hermes_cli import kanban_origin
++    monkeypatch.setattr(kanban_origin, "gateway_names", lambda: (OWN, {OWN, "remote"}))
++
++
++def test_headless_chat_link_is_not_bound_and_a_supervisor_decides(kanban_home, own_gateway):
++    """A worker transcript's chat link is no owner: binding it would send the decision to a machine session."""
++    with kbc.connect_closing() as conn:
++        tid = stopped(conn)
++        _links(conn, tid, ("remote", "default", "local-" + "b" * 64))
++        assert budget.hold(conn, tid) == "triage"
++        (event,) = helpers._events(conn, tid, decision.NOTICE)
++        producer = event.payload["producer"]
++        assert producer["kind"] == "supervisor"
++        assert kb.get_task(conn, producer["task_id"]).assignee == "default"
++        assert _subs(conn, tid) == []
++
++
++@pytest.mark.parametrize(("gw", "profile", "expected"), [
++    (OWN, "default", ("tui", "human-chat")),
++    (OWN, "other", ("hub", f"{OWN}/other/human-chat")),
++    ("remote", "default", ("hub", "remote/default/human-chat")),
++], ids=["own-gateway-active-profile", "own-gateway-other-profile", "remote-gateway"])
++def test_chat_link_binding_platform(kanban_home, own_gateway, gw, profile, expected):
++    """This gateway's own chat under the active profile is a local tui session; any other is a hub route."""
++    with kbc.connect_closing() as conn:
++        tid = stopped(conn)
++        _links(conn, tid, (gw, profile, "human-chat"))
++        assert budget.hold(conn, tid) == "triage"
++        (event,) = helpers._events(conn, tid, decision.NOTICE)
++        assert event.payload["producer"] == {"kind": "chats"}
++        assert _subs(conn, tid) == [expected]
++        _, events = notify.unseen_events_for_sub(conn, task_id=tid, platform=expected[0], chat_id=expected[1],
++                                                 kinds=(decision.NOTICE,))
++        assert [e.kind for e in events] == [decision.NOTICE]
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
++
++
++@pytest.mark.parametrize("status", ["ready", "review"])
++def test_pending_hold_leaves_a_card_with_an_open_run_untouched(kanban_home, status):
++    """An unrecorded release whose run is still open (expired claim) is not pulled into triage under that run."""
++    with kbc.connect_closing() as conn:
++        tid = stopped(conn)
++        assert budget.hold(conn, tid) == "triage"
++        run_id = conn.execute("SELECT MAX(id) FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0]
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status=?, current_run_id=?, claim_lock='gone-host:1', "
++                         "claim_expires=1 WHERE id=?", (status, run_id, tid))
++        assert decision.pending(conn, tid)
++        budget.hold(conn, tid)
++        task = kb.get_task(conn, tid)
++        assert (task.status, task.current_run_id) == (status, run_id)
++        # Control: once the run is closed the same pending hold does take the card back to triage.
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET current_run_id=NULL WHERE id=?", (tid,))
++        assert budget.hold(conn, tid) == "triage"
++        assert kb.get_task(conn, tid).status == "triage"
++
++
++def _decision_card(tid):
++    return {"task_id": tid, "board": "", "kinds": [decision.NOTICE],
++            "text": f"[kanban] Task {tid} spend_budget_decision_ready.\nHeld in triage until a recorded decision."}
++
++
++def test_stale_decision_wake_is_relabelled_after_promote(kanban_home):
++    """A decision wake that waited while someone promoted the card must not ask the chat to decide again."""
++    from gateway.kanban_wake_fold import refresh_card
++    with kbc.connect_closing() as conn:
++        tid = stopped(conn)
++        assert budget.hold(conn, tid) == "triage"
++        card = _decision_card(tid)
++        assert refresh_card(card) == card  # still in triage: the premise holds, delivered as is
++        assert kb.promote_task(conn, tid, actor="operator", reason="rescoped")[0]
++        assert kb.get_task(conn, tid).status == "ready"
++    fresh = refresh_card(card)
++    assert fresh["text"].startswith(f"[kanban] Task {tid} ready.\n")
++    assert 'said "spend_budget_decision_ready"; that no longer holds. Live status: ready.' in fresh["text"]
++    assert fresh["kinds"] == ["ready"]
++
++
++def test_tui_poller_delivers_the_decision_notice(kanban_home):
++    """A Desktop/TUI chat owning the stop gets the decision notice from its own poller, once."""
++    from tui_gateway import server
++    with kbc.connect_closing() as conn:
++        tid = stopped(conn)
++        notify.add_notify_sub(conn, task_id=tid, platform="tui", chat_id="desk-spend")
++        assert budget.hold(conn, tid) == "triage"
++    texts = [t for t in server._collect_kanban_notifications({"session_key": "desk-spend"})
++             if "recorded decision" in t]
++    assert len(texts) == 1 and tid in texts[0]
++    assert "promote" in texts[0] and "archive" in texts[0]
++    assert [t for t in server._collect_kanban_notifications({"session_key": "desk-spend"})
++            if "recorded decision" in t] == []
+-- 
+2.43.0
+

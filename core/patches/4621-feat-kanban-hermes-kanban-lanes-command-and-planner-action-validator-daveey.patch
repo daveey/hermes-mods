@@ -1,0 +1,748 @@
+From 40736110f07ad3e8befbd37c484b2d2a5c76a934 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 14:00:04 -0800
+Subject: [PATCH] feat(kanban): hermes kanban lanes command and planner action
+ validator [daveey]
+
+show/held/unclassified/assign/admit/pin/set/explain, and apply for a planner's action list with fixed limits.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ cron/AGENTS.md                               |   2 +-
+ hermes_cli/kanban.py                         |   3 +-
+ hermes_cli/kanban_lanes_cli.py               | 205 +++++++++++++++++++
+ hermes_cli/kanban_lanes_plan.py              | 194 ++++++++++++++++++
+ hermes_cli/kanban_parser.py                  |  21 ++
+ tests/hermes_cli/test_kanban_lanes_plan.py   | 134 ++++++++++++
+ tests/tools/test_kanban_lanes_tool_create.py |  43 ++++
+ website/docs/user-guide/configuration.md     |   2 +
+ website/docs/user-guide/features/kanban.md   |  30 +++
+ 9 files changed, 632 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/kanban_lanes_cli.py
+ create mode 100644 hermes_cli/kanban_lanes_plan.py
+ create mode 100644 tests/hermes_cli/test_kanban_lanes_plan.py
+ create mode 100644 tests/tools/test_kanban_lanes_tool_create.py
+
+diff --git a/cron/AGENTS.md b/cron/AGENTS.md
+index cef74949615545d92b67b4a1d0019f1fa7b78529..bed0eabda6a0337b93588fdbc0198f3e27ffa164 100644
+--- a/cron/AGENTS.md
++++ b/cron/AGENTS.md
+@@ -124,7 +124,7 @@ zero outside a kanban task (footprint ladder rung 3).
+   `db_dispatch`, `db_notify`, `db_graph` (task initialization and decomposition), `workspace`, ...). Verbs: `init, create, list (ls), show, assign, link,
+   unlink, comment, attach, attachments, attach-rm, complete, request-review, request-changes,
+   reopen-review, block, unblock, archive, tail`, plus `watch, stats, runs, log, assignees, heartbeat,
+-  notify-*, dispatch, daemon, gc`. Argparse alias dispatch must accept both `list` and `ls` (root).
++  notify-*, dispatch, daemon, gc, lanes` (project lanes: `hermes_cli/kanban_lanes*.py`). Argparse alias dispatch must accept both `list` and `ls` (root).
+ - **Toolset:** `tools/kanban_tools.py` — `kanban_show, kanban_complete, kanban_request_review,
+   kanban_request_changes, kanban_block, kanban_schedule, kanban_heartbeat, kanban_comment,
+   kanban_create, kanban_link,
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 060643cbb0ecbec8b499f99b51b63e9357aba825..881eb5772c9b42f5711704f49f93f1507ad633b8 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -58,6 +58,7 @@ from hermes_cli.kanban_claim_cli import cmd_claim as _cmd_claim  # moved; re-exp
+ from hermes_cli.kanban_source_cli import cmd_source_release as _cmd_source_release
+ from hermes_cli.kanban_sync_cli import cmd_sync as _cmd_sync
+ from hermes_cli.kanban_admission_explain import cmd_queue as _cmd_queue
++from hermes_cli.kanban_lanes_cli import command as _cmd_lanes
+ from hermes_cli.kanban_assignees_cli import cmd_assignees as _cmd_assignees  # moved; re-exported for callers
+ from hermes_cli.kanban_archive_scope import (  # moved here from this module; re-exported for callers
+     _capability_owner_waiting_card, _creator_task_id, _is_stranded_runs_on_copy,
+@@ -1851,7 +1852,7 @@ _HANDLERS = {
+     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
+     "notify-list": _cmd_notify_list, "notify-unsubscribe": _cmd_notify_unsubscribe,
+     "context": _cmd_context, "specify": _cmd_specify, "decompose": _cmd_decompose,
+-    "gc": _cmd_gc, "sync": _cmd_sync, "queue": _cmd_queue, "spend-budget": _spend_budget_cli.command,
++    "gc": _cmd_gc, "sync": _cmd_sync, "queue": _cmd_queue, "spend-budget": _spend_budget_cli.command, "lanes": _cmd_lanes,
+ }
+ 
+ 
+diff --git a/hermes_cli/kanban_lanes_cli.py b/hermes_cli/kanban_lanes_cli.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bd18caff06587655e9f4c059903993b81d644846
+--- /dev/null
++++ b/hermes_cli/kanban_lanes_cli.py
+@@ -0,0 +1,205 @@
++"""``hermes kanban lanes``: see and steer the split of worker time between project lanes. [daveey]
++
++``show`` (the default) prints target against actual share and what is backed up per lane; ``held`` and
++``unclassified`` list the cards a planner decides about; ``assign``, ``admit``, ``pin`` and ``set`` are the user's
++controls; ``apply`` runs a planner's action list through ``kanban_lanes_plan.apply``.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_lanes as lanes
++from hermes_cli.kanban_output import _json_out
++
++
++def _fleet(conn, local: bool):
++    """The connection the report reads: the board's full replica when there is one (fleet-wide), else ``conn``."""
++    if local:
++        return None
++    from hermes_cli import kanban_worker_node as wn
++
++    try:
++        return wn.open_replica(conn)
++    except RuntimeError:
++        return None
++
++
++def snapshot(conn, *, hours: float, local: bool = False) -> dict:
++    from hermes_cli import kanban_lanes_plan as plan
++
++    pol = lanes.policy()
++    if pol is None:
++        return {"configured": False}
++    replica = _fleet(conn, local)
++    try:
++        rows = lanes.usage(replica or conn, pol, window_s=int(hours * 3600))
++    finally:
++        if replica is not None:
++            replica.close()
++    for name, lane in pol.lanes.items():
++        rows[name]["describe"] = lane.describe
++    return {"configured": True, "window_hours": hours, "scope": "fleet" if replica is not None else "local",
++            "default": pol.default, "agent_priority_cap": pol.priority_cap, "lanes": rows,
++            "planner": plan.read_notes()}
++
++
++def _pct(value: float) -> str:
++    return f"{round(value * 100):3d}%"
++
++
++def render(snap: dict) -> str:
++    if not snap["configured"]:
++        return "no lanes configured (kanban.admission.lanes)"
++    lines = [f"lanes over the last {snap['window_hours']:g} h ({snap['scope']})",
++             f"{'lane':12} {'target':>6} {'actual':>6} {'run-h':>7} {'running':>7} {'ready':>5} {'held':>5} "
++             f"{'open':>5}  notes"]
++    for name, row in snap["lanes"].items():
++        notes = []
++        if row["paused"]:
++            notes.append("paused")
++        if row["gated"]:
++            budget = "no limit" if row["admit_per_day"] is None else f"{row['admitted_today']}/{row['admit_per_day']}"
++            notes.append(f"gated, admitted today {budget}")
++        if row["ready"] == 0 and row["target"] > row["actual"]:
++            notes.append("under target: nothing ready")
++        lines.append(f"{name:12} {_pct(row['target']):>6} {_pct(row['actual']):>6} "
++                     f"{row['run_seconds'] / 3600:7.1f} {row['running']:7d} {row['ready']:5d} {row['held']:5d} "
++                     f"{row['open']:5d}  {'; '.join(notes)}")
++    return "\n".join(lines)
++
++
++def _show(args) -> int:
++    with kbc.connect_closing() as conn:
++        snap = snapshot(conn, hours=args.hours, local=args.local)
++    if not _json_out(args, snap):
++        print(render(snap))
++    return 0
++
++
++def _cards(args, rows) -> int:
++    data = [{"id": r["id"], "title": r["title"], "lane": r["tenant"], "priority": r["priority"],
++             "created_at": r["created_at"], "created_by": r["created_by"]} for r in rows]
++    if not _json_out(args, data):
++        print("\n".join(f"{c['id']}  [{c['lane']}]  {c['title']}" for c in data) or "none")
++    return 0
++
++
++def _held(args) -> int:
++    with kbc.connect_closing() as conn:
++        return _cards(args, lanes.held(conn, args.lane)[:args.limit])
++
++
++def _unclassified(args) -> int:
++    with kbc.connect_closing() as conn:
++        rows = conn.execute(
++            "SELECT t.id, t.title, t.tenant, t.priority, t.created_at, t.created_by FROM tasks t "
++            "WHERE t.status NOT IN ('done', 'archived') AND ? = (SELECT json_extract(e.payload, '$.source') "
++            "FROM task_events e WHERE e.task_id = t.id AND e.kind = ? ORDER BY e.id DESC LIMIT 1) "
++            "ORDER BY t.created_at LIMIT ?", ("unclassified", lanes.ASSIGNED, args.limit)).fetchall()
++        return _cards(args, rows)
++
++
++def _assign(args) -> int:
++    with kbc.connect_closing() as conn:
++        lanes.assign(conn, args.task_id, args.lane, source=args.source, reason=args.reason or "")
++    print(f"{args.task_id}: lane {args.lane}")
++    return 0
++
++
++def _admit(args) -> int:
++    from hermes_cli.kanban_cli_actor import cli_actor
++
++    with kbc.connect_closing() as conn:
++        done = lanes.admit(conn, args.task_id, actor=cli_actor(), reason=args.reason or "")
++    print(f"{args.task_id}: {'admitted' if done else 'not held at a lane gate'}")
++    return 0 if done else 1
++
++
++def _pin(args) -> int:
++    from hermes_cli import kanban_lanes_plan as plan
++    from hermes_cli.kanban_cli_actor import cli_actor
++
++    with kbc.connect_closing() as conn:
++        plan.set_pin(conn, args.task_id, not args.off, actor=cli_actor())
++    print(f"{args.task_id}: {'unpinned' if args.off else 'pinned'}")
++    return 0
++
++
++def _set(args) -> int:
++    from hermes_cli.config import set_config_value
++
++    pol = lanes.policy()
++    if pol is None or args.lane not in pol.lanes:
++        print(f"unknown lane: {args.lane}", file=sys.stderr)
++        return 2
++    changes = {"share": args.share, "admit_per_day": args.admit_per_day,
++               "paused": True if args.pause else False if args.resume else None}
++    changes = {key: value for key, value in changes.items() if value is not None}
++    if not changes:
++        print("nothing to set: give --share, --admit-per-day, --pause or --resume", file=sys.stderr)
++        return 2
++    for key, value in changes.items():
++        set_config_value(f"kanban.admission.lanes.{args.lane}.{key}", str(value).lower())
++    lanes.policy()  # a write that left the mapping malformed fails here, loudly
++    return 0
++
++
++def _apply(args) -> int:
++    from hermes_cli import kanban_lanes_plan as plan
++
++    raw = sys.stdin.read() if args.file == "-" else open(args.file, encoding="utf-8").read()
++    with kbc.connect_closing() as conn:
++        result = plan.apply(conn, json.loads(raw), dry_run=args.dry_run)
++    if not args.dry_run:
++        plan.save_notes(result)
++    if not _json_out(args, result):
++        print(f"applied {len(result['applied'])}, rejected {len(result['rejected'])}, "
++              f"notes {len(result['notes'])}")
++        for item in result["rejected"]:
++            print(f"  rejected: {item['why']}: {json.dumps(item['action'])[:160]}")
++    return 0
++
++
++def _explain(args) -> int:
++    from hermes_cli import kanban_lanes_plan as plan
++
++    with kbc.connect_closing() as conn:
++        pol = lanes.policy()
++        row = conn.execute("SELECT id, title, tenant, status, block_kind FROM tasks WHERE id = ?",
++                           (args.task_id,)).fetchone()
++        if pol is None or row is None:
++            print("no lanes configured" if pol is None else f"no such task: {args.task_id}")
++            return 1
++        lane = pol.lanes[pol.lane_of(row["tenant"])]
++        load = lanes._running(conn, pol)
++        data = {"id": row["id"], "lane": lane.name, "source": plan.lane_source(conn, row["id"]),
++                "status": row["status"], "held_at_gate": row["block_kind"] == lanes.GATE_KIND,
++                "paused": lane.paused, "pinned": plan.pinned(conn, row["id"]),
++                "running_per_share": {name: (round(load[name] / spec.share, 3) if spec.share else None)
++                                      for name, spec in pol.lanes.items()}}
++    if not _json_out(args, data):
++        state = ("held at the lane gate until admitted" if data["held_at_gate"] else
++                 "lane is paused" if lane.paused else f"status {row['status']}")
++        ratios = ", ".join(f"{name} {'-' if value is None else value}"
++                           for name, value in data["running_per_share"].items())
++        print(f"{row['id']}: lane {lane.name} (source {data['source'] or 'none'}); {state}\n"
++              f"next free slot goes to the lowest running/share with ready work: {ratios}")
++    return 0
++
++
++_ACTIONS = {None: _show, "show": _show, "held": _held, "unclassified": _unclassified, "assign": _assign,
++            "admit": _admit, "pin": _pin, "set": _set, "apply": _apply, "explain": _explain}
++
++
++def command(args: argparse.Namespace) -> int:
++    action = getattr(args, "lanes_action", None)
++    if action is None:
++        args.hours, args.local = 6.0, False
++    try:
++        return _ACTIONS[action](args)
++    except ValueError as exc:
++        print(f"lanes: {exc}", file=sys.stderr)
++        return 2
+diff --git a/hermes_cli/kanban_lanes_plan.py b/hermes_cli/kanban_lanes_plan.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bcdb9c01951abb9bbb7d394acac7aa72d76f5baa
+--- /dev/null
++++ b/hermes_cli/kanban_lanes_plan.py
+@@ -0,0 +1,194 @@
++"""Validate and apply a lane planner's action list. [daveey]
++
++The planner is an LLM run (a cron job or a chat) that reads ``hermes kanban lanes show --json`` and proposes actions;
++nothing it says is trusted. :func:`apply` is the only writer: it applies the actions below within fixed limits and
++refuses everything else, one refusal per action, so a bad plan degrades to its valid part.
++
++==============  ==================================================================================
++``admit``       a gate-held card to ready, at most the lane's ``admit_per_day`` per local day, never a
++                title matching the lane's ``never_admit``
++``merge``       a gate-held card into an open card of the same lane: a link and a comment; the merged
++                card stays held and is never archived
++``reprioritize``  0..1000, never a pinned card
++``relane``      only a card whose lane came from ``inherited``, ``unclassified`` or ``llm``
++``note``        one line per lane, kept for the panel
++==============  ==================================================================================
++"""
++from __future__ import annotations
++
++import json
++import time
++from pathlib import Path
++from typing import Optional
++
++from hermes_cli import kanban_lanes as lanes
++
++PINNED, UNPINNED, MERGED = "lane_pinned", "lane_unpinned", "lane_merged"
++MAX_ACTIONS = 50
++ACTOR = "lane-planner"
++_MOVABLE = ("inherited", "unclassified", "llm")
++_OPEN = ("triage", "todo", "scheduled", "ready", "running", "blocked", "review")
++
++
++def notes_path() -> Path:
++    from hermes_constants import get_default_hermes_root
++
++    return Path(get_default_hermes_root()) / "kanban" / "lanes-planner.json"
++
++
++def pinned(conn, task_id: str) -> bool:
++    row = conn.execute(
++        "SELECT kind FROM task_events WHERE task_id = ? AND kind IN (?, ?) ORDER BY id DESC LIMIT 1",
++        (task_id, PINNED, UNPINNED)).fetchone()
++    return row is not None and row[0] == PINNED
++
++
++def set_pin(conn, task_id: str, on: bool, *, actor: str) -> None:
++    from hermes_cli import kanban_db as kb
++
++    with kb.write_txn(conn):
++        if kb._task_status(conn, task_id) is None:
++            raise ValueError(f"no such task: {task_id}")
++        kb._append_event(conn, task_id, PINNED if on else UNPINNED, {"actor": actor})
++
++
++def lane_source(conn, task_id: str) -> Optional[str]:
++    row = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id DESC LIMIT 1",
++                       (task_id, lanes.ASSIGNED)).fetchone()
++    return None if row is None else json.loads(row[0] or "{}").get("source")
++
++
++def _card(conn, task_id):
++    if not isinstance(task_id, str):
++        return None
++    return conn.execute("SELECT id, title, tenant, status, block_kind, priority FROM tasks WHERE id = ?",
++                        (task_id,)).fetchone()
++
++
++def _held(row) -> bool:
++    return row["status"] == "triage" and row["block_kind"] == lanes.GATE_KIND
++
++
++def _admit(conn, pol, action, row, state) -> Optional[str]:
++    if not _held(row):
++        return "card is not held at a lane gate"
++    lane = pol.lanes[pol.lane_of(row["tenant"])]
++    if any(p.search(row["title"] or "") for p in lane.never_admit):
++        return f"lane {lane.name} never auto-admits this kind of card"
++    used = state.setdefault(lane.name, lanes.admitted_today(conn, lane.name, now=state["now"]))
++    if lane.admit_per_day is not None and used >= lane.admit_per_day:
++        return f"lane {lane.name} admit budget spent ({used}/{lane.admit_per_day} today)"
++    lanes.admit(conn, row["id"], actor=ACTOR, reason=action["reason"])
++    state[lane.name] = used + 1
++    return None
++
++
++def _merge(conn, pol, action, row, _state) -> Optional[str]:
++    from hermes_cli import kanban_db as kb
++
++    target = _card(conn, action.get("into"))
++    if not _held(row):
++        return "only a gate-held card can be merged"
++    if target is None or target["id"] == row["id"] or target["status"] not in _OPEN:
++        return "merge target must be another open card"
++    if pol.lane_of(target["tenant"]) != pol.lane_of(row["tenant"]):
++        return "merge target is in another lane"
++    with kb.write_txn(conn):
++        kb.link_tasks(conn, target["id"], row["id"], allow_nested=True)
++        kb._append_event(conn, row["id"], MERGED, {"into": target["id"], "reason": action["reason"]})
++    kb.add_comment(conn, target["id"], ACTOR, f"Also covers {row['id']} ({row['title']}): {action['reason']}",
++                   system=True)
++    return None
++
++
++def _reprioritize(conn, _pol, action, row, _state) -> Optional[str]:
++    from hermes_cli import kanban_db as kb
++
++    value = action.get("priority")
++    if type(value) is not int or not 0 <= value <= 1000:
++        return "priority must be an integer from 0 to 1000"
++    if row["status"] not in _OPEN:
++        return "card is not open"
++    if pinned(conn, row["id"]):
++        return "card is pinned"
++    kb.edit_task(conn, row["id"], priority=value, priority_reason=f"{ACTOR}: {action['reason']}")
++    return None
++
++
++def _relane(conn, pol, action, row, _state) -> Optional[str]:
++    lane = action.get("lane")
++    if lane not in pol.lanes:
++        return f"unknown lane: {lane}"
++    if lane_source(conn, row["id"]) not in _MOVABLE:
++        return "lane was given or set by a rule; only the user moves it"
++    if _held(row) or pol.lanes[lane].gated:
++        return "a move into or out of a gated lane is the user's"
++    lanes.assign(conn, row["id"], lane, source="llm", reason=action["reason"], pol=pol)
++    return None
++
++
++_HANDLERS = {"admit": _admit, "merge": _merge, "reprioritize": _reprioritize, "relane": _relane}
++
++
++def apply(conn, actions, *, now: Optional[float] = None, dry_run: bool = False) -> dict:
++    """Apply a planner's ``actions``; returns ``{"applied": [...], "rejected": [{..., "why"}], "notes": [...]}``.
++
++    ``dry_run`` validates the shape only (budget and card checks need the writes of earlier actions).
++    """
++    pol = lanes.policy()
++    if pol is None:
++        raise ValueError("no lanes are configured (kanban.admission.lanes)")
++    if not isinstance(actions, list):
++        raise ValueError("actions must be a list")
++    out: dict = {"applied": [], "rejected": [], "notes": []}
++    state: dict = {"now": time.time() if now is None else now}
++    for index, action in enumerate(actions):
++        why = _refusal(conn, pol, action, index, state, out, dry_run)
++        if why:
++            out["rejected"].append({"action": action, "why": why})
++    return out
++
++
++def _refusal(conn, pol, action, index, state, out, dry_run) -> Optional[str]:
++    if index >= MAX_ACTIONS:
++        return f"over the {MAX_ACTIONS}-action limit for one plan"
++    if not isinstance(action, dict):
++        return "an action must be an object"
++    kind = action.get("action")
++    reason = action.get("reason")
++    if kind == "note":
++        if action.get("lane") not in pol.lanes or not isinstance(action.get("text"), str):
++            return "a note names a configured lane and carries text"
++        out["notes"].append({"lane": action["lane"], "text": action["text"][:300]})
++        return None
++    if kind not in _HANDLERS:
++        return f"unknown action: {kind}"
++    if not isinstance(reason, str) or not reason.strip():
++        return "a one-line reason is required"
++    row = _card(conn, action.get("card"))
++    if row is None:
++        return "no such card"
++    if not dry_run:
++        why = _HANDLERS[kind](conn, pol, action, row, state)
++        if why:
++            return why
++    out["applied"].append(action)
++    return None
++
++
++def save_notes(result: dict, *, now: Optional[float] = None) -> None:
++    """Keep the latest plan's notes and counts where the panel reads them."""
++    path = notes_path()
++    path.parent.mkdir(parents=True, exist_ok=True)
++    doc = {"at": int(time.time() if now is None else now), "notes": result["notes"],
++           "applied": len(result["applied"]), "rejected": len(result["rejected"])}
++    tmp = path.with_suffix(".tmp")
++    tmp.write_text(json.dumps(doc))
++    tmp.replace(path)
++
++
++def read_notes() -> Optional[dict]:
++    try:
++        return json.loads(notes_path().read_text())
++    except (OSError, ValueError):
++        return None
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 9f3870af37c487ed1992fd6490b89f739f393468..773e84319d8a684e0186b2251d3e96665d9c9326 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -671,6 +671,27 @@ _SPECS = [
+                    _arg("--report", action="store_true", help="Capacity-class effect report (ready-wait p50)"),
+                    _arg("--days", type=int, default=7, help="Report window in days (default 7)"),
+                    _json_flag()], help="Ready/review dispatch order with hub admission score breakdowns"),
++    _cmd("lanes", children=("lanes_action", [
++        _cmd("show", [_arg("--hours", type=float, default=6.0, help="Trailing window for actual share (default 6)"),
++                      _arg("--local", action="store_true", help="This board only, not the fleet replica"),
++                      _json_flag()], help="Target against actual share, and what is backed up, per lane"),
++        _cmd("held", [_arg("--lane"), _arg("--limit", type=int, default=200), _json_flag()],
++             help="Cards waiting at a lane gate, oldest first"),
++        _cmd("unclassified", [_arg("--limit", type=int, default=200), _json_flag()],
++             help="Open cards no rule or parent placed in a lane"),
++        _cmd("assign", [_TASK_ID, _arg("lane"), _reason("Why the card belongs there"),
++                        _arg("--source", choices=("given", "llm"), default="given")], help="Move a card to a lane"),
++        _cmd("admit", [_TASK_ID, _reason("Why it should run now")], help="Release a card held at a lane gate"),
++        _cmd("pin", [_TASK_ID, _arg("--off", action="store_true", help="Remove the pin")],
++             help="Keep the planner from reprioritizing a card"),
++        _cmd("set", [_arg("lane"), _arg("--share", type=float), _arg("--admit-per-day", type=int),
++                     _arg("--pause", action="store_true"), _arg("--resume", action="store_true")],
++             help="Change a lane's share, daily admit budget or pause state"),
++        _cmd("apply", [_arg("file", help="JSON action list, or - for stdin"),
++                       _arg("--dry-run", action="store_true"), _json_flag()],
++             help="Validate and apply a planner's action list"),
++        _cmd("explain", [_TASK_ID, _json_flag()], help="A card's lane, where it came from and why it waits"),
++    ]), help="Project lanes: the split of worker time between projects"),
+     _cmd("notify-subscribe", [
+         _TASK_ID,
+         *_NOTIFY_TARGET,
+diff --git a/tests/hermes_cli/test_kanban_lanes_plan.py b/tests/hermes_cli/test_kanban_lanes_plan.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9486e3df35abda1c8283f02c6607b79b2430593a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_lanes_plan.py
+@@ -0,0 +1,134 @@
++"""Lane planner actions are validated one by one; the CLI is the user's control surface."""
++import argparse
++import json
++
++import pytest
++
++from hermes_cli import kanban, kanban_db as kb
++from hermes_cli import kanban_lanes as lanes
++from hermes_cli import kanban_lanes_plan as plan
++from hermes_cli.kanban_parser import build_parser
++from tests.hermes_cli import test_kanban_lanes as base
++
++conn = base.conn
++configured = base.configured
++
++
++def cli(*args):
++    parser = argparse.ArgumentParser()
++    build_parser(parser.add_subparsers())
++    return kanban.kanban_command(parser.parse_args(["kanban", *args]))
++
++
++def _held(conn, parent, title="infra"):
++    return kb.create_task(conn, title=title, assignee="default", creator_task_id=parent,
++                          workspace_path="/src/hermes-agent")
++
++
++def _why(result):
++    return [item["why"] for item in result["rejected"]]
++
++
++def test_admit_stops_at_the_daily_budget_and_never_admits_guard_cards(conn, configured):
++    parent = base._hermes_parent(conn)
++    cards = [_held(conn, parent, f"infra {i}") for i in range(3)]
++    guard = _held(conn, parent, "Lifecycle guard false refusal")
++    result = plan.apply(conn, [{"action": "admit", "card": c, "reason": "next"} for c in [guard, *cards]])
++    assert [a["card"] for a in result["applied"]] == cards[:2]  # admit_per_day is 2
++    assert "never auto-admits" in _why(result)[0] and "budget spent (2/2" in _why(result)[1]
++    assert base._task(conn, cards[2])["status"] == "triage" and base._task(conn, guard)["status"] == "triage"
++
++
++def test_rejects_unknown_actions_missing_reasons_and_archives(conn, configured):
++    card = base._ready_in(conn, "myapp", "bb")
++    result = plan.apply(conn, [
++        {"action": "archive", "card": card, "reason": "tidy"},
++        {"action": "reprioritize", "card": card, "priority": 500},
++        {"action": "reprioritize", "card": card, "priority": 5000, "reason": "big"},
++        {"action": "reprioritize", "card": "t_missing", "priority": 5, "reason": "x"},
++        "not an object",
++    ])
++    assert not result["applied"] and len(result["rejected"]) == 5
++    assert base._task(conn, card)["status"] == "ready"
++
++
++def test_reprioritize_skips_pinned_cards(conn, configured):
++    card = base._ready_in(conn, "myapp", "bb", priority=10)
++    plan.set_pin(conn, card, True, actor="user")
++    result = plan.apply(conn, [{"action": "reprioritize", "card": card, "priority": 700, "reason": "up"}])
++    assert _why(result) == ["card is pinned"] and base._task(conn, card)["priority"] == 10
++    plan.set_pin(conn, card, False, actor="user")
++    assert plan.apply(conn, [{"action": "reprioritize", "card": card, "priority": 700, "reason": "up"}])["applied"]
++    assert base._task(conn, card)["priority"] == 700
++
++
++def test_relane_only_moves_cards_nothing_placed_and_never_through_a_gate(conn, configured):
++    loose = kb.create_task(conn, title="something", assignee="default")
++    given = base._ready_in(conn, "myapp", "bb")
++    result = plan.apply(conn, [
++        {"action": "relane", "card": loose, "lane": "myapp", "reason": "it is BB firmware"},
++        {"action": "relane", "card": given, "lane": "other", "reason": "guess"},
++        {"action": "relane", "card": loose, "lane": "hermes", "reason": "sneak past the gate"},
++        {"action": "relane", "card": loose, "lane": "nope", "reason": "typo"},
++    ])
++    assert len(result["applied"]) == 1 and len(result["rejected"]) == 3
++    assert base._task(conn, loose)["tenant"] == "myapp" and base._task(conn, given)["tenant"] == "myapp"
++
++
++def test_merge_links_and_keeps_the_card_held(conn, configured):
++    parent = base._hermes_parent(conn)
++    dup = _held(conn, parent, "fix the watcher again")
++    other_lane = base._ready_in(conn, "myapp", "bb")
++    result = plan.apply(conn, [
++        {"action": "merge", "card": dup, "into": other_lane, "reason": "same"},
++        {"action": "merge", "card": dup, "into": parent, "reason": "same watcher fix"},
++    ])
++    assert _why(result) == ["merge target is in another lane"] and len(result["applied"]) == 1
++    row = base._task(conn, dup)
++    assert (row["status"], row["block_kind"]) == ("triage", lanes.GATE_KIND)
++    assert conn.execute("SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?", (parent, dup)).fetchone()
++
++
++def test_plan_over_the_action_limit_and_notes(conn, configured, monkeypatch):
++    monkeypatch.setattr(plan, "MAX_ACTIONS", 2)
++    result = plan.apply(conn, [{"action": "note", "lane": "myapp", "text": "no ready work"},
++                               {"action": "note", "lane": "nope", "text": "x"},
++                               {"action": "note", "lane": "hermes", "text": "late"}])
++    assert result["notes"] == [{"lane": "myapp", "text": "no ready work"}] and len(result["rejected"]) == 2
++
++
++def test_cli_show_set_admit_apply_round_trip(conn, configured, capsys, tmp_path):
++    parent = base._hermes_parent(conn)
++    held = _held(conn, parent)
++    assert cli("lanes", "show", "--json") == 0
++    snap = json.loads(capsys.readouterr().out)
++    assert snap["lanes"]["hermes"]["held"] == 1 and snap["scope"] == "local"
++    before = lanes.policy().lanes["myapp"].share
++    assert cli("lanes", "set", "myapp", "--share", "60", "--pause") == 0
++    lane = lanes.policy().lanes["myapp"]
++    assert (lane.share, lane.paused) == (60.0, True)
++    assert cli("lanes", "set", "myapp", "--share", str(before), "--resume") == 0
++    lane = lanes.policy().lanes["myapp"]
++    assert (lane.share, lane.paused) == (before, False)  # the previous values restore the previous split
++    actions = tmp_path / "plan.json"
++    actions.write_text(json.dumps([{"action": "admit", "card": held, "reason": "unblocks the hub"},
++                                   {"action": "note", "lane": "myapp", "text": "nothing ready"}]))
++    capsys.readouterr()
++    assert cli("lanes", "apply", str(actions), "--json") == 0
++    assert len(json.loads(capsys.readouterr().out)["applied"]) == 1
++    assert base._task(conn, held)["status"] == "ready"
++    assert plan.read_notes()["notes"] == [{"lane": "myapp", "text": "nothing ready"}]
++    assert cli("lanes", "admit", held) == 1  # no longer held
++    assert cli("lanes", "set", "nope", "--share", "1") == 2
++    assert cli("lanes", "explain", held) == 0 and "lane hermes" in capsys.readouterr().out
++
++
++def test_cli_create_is_classified(conn, configured, capsys):
++    assert cli("create", "write the BB onboarding", "--assignee", "default", "--tenant", "myapp", "--json") == 0
++    made = json.loads(capsys.readouterr().out)
++    assert base._task(conn, made["id"])["tenant"] == "myapp"
++    assert cli("create", "something loose", "--assignee", "default", "--json") == 0
++    loose = json.loads(capsys.readouterr().out)["id"]
++    assert base._task(conn, loose)["tenant"] == "other"
++    assert cli("lanes", "unclassified", "--json") == 0
++    assert [c["id"] for c in json.loads(capsys.readouterr().out)] == [loose]
+diff --git a/tests/tools/test_kanban_lanes_tool_create.py b/tests/tools/test_kanban_lanes_tool_create.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..17e2425235a6bc208b1ee31eeb69e7be8b3891bf
+--- /dev/null
++++ b/tests/tools/test_kanban_lanes_tool_create.py
+@@ -0,0 +1,43 @@
++"""The kanban_create tool path: a worker's follow-up card in a gated lane is held and priority-capped."""
++import json
++from pathlib import Path
++
++from tests.tools.test_kanban_tools import worker_env  # noqa: F401  (fixture)
++
++
++def _configure():
++    from hermes_constants import get_default_hermes_root
++
++    doc = {"kanban": {"admission": {"agent_priority_cap": 100, "lanes": {
++        "hermes": {"share": 1, "gated": True}, "other": {"share": 1}}}}}
++    (Path(get_default_hermes_root()) / "config.yaml").write_text(json.dumps(doc))
++
++
++def test_tool_created_follow_up_in_gated_lane_is_held(worker_env):
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_lanes as lanes
++    from tools import kanban_tools as kt
++
++    _configure()
++    with kbc.connect() as conn:
++        conn.execute("UPDATE tasks SET tenant='hermes' WHERE id=?", (worker_env,))
++        conn.commit()
++    result = json.loads(kt._handle_create({"title": "Tidy the dispatcher", "assignee": "test-worker",
++                                           "priority": 1000}))
++    assert "error" not in result, result
++    with kbc.connect() as conn:
++        row = conn.execute("SELECT status, tenant, priority, block_kind FROM tasks WHERE id=?",
++                           (result["task_id"],)).fetchone()
++    assert tuple(row) == ("triage", "hermes", 100, lanes.GATE_KIND)
++
++
++def test_tool_created_card_without_lanes_is_unchanged(worker_env):
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools as kt
++
++    result = json.loads(kt._handle_create({"title": "Tidy the dispatcher", "assignee": "test-worker"}))
++    assert "error" not in result, result
++    with kbc.connect() as conn:
++        row = conn.execute("SELECT status, tenant, block_kind FROM tasks WHERE id=?",
++                           (result["task_id"],)).fetchone()
++    assert tuple(row) == ("ready", None, None)
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index d616e60663400a1069ff4f108e1c38fbb3fb6eac..01b8b49756039870ad27bce2f90786e2136fccbd 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -3628,6 +3628,8 @@ kanban:
+     cpu_busy_below_pct: 50   # absent/null = gate off (default)
+ ```
+ 
++`kanban.admission.lanes`, `kanban.admission.lane_default` and `kanban.admission.agent_priority_cap` (all default unset: off) configure project lanes; see [Project lanes](features/kanban.md#project-lanes).
++
+ `kanban.admission.cpu_busy_below_pct` (default unset: off) turns on the measured-CPU admission gate on a host that takes overflow work from the Board's worker-first placement. It is read only from the installation-root `config.yaml`, never from a profile override. When set:
+ 
+ - the metrics reporter attaches a measured non-nice CPU busy percentage (two `/proc/stat` snapshots about 1 s apart) to its 10 s Board report, with a 2 s total budget and no replay. Positive-nice user time, idle and iowait are excluded; system, IRQ and steal count as busy. This excludes all positive nice values, not only nice >= 10;
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 6b91c3f1b92e13561683f304c466e5f5c27f4354..3a99f84cf02e08519f026b91ffe40073252419a5 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -1549,6 +1549,36 @@ hermes kanban create "nightly backup audit" \
+ 
+ The dispatcher refuses to re-spawn a ready task when it hit an auth error (401, invalid API key, unauthorized, billing) on the previous run (`blocker_auth`), or completed a run successfully within the guard window (`recent_success`), or a recent task comment links to a GitHub PR (`active_pr`). Two cooldowns hold a card without ever counting against it: `rate_limit_cooldown` after a quota-wall requeue and `infrastructure_cooldown` after the host refused to place the worker (no restart-safe systemd scope — see [Workers and systemd cgroups](#workers-and-systemd-cgroups)); both share the `HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS` window (default 300 s). Quota / rate-limit / 429 text in `last_failure_error` always takes the `rate_limit_cooldown` path, even when a later non-failure run superseded the `rate_limited` one; once the cooldown elapses the stamp is cleared and the card retries. A quota wall is never `blocker_auth` and never escalates to a human block kind, and a legacy guard-hold block on a quota error is released automatically once another card completes after it. This prevents repeat worker storms on the same bug or task while a human catches up. See the `respawn_guarded` row in the [event reference](#event-reference).
+ 
++## Project lanes
++
++Lanes split worker time between projects. A card's lane is its `tenant`; the installation-root `config.yaml` names the lanes under `kanban.admission.lanes`. With no `lanes` mapping nothing changes.
++
++```yaml
++kanban:
++  admission:
++    lane_default: other          # lane of a card nothing else places (must be a configured lane)
++    agent_priority_cap: 100      # stored priority ceiling for cards the user did not create
++    lanes:
++      myapp: {share: 35, describe: "Example app and firmware"}
++      hermes:
++        share: 20
++        gated: true              # cards filed by other cards or by detectors start held in triage
++        admit_per_day: 50
++        match: {creators: [self-heal], key_prefixes: ["ci-main-watch:"], repos: [hermes-agent], self_work: true}
++        gate_exempt: ['independent review']
++        never_admit: ['lifecycle guard']
++      other: {share: 10}
++```
++
++- **Classification** happens once, at creation: an explicit `tenant`, then a lane whose `match` fits (creator name, idempotency-key prefix, repository directory name, or a declared `self_work`), then the parent's or creating card's lane, then `lane_default` with a `lane_unclassified` event. Every decision is a `lane_assigned` event with its source.
++- **Shares are targets, not ceilings.** Under contention each free slot goes to the lane running the fewest cards relative to its `share`; inside a lane the admission score decides. A lane with nothing ready lends its share. Land-turn owners, `urgent`/`capacity` cards and alarm cards are not reordered. `paused: true` stops a lane's cards from being dispatched.
++- **The gate.** In a `gated` lane a card filed by another card, or by a `match` creator or key prefix, starts in `triage` with `block_kind = lane_gate` until it is admitted. The user's own cards (`created_by: user`), alarm-keyed and `urgent` cards, and `gate_exempt` titles under an admitted creating card are not held. A held card that an open card of another lane is linked to wait on is admitted at once, outside the budget. The stale-triage sweep leaves held cards alone.
++- **Priority cap.** `agent_priority_cap` bounds the stored priority of a card the user did not create, at creation.
++
++`hermes kanban lanes` (default `show`) prints target against actual share of run-hours over `--hours` (default 6), running, ready, held and open cards per lane; on a synced board it reads the fleet replica unless `--local`. `held` and `unclassified` list cards; `assign <id> <lane>`, `admit <id>`, `pin <id> [--off]` and `set <lane> [--share N] [--admit-per-day N] [--pause|--resume]` are the controls; `explain <id>` says which lane a card is in and why it waits.
++
++`hermes kanban lanes apply <file|->` applies a planner's JSON action list. Each action is validated on its own and refused with a reason when it breaks a limit: `admit` (at most `admit_per_day` per local day, never a `never_admit` title), `merge` (a held card into an open card of the same lane; it stays held), `reprioritize` (0 to 1000, never a pinned card), `relane` (only a card placed by inheritance or by default, never through a gate) and `note`. Every action except `note` needs a one-line `reason`; one plan applies at most 50 actions.
++
+ The stuck detector distinguishes intentional `llm_pacing` waits and `worker_load_pressure` from unexplained zero-spawn ticks. Expected waits log `kanban dispatch held` at INFO, with provider running/limit and the next real reset (or the condition rechecked next tick); foreign `labels_mismatch` rows do not turn a fully explained local wait into a stall. A refresh deadline alone cannot justify a pacing hold: an idle zero-limit pool without a future reset remains actionable. Within one dispatcher tenure, a continuously observed card waiting for 15 minutes (or 15 minutes beyond its first real reset) emits `kanban admission prolonged` at WARNING, even if other cards start. This reports lack of admission for that card, not lack of progress by running workers. Warnings repeat at most every five minutes; a new dispatcher tenure starts a new observation window.
+ 
+ To see why a ready card is not spawning, run `hermes kanban dispatch --dry-run` — the output lists `Guarded (<reason>): <task id>` per held card (and `respawn_guarded`, `rate_limited`, `skipped_locked`, `memory_pressure` with `--json`). The gateway's and the standalone daemon's "dispatcher stuck" warning also names what the last tick held back, e.g. `Last tick held back: active_pr=1`.
+-- 
+2.43.0
+

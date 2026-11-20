@@ -1,0 +1,432 @@
+From b9cec91e758faa772e2a68e57978ae5f1d8c4f5e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 09:30:09 +0000
+Subject: [PATCH] [daveey] lifecycle guard: scan a script the same command
+ writes before it runs it
+
+`cat > F <<'EOF' ... EOF; bash F` ran F's heredoc body, but the referenced-script walk reads F
+from disk at scan time: missing (nothing to scan) or stale (old content). The guard allowed it
+while real Bash executed the payload (t_baf36593e158398d, found on PR #2929's baseline).
+
+Policy: both options from the card, combined conservatively.
+- Every file the walked command writes with an output redirection (`>`, `>>`, `>|`, `&>`,
+  `>&F`) or `tee` is recorded with what it writes, and that text is walked wherever the
+  command runs the path (`bash F`, `sh F`, `. F`, `source F`, `./F`, stdin feeds), in the
+  candidate's own mode, alongside the on-disk text (an append keeps it).
+- Known content: `cat`/`tee` fed only by a heredoc or here-string (a quoted body verbatim; an
+  unquoted body holding `$(`, backticks or process substitution is unknown), and `echo`/`printf`
+  with literal arguments (escapes decoded, via the existing printed-line helpers).
+- Any other writer (`rev`, `base64 -d`, `curl`, `python3 gen.py`, `cat a b`, stderr, `3<> F`)
+  is unknown: executing that path fails closed; mentioning it does not, and a Python program
+  still never fails closed. `<> F` on stdin (`bash <> F`) is input, not a write.
+- Matching is by resolved path, with the same lexical model as the rest of the walk (no order,
+  control-flow or `cd` tracking). Top-level fail-closed behaviour and all shell-fed and
+  file-mediated detection are unchanged; the new module is cron/lifecycle_guard_generated.py.
+
+RED/GREEN: tests/cron/test_lifecycle_guard_generated_scripts.py runs each command in real Bash
+after scanning it (F absent, or stale) and asserts the marker ran and the guard refused. On
+origin/main 22 of 34 fail; with the fix all pass (36 with the two added allow cases).
+---
+ cron/lifecycle_guard.py                       |  23 +-
+ cron/lifecycle_guard_generated.py             | 210 ++++++++++++++++++
+ .../test_lifecycle_guard_generated_scripts.py | 113 ++++++++++
+ 3 files changed, 338 insertions(+), 8 deletions(-)
+ create mode 100644 cron/lifecycle_guard_generated.py
+ create mode 100644 tests/cron/test_lifecycle_guard_generated_scripts.py
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index 72d56784c3d486f06d7c0bae91e4a1eb124092ed..3a2d5029347f8d44dcb66ad9ebd3f76a9ad6d20c 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -523,6 +523,7 @@ class _LifecycleScanBudget:
+         "alias_names",
+         "aliases_defined",
+         "bytes_remaining",
++        "generated",
+         "integer_context",
+         "lines_remaining",
+         "mask_heredocs",
+@@ -567,6 +568,8 @@ class _LifecycleScanBudget:
+         # False when a session alias may shadow a heredoc consumer, wrapper or shell name
+         # (`alias python3=bash`): then no heredoc body is provably inert, so none is masked.
+         self.mask_heredocs = not _session_aliases_shadow_consumers(session_aliases)
++        # Each file the walked text writes, with what it writes (lifecycle_guard_generated).
++        self.generated: dict[Path, list[Optional[str]]] = {}
+ 
+     def note_aliases(self, text: str) -> None:
+         """Record (sticky) that walked *text* may define or enable an alias."""
+@@ -1698,9 +1701,12 @@ def _contains_unsafe_gateway_action(
+                     else command)
+ 
+     # A nested startup-file shell's input is walked first, with unknown alias names (nit 1).
++    from cron.lifecycle_guard_generated import note_generated_scripts, preflight_candidate
+     from cron.lifecycle_guard_nested_shells import (
+         collect_nested_shell_inputs, shell_scope, unvisited_scopes)
+ 
++    note_generated_scripts(budget, command, cwd)
++
+     from cron.lifecycle_guard_output import iter_printed_shell_payloads, quote_scope
+ 
+     session_payloads = list(itertools.chain(_iter_shell_command_payloads(walk_command),
+@@ -1721,14 +1727,15 @@ def _contains_unsafe_gateway_action(
+     nested_only = ((path, executed, False) for path in sorted(nested_scripts))
+     for script_path, candidate_executed, python_source in itertools.chain(nested_only, _walk_candidates(
+             command, walk_command, cwd=cwd, executed=executed, budget=budget)):
+-        # Do not touch a FileProvider path even to discover whether the file is hydrated.
+-        if _on_cloud_path(script_path):
+-            if candidate_executed:
+-                return _refuse_unreadable(
+-                    budget, script_path,
+-                    f"`{script_path}` lives on a cloud-synced path (iCloud Drive / "
+-                    "~/Library/CloudStorage) that the guard refuses to open",
+-                )
++        # A cloud path is refused or skipped unopened; a file this command writes is walked as
++        # written (True: unsafe, False: skip, None: read it from disk below).
++        verdict = preflight_candidate(
++            budget, visited, script_path, executed=candidate_executed, python_source=python_source,
++            recurse=lambda text, directory, label: recurse(
++                text, directory, candidate_executed, label, python_source))
++        if verdict:
++            return True
++        if verdict is False:
+             continue
+         resolved = _resolve_lenient(script_path)
+         scopes = unvisited_scopes(visited, budget, resolved, python_source=python_source,
+diff --git a/cron/lifecycle_guard_generated.py b/cron/lifecycle_guard_generated.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1217721a5919c9321c0e60b71814770232f28f58
+--- /dev/null
++++ b/cron/lifecycle_guard_generated.py
+@@ -0,0 +1,210 @@
++"""Scripts a command writes before it runs them, for the lifecycle guard (t_baf36593e158398d).
++
++``cat > F <<'EOF' … EOF; bash F`` runs the heredoc body, but the referenced-script walk reads F
++from disk: missing (nothing to scan) or stale (the old content) at scan time. Every write the
++command makes with an output redirection (``>``, ``>>``, ``>|``, ``&>``, ``>&F``) or ``tee`` is
++recorded here with what it writes, and the walk scans that text wherever it runs the path:
++
++- ``cat``/``tee`` fed by a heredoc or here-string: the body (a quoted heredoc verbatim; an
++  unquoted one whose body holds a substitution writes output nobody can predict, so unknown);
++- ``echo``/``printf`` with literal arguments: the lines they may print (escapes decoded);
++- any other writer (``curl … > F``, ``python3 gen.py > F``, ``cat a b > F``, stderr, ``3<> F``):
++  unknown (``<> F`` on stdin is input, as in ``bash <> F``). Executing a path with an unknown
++  write fails closed; mentioning it does not, and a Python interpreter's file never fails closed
++  (as everywhere in the walk).
++
++The text on disk is still read and scanned too (an append keeps it, and the scan is a superset).
++Writes are matched by path, not by order or control flow, and ``cd`` is not tracked, the same
++lexical model the rest of the walk uses.
++"""
++
++from __future__ import annotations
++
++import hashlib
++from collections.abc import Callable, Iterator
++from pathlib import Path
++from typing import TYPE_CHECKING, Optional
++
++from cron.lifecycle_guard import (
++    _REDIRECTION,
++    _executable_name,
++    _executed_command_index,
++    _iter_command_segment_views,
++    _on_cloud_path,
++    _printed_argument_lines,
++    _refuse_unreadable,
++    _resolve_lenient,
++    _resolved_or_nothing,
++    _with_escapes_decoded,
++)
++from tools.shell_heredoc import _parse_heredoc_operator, iter_heredoc_bodies
++
++if TYPE_CHECKING:
++    from cron.lifecycle_guard import _LifecycleScanBudget
++
++# Marks a write whose content the guard cannot know.
++UNKNOWN: None = None
++# Text that makes a heredoc body or argument produce output decided only when it runs.
++_DYNAMIC_MARKS = ("$(", "`", "<(", ">(")
++_STDIN_COPIERS = frozenset({"cat", "tee"})
++_PRINTERS = frozenset({"echo", "printf"})
++
++
++def _owner_has_unquoted_heredoc(owner: str) -> bool:
++    """Whether some ``<<`` opener in *owner* has an unquoted delimiter (its body expands)."""
++    position = owner.find("<<")
++    while position >= 0:
++        if not owner.startswith("<<<", position):
++            parsed = _parse_heredoc_operator(owner, position)
++            if parsed is None or not parsed[3]:
++                return True
++            position = parsed[0]
++        else:
++            position += 3
++        position = owner.find("<<", position)
++    return False
++
++
++def _bodies_by_view(command: str) -> dict[tuple[str, ...], list[Optional[str]]]:
++    """Heredoc bodies keyed by every segment view of their owner that opens a heredoc. An owner
++    the parser cannot name, or an unquoted body that runs a substitution, maps to UNKNOWN."""
++    mapped: dict[tuple[str, ...], list[Optional[str]]] = {}
++    for owner, body in iter_heredoc_bodies(command):
++        if owner is None:
++            continue  # its writer segment finds no body below: an unknown write
++        dynamic = _owner_has_unquoted_heredoc(owner) and any(m in body for m in _DYNAMIC_MARKS)
++        for view in _iter_command_segment_views(owner):
++            if any(_opens_heredoc(word) for word in view):
++                mapped.setdefault(tuple(view), []).append(UNKNOWN if dynamic else body)
++    return mapped
++
++
++def _opens_heredoc(word: str) -> bool:
++    match = _REDIRECTION.match(word)
++    return match is not None and match.group(2) in ("<<", "<<-")
++
++
++def _writes(view: list[str], index: int) -> tuple[list[str], list[str], dict]:
++    """``(stdout targets, other written targets, inputs)`` of the command at *index*."""
++    stdout: list[str] = []
++    other: list[str] = []
++    inputs = {"heredoc": False, "herestrings": [], "stdin_file": False, "operands": []}
++    words = iter(view[index + 1:])
++    for word in words:
++        match = _REDIRECTION.match(word)
++        if match is None:
++            inputs["operands"].append(word)
++            continue
++        fd, operator, target = match.groups()
++        target = target or next(words, "")
++        if operator in ("<<", "<<-"):
++            inputs["heredoc"] = True
++        elif operator == "<<<":
++            inputs["herestrings"].append(target)
++        elif operator in (">&", "<&") and (target.isdigit() or target in ("-", "")):
++            continue  # descriptor duplication or close: no file
++        elif operator == "<" or (operator == "<>" and fd in ("", "0")):
++            inputs["stdin_file"] = True  # `bash <> F` reads F as its program; nothing writes it
++        elif operator == "<>" or (fd not in ("", "1") and not operator.startswith("&")):
++            other.append(target)  # `2> F`, `{fd}> F`, `3<> F`: written by unpredictable output
++        elif ">" in operator:
++            stdout.append(target)
++    return stdout, other, inputs
++
++
++def _view_writes(
++    view: list[str], bodies: dict[tuple[str, ...], list[Optional[str]]],
++) -> Iterator[tuple[str, Optional[str]]]:
++    """``(target, text or UNKNOWN)`` for each file the command in *view* writes."""
++    index = _executed_command_index(view)
++    if index is None:
++        return
++    name = _executable_name(view[index])
++    stdout, other, inputs = _writes(view, index)
++    targets = list(stdout)
++    if name == "tee":
++        targets += [word for word in inputs["operands"] if not word.startswith("-")]
++    if not targets and not other:
++        return
++    contents: list[Optional[str]] = [UNKNOWN]
++    if name in _STDIN_COPIERS:
++        copied_files = name == "cat" and any(
++            word != "-" and not word.startswith("-") for word in inputs["operands"])
++        fed: list[Optional[str]] = []
++        if inputs["heredoc"]:
++            fed += bodies.get(tuple(view), [UNKNOWN])
++        fed += [UNKNOWN if any(m in text for m in _DYNAMIC_MARKS) else text
++                for text in inputs["herestrings"]]
++        if fed and not copied_files and not inputs["stdin_file"]:
++            contents = fed
++    elif name in _PRINTERS and not any(
++            mark in word for word in inputs["operands"] for mark in _DYNAMIC_MARKS):
++        contents = [variant for line in _printed_argument_lines(name, inputs["operands"])
++                    for variant in _with_escapes_decoded(line)]
++    for target in targets:
++        for text in contents:
++            yield target, text
++    for target in other:
++        yield target, UNKNOWN
++
++
++def note_generated_scripts(budget: _LifecycleScanBudget, command: str, cwd: Optional[str]) -> None:
++    """Record in *budget* every file *command* writes and what it writes (see module docstring).
++    Shared across the whole walk, so a generated script that runs another one the root command
++    generated is followed too."""
++    if ">" not in command and "tee" not in command:
++        return  # nothing written: skip a second tokenization
++    bodies = _bodies_by_view(command) if "<<" in command else {}
++    for view in _iter_command_segment_views(command):
++        for target, text in _view_writes(view, bodies):
++            for path in _resolved_or_nothing(target, cwd):
++                texts = budget.generated.setdefault(_resolve_lenient(path), [])
++                if text not in texts:
++                    texts.append(text)
++
++
++def preflight_candidate(
++    budget: _LifecycleScanBudget, visited: set[object], script_path: Path, *, executed: bool,
++    python_source: bool, recurse: Callable[[str, str, str], bool],
++) -> Optional[bool]:
++    """Checks on a walk candidate before its file is read from disk: ``True`` unsafe, ``False``
++    skip it, ``None`` read and walk the file. ``recurse(text, directory, source)`` walks one text
++    in the candidate's own mode."""
++    # Do not touch a FileProvider path even to discover whether the file is hydrated.
++    if _on_cloud_path(script_path):
++        return executed and _refuse_unreadable(
++            budget, script_path,
++            f"`{script_path}` lives on a cloud-synced path (iCloud Drive / "
++            "~/Library/CloudStorage) that the guard refuses to open",
++        )
++    # A file this command writes runs what it writes, not (only) what is on disk now.
++    resolved = _resolve_lenient(script_path)
++    if _generated_script_is_unsafe(
++            budget, visited, resolved, executed=executed, python_source=python_source,
++            recurse=lambda text, source: recurse(text, str(resolved.parent), source)):
++        return True
++    return None
++
++
++def _generated_script_is_unsafe(
++    budget: _LifecycleScanBudget, visited: set[object], resolved: Path, *, executed: bool,
++    python_source: bool, recurse: Callable[[str, str], bool],
++) -> bool:
++    """Scan what the walked command wrote to *resolved*, which it also runs or mentions.
++    ``recurse(text, source)`` walks one generated text in the candidate's own mode."""
++    for text in budget.generated.get(resolved, ()):
++        if text is UNKNOWN:
++            if executed and not python_source:
++                return _refuse_unreadable(
++                    budget, resolved,
++                    f"`{resolved}` is written earlier in the same command by a writer whose "
++                    "output the guard cannot read, then executed")
++            continue
++        key = ("generated", resolved, python_source,
++               hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest())
++        if key in visited:
++            continue
++        visited.add(key)
++        if recurse(text, f"`{resolved}` (written by this command)"):
++            return True
++    return False
+diff --git a/tests/cron/test_lifecycle_guard_generated_scripts.py b/tests/cron/test_lifecycle_guard_generated_scripts.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ce52d78a553beaca6c12cce4eedf8455c32ddf9f
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_generated_scripts.py
+@@ -0,0 +1,113 @@
++"""A script the same command writes and then runs is scanned as written (t_baf36593e158398d).
++
++The referenced-script walk reads F from disk at scan time, so ``cat > F <<'R' … R; bash F`` with no
++F yet (or a stale F) used to allow a body real Bash then runs. Each differential below runs the
++command in real Bash: whenever the marker ran, the guard must have refused. The marker payload is
++``bash <BIG>``, an oversized script the guard fails closed on when it is executed; BIG touches the
++marker first. (A literal lifecycle command cannot run here: tests/conftest.py blocks the spawn.)
++"""
++
++import base64
++import shutil
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++
++_WRITE_THEN_RUN = [
++    "cat > F <<'R'\nBODY\nR\nbash F\n",
++    "cat > F <<'R'\nBODY\nR\nsh F\n",
++    "cat <<'R' > F\nBODY\nR\n. ./F\n",
++    "cat >F <<-'R'\nBODY\nR\nsource ./F\n",
++    "cat >> F <<'R'\nBODY\nR\nbash F\n",
++    "cat > F <<'R'\nBODY\nR\nchmod +x F; ./F\n",
++    "cat > F <<'R' && bash F\nBODY\nR\n",
++    "tee F >/dev/null <<'R'\nBODY\nR\nbash F\n",
++    "cat > ./sub/F <<'R'\nBODY\nR\nbash sub/F\n",
++    "{ cat > F; } <<'R'\nBODY\nR\nbash F\n",
++]
++
++
++@pytest.fixture
++def big(tmp_path):
++    path = tmp_path / "BIG"
++    path.write_text("touch executed\n" + "# padding\n" * 150000)
++    (tmp_path / "sub").mkdir()
++    return f"bash {path}"
++
++
++def _run_bash(tmp_path, command):
++    bash = shutil.which("bash")
++    if bash is None:
++        pytest.skip("bash unavailable")
++    subprocess.run([bash, "-c", command], cwd=tmp_path, capture_output=True, timeout=20,
++                   check=False)
++
++
++def _differential(tmp_path, command):
++    """The guard verdict, scanned BEFORE real Bash runs *command* (F does not exist yet unless the
++    test seeded it), after asserting that Bash ran the marker."""
++    unsafe, _reason = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    _run_bash(tmp_path, command)
++    assert (tmp_path / "executed").exists(), "fixture must execute its marker"
++    return unsafe
++
++
++@pytest.mark.parametrize("transport", _WRITE_THEN_RUN)
++def test_generated_script_is_scanned_as_written(tmp_path, big, transport):
++    assert _differential(tmp_path, transport.replace("BODY", big)), (
++        "real Bash executed a payload the guard allowed")
++
++
++@pytest.mark.parametrize("transport", _WRITE_THEN_RUN[:3])
++def test_stale_file_on_disk_does_not_hide_the_written_one(tmp_path, big, transport):
++    (tmp_path / "F").write_text("echo old\n")
++    assert _differential(tmp_path, transport.replace("BODY", big))
++
++
++@pytest.mark.parametrize("template", [
++    "printf '%s\\n' 'BODY' > F; bash F\n",
++    "echo 'BODY' > F && bash F\n",
++    "cat <<< 'BODY' > F; bash F\n",
++])
++def test_printed_and_herestring_writes_are_scanned(tmp_path, big, template):
++    assert _differential(tmp_path, template.replace("BODY", big))
++
++
++@pytest.mark.parametrize("template", [
++    # Writers whose output the guard cannot predict, then executed: fail closed.
++    "rev > F <<'R'\nREVERSED\nR\nbash F\n",
++    "cat > F <<R\n$(printf '%s' 'BODY')\nR\nbash F\n",
++    "base64 -d > F <<< B64; bash F\n",
++])
++def test_unpredictable_writer_then_execute_fails_closed(tmp_path, big, template):
++    command = (template.replace("REVERSED", big[::-1]).replace("BODY", big)
++               .replace("B64", base64.b64encode(f"{big}\n".encode()).decode()))
++    assert _differential(tmp_path, command)
++
++
++@pytest.mark.parametrize("transport", _WRITE_THEN_RUN)
++def test_generated_lifecycle_command_is_refused(tmp_path, transport):
++    (tmp_path / "sub").mkdir()
++    unsafe, _reason = scan_gateway_lifecycle(
++        transport.replace("BODY", "hermes gateway restart"), cwd=str(tmp_path))
++    assert unsafe
++
++
++@pytest.mark.parametrize("command", [
++    # Written, never executed: data.
++    "cat > notes.md <<'EOF'\nTo apply: hermes gateway restart\nEOF\n",
++    "curl -s https://example.invalid/x > out.json; cat out.json\n",
++    "rev > F <<'R'\nanything\nR\n",
++    # Written and executed, but benign.
++    "cat > F <<'R'\necho hello\nR\nbash F\n",
++    "printf '%s\\n' 'echo hi' > F; bash F\n",
++    # A Python program is regex-scanned only and never fails closed, generated or not.
++    "python3 -c 'print(1)' > gen.py; python3 gen.py\n",
++    # `bash <> F` reads F as its program; it is not a write.
++    "printf 'echo hi\\n' > F; bash <> F\n",
++])
++def test_inert_or_benign_generated_files_are_allowed(tmp_path, command):
++    unsafe, reason = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert not unsafe, reason
+-- 
+2.43.0
+

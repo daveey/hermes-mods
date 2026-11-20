@@ -1,0 +1,477 @@
+From 052f25fd8500d3eb08cc297d7c5f21282bdaede7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 18:27:59 +0000
+Subject: [PATCH] fix(kanban): distinguish revoked capture authority and prove
+ worker boot [daveey]
+
+---
+ hermes_cli/kanban_fairness_activation.py      |  39 ++++-
+ hermes_cli/kanban_fairness_runtime.py         |   2 +-
+ .../test_kanban_fairness_activation.py        |  46 +++++
+ .../test_kanban_fairness_gateway_process.py   | 146 ++++++++++++++++
+ .../test_kanban_fairness_process.py           | 157 ++++++++++++++++++
+ 5 files changed, 381 insertions(+), 9 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_fairness_gateway_process.py
+ create mode 100644 tests/hermes_cli/test_kanban_fairness_process.py
+
+diff --git a/hermes_cli/kanban_fairness_activation.py b/hermes_cli/kanban_fairness_activation.py
+index e046ecacdc84d34b6a28e13db9bc3a3d29683e81..08aaa4e8f8f259fba5320c403b268e3d198dc5c6 100644
+--- a/hermes_cli/kanban_fairness_activation.py
++++ b/hermes_cli/kanban_fairness_activation.py
+@@ -10,6 +10,7 @@ import logging
+ import os
+ from pathlib import Path
+ import re
++import stat
+ import threading
+ 
+ from hermes_cli.kanban_fairness_config import resolve
+@@ -43,9 +44,11 @@ def _validate(value, settings, home):
+ 
+ 
+ def _read(path):
+-    if path.is_symlink():
+-        raise ValueError("runtime descriptor must not be a symlink")
+-    with path.open("rb") as stream:
++    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
++    with os.fdopen(fd, "rb") as stream:
++        info = os.fstat(stream.fileno())
++        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_DESCRIPTOR:
++            raise ValueError("runtime descriptor must be a bounded regular file")
+         raw = stream.read(MAX_DESCRIPTOR + 1)
+     if len(raw) > MAX_DESCRIPTOR:
+         raise ValueError("runtime descriptor exceeds bound")
+@@ -103,13 +106,25 @@ def disarm(config, *, home, directory=None):
+             os.replace(path, root / DISARMED)
+ 
+ 
+-def _monitor(session, path, expected):
+-    while not session.stopping.wait(0.5):
++def _authority(path, expected):
++    """Only an exact retained descriptor proves intentional operator revocation."""
++    try:
++        return "armed" if _read(path) == expected else "lost"
++    except FileNotFoundError:
+         try:
+-            unchanged = _read(path) == expected
++            return "disarmed" if _read(path.parent / DISARMED) == expected else "lost"
+         except (OSError, ValueError):
+-            unchanged = False
+-        if not unchanged:
++            return "lost"
++    except (OSError, ValueError):
++        return "lost"
++
++
++def _monitor(session, path, expected):
++    while not session.stopping.wait(0.5):
++        state = _authority(path, expected)
++        if state != "armed":
++            if state == "lost":
++                session.abandoned.set()
+             session.close()
+             return
+ 
+@@ -135,6 +150,14 @@ def start(config, *, home):
+         session = runtime.activate(config, home=home, board=value["board"],
+                                    source_gateway=value["source_gateway"], board_uid=value["board_uid"],
+                                    clock_error_ns=value["clock_error_ns"])
++        path = settings.directory / NAME
++        session.authority_valid = lambda: _authority(path, raw) != "lost"
++        state = _authority(path, raw)
++        if state != "armed":
++            if state == "lost":
++                session.abandoned.set()
++            session.close()
++            return None
+         from agent.memory_provider import spawn_context_thread
+ 
+         session.activation_monitor = spawn_context_thread(
+diff --git a/hermes_cli/kanban_fairness_runtime.py b/hermes_cli/kanban_fairness_runtime.py
+index ceddda91fa968f2b80a391745b7703cf4c1b0b36..34d805cf9f015140031c6bb28a2d386aa4d30226 100644
+--- a/hermes_cli/kanban_fairness_runtime.py
++++ b/hermes_cli/kanban_fairness_runtime.py
+@@ -298,7 +298,7 @@ class Session:
+ 
+                 self.ready.set()
+                 self.decision.wait()
+-                if self.approved:
++                if self.approved and getattr(self, "authority_valid", lambda: True)():
+                     close_epoch(self.out, self.identity, manifest, self.deadline_ns, self.completed_ns)
+                     self.sealed = True
+         except (OSError, ValueError, TypeError, RuntimeError):
+diff --git a/tests/hermes_cli/test_kanban_fairness_activation.py b/tests/hermes_cli/test_kanban_fairness_activation.py
+index 77f165e799273f7306f88f5ee8760d4fb7f52dc2..e5feb1e869f20aca34897dbde980fe2ef88304af 100644
+--- a/tests/hermes_cli/test_kanban_fairness_activation.py
++++ b/tests/hermes_cli/test_kanban_fairness_activation.py
+@@ -130,6 +130,52 @@ def test_disarm_does_not_require_enabled_config(tmp_path):
+     assert not (tmp_path / "capture" / activation.NAME).exists()
+ 
+ 
++@pytest.mark.parametrize("change", ["missing", "modified", "false_disarm"])
++def test_authority_loss_cannot_publish_clean_tail(tmp_path, monkeypatch, change):
++    from hermes_cli import kanban_fairness_activation as activation
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    cfg = config(tmp_path)
++    activation.arm(cfg, home=tmp_path, board="default", source_gateway="gw", board_uid="board")
++    session = activation.start(cfg, home=tmp_path)
++    try:
++        read_owners(board="default", now_s=150, path=tmp_path / "missing")
++        descriptor = tmp_path / "capture" / activation.NAME
++        if change == "modified":
++            descriptor.write_bytes(b"{}")
++        else:
++            descriptor.unlink()
++            if change == "false_disarm":
++                (descriptor.parent / activation.DISARMED).write_bytes(b"{}")
++        session.activation_monitor.join(4)
++        session.thread.join(2)
++        assert not session.activation_monitor.is_alive()
++        assert session.abandoned.is_set()
++        assert not (session.out / "runtime-close.json").exists()
++        assert load(session.out)["gaps"]
++    finally:
++        session.close()
++
++
++def test_revocation_during_startup_never_returns_active_epoch(tmp_path, monkeypatch):
++    from hermes_cli import kanban_fairness_activation as activation
++    cfg = config(tmp_path)
++    activation.arm(cfg, home=tmp_path, board="default", source_gateway="gw", board_uid="board")
++    original = runtime.activate
++    sessions = []
++    def revoked(*args, **kwargs):
++        activation.disarm(cfg, home=tmp_path)
++        result = original(*args, **kwargs)
++        sessions.append(result)
++        return result
++    monkeypatch.setattr(runtime, "activate", revoked)
++    try:
++        assert activation.start(cfg, home=tmp_path) is None
++        assert sessions[0].stopping.is_set()
++    finally:
++        for session in sessions:
++            session.close()
++
++
+ def test_real_cli_disarm_after_reset(tmp_path, monkeypatch):
+     import os
+     from pathlib import Path
+diff --git a/tests/hermes_cli/test_kanban_fairness_gateway_process.py b/tests/hermes_cli/test_kanban_fairness_gateway_process.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e03d7ea03d6f46384bc10095e4826b37e35a93f2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_fairness_gateway_process.py
+@@ -0,0 +1,146 @@
++"""Fresh-process gateway fairness boot follows process-service home, not inherited profile context."""
++import json
++import os
++from pathlib import Path
++import subprocess
++import sys
++import textwrap
++
++ROOT = Path(__file__).resolve().parents[2]
++CHILD = textwrap.dedent(
++    """\
++    import asyncio
++    import json
++    import os
++    from pathlib import Path
++    from types import SimpleNamespace
++    from unittest.mock import patch
++
++    root = Path(os.environ["PROCESS_HOME"])
++    other = Path(os.environ["OTHER_HOME"])
++    from hermes_constants import get_hermes_home, get_hermes_home_override, set_hermes_home_override
++    set_hermes_home_override(str(other))
++    assert get_hermes_home_override() == str(other)
++    assert get_hermes_home() == other
++
++    seen = {}
++
++    def observe():
++        from hermes_cli import kanban_fairness_runtime as runtime
++        from hermes_cli.kanban_turn_urgency import read_owners
++        from hermes_constants import get_hermes_home, get_hermes_home_override
++        sessions = list(runtime._SESSIONS.values())
++        seen.update(
++            override=get_hermes_home_override(),
++            home=str(get_hermes_home()),
++            enabled=runtime.enabled(board="default"),
++            keys=[list(key) for key in runtime._SESSIONS],
++            identities=[dict(session.identity) for session in sessions],
++            owners=sorted(read_owners(board="default", now_s=150, path=root / "missing")),
++        )
++
++    class FakeDispatcher:
++        def __init__(self, kb, settings):
++            self.successful_scopes = ()
++
++        def tick_once(self, *, suppress_spawn=False):
++            observe()
++            return []
++
++        def ready_nonempty(self):
++            return False
++
++        def auto_decompose_tick(self, per_tick):
++            return 0
++
++    async def no_sleep(delay):
++        return None
++
++    async def main():
++        from gateway import kanban_watchers as watchers
++        runner = watchers.GatewayKanbanWatchersMixin()
++        runner._running = True
++
++        async def stop(interval):
++            runner._running = False
++
++        runner._sleep_until_tick_or_sync_wake = stop
++        lease = SimpleNamespace(should_yield=lambda: False, handle=None, release=lambda: None)
++        settings = SimpleNamespace(interval=1.0)
++        patches = [
++            patch.object(watchers.asyncio, "sleep", no_sleep),
++            patch.object(watchers, "_KanbanDispatcher", FakeDispatcher),
++            patch("hermes_cli.kanban_db_dispatch.reap_worker_zombies", lambda: []),
++            patch("hermes_cli.kanban_hub_cpu_alert.check", lambda: None),
++            patch("hermes_cli.kanban_sync_outbox_age.check", lambda: None),
++            patch("agent.estop.check_paused", lambda *a, **k: False),
++            patch("agent.core_update_drain.check_drain_hold", lambda *a, **k: False),
++        ]
++        for item in patches:
++            item.start()
++        try:
++            await runner._kanban_dispatch_while_held(
++                settings, lambda: {"kanban": {"auto_decompose": False}}, None, lease)
++        finally:
++            for item in reversed(patches):
++                item.stop()
++        Path(os.environ["RECEIPT"]).write_text(json.dumps({
++            **seen,
++            "caller_override": get_hermes_home_override(),
++            "caller_home": str(get_hermes_home()),
++        }))
++
++    asyncio.run(main())
++    """
++)
++
++
++def _config(home, capture_id):
++    return {"kanban": {"fairness_capture": {
++        "enabled": True, "capture_id": capture_id, "directory": str(home / "capture")}}}
++
++
++def test_dispatch_while_held_boots_process_home_not_inherited_profile(tmp_path):
++    from hermes_cli import kanban_fairness_activation as activation
++    from hermes_cli.kanban_fairness_store import load
++    from tests.gateway.fixtures.local_recovery_probe import child_env
++
++    root, other = tmp_path / "root", tmp_path / "other"
++    (tmp_path / "user").mkdir()
++    for home, capture_id, gateway, board_uid in (
++            (root, "root-cap", "root-gw", "root-board"),
++            (other, "other-cap", "other-gw", "other-board")):
++        home.mkdir()
++        cfg = _config(home, capture_id)
++        (home / "config.yaml").write_text(json.dumps(cfg), encoding="utf-8")
++        activation.arm(cfg, home=home, board="default", source_gateway=gateway, board_uid=board_uid)
++
++    receipt = tmp_path / "receipt.json"
++    env = child_env()
++    env.update({k: os.environ[k] for k in ("TIRITH_ENABLED",) if k in os.environ})
++    env.update(HOME=str(tmp_path / "user"), USERPROFILE=str(tmp_path / "user"),
++               HERMES_HOME=str(root), PYTHONPATH=str(ROOT), PROCESS_HOME=str(root),
++               OTHER_HOME=str(other), RECEIPT=str(receipt), HERMES_TEST_ISOLATION=str(root),
++               HERMES_DISABLE_LAZY_INSTALLS="1", PYTHONDONTWRITEBYTECODE="1")
++    result = subprocess.run(
++        [sys.executable, "-c", CHILD], cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
++        capture_output=True, text=True, timeout=90, check=False)
++    assert result.returncode == 0, result.stdout + result.stderr
++    seen = json.loads(receipt.read_text())
++    assert seen["override"] is None
++    assert seen["home"] == str(root)
++    assert seen["enabled"] is True
++    assert seen["owners"] == []
++    assert len(seen["identities"]) == 1
++    identity = seen["identities"][0]
++    assert identity["capture_id"] == "root-cap"
++    assert identity["source_gateway"] == "root-gw"
++    assert identity["board_uid"] == "root-board"
++    assert identity["clock_error_ns"] is None
++    assert [key[1] for key in seen["keys"]] == [str(root)]
++    assert seen["caller_override"] == str(other)
++    assert seen["caller_home"] == str(other)
++    epochs = list((root / "capture" / "runtime").iterdir())
++    assert len(epochs) == 1
++    assert load(epochs[0])["records"][0]["payload"]["outcome"] == "missing"
++    assert not (other / "capture" / "runtime").exists()
+diff --git a/tests/hermes_cli/test_kanban_fairness_process.py b/tests/hermes_cli/test_kanban_fairness_process.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..877ea15e3d03d9e74bda8a541903bf183e151dbc
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_fairness_process.py
+@@ -0,0 +1,157 @@
++"""Fresh-interpreter managed-worker capture startup, without providers or sockets.
++
++The ownership transport/store and agent are fixtures; main/execute, policy binding,
++profile config hydration, activation and urgency reader/journal are production code.
++"""
++import json
++import os
++from pathlib import Path
++import subprocess
++import sys
++from dataclasses import asdict, replace
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli.kanban_fairness_store import load
++
++
++CHILD = r'''
++import hermes_bootstrap
++import json, os, sys, types
++from pathlib import Path
++
++def module(name, **items):
++    m = types.ModuleType(name)
++    m.__dict__.update(items)
++    sys.modules[name] = m
++    return m
++
++class RPC:
++    def __init__(self, home): pass
++    def __call__(self, method, **kw):
++        assert method == 'worker.adopt'
++        return {'owner_epoch': 1}
++    def close(self): pass
++class Store:
++    def __init__(self, *a): pass
++    def get_messages_as_conversation(self, sid): return []
++    def flush_token_counts(self): pass
++    def finish(self): pass
++    def close(self): pass
++module('agent.runtime_session_store', RuntimeSessionStore=Store, WorkerRPC=RPC)
++module('gateway.session_kanban', bind_worker_context=lambda f: None,
++       run_worker_turns=lambda a, f, h: a.run_conversation(),
++       record_worker_failure=lambda *a: None)
++module('agent.origin_managed_custody', bind_adopted_agent=lambda *a, **k: None)
++module('tools.process_registry', process_registry=types.SimpleNamespace(recover_from_checkpoint=lambda **k: None))
++module('gateway.session_worker_construct', checkpoint_agent_kwargs=lambda c: {},
++       construct_kwargs=lambda f: {}, routing_agent_kwargs=lambda *a: {}, worker_route=lambda *a: {})
++module('agent.title_generator', wait_for_title_upgrades=lambda: None)
++
++class Agent:
++    def __init__(self, **kw):
++        from hermes_cli.config import load_config
++        from hermes_cli import kanban_fairness_runtime as runtime
++        from hermes_cli.kanban_turn_urgency import read_owners
++        cfg = load_config()
++        assert cfg['kanban']['max_running'] == 2
++        self.model, self.provider = 'fixture-model', 'custom'
++        home = Path(os.environ['HERMES_HOME'])
++        other = home.parent / 'other'
++        before = runtime._key('default', other) in runtime._SESSIONS
++        read_owners(board='default', now_s=150, path=home / 'missing-urgency')
++        from agent.safe_worker_policy import worker_config_snapshot
++        self.answer = json.dumps({'active': runtime.enabled(board='default'), 'other_active': before,
++                                  'config': worker_config_snapshot()['kanban'], 'pid': os.getpid()})
++    def run_conversation(self): return {'final_response': self.answer, 'completed': True}
++    def shutdown_memory_provider(self, messages): pass
++    def release_clients(self): pass
++import agent.managed_worker as worker
++worker.discover_profile_mcp = lambda policy: None
++bind = worker.bind_worker_policy
++def bind_then_install(frame):
++    bind(frame)
++    module('run_agent', AIAgent=Agent)
++    # Hook discovery is outside this startup contract; do not load user plugins.
++    import gateway.session_policy as policies
++    policies.register_worker_hooks = lambda policy: None
++worker.bind_worker_policy = bind_then_install
++raise SystemExit(worker.main())
++'''
++
++
++@pytest.mark.parametrize('mode', ['armed', 'unarmed', 'disabled', 'safe', 'ignore'])
++def test_managed_execute_capture_startup_and_profile_isolation(tmp_path, monkeypatch, mode):
++    from agent.managed_worker import encode_frame
++    from gateway.session_policy import LocalSessionPolicy
++    from gateway.session_managed_worker import _worker_config
++    from hermes_cli import kanban_fairness_activation as activation
++
++    home = tmp_path / 'owner'
++    home.mkdir()
++    other = tmp_path / 'other'
++    other.mkdir()
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    capture = {'enabled': mode != 'disabled', 'capture_id': 'process-fixture',
++               'directory': str(home / 'capture')}
++    live = {'kanban': {'fairness_capture': capture, 'max_running': 99}}
++    (home / 'config.yaml').write_text(json.dumps(live))
++    if mode in ('armed', 'safe', 'ignore'):
++        activation.arm(live, home=home, board='default', source_gateway='fixture-gateway', board_uid='fixture-board')
++    # A second profile really has a valid arm, not merely a missing directory.
++    other_cfg = {'kanban': {'fairness_capture': {**capture, 'enabled': True,
++                                              'directory': str(other / 'capture')}}}
++    activation.arm(other_cfg, home=other, board='default', source_gateway='other-gateway', board_uid='other-board')
++    (other / 'config.yaml').write_text(json.dumps(other_cfg))
++    bypass = mode in ('safe', 'ignore')
++    frozen = {'kanban': {'max_running': 2}}
++    policy = LocalSessionPolicy(source='cli', platform='cli', cwd=str(home), model='fixture-model',
++                                toolsets=(), config_json=json.dumps(frozen), request_json='{}',
++                                terminal_json=json.dumps({'TERMINAL_CWD': str(home)}),
++                                safe_mode=mode == 'safe', ignore_user_config=bypass)
++    hydrated = _worker_config(SimpleNamespace(profile_id=str(home)), policy)
++    assert hydrated['kanban']['max_running'] == 2
++    assert ('fairness_capture' in hydrated['kanban']) is not bypass
++    policy = replace(policy, config_json=json.dumps(hydrated))
++    # Mutate disk after owner hydration: the child must use its assigned snapshot.
++    (home / 'config.yaml').write_text(json.dumps({'kanban': {'max_running': 777}}))
++    root = Path(__file__).resolve().parents[2]
++    env = {k: os.environ[k] for k in ('PATH', 'LANG', 'TZ', 'TIRITH_ENABLED') if k in os.environ}
++    user = tmp_path / 'user'
++    user.mkdir()
++    env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONPATH=str(root))
++    # The script imports the real bootstrap before any runtime dependencies.
++    proc = subprocess.Popen([sys.executable, '-c', CHILD], cwd=root, env=env,
++                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++    try:
++        # communicate supplies the bounded bootstrap and finish without orphaning the controls reader.
++        frame = {'version': 1, 'home': str(home), 'scope': {
++            'profile_id': str(home), 'session_id': 'fixture-session', 'execution_id': 'fixture-execution',
++            'generation': 1, 'pid': proc.pid, 'birth': 'fixture-birth', 'secret': 'fixture-secret',
++            'epoch': 1}, 'policy': asdict(policy), 'api_key': None,
++            'text': 'fixture', 'route': 'fixture-route', 'user_id': 'fixture-user', 'chat_id': 'fixture-chat',
++            'turn_author': None, 'safe_mode': mode == 'safe', 'ignore_user_config': bypass}
++        out, err = proc.communicate(encode_frame(frame) + encode_frame({'type': 'finish'}), timeout=30)
++    finally:
++        if proc.poll() is None:
++            proc.kill()
++            proc.communicate(timeout=5)
++    assert proc.returncode == 0, err.decode()
++    frames = [json.loads(line) for line in out.splitlines()]
++    assert [f['type'] for f in frames] == ['hello', 'ready', 'result', 'finished'], (frames, err.decode())
++    answer = json.loads(frames[2]['result']['final_response'])
++    assert answer['pid'] == proc.pid
++    assert answer['active'] is (mode == 'armed')
++    assert answer['other_active'] is False
++    assert answer['config'] == hydrated['kanban']
++    assert not (other / 'capture' / 'runtime').exists()
++    epochs = list((home / 'capture' / 'runtime').iterdir()) if (home / 'capture' / 'runtime').exists() else []
++    assert len(epochs) == (1 if mode == 'armed' else 0)
++    if epochs:
++        records = load(epochs[0])['records']
++        receipts = [r for r in records if r['kind'] == 'owner_generation']
++        assert len(receipts) == 1, records
++        assert receipts[0]['payload']['outcome'] == 'missing'
++        assert receipts[0]['source_gateway'] == 'fixture-gateway'
++        assert receipts[0]['board_uid'] == 'fixture-board'
+-- 
+2.43.0
+

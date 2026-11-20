@@ -1,0 +1,1176 @@
+From 2f0663b599f609d887c255d2bda62db78bed44e1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 20:28:16 -0800
+Subject: [PATCH] fix(desktop): page the Archived view instead of reading the
+ whole archive
+
+The Archived sidebar view and Settings > Archived sessions read every
+archived row before listing any. On 2026-11-17 the three connected
+gateways held 16,899 archived rows (15,432 of them auto-archived bot runs
+in the mini's bb-* profiles), which is 34 pages of 500. The Electron
+merge re-reads the prefix for each page, so pages took 12 s, 12 s, 16 s,
+35 s and rising; the load never finished and the view stayed on "No
+sessions match these filters" with no sign it was loading.
+
+Why it was not caught: every loader test used an archive of at most
+three pages, and the only state the sidebar drew for a running load was
+the filtered-empty text.
+
+- sidebar-archive: createArchivedPager() reads one page per next(), with
+  the same dedupe and stop rule as before. loadArchivedSessions() reads
+  the first page and publishes it; loadMoreArchivedSessions() adds one
+  page; a refresh re-reads as many pages as the user loaded. A load-more
+  asked for during a refresh is read by that refresh. When the list was
+  edited in place (archive, unarchive, delete) the next load-more reads
+  again from the top, because the server offsets have shifted.
+- sidebar: Archived gets the load-more row (one page per click, also
+  under project grouping, not disabled by a background refresh) and
+  skeletons only while it holds no row at all.
+- settings: the archived list shows the first page and a Load more
+  button, re-reads from the top after an unarchive or delete, and no
+  longer lists live pins the server back-fills onto an archived page.
+
+Tests: sidebar-archive.test.ts (first page of a 16,899-row archive is
+published after one request; load-more, refresh, failure, scope switch
+and round trip, edit before and during a load-more, load-more during a
+refresh), chat-sidebar.integration.test.tsx (rows + load-more row under
+project grouping, one page per click, no filtered-empty text while
+loading), sessions-settings.test.tsx (first page, Load more, re-read
+after unarchive, no live pins).
+
+Not changed and not tested here: each deeper page still costs more in
+the Electron merge (it re-reads the prefix), bot rows still share the
+pages with the user's own chats, a refresh that arrives while a load is
+running is still dropped, and the settings list does not follow a
+connection switch while it is open.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .../electron/profile-session-routing.test.ts  |   2 +-
+ .../src/app/chat/sidebar/archived-view.ts     |  54 ++++
+ .../sidebar/chat-sidebar.integration.test.tsx |  94 ++++++-
+ apps/desktop/src/app/chat/sidebar/index.tsx   |  37 ++-
+ .../app/settings/sessions-settings.test.tsx   |  85 +++++-
+ .../src/app/settings/sessions-settings.tsx    |  98 +++++--
+ .../desktop/src/store/sidebar-archive.test.ts | 247 +++++++++++++++++-
+ apps/desktop/src/store/sidebar-archive.ts     | 181 +++++++++++--
+ 8 files changed, 723 insertions(+), 75 deletions(-)
+ create mode 100644 apps/desktop/src/app/chat/sidebar/archived-view.ts
+
+diff --git a/apps/desktop/electron/profile-session-routing.test.ts b/apps/desktop/electron/profile-session-routing.test.ts
+index 79c57bf761aa9fa225aec812f7bab224bddb13c2..82549f1f303fe97f8180aeb4c916f0a9a33f62d9 100644
+--- a/apps/desktop/electron/profile-session-routing.test.ts
++++ b/apps/desktop/electron/profile-session-routing.test.ts
+@@ -824,7 +824,7 @@ test('archived merged pages reach every archived row from older and current back
+ 
+ test('a full page of newer live pins does not hide an older archived row from the Archived loader', async () => {
+   // Greptile/@dokterdok on #140972: run the renderer loader's own stop rule
+-  // (sidebar-archive.ts listEveryArchivedSession) over the merge path, with
++  // (sidebar-archive.ts createArchivedPager) over the merge path, with
+   // enough live pins to fill a page, on both backend orderings.
+   const archived = [{ id: 'old', profile: 'default', archived: true, pinned: false, last_active: 1 }]
+ 
+diff --git a/apps/desktop/src/app/chat/sidebar/archived-view.ts b/apps/desktop/src/app/chat/sidebar/archived-view.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..55a2c23da4df6adabf637f863bfbb70fa75c5d49
+--- /dev/null
++++ b/apps/desktop/src/app/chat/sidebar/archived-view.ts
+@@ -0,0 +1,54 @@
++import { useStore } from '@nanostores/react'
++import { useCallback, useEffect, useState } from 'react'
++
++import {
++  $archivedSessions,
++  $archivedSessionsHasMore,
++  $archivedSessionsLoading,
++  loadArchivedSessions,
++  loadMoreArchivedSessions
++} from '@/store/sidebar-archive'
++
++/**
++ * The sidebar's Archived view: its own rows and its own paging.
++ *
++ * Archived rows are excluded from the sessions query, so the view fetches its
++ * own set (store/sidebar-archive): the first page when it opens, then one
++ * 500-row page per load-more click. One per click because each page costs
++ * more than the one before it, so a sparse page must not chain into the next.
++ */
++export function useArchivedView(active: boolean) {
++  const sessions = useStore($archivedSessions)
++  const hasMore = useStore($archivedSessionsHasMore)
++  const loading = useStore($archivedSessionsLoading)
++  const [loadingMore, setLoadingMore] = useState(false)
++
++  useEffect(() => {
++    if (active) {
++      void loadArchivedSessions()
++    }
++  }, [active])
++
++  const loadMore = useCallback(async () => {
++    setLoadingMore(true)
++
++    try {
++      await loadMoreArchivedSessions()
++    } finally {
++      setLoadingMore(false)
++    }
++  }, [])
++
++  return {
++    /** Skeletons only while the view holds no row at all: a page with nothing
++     *  for this profile is a loaded page and keeps its load-more row. */
++    firstLoad: loading && sessions.length === 0,
++    hasMore,
++    loadMore,
++    /** A click's own read, not a background refresh: that must not disable the row. */
++    loadingMore,
++    /** The Archived view's value while it is showing, the live list's otherwise. */
++    pick: <T>(archived: T, live: T): T => (active ? archived : live),
++    sessions
++  }
++}
+diff --git a/apps/desktop/src/app/chat/sidebar/chat-sidebar.integration.test.tsx b/apps/desktop/src/app/chat/sidebar/chat-sidebar.integration.test.tsx
+index 70635e8e9ea5ba3e9be268c531d6867089de2fe5..d81757b83c38adc7585d43d7ed8188471bba32a3 100644
+--- a/apps/desktop/src/app/chat/sidebar/chat-sidebar.integration.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/chat-sidebar.integration.test.tsx
+@@ -1,5 +1,5 @@
+ // @vitest-environment jsdom
+-import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
++import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+ import { MemoryRouter } from 'react-router'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+@@ -32,6 +32,7 @@ import {
+   $workspaceCwdOwner
+ } from '@/store/session'
+ import { $removedSessionIds } from '@/store/session-removal'
++import { $archivedSessions } from '@/store/sidebar-archive'
+ import { SIDEBAR_NAV_PREFS_AREA } from '@/store/sidebar-nav'
+ import { makeSessionInfo } from '@/test/session-info'
+ 
+@@ -41,6 +42,18 @@ import { $gatewayGroupCollapsed } from './gateway-group-preferences'
+ 
+ import { ChatSidebar } from './index'
+ 
++// The Archived view reads its own pages through this one call; everything else in the module stays real.
++const listAllProfileSessions = vi.hoisted(() => vi.fn())
++
++vi.mock('@/api/sessions', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  listAllProfileSessions
++}))
++
++beforeEach(() => {
++  listAllProfileSessions.mockReset().mockResolvedValue({ sessions: [], total: 0 })
++})
++
+ const noop = () => {}
+ 
+ const noopAsync = async () => {}
+@@ -291,13 +304,88 @@ describe('ChatSidebar pinned empty state under filters', () => {
+     expect(screen.getByText('Shift-click a chat to pin')).toBeTruthy()
+   })
+ 
+-  it('drops the pin hint in the Archived view when Pinned is empty', () => {
++  it('drops the pin hint in the Archived view when Pinned is empty', async () => {
+     $sidebarShowArchived.set(true)
+ 
+     renderSidebar('/', 'chat')
+ 
+     expect(screen.queryByText('Shift-click a chat to pin')).toBeNull()
+-    expect(screen.getAllByText('No sessions match these filters')).toHaveLength(2)
++    await waitFor(() => expect(screen.getAllByText('No sessions match these filters')).toHaveLength(2))
++  })
++})
++
++// 2026-11-17: with 16,899 archived rows the view read every page before listing any, and said
++// "No sessions match these filters" the whole time.
++describe('ChatSidebar Archived view paging', () => {
++  const archivedRow = (id: string, title: string) =>
++    makeSessionInfo({ archived: true, id, last_active: 2, profile: 'default', started_at: 1, title })
++
++  let previousShowAutomated: boolean
++
++  beforeEach(() => {
++    previousShowAutomated = $sidebarShowAutomated.get()
++    $sidebarShowAutomated.set(true)
++    $sidebarStatusFilter.set([])
++    $sidebarProjectFilter.set([])
++    $pinnedSessionIds.set([])
++    $sessions.set([])
++    $sessionsLoading.set(false)
++    $archivedSessions.set([])
++    $sidebarShowArchived.set(true)
++  })
++
++  afterEach(() => {
++    cleanup()
++    $sidebarShowAutomated.set(previousShowAutomated)
++    $sidebarShowArchived.set(false)
++    $archivedSessions.set([])
++    $sessionsLoading.set(true)
++    setSidebarAgentsGrouped(false)
++  })
++
++  it('lists the first page and reads the next one from the load-more row, whatever the grouping', async () => {
++    setSidebarAgentsGrouped(true)
++    listAllProfileSessions
++      .mockReset()
++      .mockResolvedValueOnce({ sessions: [archivedRow('old-one', 'Old one')], total: 16_899 })
++      .mockResolvedValueOnce({ sessions: [archivedRow('old-two', 'Old two')], total: 16_899 })
++
++    renderSidebar('/', 'chat')
++
++    expect(await screen.findByText('Old one')).toBeTruthy()
++    expect(listAllProfileSessions).toHaveBeenCalledTimes(1)
++
++    await act(async () => fireEvent.click(screen.getByRole('button', { name: 'Load more' })))
++
++    expect(await screen.findByText('Old two')).toBeTruthy()
++    expect(screen.getByText('Old one')).toBeTruthy()
++    // One page per click, even though it revealed a single row.
++    expect(listAllProfileSessions).toHaveBeenCalledTimes(2)
++    expect(listAllProfileSessions).toHaveBeenLastCalledWith(500, 0, 'only', 'recent', 'all', {}, 500)
++  })
++
++  it('offers no load-more row once the archive is fully listed', async () => {
++    listAllProfileSessions.mockReset().mockResolvedValue({ sessions: [archivedRow('old-one', 'Old one')], total: 1 })
++
++    renderSidebar('/', 'chat')
++
++    await screen.findByText('Old one')
++
++    expect(screen.queryByRole('button', { name: 'Load more' })).toBeNull()
++  })
++
++  it('does not call an archive that is still loading empty', async () => {
++    let finish!: (page: unknown) => void
++    listAllProfileSessions.mockReset().mockImplementation(() => new Promise(resolve => (finish = resolve)))
++
++    renderSidebar('/', 'chat')
++
++    // Pinned has nothing to load, so it alone states its empty filter result.
++    expect(screen.getAllByText('No sessions match these filters')).toHaveLength(1)
++
++    await act(async () => finish({ sessions: [], total: 0 }))
++
++    await waitFor(() => expect(screen.getAllByText('No sessions match these filters')).toHaveLength(2))
+   })
+ })
+ 
+diff --git a/apps/desktop/src/app/chat/sidebar/index.tsx b/apps/desktop/src/app/chat/sidebar/index.tsx
+index 322930bba905ea45ff82e4d7f428c547108d0665..4fab42ff383db2ac806304b153102a862c38a1ff 100644
+--- a/apps/desktop/src/app/chat/sidebar/index.tsx
++++ b/apps/desktop/src/app/chat/sidebar/index.tsx
+@@ -136,7 +136,6 @@ import { $removedSessionIds } from '@/store/session-removal'
+ import { $workingSessionIds } from '@/store/session-states'
+ import { ackAllSessionsRead } from '@/store/session-unread'
+ import { markSessionUnread } from '@/store/session-unread-remote'
+-import { $archivedSessions, loadArchivedSessions } from '@/store/sidebar-archive'
+ import { sessionHiddenAsAutomated } from '@/store/sidebar-automated'
+ import { $sidebarSessionRank, $sidebarSessionRankIds } from '@/store/sidebar-sort'
+ 
+@@ -144,6 +143,7 @@ import { type AppView } from '../../routes'
+ import type { SidebarNavItem } from '../../types'
+ import { type NewSessionSplitHandler, startNewSessionDrag } from '../new-session-drag'
+ 
++import { useArchivedView } from './archived-view'
+ import { SidebarSectionAddButton } from './chrome'
+ import { SidebarContributedSections } from './contributed-sections'
+ import { SidebarCronJobsSection } from './cron-jobs-section'
+@@ -298,7 +298,8 @@ export function ChatSidebar({
+   const showArchived = useStore($sidebarShowArchived)
+   const showAutomated = useStore($sidebarShowAutomated)
+   const cardRows = useStore($sidebarCardRows)
+-  const archivedSessions = useStore($archivedSessions)
++  const archive = useArchivedView(showArchived)
++  const archivedSessions = archive.sessions
+   const dotStates = useStore($sessionDotStateById)
+   // The active sort key as an id order. The flat list applies it within its
+   // dividers; groups apply it to their own lanes.
+@@ -1279,13 +1280,14 @@ export function ChatSidebar({
+   // rather than an exact count, so no COUNT(*) runs per refresh.
+   const loadedSessionCount = showAllProfiles ? sessions.length : scopedSessions.length
+ 
+-  // The archived view is its own (single, capped) query — paging the live
+-  // sessions list from under it would just fold un-archived rows back in.
+-  const hasMoreSessions =
+-    !showArchived &&
+-    (showAllProfiles
++  // The archived view pages its own cursor — paging the live sessions list
++  // from under it would just fold un-archived rows back in.
++  const hasMoreSessions = archive.pick(
++    archive.hasMore,
++    showAllProfiles
+       ? Object.values(sessionProfilesTruncated).some(Boolean)
+-      : Boolean(sessionProfilesTruncated[profileScope]))
++      : Boolean(sessionProfilesTruncated[profileScope])
++  )
+ 
+   const displayRecentsCountRef = useRef(0)
+   const loadedRecentsCountRef = useRef(0)
+@@ -1330,14 +1332,6 @@ export function ChatSidebar({
+     }
+   }, [onLoadMoreSessions, recentsLoadMorePending])
+ 
+-  // Archived rows are excluded from the sessions query, so the view has to
+-  // fetch its own set.
+-  useEffect(() => {
+-    if (showArchived) {
+-      void loadArchivedSessions()
+-    }
+-  }, [showArchived])
+-
+   // Ranking by size is a question about the whole list ("what did I burn money
+   // on"), so it drops the calendar dividers and ranks globally — "Today" above
+   // the priciest session you have ever had would be a lie. Time- and
+@@ -1401,7 +1395,7 @@ export function ChatSidebar({
+   // Skeletons mean "still loading", so they key off the UNFILTERED set. Keyed
+   // off the filtered one, a filter that matches nothing showed skeletons on
+   // every background refresh instead of the empty state.
+-  const showSessionSkeletons = sessionsLoading && scopedSessions.length === 0
++  const showSessionSkeletons = archive.pick(archive.firstLoad, sessionsLoading && scopedSessions.length === 0)
+ 
+   // [daveey] Cold-start timing: when this launch's sidebar first drew rows, and whether they were live or the boot
+   // snapshot (hub.db rows / last projects tree) painted before the backend was up.
+@@ -1753,11 +1747,12 @@ export function ChatSidebar({
+                 footer={
+                   // Hidden only when workspace-grouped — those groups page
+                   // themselves. Profile groups don't: this one footer fetches the
+-                  // next page, which grows every profile at once.
+-                  !agentsGrouped && !showSessionSkeletons && hasMoreSessions ? (
++                  // next page, which grows every profile at once. Archived is
++                  // flat whatever the grouping, so it always pages here.
++                  archive.pick(true, !agentsGrouped) && !showSessionSkeletons && hasMoreSessions ? (
+                     <SidebarLoadMoreRow
+-                      loading={sessionsLoading || recentsLoadMorePending}
+-                      onClick={() => void onLoadMoreRecents()}
++                      loading={archive.pick(archive.loadingMore, sessionsLoading || recentsLoadMorePending)}
++                      onClick={() => void archive.pick(archive.loadMore, onLoadMoreRecents)()}
+                       // Recents are post-filtered to non-project sessions, so a
+                       // backend page size (50) is not a truthful "rows you'll
+                       // see" count. Use the generic label instead of a fake N.
+diff --git a/apps/desktop/src/app/settings/sessions-settings.test.tsx b/apps/desktop/src/app/settings/sessions-settings.test.tsx
+index e2a2781cac4eda3c0ba97f6b3dbbd040d6a46a9b..67b0f7db61e1232e01fa9db250f41b0ac1b35858 100644
+--- a/apps/desktop/src/app/settings/sessions-settings.test.tsx
++++ b/apps/desktop/src/app/settings/sessions-settings.test.tsx
+@@ -17,13 +17,13 @@ vi.mock('@/hermes', async importOriginal => ({
+   setSessionArchived: vi.fn().mockResolvedValue(undefined)
+ }))
+ 
+-// The settings page loads its archived list through the paginating store helper,
++// The settings page reads its archived list through the store's page cursor,
+ // which reads the sessions API module directly — mock that seam, not the barrel.
+-const listEveryArchivedSession = vi.hoisted(() => vi.fn())
++const listAllProfileSessions = vi.hoisted(() => vi.fn())
+ 
+-vi.mock('@/store/sidebar-archive', async importOriginal => ({
++vi.mock('@/api/sessions', async importOriginal => ({
+   ...(await importOriginal<Record<string, unknown>>()),
+-  listEveryArchivedSession
++  listAllProfileSessions
+ }))
+ 
+ const selectDesktopPaths = vi.hoisted(() => vi.fn())
+@@ -53,7 +53,7 @@ const archivedMatrixSession = {
+ beforeEach(() => {
+   setSessions([])
+   setMessagingSessions([])
+-  listEveryArchivedSession.mockReset().mockResolvedValue([archivedMatrixSession])
++  listAllProfileSessions.mockReset().mockResolvedValue({ sessions: [archivedMatrixSession], total: 1 })
+ })
+ 
+ afterEach(() => {
+@@ -74,6 +74,81 @@ describe('SessionsSettings unarchive', () => {
+   })
+ })
+ 
++describe('SessionsSettings archived list paging', () => {
++  const archived = (id: string): SessionInfo => ({ ...archivedMatrixSession, id, title: `chat ${id}` })
++
++  // 2026-11-17: an archive of 16,899 rows was read to the end before any row was listed.
++  it('lists the first page of a deep archive and reads the next on request', async () => {
++    listAllProfileSessions
++      .mockReset()
++      .mockResolvedValueOnce({ sessions: [archived('a')], total: 16_899 })
++      .mockResolvedValueOnce({ sessions: [archived('b')], total: 16_899 })
++
++    render(<SessionsSettings />)
++
++    expect(await screen.findByText('chat a')).toBeTruthy()
++    expect(listAllProfileSessions).toHaveBeenCalledTimes(1)
++
++    await act(async () => fireEvent.click(screen.getByRole('button', { name: en.sidebar.loadMore })))
++
++    expect(await screen.findByText('chat b')).toBeTruthy()
++    expect(screen.getByText('chat a')).toBeTruthy()
++    expect(listAllProfileSessions).toHaveBeenCalledTimes(2)
++  })
++
++  it('reads again from the top after an unarchive, so the row that moved up is not skipped', async () => {
++    const server = [archived('a'), archived('b'), archived('c')]
++
++    // A one-row "page": the mock serves the row at the asked offset.
++    listAllProfileSessions.mockReset().mockImplementation(async (...args: unknown[]) => ({
++      sessions: server.slice((args[6] as number) / 500, (args[6] as number) / 500 + 1),
++      total: server.length
++    }))
++    vi.mocked(setSessionArchived).mockImplementation(async id => {
++      server.splice(
++        server.findIndex(row => row.id === id),
++        1
++      )
++
++      return { ok: true }
++    })
++
++    render(<SessionsSettings />)
++    await screen.findByText('chat a')
++
++    await act(async () => fireEvent.click(screen.getByRole('button', { name: en.settings.sessions.unarchive })))
++    await waitFor(() => expect(screen.queryByText('chat a')).toBeNull())
++
++    await act(async () => fireEvent.click(screen.getByRole('button', { name: en.sidebar.loadMore })))
++
++    // b moved to offset 0; the old cursor's next page (offset 500) would show only c.
++    expect(await screen.findByText('chat b')).toBeTruthy()
++    expect(screen.getByText('chat c')).toBeTruthy()
++    expect(screen.queryByText('chat a')).toBeNull()
++  })
++
++  it('offers no load-more when the first page is the whole archive', async () => {
++    render(<SessionsSettings />)
++
++    await screen.findByText('archived room')
++
++    expect(screen.queryByRole('button', { name: en.sidebar.loadMore })).toBeNull()
++  })
++
++  it('leaves out a live pinned chat the server back-filled onto the page', async () => {
++    listAllProfileSessions.mockReset().mockResolvedValue({
++      sessions: [archived('a'), { ...archived('pin'), archived: false, pinned: true }],
++      total: 1
++    })
++
++    render(<SessionsSettings />)
++
++    await screen.findByText('chat a')
++
++    expect(screen.queryByText('chat pin')).toBeNull()
++  })
++})
++
+ describe('SessionsSettings default directory in a browser tab', () => {
+   afterEach(() => {
+     delete document.documentElement.dataset.hermesDesktopHost
+diff --git a/apps/desktop/src/app/settings/sessions-settings.tsx b/apps/desktop/src/app/settings/sessions-settings.tsx
+index b302129e10fe6c7fa76bf782912e1279d8d7d829..516249ac11a4f4317fde1d1b294b0b27d4321834 100644
+--- a/apps/desktop/src/app/settings/sessions-settings.tsx
++++ b/apps/desktop/src/app/settings/sessions-settings.tsx
+@@ -28,7 +28,7 @@ import { notify, notifyError } from '@/store/notifications'
+ import { $connection, applyConfiguredDefaultProjectDir, ensureDefaultWorkspaceCwd } from '@/store/session'
+ import { untombstoneSessions } from '@/store/session-removal'
+ import { forgetSessionUnread } from '@/store/session-unread'
+-import { listEveryArchivedSession } from '@/store/sidebar-archive'
++import { type ArchivedPager, createArchivedPager } from '@/store/sidebar-archive'
+ import type { HermesConfigRecord, SessionInfo } from '@/types/hermes'
+ 
+ import { EmptyState, ListRow, SectionHeading, SettingsContent, SettingsSkeleton, ToggleRow } from './primitives'
+@@ -69,23 +69,72 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
+   const s = t.settings.sessions
+   const [sessions, setLocalSessions] = useState<SessionInfo[]>([])
+   const [loading, setLoading] = useState(true)
++  const [loadingMore, setLoadingMore] = useState(false)
++  const [hasMore, setHasMore] = useState(false)
+   const [busyId, setBusyId] = useState<string | null>(null)
+ 
+-  const load = useCallback(async () => {
+-    setLoading(true)
++  // One page at a time: an archive can hold far more rows than a page can
++  // usefully list, and reading all of it first shows nothing until the end.
++  // `removed` holds rows unarchived or deleted here, so a page read while the
++  // server still lists them cannot bring them back.
++  const [paging] = useState(() => ({
++    cursor: null as ArchivedPager | null,
++    pages: 0,
++    removed: new Set<string>(),
++    removedAtStart: 0,
++    started: false
++  }))
++
++  const readPages = useCallback(
++    async (more: number) => {
++      const target = paging.pages + more
++      // A removal shifts every later row up one offset, so the old cursor's
++      // next page would skip a row per removal: read again from the top.
++      const stale = paging.removed.size !== paging.removedAtStart
++      const removedAtStart = paging.removed.size
++      const pager = paging.cursor && !stale ? paging.cursor : createArchivedPager()
++      let pages = pager === paging.cursor ? paging.pages : 0
+ 
+-    try {
+-      setLocalSessions(await listEveryArchivedSession())
+-    } catch (err) {
+-      notifyError(err, s.failedLoad)
+-    } finally {
+-      setLoading(false)
+-    }
+-  }, [s.failedLoad])
++      try {
++        while (pages < target && pager.hasMore) {
++          await pager.next()
++          pages += 1
++        }
++
++        if (pager !== paging.cursor) {
++          paging.removedAtStart = removedAtStart
++        }
++
++        paging.cursor = pager
++        paging.pages = pages
++        // The cursor back-fills live pins onto an archived page; this list is archived rows only.
++        setLocalSessions(pager.sessions.filter(row => row.archived && !paging.removed.has(row.id)))
++        setHasMore(pager.hasMore)
++      } catch (err) {
++        notifyError(err, s.failedLoad)
++      }
++    },
++    [paging, s.failedLoad]
++  )
+ 
+   useEffect(() => {
+-    void load()
+-  }, [load])
++    // Only the first page loads on its own; a re-run (strict mode, a language
++    // switch) must not page further.
++    if (!paging.started) {
++      paging.started = true
++      void readPages(1).finally(() => setLoading(false))
++    }
++  }, [paging, readPages])
++
++  const loadMore = useCallback(async () => {
++    if (loadingMore) {
++      return
++    }
++
++    setLoadingMore(true)
++    await readPages(1)
++    setLoadingMore(false)
++  }, [loadingMore, readPages])
+ 
+   const unarchive = useCallback(
+     async (session: SessionInfo) => {
+@@ -93,6 +142,7 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
+ 
+       try {
+         await setSessionArchived(session.id, false, session.profile)
++        paging.removed.add(session.id)
+         setLocalSessions(prev => prev.filter(s => s.id !== session.id))
+         // Surface it again in the sidebar without waiting for a full refresh, and
+         // lift any optimistic eviction so the grouped tree shows it again too.
+@@ -106,7 +156,7 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
+         setBusyId(null)
+       }
+     },
+-    [s]
++    [paging, s]
+   )
+ 
+   const remove = useCallback(
+@@ -134,6 +184,7 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
+         // stored tip and the durable lineage root — the journal keys on the
+         // stored id and the row may carry either.
+         purgeInFlightTurnJournals([session.id, session._lineage_root_id])
++        paging.removed.add(session.id)
+         setLocalSessions(prev => prev.filter(s => s.id !== session.id))
+         triggerHaptic('warning')
+       } catch (err) {
+@@ -142,7 +193,7 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
+         setBusyId(null)
+       }
+     },
+-    [s]
++    [paging, s]
+   )
+ 
+   useDeepLinkHighlight({
+@@ -163,14 +214,14 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
+ 
+       <SectionHeading
+         icon={Archive}
+-        meta={sessions.length ? String(sessions.length) : undefined}
++        meta={sessions.length ? `${sessions.length}${hasMore ? '+' : ''}` : undefined}
+         title={s.archivedTitle}
+       />
+       <p className="mb-2 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
+         {s.archivedIntro}
+       </p>
+ 
+-      {sessions.length === 0 ? (
++      {sessions.length === 0 && !hasMore ? (
+         <EmptyState description={s.emptyArchivedDesc} title={s.emptyArchivedTitle} />
+       ) : (
+         <div className="grid gap-1">
+@@ -215,6 +266,19 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
+               </div>
+             )
+           })}
++          {hasMore && (
++            <Button
++              className="justify-self-start"
++              disabled={loadingMore}
++              onClick={() => void loadMore()}
++              size="sm"
++              type="button"
++              variant="textStrong"
++            >
++              {loadingMore && <Loader2 className="size-3.5 animate-spin" />}
++              <span>{t.sidebar.loadMore}</span>
++            </Button>
++          )}
+         </div>
+       )}
+     </SettingsContent>
+diff --git a/apps/desktop/src/store/sidebar-archive.test.ts b/apps/desktop/src/store/sidebar-archive.test.ts
+index e55244cbd85f2a4bc9b5fb69a9e2a89dbae6ac0f..9419235f5bb29da0194f47461c0695dc043ed84f 100644
+--- a/apps/desktop/src/store/sidebar-archive.test.ts
++++ b/apps/desktop/src/store/sidebar-archive.test.ts
+@@ -6,9 +6,11 @@ import type { SessionInfo } from '@/types/hermes'
+ import { $sidebarShowArchived } from './layout'
+ import {
+   $archivedSessions,
++  $archivedSessionsHasMore,
+   $archivedSessionsLoading,
+-  listEveryArchivedSession,
+-  loadArchivedSessions
++  createArchivedPager,
++  loadArchivedSessions,
++  loadMoreArchivedSessions
+ } from './sidebar-archive'
+ 
+ const listAllProfileSessions = vi.hoisted(() => vi.fn())
+@@ -41,8 +43,23 @@ const pinnedRow = (id: string): SessionInfo => row(id, { archived: false, pinned
+ const page = (from: number, count: number): SessionInfo[] =>
+   Array.from({ length: count }, (_, i) => row(`a-${from + i}`))
+ 
++/** Read a cursor to its end, as a caller that wants the whole archive would. */
++async function listEveryArchivedSession(): Promise<SessionInfo[]> {
++  const pager = createArchivedPager()
++
++  while (pager.hasMore) {
++    await pager.next()
++  }
++
++  return pager.sessions
++}
++
++let scopeSerial = 0
++
+ beforeEach(() => {
+   $sidebarShowArchived.set(false)
++  // A fresh scope per test: the switch drops the previous test's cursor and page count.
++  $apiRequestScope.set({ connectionId: `reset-${(scopeSerial += 1)}`, profile: null })
+   $apiRequestScope.set({ connectionId: null, profile: null })
+   $archivedSessions.set([])
+   listAllProfileSessions.mockReset()
+@@ -170,7 +187,231 @@ describe('loadArchivedSessions', () => {
+   })
+ })
+ 
+-describe('listEveryArchivedSession', () => {
++describe('archived view paging', () => {
++  // 2026-11-17: 16,899 archived rows across three gateways. Reading all of them before
++  // publishing any (34 pages, each slower than the last) left the view empty.
++  it('shows the first page of a deep archive without reading the rest', async () => {
++    listAllProfileSessions.mockResolvedValue({ sessions: page(0, PAGE_SIZE), total: 16_899 })
++
++    await loadArchivedSessions()
++
++    expect(listAllProfileSessions).toHaveBeenCalledTimes(1)
++    expect($archivedSessions.get()).toHaveLength(PAGE_SIZE)
++    expect($archivedSessionsHasMore.get()).toBe(true)
++    expect($archivedSessionsLoading.get()).toBe(false)
++  })
++
++  it('reports nothing more when the first page holds the whole archive', async () => {
++    listAllProfileSessions.mockResolvedValue({ sessions: page(0, 3), total: 3 })
++
++    await loadArchivedSessions()
++
++    expect($archivedSessionsHasMore.get()).toBe(false)
++    await loadMoreArchivedSessions()
++    expect(listAllProfileSessions).toHaveBeenCalledTimes(1)
++  })
++
++  it('appends one page per load-more, from the next offset', async () => {
++    listAllProfileSessions.mockImplementation(async (...args: unknown[]) => ({
++      sessions: page(args[6] as number, PAGE_SIZE),
++      total: 3 * PAGE_SIZE
++    }))
++
++    await loadArchivedSessions()
++    await loadMoreArchivedSessions()
++
++    expect(listAllProfileSessions).toHaveBeenCalledTimes(2)
++    expect(listAllProfileSessions).toHaveBeenNthCalledWith(2, PAGE_SIZE, 0, 'only', 'recent', 'all', {}, PAGE_SIZE)
++    expect($archivedSessions.get().map(session => session.id)).toEqual(page(0, 2 * PAGE_SIZE).map(s => s.id))
++    expect($archivedSessionsHasMore.get()).toBe(true)
++
++    await loadMoreArchivedSessions()
++
++    expect($archivedSessions.get()).toHaveLength(3 * PAGE_SIZE)
++    expect($archivedSessionsHasMore.get()).toBe(false)
++  })
++
++  it('re-reads every page the user loaded on a refresh', async () => {
++    listAllProfileSessions.mockImplementation(async (...args: unknown[]) => ({
++      sessions: page(args[6] as number, PAGE_SIZE),
++      total: 4 * PAGE_SIZE
++    }))
++
++    await loadArchivedSessions()
++    await loadMoreArchivedSessions()
++    listAllProfileSessions.mockClear()
++
++    await loadArchivedSessions()
++
++    expect(listAllProfileSessions).toHaveBeenCalledTimes(2)
++    expect($archivedSessions.get()).toHaveLength(2 * PAGE_SIZE)
++    expect($archivedSessionsHasMore.get()).toBe(true)
++  })
++
++  it('keeps the loaded rows and the offer when a load-more fails', async () => {
++    listAllProfileSessions
++      .mockResolvedValueOnce({ sessions: page(0, PAGE_SIZE), total: 2 * PAGE_SIZE })
++      .mockRejectedValueOnce(new Error('offline'))
++      .mockResolvedValueOnce({ sessions: page(PAGE_SIZE, PAGE_SIZE), total: 2 * PAGE_SIZE })
++
++    await loadArchivedSessions()
++    await loadMoreArchivedSessions()
++
++    expect($archivedSessions.get()).toHaveLength(PAGE_SIZE)
++    expect($archivedSessionsHasMore.get()).toBe(true)
++    expect($archivedSessionsLoading.get()).toBe(false)
++
++    await loadMoreArchivedSessions()
++
++    expect(listAllProfileSessions).toHaveBeenLastCalledWith(PAGE_SIZE, 0, 'only', 'recent', 'all', {}, PAGE_SIZE)
++    expect($archivedSessions.get()).toHaveLength(2 * PAGE_SIZE)
++  })
++
++  // Review of the first cut: archive/unarchive/delete edit $archivedSessions in place.
++  it('reads again from the top when the list was edited before a load-more', async () => {
++    const server = page(0, 3 * PAGE_SIZE)
++
++    listAllProfileSessions.mockImplementation(async (...args: unknown[]) => ({
++      sessions: server.slice(args[6] as number, (args[6] as number) + PAGE_SIZE),
++      total: server.length
++    }))
++
++    await loadArchivedSessions()
++    // What unarchiving a-0 does: the row leaves the list here and on the server.
++    $archivedSessions.set($archivedSessions.get().filter(session => session.id !== 'a-0'))
++    server.shift()
++    listAllProfileSessions.mockClear()
++
++    await loadMoreArchivedSessions()
++
++    const ids = $archivedSessions.get().map(session => session.id)
++
++    expect(listAllProfileSessions).toHaveBeenNthCalledWith(1, PAGE_SIZE, 0, 'only', 'recent', 'all', {}, 0)
++    expect(ids).not.toContain('a-0')
++    // a-500 moved into the first window; the old cursor would have skipped it.
++    expect(ids).toEqual(server.slice(0, 2 * PAGE_SIZE).map(session => session.id))
++  })
++
++  it('reads again from the top when the list is edited while a load-more is reading', async () => {
++    const server = page(0, 3 * PAGE_SIZE)
++    let release!: () => void
++
++    listAllProfileSessions.mockImplementation(async (...args: unknown[]) => ({
++      sessions: server.slice(args[6] as number, (args[6] as number) + PAGE_SIZE),
++      total: server.length
++    }))
++    await loadArchivedSessions()
++
++    listAllProfileSessions.mockImplementationOnce(async () => {
++      const rows = server.slice(PAGE_SIZE, 2 * PAGE_SIZE)
++
++      await new Promise<void>(resolve => (release = resolve))
++
++      return { sessions: rows, total: server.length + 1 }
++    })
++
++    const more = loadMoreArchivedSessions()
++
++    await vi.waitFor(() => expect(release).toBeTypeOf('function'))
++    $archivedSessions.set($archivedSessions.get().filter(session => session.id !== 'a-0'))
++    server.shift()
++    release()
++    await more
++
++    expect($archivedSessions.get().map(session => session.id)).toEqual(
++      server.slice(0, 2 * PAGE_SIZE).map(session => session.id)
++    )
++    expect($archivedSessionsLoading.get()).toBe(false)
++  })
++
++  // sessions.changed refreshes can run back to back; a click must not be lost to one.
++  it('has a running refresh read the extra page when load-more is asked mid-refresh', async () => {
++    let release!: () => void
++
++    listAllProfileSessions.mockImplementation(async (...args: unknown[]) => ({
++      sessions: page(args[6] as number, PAGE_SIZE),
++      total: 4 * PAGE_SIZE
++    }))
++    await loadArchivedSessions()
++
++    listAllProfileSessions.mockImplementationOnce(async () => {
++      await new Promise<void>(resolve => (release = resolve))
++
++      return { sessions: page(0, PAGE_SIZE), total: 4 * PAGE_SIZE }
++    })
++
++    const refresh = loadArchivedSessions()
++
++    await vi.waitFor(() => expect(release).toBeTypeOf('function'))
++
++    const more = loadMoreArchivedSessions()
++    let moreDone = false
++    void more.then(() => (moreDone = true))
++
++    await Promise.resolve()
++    expect(moreDone).toBe(false)
++
++    release()
++    await Promise.all([refresh, more])
++
++    expect($archivedSessions.get()).toHaveLength(2 * PAGE_SIZE)
++    expect($archivedSessionsLoading.get()).toBe(false)
++  })
++
++  it('does not count a load-more stranded by a scope round trip against the scope it returns to', async () => {
++    let release!: () => void
++
++    listAllProfileSessions.mockImplementation(async (...args: unknown[]) => ({
++      sessions: page(args[6] as number, PAGE_SIZE),
++      total: 4 * PAGE_SIZE
++    }))
++    await loadArchivedSessions()
++
++    listAllProfileSessions.mockImplementationOnce(async () => {
++      await new Promise<void>(resolve => (release = resolve))
++
++      return { sessions: page(PAGE_SIZE, PAGE_SIZE), total: 4 * PAGE_SIZE }
++    })
++
++    const more = loadMoreArchivedSessions()
++
++    await vi.waitFor(() => expect(release).toBeTypeOf('function'))
++    $apiRequestScope.setKey('profile', 'work')
++    $apiRequestScope.setKey('profile', null)
++    release()
++    await more
++
++    expect($archivedSessions.get()).toEqual([])
++    expect($archivedSessionsLoading.get()).toBe(false)
++
++    await loadArchivedSessions()
++
++    expect($archivedSessions.get()).toHaveLength(PAGE_SIZE)
++  })
++
++  it('drops the cursor on a scope switch, so the new scope starts at its first page', async () => {
++    listAllProfileSessions.mockImplementation(async (...args: unknown[]) => ({
++      sessions: page(args[6] as number, PAGE_SIZE),
++      total: 4 * PAGE_SIZE
++    }))
++
++    await loadArchivedSessions()
++    await loadMoreArchivedSessions()
++    $apiRequestScope.setKey('profile', 'work')
++
++    expect($archivedSessionsHasMore.get()).toBe(false)
++    listAllProfileSessions.mockClear()
++    await loadMoreArchivedSessions()
++    expect(listAllProfileSessions).not.toHaveBeenCalled()
++
++    await loadArchivedSessions()
++
++    expect(listAllProfileSessions).toHaveBeenCalledTimes(1)
++    expect($archivedSessions.get()).toHaveLength(PAGE_SIZE)
++  })
++})
++
++describe('createArchivedPager read to the end', () => {
+   it('keeps paging when a live pin displaced the last archived row', async () => {
+     listAllProfileSessions
+       .mockResolvedValueOnce({ sessions: [pinnedRow('pin-x'), ...page(0, PAGE_SIZE - 1)], total: PAGE_SIZE })
+diff --git a/apps/desktop/src/store/sidebar-archive.ts b/apps/desktop/src/store/sidebar-archive.ts
+index ec9d34f04543e4ba74979805316ab3bdbd75d4d3..4aa4a53654b3762bc7d19400f996ba0cbede4310 100644
+--- a/apps/desktop/src/store/sidebar-archive.ts
++++ b/apps/desktop/src/store/sidebar-archive.ts
+@@ -14,8 +14,24 @@ import { $sessions } from './session'
+ // deep archive from re-reading that prefix once per 200 rows.
+ const ARCHIVED_FETCH_PAGE_SIZE = 500
+ 
++/** One page-at-a-time cursor over `archived=only`. `next()` reads one more
++ *  page (a call made while a read is running joins that read); `sessions` is
++ *  everything read so far and `hasMore` says whether the server still holds
++ *  archived rows past the cursor. */
++export interface ArchivedPager {
++  hasMore: boolean
++  next: () => Promise<SessionInfo[]>
++  sessions: SessionInfo[]
++}
++
+ /**
+- * Pages through `archived=only` until every archived row is loaded.
++ * A cursor over `archived=only`, one page per `next()`.
++ *
++ * The Archived view shows a page and reads the next one on request. It never
++ * reads the whole archive up front: an archive can run to tens of thousands
++ * of rows (bot profiles auto-archive every run), the Electron merge re-reads
++ * the prefix for each page, and a view that waits for the last page shows
++ * nothing at all until then.
+  *
+  * The offset advances by the page size only — never by the number of rows
+  * received. The list endpoints deliberately back-fill pinned conversations
+@@ -27,24 +43,38 @@ const ARCHIVED_FETCH_PAGE_SIZE = 500
+  *
+  * Back-filled pins can repeat across pages (a pinned row past the window is
+  * re-appended by every page whose window covers it), so rows dedupe by owner
+- * and id on the way in. Termination: `page.total` counts only archived rows, so stop
+- * after that many distinct archived rows have arrived. Older backends can
++ * and id on the way in. `hasMore` turns false once `page.total` (which counts
++ * only archived rows) distinct archived rows have arrived. Older backends can
+  * let a live pin displace an archived row from a page; cursor >= total would
+- * leave that final row unread. An empty page also stops the loop. Live pins
+- * can ride along even past the end, so once the cursor has covered `total`,
+- * a page with no new archived row stops it too: a row archived or reordered
+- * mid-load can leave the distinct count short for good.
++ * leave that final row unread. An empty page also ends it. Live pins can ride
++ * along even past the end, so once the cursor has covered `total`, a page
++ * with no new archived row ends it too: a row archived or reordered mid-load
++ * can leave the distinct count short for good.
+  */
+-export async function listEveryArchivedSession(): Promise<SessionInfo[]> {
+-  const sessions: SessionInfo[] = []
++export function createArchivedPager(): ArchivedPager {
+   const seen = new Set<string>()
+   let archivedCount = 0
+-
+   let offset = 0
++  let reading: null | Promise<SessionInfo[]> = null
++
++  const pager: ArchivedPager = {
++    hasMore: true,
++    sessions: [],
++    next() {
++      reading ??= readPage().finally(() => (reading = null))
++
++      return reading
++    }
++  }
++
++  async function readPage(): Promise<SessionInfo[]> {
++    if (!pager.hasMore) {
++      return pager.sessions
++    }
+ 
+-  while (true) {
+     const page = await listAllProfileSessions(ARCHIVED_FETCH_PAGE_SIZE, 0, 'only', 'recent', 'all', {}, offset)
+     const archivedBefore = archivedCount
++    const sessions = [...pager.sessions]
+ 
+     for (const session of page.sessions) {
+       const identity = `${session.connection_id || ''}\0${session.profile || 'default'}\0${session.id}`
+@@ -60,25 +90,37 @@ export async function listEveryArchivedSession(): Promise<SessionInfo[]> {
+     }
+ 
+     offset += ARCHIVED_FETCH_PAGE_SIZE
+-
+-    if (
++    pager.sessions = sessions
++    pager.hasMore = !(
+       page.sessions.length === 0 ||
+       archivedCount >= page.total ||
+       (offset >= page.total && archivedCount === archivedBefore)
+-    ) {
+-      return sessions
+-    }
++    )
++
++    return sessions
+   }
++
++  return pager
+ }
+ 
+ export const $archivedSessions = atom<SessionInfo[]>([])
+ export const $archivedSessionsLoading = atom(false)
++/** Whether the server holds archived rows past the pages loaded so far. */
++export const $archivedSessionsHasMore = atom(false)
+ 
+ // Each load takes a generation; only the newest may publish or clear the
+ // flag. The scope key pins it to the connection/profile it was issued on, so
+ // a switch mid-load starts a fresh fetch and strands the previous one.
+ let archiveGeneration = 0
+ let loadingScope: null | string = null
++let running: null | Promise<void> = null
++// The cursor behind the published rows, and how many pages it has read.
++let publishedPager: ArchivedPager | null = null
++let publishedPages = 0
++// How many pages the view should hold: one, plus one per load-more. A running
++// load reads this as it goes, so a load-more asked for mid-refresh is read by
++// that refresh instead of being dropped.
++let wantedPages = 1
+ 
+ function archiveScopeKey(): string {
+   const { connectionId, profile } = $apiRequestScope.get()
+@@ -86,34 +128,115 @@ function archiveScopeKey(): string {
+   return backendScopeKey(connectionId, profile)
+ }
+ 
+-export async function loadArchivedSessions(): Promise<void> {
+-  const scope = archiveScopeKey()
++function publish(pager: ArchivedPager, pages: number): void {
++  publishedPager = pager
++  publishedPages = pages
++  $archivedSessions.set(pager.sessions)
++  $archivedSessionsHasMore.set(pager.hasMore)
++}
+ 
+-  if ($archivedSessionsLoading.get() && loadingScope === scope) {
+-    return
+-  }
++/** Whether the view still shows exactly what the published cursor read. An
++ *  archive, unarchive or delete edits the list in place; the server's offsets
++ *  then no longer line up with the cursor's, and its next page would skip a
++ *  row per removal and bring the removed rows back. */
++function cursorMatchesView(): boolean {
++  return publishedPager !== null && $archivedSessions.get() === publishedPager.sessions
++}
+ 
++async function runArchiveLoad(extend: boolean): Promise<void> {
++  const scope = archiveScopeKey()
+   const generation = ++archiveGeneration
++  const current = () => generation === archiveGeneration && archiveScopeKey() === scope
+   loadingScope = scope
+ 
+   $archivedSessionsLoading.set(true)
+ 
+   try {
+-    const sessions = await listEveryArchivedSession()
++    // One more page can come off the published cursor; anything else starts over.
++    let pager = extend && cursorMatchesView() ? publishedPager : null
++    let read = pager ? publishedPages : 0
++
++    for (let pass = 0; pass < 2 && current(); pass += 1) {
++      const continued = pager !== null
++      const firstLoad = $archivedSessions.get().length === 0
++      pager ??= createArchivedPager()
++
++      while (read < wantedPages && pager.hasMore && current()) {
++        const shown = $archivedSessions.get()
++
++        await pager.next()
++        read += 1
++
++        if (continued && $archivedSessions.get() !== shown) {
++          // The list was edited while the cursor read on: start over.
++          break
++        }
+ 
+-    if (generation === archiveGeneration && archiveScopeKey() === scope) {
+-      $archivedSessions.set(sessions)
++        if (current() && (firstLoad || read >= wantedPages || !pager.hasMore)) {
++          publish(pager, read)
++        }
++      }
++
++      if (!continued || cursorMatchesView()) {
++        break
++      }
++
++      pager = null
++      read = 0
+     }
+   } catch {
+     // A background refresh must not turn a usable Archived view into an empty
+-    // one when the backend is temporarily unavailable. Keep the last good set.
++    // one when the backend is temporarily unavailable. Keep the last good set;
++    // a failed load-more stays offered and the next click retries it.
+   } finally {
+     if (generation === archiveGeneration) {
++      wantedPages = Math.max(1, publishedPages)
+       $archivedSessionsLoading.set(false)
+     }
+   }
+ }
+ 
++function startArchiveLoad(extend: boolean): Promise<void> {
++  const load = runArchiveLoad(extend).finally(() => {
++    if (running === load) {
++      running = null
++    }
++  })
++
++  running = load
++
++  return load
++}
++
++/** Load the Archived view: its first page, or on a refresh as many pages as
++ *  the user has paged in, so rows they loaded do not vanish. */
++export async function loadArchivedSessions(): Promise<void> {
++  if ($archivedSessionsLoading.get() && loadingScope === archiveScopeKey()) {
++    return
++  }
++
++  await startArchiveLoad(false)
++}
++
++/** Read one more page into the Archived view; resolves when it is in. A
++ *  no-op when nothing is left. Asked for while a load is running, that load
++ *  reads the extra page. A failure leaves the loaded rows as they are. */
++export async function loadMoreArchivedSessions(): Promise<void> {
++  if (!$archivedSessionsHasMore.get()) {
++    return
++  }
++
++  wantedPages = publishedPages + 1
++
++  if ($archivedSessionsLoading.get() && loadingScope === archiveScopeKey() && running) {
++    await running
++
++    return
++  }
++
++  await startArchiveLoad(true)
++}
++
+ // Rows from another connection/profile must not linger (or be acted on), and
+ // nothing else reloads on a switch: the sidebar effect watches only the
+ // Archived toggle and background sync waits for a backend sessions.changed.
+@@ -130,7 +253,15 @@ $apiRequestScope.listen(() => {
+   }
+ 
+   observedScope = scope
++  // Strand whatever is reading the old scope: it may neither publish nor
++  // count its pages against the new one.
++  archiveGeneration += 1
++  publishedPager = null
++  publishedPages = 0
++  wantedPages = 1
+   $archivedSessions.set([])
++  $archivedSessionsHasMore.set(false)
++  $archivedSessionsLoading.set(false)
+ 
+   if ($sidebarShowArchived.get()) {
+     void loadArchivedSessions()
+-- 
+2.43.0
+

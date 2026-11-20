@@ -1,0 +1,310 @@
+From 87b3aaa3cb98f20f41a24305443f07c9c5d9b4b8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 07:44:53 +0000
+Subject: [PATCH] [daveey] kanban chat waits: a 2 h board deadline and a daily
+ cap end every unanswered ask
+
+Review and adversarial pass of the previous head:
+- A wake the sweeper tried but that did not start (refused, error, busy,
+  missing) still acked the ask as a passive row with no escalation. Instead of
+  patching each delivery path, the guarantee now sits on the board: after the
+  card's own comment probe says "not yet", kanban_wake_check calls
+  kanban_decision_ask.escalate_if_overdue, and a chat park older than
+  ASK_OVERDUE_S (2 h) with no answer goes to David (needs_input). escalate()
+  re-checks for an answer first, so an answer that beat the deadline wins.
+- "Not yet" replies reset the streak forever: CHAT_PARK_CAP (6) chat parks per
+  card per 24 h escalate however each was answered.
+- The card's own worker commenting before it re-asks counted as an answer:
+  _answered_since ignores comments stamped with one of this card's runs.
+- Sweeper: a failing escalation is logged, not swallowed; after escalating it
+  acks the claim without writing the now-stale "parked until you decide" row.
+
+Tests: the 2 h backstop (and an answer beating it), the wake-check runner
+calling it after a "not yet", six "not yet" answers then escalation, the
+worker's own notes not counting. 5 of 60 fail on the previous head; 31
+neighbouring files (647 tests) pass.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_awaiting.py                | 38 ++++++++-
+ hermes_cli/kanban_decision_ask.py            | 35 ++++++++
+ hermes_cli/kanban_wake_check.py              |  3 +
+ tests/hermes_cli/test_kanban_decision_ask.py | 86 +++++++++++++++++++-
+ tui_gateway/kanban_unloaded.py               | 17 +++-
+ 5 files changed, 172 insertions(+), 7 deletions(-)
+
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index c1eb633ce984e536a512d991958b90eddc688ca4..c60d3e79314557b6095ed2c09ea58108ead4bbd7 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -923,6 +923,25 @@ def prior_same_premise(conn: sqlite3.Connection, task_id: str, premise: str, *,
+ 
+ 
+ _AFTER_ID = re.compile(r"--after-id\s+(\d+)")
++CHAT_PARK_CAP = 6  # chat parks per card per 24 h before the next one escalates, however each was answered
++
++
++def chat_parks_today(conn: sqlite3.Connection, task_id: str) -> int:
++    """Chat-wait parks of this card in the last 24 h, since its last escalation."""
++    since = int(time.time()) - 86400
++    count = 0
++    for kind, payload in conn.execute(
++            "SELECT kind, payload FROM task_events WHERE task_id = ? AND created_at >= ? AND kind IN "
++            "('scheduled', 'continued', ?) ORDER BY id DESC", (task_id, since, ESCALATED_EVENT)):
++        if kind == ESCALATED_EVENT:
++            break
++        try:
++            got = (json.loads(payload or "{}") or {}).get("awaiting") or {}
++        except (ValueError, AttributeError):
++            continue
++        if isinstance(got, dict) and got.get("kind") == CHAT:
++            count += 1
++    return count
+ 
+ 
+ def _answered_since(conn: sqlite3.Connection, task_id: str, wake_check: Optional[str]) -> bool:
+@@ -932,8 +951,19 @@ def _answered_since(conn: sqlite3.Connection, task_id: str, wake_check: Optional
+     if not m:
+         return False
+     from hermes_cli.kanban_comment_origin import is_system_author
+-    return any(not is_system_author(author) for (author,) in conn.execute(
+-        "SELECT author FROM task_comments WHERE task_id = ? AND id > ?", (task_id, int(m.group(1)))))
++    own_runs = {int(r[0]) for r in conn.execute("SELECT id FROM task_runs WHERE task_id = ?", (task_id,))}
++    for cid, author in conn.execute("SELECT id, author FROM task_comments WHERE task_id = ? AND id > ?",
++                                    (task_id, int(m.group(1)))):
++        if is_system_author(author):
++            continue
++        # The card's own worker leaving a progress note before re-parking is not an answer (review of #3647).
++        row = conn.execute("SELECT json_extract(payload, '$.writer_run_id') FROM task_events WHERE task_id = ? AND "
++                           "kind = 'commented' AND json_extract(payload, '$.comment_id') = ? LIMIT 1",
++                           (task_id, cid)).fetchone()
++        if row is not None and isinstance(row[0], int) and row[0] in own_runs:
++            continue
++        return True
++    return False
+ 
+ 
+ def probe_fire_reparks(conn: sqlite3.Connection, task_id: str, premise: str, probe: Optional[str]) -> int:
+@@ -1023,6 +1053,10 @@ def gate(conn: sqlite3.Connection, task_id: str, *, awaiting: Any, reason: Optio
+     if (not passive.eligible(task_id, wake_check, record, blocker_id)
+             and prior_same_premise(conn, task_id, record["premise"], probe=probe) >= REPARK_LIMIT):
+         raise RepeatedPark(record)
++    if record["kind"] == CHAT and chat_parks_today(conn, task_id) >= CHAT_PARK_CAP:
++        # Answered "not yet" each time, the streak above never builds: a card asking its orchestrator this often in
++        # a day is stuck behind something the orchestrator cannot give (adversarial review of #3647).
++        raise RepeatedPark(record)
+     fired = probe_fire_reparks(conn, task_id, record["premise"], probe)
+     if fired >= PROBE_FIRE_REPARK_LIMIT:
+         record["fired_reparks"] = fired
+diff --git a/hermes_cli/kanban_decision_ask.py b/hermes_cli/kanban_decision_ask.py
+index ac979223090e8629dc1f27f31b81ba1a13646e91..a7f0311714c7c4c6ac31154b0c24c1c31daf9893 100644
+--- a/hermes_cli/kanban_decision_ask.py
++++ b/hermes_cli/kanban_decision_ask.py
+@@ -21,6 +21,9 @@ from __future__ import annotations
+ from typing import Any
+ 
+ NOTICE_KIND = "decision_requested"
++# A chat wait unanswered this long goes to David, whatever happened to its delivery (a wake refused, failed, never
++# started, a budget or slot shortage): checked by the card's own comment probe (escalate_if_overdue).
++ASK_OVERDUE_S = 2 * 3600
+ UNANSWERED_KIND = "decision_unanswerable"  # the owner had no chat to take the ask; it became David's
+ 
+ 
+@@ -62,11 +65,15 @@ def escalate(conn, task_id: str, why_unanswered: str) -> bool:
+     """A still-parked card whose orchestrator ask cannot reach anyone: leave the park (``scheduled`` -> ``triage``,
+     probe cleared, ``decision_unanswerable``) and block it ``needs_input`` with the question, as the spend-budget hold
+     leaves a park. If the block is refused it stays visibly in triage. True when it blocked."""
++    from hermes_cli import kanban_awaiting as kaw
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_wake_check as kwc
+     task = kb.get_task(conn, task_id)
+     if task is None or task.status != "scheduled":
+         return False
++    record, _reason, wake_check, _at = _latest_chat_park(conn, task_id)
++    if record is not None and kaw._answered_since(conn, task_id, wake_check):
++        return False  # answered meanwhile: its probe wakes the card on its next check
+     ask = [e for e in kb.list_events(conn, task_id) if e.kind == NOTICE_KIND]
+     payload = (ask[-1].payload or {}) if ask else {}
+     question = str(payload.get("why") or payload.get("reason") or "").strip()[:1500]
+@@ -88,3 +95,31 @@ def escalate(conn, task_id: str, why_unanswered: str) -> bool:
+             "scope": f"card {task_id}: {str(task.title or '')[:120]}",
+             "evidence": f"decision_requested on {task_id}; {why_unanswered}",
+         }))
++
++
++def _latest_chat_park(conn, task_id: str) -> tuple:
++    """``(awaiting, reason, wake_check, created_at)`` of the card's newest park when it is a chat wait."""
++    import json
++    row = conn.execute("SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind IN "
++                       "('scheduled', 'continued') ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
++    try:
++        payload = json.loads(row[0] or "{}") if row else {}
++    except ValueError:
++        payload = {}
++    record = payload.get("awaiting")
++    if not is_chat_wait(record):
++        return None, "", None, None
++    return record, str(payload.get("reason") or ""), payload.get("wake_check"), int(row[1])
++
++
++def escalate_if_overdue(conn, task_id: str, *, now: int | None = None) -> bool:
++    """Called after a chat wait's comment probe said "not yet" (outside its write txn): a chat park older than
++    ``ASK_OVERDUE_S`` with no answer becomes David's. The board-side guarantee behind every delivery path."""
++    import time
++    record, _reason, _cmd, at = _latest_chat_park(conn, task_id)
++    if record is None or at is None:
++        return False
++    now = int(time.time()) if now is None else int(now)
++    if now - at < ASK_OVERDUE_S:
++        return False
++    return escalate(conn, task_id, f"it has had no answer for {ASK_OVERDUE_S // 3600} h")
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 06fd02e495c09c8af6bc9af3cf18095b366213e8..f9923358ddbafec6c3ea0c9222c76eb2306186ae 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -844,6 +844,9 @@ def _probe_and_apply(db_path: str, task_id: str, cmd: str, cwd: str, env: dict,
+             apply_result(conn, task_id, cmd, rc, out, now=now, generation=generation, diagnostics=diag,
+                          answered=answered, producer=producer, dead_ancestry=dead_ancestry,
+                          stale_interval=stale_interval, passive_policy=passive_policy)
++            if rc == 1 and not output_error(out):
++                from hermes_cli import kanban_decision_ask  # [daveey] a chat wait unanswered for 2 h goes to David
++                kanban_decision_ask.escalate_if_overdue(conn, task_id, now=now)
+         finally:
+             conn.close()
+         return rc
+diff --git a/tests/hermes_cli/test_kanban_decision_ask.py b/tests/hermes_cli/test_kanban_decision_ask.py
+index 1ac06caeefeb87196ad833756379b0196fdcfc68..0a311db64b1118c91fe158feb8cd6f639d43971f 100644
+--- a/tests/hermes_cli/test_kanban_decision_ask.py
++++ b/tests/hermes_cli/test_kanban_decision_ask.py
+@@ -617,8 +617,92 @@ def test_separately_answered_questions_do_not_escalate(kanban_home, monkeypatch)
+             out = _tool("schedule", {"reason": f"waiting for the owning orchestrator decision {n}", "clock_only": True,
+                                      "awaiting": {"kind": "chat", "ref": "owning orchestrator", "why": f"question {n}?"}})
+             assert out.get("status") == "scheduled", (n, out)
+-            kb.add_comment(conn, tid, "default", f"Answer {n}: go with A.")
++            _orchestrator_comment(monkeypatch, conn, tid, f"Answer {n}: go with A.")
+             assert kb.unblock_task(conn, tid)
+             with kb.write_txn(conn):
+                 conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+             assert kb.claim_task(conn, tid, claimer="worker") is not None
++
++
++@pytest.mark.parametrize("answered", [False, True])
++def test_unanswered_chat_wait_goes_to_david_after_two_hours(kanban_home, monkeypatch, answered) -> None:
++    """Adversarial review of #3647: a wake that was refused, failed or never started acked the ask passively.
++    The board backstop: the card's comment probe says "not yet" for 2 h -> needs_input for David."""
++    from hermes_cli import kanban_decision_ask as kda
++    _chat, tid = _parked_ask(monkeypatch)
++    with kbc.connect_closing() as conn:
++        if answered:
++            kb.add_comment(conn, tid, "default", "Decisions: B, authorize, Phase A alone.")
++        assert not kda.escalate_if_overdue(conn, tid, now=int(time.time()) + 60)  # not yet overdue
++        result = kda.escalate_if_overdue(conn, tid, now=int(time.time()) + kda.ASK_OVERDUE_S + 60)
++        task = kb.get_task(conn, tid)
++    if answered:  # the answer beat the deadline: its probe wakes the card instead
++        assert result is False and task.status == "scheduled"
++    else:
++        assert result is True and task.status == "blocked"
++
++
++def test_wake_check_runner_calls_the_backstop(kanban_home, monkeypatch) -> None:
++    """The backstop runs on the probe's own path: a "not yet" from the chat probe past the deadline escalates."""
++    _chat, tid = _parked_ask(monkeypatch)
++    calls = []
++    from hermes_cli import kanban_decision_ask as kda
++    monkeypatch.setattr(kda, "escalate_if_overdue", lambda conn, task_id, now=None: calls.append(task_id) or False)
++    with kbc.connect_closing() as conn:
++        state = kwc.get_state(conn, tid)
++        db_path = conn.execute("PRAGMA database_list").fetchone()[2]
++    monkeypatch.setattr(kwc, "_run_probe", lambda key, cmd, cwd, env: (1, "not yet: no comment"))
++    kwc._probe_and_apply(db_path, tid, state["cmd"], str(kanban_home), {}, None, state["generation"])
++    assert calls == [tid]
++
++
++def test_not_yet_answers_still_end_in_escalation(kanban_home, monkeypatch) -> None:
++    """Adversarial review of #3647: "not yet" replies reset the streak; the daily cap ends the loop."""
++    monkeypatch.setattr(kaw, "_supervisor_profile", lambda task: None)
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _subscribe(conn, tid)
++        for n in range(kaw.CHAT_PARK_CAP):
++            _as_worker(monkeypatch, conn, tid)
++            out = _tool("schedule", {"reason": "waiting for the owning orchestrator decision", "clock_only": True,
++                                     "awaiting": {"kind": "chat", "ref": "owning orchestrator", "why": f"ready? {n}"}})
++            assert out.get("status") == "scheduled", (n, out)
++            _orchestrator_comment(monkeypatch, conn, tid, "Not yet - still waiting on David. Hold.")
++            assert kb.unblock_task(conn, tid)
++            with kb.write_txn(conn):
++                conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++            assert kb.claim_task(conn, tid, claimer="worker") is not None
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": "waiting for the owning orchestrator decision", "clock_only": True,
++                                 "awaiting": {"kind": "chat", "ref": "owning orchestrator", "why": "ready now?"}})
++        assert out.get("code") == "repark_escalated", out
++
++
++def test_the_workers_own_progress_note_is_not_an_answer(kanban_home, monkeypatch) -> None:
++    """Review of #3647: a worker that comments in each run before re-asking never escalated."""
++    monkeypatch.setattr(kaw, "_supervisor_profile", lambda task: None)
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _subscribe(conn, tid)
++        for n in range(2):
++            _as_worker(monkeypatch, conn, tid)
++            out = _tool("schedule", {"reason": f"waiting for the owning orchestrator decision {n}", "clock_only": True,
++                                     "awaiting": {"kind": "chat", "ref": "owning orchestrator", "why": f"q {n}?"}})
++            assert out.get("status") == "scheduled", (n, out)
++            assert kb.unblock_task(conn, tid)
++            with kb.write_txn(conn):
++                conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++            assert kb.claim_task(conn, tid, claimer="worker") is not None
++            _as_worker(monkeypatch, conn, tid)
++            assert _tool("comment", {"task_id": tid, "body": f"Progress: prepared the next prefix ({n})."}).get("ok")
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": "waiting for the owning orchestrator decision", "clock_only": True,
++                                 "awaiting": {"kind": "chat", "ref": "owning orchestrator", "why": "q again?"}})
++        assert out.get("code") == "repark_escalated", out
++
++
++def _orchestrator_comment(monkeypatch, conn, tid, body) -> None:
++    """The orchestrator answers from its own chat, not from inside this card's run."""
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
++    kb.add_comment(conn, tid, "default", body)
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index 1892277232e5514d691a8f4bcf19516f3dc74fde..b23395e2ae7abd4b2b7f96184178a0fc12c2075f 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -80,7 +80,7 @@ _wake_times: dict[str, list[float]] = {}  # chat -> recent started wakes (this p
+ # that cannot wake its chat now (budget spent, slots busy) is handed back and retried, the budget still pacing
+ # wakes; one still undelivered after ASK_OVERDUE_S goes to David as a visible needs_input block
+ # (kanban_decision_ask.escalate). Adversarial review of #3647.
+-ASK_OVERDUE_S = 2 * 3600.0
++from hermes_cli.kanban_decision_ask import ASK_OVERDUE_S
+ _wake_slots = wake_slots.WakeSlots(MAX_PARALLEL_WAKES)
+ _slot_waits: dict[tuple, float] = {}  # remote notice -> when slots first refused it (this process)
+ 
+@@ -478,9 +478,18 @@ def _deliver_sub(conn, slug, sub, ident, grace_s, now, session_db, _kb, _kbn, ki
+                             slug, ident["task_id"], tip, verdict)
+             return None
+         from hermes_cli import kanban_decision_ask
+-        with contextlib.suppress(Exception):
+-            kanban_decision_ask.escalate(conn, ident["task_id"], f"its orchestrator chat {tip} could not be woken "
+-                                         f"for {ASK_OVERDUE_S / 3600:.0f} h ({verdict})")
++        try:
++            escalated = kanban_decision_ask.escalate(
++                conn, ident["task_id"], f"its orchestrator chat {tip} could not be woken for "
++                f"{ASK_OVERDUE_S / 3600:.0f} h ({verdict})")
++        except Exception:  # health: allow BLE001 -- the claim is held: fall back to the passive row below, logged
++            logger.warning("kanban ask escalation for %s/%s failed; writing the notice row", slug, ident["task_id"],
++                           exc_info=True)
++            escalated = False
++        if escalated:  # it is David's now: its blocked event tells the chat; the "parked until you decide" text is stale
++            with contextlib.suppress(Exception):
++                _kbn.ack_notify_claim(conn, upto=new, from_cursor=old, **ident)
++            return None
+     if verdict == "skipped:slots" and _slots_may_wait(claimed, now):
+         # Every wake slot is busy: hand the range back so the next pass wakes the chat, instead of a passive row
+         # that no turn reads (design t_01a1d45d75851804 R4). An OVERDUE_S-old notice gets its row as before.
+-- 
+2.43.0
+

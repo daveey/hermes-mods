@@ -1,0 +1,155 @@
+From c4cec394e5afea4f1f01d0a8c6921087386c44ae Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 08:28:45 +0000
+Subject: [PATCH] fix(kanban): resolve delayed legacy comments from proven
+ local runs [daveey]
+
+Incident: on the MacBook board, `hermes kanban promote|unblock
+t_d3caf2c71c64010a --seen 12183` refused forever with "Comment data
+unavailable". task_event 245663 (commented, comment_id 10315, no
+comment_uid) was written 21 s after its task_comments row 10315. The
+legacy branch of _resolve() only matches rows within +-1 s, so the event
+resolved to no row, _missing_coverage marked it missing and --seen could
+never acknowledge it.
+
+Choice: local-writer provenance, not a wider timestamp window. A wider
+window keyed on author+comment_id would still compare a foreign
+(imported) integer id with a local row, which is exactly what the guard
+exists to prevent, and any fixed bound is arbitrary. Instead the integer
+comment_id is trusted only when the event's (writer_run_id,
+writer_run_uid) is a task_runs row of this same task whose `claimed`
+receipt names this board's sync gateway_id as holder; then the row must
+also have the same id and author. NULL event origin and a `local-`
+writer_session prefix alone are not host provenance (imports can carry
+both). Every other legacy event keeps the +-1 s rule and the
+missing-data refusal unchanged. Malformed writer fields (non-scalar run
+ids, non-string author) fall back to the old path instead of raising.
+
+Proof: tests/hermes_cli/test_kanban_release_imported_comments.py
+test_delayed_legacy_local_writer covers promote/unblock/tool with the
+21 s delay: proven local writer -> release with --seen succeeds; foreign
+holder, no claim, wrong run id, wrong author, missing row and
+unhashable run id -> still refused as missing data. RED without the fix
+(delayed cases, and unhashable cases without the type guard); GREEN 86
+tests in that file plus test_kanban_release_unread_comments.py.
+Rollback: revert this commit.
+---
+ hermes_cli/kanban_release_comments.py         | 33 +++++++++++++-
+ .../test_kanban_release_imported_comments.py  | 43 +++++++++++++++++++
+ 2 files changed, 74 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_release_comments.py b/hermes_cli/kanban_release_comments.py
+index ae0eb3919180687f0e74fe723a06cc2a791c76a4..e9424178289aea1e9a1340b7b8830d69bb3a4461 100644
+--- a/hermes_cli/kanban_release_comments.py
++++ b/hermes_cli/kanban_release_comments.py
+@@ -38,7 +38,13 @@ def check(conn, tid, *, session, seen=None, verb="unblock", board=None):
+     all_events = conn.execute(
+         "SELECT * FROM task_events WHERE task_id=? AND kind='commented'", (tid,),
+     ).fetchall()
+-    resolved = {e["id"]: _resolve(rows, e, json.loads(e["payload"] or "{}")) for e in all_events}
++    local_runs = _local_writer_runs(conn, tid)
++    resolved = {}
++    for event in all_events:
++        payload = json.loads(event["payload"] or "{}")
++        writer = (payload.get("writer_run_id"), payload.get("writer_run_uid"))
++        local_writer = all(isinstance(v, (int, str)) for v in writer) and writer in local_runs
++        resolved[event["id"]] = _resolve(rows, event, payload, local_writer=local_writer)
+     missing = _missing_coverage(resolved)
+     comments = []
+     for event in events:
+@@ -117,7 +123,25 @@ def _listing(cid, body, event, payload):
+             "time": datetime.fromtimestamp(event["created_at"], UTC).isoformat(), "body": body[:300]}
+ 
+ 
+-def _resolve(rows, event, payload):
++def _local_writer_runs(conn, tid):
++    """Prove the writer's integer namespace using its portable local claim receipt.
++
++    NULL event origin and a ``local-`` session prefix are not host identity:
++    imports can have both. A foreign run must never lend its comment_id to a
++    colliding local row, even when its run integer happens to collide too.
++    """
++    from hermes_cli.kanban_db_sync import sync_state
++    state = sync_state(conn)
++    if not state or not state.get("gateway_id"):
++        return set()
++    return {(row[0], row[1]) for row in conn.execute(
++        "SELECT r.id, r.uid FROM task_runs r WHERE r.task_id=? AND r.uid IS NOT NULL "
++        "AND EXISTS (SELECT 1 FROM task_events e WHERE e.task_id=r.task_id AND e.kind='claimed' "
++        "AND json_extract(e.payload, '$.run_uid')=r.uid "
++        "AND json_extract(e.payload, '$.holder')=?)", (tid, state["gateway_id"]))}
++
++
++def _resolve(rows, event, payload, *, local_writer=False):
+     """Never compare a wire-local integer with a receiver's watermark.
+ 
+     Legacy synced events have no portable reference. Require acknowledgement of
+@@ -129,6 +153,11 @@ def _resolve(rows, event, payload):
+         return [r for r in rows if "uid" in r.keys() and r["uid"] == payload["comment_uid"]]
+     if rows and "uid" not in rows[0].keys():  # never-synced board: IDs are local
+         return [r for r in rows if r["id"] == payload.get("comment_id")]
++    if local_writer and isinstance(payload.get("author"), str) and payload["author"].strip():
++        # add_comment writes the row before the event; scheduling/IO may delay
++        # the second timestamp. Local run provenance makes its integer usable.
++        return [r for r in rows if r["id"] == payload.get("comment_id")
++                and r["author"] == payload["author"].strip()]
+     return [r for r in rows if abs(r["created_at"] - event["created_at"]) <= 1
+             and (not payload.get("author") or r["author"] == payload["author"].strip())]
+ 
+diff --git a/tests/hermes_cli/test_kanban_release_imported_comments.py b/tests/hermes_cli/test_kanban_release_imported_comments.py
+index c5e4d5a601320ebb8458187d5a5b3884555097e8..d35ffaa26ffbe7479f59d2c4f6e45b3196503f4f 100644
+--- a/tests/hermes_cli/test_kanban_release_imported_comments.py
++++ b/tests/hermes_cli/test_kanban_release_imported_comments.py
+@@ -147,6 +147,49 @@ def test_event_coverage_requires_injective_matching(candidates, missing):
+     assert _missing_coverage(resolved) == missing
+ 
+ 
++@pytest.mark.parametrize("entry", ["promote", "unblock", "tool"])
++@pytest.mark.parametrize("broken", [None, "foreign", "no_claim", "wrong_run", "wrong_author", "missing",
++                                    "unhashable_run"])
++def test_delayed_legacy_local_writer(board, entry, broken, capsys):
++    enable_sync(board)
++    cid = comment(board)
++    with kbc.connect_closing() as conn:
++        with kbc.write_txn(conn):
++            run = conn.execute(
++                "INSERT INTO task_runs (task_id, profile, status, started_at, uid) "
++                "VALUES (?, 'default', 'done', ?, 'writer-run')",
++                (board, int(time.time()) - 300)).lastrowid
++            payload = {"comment_id": cid, "author": "default", "writer_session": "other",
++                       "writer_run_id": run, "writer_run_uid": "writer-run"}
++            if broken == "wrong_run":
++                payload["writer_run_id"] = run + 1
++            if broken == "wrong_author":
++                payload["author"] = "another"
++            if broken == "unhashable_run":
++                payload["writer_run_id"] = [run]
++            conn.execute("UPDATE task_events SET created_at=created_at+21, payload=? "
++                         "WHERE task_id=? AND kind='commented'", (json.dumps(payload), board))
++            if broken != "no_claim":
++                kb._append_event(conn, board, "claimed", {
++                    "holder": "peer" if broken == "foreign" else "owner", "run_uid": "writer-run"})
++            if broken == "missing":
++                conn.execute("DELETE FROM task_comments WHERE id=?", (cid,))
++    before = snapshot(board)
++    ok, output = release(board, entry, capsys)
++    assert not ok, output
++    assert snapshot(board) == before
++    if broken is None:
++        assert "Leave this card in triage" in output
++        assert "Comment data unavailable" not in output
++    ok, output = release(board, entry, capsys, cid)
++    if broken:
++        assert not ok and "Comment data unavailable" in output, output
++        assert snapshot(board) == before
++    else:
++        assert ok, output
++        assert snapshot(board)[0] == "ready"
++
++
+ def test_writer_stamps_actual_comment_uid(board):
+     enable_sync(board)
+     cid = comment(board)
+-- 
+2.43.0
+

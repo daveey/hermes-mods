@@ -1,0 +1,866 @@
+From 210d9941220ea67946d121cecd8ae1dd434532d4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 08:16:36 +0000
+Subject: [PATCH] [daveey] Read listed outcome cards without sidebar enrichment
+
+W1 of hub host-pass redesign. Preserve selection, waits and busy fallback while isolating lean/full memo shapes. Full session_tasks remains enriched. Keep optional wait failures compatible with full reader. No notice timing or stale-mark changes.
+
+Proof: RED on af93f6f5 (35 failures); canonical targeted 242 tests and related 130 tests; parent rerun 168 tests plus 17 differential/snapshot tests. Missing read-transaction mutant killed. All 21 scripts/check gates pass. Whole-loop CPU acceptance pending; not shipped.
+---
+ hermes_cli/kanban_session_activity.py         |  43 +-
+ hermes_cli/kanban_session_activity_busy.py    |  37 +-
+ hermes_cli/kanban_session_outcome_tasks.py    | 109 +++++
+ hermes_state_outcome.py                       |   4 +-
+ .../test_kanban_outcome_reader_parity.py      |  71 +++
+ .../test_kanban_session_outcome_tasks.py      | 403 ++++++++++++++++++
+ tests/hermes_state/test_session_outcome.py    |  10 +-
+ .../test_actionable_block_notices.py          |   4 +-
+ 8 files changed, 632 insertions(+), 49 deletions(-)
+ create mode 100644 hermes_cli/kanban_session_outcome_tasks.py
+ create mode 100644 tests/hermes_cli/test_kanban_outcome_reader_parity.py
+ create mode 100644 tests/hermes_cli/test_kanban_session_outcome_tasks.py
+
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index fbdb4e340639044ca5c9ffa79c407265263ffd89..b7ee5cbd81066cff3369f2ff6df3730f791a7694 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -1530,32 +1530,13 @@ def _board_slug(path: Path) -> str:
+ def _read_session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...]) -> list[dict[str, Any]]:
+     """Tasks on one board that any of ``ids`` created or is a ``tui`` subscriber
+     of, in ``statuses`` — the same pairs ``_read_counts`` counts."""
+-    sid_ph = ",".join("?" for _ in ids)
+-    st_ph = ",".join("?" for _ in statuses)
+     with cached_ro(path) as conn, _execution_transaction(conn) as read_at:
+         conn.row_factory = sqlite3.Row
+         cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+         if "session_id" not in cols:
+             return []  # explicitly supported pre-session schema
+-        select = ", ".join(f"t.{c}" if c in cols else f"NULL AS {c}" for c in _TASK_FIELDS)
+-        run_start = "NULL"
+-        if "current_run_id" in cols and conn.execute(
+-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'").fetchone():
+-            run_start = "(SELECT r.started_at FROM task_runs r WHERE r.id = t.current_run_id AND r.task_id = t.id)"
+-        found: dict[str, dict[str, Any]] = {}
+-        watch = _not_watch(conn)  # [daveey] a watch park is not the chat's open card (close-out gate)
+-        for row in conn.execute(
+-                f"SELECT {select}, {run_start} AS current_run_started_at FROM tasks t "
+-                f"WHERE t.session_id IN ({sid_ph}) AND t.status IN ({st_ph}) AND {watch}", (*ids, *statuses)):
+-            found[row["id"]] = {**dict(row), "via": "created"}
+-        try:
+-            for row in conn.execute(
+-                    f"SELECT {select}, {run_start} AS current_run_started_at FROM kanban_notify_subs s "
+-                    f"JOIN tasks t ON t.id = s.task_id WHERE s.platform = 'tui' AND {_counted_sub_clause(conn)} "
+-                    f"AND s.chat_id IN ({sid_ph}) AND t.status IN ({st_ph}) AND {watch}", (*ids, *statuses)):
+-                found.setdefault(row["id"], {**dict(row), "via": "subscribed"})
+-        except sqlite3.Error:  # board predates notify subscriptions
+-            pass
++        from hermes_cli.kanban_session_outcome_tasks import select_listed_local_tasks
++        found = select_listed_local_tasks(conn, ids, statuses)
+         from hermes_cli.kanban_execution_source import assemble
+         from hermes_cli.kanban_execution_observations import ADAPTER_ERRORS, card_scope
+         gateway, profile = card_scope(path)
+@@ -1626,21 +1607,19 @@ def session_tasks(session_ids: Iterable[str], statuses: tuple[str, ...] = LISTED
+         t.setdefault("key", f"{t['board']}/{t['id']}")
+     # [daveey] Cards on other gateways this lineage owns: the same rows the counts use, owner-qualified
+     # (gateway/board/id), with ``stale``/``synced_at`` from the replica. One row per card.
+-    wanted, seen = set(ids), set()
+-    for card in _remote_cards(ids, statuses, stale_ok):
+-        belongs = card['session'] in wanted or card.get('origin_session') in wanted
+-        listed = card.get('status') in statuses or (card.get('status') in PENDING_RELEASE_STATUSES and card.get('unfinished'))
+-        if belongs and listed and card['key'] not in seen:
+-            seen.add(card["key"])
+-            row = {**card, "session_id": card["session"]}
+-            wait = _remote_wait(card)
+-            if wait is not None:
+-                row["wait"] = wait
+-            out.append(row)
++    from hermes_cli.kanban_session_outcome_tasks import append_remote_listed_cards
++    append_remote_listed_cards(out, ids, statuses, stale_ok)
+     from hermes_cli.kanban_execution_observations import add_cards
+     return add_cards([dict(row) for row in out])
+ 
+ 
++def session_outcome_tasks(session_ids: Iterable[str], statuses: tuple[str, ...] = LISTED_STATUSES, *,
++                          stale_ok: bool = False) -> list[dict[str, Any]]:
++    """Listed cards for session outcome: same membership as ``session_tasks``, without sidebar enrichment."""
++    from hermes_cli.kanban_session_outcome_tasks import session_outcome_tasks as _impl
++    return _impl(session_ids, statuses, stale_ok=stale_ok)
++
++
+ # [daveey] A "done" card can still need the user: its handoff admits part of the
+ # work was dropped, deferred or never run, and no follow-up card carries it.
+ # Core has no opinion on what counts; plugins register a check
+diff --git a/hermes_cli/kanban_session_activity_busy.py b/hermes_cli/kanban_session_activity_busy.py
+index ced19554e7711c5d2e71aa45143552945899530e..5949e87d8b40d74f424786dce85034792dcdd38f 100644
+--- a/hermes_cli/kanban_session_activity_busy.py
++++ b/hermes_cli/kanban_session_activity_busy.py
+@@ -30,6 +30,7 @@ _log = logging.getLogger("hermes_cli.kanban_session_activity")
+ reuse_sink = threading.local()
+ 
+ _tasks_memo: dict[tuple, list[dict[str, Any]]] = {}  # last good per-board task list, by (board, ids, statuses)
++_lean_tasks_memo: dict[tuple, list[dict[str, Any]]] = {}  # outcome lean reader; never the sidebar namespace
+ _tasks_lock = threading.Lock()
+ TASKS_MEMO_MAX = 512
+ # One request's shared budget for re-reading busy boards that have no last good list for the query (well inside the
+@@ -71,9 +72,23 @@ def board_reads(path: Path, key: tuple, hit: tuple | None, parked: bool, stalled
+     return reads, complete, True
+ 
+ 
++def _memo(namespace: str) -> dict[tuple, list[dict[str, Any]]]:
++    return _lean_tasks_memo if namespace == "lean" else _tasks_memo
++
++
++def _row_copy(task: dict[str, Any], *, stale: bool = False) -> dict[str, Any]:
++    row = dict(task)
++    wait = row.get("wait")
++    if isinstance(wait, dict):
++        row["wait"] = dict(wait)
++    if stale:
++        row["stale"] = True
++    return row
++
++
+ def session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...],
+                   read: Callable[[Path, list[str], tuple[str, ...]], list[dict[str, Any]]], *,
+-                  deadline: float | None = None) -> list[dict[str, Any]]:
++                  deadline: float | None = None, memo_namespace: str = "") -> list[dict[str, Any]]:
+     """``read(path, ids, statuses)``, or on a busy board its last good list for the same query, every row ``stale``.
+ 
+     A busy board with no last list for this query (a chat opened for the first time since the backend started) is
+@@ -81,7 +96,12 @@ def session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...],
+     for the board, and a lifecycle hold a little longer than that made ``/api/session-kanban-tasks`` 500 and the
+     Desktop panel show "Task status unavailable" for every newly opened chat. The deadline belongs to the whole
+     request (``request_deadline``), so several busy boards share one budget. ``None`` never retries: callers holding
+-    a lock (the links projection under ``_links_lock``) must fail fast."""
++    a lock (the links projection under ``_links_lock``) must fail fast.
++
++    ``memo_namespace`` default empty keeps the sidebar key ``(path, ids, statuses)``. The outcome lean
++    reader uses ``lean`` so the two last-good lists cannot poison each other.
++    """
++    store = _memo(memo_namespace)
+     key = (str(path), tuple(ids), tuple(statuses))
+     while True:
+         try:
+@@ -91,23 +111,24 @@ def session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...],
+             if not is_busy(exc):
+                 raise
+             with _tasks_lock:
+-                last = _tasks_memo.get(key)
++                last = store.get(key)
+             if last is not None:
+                 _log.warning("kanban board %s busy; reused last counts kind=%s sqlite_code=%s pid=%s holder=%s",
+                              path, *busy_details(exc))
+-                return [{**t, "stale": True} for t in last]
++                return [_row_copy(t, stale=True) for t in last]
+             now = time.monotonic()
+             if deadline is None or now >= deadline:
+                 raise
+             time.sleep(min(FIRST_READ_RETRY_PAUSE_S, deadline - now))  # an instant busy error must not spin
+     with _tasks_lock:
+-        _tasks_memo.pop(key, None)
+-        _tasks_memo[key] = tasks
+-        while len(_tasks_memo) > TASKS_MEMO_MAX:
+-            _tasks_memo.pop(next(iter(_tasks_memo)))
++        store.pop(key, None)
++        store[key] = [_row_copy(t) for t in tasks]
++        while len(store) > TASKS_MEMO_MAX:
++            store.pop(next(iter(store)))
+     return tasks
+ 
+ 
+ def reset() -> None:
+     with _tasks_lock:
+         _tasks_memo.clear()
++        _lean_tasks_memo.clear()
+diff --git a/hermes_cli/kanban_session_outcome_tasks.py b/hermes_cli/kanban_session_outcome_tasks.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fc1e4733b58f077321228044b413e5c064a9d175
+--- /dev/null
++++ b/hermes_cli/kanban_session_outcome_tasks.py
+@@ -0,0 +1,109 @@
++"""Lean listed-card reader for session outcome. Sidebar ``session_tasks`` stays full.
++
++Same local selection (creator/subscriber union, creator precedence, counted-sub
++clause, watch exclusion, ``_TASK_FIELDS``) and the same remote membership/dedup/
++wait derivation as ``session_tasks``. Skips execution assemble, done receipts,
++card details and ``add_cards``.
++"""
++
++from __future__ import annotations
++
++import logging
++import sqlite3
++from pathlib import Path
++from typing import Any, Iterable
++
++_log = logging.getLogger("hermes_cli.kanban_session_activity")
++
++
++def select_listed_local_tasks(conn: sqlite3.Connection, ids: list[str], statuses: tuple[str, ...],
++                              ) -> dict[str, dict[str, Any]]:
++    """Tasks on one board that any of ``ids`` created or tui-shepherds, in ``statuses``.
++
++    Creator rows win over subscriber rows (``setdefault``). Same pairs ``_read_counts`` counts.
++    """
++    from hermes_cli.kanban_session_activity import _TASK_FIELDS, _counted_sub_clause
++    from hermes_cli.kanban_watch import not_watch_sql as _not_watch
++
++    sid_ph = ",".join("?" for _ in ids)
++    st_ph = ",".join("?" for _ in statuses)
++    cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
++    if "session_id" not in cols:
++        return {}  # explicitly supported pre-session schema
++    select = ", ".join(f"t.{c}" if c in cols else f"NULL AS {c}" for c in _TASK_FIELDS)
++    run_start = "NULL"
++    if "current_run_id" in cols and conn.execute(
++            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'").fetchone():
++        run_start = "(SELECT r.started_at FROM task_runs r WHERE r.id = t.current_run_id AND r.task_id = t.id)"
++    found: dict[str, dict[str, Any]] = {}
++    watch = _not_watch(conn)
++    for row in conn.execute(
++            f"SELECT {select}, {run_start} AS current_run_started_at FROM tasks t "
++            f"WHERE t.session_id IN ({sid_ph}) AND t.status IN ({st_ph}) AND {watch}", (*ids, *statuses)):
++        found[row["id"]] = {**dict(row), "via": "created"}
++    try:
++        for row in conn.execute(
++                f"SELECT {select}, {run_start} AS current_run_started_at FROM kanban_notify_subs s "
++                f"JOIN tasks t ON t.id = s.task_id WHERE s.platform = 'tui' AND {_counted_sub_clause(conn)} "
++                f"AND s.chat_id IN ({sid_ph}) AND t.status IN ({st_ph}) AND {watch}", (*ids, *statuses)):
++            found.setdefault(row["id"], {**dict(row), "via": "subscribed"})
++    except sqlite3.Error:  # board predates notify subscriptions
++        pass
++    return found
++
++
++def append_remote_listed_cards(out: list[dict[str, Any]], ids: list[str], statuses: tuple[str, ...],
++                               stale_ok: bool) -> None:
++    """Remote cards this lineage owns: session or origin_session, key-deduped, wait derived first."""
++    from hermes_cli.kanban_session_activity import _remote_cards, _remote_wait
++    from hermes_cli.kanban_session_activity_release import PENDING_RELEASE_STATUSES
++
++    wanted, seen = set(ids), set()
++    for card in _remote_cards(ids, statuses, stale_ok):
++        belongs = card["session"] in wanted or card.get("origin_session") in wanted
++        listed = (card.get("status") in statuses
++                  or (card.get("status") in PENDING_RELEASE_STATUSES and card.get("unfinished")))
++        if belongs and listed and card["key"] not in seen:
++            seen.add(card["key"])
++            wait = _remote_wait(card)  # before trimming source fields; stale remote has none
++            row = {**card, "session_id": card["session"]}
++            if wait is not None:
++                row["wait"] = wait
++            out.append(row)
++
++
++def _read_lean_session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...]) -> list[dict[str, Any]]:
++    from hermes_cli.kanban_session_activity import _board_slug, _execution_transaction, cached_ro
++    from hermes_cli.kanban_session_wait_rows import _local_wait_info
++
++    with cached_ro(path) as conn, _execution_transaction(conn):
++        conn.row_factory = sqlite3.Row
++        found = select_listed_local_tasks(conn, ids, statuses)
++        try:
++            for tid, info in _local_wait_info(conn, found).items():
++                found[tid]["wait"] = info
++        except Exception as exc:  # health: allow BLE001 -- Same optional wait boundary as full sidebar reader; never drop listed cards on enrichment failure.
++            _log.debug("kanban wait info read failed for %s: %s", path, exc, exc_info=True)
++    board = _board_slug(path)
++    return [{**t, "board": board} for t in found.values()]
++
++
++def session_outcome_tasks(session_ids: Iterable[str], statuses: tuple[str, ...] | None = None, *,
++                          stale_ok: bool = False) -> list[dict[str, Any]]:
++    """Open/blocked/review cards the lineage created or shepherds, without sidebar enrichment."""
++    from hermes_cli.kanban_session_activity import LISTED_STATUSES, _board_db_paths, _busy
++
++    if statuses is None:
++        statuses = LISTED_STATUSES
++    ids = [s for s in dict.fromkeys(str(s) for s in session_ids if s)]
++    if not ids:
++        return []
++    out: list[dict[str, Any]] = []
++    deadline = _busy.request_deadline()
++    for path in _board_db_paths():
++        out.extend(_busy.session_tasks(path, ids, statuses, _read_lean_session_tasks, deadline=deadline,
++                                       memo_namespace="lean"))
++    for t in out:
++        t.setdefault("key", f"{t['board']}/{t['id']}")
++    append_remote_listed_cards(out, ids, statuses, stale_ok)
++    return out
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index c7ab1ceff661f14ff5f99a68ec470e171b23e2b8..40ce37b3ff3ef2ed32c239249238146aeaf39e81 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -327,10 +327,10 @@ def _card_items(ids: list[str]) -> tuple[list[dict], list[dict]]:
+     """(decision items, waits) from the cards these chats created or shepherd: a card parked on a
+     validated ``human_request`` is a decision, every other open card is a wait."""
+     from hermes_cli.kanban_human_request import needs_human
+-    from hermes_cli.kanban_session_activity import LISTED_STATUSES, session_tasks
++    from hermes_cli.kanban_session_activity import LISTED_STATUSES, session_outcome_tasks
+ 
+     decisions, waits = [], []
+-    cards = session_tasks(ids, LISTED_STATUSES, stale_ok=True)
++    cards = session_outcome_tasks(ids, LISTED_STATUSES, stale_ok=True)
+     if not cards:
+         # The display list may be a stale-empty projection while the sidebar counts
+         # already know about open work. Absence is not completion without agreement.
+diff --git a/tests/hermes_cli/test_kanban_outcome_reader_parity.py b/tests/hermes_cli/test_kanban_outcome_reader_parity.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..252e169738f96821174bda005aab6144a41479ed
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_outcome_reader_parity.py
+@@ -0,0 +1,71 @@
++"""Full/lean outcome parity and same-snapshot wait derivation."""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++import hermes_state_outcome as outcome
++from hermes_cli import kanban_session_activity as activity
++from hermes_cli import kanban_session_outcome_tasks as lean
++from hermes_cli import kanban_session_wait_rows as wait_rows
++from tests.hermes_cli import test_kanban_session_outcome_tasks as helpers
++
++kanban_root = helpers.kanban_root
++
++
++@pytest.mark.parametrize("status,request_value,kind", [
++    ("blocked", helpers.HUMAN_REQUEST, "needs_input"),
++    ("blocked", "{broken", "needs_input"),
++    ("blocked", {"action": "incomplete"}, "needs_input"),
++    ("blocked", helpers.HUMAN_REQUEST, "transient"),
++    ("triage", helpers.HUMAN_REQUEST, "needs_input"),
++    ("scheduled", None, None),
++    ("running", None, None),
++    ("review", None, None),
++])
++@pytest.mark.parametrize("stale", [False, True])
++def test_full_and_lean_produce_identical_decisions_and_waits(kanban_root, monkeypatch, status, request_value, kind, stale):
++    path = kanban_root / "kanban.db"
++    conn = helpers._connect(path)
++    helpers._insert_task(conn, "t1", status, "chat", request=request_value, block_kind=kind)
++    conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?,?,?,?)",
++                 ("t1", "scheduled", json.dumps({"wake_at": 9_999_999_999}), 100.0))
++    conn.commit()
++    conn.close()
++    monkeypatch.setattr(activity, "_remote_cards", lambda *args, **kwargs: [{
++        "id": "r1", "key": "remote/default/default/r1", "board": "default", "gateway": "remote",
++        "session": "chat", "status": status, "title": "Remote", "human_request": request_value,
++        "block_kind": kind, "stale": stale, "wait": {"until": 9_999_999_999, "eta": "later"},
++    }])
++    actual = outcome._card_items(["chat"])
++    monkeypatch.setattr(activity, "session_outcome_tasks", activity.session_tasks)
++    expected = outcome._card_items(["chat"])
++    assert actual == expected
++
++
++def test_lean_wait_uses_the_selection_read_transaction(kanban_root, monkeypatch):
++    path = kanban_root / "kanban.db"
++    writer = helpers._connect(path)
++    writer.execute("PRAGMA journal_mode=WAL")
++    helpers._insert_task(writer, "t1", "scheduled", "chat")
++    writer.commit()
++    seen = []
++    original = wait_rows._local_wait_info
++
++    def raced(conn, found):
++        # A concurrent park committed after card selection must not leak into
++        # this outcome's wait. The next request must see it.
++        seen.append(conn.in_transaction)
++        writer.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?,?,?,?)",
++                       ("t1", "scheduled", json.dumps({"wake_at": 9_999_999_999}), 100.0))
++        writer.commit()
++        seen.append(conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0])
++        return original(conn, found)
++
++    monkeypatch.setattr(wait_rows, "_local_wait_info", raced)
++    try:
++        lean._read_lean_session_tasks(path, ["chat"], activity.LISTED_STATUSES)
++        assert seen == [True, 0]
++    finally:
++        writer.close()
+diff --git a/tests/hermes_cli/test_kanban_session_outcome_tasks.py b/tests/hermes_cli/test_kanban_session_outcome_tasks.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..745a6b6bc447dce04641a11ec4fcf798e781a4df
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_session_outcome_tasks.py
+@@ -0,0 +1,403 @@
++"""Lean listed-card reader for session outcome (W1): not the sidebar session_tasks path."""
++
++from __future__ import annotations
++
++import json
++import sqlite3
++from pathlib import Path
++
++import pytest
++
++import hermes_state_outcome as so
++from hermes_cli import kanban_generation as gen
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli import kanban_session_activity_busy as busy
++from hermes_cli.kanban_generation import BoardLifecycleBusy
++
++HUMAN_REQUEST = {
++    "action": "Approve the production deploy?",
++    "why_human": "Only David can approve a deploy.",
++    "interaction": "approval",
++    "scope": "deploy",
++    "evidence": "CI is green.",
++    "choices": [{"label": "Ship it", "value": "yes"}, {"label": "Hold", "value": "no"}],
++}
++
++
++def _lean():
++    reader = getattr(ksa, "session_outcome_tasks", None)
++    if reader is None or reader is ksa.session_tasks:
++        pytest.fail("missing session_outcome_tasks lean reader")
++    return reader
++
++
++@pytest.fixture
++def kanban_root(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub-state"))
++    monkeypatch.setattr(ksa, "_hub_db_path", lambda: None)
++    ksa._reset_cache_for_tests()
++    busy.reset()
++    yield tmp_path
++    ksa._reset_cache_for_tests()
++    busy.reset()
++
++
++def _connect(path: Path) -> sqlite3.Connection:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    conn = sqlite3.connect(path)
++    conn.execute(
++        "CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT NOT NULL, "
++        "session_id TEXT, assignee TEXT, created_at REAL, started_at REAL, block_kind TEXT, "
++        "human_request TEXT, current_run_id INTEGER, last_heartbeat_at REAL)")
++    conn.execute(
++        "CREATE TABLE IF NOT EXISTS kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, "
++        "delivery_metadata TEXT)")
++    conn.execute(
++        "CREATE TABLE IF NOT EXISTS task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, "
++        "payload TEXT, created_at REAL)")
++    conn.execute("CREATE TABLE IF NOT EXISTS task_runs (id INTEGER PRIMARY KEY, task_id TEXT, started_at REAL, "
++                 "summary TEXT)")
++    return conn
++
++
++def _insert_task(conn, tid, status, session_id, *, title=None, block_kind=None, request=None, **extra):
++    human = request if isinstance(request, str) else (json.dumps(request) if request is not None else None)
++    cols = {"id": tid, "title": title or tid, "status": status, "session_id": session_id,
++            "block_kind": block_kind, "human_request": human}
++    cols.update(extra)
++    names = ", ".join(cols)
++    conn.execute(f"INSERT INTO tasks ({names}) VALUES ({', '.join('?' for _ in cols)})", tuple(cols.values()))
++
++
++def _sub(conn, tid, chat, reason):
++    meta = json.dumps({"reason": reason}) if reason is not None else None
++    conn.execute("INSERT INTO kanban_notify_subs VALUES (?, 'tui', ?, ?)", (tid, chat, meta))
++
++
++def _items(ids):
++    return so._card_items(list(ids))
++
++
++def test_outcome_reader_is_not_the_sidebar_session_tasks():
++    assert getattr(ksa, "session_outcome_tasks", ksa.session_tasks) is not ksa.session_tasks
++
++
++def test_lean_bypasses_enrichment_while_full_still_enriches(kanban_root, monkeypatch):
++    path = kanban_root / "kanban.db"
++    conn = _connect(path)
++    _insert_task(conn, "t_run", "running", "s1", title="Run")
++    conn.commit()
++    conn.close()
++    hits: list[str] = []
++
++    def rec(name, result=None):
++        def fn(*a, **k):
++            hits.append(name)
++            return result if result is not None else (a[0] if name == "add_cards" and a else None)
++        return fn
++
++    monkeypatch.setattr(ksa, "_add_card_details", rec("_add_card_details"))
++    monkeypatch.setattr("hermes_cli.kanban_execution_source.assemble", rec("assemble", {}))
++    monkeypatch.setattr(ksa._receipts, "attach_done", rec("attach_done"))
++    monkeypatch.setattr("hermes_cli.kanban_execution_observations.add_cards", rec("add_cards"))
++
++    decisions, waits = _items(["s1"])
++    assert decisions == []
++    assert [w["id"] for w in waits] == ["t_run"]
++    assert not hits, f"lean path called enrichment {hits}"
++
++    listed = ksa.session_tasks(["s1"])
++    assert [t["id"] for t in listed] == ["t_run"]
++    assert set(hits) >= {"_add_card_details", "assemble", "attach_done", "add_cards"}
++
++
++@pytest.mark.parametrize("request_value", [
++    json.dumps(HUMAN_REQUEST),
++    dict(HUMAN_REQUEST),
++])
++def test_decision_parity_valid_json_text_and_dict(kanban_root, monkeypatch, request_value):
++    path = kanban_root / "kanban.db"
++    conn = _connect(path)
++    if isinstance(request_value, dict):
++        _insert_task(conn, "t_ask", "blocked", "s1", title="Ask", block_kind="needs_input",
++                     request=json.dumps(request_value))
++    else:
++        _insert_task(conn, "t_ask", "blocked", "s1", title="Ask", block_kind="needs_input",
++                     request=request_value)
++    conn.commit()
++    conn.close()
++    monkeypatch.setattr(ksa, "_remote_cards", lambda *a, **k: [
++        {"key": "hub/default/default/t_remote", "id": "t_remote", "board": "default", "gateway": "hub",
++         "session": "s1", "status": "blocked", "title": "Remote ask", "block_kind": "needs_input",
++         "human_request": request_value}])
++    decisions, waits = _items(["s1"])
++    assert waits == []
++    questions = {d["question"] for d in decisions}
++    assert HUMAN_REQUEST["action"] in questions
++    assert {d["card_id"] for d in decisions} == {"t_ask", "t_remote"}
++
++
++@pytest.mark.parametrize("request_value,block_kind,status,expect", [
++    ("{not json", "needs_input", "blocked", "wait"),
++    ({"action": "incomplete"}, "needs_input", "blocked", "wait"),
++    (HUMAN_REQUEST, "transient", "blocked", "wait"),
++    (HUMAN_REQUEST, "needs_input", "running", "wait"),
++    (HUMAN_REQUEST, "needs_input", "triage", "decision"),
++    (HUMAN_REQUEST, "needs_input", "blocked", "decision"),
++    (None, None, "review", "wait"),
++])
++def test_decision_parity_invalid_request_block_kind_and_status(kanban_root, request_value, block_kind, status, expect):
++    path = kanban_root / "kanban.db"
++    conn = _connect(path)
++    _insert_task(conn, "t1", status, "s1", title="Card", block_kind=block_kind, request=request_value)
++    conn.commit()
++    conn.close()
++    decisions, waits = _items(["s1"])
++    if expect == "decision":
++        assert waits == [] and decisions[0]["card_id"] == "t1"
++        assert decisions[0]["question"] == HUMAN_REQUEST["action"]
++    else:
++        assert decisions == [] and waits[0]["id"] == "t1" and waits[0]["state"] == status
++
++
++def test_local_park_event_wait_is_derived(kanban_root):
++    path = kanban_root / "kanban.db"
++    conn = _connect(path)
++    _insert_task(conn, "t_sched", "scheduled", "s1", title="Soak")
++    conn.execute(
++        "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'scheduled', ?, 100.0)",
++        ("t_sched", json.dumps({"wake_at": 9_999_999_999, "awaiting": {"kind": "clock", "ref": "slot"}})))
++    conn.commit()
++    conn.close()
++    cards = {c["id"]: c for c in _lean()(["s1"])}
++    assert cards["t_sched"]["wait"]["wait_state"] == "waiting"
++    assert "clock" in cards["t_sched"]["wait"]["waiting_on"] or "slot" in cards["t_sched"]["wait"]["waiting_on"]
++    decisions, waits = _items(["s1"])
++    assert decisions == []
++    assert waits[0]["id"] == "t_sched" and waits[0]["state"] == "scheduled"
++
++
++def test_fresh_and_stale_remote_waits_and_numeric_eta(kanban_root, monkeypatch):
++    reader = _lean()
++    fresh = {"key": "hub/default/default/t_fresh", "id": "t_fresh", "board": "default", "gateway": "hub",
++             "session": "s1", "status": "scheduled", "title": "Fresh", "stale": False,
++             "park": {"wake_at": 9_999_999_999, "outcome": "scheduled"},
++             "awaiting": {"kind": "clock", "ref": "window"}}
++    stale = {"key": "hub/default/default/t_stale", "id": "t_stale", "board": "default", "gateway": "hub",
++             "session": "s1", "status": "scheduled", "title": "Stale", "stale": True,
++             "park": {"wake_at": 9_999_999_999}}
++    eta_card = {"key": "hub/default/default/t_eta", "id": "t_eta", "board": "default", "gateway": "hub",
++                "session": "s1", "status": "running", "title": "Eta",
++                "wait": {"until": 1700000000.5, "eta": 12}}
++    monkeypatch.setattr(ksa, "_remote_cards", lambda *a, **k: [fresh, stale, eta_card])
++    real_wait = ksa._remote_wait
++
++    def remote_wait(card):
++        if card.get("stale"):
++            return None
++        if card["id"] == "t_eta":
++            return {"until": 1700000000.5, "eta": 12}
++        return real_wait(card)
++
++    monkeypatch.setattr(ksa, "_remote_wait", remote_wait)
++    cards = {c["id"]: c for c in reader(["s1"], stale_ok=True)}
++    assert "wait" in cards["t_fresh"]
++    assert "wait" not in cards["t_stale"]
++    assert cards["t_eta"]["wait"]["until"] == 1700000000.5
++    decisions, waits = _items(["s1"])
++    by_id = {w["id"]: w for w in waits}
++    assert "t_fresh" in by_id and "eta" not in by_id["t_fresh"]
++    assert by_id["t_eta"]["eta"] == 1700000000.5
++    assert decisions == []
++
++
++def test_creator_subscriber_union_creator_precedence_and_exclusions(kanban_root):
++    path = kanban_root / "kanban.db"
++    conn = _connect(path)
++    _insert_task(conn, "t_mine", "running", "s_creator", title="Mine")
++    _insert_task(conn, "t_shep", "ready", "s_other", title="Shepherded")
++    _insert_task(conn, "t_touch", "running", "s_other", title="Touched")
++    _insert_task(conn, "t_refused", "running", "s_other", title="Refused")
++    _insert_task(conn, "t_both", "todo", "s_creator", title="Both")
++    _sub(conn, "t_shep", "s_creator", "shepherd")
++    _sub(conn, "t_touch", "s_creator", "touch")
++    _sub(conn, "t_refused", "s_creator", "send_refused")
++    _sub(conn, "t_both", "s_creator", "shepherd")
++    conn.commit()
++    conn.close()
++    rows = _lean()(["s_creator"])
++    got = {r["id"]: r for r in rows}
++    assert set(got) == {"t_mine", "t_shep", "t_both"}
++    assert got["t_mine"]["via"] == "created"
++    assert got["t_shep"]["via"] == "subscribed"
++    assert got["t_both"]["via"] == "created"
++    assert ksa.session_tasks(["s_creator"])  # public sidebar still lists the same ids
++    assert {t["id"] for t in ksa.session_tasks(["s_creator"])} == set(got)
++
++
++def test_watch_park_and_lineage_ids(kanban_root):
++    path = kanban_root / "kanban.db"
++    conn = _connect(path)
++    _insert_task(conn, "t_watch", "scheduled", "s_root", title="Watch")
++    _insert_task(conn, "t_live", "running", "s_root", title="Live")
++    conn.execute(
++        "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'scheduled', ?, 1)",
++        ("t_watch", json.dumps({"watch": True, "wake_at": 9_999_999_999})))
++    conn.commit()
++    conn.close()
++    assert {r["id"] for r in _lean()(["s_tip"])} == set()
++    assert {r["id"] for r in _lean()(["s_root", "s_tip"])} == {"t_live"}
++    decisions, waits = _items(["s_root", "s_tip"])
++    assert [w["id"] for w in waits] == ["t_live"] and decisions == []
++
++
++def test_remote_session_origin_session_dedup_and_pending_release(kanban_root, monkeypatch):
++    reader = _lean()
++    cards = [
++        {"key": "hub/default/default/t_dup", "id": "t_dup", "board": "default", "gateway": "hub",
++         "session": "s_tip", "origin_session": "s_root", "status": "running", "title": "Dup"},
++        {"key": "hub/default/default/t_dup", "id": "t_dup", "board": "default", "gateway": "hub",
++         "session": "s_other", "origin_session": "s_root", "status": "ready", "title": "Dup again"},
++        {"key": "mini/default/default/t_origin", "id": "t_origin", "board": "default", "gateway": "mini",
++         "session": "s_other", "origin_session": "s_root", "status": "todo", "title": "Origin only"},
++        {"key": "hub/default/default/t_pend", "id": "t_pend", "board": "default", "gateway": "hub",
++         "session": "s_tip", "status": "done_pending_release", "title": "Pending", "unfinished": True},
++        {"key": "hub/default/default/t_done", "id": "t_done", "board": "default", "gateway": "hub",
++         "session": "s_tip", "status": "done_pending_release", "title": "Released", "unfinished": False},
++        {"key": "hub/default/default/t_unk", "id": "t_unk", "board": "default", "gateway": "hub",
++         "session": "s_tip", "status": "unknown", "title": "Unknown", "unfinished": True},
++    ]
++    monkeypatch.setattr(ksa, "_remote_cards", lambda *a, **k: cards)
++    got = reader(["s_root", "s_tip"], stale_ok=True)
++    ids = [r["id"] for r in got]
++    assert ids.count("t_dup") == 1
++    assert {r["id"] for r in got} == {"t_dup", "t_origin", "t_pend", "t_unk"}
++    decisions, waits = _items(["s_root", "s_tip"])
++    assert {w["id"] for w in waits} == {"t_dup", "t_origin", "t_pend", "t_unk"}
++    assert decisions == []
++
++
++def test_empty_list_with_open_counts_is_valueerror(kanban_root, monkeypatch):
++    path = kanban_root / "kanban.db"
++    conn = _connect(path)
++    _insert_task(conn, "t_open", "running", "s1")
++    conn.commit()
++    conn.close()
++    assert ksa.active_task_counts().get("s1", 0) == 1
++    monkeypatch.setattr(ksa, "session_outcome_tasks", lambda *a, **k: [])
++    with pytest.raises(ValueError, match="empty but sidebar counts retain open work"):
++        so._card_items(["s1"])
++
++
++def test_unreadable_counts_fail_closed(kanban_root, monkeypatch):
++    monkeypatch.setattr(ksa, "session_outcome_tasks", lambda *a, **k: [])
++
++    def boom():
++        raise sqlite3.OperationalError("counts unavailable")
++
++    monkeypatch.setattr(ksa, "active_task_counts", boom)
++    with pytest.raises(sqlite3.OperationalError, match="counts unavailable"):
++        so._card_items(["s1"])
++
++
++class _Clock:
++    def __init__(self):
++        self.now = 100.0
++        self.sleeps: list[float] = []
++
++    def monotonic(self):
++        return self.now
++
++    def sleep(self, s):
++        self.sleeps.append(s)
++        self.now += s
++
++
++@pytest.fixture
++def clock(monkeypatch):
++    c = _Clock()
++    monkeypatch.setattr(busy.time, "monotonic", c.monotonic)
++    monkeypatch.setattr(busy.time, "sleep", c.sleep)
++    busy.reset()
++    yield c
++    busy.reset()
++
++
++def test_busy_alternation_does_not_poison_and_copies_retained_rows(clock):
++    path = Path("board")
++    ids, statuses = ["s1"], ("running",)
++
++    def full_read(*a, **k):
++        return [{"id": "t1", "note": "full-note", "wait": {"until": 1.0}}]
++
++    def lean_read(*a, **k):
++        return [{"id": "t1", "wait": {"until": 1.0}}]
++
++    def busy_read(*a, **k):
++        raise BoardLifecycleBusy("database is locked: board lifecycle is busy")
++
++    def explode(*a, **k):
++        raise sqlite3.OperationalError("no such table: tasks")
++
++    full = busy.session_tasks(path, ids, statuses, full_read, deadline=clock.now + 3)
++    lean = busy.session_tasks(path, ids, statuses, lean_read, deadline=clock.now + 3, memo_namespace="lean")
++    assert full[0]["note"] == "full-note"
++    assert "note" not in lean[0]
++
++    full_stale = busy.session_tasks(path, ids, statuses, busy_read, deadline=clock.now + 3)
++    lean_stale = busy.session_tasks(path, ids, statuses, busy_read, deadline=clock.now + 3, memo_namespace="lean")
++    assert full_stale[0]["note"] == "full-note" and full_stale[0]["stale"] is True
++    assert "note" not in lean_stale[0] and lean_stale[0]["stale"] is True
++
++    lean_stale[0]["id"] = "mutated"
++    lean_stale[0]["wait"]["until"] = 99.0
++    full_stale[0]["note"] = "mutated-note"
++    again_lean = busy.session_tasks(path, ids, statuses, busy_read, deadline=clock.now + 3, memo_namespace="lean")
++    again_full = busy.session_tasks(path, ids, statuses, busy_read, deadline=clock.now + 3)
++    assert again_lean[0]["id"] == "t1" and again_lean[0]["wait"]["until"] == 1.0
++    assert again_full[0]["note"] == "full-note"
++
++    with pytest.raises(sqlite3.OperationalError, match="no such table"):
++        busy.session_tasks(path, ids, statuses, explode, deadline=clock.now + 3, memo_namespace="lean")
++
++
++def test_busy_successful_empty_cold_and_shared_deadline(clock):
++    path = Path("empty")
++    ids, statuses = ["s1"], ("running",)
++
++    def empty_read(*a, **k):
++        return []
++
++    def busy_read(*a, **k):
++        raise BoardLifecycleBusy()
++
++    assert busy.session_tasks(path, ids, statuses, empty_read, deadline=clock.now + 3,
++                              memo_namespace="lean") == []
++    stale = busy.session_tasks(path, ids, statuses, busy_read, deadline=clock.now + 3, memo_namespace="lean")
++    assert stale == [] or all(t.get("stale") for t in stale)
++
++    cold = Path("cold")
++    with pytest.raises(sqlite3.OperationalError):
++        busy.session_tasks(cold, ids, statuses, busy_read, deadline=clock.now, memo_namespace="lean")
++
++
++def test_public_session_tasks_still_uses_the_full_memo_namespace(kanban_root, monkeypatch):
++    path = kanban_root / "kanban.db"
++    conn = _connect(path)
++    _insert_task(conn, "t1", "running", "s1", title="Run")
++    conn.commit()
++    conn.close()
++    seen: list[str] = []
++    real = busy.session_tasks
++
++    def wrapped(path, ids, statuses, read, *, deadline=None, **kw):
++        seen.append(kw.get("memo_namespace", ""))
++        return real(path, ids, statuses, read, deadline=deadline, **kw)
++
++    monkeypatch.setattr(busy, "session_tasks", wrapped)
++    ksa.session_tasks(["s1"])
++    assert seen and seen[0] == ""
++    seen.clear()
++    _lean()(["s1"])
++    assert seen and seen[0] == "lean"
+diff --git a/tests/hermes_state/test_session_outcome.py b/tests/hermes_state/test_session_outcome.py
+index 7bcc6148097b2dc90b34d8708109f08dff8afa73..2c53833090d6e4f56ddb68b3071460c183b9e3d3 100644
+--- a/tests/hermes_state/test_session_outcome.py
++++ b/tests/hermes_state/test_session_outcome.py
+@@ -685,7 +685,7 @@ def test_busy_card_read_cannot_derive_done(db, board, monkeypatch, verdict, prio
+     def busy(*args, **kwargs):
+         raise BoardLifecycleBusy("database is locked: board lifecycle is busy")
+ 
+-    monkeypatch.setattr(ksa, "session_tasks", busy)
++    monkeypatch.setattr(ksa, "session_outcome_tasks", busy)
+     so.register_outcome_judge(lambda sid, text: verdict)
+     out = so.refresh_outcome("chat", "turn_end", db=db)
+     if prior_kind in ("waiting", "decision"):
+@@ -704,7 +704,7 @@ def test_empty_card_list_cannot_override_open_counts(db, board, monkeypatch, sta
+              HUMAN_REQUEST if status == "blocked" else None)
+     # Counts retain an open obligation while the independently cached list misses it.
+     assert ksa.active_task_counts().get("chat", 0) + ksa.blocked_task_counts().get("chat", 0) == 1
+-    monkeypatch.setattr(ksa, "session_tasks", lambda *a, **kw: [])
++    monkeypatch.setattr(ksa, "session_outcome_tasks", lambda *a, **kw: [])
+     out = so.derive_outcome("chat", db=db)
+     assert (out["kind"], out.get("reason")) == ("unresolved", "card_read_failed")
+ 
+@@ -715,7 +715,7 @@ def test_empty_card_list_checks_compression_ancestor_counts(db, board, monkeypat
+     db.create_session("tip", source="desktop", parent_session_id="chat")
+     db.append_message("tip", role="assistant", content=SUMMARY)
+     add_card(board, "t_0a6a9f59d9af4492", "chat", "triage")
+-    monkeypatch.setattr(ksa, "session_tasks", lambda *a, **kw: [])
++    monkeypatch.setattr(ksa, "session_outcome_tasks", lambda *a, **kw: [])
+     out = so.derive_outcome("tip", db=db)
+     assert (out["kind"], out.get("reason")) == ("unresolved", "card_read_failed")
+ 
+@@ -792,7 +792,7 @@ def test_same_sid_interleaved_card_reads_are_invocation_local(db, monkeypatch, f
+             nested.append(so.derive_outcome(sid, db=db))
+         return {}
+ 
+-    monkeypatch.setattr(ksa, "session_tasks", cards)
++    monkeypatch.setattr(ksa, "session_outcome_tasks", cards)
+     so.register_outcome_provider("interleave", provider)
+     outer = so.derive_outcome("chat", db=db)
+     failed, succeeded = (outer, nested[0]) if failed_outer else (nested[0], outer)
+@@ -827,7 +827,7 @@ def test_busy_card_read_preserves_authority_but_not_silent_completion(db, monkey
+     def busy(*args, **kwargs):
+         raise BoardLifecycleBusy("database is locked: board lifecycle is busy")
+ 
+-    monkeypatch.setattr(ksa, "session_tasks", busy)
++    monkeypatch.setattr(ksa, "session_outcome_tasks", busy)
+     out = so.refresh_outcome("chat", "manual", db=db)
+     if precedence == "declared":
+         # A declared done cannot outrank an unread card any more than a counted open one.
+diff --git a/tests/tui_gateway/test_actionable_block_notices.py b/tests/tui_gateway/test_actionable_block_notices.py
+index d22ad4138ec69456aaae4950a0957dce356c9779..44e2d9cab3715c54bc53b6c1da9d6ff9189a12ee 100644
+--- a/tests/tui_gateway/test_actionable_block_notices.py
++++ b/tests/tui_gateway/test_actionable_block_notices.py
+@@ -50,7 +50,7 @@ def test_actionable_block_entry_paths(path, case):
+ def test_outcome_rejects_legacy_human_wait_without_evidence(monkeypatch):
+     from hermes_cli import kanban_session_activity as activity
+     import hermes_state_outcome as outcome
+-    monkeypatch.setattr(activity, "session_tasks", lambda *a, **k: [dict(id="t_example", status="blocked", wait={"wait_state": "human"})])
++    monkeypatch.setattr(activity, "session_outcome_tasks", lambda *a, **k: [dict(id="t_example", status="blocked", wait={"wait_state": "human"})])
+     decisions, waits = outcome._card_items(["chat"])
+     assert decisions == []
+     assert waits[0]["id"] == "t_example"
+@@ -77,7 +77,7 @@ def test_deleted_card_is_agent_owned():
+ def test_outcome_decision_keeps_full_validated_action(monkeypatch):
+     from hermes_cli import kanban_session_activity as activity
+     import hermes_state_outcome as outcome
+-    monkeypatch.setattr(activity, "session_tasks", lambda *a, **k: [dict(
++    monkeypatch.setattr(activity, "session_outcome_tasks", lambda *a, **k: [dict(
+         id="t_example", status="blocked", block_kind="needs_input", human_request=dict(ASK))])
+     decisions, waits = outcome._card_items(["chat"])
+     assert waits == []
+-- 
+2.43.0
+

@@ -1,0 +1,133 @@
+From fb335a83d612fa81137c6eae51ae6c53023b8c91 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 13:28:18 +0000
+Subject: [PATCH] [daveey] serialize refused source replay ownership and
+ reservation
+
+Recheck source ownership for every observation under the writer lock, and reopen refused observations to pending in that same transaction. Previously replay skipped the ownership recheck and reopened only before RPC, allowing two active tasks to attach the same external worktree.
+
+Proof: two replay regressions fail on 01dcd05d (missing refusal and refused-vs-pending assertion); restored fix passes 532 tests across 35 source suites. Review t_cbac95a5036702c9 P1.
+---
+ hermes_cli/kanban_source_registration.py      | 20 ++++--
+ .../test_kanban_source_ownership_budget.py    | 62 +++++++++++++++++++
+ 2 files changed, 76 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_source_registration.py b/hermes_cli/kanban_source_registration.py
+index 8568e011a4939af47c2c2447ff8b92644654e2d0..21dd8faa339c5f791508d0966f48dda1dfbb1d23 100644
+--- a/hermes_cli/kanban_source_registration.py
++++ b/hermes_cli/kanban_source_registration.py
+@@ -176,12 +176,20 @@ def _persist_observation(conn, run: board.AttachedRun, *, predecessor=None) -> b
+             _refuse("local run changed during source observation")
+         if run.mode == "initial":
+             _initial_lane(conn, run.task_id, run.run_id)
++        # Recheck ownership under the writer lock so two registrations of one path serialize here. This runs
++        # on every observation, replays included: a definitely refused row owns nothing, so another task may
++        # have registered the path since, and reopening it without the check would attach both.
++        _owned_elsewhere(conn, run.task_id, run.path)
+         prior = board.attached_run(conn, run.run_id)
+         if prior is None:
+-            # Recheck ownership under the writer lock so two registrations of one path serialize here.
+-            _owned_elsewhere(conn, run.task_id, run.path)
+             board.record_run(conn, run, allow_nested=True)
+             prior = run
++        elif prior.state == "refused":
++            # Reopen in the same transaction as the ownership check, so a replay never looks refused (and
++            # never owns nothing) while its attach RPC may still apply.
++            conn.execute("UPDATE kanban_source_runs SET state = 'pending' WHERE run_id = ? AND run_uid = ? "
++                         "AND state = 'refused'", (int(run.run_id), run.run_uid))
++            prior = board.attached_run(conn, run.run_id) or prior
+         fields = ("task_id", "run_uid", "machine", "path", "branch", "mode", "source_protocol", "manifest_revision",
+                   "source_identity")
+         if any(getattr(prior, field) != getattr(run, field) for field in fields):
+@@ -198,11 +206,11 @@ def _persist_observation(conn, run: board.AttachedRun, *, predecessor=None) -> b
+ def _attach_settled(conn, run: board.AttachedRun, mode: str) -> None:
+     """Send the protocol-2 attach for a durable observation and settle it (M3).
+ 
+-    A replay reopens a definitely refused observation before the RPC, so an unanswered replay never looks
+-    refused. Only a refusal proving nothing is attached settles ``refused``; the row is kept as evidence.
+-    Uncertain refusals leave it ``pending``: an earlier unanswered attach of this run may have applied.
++    ``_persist_observation`` has already reopened a definitely refused observation to ``pending`` under the
++    ownership check, so an unanswered replay never looks refused. Only a refusal proving nothing is attached
++    settles ``refused``; the row is kept as evidence. Uncertain refusals leave it ``pending``: an earlier
++    unanswered attach of this run may have applied.
+     """
+-    board.settle_state(conn, run.run_id, run.run_uid, "refused", "pending")
+     try:
+         board.attach(conn, run.task_id, run.run_uid, mode=mode, manifest_revision=0, source_protocol=2)
+     except board.SourceCallRefused as exc:
+diff --git a/tests/hermes_cli/test_kanban_source_ownership_budget.py b/tests/hermes_cli/test_kanban_source_ownership_budget.py
+index 0934c891109859fc2bd043fe9f049ddf512c9bab..81c242b786edd31f35c6c7d3d7bf9d743eb42384 100644
+--- a/tests/hermes_cli/test_kanban_source_ownership_budget.py
++++ b/tests/hermes_cli/test_kanban_source_ownership_budget.py
+@@ -85,6 +85,68 @@ def test_a_definitely_refused_observation_owns_nothing(setup, tmp_path):
+     assert reg.register_initial(conn, other, str(source)).state == "attached"
+ 
+ 
++def test_refused_replay_rechecks_ownership_inside_the_observation_transaction(setup, tmp_path, monkeypatch):
++    """X is definitely refused; X replays while Y registers the same path first: X's transaction refuses."""
++    conn, b, tid, source, _scratch, _home, _clone = setup
++    b.refuse["source_attach"] = "initial_attach_refused"
++    with pytest.raises(launch.AttachRefused):
++        reg.register_initial(conn, tid, str(source))
++    b.refuse.clear()
++    own = kb.get_task(conn, tid).current_run_id
++    assert board.attached_run(conn, own).state == "refused"
++    other = _second_task(conn, tmp_path, f"wt/{tid}")
++    original = reg.source_identity
++    raced = []
++
++    def racing_identity(path, kind, **kwargs):
++        if not raced:
++            raced.append(True)
++            assert reg.register_initial(conn, other, str(source)).state == "attached"
++        return original(path, kind, **kwargs)
++
++    monkeypatch.setattr(reg, "source_identity", racing_identity)
++    with pytest.raises(launch.AttachRefused) as exc:
++        reg.register_initial(conn, tid, str(source))
++    assert raced and "another active task" in exc.value.detail
++    assert board.attached_run(conn, own).state == "refused", "a refused replay must not reopen past the recheck"
++    assert board.attached_run(conn, kb.get_task(conn, other).current_run_id).state == "attached"
++    attaches = [kw for name, kw in _source_calls(b) if kw.get("mode") == "initial"]
++    assert len(attaches) == 2, "X's refused first attach and Y's attach; X's replay must not reach the Board"
++
++
++def test_refused_replay_without_a_competitor_reopens_and_attaches(setup):
++    conn, b, tid, source, _scratch, _home, _clone = setup
++    b.refuse["source_attach"] = "initial_attach_refused"
++    with pytest.raises(launch.AttachRefused):
++        reg.register_initial(conn, tid, str(source))
++    b.refuse.clear()
++    assert reg.register_initial(conn, tid, str(source)).state == "attached"
++
++
++def test_refused_replay_reserves_path_before_attach_rpc(setup, tmp_path, monkeypatch):
++    conn, b, tid, source, _scratch, _home, _clone = setup
++    b.refuse["source_attach"] = "initial_attach_refused"
++    with pytest.raises(launch.AttachRefused):
++        reg.register_initial(conn, tid, str(source))
++    b.refuse.clear()
++    other = _second_task(conn, tmp_path, f"wt/{tid}")
++    original = reg._attach_settled
++    checked = []
++
++    def competing_attach(connection, run, mode):
++        assert board.attached_run(connection, run.run_id).state == "pending"
++        with pytest.raises(launch.AttachRefused) as exc:
++            reg.register_initial(connection, other, str(source))
++        assert "another active task" in exc.value.detail
++        checked.append(True)
++        return original(connection, run, mode)
++
++    monkeypatch.setattr(reg, "_attach_settled", competing_attach)
++    assert reg.register_initial(conn, tid, str(source)).state == "attached"
++    assert checked == [True]
++    assert board.attached_run(conn, kb.get_task(conn, other).current_run_id) is None
++
++
+ def test_a_finished_task_releases_its_external_worktree(setup, tmp_path):
+     conn, _b, tid, source, _scratch, _home, _clone = setup
+     reg.register_initial(conn, tid, str(source))
+-- 
+2.43.0
+

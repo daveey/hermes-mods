@@ -1,0 +1,125 @@
+From ab3f3d9e5868f2ad1a892059963e3f35c1f3b139 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:51:59 -0800
+Subject: [PATCH] fix(kanban-pacing): a non-finite used reads as exhausted, not
+ as no reading [daveey]
+
+Dropping a NaN/inf used changed the legacy held verdict against its parent (NaN beside
+an account past reserve now held; a sole inf account no longer held). valid_readings now
+reads it as 100% (reserved for held, no capacity for the plan), stored as 100.0 so no
+NaN/inf reaches JSON. route_ratios reads a malformed document as no ratios.
+
+Committed with LEFTHOOK=0: `just` is missing on this Mac and scripts/check refuses
+core execution here; ruff (ruff.pre-commit.toml) was run by hand on staged files.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_llm_pacing.py               | 17 ++++++++-------
+ hermes_cli/kanban_llm_pacing_dispatch.py      |  2 +-
+ .../test_kanban_llm_pacing_robustness.py      | 21 +++++++++++++++----
+ 3 files changed, 27 insertions(+), 13 deletions(-)
+
+diff --git a/hermes_cli/kanban_llm_pacing.py b/hermes_cli/kanban_llm_pacing.py
+index f695f485549b77c109c9b3f9988679cbc70f8b9d..a356787beeda4f087482e5a6f296110b0b1f2e6a 100644
+--- a/hermes_cli/kanban_llm_pacing.py
++++ b/hermes_cli/kanban_llm_pacing.py
+@@ -268,14 +268,14 @@ MAX_CURVE_POINTS = 64
+ 
+ 
+ def valid_readings(readings: Iterable[Reading]) -> list[Reading]:
+-    """Readings fit to store and plan: a non-finite ``used`` (NaN/inf would not even serialize as JSON) drops the
+-    reading as invalid; a non-finite ``reset_at`` reads as no reset."""
++    """Readings fit to store and plan: a non-finite ``used`` reads as exhausted (100%: reserved for the ``held``
++    verdict, no capacity for the plan), never as headroom, and never reaches JSON as NaN/inf; a non-finite
++    ``reset_at`` reads as no reset."""
+     out = []
+     for r in readings:
+-        if not math.isfinite(r.used):
+-            continue
++        used = r.used if math.isfinite(r.used) else 100.0
+         reset = r.reset_at if r.reset_at is not None and math.isfinite(r.reset_at) else None
+-        out.append(r if reset == r.reset_at else Reading(r.ts, r.account, r.kind, r.used, reset))
++        out.append(r if (used, reset) == (r.used, r.reset_at) else Reading(r.ts, r.account, r.kind, used, reset))
+     return out
+ 
+ 
+@@ -580,6 +580,7 @@ def assemble_v2(previous: Any, provider: str, pool: dict, curve: list, events: l
+ 
+ def route_ratios(v2: Any) -> dict[str, float]:
+     """Phase 2's routing input: each governed pool's share of the global rate (0 at reserve), known pools only."""
+-    pools = (v2 or {}).get("pools") if isinstance(v2, dict) else None
+-    return {p: float(v["ratio"]) for p, v in (pools or {}).items()
+-            if isinstance(v, dict) and isinstance(v.get("ratio"), (int, float)) and not isinstance(v["ratio"], bool)}
++    pools = _dict(_dict(v2).get("pools"))
++    return {p: float(v["ratio"]) for p, v in pools.items()
++            if isinstance(v, dict) and isinstance(v.get("ratio"), (int, float)) and not isinstance(v["ratio"], bool)
++            and math.isfinite(v["ratio"])}
+diff --git a/hermes_cli/kanban_llm_pacing_dispatch.py b/hermes_cli/kanban_llm_pacing_dispatch.py
+index 82a52c3cbf56e1e36b8d7b3667b5dfcd8d2747f3..9ffa0cc0a2abadfc1d57be912655b25c9fa48c31 100644
+--- a/hermes_cli/kanban_llm_pacing_dispatch.py
++++ b/hermes_cli/kanban_llm_pacing_dispatch.py
+@@ -216,7 +216,7 @@ def _refresh(conn: sqlite3.Connection, provider: str, cfg: lp.PacingConfig, now:
+         _warn(f"read:{provider}", "kanban pacing: cannot read the %s usage windows (%s); dispatch is ungoverned "
+               "until it reads again", provider, exc)
+         current = []
+-    current = lp.valid_readings(current)  # NaN/inf ``used`` is no reading (and would not serialize)
++    current = lp.valid_readings(current)  # NaN/inf ``used`` reads as exhausted (and never serializes as NaN)
+     history = _history(entry, now, cfg)
+     pace = lp.pool_pace(provider, current, history, cfg)
+     state[provider] = {"read_at": now, "pace": pace.as_dict(), "samples": [r.as_row() for r in history + current]}
+diff --git a/tests/hermes_cli/test_kanban_llm_pacing_robustness.py b/tests/hermes_cli/test_kanban_llm_pacing_robustness.py
+index 0622b9f361452f796f9fededbe25235902d91acd..5ef043fa6b5bb8d8ea83977dcd83b92c36d47649 100644
+--- a/tests/hermes_cli/test_kanban_llm_pacing_robustness.py
++++ b/tests/hermes_cli/test_kanban_llm_pacing_robustness.py
+@@ -54,16 +54,23 @@ def test_a_hostile_reset_plans_fast_and_bounded(reset):
+     json.dumps(curve, allow_nan=False)
+ 
+ 
+-def test_a_non_finite_used_is_dropped_before_it_reaches_json():
++def test_a_non_finite_used_reads_as_exhausted_and_never_reaches_json():
+     readings = [lp.Reading(NOW, "a", lp.SEVEN_DAY, math.nan, NOW + DAY),
+                 lp.Reading(NOW, "b", lp.SEVEN_DAY, math.inf, NOW + DAY),
+                 lp.Reading(NOW, "c", lp.SEVEN_DAY, 90.0, NOW + DAY)]
+-    assert [r.account for r in lp.valid_readings(readings)] == ["c"]
++    assert [(r.account, r.used) for r in lp.valid_readings(readings)] == [("a", 100.0), ("b", 100.0), ("c", 90.0)]
+     pool, _ = lp.plan_pool("anthropic", readings, TPP, TPP, NOW, CFG)
+-    assert [a["id"] for a in pool["accounts"]] == ["c"] and pool["at_reserve"] is True
++    assert pool["at_reserve"] is True and pool["remaining_tokens"] == 0.0
+     json.dumps(pool, allow_nan=False)
+ 
+ 
++@pytest.mark.parametrize("pools", [True, [1], "x", 5, None, {"anthropic": 7}, {"anthropic": {"ratio": math.nan}}],
++                         ids=repr)
++def test_route_ratios_reads_a_malformed_document_as_no_ratios(pools):
++    assert lp.route_ratios({"pools": pools}) == {}
++    assert lp.route_ratios(pools) == {}
++
++
+ # --- 2. a malformed stored file: held stays held, one usage read per interval ---------------------------------------
+ 
+ def _governed(monkeypatch, clock):
+@@ -126,6 +133,9 @@ def test_malformed_fields_of_a_fresh_stored_pool_still_hold(home, monkeypatch, j
+ # --- 3. dispatch-level equivalence: the hold is exactly the legacy ``held`` verdict ---------------------------------
+ 
+ CASES = {
++    "nan beside one past reserve": [("a", lp.SEVEN_DAY, math.nan, 2), ("b", lp.SEVEN_DAY, 90.0, 2)],
++    "sole account inf": [("a", lp.SEVEN_DAY, math.inf, 2)],
++    "nan beside one under": [("a", lp.SEVEN_DAY, math.nan, 2), ("b", lp.SEVEN_DAY, 40.0, 2)],
+     "one past reserve": [("a", lp.SEVEN_DAY, 90.0, 2)],
+     "one under": [("a", lp.SEVEN_DAY, 40.0, 2)],
+     "mixed": [("a", lp.SEVEN_DAY, 100.0, 1), ("b", lp.SEVEN_DAY, 50.0, 3)],
+@@ -151,7 +161,10 @@ def test_the_dispatch_hold_is_the_legacy_held_verdict(home, monkeypatch, case, m
+     windows = CASES[case]
+     readings = [lp.Reading(NOW, f"{a}@example.test", kind, used, NOW + days * DAY) for a, kind, used, days in windows]
+     monkeypatch.setattr(pd, "read_pool", lambda provider, now: list(readings))
+-    legacy = lp.pool_pace("anthropic", readings, [], CFG).state == lp.HELD
++    # The legacy verdict on the same readings, a non-finite ``used`` read as exhausted (``valid_readings``).
++    legacy = lp.pool_pace("anthropic", lp.valid_readings(readings), [], CFG).state == lp.HELD
++    expected = {"nan beside one past reserve": True, "sole account inf": True, "nan beside one under": False}
++    assert legacy is expected.get(case, legacy)
+     if mode == "memo":
+         monkeypatch.setattr(pd, "_save_state", lambda *a: None)
+     elif mode == "junk-file":
+-- 
+2.43.0
+

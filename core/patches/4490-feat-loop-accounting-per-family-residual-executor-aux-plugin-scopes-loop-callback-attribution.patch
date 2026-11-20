@@ -1,0 +1,129 @@
+From 67badf72c2859df7f59061e87a3dbe4c208b87b9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 15:49:22 +0000
+Subject: [PATCH] feat(loop-accounting): per-family residual,
+ executor/aux/plugin scopes, loop callback attribution
+
+---
+ agent/aux_provider_handoff.py                    | 14 ++++++++++++++
+ agent/auxiliary_client.py                        | 16 ++--------------
+ hermes_cli/loop_accounting.py                    |  8 ++++----
+ .../hermes_cli/test_loop_accounting_residual.py  |  3 ++-
+ 4 files changed, 22 insertions(+), 19 deletions(-)
+
+diff --git a/agent/aux_provider_handoff.py b/agent/aux_provider_handoff.py
+index 8ff71b8309c9e4d61cf1b53cee73140b0948e9be..9955f937375aa5b5058ab640cd75514b7031a276 100644
+--- a/agent/aux_provider_handoff.py
++++ b/agent/aux_provider_handoff.py
+@@ -182,3 +182,17 @@ def release_client(client: Any, close: Callable[[Any], None], abandoned: list[Pr
+     if deferred:
+         logger.info("auxiliary client close handed to %d abandoned provider daemon(s) (tcp_shutdown=%d)",
+                     deferred, shutdown_count)
++
++
++def provider_worker_scope() -> Any:
++    """Loop-accounting residual scope ``aux_provider/<initiating operation>`` for a protected provider daemon
++    (run inside the daemon, whose context copy carries the relay task name; never prompt or token content).
++    A no-op context when accounting cannot load."""
++    try:
++        from agent.auxiliary_client import _RELAY_AUX_CALL_CONTEXT
++        from hermes_cli import loop_accounting
++        operation = str((_RELAY_AUX_CALL_CONTEXT.get() or {}).get("task") or "unknown")[:48]
++        return loop_accounting.scope(f"aux_provider/{operation}")
++    except Exception:  # health: allow BLE001 -- accounting must never fail a provider call
++        logger.debug("aux provider scope unavailable", exc_info=True)
++        return contextlib.nullcontext()
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index 85182992c32a6bca445a3d852e80a9d5e6ee55bd..95245c75c2da049678e34da35c3df0411fc3f25a 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -39,7 +39,7 @@ from agent.errors import InvalidProviderResponseError
+ from agent.auxiliary_fallback_recovery import reapply_repairs
+ from agent.auxiliary_call_scope import aux_call_scope
+ from agent.auxiliary_managed_local import _is_managed_local_endpoint
+-from agent.aux_provider_handoff import ProviderAttempt, note_abandoned as note_abandoned_provider_call, run_in_thread
++from agent.aux_provider_handoff import ProviderAttempt, note_abandoned as note_abandoned_provider_call, provider_worker_scope, run_in_thread
+ from agent.auxiliary_probe_stub import _AuxProbeClientStub
+ from agent.auxiliary_reasoning_floor import remember_reasoning_floor, with_reasoning_floor
+ from agent.auxiliary_profile_gates import (
+@@ -435,15 +435,6 @@ def aux_stream_deadline(deadline: float | Callable[[], float | None] | None):
+         _aux_stream_deadline.value = previous
+ 
+ 
+-def _loop_accounting_scope(name: str):
+-    """Residual CPU scope for ``name`` (a no-op context if loop accounting cannot import)."""
+-    try:
+-        from hermes_cli import loop_accounting
+-        return loop_accounting.scope(name)
+-    except Exception:  # health: allow BLE001 -- accounting must never fail a provider call
+-        return contextlib.nullcontext()
+-
+-
+ def _run_protected_sync_provider_call(callback: Callable[[dict[str, Any]], Any], kwargs: dict[str, Any]) -> Any:
+     """Run one protected provider callback in an attempt-isolated daemon thread.
+ 
+@@ -469,13 +460,10 @@ def _run_protected_sync_provider_call(callback: Callable[[dict[str, Any]], Any],
+     # The daemon consumes the stream: an owner-thread-only deadline would be inert (#99692).
+     provider_context = contextvars.copy_context()
+     done, outcome, attempt = threading.Event(), {}, ProviderAttempt()
+-
+-    operation = str((_RELAY_AUX_CALL_CONTEXT.get() or {}).get("task") or "unknown")[:48]  # initiating operation only
+-
+     def _provider_worker() -> None:
+         try:
+             with (
+-                _loop_accounting_scope(f"aux_provider/{operation}"),
++                provider_worker_scope(),
+                 aux_progress_hook(progress_hook),
+                 _aux_thread_local_hook(_aux_dispatch, dispatch_hook),
+                 _aux_thread_local_hook(_aux_provider_response, provider_response_hook),
+diff --git a/hermes_cli/loop_accounting.py b/hermes_cli/loop_accounting.py
+index 12270d3d0a75bd425317ade274f41e12cf765319..e4c21ab12e5c0ba389d9f6134af5a5fa59b382d4 100644
+--- a/hermes_cli/loop_accounting.py
++++ b/hermes_cli/loop_accounting.py
+@@ -813,7 +813,7 @@ def _callback_key(cb: Any) -> str:
+             coro = get_coro()
+             return f"loop_cb/{getattr(coro, '__qualname__', None) or type(coro).__name__}"
+         except Exception:  # health: allow BLE001 -- a label only
+-            pass
++            logger.debug("loop accounting: callback label unavailable", exc_info=True)
+     return "loop_cb/" + _callable_name(cb)
+ 
+ 
+@@ -890,7 +890,7 @@ def instrument_callbacks() -> bool:
+             try:
+                 _book_callback(_callback_key(self._callback), cpu, _perf() - w0, tid, acc0)
+             except Exception:  # health: allow BLE001 -- accounting must never break a loop callback
+-                pass
++                logger.debug("loop accounting: callback booking failed", exc_info=True)
+ 
+     _run._la_orig = orig  # type: ignore[attr-defined]
+     ev.Handle._run = _run  # type: ignore[method-assign]
+@@ -905,8 +905,8 @@ def uninstrument() -> None:
+         try:
+             import anyio.to_thread as at
+             at.run_sync = at.run_sync._la_orig  # type: ignore[attr-defined]
+-        except Exception:  # health: allow BLE001
+-            pass
++        except ImportError:  # no anyio: nothing to restore
++            logger.debug("loop accounting: anyio not restored", exc_info=True)
+     if _instrumented.pop("callbacks", None):
+         import asyncio.events as ev
+         ev.Handle._run = ev.Handle._run._la_orig  # type: ignore[attr-defined]
+diff --git a/tests/hermes_cli/test_loop_accounting_residual.py b/tests/hermes_cli/test_loop_accounting_residual.py
+index 687dc9659214d0b63aac8968115c6b570e51ab26..b367884a506ff456d10485b1718364b440a292ac 100644
+--- a/tests/hermes_cli/test_loop_accounting_residual.py
++++ b/tests/hermes_cli/test_loop_accounting_residual.py
+@@ -255,7 +255,8 @@ def test_callback_keys_are_capped_with_an_other_bucket():
+             ns = {}
+             exec(f"def cb_{i}(): pass", ns)
+             loop.call_soon(ns[f"cb_{i}"])
+-        await asyncio.sleep(0.05)
++        for _ in range(4):
++            await asyncio.sleep(0)
+ 
+     asyncio.run(main())
+     keys = [k for k in la.counters() if k.startswith("loop_cb/")]
+-- 
+2.43.0
+

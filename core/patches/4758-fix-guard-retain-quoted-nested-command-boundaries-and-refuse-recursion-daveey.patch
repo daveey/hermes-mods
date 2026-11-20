@@ -1,0 +1,149 @@
+From b053dcb202561155d6b4ae2229cfae7b54f8c410 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 00:47:26 +0000
+Subject: [PATCH] fix(guard): retain quoted nested command boundaries and
+ refuse recursion [daveey]
+
+Catch recursive frame exhaustion at the public scanner boundary rather than
+retrying the same parser in the last-resort path. Carry inner command newline
+offsets through double-quoted parameter frames; also retain complete outer
+logical words so splitting cannot erase arguments or heredoc context.
+
+Regression proof at 8d981897fe: 2 RUN failures, 2 clean twins pass. Candidate:
+4 pass; all 74 lifecycle consumers: 10922 passed, 0 failed. Literal deep nesting
+is the allowed twin of executable over-budget nesting (which must refuse).
+---
+ cron/lifecycle_guard.py                       |  3 +-
+ cron/lifecycle_guard_lines.py                 | 27 ++++++++++++----
+ ...fecycle_guard_nested_review_regressions.py | 32 +++++++++++++++++++
+ 3 files changed, 54 insertions(+), 8 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_nested_review_regressions.py
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index 72039f219841c404943e71cf54e38fc513f147f7..c1e9a36cabc77d30bea536dbb90d308417746f0a 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -1822,7 +1822,8 @@ def scan_gateway_lifecycle(
+             read_remote_script=read_remote_script, source=source,
+         )
+         return unsafe, budget.refusal if unsafe else None
+-    except SubstitutionNestingLimit:
++    except (SubstitutionNestingLimit, RecursionError):
++        # Frame walkers can exhaust Python's stack before the substitution budget.
+         # Retrying the direct scanner would hit the same parser limit again.
+         return True, 'the substitution nesting limit was reached'
+     except Exception:
+diff --git a/cron/lifecycle_guard_lines.py b/cron/lifecycle_guard_lines.py
+index 78110c59e17063bfb408b6321f7d925bddef6f6b..c3df04d333237ddd21dca820057eaf4c06f96daf 100644
+--- a/cron/lifecycle_guard_lines.py
++++ b/cron/lifecycle_guard_lines.py
+@@ -27,10 +27,11 @@ def _quoted_end(text: str, start: int, closer: str, *, escapes: bool = True) ->
+     return len(text)
+ 
+ 
+-def _double_span(text: str, start: int, *, shlex_quotes: bool) -> tuple[int, str]:
++def _double_span(text: str, start: int, *, shlex_quotes: bool,
++                 breaks: list[int] | None = None) -> tuple[int, str]:
+     """A substitution's quotes belong to its own frame, not the enclosing word."""
+     pos = copied = start
+-    parts = ['"']
++    parts = _OutputParts('"')
+     while pos < len(text):
+         char = text[pos]
+         if char == "\\":
+@@ -40,8 +41,11 @@ def _double_span(text: str, start: int, *, shlex_quotes: bool) -> tuple[int, str
+             pos += 1
+             break
+         if char in "$`":
+-            end, span = _expansion(text, pos, in_double=True, shlex_quotes=shlex_quotes)
++            nested = [] if breaks is not None else None
++            end, span = _expansion(text, pos, in_double=True, shlex_quotes=shlex_quotes,
++                                   breaks=nested)
+             if span:
++                _shift_breaks(breaks, nested, _out_len(parts) + pos - copied)
+                 if shlex_quotes:
+                     span = span.replace("\\", "\\\\").replace('"', '\\"')
+                 parts.extend((text[copied:pos], span))
+@@ -404,7 +408,9 @@ def _parameter_span(text: str, start: int, *, shlex_quotes: bool,
+             pos += 2
+             continue
+         if char == '"':
+-            end, span = _double_span(text, pos + 1, shlex_quotes=shlex_quotes)
++            nested = [] if breaks is not None else None
++            end, span = _double_span(text, pos + 1, shlex_quotes=shlex_quotes, breaks=nested)
++            _shift_breaks(breaks, nested, _out_len(parts) + pos - copied)
+             parts.extend((text[copied:pos], span))
+             pos = copied = end
+             continue
+@@ -502,7 +508,8 @@ def _plain_word(text: str, pos: int) -> str | None:
+ _CONTINUATION = re.compile(r"\\\r?\n[ \t]*")
+ 
+ 
+-def _scan(text: str, *, split: bool, keep_comments: bool, shlex_quotes: bool = False) -> list[str]:
++def _scan(text: str, *, split: bool, keep_comments: bool, shlex_quotes: bool = False,
++          nested_breaks: bool = True) -> list[str]:
+     """*text* as one string or (*split*) as logical lines: newlines outside quotes separate them
+     (a quoted newline is data). Honors quotes and escapes. Comments are dropped, or with
+     *keep_comments* kept without the backslashes they end with (no continuation)."""
+@@ -519,7 +526,7 @@ def _scan(text: str, *, split: bool, keep_comments: bool, shlex_quotes: bool = F
+                 and not text.startswith("$(", pos)):
+             # Root $() traversal stays visible to logical-line consumers; only
+             # nested opaque words need the substitution framed as a whole.
+-            breaks: list[int] | None = [] if split and not in_double else None
++            breaks: list[int] | None = [] if split and nested_breaks else None
+             end, span = _expansion(text, pos, in_double=in_double, shlex_quotes=shlex_quotes,
+                                    breaks=breaks)
+             if span:
+@@ -600,4 +607,10 @@ def join_line_continuations(text: str) -> str:
+ def _split_logical_lines(text: str) -> list[str]:
+     """Split on newlines outside quotes (a quoted newline is data, not a separator); honors
+     escapes and drops comments, so a quote in a comment opens nothing."""
+-    return _scan(text, split=True, keep_comments=False)
++    lines = _scan(text, split=True, keep_comments=False)
++    if '${' in text:
++        # Also retain whole outer words: splitting inner commands must not erase
++        # the enclosing command's redirections, arguments, or heredoc context.
++        whole = _scan(text, split=True, keep_comments=False, nested_breaks=False)
++        lines = list(dict.fromkeys([*lines, *whole]))
++    return lines
+diff --git a/tests/cron/test_lifecycle_guard_nested_review_regressions.py b/tests/cron/test_lifecycle_guard_nested_review_regressions.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..76220d9892f32048218623cf6aad2e53cea6fc4a
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_nested_review_regressions.py
+@@ -0,0 +1,32 @@
++"""Real-shell execution and clean twins for nested-frame review regressions."""
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from tests.cron.test_lifecycle_guard_fd_redirections import _bash_runs, _tree
++
++DEEP = '${x:-$(' * 199 + 'true' + ')}' * 199
++RUN = [
++    'echo ' + DEEP + '; bash ./r.sh',
++    'echo "${x:-${y:-"\'"} "$(true\nbash ./r.sh)"}"',
++]
++CLEAN = [
++    "echo '" + DEEP + "'; python3 ./clean.py",
++    RUN[1].replace('bash ./r.sh', 'python3 ./clean.py'),
++]
++
++
++@pytest.mark.parametrize('command', RUN)
++def test_review_run(tmp_path, command):
++    _tree(tmp_path)
++    assert _bash_runs(tmp_path, command)
++    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert unsafe
++    if command == RUN[0]:
++        assert refusal == 'the substitution nesting limit was reached'
++
++
++@pytest.mark.parametrize('command', CLEAN)
++def test_review_clean(tmp_path, command):
++    _tree(tmp_path)
++    assert not _bash_runs(tmp_path, command)
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
+-- 
+2.43.0
+

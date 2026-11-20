@@ -1,0 +1,353 @@
+From a815b31a31e860dc237a9c5788fea171d3448b6b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 21:23:28 -0800
+Subject: [PATCH] ci(macos): let the three room-mini runners serve the macOS
+ lanes [daveey]
+
+Operator note (2026-11-14): keep the macOS runners on custom runners and use all
+three Mac minis. The office minis a, b and c now each run a
+dedicated example-org/hermes runner as the hidden non-GUI ci
+user (LaunchDaemon, nice 19 + low-priority I/O, /Users/ci/actions-runner-hermes).
+
+Two things pinned the lanes to the mini's runner:
+- hermes_state (macOS)'s first step refused every runner root except
+  /Users/me/ci-runner-hermes-state, so a job on a room mini would fail
+  before checkout. It now selects its root from a two-entry allowlist by
+  RUNNER_TEMP and keeps every other guard.
+- recover_macos_runner.py reran a runner-lost job only on mini-hermes-state-1.
+  It now accepts the four dedicated runner names (RUNNER_NAMES); a non-str
+  runner name is refused instead of raising.
+
+Runner labels decide which hosts take jobs, so no runs-on changes. Comments
+that described "the one mini runner" now describe the pool.
+
+Tests (Mac, hermes-core-wt test --local, 0 skips): checkout retention 32,
+recover 67, macos-os workflow 26. Predictions written first. Mutants killed:
+cleanup ignoring the RUNNER_TEMP selection (1 fail), recover back to the
+single name (3 fail), runner-name check removed (4 fail), str guard dropped
+(1 fail). Equivalent: falling back to the first root when none matches (the
+expected-environment RUNNER_TEMP equality refuses the same inputs).
+---
+ .github/workflows/hermes-state-macos.yml  | 35 +++++++++++++++++------
+ .github/workflows/macos-os-tests.yml      | 10 +++----
+ .github/workflows/native-memory-macos.yml |  4 +--
+ scripts/ci/macos_os_tests_gate.py         | 20 ++++++-------
+ scripts/ci/recover_macos_runner.py        | 24 ++++++++++------
+ tests/ci/test_macos_checkout_retention.py | 33 +++++++++++++++++++--
+ tests/ci/test_recover_macos_runner.py     | 17 +++++++++++
+ 7 files changed, 107 insertions(+), 36 deletions(-)
+
+diff --git a/.github/workflows/hermes-state-macos.yml b/.github/workflows/hermes-state-macos.yml
+index 47a36321a3849ec45b50369de0cc86477e87a485..27521104e5a902b041bcd43c6854e571f9a851c5 100644
+--- a/.github/workflows/hermes-state-macos.yml
++++ b/.github/workflows/hermes-state-macos.yml
+@@ -5,10 +5,13 @@ name: hermes_state (macOS)
+ # darwin-only divergence (65 failures, fixed in a408ba1b05) stayed green for
+ # weeks. This lane closes that gap.
+ #
+-# Runner: self-hosted on the Mac mini (labels self-hosted, macOS, hermes-state),
+-# a dedicated launchd user agent (com.daveey.ci-runner-hermes-state) with its own
+-# work dir, one job at a time. GitHub-hosted runners are not used (account
+-# billing refusal), so this lane does not depend on billing.
++# Runners: self-hosted, labels self-hosted, macOS, hermes-state. Each is a
++# dedicated runner with its own work dir, one job at a time: the three office
++# room Mac minis (ex-{a,b,c}-...-hermes, a hidden non-GUI ci
++# user's LaunchDaemon at nice 19 + low-priority I/O) and the Mac mini's launchd
++# user agent (com.daveey.ci-runner-hermes-state). Which of them carry the label
++# is runner configuration, not this file. GitHub-hosted runners are not used
++# (account billing refusal), so this lane does not depend on billing.
+ #
+ # ci.yaml calls this for selected same-repository PRs and release/dispatch runs.
+ # Its macOS state required (v1) consumer requires success when selected.
+@@ -31,8 +34,9 @@ name: hermes_state (macOS)
+ # Renaming or moving this file needs that SCHEDULED entry updated too.
+ #
+ # HERMES_HOME points at a throwaway temp dir, so the lane writes none of the live
+-# ~/.hermes's config, state, sessions or environments. The runner is the daveey
+-# login (HOME=/Users/me, same APFS volume as RUNNER_TEMP), so the temp home
++# ~/.hermes's config, state, sessions or environments. The runner is its host's
++# CI login (operator on the mini, ci on the office minis; HOME on the same APFS
++# volume as RUNNER_TEMP), so the temp home
+ # BORROWS that account's content-checked state (pm/AGENTS.md, Homes that borrow
+ # the account's state): run_tests.sh provisions from its tool store when the
+ # pins match, pm hard-links its verified tool entries and unchanged snapshot
+@@ -69,7 +73,7 @@ concurrency:
+ jobs:
+   hermes-state-macos:
+     name: tests/hermes_state (macOS, mini)
+-    # Defense in depth for other callers: fork PR code never reaches the mini.
++    # Defense in depth for other callers: fork PR code never reaches a self-hosted runner.
+     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+     runs-on: [self-hosted, macOS, hermes-state]
+     # Include cold environment provisioning and reduced-priority shared-host work.
+@@ -87,9 +91,21 @@ jobs:
+           import shutil
+           import subprocess
+ 
+-          ROOT = Path('/Users/me/ci-runner-hermes-state')
++          # Dedicated runner roots: the Mac mini's operator login agent and the
++          # office minis' ci LaunchDaemons (one job at a time each).
++          ROOTS = (
++              Path('/Users/me/ci-runner-hermes-state'),
++              Path('/Users/ci/actions-runner-hermes'),
++          )
+ 
+           def prepare():
++              # Use the root this runner runs from; any other runner or user
++              # checkout matches none and is refused before anything is read.
++              matches = [root for root in ROOTS
++                         if os.environ.get('RUNNER_TEMP') == str(root / '_work' / '_temp')]
++              if len(matches) != 1:
++                  raise RuntimeError('Refusing cleanup outside dedicated CI workspace')
++              ROOT = matches[0]
+               work = ROOT / '_work'
+               expected = {
+                   'GITHUB_ACTIONS': 'true',
+@@ -152,7 +168,8 @@ jobs:
+           HERMES_HOME="$(mktemp -d "${RUNNER_TEMP:-/tmp}/hermes-home.XXXXXX")"
+           export HERMES_HOME
+           trap 'rm -rf "$HERMES_HOME"' EXIT
+-          # The mini also runs BabyBear services and Desktop builds/signing: utility QoS lets
++          # The hosts also run other work (the mini: example-app services, Desktop builds and
++          # signing; the office minis: meetings, signage, example-app CI): utility QoS lets
+           # macOS put those first, and 2 workers instead of 4 halve this lane's CPU.
+           taskpolicy -c utility scripts/run_tests.sh tests/hermes_state/ -j 2
+         env:
+diff --git a/.github/workflows/macos-os-tests.yml b/.github/workflows/macos-os-tests.yml
+index 379ec89068d3bc01a155af84e073bce6c3efd5d3..2023d8ed53f0e5e400683e107d7615cf02bee709 100644
+--- a/.github/workflows/macos-os-tests.yml
++++ b/.github/workflows/macos-os-tests.yml
+@@ -7,15 +7,15 @@ name: macOS OS-marked tests (scheduled)
+ # ran those tests on Darwin. Decision: kanban t_01a1d5b9382b24ad, option B
+ # (scheduled, non-required; not a PR lane).
+ #
+-# Runner: the Mac mini's self-hosted runner (labels self-hosted, macOS,
+-# hermes-state), the same one that serves the REQUIRED hermes_state (macOS)
+-# and Native memory PR lanes and is already saturated by them. So this lane:
++# Runners: the self-hosted macOS runners (labels self-hosted, macOS,
++# hermes-state: the room minis and the Mac mini), the same ones that serve the
++# REQUIRED hermes_state (macOS) and Native memory PR lanes. So this lane:
+ #   * never runs on a pull request and is not part of "All required checks
+ #     pass (v2)";
+ #   * runs twice a day, 00:37 and 12:37 UTC (00-01 UTC had the fewest PR runs
+ #     on 2026-11-11/12; agent PRs land around the clock, so the gate below,
+ #     not the hour, is what keeps it out of the way);
+-#   * yields: a `gate` job on Linux skips the slot when any job for the mini's
++#   * yields: a `gate` job on Linux skips the slot when any job for that
+ #     label is already waiting for a runner (scripts/ci/macos_os_tests_gate.py);
+ #     the next slot tries again. A manual dispatch is never gated;
+ #   * runs at utility QoS with 2 workers, like the hermes_state lane.
+@@ -28,7 +28,7 @@ name: macOS OS-marked tests (scheduled)
+ #
+ # Probe the lane before merging a change to it by pushing a
+ # `macos-os-probe/**` branch (deliberately not ci-probe/**, which also starts
+-# the hermes_state lane on the same runner).
++# the hermes_state lane on the same runners).
+ 
+ on:
+   schedule:
+diff --git a/.github/workflows/native-memory-macos.yml b/.github/workflows/native-memory-macos.yml
+index 88aa1950b46d95588632a1fa95515e2d7c4613ce..a9279a27acb13ab1bb43dfeca06d9c1a59efae20 100644
+--- a/.github/workflows/native-memory-macos.yml
++++ b/.github/workflows/native-memory-macos.yml
+@@ -9,7 +9,7 @@ name: Native memory (macOS)
+ # dispatch / release. "All required checks pass (v2)" then requires its success,
+ # so the PR cannot land with this lane pending, skipped or red. There is no
+ # pull_request trigger here: a second, unrequired copy of the job would only
+-# hold the one mini runner. Main pushes run here directly; CI masks its
++# hold a macOS runner. Main pushes run here directly; CI masks its
+ # duplicate call only on main pushes.
+ on:
+   push:
+@@ -44,7 +44,7 @@ concurrency:
+ jobs:
+   native-memory:
+     name: Native memory ABI and no-fork tests
+-    # Defense in depth for other callers: fork PR code never reaches the mini.
++    # Defense in depth for other callers: fork PR code never reaches a self-hosted runner.
+     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+     runs-on: [self-hosted, macOS, hermes-state]
+     timeout-minutes: 30
+diff --git a/scripts/ci/macos_os_tests_gate.py b/scripts/ci/macos_os_tests_gate.py
+index 00dbb04595905a17691ce15e1e4e95e155f42044..882081cd46b4ace983448f60e41a65c6412d86a8 100644
+--- a/scripts/ci/macos_os_tests_gate.py
++++ b/scripts/ci/macos_os_tests_gate.py
+@@ -1,14 +1,14 @@
+ #!/usr/bin/env python3
+-"""Decide whether a scheduled macOS OS-marked test run may take the mini.
+-
+-Called by .github/workflows/macos-os-tests.yml before its job on the Mac mini's
+-self-hosted runner (labels self-hosted, macOS, hermes-state). That one runner
+-also serves the required hermes_state (macOS) and Native memory lanes of pull
+-requests, and it is already saturated by them. So the scheduled run yields:
+-when any job for the mini's label is waiting for a runner (queued, waiting,
+-pending or requested) in another workflow run, this run skips, and the next
+-schedule slot tries again. A job that is already running on the mini is not a
+-reason to skip: ours queues behind one job, it does not starve a queue.
++"""Decide whether a scheduled macOS OS-marked test run may take a macOS runner.
++
++Called by .github/workflows/macos-os-tests.yml before its job on the self-hosted
++macOS runners (labels self-hosted, macOS, hermes-state: the room minis and the
++Mac mini). They also serve the required hermes_state (macOS) and Native memory
++lanes of pull requests, which come first. So the scheduled run yields: when any
++job for that label is waiting for a runner (queued, waiting, pending or
++requested) in another workflow run, this run skips, and the next schedule slot
++tries again. A job that is already running is not a reason to skip: ours queues
++behind running jobs, it does not starve a queue.
+ 
+ Only ``schedule`` runs are gated. A manual dispatch or a probe push always runs.
+ If the API cannot be read, the run goes ahead (fail open to testing): a
+diff --git a/scripts/ci/recover_macos_runner.py b/scripts/ci/recover_macos_runner.py
+index 1b7b88c43553d5d36a57ab3652e9377ee809b5f4..e6c202ae5ec87f561f6346536633940deff824f5 100644
+--- a/scripts/ci/recover_macos_runner.py
++++ b/scripts/ci/recover_macos_runner.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-"""Rerun a macOS state job once when the mini's self-hosted runner was lost.
++"""Rerun a macOS state job once when its dedicated self-hosted runner was lost.
+ 
+ Called by .github/workflows/hermes-state-recovery.yml on ``workflow_run``
+ (completed) for CI and hermes_state (macOS). That workflow checks out only its
+@@ -14,9 +14,9 @@ when ALL of these hold, read from the API, not only from the event payload:
+ * the workflow file is one of the approved paths;
+ * the run is attempt 1, completed, conclusion ``failure``;
+ * attempt 1 has exactly one job with the approved macOS job name for that
+-  workflow, it ran on ``mini-hermes-state-1``, failed, no step reports a
+-  failure, and every failure annotation on it is GitHub's exact runner-loss
+-  message;
++  workflow, it ran on one of the dedicated runners (``RUNNER_NAMES``), failed,
++  no step reports a failure, and every failure annotation on it is GitHub's
++  exact runner-loss message;
+ * every other non-successful job in attempt 1 is a known downstream aggregate
+   (which rerun-failed-jobs reruns anyway as a dependent);
+ * immediately before the POST the run is re-read and is still attempt 1,
+@@ -41,7 +41,14 @@ from dataclasses import dataclass
+ from typing import Any, Protocol
+ 
+ TRUSTED_REPOSITORY = "example-org/hermes"
+-RUNNER_NAME = "mini-hermes-state-1"
++# The dedicated self-hosted runners of the macOS lanes (label hermes-state):
++# the Mac mini's operator login agent and the office minis' ci daemons.
++RUNNER_NAMES = frozenset({
++    "mini-hermes-state-1",
++    "office-mini-a-hermes",
++    "office-mini-b-hermes",
++    "office-mini-c-hermes",
++})
+ MACOS_JOB = "tests/hermes_state (macOS, mini)"
+ 
+ # Approved workflow file -> exact job name of the macOS lane in that workflow,
+@@ -160,8 +167,9 @@ def _job_problem(job: dict[str, Any], annotations: list[Any]) -> str | None:
+         return f"job attempt is {job.get('run_attempt')!r}, not 1"
+     if job.get("status") != "completed" or job.get("conclusion") != "failure":
+         return f"job is {job.get('status')!r}/{job.get('conclusion')!r}, not completed/failure"
+-    if job.get("runner_name") != RUNNER_NAME:
+-        return f"job ran on {job.get('runner_name')!r}, not {RUNNER_NAME!r}"
++    runner = job.get("runner_name")
++    if not isinstance(runner, str) or runner not in RUNNER_NAMES:
++        return f"job ran on {runner!r}, not a dedicated macOS runner"
+     failed_steps = [s.get("name") for s in job.get("steps") or [] if s.get("conclusion") == "failure"]
+     if failed_steps:
+         return f"step(s) failed: {failed_steps}"
+@@ -230,7 +238,7 @@ def recover(event: dict[str, Any], api: Api, *, repository: str = TRUSTED_REPOSI
+         pull = api.get(f"repos/{repository}/pulls/{pulls[0]['number']}")
+         if pull.get("state") != "open" or (pull.get("head") or {}).get("sha") != run.get("head_sha"):
+             return _skip("PR closed or head superseded", run_id)
+-    reason = f"runner lost on {RUNNER_NAME}; rerunning failed jobs of attempt 1"
++    reason = f"runner lost on {target['runner_name']}; rerunning failed jobs of attempt 1"
+     if dry_run:
+         return Decision("rerun", reason, run_id, dry_run=True)
+     api.post(f"{run_path}/rerun-failed-jobs")
+diff --git a/tests/ci/test_macos_checkout_retention.py b/tests/ci/test_macos_checkout_retention.py
+index 05dce116110e0ef7fe077bd72829b8f60d83785a..58fbc3064148ac9f726228c5fc3ab88c8e4013a1 100644
+--- a/tests/ci/test_macos_checkout_retention.py
++++ b/tests/ci/test_macos_checkout_retention.py
+@@ -23,12 +23,12 @@ def boundary(tmp_path, monkeypatch):
+     tree = ast.parse(first['run'])
+     assert isinstance(tree.body[-1], ast.Expr)
+     assert ast.unparse(tree.body[-1]) == 'prepare()'
+-    # Load definitions, then replace only the hard-coded root with a temp tree.
++    # Load definitions, then replace only the hard-coded runner roots with a temp tree.
+     tree.body.pop()
+     namespace = {}
+     exec(compile(tree, '<workflow-cleanup>', 'exec'), namespace)
+     root = tmp_path / 'ci-runner-hermes-state'
+-    namespace['ROOT'] = root
++    namespace['ROOTS'] = (root,)
+     work = root / '_work'
+     current = work / 'daveey-hermes/daveey-hermes'
+     old = work / 'hermes'
+@@ -112,6 +112,35 @@ def test_explicit_ci_allowlist(boundary, monkeypatch, key):
+     assert (current / 'sentinel').exists() and (old / 'sentinel').exists()
+ 
+ 
++def test_real_roots_are_the_mini_agent_and_room_mini_daemons():
++    tree = ast.parse(steps()[0]['run'])
++    tree.body.pop()
++    namespace = {}
++    exec(compile(tree, '<workflow-cleanup>', 'exec'), namespace)
++    assert namespace['ROOTS'] == (Path('/Users/me/ci-runner-hermes-state'),
++                                  Path('/Users/ci/actions-runner-hermes'))
++
++
++def test_runner_from_a_later_listed_root_cleans_its_own_checkout(boundary, tmp_path):
++    # A room mini's runner root is listed after the mini's: selection follows
++    # RUNNER_TEMP, not list order.
++    prepare, current, old, calls = boundary
++    prepare.__globals__['ROOTS'] = (tmp_path / 'other-runner', *prepare.__globals__['ROOTS'])
++    prepare()
++    assert list(current.iterdir()) == []
++    assert not old.exists()
++    assert calls == [current, old]
++
++
++def test_runner_from_an_unlisted_root_is_refused(boundary, tmp_path):
++    prepare, current, old, calls = boundary
++    prepare.__globals__['ROOTS'] = (tmp_path / 'other-runner',)
++    with pytest.raises(RuntimeError, match='outside dedicated CI'):
++        prepare()
++    assert not calls
++    assert (current / 'sentinel').exists() and (old / 'sentinel').exists()
++
++
+ @pytest.mark.parametrize('ancestor', [False, True])
+ def test_symlink_target_or_ancestor_refused(boundary, tmp_path, ancestor):
+     prepare, current, old, _ = boundary
+diff --git a/tests/ci/test_recover_macos_runner.py b/tests/ci/test_recover_macos_runner.py
+index 44a4a48599fba413649e7fec762d03b8812cbbcc..2eb028f725e3d86beb84344e1d505d158cdad4e6 100644
+--- a/tests/ci/test_recover_macos_runner.py
++++ b/tests/ci/test_recover_macos_runner.py
+@@ -120,6 +120,21 @@ def test_historical_runner_loss_reruns_failed_jobs_once():
+     assert api.posts == [f"repos/{REPO}/actions/runs/41003441463/rerun-failed-jobs"]
+ 
+ 
++# The mini's agent and the three office minis' ci daemons (listed here,
++# not read from the module, so an emptied allowlist cannot pass vacuously).
++DEDICATED_RUNNERS = ["mini-hermes-state-1", "office-mini-a-hermes",
++                     "office-mini-b-hermes", "office-mini-c-hermes"]
++
++
++@pytest.mark.parametrize("runner", DEDICATED_RUNNERS)
++def test_runner_loss_on_each_dedicated_runner_reruns_once(runner):
++    run, api = _loss(job_changes={"runner_name": runner})
++    decision = recover.recover(_event(run), api, repository=REPO)
++    assert decision.action == "rerun", decision.reason
++    assert f"runner lost on {runner};" in decision.reason
++    assert api.posts == [f"repos/{REPO}/actions/runs/{run['id']}/rerun-failed-jobs"]
++
++
+ # --- run 40751299089: ordinary test failure (real, historical) ---------------------
+ TEST_FAILURE_RUN = {
+     "id": 40751299089, "name": "hermes_state (macOS)",
+@@ -278,6 +293,8 @@ def test_api_state_overrides_a_stale_or_forged_event():
+ @pytest.mark.parametrize("job_changes,fragment", [
+     ({"runner_name": "mini-hermes-state-2"}, "ran on"),
+     ({"runner_name": None}, "ran on"),
++    ({"runner_name": "office-mini-a"}, "ran on"),
++    ({"runner_name": ["office-mini-a-hermes"]}, "ran on"),
+     ({"name": "tests/hermes_state (macOS, mini) "}, "expected exactly one"),
+     ({"name": "hermes_state (macOS) / tests/hermes_state (macOS, mini)"}, "expected exactly one"),
+     ({"conclusion": "cancelled"}, "not completed/failure"),
+-- 
+2.43.0
+

@@ -1,0 +1,690 @@
+From 6291d495e932c7641c1e2f9564c259db29787635 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 22:21:24 -0800
+Subject: [PATCH] [daveey] Kanban churn guards: cap parent handoffs in worker
+ context, wait-comment --from-card, tell a commenter when a parked card will
+ not wake
+
+Three causes of card churn measured on 2026-11-18 (t_c850e0f6, t_5f0d878cd1c10371, t_0b716b01a47db7f6):
+
+- Worker context: done-parent handoffs are capped at the 8 most recently completed; older ones are named in
+  one line. Long-lived owner cards had 22 and 30 finished prerequisites linked (51 KB and 42 KB of ~100 KB).
+  Cards with 8 or fewer done parents are unchanged.
+- wait-comment --from-card <task id>: wake on a comment written by one card's worker instead of a phrase the
+  other card has to reproduce. A worker commenting on another card now records writer_task on the commented
+  event (workers share a profile, so the author cannot say); a relay author <gateway>/<task id> also matches.
+- kanban comment (CLI and the kanban_comment tool) says when the target is scheduled on a probe made only of
+  wait-comment alternatives on that card and this comment satisfies none. A request worded 'bounded SOURCE
+  GO REQUEST' sat five hours against a probe wanting 'BOUNDED exact-head SOURCE GO REQUEST'.
+
+Limits: the note is given only where the board holding the comment also holds the card's wake check (its
+home). Any probe with &&, ;, a pipe, a subshell, a negation, another command or raw SQL is never judged.
+Comments written before this change carry no writer_task, so --from-card sees only their author spelling.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ hermes_cli/kanban.py                          |   5 +
+ hermes_cli/kanban_comment_origin.py           | 168 +++++++++++++++++-
+ hermes_cli/kanban_db_comment_ids.py           |   6 +
+ hermes_cli/kanban_db_context.py               |  22 ++-
+ hermes_cli/kanban_parser.py                   |   4 +
+ .../hermes_cli/test_kanban_comment_origin.py  | 164 +++++++++++++++++
+ .../test_kanban_context_parent_cap.py         |  76 ++++++++
+ .../tools/test_kanban_comment_writer_kind.py  |  50 ++++++
+ tools/kanban_tools.py                         |   4 +
+ 9 files changed, 495 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_context_parent_cap.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 15cd0fc59ae8d992ecc126e6538e8aa179c80d56..e43f3508d22f481c9dd1df55ff5ee810e14739b2 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1080,6 +1080,9 @@ def _cmd_comment(args: argparse.Namespace) -> int:
+         except ValueError as exc:
+             return _err(f"kanban comment: {exc}", 2)
+         live = kb.live_run_id(conn, args.task_id)
++        from hermes_cli.kanban_comment_origin import comment_wake_note  # [daveey] parked reader, unmatched note
++        wake_note = comment_wake_note(conn, args.task_id, author, body,
++                                      origin_gateway=getattr(args, "origin_gateway", None))
+         from hermes_cli.kanban_comment_liveness import EXITED_NOTE, worker_exited
+         exited = live is not None and worker_exited(conn, args.task_id, live)  # [daveey] no reader left
+         from hermes_cli.kanban_board_delivery import cli_lines, remote_runner
+@@ -1091,6 +1094,8 @@ def _cmd_comment(args: argparse.Namespace) -> int:
+         print(EXITED_NOTE[0].upper() + EXITED_NOTE[1:] + ".")
+     elif live is not None and not own_run and not remote:
+         print("The card has a live worker run: it gets this note at its next model call.")
++    if wake_note and not own_run:
++        print(wake_note)
+     for line in queued:
+         print(line)
+     return 0
+diff --git a/hermes_cli/kanban_comment_origin.py b/hermes_cli/kanban_comment_origin.py
+index 537fbdc02c97e14b739d1dceae7e2959b28355c6..baeef76585875166a0d5b324819d0f6a03c6c59e 100644
+--- a/hermes_cli/kanban_comment_origin.py
++++ b/hermes_cli/kanban_comment_origin.py
+@@ -20,6 +20,7 @@ from __future__ import annotations
+ 
+ import json
+ import logging
++import os
+ import re
+ import sqlite3
+ from typing import Any, Optional
+@@ -100,9 +101,68 @@ def backfill(conn: sqlite3.Connection) -> int:
+ 
+ # --- wait-comment -----------------------------------------------------------------------------
+ 
++def _from_card(author: Optional[str], card: str) -> bool:
++    """A relayed card comment is authored ``<gateway>/<task id>`` (``worker-1/t_01a1...``); a bare id also counts."""
++    a, c = (author or "").strip().lower(), card.strip().lower()
++    return bool(c) and (a == c or a.endswith("/" + c))
++
++
++def _writer_tasks(conn: sqlite3.Connection, task_id: str) -> dict:
++    """``{comment key: writing card}`` from the ``commented`` events of ``task_id`` (``writer_task``, set when a
++    worker comments on another card). Keys are the portable ``comment_uid`` and the local ``("id", n)``."""
++    out: dict = {}
++    try:
++        rows = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'commented' "
++                            "AND payload LIKE '%writer_task%'", (task_id,)).fetchall()
++    except sqlite3.Error:
++        return out
++    for (raw,) in rows:
++        try:
++            p = json.loads(raw or "{}")
++        except ValueError:
++            continue
++        wt = str(p.get("writer_task") or "").strip().lower()
++        if not wt:
++            continue
++        # The integer id is the WRITER board's: it names a row here only when the event has no portable uid
++        # (an unsynced board). A synced event is matched by uid alone, never by a coinciding local integer.
++        if p.get("comment_uid"):
++            out[str(p["comment_uid"])] = wt
++        elif p.get("comment_id") is not None:
++            try:
++                out[("id", int(p["comment_id"]))] = wt
++            except (TypeError, ValueError):
++                continue
++    return out
++
++
+ def find_comment(conn: sqlite3.Connection, task_id: str, *, after_id: int = 0, from_gateway: Optional[str] = None,
+-                 contains: Optional[str] = None) -> Optional[dict]:
+-    """The first comment on ``task_id`` after ``after_id`` from ``from_gateway`` containing ``contains``."""
++                 contains: Optional[str] = None, from_card: Optional[str] = None) -> Optional[dict]:
++    """The first comment on ``task_id`` after ``after_id`` from ``from_gateway`` / ``from_card`` containing
++    ``contains``. ``from_card``: written by that card's worker (the ``writer_task`` on its ``commented`` event)
++    or authored ``<gateway>/<card>`` by the relay."""
++    if from_card and from_card.strip():
++        card, writers = from_card.strip().lower(), _writer_tasks(conn, task_id)
++        try:
++            rows = conn.execute("SELECT id, author, origin_gateway, body, uid FROM task_comments WHERE task_id = ? "
++                                "AND id > ? ORDER BY id", (task_id, int(after_id or 0))).fetchall()
++        except sqlite3.OperationalError:  # unsynced board: no uid column
++            rows = [(*r, None) for r in conn.execute(
++                "SELECT id, author, origin_gateway, body FROM task_comments WHERE task_id = ? AND id > ? "
++                "ORDER BY id", (task_id, int(after_id or 0))).fetchall()]
++        gw = (from_gateway or "").strip().lower()
++        for row in rows:
++            writer = writers.get(str(row[4])) if row[4] else writers.get(("id", int(row[0])))
++            if writer != card and not _from_card(row[1], card):
++                continue
++            if gw and gw != (row[2] or "").lower() and gw not in (row[1] or "").lower():
++                continue
++            if contains and contains.lower() not in (row[3] or "").lower():
++                continue
++            return {"id": row[0], "author": row[1], "origin_gateway": row[2], "body": row[3]}
++        return None
++    if from_card is not None:
++        return None  # an empty card id matches nothing
+     sql = "SELECT id, author, origin_gateway, body FROM task_comments WHERE task_id = ? AND id > ?"
+     params: list[Any] = [task_id, int(after_id or 0)]
+     if from_gateway:
+@@ -128,13 +188,14 @@ def run_wait_comment(args) -> int:
+                 print(f"error: no task {args.task_id}")
+                 return 2
+             hit = find_comment(conn, args.task_id, after_id=args.after_id, from_gateway=args.from_gateway,
+-                               contains=args.contains)
++                               contains=args.contains, from_card=getattr(args, "from_card", None))
+     except sqlite3.Error as exc:
+         print(f"error: {exc}")
+         return 2
+     if hit is None:
+         print(f"not yet: no comment on {args.task_id} after {args.after_id}"
+               + (f" from {args.from_gateway}" if args.from_gateway else "")
++              + (f" from card {args.from_card}" if getattr(args, "from_card", None) else "")
+               + (f" containing {args.contains!r}" if args.contains else ""))
+         return 1
+     body = " ".join(str(hit["body"]).split())
+@@ -142,6 +203,107 @@ def run_wait_comment(args) -> int:
+     return 0
+ 
+ 
++# --- comment-wake note ------------------------------------------------------------------------
++
++def _wait_comment_clauses(cmd: str, task_id: str) -> Optional[list[dict]]:
++    """The filters of a wake check that is ONLY ``hermes kanban wait-comment <task_id> ...`` alternatives joined
++    by ``||``; None for anything else (``&&``, ``;``, a pipe, a subshell, ``!``, another command, another card,
++    an unparsable quote): a probe this function cannot fully read is never judged."""
++    import shlex
++    if any(ch in (cmd or "") for ch in "$`#*?~{}\\\n"):
++        return None  # expansion, globbing, a comment or an escape: bash and this parser may read it differently
++    try:
++        lex = shlex.shlex(cmd or "", posix=True, punctuation_chars=True)
++        lex.whitespace_split = True
++        lex.commenters = ""
++        tokens = list(lex)
++    except ValueError:
++        return None
++    clauses: list[list[str]] = [[]]
++    for tok in tokens:
++        if tok == "||":
++            clauses.append([])
++        elif tok and set(tok) <= set("();<>|&"):
++            return None
++        else:
++            clauses[-1].append(tok)
++    out: list[dict] = []
++    for words in clauses:
++        if words[:3] != ["hermes", "kanban", "wait-comment"]:
++            return None
++        clause: dict = {"contains": None, "from_gateway": None, "from_card": None, "task": None}
++        rest, i = words[3:], 0
++        while i < len(rest):
++            w = rest[i]
++            name, eq, val = w.partition("=")
++            key = {"--contains": "contains", "--from-gateway": "from_gateway", "--from-card": "from_card",
++                   "--after-id": "after_id"}.get(name)
++            if key is None:
++                if w.startswith("-") or clause["task"] is not None:
++                    return None
++                clause["task"] = w
++            elif eq:
++                clause[key] = val
++            elif i + 1 < len(rest):
++                clause[key] = rest[i + 1]
++                i += 1
++            else:
++                return None
++            i += 1
++        if clause["task"] != task_id:
++            return None
++        out.append(clause)
++    return out or None
++
++
++def comment_wake_note(conn: sqlite3.Connection, task_id: str, author: str, body: str,
++                      origin_gateway: Optional[str] = None) -> Optional[str]:
++    """What to tell the sender of a comment on a card parked on ``wait-comment``: nothing when the comment
++    satisfies one alternative, else the filters it missed. [daveey]
++
++    Regression for t_5f0d878cd1c10371 (2026-11-18): a source card's "bounded SOURCE GO REQUEST" sat five hours
++    because the owner's wake check wanted the phrase ``BOUNDED exact-head SOURCE GO REQUEST``; the sender could
++    not see that its line would not wake the reader. Judged only when the card is ``scheduled`` and its whole
++    probe is wait-comment alternatives on this card (:func:`_wait_comment_clauses`); the after-id is the
++    reader's, and a new comment is always after it. Never raises: the comment is already written."""
++    try:
++        row = conn.execute(
++            "SELECT w.cmd FROM task_wake_checks w JOIN tasks t ON t.id = w.task_id "
++            "WHERE w.task_id = ? AND w.purpose = 'wake' AND t.status = 'scheduled'", (task_id,)).fetchone()
++        if row is None or not row[0]:
++            return None
++        clauses = _wait_comment_clauses(str(row[0]), task_id)
++        if not clauses:
++            return None
++        try:
++            gw = (resolve_origin(author, origin_gateway) or "").lower()   # what add_comment stored
++        except ValueError:
++            gw = ""
++        low, a = (body or "").lower(), (author or "").lower()
++        own = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()            # add_comment's writer_task
++        own = own if re.fullmatch(r"t_[0-9a-f]{6,}", own) else ""
++        missed: list[str] = []
++        for c in clauses:
++            why: list[str] = []
++            if c["contains"] and c["contains"].lower() not in low:
++                why.append(f"the text {c['contains']!r}")
++            if c["from_card"] is not None:
++                card = c["from_card"].strip().lower()
++                if not card or (own != card and not _from_card(author, card)):
++                    why.append(f"a comment from card {c['from_card']}")
++            if c["from_gateway"]:
++                g = c["from_gateway"].strip().lower()
++                if g != gw and g not in a:
++                    why.append(f"a comment from gateway {c['from_gateway']}")
++            if not why:
++                return None
++            missed.append(" and ".join(why))
++    except (sqlite3.Error, TypeError, ValueError, AttributeError):
++        return None
++    return ("This comment will NOT wake the card: it is parked on wait-comment and needs "
++            + "; or ".join(missed) + ". It stays parked until its backstop unless a comment matches.")
++
++
+ # --- park guard -------------------------------------------------------------------------------
+ 
+ _COMMENTS = re.compile(r"\btask_comments\b", re.IGNORECASE)
+diff --git a/hermes_cli/kanban_db_comment_ids.py b/hermes_cli/kanban_db_comment_ids.py
+index 6e41fba2b11f25f930d84a69220153c2da936cbb..9179be78770810703cc1d2af4531f7bd64ccc496 100644
+--- a/hermes_cli/kanban_db_comment_ids.py
++++ b/hermes_cli/kanban_db_comment_ids.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ 
+ import json
+ import os
++import re
+ import sqlite3
+ import time
+ from typing import Optional
+@@ -146,6 +147,11 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str,
+             payload["comment_uid"] = row["uid"]
+         if not system:
+             payload.update(writer_provenance(conn, task_id))  # writer_run_id + portable writer_run_uid
++        # [daveey] A worker commenting on ANOTHER card: name its own card, so that card's owner can wait on
++        # "a comment from card X" (wait-comment --from-card). The author cannot say: workers share a profile.
++        own = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
++        if not system and own and own != task_id and re.fullmatch(r"t_[0-9a-f]{6,}", own):
++            payload["writer_task"] = own
+         if writer_kind:
+             payload["writer_kind"] = writer_kind
+             if writer_session:
+diff --git a/hermes_cli/kanban_db_context.py b/hermes_cli/kanban_db_context.py
+index 2545215f40eb8d4eb3cf0c39e3b8e516a12f4e5f..f4f8d0d0e5f7cbd589c29bc3a1ce34299afcf4e7 100644
+--- a/hermes_cli/kanban_db_context.py
++++ b/hermes_cli/kanban_db_context.py
+@@ -22,6 +22,7 @@ if TYPE_CHECKING:
+ # build_worker_context() caps, sized for a ~100k-char prompt with headroom.
+ _CTX_MAX_PRIOR_ATTEMPTS = 10      # most recent N prior runs shown in full
+ _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
++_CTX_MAX_PARENT_RESULTS = 8       # most recently completed N parent handoffs shown in full [daveey]
+ _CTX_MAX_FIELD_BYTES    = 4 * 1024   # per summary/error/metadata/result
+ _CTX_MAX_BODY_BYTES     = 8 * 1024   # per task.body (opening post)
+ _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # per comment
+@@ -179,7 +180,7 @@ def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str
+     parent_rows = conn.execute(
+         "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id", (task_id,),
+     ).fetchall()
+-    wrote_header = False
++    done: list[tuple] = []
+     for pid in (r["parent_id"] for r in parent_rows):
+         pt = _kb.get_task(conn, pid)
+         if not pt or pt.status != "done":
+@@ -187,6 +188,18 @@ def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str
+         runs = [r for r in _kb.list_runs(conn, pid) if r.outcome == "completed"]
+         runs.sort(key=lambda r: r.started_at, reverse=True)
+         run = runs[0] if runs else None
++        done_ts = run.ended_at if run is not None and run.ended_at else (pt.completed_at or None)
++        done.append((done_ts or 0, pid, pt, run))
++    # [daveey] A long-lived owner card collects finished prerequisites as parents (30 on t_0b716b01a47db7f6,
++    # 42 KB of a 99 KB context). Oldest handoffs are the stalest: keep the newest in full, name the rest.
++    older: list[tuple] = []
++    if len(done) > _CTX_MAX_PARENT_RESULTS:
++        by_age = sorted(done, key=lambda d: (d[0], d[1]))
++        older = by_age[:-_CTX_MAX_PARENT_RESULTS]
++        keep = {d[1] for d in by_age[-_CTX_MAX_PARENT_RESULTS:]}
++        done = [d for d in done if d[1] in keep]
++    wrote_header = False
++    for _ts, pid, pt, run in done:
+         if not wrote_header:
+             lines.append("## Parent task results")
+             lines.append(
+@@ -210,6 +223,13 @@ def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str
+         if meta_line:
+             lines.append(meta_line)
+         lines.append("")
++    if older:
++        lines.append(
++            f"_({len(older)} earlier parent result{'s' if len(older) != 1 else ''} omitted; showing the "
++            f"{_CTX_MAX_PARENT_RESULTS} most recently completed. Read one with `hermes kanban show <id>`: "
++            + ", ".join(d[1] for d in older) + ")_"
++        )
++        lines.append("")
+ 
+ 
+ def _ctx_role_history(lines: list[str], conn: sqlite3.Connection, task: Task, now: int) -> None:
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 4edbbc741be530360daf9df0f1356901caecd655..363bd6945d4b2379c40448b85049dce23bee08fe 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -499,6 +499,10 @@ _SPECS = [
+              help="Only comments from this gateway: its origin_gateway, or any author spelling of it "
+                   "(hub:gw:<gw>, <gw>, <gw>-chat, <gw>/t_...)"),
+         _arg("--contains", default=None, help="Only comments whose body contains this text (case-insensitive)"),
++        _arg("--from-card", default=None,
++             help="Only comments written by this card's worker (it commented from inside its run, or the relay "
++                  "authored it <gateway>/<task id>). Use it to wait for another card's answer instead of a phrase "
++                  "the other card has to reproduce"),
+     ], help="Wake-probe primitive for a reply: exit 0 a matching comment exists, 1 not yet, 2 cannot tell. "
+             "Use it instead of matching task_comments.author (the park guard refuses that: author_probe)"),
+     _cmd("attach", [
+diff --git a/tests/hermes_cli/test_kanban_comment_origin.py b/tests/hermes_cli/test_kanban_comment_origin.py
+index cce1b56756d6d33617ba168a3ff643147bf7589c..d2d8bf2fd944c81b4f04f1bb65cd6b1f29370595 100644
+--- a/tests/hermes_cli/test_kanban_comment_origin.py
++++ b/tests/hermes_cli/test_kanban_comment_origin.py
+@@ -361,3 +361,167 @@ def test_pending_hub_request_keeps_the_card_parked(kanban_home, tmp_path, monkey
+         kwc.run_due_wake_checks(conn, now=int(time.time()), wait=True)
+         assert kb.get_task(conn, tid).status == "scheduled"
+         assert not [e for e in kb.list_events(conn, tid) if e.kind == "wake_probe_stale"]
++
++
++# -- (e) a reply from one card, and telling the sender when a comment will not wake the reader -----
++
++@pytest.mark.parametrize("author,want", [
++    ("worker-1/t_0b716b01a47db7f6", 0),      # the source card's worker, on any gateway
++    ("t_0b716b01a47db7f6", 0),               # a bare id
++    ("worker-1/t_617ce7e611eaf7e7", 1),      # another card (a burn-down consumer recheck)
++    ("default", 1),
++    ("worker-1/t_0b716b01a47db7f6-x", 1),    # not a suffix match on a longer token
++])
++def test_wait_comment_from_card(kanban_home, capsys, author, want) -> None:
++    run = _cli()
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="owner", assignee="worker")
++        kb.add_comment(conn, tid, author, "bounded SOURCE GO REQUEST for PR4151")
++    assert run("wait-comment", tid, "--after-id", "0", "--from-card", "t_0b716b01a47db7f6") == want
++    assert run("wait-comment", tid, "--after-id", "0", "--from-card", "t_0b716b01a47db7f6",
++               "--contains", "rollback") == 1
++    capsys.readouterr()
++
++
++def _park_on(conn, tid: str, cmd: str) -> None:
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (tid,))
++        conn.execute("INSERT OR REPLACE INTO task_wake_checks(task_id, cmd, every, next_at) VALUES (?,?,900,?)",
++                     (tid, cmd, int(time.time()) + 900))
++
++
++def test_comment_cli_says_when_it_will_not_wake_a_parked_card(kanban_home, capsys) -> None:
++    """t_5f0d878cd1c10371: the request was worded 'bounded SOURCE GO REQUEST'; the probe wanted another phrase."""
++    run = _cli()
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="owner", assignee="worker")
++        _park_on(conn, tid, f"hermes kanban wait-comment {tid} --after-id 587534 --contains "
++                            f"'BOUNDED exact-head SOURCE GO REQUEST' || hermes kanban wait-comment {tid} "
++                            f"--after-id 587534 --contains 'PR4144'")
++    assert run("comment", tid, "--author", "worker-1/t_0b716b01a47db7f6",
++               "Run151 bounded SOURCE GO REQUEST for PR4151") == 0
++    out = capsys.readouterr().out
++    assert "will NOT wake the card" in out
++    assert "BOUNDED exact-head SOURCE GO REQUEST" in out and "PR4144" in out
++    # either clause matching is enough, and then nothing is said
++    assert run("comment", tid, "--author", "worker-1/t_0b716b01a47db7f6", "milestone on pr4144 reached") == 0
++    assert "will NOT wake" not in capsys.readouterr().out
++
++
++def test_comment_wake_note_from_card_and_other_probes(kanban_home, capsys) -> None:
++    run = _cli()
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="owner", assignee="worker")
++        other = kb.create_task(conn, title="other", assignee="worker")
++        plain = kb.create_task(conn, title="unparked", assignee="worker")
++        _park_on(conn, tid, f"hermes kanban wait-comment {tid} --after-id 0 --from-card t_0b716b01a47db7f6")
++        # a probe that is not wait-comment, or that waits on another card, is never judged
++        _park_on(conn, other, f"test -f /tmp/x || hermes kanban wait-comment {tid} --contains nope")
++    assert run("comment", tid, "--author", "worker-1/t_617ce7e611eaf7e7", "consumer recheck") == 0
++    assert "from card t_0b716b01a47db7f6" in capsys.readouterr().out
++    assert run("comment", tid, "--author", "worker-a2/t_0b716b01a47db7f6", "any wording at all") == 0
++    assert "will NOT wake" not in capsys.readouterr().out
++    for card in (other, plain):
++        assert run("comment", card, "--author", "default", "hello") == 0
++        assert "will NOT wake" not in capsys.readouterr().out
++
++
++def test_from_card_matches_a_worker_commenting_from_its_own_run(kanban_home, capsys, monkeypatch) -> None:
++    """Workers share a profile, so the author is 'default': the commented event's writer_task names the card."""
++    run = _cli()
++    with kbc.connect_closing() as conn:
++        owner = kb.create_task(conn, title="owner", assignee="worker")
++        _park_on(conn, owner, f"hermes kanban wait-comment {owner} --after-id 0 --from-card t_0b716b01a47db7f6")
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_617ce7e611eaf7e7")      # an unrelated consumer card
++    assert run("comment", owner, "--author", "default", "recheck") == 0
++    assert "from card t_0b716b01a47db7f6" in capsys.readouterr().out
++    assert run("wait-comment", owner, "--after-id", "0", "--from-card", "t_0b716b01a47db7f6") == 1
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_0b716b01a47db7f6")      # the awaited card's worker
++    assert run("comment", owner, "--author", "default", "any wording") == 0
++    assert "will NOT wake" not in capsys.readouterr().out
++    assert run("wait-comment", owner, "--after-id", "0", "--from-card", "t_0b716b01a47db7f6") == 0
++    assert run("wait-comment", owner, "--after-id", "0", "--from-card", "t_0b716b01a47db7f6",
++               "--contains", "rollback") == 1
++    assert run("wait-comment", owner, "--after-id", "0", "--from-card", "  ") == 1
++    capsys.readouterr()
++
++
++def test_wake_note_agrees_with_the_probe_on_the_local_gateway(kanban_home, capsys, monkeypatch) -> None:
++    """A comment with no explicit origin is stored with this gateway: no false 'will not wake'."""
++    from hermes_cli import kanban_comment_origin as kco
++    monkeypatch.setattr(kco, "_local_gateway", lambda: "mbp")
++    run = _cli()
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="owner", assignee="worker")
++        _park_on(conn, tid, f"hermes kanban wait-comment {tid} --after-id 0 --from-gateway mbp")
++    assert run("comment", tid, "--author", "zed", "hello") == 0
++    assert "will NOT wake" not in capsys.readouterr().out
++    assert run("wait-comment", tid, "--after-id", "0", "--from-gateway", "mbp") == 0
++    with kbc.connect_closing() as conn:
++        _park_on(conn, tid, f"hermes kanban wait-comment {tid} --after-id 0 --from-gateway macbook")
++    assert run("comment", tid, "--author", "zed", "hello again") == 0
++    assert "from gateway macbook" in capsys.readouterr().out
++
++
++@pytest.mark.parametrize("probe", [
++    "hermes kanban wait-comment {t} --contains A1 && hermes kanban wait-comment {t} --contains B2",
++    "hermes kanban wait-comment {t} --contains A1 ; true",
++    "test -f /tmp/x || hermes kanban wait-comment {t} --contains A1",
++    "(hermes kanban wait-comment {t} --contains A1)",
++    "! hermes kanban wait-comment {t} --contains A1",
++    "hermes kanban wait-comment {t} --contains A1 | cat",
++    "hermes kanban wait-comment {t} --contains 'unterminated",
++    "hermes kanban wait-comment t_other --contains A1",
++    "hermes kanban wait-comment {t} --unknown-flag --contains A1",
++    "hermes kanban wait-comment {t} --contains PR#42 || hermes kanban wait-comment {t} --contains GO",
++    "hermes kanban wait-comment {t} --contains \"$PHRASE\"",
++    "hermes kanban wait-comment {t} --contains A1 2>/dev/null",
++    "hermes kanban wait-comment {t} --contains A*",
++])
++def test_a_probe_that_is_not_only_wait_comment_alternatives_is_never_judged(kanban_home, capsys, probe) -> None:
++    run = _cli()
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="owner", assignee="worker")
++        _park_on(conn, tid, probe.format(t=tid))
++    assert run("comment", tid, "--author", "default", "matches nothing") == 0
++    assert "will NOT wake" not in capsys.readouterr().out
++
++
++def test_quoted_separators_and_equals_form_are_read_as_values(kanban_home, capsys) -> None:
++    run = _cli()
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="owner", assignee="worker")
++        _park_on(conn, tid, f"hermes kanban wait-comment {tid} --after-id=5 --contains 'GO; proceed || now' "
++                            f"|| hermes kanban wait-comment {tid} --contains=PR4144")
++        ready = kb.create_task(conn, title="not parked", assignee="worker")
++        with kb.write_txn(conn):   # a leftover probe row on a card that is not scheduled says nothing
++            conn.execute("INSERT INTO task_wake_checks(task_id, cmd, every, next_at) VALUES (?,?,900,0)",
++                         (ready, f"hermes kanban wait-comment {ready} --contains nope"))
++    assert run("comment", tid, "--author", "default", "go; proceed || now") == 0
++    assert "will NOT wake" not in capsys.readouterr().out
++    assert run("comment", tid, "--author", "default", "something else") == 0
++    out = capsys.readouterr().out
++    assert "'GO; proceed || now'" in out and "PR4144" in out
++    assert run("comment", ready, "--author", "default", "hello") == 0
++    assert "will NOT wake" not in capsys.readouterr().out
++
++
++def test_no_space_alternatives_and_a_foreign_comment_id_never_matching_a_local_row(kanban_home, capsys) -> None:
++    run = _cli()
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="owner", assignee="worker")
++        _park_on(conn, tid, f"hermes kanban wait-comment {tid} --contains A1||hermes kanban wait-comment {tid} "
++                            f"--contains B2")
++        local = kb.add_comment(conn, tid, "default", "unrelated local note")
++        # A synced event from another board: its comment_id is that board's integer and happens to equal ours.
++        kb._append_event(conn, tid, "commented", {"author": "default", "len": 5, "comment_id": local,
++                                                   "comment_uid": "u-foreign-77",
++                                                   "writer_task": "t_0b716b01a47db7f6"})
++        kb._append_event(conn, tid, "commented", {"comment_id": "not-a-number", "writer_task": "t_0b716b01a47db7f6"})
++    assert run("wait-comment", tid, "--after-id", "0", "--from-card", "t_0b716b01a47db7f6") == 1
++    assert run("comment", tid, "--author", "default", "has b2 in it") == 0
++    assert "will NOT wake" not in capsys.readouterr().out
++    assert run("comment", tid, "--author", "default", "neither") == 0
++    out = capsys.readouterr().out
++    assert "'A1'" in out and "'B2'" in out
++
+diff --git a/tests/hermes_cli/test_kanban_context_parent_cap.py b/tests/hermes_cli/test_kanban_context_parent_cap.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1babb8133d83a42447682599ed26e7769bd1bf2d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_context_parent_cap.py
+@@ -0,0 +1,76 @@
++"""Worker context caps done-parent handoffs at the newest ``_CTX_MAX_PARENT_RESULTS``. [daveey]
++
++Regression for t_0b716b01a47db7f6 / t_5f0d878cd1c10371 (2026-11-18): long-lived owner cards had 30 and 22
++finished prerequisite cards linked as parents, and their results were 42 KB and 51 KB of a ~100 KB context.
++"""
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_context as ctx
++
++
++@pytest.fixture
++def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    return home
++
++
++def _child_with_done_parents(conn, n: int) -> tuple[str, list[str]]:
++    child = kb.create_task(conn, title="owner", assignee="worker")
++    parents = []
++    for i in range(n):
++        pid = kb.create_task(conn, title=f"prereq {i}", assignee="worker")
++        kb.link_tasks(conn, pid, child)
++        assert kb.complete_task(conn, pid, result=f"RESULT-{i:02d} " + "x" * 200)
++        with kb.write_txn(conn):   # distinct, increasing completion times
++            conn.execute("UPDATE tasks SET completed_at=? WHERE id=?", (1_700_000_000 + i * 60, pid))
++            conn.execute("UPDATE task_runs SET ended_at=? WHERE task_id=?", (1_700_000_000 + i * 60, pid))
++        parents.append(pid)
++    return child, parents
++
++
++def test_few_parents_are_all_shown(kanban_home) -> None:
++    with kbc.connect_closing() as conn:
++        child, parents = _child_with_done_parents(conn, ctx._CTX_MAX_PARENT_RESULTS)
++        text = kb.build_worker_context(conn, child)
++    assert all(f"### {p}" in text for p in parents)
++    assert "earlier parent result" not in text
++
++
++def test_many_parents_keep_the_newest_and_name_the_rest(kanban_home) -> None:
++    cap = ctx._CTX_MAX_PARENT_RESULTS
++    with kbc.connect_closing() as conn:
++        child, parents = _child_with_done_parents(conn, cap + 5)
++        text = kb.build_worker_context(conn, child)
++    old, new = parents[:5], parents[5:]
++    assert all(f"### {p}" in text for p in new)
++    assert all(f"### {p}" not in text for p in old)
++    assert "RESULT-00" not in text and f"RESULT-{cap + 4:02d}" in text
++    note = next(line for line in text.splitlines() if "earlier parent result" in line)
++    assert note.startswith("_(5 earlier parent results omitted")
++    assert all(p in note for p in old)     # every omitted id stays reachable by name
++
++
++def test_cap_leaves_small_cards_unchanged_and_orders_by_parent_id(kanban_home) -> None:
++    """At or under the cap nothing is dropped or reordered; a parent with no completion time is omitted first."""
++    cap = ctx._CTX_MAX_PARENT_RESULTS
++    with kbc.connect_closing() as conn:
++        child, parents = _child_with_done_parents(conn, cap + 1)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET completed_at=NULL WHERE id=?", (parents[-1],))
++            conn.execute("UPDATE task_runs SET ended_at=NULL WHERE task_id=?", (parents[-1],))
++        text = kb.build_worker_context(conn, child)
++    shown = [line[4:].split(" ")[0] for line in text.splitlines() if line.startswith("### t_")]
++    assert shown == sorted(shown) and len(shown) == cap
++    assert parents[-1] not in shown
++    assert "_(1 earlier parent result omitted" in text
++
+diff --git a/tests/tools/test_kanban_comment_writer_kind.py b/tests/tools/test_kanban_comment_writer_kind.py
+index 5c5a6caedf1b4f2edbac5a2994b809d12ea5088d..5bf27b5768f186bd2ad9b5f6e7d6a52addee8e28 100644
+--- a/tests/tools/test_kanban_comment_writer_kind.py
++++ b/tests/tools/test_kanban_comment_writer_kind.py
+@@ -190,3 +190,53 @@ def test_mixed_notes_keep_operator_header_and_stamp_each_line(worker_home, monke
+     assert note.startswith("New notes " + OPERATOR_HEADER), note
+     assert "- default (agent chat, another session) at " in note
+     assert "- default (another session) at " in note  # the human line keeps the old stamp
++
++
++def test_tool_comment_reports_a_parked_reader_it_will_not_wake(worker_home, monkeypatch):
++    """t_5f0d878cd1c10371: the sender must learn at once that its line misses the reader's wait-comment."""
++    import time
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    tid = _ready_task("owner")
++    conn = kbc.connect()
++    try:
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (tid,))
++            conn.execute("INSERT OR REPLACE INTO task_wake_checks(task_id, cmd, every, next_at) VALUES (?,?,900,?)",
++                         (tid, f"hermes kanban wait-comment {tid} --after-id 0 --contains 'SOURCE-GO-REQUEST'",
++                          int(time.time()) + 900))
++    finally:
++        conn.close()
++    miss = json.loads(kt._handle_comment({"task_id": tid, "body": "bounded source go request for PR4151"}))
++    assert "will NOT wake the card" in miss["wake"] and "SOURCE-GO-REQUEST" in miss["wake"]
++    hit = json.loads(kt._handle_comment({"task_id": tid, "body": "SOURCE-GO-REQUEST PR4151@97ce66fd"}))
++    assert "wake" not in hit
++
++
++def test_tool_comment_from_a_worker_satisfies_from_card(worker_home, monkeypatch):
++    """The tool authors every worker as the profile; the awaited card is known from its run's environment."""
++    import time
++    from hermes_cli import kanban_comment_origin as kco
++    tid = _ready_task("owner")
++    conn = kbc.connect()
++    try:
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (tid,))
++            conn.execute("INSERT OR REPLACE INTO task_wake_checks(task_id, cmd, every, next_at) VALUES (?,?,900,?)",
++                         (tid, f"hermes kanban wait-comment {tid} --after-id 0 --from-card t_0b716b01a47db7f6",
++                          int(time.time()) + 900))
++    finally:
++        conn.close()
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_617ce7e611eaf7e7")
++    miss = json.loads(kt._handle_comment({"task_id": tid, "body": "consumer recheck"}))
++    assert "from card t_0b716b01a47db7f6" in miss["wake"]
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_0b716b01a47db7f6")
++    hit = json.loads(kt._handle_comment({"task_id": tid, "body": "request, in any wording"}))
++    assert "wake" not in hit
++    assert _payload(tid, hit["comment_id"])["writer_task"] == "t_0b716b01a47db7f6"
++    conn = kbc.connect()
++    try:
++        found = kco.find_comment(conn, tid, from_card="t_0b716b01a47db7f6")
++    finally:
++        conn.close()
++    assert found is not None and found["id"] == hit["comment_id"]
++
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 01d3366c02e8c5dbf7e63f410c00efd755c3795c..d00b46a73b830ec284d50452d5e6222f469fbbe8 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1376,6 +1376,10 @@ def _handle_comment(args: dict, **kw) -> str:
+             extra["delivery"] = (
+                 "the card has a live worker run: it gets this note at its next model call "
+                 "(often a few minutes); a comment_delivered event on the card confirms it")
++        if os.environ.get("HERMES_KANBAN_TASK") != str(tid):  # [daveey] a parked reader this comment will not wake
++            from hermes_cli.kanban_comment_origin import comment_wake_note
++            if note := comment_wake_note(conn, str(tid), author, str(body)):
++                extra["wake"] = note
+         return _ok(task_id=tid, comment_id=cid, **extra,
+                    **({"subscribed": True} if subscribed else {}))
+ 
+-- 
+2.43.0
+

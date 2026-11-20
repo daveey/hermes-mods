@@ -1,0 +1,304 @@
+From e8e257c585c7e01b5b065fb6227df792a0f5fc71 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 04:37:01 +0000
+Subject: [PATCH] [daveey] honor native host wake grace in newly started lease
+ waiters
+
+Why: suspend deltas were sampled per process, so a waiter born after resume
+could steal a live holder's lapsed lease before its renewal tick. No earlier
+sample exists in a fresh process. Darwin exposes the host's wake instant in
+kern.wake_abs_time; convert Mach ticks to Python's awake-clock domain instead
+of using calendar waketime, which can jump with wall-clock corrections.
+Retain per-process detection on other hosts and on native read failure.
+
+Proof: fresh tracker regressions failed four assertions on base and pass
+with this change (10s recent, 200s old, 90s boundary, no signal, future
+signal, bounded polling and missing suspend baseline). Integration exercises
+a fresh waiter against a real SessionDB and holder renewal. Native ABI tests
+cover sysctl/size/timebase/zero failures. 26 focused Linux tests pass; three
+macOS-marked cases defer to native CI. Nine source mutants killed. Full
+scripts/check: 20 checks green. Live MacBook bundled Python 3.14 read exact
+candidate bytes (sha256 73a8c9c148175f40a0180ac5a2a9bde3505d4195b115eeb764b7e147801c876e),
+converted wake 1353174.4705925s and age 9877.866s; kern.waketime matches
+pmset's lid wake. Natural DarkWake live correlation remains pending on the
+owning card; XNU IOPMrootDomain updates both signals after CPU resume.
+---
+ hermes_platform/wake_clock.py                 | 54 +++++++++++++++++
+ hermes_state_wake_grace.py                    | 22 ++++---
+ tests/hermes_platform/test_wake_clock.py      | 58 +++++++++++++++++++
+ .../test_fresh_process_wake_grace.py          | 46 +++++++++++++++
+ .../test_session_turn_lease_wake_grace.py     | 13 ++++-
+ 5 files changed, 183 insertions(+), 10 deletions(-)
+ create mode 100644 hermes_platform/wake_clock.py
+ create mode 100644 tests/hermes_platform/test_wake_clock.py
+ create mode 100644 tests/hermes_state/test_fresh_process_wake_grace.py
+
+diff --git a/hermes_platform/wake_clock.py b/hermes_platform/wake_clock.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9fe36418a913e10d10b0e9cebfdef99e1f37e005
+--- /dev/null
++++ b/hermes_platform/wake_clock.py
+@@ -0,0 +1,54 @@
++"""Host-wide wake instant in the awake clock domain, independent of process age.
++
++Darwin's IOPMrootDomain updates kern.wake_abs_time with clock_get_uptime after
++CPU resume (including dark wakes). Unlike kern.waketime, this is not calendar
++time: converting Mach ticks gives the same domain as Python's monotonic clock.
++Other hosts retain the caller's per-process suspend detection.
++"""
++
++from __future__ import annotations
++
++import ctypes
++import functools
++import sys
++
++
++class _Timebase(ctypes.Structure):
++    _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
++
++
++@functools.cache
++def _darwin_api():
++    lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
++    lib.sysctlbyname.argtypes = [ctypes.c_char_p, ctypes.c_void_p,
++                               ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t]
++    lib.sysctlbyname.restype = ctypes.c_int
++    lib.mach_timebase_info.argtypes = [ctypes.POINTER(_Timebase)]
++    lib.mach_timebase_info.restype = ctypes.c_int
++    return lib
++
++
++def _darwin_wake_awake_s(lib) -> float | None:
++    ticks = ctypes.c_uint64()
++    size = ctypes.c_size_t(ctypes.sizeof(ticks))
++    if lib.sysctlbyname(b"kern.wake_abs_time", ctypes.byref(ticks),
++                        ctypes.byref(size), None, 0) != 0:
++        return None
++    if size.value != ctypes.sizeof(ticks) or ticks.value == 0:
++        return None
++    scale = _Timebase()
++    if lib.mach_timebase_info(ctypes.byref(scale)) != 0:
++        return None
++    if scale.numer == 0 or scale.denom == 0:
++        return None
++    return ticks.value * scale.numer / scale.denom / 1e9
++
++
++def host_wake_awake_s() -> float | None:
++    """Last native wake in monotonic seconds, or None if no trustworthy signal exists."""
++    if sys.platform != "darwin":
++        return None
++    try:
++        return _darwin_wake_awake_s(_darwin_api())
++    except (OSError, AttributeError):
++        return None
+diff --git a/hermes_state_wake_grace.py b/hermes_state_wake_grace.py
+index b6f97c801090c775692892811d177bb92a82a85c..b533d5f87536bb5215ff6d119ab962399f2c9663 100644
+--- a/hermes_state_wake_grace.py
++++ b/hermes_state_wake_grace.py
+@@ -13,7 +13,9 @@ never renews is reclaimed once the grace has passed; a dead holder is reclaimed
+ 
+ Suspend detection: the suspend-inclusive clock (``hermes_platform.quiet_clock``) minus the awake
+ clock grows by exactly the suspended time, host-wide. The tracker keeps the last sample per process
+-and records the awake instant at which it first saw growth. No suspend clock, no deferral.
++and records the awake instant at which it first saw growth. Darwin also supplies a native host-wide
++wake instant, so a process born after resume honours the remaining grace without a pre-sleep baseline.
++Without either signal there is no deferral.
+ """
+ 
+ from __future__ import annotations
+@@ -22,6 +24,8 @@ import threading
+ import time
+ from typing import Optional
+ 
++from hermes_platform.wake_clock import host_wake_awake_s
++
+ # Longer than the refresher's default 60 s interval plus its write patience, so one post-wake tick lands.
+ WAKE_GRACE_SECONDS = 90.0
+ # Clock-read jitter between the two clocks is microseconds; growth past this is a suspend.
+@@ -49,19 +53,19 @@ def _awake_now() -> float:
+ 
+ 
+ def recently_woke() -> bool:
+-    """True while this host resumed from a suspend less than ``WAKE_GRACE_SECONDS`` awake seconds ago
+-    (as first observed by this process)."""
++    """True within the host's native wake grace or this process's observed suspend grace."""
+     global _last_total, _woke_at
+     total = suspended_total_s()
+-    if total is None:
+-        return False
++    host_woke_at = host_wake_awake_s()
+     now = _awake_now()
+     with _lock:
+-        if _last_total is not None and total - _last_total > _SUSPEND_STEP_SECONDS:
+-            _woke_at = now
+-        _last_total = total if _last_total is None else max(_last_total, total)
++        if total is not None:
++            if _last_total is not None and total - _last_total > _SUSPEND_STEP_SECONDS:
++                _woke_at = now
++            _last_total = total if _last_total is None else max(_last_total, total)
+         woke_at = _woke_at
+-    return woke_at is not None and now - woke_at < WAKE_GRACE_SECONDS
++    return ((host_woke_at is not None and 0 <= now - host_woke_at < WAKE_GRACE_SECONDS)
++            or (woke_at is not None and 0 <= now - woke_at < WAKE_GRACE_SECONDS))
+ 
+ 
+ def lapsed_row_reclaimable(holder: str, expires_at: float, now: float) -> bool:
+diff --git a/tests/hermes_platform/test_wake_clock.py b/tests/hermes_platform/test_wake_clock.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b3930cbc66658fba593b3b7090e8f3c70289d21f
+--- /dev/null
++++ b/tests/hermes_platform/test_wake_clock.py
+@@ -0,0 +1,58 @@
++"""Native ABI decoding uses a fake sysctl; platform dispatch runs on its real host."""
++
++import ctypes
++
++import pytest
++
++from hermes_platform import wake_clock
++
++
++class FakeLib:
++    def __init__(self, *, ticks=12_000_000_000, size=8, status=0,
++                 numer=125, denom=3, scale_status=0):
++        self.ticks, self.size, self.status = ticks, size, status
++        self.numer, self.denom, self.scale_status = numer, denom, scale_status
++
++    def sysctlbyname(self, name, out, size, new, length):
++        assert name == b"kern.wake_abs_time"
++        assert new is None and length == 0
++        ctypes.cast(out, ctypes.POINTER(ctypes.c_uint64))[0] = self.ticks
++        ctypes.cast(size, ctypes.POINTER(ctypes.c_size_t))[0] = self.size
++        return self.status
++
++    def mach_timebase_info(self, out):
++        scale = ctypes.cast(out, ctypes.POINTER(wake_clock._Timebase)).contents
++        scale.numer, scale.denom = self.numer, self.denom
++        return self.scale_status
++
++
++def test_native_ticks_convert_to_monotonic_seconds():
++    assert wake_clock._darwin_wake_awake_s(FakeLib()) == 500.0
++
++
++@pytest.mark.parametrize("overrides", [
++    {"ticks": 0}, {"size": 4}, {"status": -1},
++    {"scale_status": 1}, {"numer": 0}, {"denom": 0},
++])
++def test_missing_or_invalid_native_signal(overrides):
++    assert wake_clock._darwin_wake_awake_s(FakeLib(**overrides)) is None
++
++
++@pytest.mark.platforms("not macos")
++def test_unsupported_host_has_no_native_signal():
++    assert wake_clock.host_wake_awake_s() is None
++
++
++@pytest.mark.platforms("macos")
++def test_darwin_entry_uses_native_reader(monkeypatch):
++    monkeypatch.setattr(wake_clock, "_darwin_api", lambda: FakeLib())
++    assert wake_clock.host_wake_awake_s() == 500.0
++
++
++@pytest.mark.platforms("macos")
++@pytest.mark.parametrize("error", [OSError, AttributeError])
++def test_unavailable_native_api_is_no_signal(monkeypatch, error):
++    def unavailable():
++        raise error("unavailable")
++    monkeypatch.setattr(wake_clock, "_darwin_api", unavailable)
++    assert wake_clock.host_wake_awake_s() is None
+diff --git a/tests/hermes_state/test_fresh_process_wake_grace.py b/tests/hermes_state/test_fresh_process_wake_grace.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..21680e5c400f627d8b32278838de651d2bea1b5c
+--- /dev/null
++++ b/tests/hermes_state/test_fresh_process_wake_grace.py
+@@ -0,0 +1,46 @@
++"""A waiter born after resume must respect the host's remaining awake grace."""
++
++import pytest
++
++import hermes_state_wake_grace as grace
++
++
++@pytest.fixture(autouse=True)
++def fresh_tracker(monkeypatch):
++    monkeypatch.setattr(grace, "suspended_total_s", lambda: 1000.0)
++    monkeypatch.setattr(grace, "_awake_now", lambda: 500.0)
++    grace._reset_for_tests()
++    yield
++    grace._reset_for_tests()
++
++
++@pytest.mark.parametrize("wake,expected", [
++    (490.0, True), (300.0, False), (410.0, False),
++    (410.001, True), (None, False), (501.0, False),
++])
++def test_fresh_tracker_uses_host_wake(monkeypatch, wake, expected):
++    monkeypatch.setattr(grace, "host_wake_awake_s", lambda: wake, raising=False)
++    assert grace.recently_woke() is expected
++    assert grace.lapsed_row_reclaimable("live", 1.0, 2.0) is not expected
++
++
++def test_host_grace_expires_without_restarting_on_each_poll(monkeypatch):
++    monkeypatch.setattr(grace, "host_wake_awake_s", lambda: 490.0, raising=False)
++    assert grace.recently_woke()
++    monkeypatch.setattr(grace, "_awake_now", lambda: 580.0)
++    assert not grace.recently_woke()
++
++
++def test_host_signal_does_not_require_process_suspend_baseline(monkeypatch):
++    monkeypatch.setattr(grace, "suspended_total_s", lambda: None)
++    monkeypatch.setattr(grace, "host_wake_awake_s", lambda: 490.0, raising=False)
++    assert grace.recently_woke()
++
++
++def test_absent_host_signal_retains_process_suspend_detection(monkeypatch):
++    monkeypatch.setattr(grace, "host_wake_awake_s", lambda: None, raising=False)
++    assert not grace.recently_woke()
++    monkeypatch.setattr(grace, "suspended_total_s", lambda: 1600.0)
++    assert grace.recently_woke()
++    monkeypatch.setattr(grace, "_awake_now", lambda: 590.0)
++    assert not grace.recently_woke()
+diff --git a/tests/hermes_state/test_session_turn_lease_wake_grace.py b/tests/hermes_state/test_session_turn_lease_wake_grace.py
+index 987218e7e0ddc9b5688bbf772dd4a9030f375469..5f8bda51973e80759e01590cbcf1f943879be445 100644
+--- a/tests/hermes_state/test_session_turn_lease_wake_grace.py
++++ b/tests/hermes_state/test_session_turn_lease_wake_grace.py
+@@ -17,6 +17,13 @@ import hermes_state_wake_grace as wake_grace
+ from hermes_state import SessionDB
+ 
+ 
++@pytest.fixture(autouse=True)
++def isolate_host_wake(monkeypatch):
++    monkeypatch.setattr(wake_grace, "host_wake_awake_s", lambda: None)
++    yield
++    wake_grace._reset_for_tests()
++
++
+ class _FakeClocks:
+     """Drives the tracker's suspended-total and awake clocks."""
+ 
+@@ -55,7 +62,8 @@ def _owner(db_path):
+     return row[0] if row else None
+ 
+ 
+-def test_waiter_does_not_steal_live_holders_lease_right_after_a_suspend(tmp_path, monkeypatch):
++@pytest.mark.parametrize("fresh_process", [False, True])
++def test_waiter_does_not_steal_live_holders_lease_right_after_a_suspend(tmp_path, monkeypatch, fresh_process):
+     clocks = _FakeClocks(monkeypatch)
+     path = tmp_path / "state.db"
+     db = SessionDB(path)
+@@ -66,6 +74,9 @@ def test_waiter_does_not_steal_live_holders_lease_right_after_a_suspend(tmp_path
+ 
+     clocks.sleep(441)  # the Mac slept; the row's wall-clock TTL ran out meanwhile
+     _expire(path, holder)
++    if fresh_process:
++        wake_grace._reset_for_tests()  # waiter born after resume has no pre-sleep sample
++        monkeypatch.setattr(wake_grace, "host_wake_awake_s", lambda: clocks.awake - 10)
+ 
+     assert not db.try_acquire_session_turn_lease("chat", waiter, ttl_seconds=300)
+     assert _owner(path) == holder
+-- 
+2.43.0
+

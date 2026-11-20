@@ -1,0 +1,126 @@
+From bdd106b3c38a01b74c875198fc0622932a9e8261 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 08:54:03 +0000
+Subject: [PATCH] fix(kanban): omit sweep time from registry evidence identity
+ [daveey]
+
+The minute-boundary fix alone was insufficient: raw CI occurrence-35 comment
+seconds were 1794798490/1794798491 (10/11 seconds within a minute). The registry
+body independently interpolates _now_ms() to the second, so an unchanged
+registry also bypasses exact-body comment dedup on every second boundary.
+
+Remove that rendering-time stamp for readable and unreadable registries.
+Task/comment created_at preserves observation time; all actual registry fields
+remain in the evidence. Extend the regression to advance the narrow module
+clock (not global time) across second-only and minute boundaries. Retain skip
+updates, target expansion, distinct causes, and verify registry field changes
+still alter evidence.
+
+RED after minute-only fix: all 16 boundary/cause/target rows fail (3 vs 2).
+Final GREEN: all 16 importing test files, 315 passed via hermes-core-wt test.
+Full scripts/check --base origin/main passed. Raw CI logs and both independent
+RED logs are in task t_21bdb628627b563e's evidence. No sleeps or retries added.
+---
+ hermes_cli/kanban_pickup_stall.py             |  5 +++--
+ tests/hermes_cli/test_kanban_pickup_stall.py  | 21 ++++++++++++-------
+ .../hermes_cli/test_pickup_incident_append.py | 15 +++++++++++++
+ 3 files changed, 31 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_cli/kanban_pickup_stall.py b/hermes_cli/kanban_pickup_stall.py
+index bd14cfa13d4eaec0ddedf1b34c8e9ce31a0bcdee..0c39f5434c963ec6c000e2fc38ee88a2f74c7a4a 100644
+--- a/hermes_cli/kanban_pickup_stall.py
++++ b/hermes_cli/kanban_pickup_stall.py
+@@ -409,11 +409,12 @@ def _registry_line(own: str) -> str:
+     from hermes_cli import kanban_worker_node as wn
+     entry = ((wn.registry() or {}).get("machines") or {}).get(own)
+     if not entry:
+-        return f"Registry entry for {own}: unreadable from {own} at {_stamp(_now_ms())}."
++        return f"Registry entry for {own}: unreadable from {own}."
+     keys = ("state", "hold", "hold_reason", "hold_by", "hold_at", "hold_owner", "pickup", "max_card_runs")
+     fields = ", ".join(f"{k}={entry.get(k)!r}" for k in keys if k in entry)
+     active = (entry.get("metrics") or {}).get("active_card_runs")
+-    return f"Registry entry for {own} at {_stamp(_now_ms())}: {fields}, active_card_runs={active!r}."
++    # The task/comment creation time records when we observed these fields.
++    return f"Registry entry for {own}: {fields}, active_card_runs={active!r}."
+ 
+ 
+ # --- expected holds ------------------------------------------------------------------------------------------
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall.py b/tests/hermes_cli/test_kanban_pickup_stall.py
+index b3421786107a1151ba1a2ca585e17e61784ab9ff..c54fab96bf7c84d1d14f105009666dbebecfbe3d 100644
+--- a/tests/hermes_cli/test_kanban_pickup_stall.py
++++ b/tests/hermes_cli/test_kanban_pickup_stall.py
+@@ -324,8 +324,11 @@ def test_a_full_queue_files_one_card_per_host_naming_the_oldest(gws):
+ 
+ @pytest.mark.parametrize("reason", ["budget_exhausted", "hold", "other", "evidence_missing"])
+ @pytest.mark.parametrize("initial", [2, 25])
+-def test_same_cause_burst_refreshes_all_targets_without_comment_churn(gws, reason, initial):
++@pytest.mark.parametrize("start", [1200, 1201])
++def test_same_cause_burst_refreshes_all_targets_without_comment_churn(gws, monkeypatch, reason, initial, start):
+     from hermes_cli import kanban_pickup_stall as kps
++    clock = [start]
++    monkeypatch.setattr(kps, "_now_ms", lambda now=None: int((clock[0] if now is None else now) * 1000))
+     _, worker = gws
+     worker.enter()
+     if reason == "hold":  # a hold repair needs the hold in the live registry entry (t_01a1d5b42df173d3)
+@@ -336,23 +339,25 @@ def test_same_cause_burst_refreshes_all_targets_without_comment_churn(gws, reaso
+               "skip": {"reason": reason, "first_at": 1, "last_at": 1, "passes": 1,
+                        "detail": "machine registry unavailable" if reason == "other" else None}}
+              for i in range(25)]
+-    # Cross a whole-minute boundary without changing any pickup evidence.
+-    [tid] = kps.file_repairs(worker.conn, WORKER, cards[:initial], now=1200)
+-    assert kps.file_repairs(worker.conn, WORKER, cards, now=1200) == [tid]
++    # Cross a second boundary, with and without a whole-minute age change.
++    [tid] = kps.file_repairs(worker.conn, WORKER, cards[:initial])
++    assert kps.file_repairs(worker.conn, WORKER, cards) == [tid]
+     comments = kb.list_comments(worker.conn, tid)
+     repair = kb.get_task(worker.conn, tid)
+     assert repair is not None
+     text = (repair.body or "") + "\n".join(c.body for c in comments)
+     assert all(c["id"] in text for c in cards)
+-    kps.file_repairs(worker.conn, WORKER, cards, now=1201)
++    clock[0] += 1
++    kps.file_repairs(worker.conn, WORKER, cards)
+     assert len(kb.list_comments(worker.conn, tid)) == len(comments)
+     # Real new pickup evidence must still reach the open incident.
+-    cards[0]["skip"].update(last_at=1201000, passes=2)
+-    assert kps.file_repairs(worker.conn, WORKER, cards, now=1201) == [tid]
++    cards[0]["skip"].update(last_at=clock[0] * 1000, passes=2)
++    assert kps.file_repairs(worker.conn, WORKER, cards) == [tid]
+     updated = kb.list_comments(worker.conn, tid)
+     assert len(updated) == len(comments) + 1
+     assert "2 pass(es)" in updated[-1].body
+-    kps.file_repairs(worker.conn, WORKER, cards, now=1261)
++    clock[0] += 60
++    kps.file_repairs(worker.conn, WORKER, cards)
+     assert len(kb.list_comments(worker.conn, tid)) == len(updated)
+     other = {**cards[0], "skip": {**cards[0]["skip"], "reason": "capability_missing"}}
+     assert kps.file_repairs(worker.conn, WORKER, [other]) != [tid]
+diff --git a/tests/hermes_cli/test_pickup_incident_append.py b/tests/hermes_cli/test_pickup_incident_append.py
+index 69d0231ae2ac6227cd995e73cc75bd28624783aa..f0d402cfbf66a525e0b3a6f57502d67ae1b7e675 100644
+--- a/tests/hermes_cli/test_pickup_incident_append.py
++++ b/tests/hermes_cli/test_pickup_incident_append.py
+@@ -37,6 +37,21 @@ def test_repeat_appends_one_comment(gws):
+     assert refusal(identity, "worker-2") is None
+ 
+ 
++@pytest.mark.parametrize("entry", [None, {"hold": False, "metrics": {"active_card_runs": 1}}])
++def test_registry_evidence_changes_only_when_fields_change(monkeypatch, entry):
++    clock = [1201000]
++    registry = {"machines": {support.WORKER: entry}}
++    monkeypatch.setattr(pickup, "_now_ms", lambda now=None: clock[0])
++    monkeypatch.setattr(support.wn, "registry", lambda: registry)
++    before = pickup._registry_line(support.WORKER)
++    clock[0] += 1000
++    assert pickup._registry_line(support.WORKER) == before
++    registry["machines"][support.WORKER] = {"hold": True, "metrics": {"active_card_runs": 2}}
++    after = pickup._registry_line(support.WORKER)
++    assert after != before
++    assert "hold=True" in after and "active_card_runs=2" in after
++
++
+ def test_distinct_subjects_have_distinct_incidents(gws):
+     _, worker = gws
+     assert fire(worker) != fire(worker, "hold")
+-- 
+2.43.0
+

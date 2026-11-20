@@ -1,0 +1,128 @@
+From dd9b3398b56cab93502a64d71b12274430ad1c88 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 23:56:27 -0800
+Subject: [PATCH] [daveey] kanban: failure recovery no longer promotes a
+ spend-held card every tick
+
+Live (MacBook board, 2026-11-14 PST): the spend budget held t_c21c170e at 23:13:42. From 23:14:00 the card
+went triage -> ready -> triage on every ~16 s dispatcher tick: 137 `promoted` events in 34 minutes, each
+flip a synced status write. No worker spawned, so no LLM spend.
+
+Five whys:
+1. Why was it promoted every tick? recompute_ready's agent-triage recovery selects a triage card with
+   block_kind 'transient' whose latest stop (gave_up/blocked/block_loop_detected/supervisor_escalated/status)
+   is gave_up. This card's latest was a gave_up from 11-10; its block_kind was still 'transient'.
+2. Why did it go back to triage? kanban_spend_budget.hold() re-triages a ready card while
+   kanban_spend_decision.pending(), without an event, so the next tick matched again.
+3. Why didn't the recovery see the spend stop? The stop is recorded as spend_budget_triaged, which isn't in
+   that stop list. The pending-decision hold (2821896222) and the recovery clause (e1ed46288c) were never tested
+   together.
+4. Why wasn't it caught? The spend-hold tests start from a fresh blocked card with no earlier gave_up, so
+   the recovery clause never matched.
+5. Root: the spend module's contract ("only an explicit promotion or archive releases a spend stop, not an
+   automatic status change") was not enforced by recompute_ready, the automatic promoter.
+
+Fix: recompute_ready skips a triage card whose spend decision is pending. A recorded promote or archive still
+releases it, and the failure-budget recovery is unchanged.
+
+Tests: test_failure_recovery_cannot_release_spend_stop_after_old_gave_up.
+- RED on aedb2a2301: recompute_ready returned 1 for the held card.
+- GREEN: the spend-budget, spend-hold and agent-stop-routing files pass 62/62.
+- The 65 test files that call recompute_ready all pass except 4 tests in
+  test_kanban_dependency_review_historical_cover.py. Those 4 fail the same way on aedb2a2301 on macOS:
+  StopIteration from kanban_host_identity.boot_prefix's subprocess consuming the test's mocked gh replies.
+  That failure is pre-existing and Mac-only.
+---
+ hermes_cli/kanban_db.py                       | 18 +++++-----
+ .../test_kanban_spend_budget_hold.py          | 33 +++++++++++++++++++
+ 2 files changed, 42 insertions(+), 9 deletions(-)
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index d64fe0b3f3fec4fed00efdbbfa5d25933bb561d3..3199a0606932ed6018b1c5688e3d859db0f507d1 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1913,21 +1913,17 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
+ 
+ 
+ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) -> int:
+-    """Promote dependency waits and recoverable failure stops; returns the count.
+-
+-    Opens its own IMMEDIATE txn: call OUTSIDE any write txn. Agent-triage failure-budget
+-    stops get the same recovery as legacy blocked stops; guard holds and other triage
+-    reasons still need explicit resolution. ``kanban_block_routing.recovery_held`` skips a
+-    sticky stop (a worker ``kanban_block`` stays blocked until ``kanban_unblock``, #28712) and
+-    one at the breaker limit (``max_retries`` > ``failure_limit`` > DEFAULT_FAILURE_LIMIT; else
+-    the breaker could never trip). The dependency-review release is
+-    precomputed outside the txn (same skips: no GitHub reads for held cards), fenced inside.
++    """Promote dependency waits/recoverable failure stops; return count. Call OUTSIDE a write txn.
++    Opens an IMMEDIATE txn. Agent-triage failure stops recover like blocked stops; other holds need resolution.
++    ``recovery_held`` preserves sticky blocks and breaker limits (max_retries > failure_limit > default).
++    Dependency-review release is prepared outside the txn (no GitHub reads for held cards), fenced inside.
+     """
+     if failure_limit is None:
+         failure_limit = DEFAULT_FAILURE_LIMIT
+     from hermes_cli.kanban_block_routing import recovery_held
+     from hermes_cli.kanban_wake_check import foreign_ids
+     from hermes_cli import kanban_review_release
++    from hermes_cli import kanban_spend_decision as spend_decision
+     from hermes_cli import kanban_db_graph as _graph
+     promoted = 0
+     remote = _sync.has_remote_parents(conn)
+@@ -1949,6 +1945,10 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None)
+             # publish a second promotion or expire the owner's missing streak.
+             if task_id in copies:
+                 continue
++            # A spend stop leaves only on a recorded decision (kanban_spend_decision.pending). The triage clause
++            # above would read an older ``gave_up`` as the stop: promote here, re-triage in the hold, every tick.
++            if row["status"] == "triage" and spend_decision.pending(conn, task_id):
++                continue
+             cur_status = _graph.clear_found_parents(conn, row, remote=remote)  # parent_missing block, parents back: todo
+             if cur_status == row["status"] and recovery_held(conn, row, failure_limit):
+                 continue
+diff --git a/tests/hermes_cli/test_kanban_spend_budget_hold.py b/tests/hermes_cli/test_kanban_spend_budget_hold.py
+index b81d2be338429fc1a7b901d3d5b1082e1b11fa90..04f5afe660923aba6a6365a61d3e1f1142479c3d 100644
+--- a/tests/hermes_cli/test_kanban_spend_budget_hold.py
++++ b/tests/hermes_cli/test_kanban_spend_budget_hold.py
+@@ -93,6 +93,39 @@ def test_unrecorded_release_cannot_spawn_even_with_limits_disabled(kanban_home,
+         assert len(helpers._events(conn, tid, budget.EVENT)) == 1
+ 
+ 
++def test_failure_recovery_cannot_release_spend_stop_after_old_gave_up(kanban_home):
++    """A card that once exhausted its failure budget keeps ``block_kind='transient'`` and that ``gave_up`` as its
++    latest failure stop. When the spend budget later stops it, ``recompute_ready``'s agent-triage recovery must not
++    read the old ``gave_up`` as the reason it is in triage. Otherwise it promotes the card, the dispatcher's hold
++    sends it back to triage, and every tick repeats that (live: 137 ``promoted`` events in 34 min on one card)."""
++    from hermes_cli import kanban_db_dispatch as dispatch
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Bounded work", assignee="default")
++        assert kb.claim_task(conn, tid)
++        assert dispatch._record_task_failure(conn, tid, "Worker crashed", outcome="crashed",
++                                             failure_limit=1, release_claim=True, end_run=True)
++        assert (kb.get_task(conn, tid).status, kb.get_task(conn, tid).block_kind) == ("triage", "transient")
++        assert kb.recompute_ready(conn, failure_limit=100) == 1  # the failure-budget recovery itself is unchanged
++        assert kb.get_task(conn, tid).status == "ready"
++        helpers._runs(conn, tid, budget.DEFAULT_RUNS, usage={"cache_read_tokens": 1_200_000})
++        assert budget.hold(conn, tid) == "triage"
++        promoted = len(helpers._events(conn, tid, "promoted"))
++        for _tick in range(3):
++            assert kb.recompute_ready(conn, failure_limit=100) == 0
++            assert kb.get_task(conn, tid).status == "triage"
++            assert budget.hold(conn, tid) == "triage"
++        assert len(helpers._events(conn, tid, "promoted")) == promoted
++        assert decision.pending(conn, tid)
++        # A recorded decision still releases it, and a later failure stop recovers as before.
++        assert kb.promote_task(conn, tid, actor="operator", reason="rescope")[0]
++        assert kb.get_task(conn, tid).status in ("ready", "todo")
++        assert kb.claim_task(conn, tid)
++        assert dispatch._record_task_failure(conn, tid, "Worker crashed", outcome="crashed",
++                                             failure_limit=1, release_claim=True, end_run=True)
++        assert kb.get_task(conn, tid).status == "triage"
++        assert kb.recompute_ready(conn, failure_limit=100) == 1
++
++
+ def test_decomposer_cannot_release_spend_stop(kanban_home):
+     from hermes_cli.kanban_decompose import list_triage_ids
+     with kbc.connect_closing() as conn:
+-- 
+2.43.0
+

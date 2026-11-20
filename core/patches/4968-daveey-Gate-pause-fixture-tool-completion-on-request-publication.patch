@@ -1,0 +1,109 @@
+From ebb8ce51733996d1eab232246c6e6d44e41ac620 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 10:20:54 +0000
+Subject: [PATCH] [daveey] Gate pause fixture tool completion on request
+ publication
+
+The fixed 0.3s fake tool could finish before hold/request fsync, producing a normal result that legitimately drained pending FIFO work. Hold the tool on an Event until publication or user-stop completes, releasing it in finally. Preserve normal, ineligible and user-stop controls and both FIFO kinds. Add delayed-publication variants: original helper gives exact pending0-vs-None RED (2 failed); gated helper and adjacent delegation file give 20 passed, 0 failed with retries disabled. No production policy or timeout thresholds changed.
+---
+ .../test_turn_update_pause_real_agent.py      | 23 +++++++++----
+ .../test_update_pause_pending_followup.py     | 34 ++++++++++++++++++-
+ 2 files changed, 49 insertions(+), 8 deletions(-)
+
+diff --git a/tests/gateway/test_turn_update_pause_real_agent.py b/tests/gateway/test_turn_update_pause_real_agent.py
+index c49240724d715613e928612f45c4053fff9b15d1..96061b081eaddc6655e3ff811b7d9b2a1d9dadf7 100644
+--- a/tests/gateway/test_turn_update_pause_real_agent.py
++++ b/tests/gateway/test_turn_update_pause_real_agent.py
+@@ -30,7 +30,13 @@ def _drive(tmp_path, *, request, eligible=True, stop=False):
+     """Run a real agent turn through the runner; the request lands while its first tool runs."""
+     events: list = []
+     tool_started = threading.Event()
+-    agent = _make_agent(events, tool_seconds=0.3, on_tool_start=tool_started.set)
++    release_tool = threading.Event()
++
++    def tool_start():
++        tool_started.set()
++        assert release_tool.wait(10), 'pause/stop publication did not release the tool'
++
++    agent = _make_agent(events, on_tool_start=tool_start)
+     agent.client.chat.completions.create.side_effect = [_tool_response(1), _final_response()]
+     turn = _local_turn()
+     from hermes_state import SessionDB
+@@ -53,12 +59,15 @@ def _drive(tmp_path, *, request, eligible=True, stop=False):
+     try:
+         with ThreadPoolExecutor(max_workers=1) as executor:
+             running = executor.submit(go)
+-            assert tool_started.wait(10)
+-            if stop:
+-                agent.interrupt()
+-            if request:
+-                admission_fence.set_hold(tmp_path)
+-                admission_fence.request_pause(tmp_path, expires_at=time.time() + 60)
++            try:
++                assert tool_started.wait(10)
++                if stop:
++                    agent.interrupt()
++                if request:
++                    admission_fence.set_hold(tmp_path)
++                    admission_fence.request_pause(tmp_path, expires_at=time.time() + 60)
++            finally:
++                release_tool.set()
+             return agent, running.result(timeout=20), events
+     finally:
+         admission_fence.clear_hold(tmp_path)
+diff --git a/tests/gateway/test_update_pause_pending_followup.py b/tests/gateway/test_update_pause_pending_followup.py
+index 0af2eda21441a5f302faf47ab00562b8425011a1..465ac7c63458236d3c322738d0ef5a8de53f4d95 100644
+--- a/tests/gateway/test_update_pause_pending_followup.py
++++ b/tests/gateway/test_update_pause_pending_followup.py
+@@ -1,6 +1,10 @@
+ """Real paused agent result must not launch or consume legacy follow-up work."""
++import threading
++
+ import pytest
+ 
++from tests.gateway import test_turn_update_pause_real_agent as real_turn
++
+ from gateway.config import Platform, PlatformConfig
+ from gateway.platforms.event import MessageEvent
+ from gateway.run import GatewayRunner
+@@ -12,8 +16,36 @@ from tests.gateway.test_turn_update_pause_real_agent import _drive
+ 
+ @pytest.mark.asyncio
+ @pytest.mark.parametrize('internal', [False, True])
+-async def test_real_pause_preserves_pending_fifo_until_resumed_turn_finishes(tmp_path, monkeypatch, internal):
++@pytest.mark.parametrize('delayed_publication', [False, True])
++async def test_real_pause_preserves_pending_fifo_until_resumed_turn_finishes(
++        tmp_path, monkeypatch, internal, delayed_publication):
+     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    if delayed_publication:
++        tool_finished = threading.Event()
++        make_agent = real_turn._make_agent
++        set_hold = admission_fence.set_hold
++
++        def observed_agent(*args, **kwargs):
++            agent = make_agent(*args, **kwargs)
++            execute = agent._execute_tool_calls
++
++            def observed_execute(*args, **kwargs):
++                try:
++                    return execute(*args, **kwargs)
++                finally:
++                    tool_finished.set()
++
++            agent._execute_tool_calls = observed_execute
++            return agent
++
++        def delayed_hold(*args, **kwargs):
++            # Give an unguarded tool its completion before publishing the hold.
++            # A correctly gated tool cannot finish until publication releases it.
++            tool_finished.wait(0.6)
++            return set_hold(*args, **kwargs)
++
++        monkeypatch.setattr(real_turn, '_make_agent', observed_agent)
++        monkeypatch.setattr(admission_fence, 'set_hold', delayed_hold)
+     agent, paused, _ = _drive(tmp_path, request=True)
+     runner = object.__new__(GatewayRunner)
+     runner._draining = False
+-- 
+2.43.0
+

@@ -1,0 +1,280 @@
+From 50301ade51e441b8ec8ef25a1189d238957ef7d0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 11:11:41 +0000
+Subject: [PATCH] [daveey] Keep origin forwarding hooks within facade health
+ limits
+
+---
+ hermes_cli/kanban.py                         | 24 +++--
+ hermes_cli/kanban_creator_chats.py           |  9 +-
+ hermes_cli/kanban_db.py                      |  7 +-
+ tests/hermes_cli/test_origin_turn_custody.py | 97 ++++++++++++--------
+ tools/kanban_tools.py                        |  8 +-
+ tools/kanban_tools_placement.py              |  9 ++
+ 6 files changed, 93 insertions(+), 61 deletions(-)
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index bba2eeadd4481c89e5876236d5699490b9e3dbe1..15cd0fc59ae8d992ecc126e6538e8aa179c80d56 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -8,6 +8,7 @@ from __future__ import annotations
+ 
+ import argparse
+ import contextlib
++import importlib
+ import json
+ 
+ from hermes_cli.kanban_published_worktree import publication_scope
+@@ -140,6 +141,14 @@ def _check_dispatcher_presence(hermes_home: Optional[Path] = None) -> tuple[bool
+ 
+ # --- Command dispatch ---
+ 
++_ORIGIN_COMMANDS = {
++    "chat-tasks": "hermes_cli.kanban_chat_tasks",
++    "origin-forward": "hermes_cli.kanban_origin_forward_adapter",
++    "origin-bind": "hermes_cli.kanban_origin_adapter",
++    **dict.fromkeys(("origin-create", "origin-adopt", "ownership-snapshot", "selfwork-create", "selfwork-forward", "selfwork-producer"),
++                    "hermes_cli.kanban_origin_owner"),
++}
++
+ def kanban_command(args: argparse.Namespace) -> int:
+     """Entry point from ``hermes kanban …``; returns a shell-style exit code."""
+     action = getattr(args, "kanban_action", None)
+@@ -164,19 +173,8 @@ def kanban_command(args: argparse.Namespace) -> int:
+ 
+     # Origin obligations are profile-local, not current-board state; do not
+     # auto-initialize a board or route by a worker's inherited board override.
+-    if action == "chat-tasks":
+-        from hermes_cli.kanban_chat_tasks import command
+-        return command(args)
+-    if action == "origin-forward":
+-        from hermes_cli.kanban_origin_forward_adapter import command
+-        return command(args)
+-    if action == "origin-bind":
+-        from hermes_cli.kanban_origin_adapter import command
+-        return command(args)
+-
+-    if action in {"origin-create", "origin-adopt", "ownership-snapshot", "selfwork-create", "selfwork-forward", "selfwork-producer"}:
+-        from hermes_cli.kanban_origin_owner import command
+-        return command(args)
++    if module := _ORIGIN_COMMANDS.get(action):
++        return importlib.import_module(module).command(args)
+ 
+     # `boards …` manages board metadata and the current-board pointer itself, so it must ignore
+     # the `--board` routing override (else `--board beta boards show` reports beta).
+diff --git a/hermes_cli/kanban_creator_chats.py b/hermes_cli/kanban_creator_chats.py
+index 003f7b1e349541753161e08f3adb191cc740d692..b59172148cbb1aa43ea538c6693885829f390443 100644
+--- a/hermes_cli/kanban_creator_chats.py
++++ b/hermes_cli/kanban_creator_chats.py
+@@ -7,7 +7,14 @@ import sqlite3
+ MAX_DEPTH = 16
+ 
+ 
+-def initialize_ownership(conn, task_id, creator_task_id, parents, created_at, chat_origin):
++def initialize_ownership(conn, task_id, creator_task_id, parents, created_at, chat_origin, native_origin=None):
++    """Resolve chat ownership, then record the machine-local native origin receipt (same transaction)."""
++    _resolve_ownership(conn, task_id, creator_task_id, parents, created_at, chat_origin)
++    from hermes_cli.kanban_origin_native import record
++    record(conn, task_id, native_origin, created_at)
++
++
++def _resolve_ownership(conn, task_id, creator_task_id, parents, created_at, chat_origin):
+     """An explicit validated origin wins over ambient worker/ancestor ownership.
+ 
+     It replaces only the CREATOR's ownership (link, origin sub, ambient session). Dependency parents' owning subs
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index d1abdc08ffa7b3c4271d940d6826a5dd81c964bc..509cf63ba529efc02a575dfa34a20b695ea3dc70 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1201,8 +1201,7 @@ def create_task(
+     completion_contract: Optional[str] = None, review_required: bool = False,
+     validate_workspace: bool = False, validate_skills: bool = False,
+     human_request: Optional[dict] = None,
+-    origin_intent: Optional[dict] = None, chat_origin: Optional[str] = None,
+-    native_origin: Optional[object] = None,
++    origin_intent: Optional[dict] = None, chat_origin: Optional[str] = None, native_origin: Optional[object] = None,
+     requires: Optional[list[str]] = None,
+     lint_blocked: bool = True, runs_on: Optional[Iterable[str]] = None, require_declaration: bool = False,
+     placement_policy: Optional[str] = None,
+@@ -1376,9 +1375,7 @@ def create_task(
+                     human_request=human_request, placement_audit=placement_audit, placement_policy=placement_policy,
+                 )
+                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
+-                initialize_ownership(conn, task_id, creator_task_id, parents, now, chat_origin)
+-                from hermes_cli.kanban_origin_native import record as record_native_origin
+-                record_native_origin(conn, task_id, native_origin, now)
++                initialize_ownership(conn, task_id, creator_task_id, parents, now, chat_origin, native_origin)
+             return task_id
+         except sqlite3.IntegrityError:
+             if attempt == 1:
+diff --git a/tests/hermes_cli/test_origin_turn_custody.py b/tests/hermes_cli/test_origin_turn_custody.py
+index 508e4f8edfd241267cbab6f34990a1175de7c23f..2875515ca8d835f875812fb0eda460694417697b 100644
+--- a/tests/hermes_cli/test_origin_turn_custody.py
++++ b/tests/hermes_cli/test_origin_turn_custody.py
+@@ -68,56 +68,81 @@ def test_admitted_capture_and_copied_thread_context(admitted):
+     assert copied.run(native.capture, None) is None
+ 
+ 
+-@pytest.mark.parametrize("change", ["expired", "holder", "session", "db", "released", "pid", "delegated",
+-                                    "home", "profile", "gateway", "custom_profile", "persist_disabled",
+-                                    "noncanonical_db", "source", "interrupt", "nonfinite_expiry"])
++def _holder(agent, db, lease, mp):
++    db.release_session_turn_lease("chat-1", lease.holder)
++    db.acquire_session_turn_lease("chat-1", "other", ttl_seconds=60)
++
++
++def _session(agent, db, lease, mp):
++    db.create_session("other", source="desktop")
++    agent.session_id = "other"
++
++
++def _profile(name):
++    def mutate(agent, db, lease, mp):
++        from hermes_cli import profiles
++        mp.setattr(profiles, "get_active_profile_name", lambda: name)
++    return mutate
++
++
++def _gateway(agent, db, lease, mp):
++    from hermes_cli import kanban_origin
++    mp.setattr(kanban_origin, "gateway_names", lambda: ("other", []))
++
++
++def _pid(agent, db, lease, mp):
++    from agent import origin_turn_custody as custody
++    mp.setattr(custody.os, "getpid", lambda: -1)
++
++
++def _set(obj_name, attr, value):
++    def mutate(agent, db, lease, mp):
++        setattr({"agent": agent, "lease": lease}[obj_name], attr, value)
++    return mutate
++
++
++def _patch_db(attr, value):
++    def mutate(agent, db, lease, mp):
++        mp.setattr(db, attr, value)
++    return mutate
++
++
++_MUTATIONS = {
++    "expired": _patch_db("session_turn_lease_expires_at", lambda *a: 0),
++    "holder": _holder,
++    "session": _session,
++    "db": _set("agent", "_session_db", object()),
++    "home": lambda agent, db, lease, mp: mp.setenv("HERMES_HOME", str(db.db_path.parent / "other-home")),
++    "profile": _profile("other"),
++    "custom_profile": _profile("custom"),
++    "gateway": _gateway,
++    "persist_disabled": _set("agent", "_persist_disabled", True),
++    "source": _patch_db("get_session", lambda sid: {"source": "kanban"}),
++    "interrupt": _set("lease", "interrupt_message", "revoked"),
++    "nonfinite_expiry": _patch_db("session_turn_lease_expires_at", lambda *a: float("nan")),
++    "released": lambda agent, db, lease, mp: lease.release(),
++    "pid": _pid,
++}
++
++
++@pytest.mark.parametrize("change", [*_MUTATIONS, "noncanonical_db", "delegated"])
+ def test_custody_revalidated(admitted, monkeypatch, change):
+     from agent import origin_turn_custody as custody
+     from agent.delegation_context import delegated_child_context
+     agent, db, lease = admitted
+     with custody.scope(lease):
+         assert native.capture(None) is not None
+-        if change == "expired":
+-            monkeypatch.setattr(db, "session_turn_lease_expires_at", lambda *a: 0)
+-        elif change == "holder":
+-            db.release_session_turn_lease("chat-1", lease.holder)
+-            db.acquire_session_turn_lease("chat-1", "other", ttl_seconds=60)
+-        elif change == "session":
+-            db.create_session("other", source="desktop")
+-            agent.session_id = "other"
+-        elif change == "db":
+-            agent._session_db = object()
+-        elif change == "home":
+-            monkeypatch.setenv("HERMES_HOME", str(db.db_path.parent / "other-home"))
+-        elif change in ("profile", "custom_profile"):
+-            from hermes_cli import profiles
+-            monkeypatch.setattr(profiles, "get_active_profile_name",
+-                                lambda: "custom" if change == "custom_profile" else "other")
+-        elif change == "gateway":
+-            from hermes_cli import kanban_origin
+-            monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("other", []))
+-        elif change == "persist_disabled":
+-            agent._persist_disabled = True
+-        elif change == "noncanonical_db":
++        if change == "noncanonical_db":
+             with monkeypatch.context() as patch:
+                 patch.setattr(db, "db_path", db.db_path.parent / "shadow.db")
+                 assert native.capture(None) is None
+             return
+-        elif change == "source":
+-            monkeypatch.setattr(db, "get_session", lambda sid: {"source": "kanban"})
+-        elif change == "interrupt":
+-            lease.interrupt_message = "revoked"
+-        elif change == "nonfinite_expiry":
+-            monkeypatch.setattr(db, "session_turn_lease_expires_at", lambda *a: float("nan"))
+-        elif change == "released":
+-            lease.release()
+-        elif change == "pid":
+-            monkeypatch.setattr(custody.os, "getpid", lambda: -1)
+-        elif change == "delegated":
++        if change == "delegated":
+             with delegated_child_context():
+                 assert native.capture(None) is None
+             assert native.capture(None) is not None
+             return
++        _MUTATIONS[change](agent, db, lease, monkeypatch)
+         assert native.capture(None) is None
+ 
+ 
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 76dee84a188ea4a13b5e1c3fa682bc0881219881..58895a1d390a019e7c43408a484273bdc6089627 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -26,7 +26,7 @@ from hermes_cli import kanban_contract_cli as _contract_cli, kanban_overlap, kan
+ from tools.kanban_tools_placement import (_local_placement, _machine_placement, _marker_placement_fields, _persisted_session_id,
+                                           _create_session_id, _placement_origin, _placement_refused, _runs_where,
+                                           _effective_board_args, _origin_enrollment, _landing_placement, _pinned_note,
+-                                          _admission_refused, _effective_requires, _with_admission)
++                                          _admission_refused, _effective_requires, _with_admission, _forwarding_fields)
+ # SSRF-checked capped download lives in a sibling; tests monkeypatch it on this module.
+ from tools.kanban_tools_attach_url import _download_url_with_cap, _store_attachment
+ from tools.kanban_tools_db_hint import generic_tool_error
+@@ -1489,11 +1489,7 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+             return (tool_error(stranded, rejection="sync_not_running"), None) if stranded else (None, local)
+         self_gw = reg.self_gateway() or "local"
+         cfg = kp.config()
+-        forwarding = {}
+-        if origin_gateway and origin_gateway != self_gw:
+-            from hermes_cli.kanban_placement_provenance import forwarding_authority
+-            forwarding = {"origin_gateway": origin_gateway, **forwarding_authority(
+-                conn, creator_task_id, _worker_run_id(creator_task_id) if creator_task_id else None, self_gw=self_gw)}
++        forwarding = _forwarding_fields(conn, origin_gateway, creator_task_id, self_gw, _worker_run_id)
+         placed = kp.create_remote(view, target=target, origin_session=session_id,
+                                   origin_profile=origin_profile or current_profile_name("default") or "default",
+                                   self_gw=self_gw, cfg=cfg, hub_cli=reg.hub_cli_path(cfg.get("hub_cli")), **forwarding)
+diff --git a/tools/kanban_tools_placement.py b/tools/kanban_tools_placement.py
+index b1f507dc5de967c97baa60ce9fc57d3fa390e1da..5022b9538b9a80253fb4cc008f5237c0b8a6235e 100644
+--- a/tools/kanban_tools_placement.py
++++ b/tools/kanban_tools_placement.py
+@@ -101,6 +101,15 @@ def _placement_origin(conn, creator_task_id: Optional[str], session_id: Optional
+     return {"session_id": session_id, "origin_profile": None}
+ 
+ 
++def _forwarding_fields(conn, origin_gateway, creator_task_id, self_gw, run_id_fn) -> dict:
++    """Kwargs that forward a qualified foreign origin to the placement target; empty when the origin is local."""
++    if not origin_gateway or origin_gateway == self_gw:
++        return {}
++    from hermes_cli.kanban_placement_provenance import forwarding_authority
++    return {"origin_gateway": origin_gateway, **forwarding_authority(
++        conn, creator_task_id, run_id_fn(creator_task_id) if creator_task_id else None, self_gw=self_gw)}
++
++
+ def _placement_refused(pin: str, why: str, *, hub_admission=None, remedy=None) -> str:
+     """[daveey] A caller-pinned gateway cannot be honoured: say so instead of creating the card here.
+ 
+-- 
+2.43.0
+

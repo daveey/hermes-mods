@@ -1,0 +1,141 @@
+From 70c7b168d188b031eb7f9505df07b0a372260daf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 01:40:21 +0000
+Subject: [PATCH] [daveey] preserve case arms and consumer compounds in nested
+ printed pipelines
+
+Proof: 24 added regressions fail with base nested-shell scanner; 322 session alias tests and 8904 lifecycle tests pass on candidate. scripts/check --base origin/main: all 20 checks pass.
+---
+ cron/lifecycle_guard_nested_shells.py         | 44 +++++++++++++++++--
+ .../test_lifecycle_guard_session_aliases.py   | 10 +++++
+ 2 files changed, 51 insertions(+), 3 deletions(-)
+
+diff --git a/cron/lifecycle_guard_nested_shells.py b/cron/lifecycle_guard_nested_shells.py
+index 3b18fb01563ff86323ee2e3d6de5e0e393e1cd24..2c90c9993bff10fefe077b7d182535c306d407e3 100644
+--- a/cron/lifecycle_guard_nested_shells.py
++++ b/cron/lifecycle_guard_nested_shells.py
+@@ -282,8 +282,8 @@ def _nested_shell_input(view: list[str]) -> Optional[tuple[str, Optional[str]]]:
+ 
+ # Printed pipeline structure (PR #2928 review 5901902665). A word opens or closes a compound
+ # command only in command position (`echo {` prints a brace); `(`/`)` are operators and always do.
+-_GROUP_OPEN_WORDS = frozenset({"{", "if", "while", "until", "for", "select"})
+-_GROUP_CLOSE_WORDS = frozenset({"}", "fi", "done"})
++_GROUP_OPEN_WORDS = frozenset({"{", "if", "while", "until", "for", "select", "case"})
++_GROUP_CLOSE_WORDS = frozenset({"}", "fi", "done", "esac"})
+ # Reserved words after which the next word is in command position again (`for`/`select` are not:
+ # their name and word list are no commands).
+ _COMMAND_PREFIX_WORDS = frozenset({"{", "if", "while", "until", "then", "else", "elif", "do", "!",
+@@ -339,6 +339,27 @@ class _PrintedUnit:
+                         for role, word in self.events).replace(" \n ", "\n")
+ 
+ 
++def _case_word_role(cases: dict[int, str], depth: int, word: str) -> Optional[str]:
++    """Keep case subjects/pattern punctuation out of command and group tracking."""
++    phase = cases.get(depth)
++    if phase == "subject":
++        cases[depth] = "header"
++    elif phase == "header" and word == "in":
++        cases[depth] = "pattern"
++    elif phase in ("pattern", "pattern-word") and word == ")":
++        cases[depth] = "body"
++        return "arm"
++    elif phase == "pattern" and word == "(":
++        cases[depth] = "pattern-word"
++    elif phase == "body" and word == ";;":
++        cases[depth] = "pattern"
++    elif phase == "pattern" and word == "esac":
++        return "end"
++    if phase in ("subject", "header", "pattern", "pattern-word"):
++        return "data"
++    return None
++
++
+ def _printed_pipeline_units(command: str) -> list[_PrintedUnit]:
+     """Split *command* into printed-text units: top-level lists, with compound groups and
+     pipe-newline continuations kept whole. Event roles are ``word``, ``open``, ``close``,
+@@ -352,6 +373,7 @@ def _printed_pipeline_units(command: str) -> list[_PrintedUnit]:
+     depth = 0
+     continued = False
+     command_position = True
++    cases: dict[int, str] = {}  # depth -> subject/header, pattern, or arm body
+     for line, bodies in _lines_with_heredoc_bodies(command):
+         touched = [unit]
+         openers: list[_PrintedUnit] = []
+@@ -368,6 +390,16 @@ def _printed_pipeline_units(command: str) -> list[_PrintedUnit]:
+                 words = re.findall(r"\|&|&&|\|\||;;|[;&|()]", token) if (
+                     token and set(token) <= _CONTROL_CHARS) else [token]
+                 for word in words:
++                    case_role = _case_word_role(cases, depth, word)
++                    if case_role == "arm":
++                        unit.events.append(("arm", ")"))
++                        command_position = True
++                        continue
++                    if case_role == "end":
++                        command_position = True
++                    if case_role == "data":
++                        unit.events.append(("data", word))
++                        continue
+                     if word in _PIPE_OPERATORS or word in _LIST_OPERATORS or word in ("(", ")"):
+                         role = ("pipe" if word in _PIPE_OPERATORS else "list"
+                                 if word in _LIST_OPERATORS else "open" if word == "(" else "close")
+@@ -379,7 +411,11 @@ def _printed_pipeline_units(command: str) -> list[_PrintedUnit]:
+                     else:
+                         role = "word"
+                         command_position = command_position and word in _COMMAND_PREFIX_WORDS
++                    if role == "close":
++                        cases.pop(depth, None)
+                     depth = depth + 1 if role == "open" else max(0, depth - (role == "close"))
++                    if role == "open" and word == "case":
++                        cases[depth] = "subject"
+                     if role == "list" and not depth:
+                         units.append(unit)
+                         unit = _PrintedUnit()
+@@ -411,6 +447,8 @@ def _unit_feeds_nested_stdin(unit: _PrintedUnit) -> tuple[bool, bool]:
+     frames: list[list[bool]] = []  # [piped, carried, holds a body] at each open group
+     words: list[str] = []
+     for role, word in [*unit.events, ("list", ";")]:
++        if role == "data":
++            continue
+         if role == "word":
+             words.append(word)
+             if _is_heredoc_opener(word):
+@@ -425,7 +463,7 @@ def _unit_feeds_nested_stdin(unit: _PrintedUnit) -> tuple[bool, bool]:
+         words = []
+         if role == "pipe":
+             piped, carried, own_body = True, carried or own_body, False
+-        elif role in ("list", "newline"):
++        elif role in ("list", "newline", "arm"):
+             piped, carried = (frames[-1][0], frames[-1][1]) if frames else (False, False)
+             own_body = False
+         elif role == "open":
+diff --git a/tests/cron/test_lifecycle_guard_session_aliases.py b/tests/cron/test_lifecycle_guard_session_aliases.py
+index f128881b22aa22b7e02ebcf9d282e8bb6bc86c8f..5094265a8e4dc06e1f0e4ada26c3f94a749eff81 100644
+--- a/tests/cron/test_lifecycle_guard_session_aliases.py
++++ b/tests/cron/test_lifecycle_guard_session_aliases.py
+@@ -529,6 +529,9 @@ def test_heredoc_producer_pipe_uses_consuming_shell_scope(tmp_path, live_kanban_
+     "{{ printf 't ( bash {db} )' | cat\nbash -l\n}}",
+     "( printf 't ( bash {db} )' | cat; bash -l )",
+     "{{ printf 't ( bash {db} )' | cat; bash -l; }} | cat",
++    "case x in x) printf 't ( bash {db} )' | cat; bash -l;; esac",
++    "echo case; printf 't ( bash {db} )' | bash; printf ':' | bash -l",
++    "printf 't ( bash {db} )' | case x in bash|-l) :;; esac",
+ ])
+ def test_group_pipe_does_not_reach_later_login_shell(tmp_path, live_kanban_db, shape):
+     assert scan_gateway_lifecycle(
+@@ -545,6 +548,13 @@ def test_group_pipe_does_not_reach_later_login_shell(tmp_path, live_kanban_db, s
+     "if true; then printf 't ( bash {db} )'; fi | bash -l",
+     "while :; do printf 't ( bash {db} )'; done | bash -l",
+     "for x in a; do printf 't ( bash {db} )'; done | bash -l",
++    "case x in x) printf 't ( bash {db} )';; esac | bash -l",
++    "printf 't ( bash {db} )' | if true; then bash -l; fi",
++    "printf 't ( bash {db} )' | while read -r l; do bash -l; done",
++    "printf 't ( bash {db} )' | case x in x) bash -l;; esac",
++    "case x in (x|y) case y in y) printf 't ( bash {db} )';; esac;; esac | bash -l",
++    "case esac in (x) :;; (esac) printf 't ( bash {db} )';; esac | bash -l",
++    "printf 't ( bash {db} )' | case x in\ny) :;;\nx) bash -l;;\nesac",
+     "f() {{ :; }}; {{ printf 't ( bash {db} )'; }} | bash -l",
+ ])
+ def test_group_output_piped_to_login_shell_keeps_nested_scope(tmp_path, live_kanban_db, shape):
+-- 
+2.43.0
+

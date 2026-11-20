@@ -1,0 +1,202 @@
+From 30ba40289ea0f03bba97be77a4e882219ab184b6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 06:37:22 +0000
+Subject: [PATCH] [daveey] Prefer verified local origins and reject absent
+ origin ledgers
+
+Proof: canonical runner reproduced both original failures; 70 focused tests pass across create, authority, durable decision and real adapter boundaries. Seven exact-anchor mutants killed; missing, dangling, permission, corrupt and open-race controls retain fail-closed authorization. No origin adoption or native authority changes.
+---
+ hermes_cli/kanban_origin_forward.py           |  6 ++
+ .../test_origin_forward_authority.py          |  2 +-
+ .../test_origin_forward_missing_ledger.py     | 79 +++++++++++++++++++
+ .../test_kanban_cross_board_creator_chats.py  | 24 ++++++
+ tools/kanban_tools_placement.py               | 11 ++-
+ 5 files changed, 117 insertions(+), 5 deletions(-)
+ create mode 100644 tests/hermes_cli/test_origin_forward_missing_ledger.py
+
+diff --git a/hermes_cli/kanban_origin_forward.py b/hermes_cli/kanban_origin_forward.py
+index d53c7175e9f9563cf97ce359420118a177defed1..94670e4b9c25d1103408c6817cb9c1c9164893f8 100644
+--- a/hermes_cli/kanban_origin_forward.py
++++ b/hermes_cli/kanban_origin_forward.py
+@@ -15,6 +15,12 @@ from hermes_cli.kanban_origin_ledger import _binding_key, binding_hash, validate
+ 
+ 
+ def _local_binding(ledger: Path, origin: dict, creator: dict) -> dict:
++    # lstat distinguishes an absent ledger from unreadable or dangling evidence.
++    # Only ENOENT is terminal; permission/I/O errors and failed opens stay pending.
++    try:
++        ledger.lstat()
++    except FileNotFoundError as exc:
++        raise ValueError("origin_forward_binding_missing") from exc
+     # Do not initialize an empty ledger and mistake it for authenticated custody.
+     with closing(sqlite3.connect(ledger.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+         rows = db.execute("SELECT binding_id,binding_hash,binding_json FROM origin_obligations WHERE released=0")
+diff --git a/tests/hermes_cli/test_origin_forward_authority.py b/tests/hermes_cli/test_origin_forward_authority.py
+index c01c642cc3c5d89ab57a212b875f84dcb27b3bde..df90ccf67bc2cecf9cd14061a572fd9911268011 100644
+--- a/tests/hermes_cli/test_origin_forward_authority.py
++++ b/tests/hermes_cli/test_origin_forward_authority.py
+@@ -67,7 +67,7 @@ def test_unknown_owner_not_authorized_by_matching_chat(authority):
+ 
+ def test_missing_ledger_not_created(authority, tmp_path):
+     path = tmp_path / "absent.db"
+-    with pytest.raises(sqlite3.OperationalError):
++    with pytest.raises(ValueError, match="origin_forward_binding_missing"):
+         check(authority, ledger=path)
+     assert not path.exists()
+ 
+diff --git a/tests/hermes_cli/test_origin_forward_missing_ledger.py b/tests/hermes_cli/test_origin_forward_missing_ledger.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..85fecc66f3329e10317daac0ae81dec2f3e928a0
+--- /dev/null
++++ b/tests/hermes_cli/test_origin_forward_missing_ledger.py
+@@ -0,0 +1,79 @@
++"""Real adapter classification: absence is terminal, unavailable evidence retries."""
++import io
++import json
++import sqlite3
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from tests.hermes_cli import test_origin_forward_authority as authority_helpers
++from tests.hermes_cli import test_origin_forward_decision as decision_helpers
++
++authority = authority_helpers.authority
++forwarding = decision_helpers.forwarding
++
++
++@pytest.mark.parametrize("case", ["absent", "absent_parent", "dangling", "directory", "corrupt", "permission", "open_race"])
++def test_adapter_missing_vs_unavailable(forwarding, authority, tmp_path, monkeypatch, capsys, case):
++    import hermes_constants
++    from hermes_cli import kanban_origin_forward_adapter as adapter
++    from hermes_cli import kanban_origin_native as native
++    from hermes_cli import kanban_sync_client as sync
++    from hermes_cli import profiles
++
++    home = tmp_path / "home"
++    home.mkdir()
++    ledger = home / "kanban/origin-ledger.db"
++    if case != "absent_parent":
++        ledger.parent.mkdir()
++    if case == "dangling":
++        ledger.symlink_to(home / "missing-target")
++    elif case == "directory":
++        ledger.mkdir()
++    elif case == "corrupt":
++        ledger.write_bytes(b"not a SQLite database" * 20)
++    elif case in ("permission", "open_race"):
++        ledger.write_bytes(authority[0].read_bytes())
++
++    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: home)
++    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
++    monkeypatch.setattr(adapter, "_gateway", lambda _: "macbook")
++    monkeypatch.setattr(adapter, "_resolve_session", lambda path, sid: sid == "chat-1")
++    monkeypatch.setattr(native, "lookup", lambda *a, **kw: None)
++    monkeypatch.setattr(sync, "load_identity", dict)
++    monkeypatch.setattr(sync, "Hub", lambda _: SimpleNamespace(snapshot_page=lambda *a, **kw: {
++        "table": "leases", "rows": [authority[2]], "more": False}))
++    monkeypatch.setattr(adapter.time, "time", lambda: 1)
++    if case == "permission":
++        original = Path.lstat
++
++        def denied(path, *args, **kwargs):
++            if path == ledger:
++                raise PermissionError("inaccessible evidence")
++            return original(path, *args, **kwargs)
++
++        monkeypatch.setattr(Path, "lstat", denied)
++    elif case == "open_race":
++        original_connect = sqlite3.connect
++
++        def failed_open(database, *args, **kwargs):
++            if str(database).endswith("origin-ledger.db?mode=ro"):
++                raise sqlite3.OperationalError("unavailable after stat")
++            return original_connect(database, *args, **kwargs)
++
++        monkeypatch.setattr(sqlite3, "connect", failed_open)
++
++    absent = case in ("absent", "absent_parent")
++    for _ in range(2):
++        monkeypatch.setattr(adapter.sys, "stdin", io.StringIO(json.dumps(forwarding[0])))
++        assert adapter.command(SimpleNamespace(request_file="-")) == 0
++        assert json.loads(capsys.readouterr().out) == {
++            "status": "rejected" if absent else "pending",
++            "code": "origin_forward_binding_missing" if absent else "origin_forward_evidence_unavailable",
++            "handoff_complete": False,
++        }
++    if absent:
++        assert not ledger.exists()
++    with sqlite3.connect(home / "kanban/origin-forward.db") as db:
++        assert db.execute("SELECT count(*) FROM decisions").fetchone()[0] == 0
+diff --git a/tests/tools/test_kanban_cross_board_creator_chats.py b/tests/tools/test_kanban_cross_board_creator_chats.py
+index 5b3ba8c7802ca69c7a87119ede54e0db35bf6d30..7008d67d70fbecc3f60b61e98b29af5ecb0585ce 100644
+--- a/tests/tools/test_kanban_cross_board_creator_chats.py
++++ b/tests/tools/test_kanban_cross_board_creator_chats.py
+@@ -131,6 +131,30 @@ def test_placed_worker_child_of_an_unresolved_creator_has_no_origin(placed, monk
+     assert placed == [{"target": "hub", "origin_session": None, "origin_profile": "default"}]
+ 
+ 
++@pytest.mark.parametrize("order", [("away", "here"), ("here", "away")])
++def test_placed_mixed_owners_prefer_verified_local_chat(placed, monkeypatch, order):
++    with kbc.connect_closing() as conn:
++        creator = kb.create_task(conn, title="mixed creator", assignee="default", session_id=WORKER)
++        for gateway in order:
++            _link(conn, creator, gateway, None, CHAT)
++    _place(creator, monkeypatch)
++    assert placed == [{"target": "hub", "origin_session": CHAT, "origin_profile": "default"}]
++
++
++@pytest.mark.parametrize("local_session", [None, "unpersisted-local"])
++def test_unverified_local_does_not_replace_first_foreign(home, local_session):
++    from tools.kanban_tools_placement import _placement_origin
++
++    with kbc.connect_closing() as conn:
++        creator = kb.create_task(conn, title="foreign owners", assignee="default", session_id=WORKER)
++        _link(conn, creator, "away", "research", FOREIGN_CHAT)
++        if local_session:
++            _link(conn, creator, "here", None, local_session)
++        _link(conn, creator, "other", None, CHAT)
++        assert _placement_origin(conn, creator, WORKER) == {
++            "session_id": FOREIGN_CHAT, "origin_profile": "research", "origin_gateway": "away"}
++
++
+ def test_placed_foreign_chat_without_creator_authority_refuses(placed, monkeypatch):
+     """A foreign chat must never be silently dropped or stamped with this worker."""
+     with kbc.connect_closing() as conn:
+diff --git a/tools/kanban_tools_placement.py b/tools/kanban_tools_placement.py
+index 564e854a4bec6b4e7a284d95059c74b78af9e730..48f15a60ea73c2cdffc062166e4c6a0362b30bd7 100644
+--- a/tools/kanban_tools_placement.py
++++ b/tools/kanban_tools_placement.py
+@@ -77,7 +77,7 @@ def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
+ 
+ 
+ def _placement_origin(conn, creator_task_id: Optional[str], session_id: Optional[str]) -> dict:
+-    """Preserve the discovered chat owner, including a foreign gateway.
++    """Prefer a verified local chat owner; otherwise preserve the first foreign owner.
+ 
+     Discovery is not authorization: foreign sessions are verified on their own
+     gateway by the authenticated forward adapter, never in the worker's state.db.
+@@ -89,13 +89,16 @@ def _placement_origin(conn, creator_task_id: Optional[str], session_id: Optional
+         from hermes_cli.kanban_creator_chats import resolve_chats
+         self_gw = reg.self_gateway()
+         has_links = conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone()
++        foreign = None
+         for owner in (resolve_chats(conn, creator_task_id) if has_links else []):
+             gateway, session = owner["chat_gateway"], owner["chat_session"]
+-            if gateway and gateway != self_gw:
+-                return {"session_id": session, "origin_profile": owner.get("chat_profile") or "default",
+-                        "origin_gateway": gateway}
++            if gateway and gateway != self_gw and foreign is None:
++                foreign = {"session_id": session, "origin_profile": owner.get("chat_profile") or "default",
++                           "origin_gateway": gateway}
+             if self_gw and gateway == self_gw and _persisted_session_id(session):
+                 return {"session_id": session, "origin_profile": owner.get("chat_profile") or None}
++        if foreign is not None:
++            return foreign
+     if session_id and is_headless_session(session_id):
+         return {"session_id": None, "origin_profile": None}
+     return {"session_id": session_id, "origin_profile": None}
+-- 
+2.43.0
+

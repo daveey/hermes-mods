@@ -1,0 +1,318 @@
+From 1b5a0f853f9425c311e5d303c91bf879185724e6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 22:46:37 -0800
+Subject: [PATCH] fix(kanban): origin-bound verified completions stay settled
+ when the owner goes quiet [daveey]
+
+Supersedes #3558, rebuilt on 6721503d602 (#3567), which fixed the replica
+read for the same incident: workers 2, 5 and 7 were stopped on 2026-11-16 and
+every card they had finished read as unreleased 450 s later (770 links).
+This is what #3567 does not reach.
+
+1. kanban_origin_ledger.project required a live, readable owner scope for
+   every row, so an origin-bound (created) link to a verified completion on a
+   quiet owner still projected unknown and superseded the released replica
+   card. A verified completion that is still the owner's latest published
+   record (same version, same data) is now settled: status, unfinished and
+   stale no longer depend on the owner's heartbeat. Still required: a fresh
+   origin pull, the stored released bit backed by verified evidence, a known
+   status. A newer owner record reopens it. Open cards and unverified
+   completions on a quiet owner stay unknown.
+2. _ledger_links was last-copy-wins when two gateways publish the same card
+   id. Now that a quiet owner's finished copy stays released for good, it
+   could release the chat's one link to a copy still open elsewhere, so an
+   open copy keeps the link whatever the order.
+
+Why not caught: three tests pinned the old ledger rule for a verified record.
+They now state the new one and keep their unverified or open control:
+- test_fresh_transport_cannot_refresh_an_offline_owner[True]
+- test_activity_consumers_share_live_verified_release (last step)
+- test_alias_merge_never_releases_unavailable_or_unverified_evidence[expired]
+  (the verified case moved to its own test; expired now runs unverified)
+
+Tests: 6 new in test_kanban_release_survives_owner_offline.py. Against
+main's code, 3 of them and 3 of the restated tests fail.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_chat_links.py               |   7 +-
+ hermes_cli/kanban_origin_ledger.py            |  17 ++-
+ .../test_kanban_origin_alias_release.py       |  26 +++-
+ .../hermes_cli/test_kanban_origin_evidence.py |  11 +-
+ ...t_kanban_release_survives_owner_offline.py | 113 ++++++++++++++++++
+ 5 files changed, 161 insertions(+), 13 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_release_survives_owner_offline.py
+
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index e31ea925cf88aa7dd7d8a902d77964fae710ef58..b313b43eb4d225079851e7930465d56e6f177c15 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -160,9 +160,12 @@ def _ledger_links(board: str, gateway: str) -> dict[str, dict[str, Any]]:
+         kind = "created" if card.get("via") == "origin" else "shepherd"
+         profile = card.get("origin_profile")
+         uid = link_uid(card["id"], gateway, profile, card["session"], kind)
++        # [daveey] Two gateways can publish the same card id (a worker's copy of another gateway's card). The link is
++        # one row, so it is released only when every copy is: an open copy keeps it, whatever order they arrive in.
++        # It used to be last-copy-wins, and a stopped gateway's finished copy now stays released for good.
++        released = 1 if card.get("released") and out.get(uid, {}).get("released", 1) else 0
+         out[uid] = {"uid": uid, "task_id": card["id"], "chat_gateway": gateway, "chat_profile": profile,
+-                    "chat_session": card["session"], "kind": kind,
+-                    "released": 1 if card.get("released") else 0, "created_at": now}
++                    "chat_session": card["session"], "kind": kind, "released": released, "created_at": now}
+     return out
+ 
+ 
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 124bac1e289f9438593b2f4c56ecb5e785533318..7810111acac8da07cbab5624824d75893433439d 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -475,12 +475,18 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+                 # Old ledgers set released from status alone. Recheck evidence
+                 # even when the replica version has not advanced.
+                 released = bool(released and _owner_evidence(task).get('verified') is True)
+-                current = False
++                current = settled = False
+                 if fresh and source is not None:
+                     row = source.execute(
+                         "SELECT version,data FROM replica WHERE gw=? AND coll='tasks' AND key=?",
+                         (owner['gateway'], binding['task_record_key'])).fetchone()
+                     current = bool(row and row[0] == version and json.loads(row[1]) == task)
++                    # [daveey] A verified completion that is still the owner's latest published record is settled:
++                    # the owner going quiet afterwards does not reopen it, only a newer record does. Without this
++                    # every card a stopped worker had finished went back to unknown 450 s after the stop
++                    # (2026-11-16, workers 2, 5 and 7). The replica read keeps such a record released too
++                    # (``kanban_scope_heartbeat.published_before_silence``).
++                    settled = current and released
+                     # A successful origin pull does not prove the owner could
+                     # read this board. Consume the collector's qualified scope
+                     # inventory; missing/ambiguous inventory is not healthy.
+@@ -522,7 +528,7 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+                     # An unreadable local authority must not fall back to a stale
+                     # own replica, even one which previously proved completion.
+                     current = local is not None
+-                    released = False
++                    released = settled = False
+                     if local is not None:
+                         task = local
+                         released = _owner_evidence(task).get('verified') is True
+@@ -534,7 +540,8 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+                 # [daveey] A currently observed owner archive without a verified completion produces nothing: the
+                 # card is closed, not completed. It neither waits nor counts as done, and never releases as done.
+                 closed = bool(current and status == 'archived' and not released and _owner_evidence(task))
+-                if not current or not known or (status in ('done', 'archived') and not released and not closed):
++                observed = current or settled
++                if not observed or not known or (status in ('done', 'archived') and not released and not closed):
+                     status = 'unknown'
+                 from hermes_cli.kanban_completion_receipt_projection import remote_fields
+                 result.append({
+@@ -546,9 +553,9 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+                     'origin_profile': origin['profile'], 'origin_gateway': origin['gateway'],
+                     'binding_id': binding['binding_id'], 'observation_version': version,
+                     'status': status, 'reported_status': task.get('status'),
+-                    'unfinished': not (current and (released or closed) and status in ('done', 'archived')),
++                    'unfinished': not (observed and (released or closed) and status in ('done', 'archived')),
+                     **({'closed_uncompleted': True} if closed else {}),
+-                    'stale': not current, 'synced_at': last_ok,
++                    'stale': not observed, 'synced_at': last_ok,
+                     'remote': True, 'via': 'origin',
+                     'legacy_aliases': aliases_for_projection(alias_receipts.get(binding_hash(binding), []), binding),
+                     # [daveey] Bounded run fields for what the card waits on (kanban_wait_info, display only).
+diff --git a/tests/hermes_cli/test_kanban_origin_alias_release.py b/tests/hermes_cli/test_kanban_origin_alias_release.py
+index 7292f5ed6d977797d908f7d15b256851ff7b6ab8..14e4080a149623a542c0ada4915d2b68bde7c44f 100644
+--- a/tests/hermes_cli/test_kanban_origin_alias_release.py
++++ b/tests/hermes_cli/test_kanban_origin_alias_release.py
+@@ -88,11 +88,31 @@ def test_verified_release_removes_all_proven_legacy_aliases(scenario, aliases):
+         assert activity.active_task_counts() == {}
+ 
+ 
++def _owner_quiet_for_500s(replica, monkeypatch):
++    monkeypatch.setattr(activity.time, 'time', lambda: 1501)
++    with sqlite3.connect(replica) as db:
++        db.execute("UPDATE meta SET v='1500' WHERE k='last_ok'")
++
++
++def test_alias_merge_keeps_a_verified_release_when_the_owner_goes_quiet(scenario, monkeypatch):
++    """[daveey] Fresh transport, owner heartbeat expired: the verified completion stays released for every alias. It
++    used to come back ``unknown`` (2026-11-16: stopped workers 2, 5 and 7 un-released every card they had finished)."""
++    _, replica, _ = scenario
++    aliases = ['s_old', 's_middle', 's_new']
++    prepare(scenario, aliases)
++    activity._remote_links()
++    _owner_quiet_for_500s(replica, monkeypatch)
++    activity._cache = None
++    assert activity.session_tasks(aliases) == []
++    assert activity.active_task_counts() == {}
++
++
+ @pytest.mark.parametrize('fault', ['missing', 'unreadable', 'expired', 'unverified'])
+ def test_alias_merge_never_releases_unavailable_or_unverified_evidence(scenario, fault, monkeypatch):
+     _, replica, _ = scenario
+     aliases = ['s_old', 's_middle', 's_new']
+-    prepare(scenario, aliases, verified=fault != 'unverified')
++    # An expired owner heartbeat withholds release only from an unverified completion (see the test above).
++    prepare(scenario, aliases, verified=fault not in ('unverified', 'expired'))
+     # Prime the verified ledger before simulating transport loss.
+     activity._remote_links()
+     if fault == 'missing':
+@@ -100,9 +120,7 @@ def test_alias_merge_never_releases_unavailable_or_unverified_evidence(scenario,
+     elif fault == 'unreadable':
+         replica.write_bytes(b'not sqlite')
+     elif fault == 'expired':
+-        monkeypatch.setattr(activity.time, 'time', lambda: 1501)
+-        with sqlite3.connect(replica) as db:
+-            db.execute("UPDATE meta SET v='1500' WHERE k='last_ok'")
++        _owner_quiet_for_500s(replica, monkeypatch)
+     activity._cache = None
+     cards = activity.session_tasks(aliases)
+     assert len(cards) == 1
+diff --git a/tests/hermes_cli/test_kanban_origin_evidence.py b/tests/hermes_cli/test_kanban_origin_evidence.py
+index 401dffd3f3eaf86b0b5119c8945530812034c19b..8352d09e5a555ee086e25fe806977a19a49b1966 100644
+--- a/tests/hermes_cli/test_kanban_origin_evidence.py
++++ b/tests/hermes_cli/test_kanban_origin_evidence.py
+@@ -134,6 +134,11 @@ def test_fresh_transport_cannot_refresh_an_offline_owner(world, board, terminal)
+     with sqlite3.connect(replica) as db:
+         db.execute("UPDATE meta SET v='1500' WHERE k='last_ok'")
+     row = ledger.project(path, replica=replica, gateway='origin', profile='default', now=1501)[0]
++    if terminal:
++        # [daveey] A verified completion is settled: the owner going quiet does not reopen it (2026-11-16, stopped
++        # workers 2, 5 and 7 turned every card they had finished back to unknown). An open card still goes unknown.
++        assert row['status'] == 'done' and not row['unfinished'] and not row['stale']
++        return
+     assert row['status'] == 'unknown'
+     assert row['unfinished'] and row['stale']
+ 
+@@ -211,8 +216,10 @@ def test_activity_consumers_share_live_verified_release(world, board, monkeypatc
+         with sqlite3.connect(replica) as db:
+             db.execute("UPDATE meta SET v='1500' WHERE k='last_ok'")
+         cards, stamped = read()
+-        assert len(cards) == stamped['kanban_active'] == stamped['kanban_remote_stale'] == 1
+-        assert cards[0]['status'] == 'unknown'
++        # [daveey] The verified completion stays released: a quiet owner does not bring a finished card back as
++        # waiting (2026-11-16, 770 links after workers 2, 5 and 7 were stopped). It used to return as ``unknown``.
++        assert cards == []
++        assert not stamped.get('kanban_active') and not stamped.get('kanban_remote_stale')
+ 
+ 
+ def test_missing_run_end_is_unverified_not_a_collection_error(board):
+diff --git a/tests/hermes_cli/test_kanban_release_survives_owner_offline.py b/tests/hermes_cli/test_kanban_release_survives_owner_offline.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..54b2291b248cb1d9ed6add6dbe848ba078d43ec0
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_release_survives_owner_offline.py
+@@ -0,0 +1,113 @@
++"""Origin-bound completions and duplicate card copies when an owner goes quiet. [daveey]
++
++2026-11-16: workers 2, 5 and 7 were stopped and every card they had finished read as unreleased 450 s later (770
++links). The replica read was fixed by "A finished remote card stays released when its owner goes silent after
++publishing it". Two paths that fix does not reach are pinned here:
++
++- kanban_origin_ledger.project still asked for a live owner scope on every row, so an origin-bound (created)
++  link to a verified completion on a quiet owner projected unknown and superseded the released replica card.
++- _ledger_links was last-copy-wins when two gateways publish the same card id. Now that a quiet owner's finished
++  copy stays released, it must not release a link to a copy that is still open elsewhere.
++"""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_session_activity as activity
++from tests.hermes_cli.test_kanban_origin_creation import board as board  # noqa: PLC0414 -- pytest fixture
++from tests.hermes_cli.test_kanban_origin_ledger import world as world  # noqa: PLC0414 -- pytest fixture
++
++
++@pytest.fixture(autouse=True)
++def _origin_profile(monkeypatch):
++    from hermes_cli import profiles
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
++
++
++# ---------------------------------------------------------------- one link, two gateways' copies of the card
++
++
++def _copy(gateway, released):
++    return {'id': 't_1', 'board': 'default', 'gateway': gateway, 'key': f'{gateway}/default/default/t_1',
++            'session': 's1', 'via': 'shepherd', 'origin_gateway': 'origin', 'origin_profile': 'default',
++            'released': released, 'status': 'done' if released else 'running', 'unfinished': not released}
++
++
++@pytest.mark.parametrize('order', [('hub', 'worker-5'), ('worker-5', 'hub')])
++def test_an_open_copy_on_another_gateway_keeps_the_link_open(monkeypatch, order):
++    """A stopped worker's finished copy of a card that is running elsewhere must not release the chat's one link."""
++    from hermes_cli import kanban_chat_links as links
++    from hermes_cli import kanban_db_notify
++    rows = [_copy(gw, released=(gw == 'worker-5')) for gw in order]
++    monkeypatch.setattr(activity, '_remote_links', lambda stale_ok=False: rows)
++    monkeypatch.setattr(kanban_db_notify, 'machine_sessions', lambda *a, **k: set())
++    assert [link['released'] for link in links._ledger_links('default', 'origin').values()] == [0]
++    rows[:] = [_copy(gw, released=True) for gw in order]
++    assert [link['released'] for link in links._ledger_links('default', 'origin').values()] == [1]
++
++
++# ---------------------------------------------------------------- origin-bound cards (the origin ledger)
++
++
++def _bound_done(world, *, verified_completion=True):
++    """An origin-bound card the owner completed and published, then the owner went quiet 500 s ago."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tests.hermes_cli.test_kanban_origin_evidence import create_bound, publish_observed
++    from tests.hermes_cli.test_kanban_origin_ledger import accept
++    path, replica, binding = world
++    with kbc.connect_closing() as conn:
++        tid = create_bound(conn, binding)
++        publish_observed(conn, replica, binding, version=3)
++        accept(world)
++        assert kb.complete_task(conn, tid, summary='Built and tested')
++        publish_observed(conn, replica, binding, version=4)
++    if not verified_completion:
++        with sqlite3.connect(replica) as db:
++            task = json.loads(db.execute("SELECT data FROM replica WHERE coll='tasks'").fetchone()[0])
++            task['origin_observation']['verified'] = False
++            db.execute("UPDATE replica SET data=?, version=5 WHERE coll='tasks'", (json.dumps(task),))
++    return path, replica
++
++
++def _project(path, replica, now):
++    from hermes_cli import kanban_origin_ledger as ledger
++    return ledger.project(path, replica=replica, gateway='origin', profile='default', now=now)[0]
++
++
++def _hub_synced_at(replica, when):
++    with sqlite3.connect(replica) as db:
++        db.execute("UPDATE meta SET v=? WHERE k='last_ok'", (str(when),))
++
++
++def test_origin_bound_verified_completion_survives_an_offline_owner(world, board):
++    path, replica = _bound_done(world)
++    assert _project(path, replica, 1001)['unfinished'] is False
++    _hub_synced_at(replica, 1000 + 37 * 3600)
++    row = _project(path, replica, 1001 + 37 * 3600)
++    assert (row['status'], row['unfinished'], row['stale']) == ('done', False, False)
++
++
++def test_origin_bound_unverified_completion_still_needs_a_live_owner(world, board):
++    path, replica = _bound_done(world, verified_completion=False)
++    _hub_synced_at(replica, 1500)
++    row = _project(path, replica, 1501)
++    assert row['status'] == 'unknown' and row['unfinished'] and row['stale']
++
++
++def test_origin_bound_settled_completion_reopens_on_a_newer_owner_record(world, board):
++    path, replica = _bound_done(world)
++    _hub_synced_at(replica, 1500)
++    assert _project(path, replica, 1501)['unfinished'] is False
++    with sqlite3.connect(replica) as db:  # the owner comes back with the card open again, heartbeat still old
++        task = json.loads(db.execute("SELECT data FROM replica WHERE coll='tasks'").fetchone()[0])
++        task = {k: v for k, v in task.items() if k != 'origin_observation'} | {'status': 'running'}
++        db.execute("UPDATE replica SET data=?, version=9 WHERE coll='tasks'", (json.dumps(task),))
++    assert _project(path, replica, 1501)['unfinished'] is True
++
++
++def test_origin_bound_settled_completion_needs_a_fresh_hub_sync(world, board):
++    path, replica = _bound_done(world)
++    row = _project(path, replica, 1001 + 37 * 3600)  # this gateway has not pulled for 37 h
++    assert row['status'] == 'unknown' and row['unfinished']
+-- 
+2.43.0
+

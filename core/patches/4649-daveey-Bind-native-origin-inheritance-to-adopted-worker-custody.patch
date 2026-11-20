@@ -1,0 +1,782 @@
+From dafdacbfc067314053567b48b800b97f513f38b6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 09:57:48 +0000
+Subject: [PATCH] [daveey] Bind native origin inheritance to adopted worker
+ custody
+
+Intersect a one-shot private claim capability with the exact agent, adopted RPC store and active facade lease. Recheck task/run/lock and expiry on the child creation transaction connection; only local native parent receipts authorize inheritance. Reject plain mapping capabilities.
+
+Proof: canonical selected runner reports 182 passed across 13 files; final lifecycle fixture lint cleanup rerun reports 15 passed. Ruff passes; code-health passes relative to dbef0c378e5d. Handoff, transaction-fence and final-revalidation removal mutants fail their targeted tests. No courier, deployment or publication changes.
+---
+ agent/managed_worker.py                       |   4 +-
+ agent/origin_worker_custody.py                | 157 +++++++++++++++
+ gateway/session_kanban.py                     |   6 +
+ hermes_cli/kanban_db.py                       |   2 +-
+ hermes_cli/kanban_origin_native.py            |  18 +-
+ tests/hermes_cli/origin_custody_support.py    |  29 +++
+ tests/hermes_cli/test_origin_native.py        |  31 +--
+ .../test_origin_native_lifecycle.py           |  25 ++-
+ .../hermes_cli/test_origin_worker_custody.py  | 138 +++++++++++++
+ .../hermes_cli/test_origin_worker_refusals.py | 184 ++++++++++++++++++
+ 10 files changed, 564 insertions(+), 30 deletions(-)
+ create mode 100644 agent/origin_worker_custody.py
+ create mode 100644 tests/hermes_cli/origin_custody_support.py
+ create mode 100644 tests/hermes_cli/test_origin_worker_custody.py
+ create mode 100644 tests/hermes_cli/test_origin_worker_refusals.py
+
+diff --git a/agent/managed_worker.py b/agent/managed_worker.py
+index de462e2ce581cfa00213066ffe521d6a463d70cd..99f8083abe2c67a9628bfe7b71de1392388144ac 100644
+--- a/agent/managed_worker.py
++++ b/agent/managed_worker.py
+@@ -345,7 +345,7 @@ def execute(frame, channel):
+         raise RuntimeError('stale_epoch')
+     store = RuntimeSessionStore(rpc, scope, outbox_dir(frame['home'], scope['execution_id']), adopted)
+     from gateway.session_kanban import bind_worker_context
+-    bind_worker_context(frame)
++    origin_custody = bind_worker_context(frame)
+     # [daveey] Capsule-required cards: bind the owner-brokered capsule now, before checkpoint recovery,
+     # hooks, MCP and AIAgent import any tool (no-op without an owner-installed channel; raises otherwise).
+     from agent.observation_bind import observation_bind, observation_finish, observation_revoke
+@@ -400,6 +400,8 @@ def execute(frame, channel):
+                 tool_complete_callback=lambda call_id, name, args, result: channel.send('tool.complete',
+                                                                                          **tool_frame(call_id, name, args, result)))
+             controls.agent = agent
++            if origin_custody is not None:
++                origin_custody.bind_agent(agent)
+             if controls.stopped.is_set():
+                 from agent.interrupt_compat import request_hard_interrupt
+                 request_hard_interrupt(agent)
+diff --git a/agent/origin_worker_custody.py b/agent/origin_worker_custody.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d05a27b950f60b44d07fe17e69e4a1889fbe2c0a
+--- /dev/null
++++ b/agent/origin_worker_custody.py
+@@ -0,0 +1,157 @@
++"""Private adopted-worker authority, intersected with each actual facade turn.
++
++Nothing here is serialized. Board ancestry and environment pins are not authority.
++"""
++from contextlib import closing
++from dataclasses import dataclass, field, replace
++import json
++import math
++import os
++from pathlib import Path
++import sqlite3
++import threading
++import time
++
++
++def _unexpired(value):
++    return type(value) in (int, float) and math.isfinite(value) and value > time.time()
++
++
++class _Handoff:
++    def __init__(self):
++        self.lock = threading.Lock()
++        self.used = False
++
++    def consume(self):
++        with self.lock:
++            if self.used:
++                raise ValueError('invalid_worker_origin_agent')
++            self.used = True
++
++
++@dataclass(frozen=True, eq=False)
++class WorkerCustody:
++    """Minted only after bind_worker_context verifies its private adopted frame."""
++    task_id: str
++    run_id: int
++    claim_lock: str
++    board: str
++    path: Path
++    home: Path
++    profile: str
++    gateway: str
++    pid: int
++    session_id: str
++    execution_scope: tuple
++    agent: object = None
++    store: object = None
++    _handoff: _Handoff = field(default_factory=_Handoff, repr=False)
++
++    def bind_agent(self, agent):
++        """One explicit handoff to the constructed agent and its adopted RPC store."""
++        from agent.runtime_session_store import RuntimeSessionStore
++        store = getattr(agent, '_session_db', None)
++        if (self.agent is not None or not isinstance(store, RuntimeSessionStore)
++                or tuple(sorted(store.scope.items())) != self.execution_scope
++                or getattr(agent, 'session_id', None) != self.session_id):
++            raise ValueError('invalid_worker_origin_agent')
++        self._handoff.consume()
++        agent._native_origin_worker_custody = replace(self, agent=agent, store=store)
++
++    def _claim(self, conn):
++        from hermes_cli.kanban_db_sync import _db_key
++        from hermes_cli.kanban_origin_native import _primary_scope
++        if (_db_key(conn) != str(self.path)
++                or _primary_scope(conn) != (self.gateway, self.profile, self.board)):
++            return False
++        row = conn.execute('SELECT t.status,t.current_run_id,t.claim_lock,t.claim_expires,'
++            'r.task_id,r.status,r.claim_lock,r.claim_expires,r.ended_at FROM tasks t '
++            'JOIN task_runs r ON r.id=? WHERE t.id=?', (self.run_id, self.task_id)).fetchone()
++        if (row is None or tuple(row[:3]) != ('running', self.run_id, self.claim_lock)
++                or tuple(row[4:7]) != (self.task_id, 'running', self.claim_lock)
++                or row[8] is not None or not _unexpired(row[3]) or not _unexpired(row[7])):
++            return False
++        row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
++            "AND kind='worker_bound' ORDER BY id DESC LIMIT 1", (self.task_id, self.run_id)).fetchone()
++        bound = json.loads(row[0]) if row else {}
++        return (bound.get('pid'), bound.get('claim_lock')) == (self.pid, self.claim_lock)
++
++    def validated(self, custody, conn=None):
++        from agent.delegation_context import is_delegated_child_process_context
++        from agent.runtime_session_store import WorkerPersistenceError
++        from hermes_cli.profiles import get_active_profile_name
++        from hermes_constants import get_hermes_home
++        from hermes_cli.kanban_origin import gateway_names
++        if custody is None or is_delegated_child_process_context():
++            return None
++        lease, pid, home, profile, gateway = custody
++        agent, store = self.agent, self.store
++        def identity_matches():
++            return not (agent is None or lease.agent is not agent or lease.db is not store
++                or getattr(agent, '_native_origin_worker_custody', None) is not self
++                or (pid, home, profile, gateway) != (self.pid, self.home, self.profile, self.gateway)
++                or self.pid != os.getpid() or self.home != Path(get_hermes_home()).resolve()
++                or self.profile != get_active_profile_name() or self.profile == 'custom'
++                or not self.gateway or self.gateway != gateway_names()[0]
++                or getattr(agent, '_session_db', None) is not store
++                or getattr(agent, 'session_id', None) != self.session_id
++                or lease.session_id != self.session_id
++                or tuple(sorted(store.scope.items())) != self.execution_scope
++                or getattr(agent, '_persist_disabled', False))
++        if not identity_matches():
++            return None
++        def live_turn():
++            expiry = store.session_turn_lease_expires_at(self.session_id, lease.holder)
++            # The RPC can block while local cancellation revokes a copied scope.
++            return (_unexpired(expiry) and lease.is_turn_active() and not lease.stop.is_set()
++                    and not lease.interrupt_message
++                    and getattr(agent, '_active_session_turn_lease_holder', None) == lease.holder)
++        try:
++            if not live_turn():
++                return None
++            if conn is None:
++                from hermes_cli import kanban_lockguard
++                with closing(kanban_lockguard.connect(self.path.as_uri() + '?mode=ro', uri=True)) as reader:
++                    reader.execute('BEGIN')
++                    valid = self._claim(reader)
++            else:
++                # create_task already owns the write transaction. Do not read a
++                # different connection's pre-transaction claim behind that lock.
++                valid = self._claim(conn)
++            return {'creator': self.task_id} if valid and live_turn() and identity_matches() else None
++        except (OSError, sqlite3.Error, ValueError, AttributeError, TypeError, WorkerPersistenceError):
++            return None
++
++
++def from_bound_frame(frame, context):
++    """Called by the private bind seam after its exact claim transaction."""
++    from hermes_cli.profiles import get_active_profile_name
++    from hermes_cli.kanban_origin import gateway_names
++    return WorkerCustody(context['task_id'], context['run_id'], context['claim_lock'], context['board'],
++                         Path(context['db']).resolve(), Path(frame['home']).resolve(),
++                         get_active_profile_name(), gateway_names()[0], os.getpid(),
++                         frame['scope']['session_id'], tuple(sorted(frame['scope'].items())))
++
++
++class CapturedWorkerOrigin:
++    """Revocable snapshot, usable only by its exact live facade scope."""
++    def __init__(self, capability, custody):
++        self._capability, self._custody = capability, custody
++
++    def validated(self, conn=None):
++        from agent.origin_turn_custody import _current
++        if self._custody is not _current.get():
++            return None
++        return self._capability.validated(self._custody, conn)
++
++
++def capture(creator):
++    from agent.origin_turn_custody import _current
++    custody = _current.get()
++    if custody is None:
++        return None
++    capability = getattr(custody[0].agent, '_native_origin_worker_custody', None)
++    if type(capability) is not WorkerCustody or creator != capability.task_id:
++        return None
++    captured = CapturedWorkerOrigin(capability, custody)
++    return captured if captured.validated() else None
+diff --git a/gateway/session_kanban.py b/gateway/session_kanban.py
+index 0a23964a67e1af070188a6bfbae84bfb260641cb..64643182aa1721f9784ce175e454aa54224e36d0 100644
+--- a/gateway/session_kanban.py
++++ b/gateway/session_kanban.py
+@@ -242,6 +242,10 @@ def bind_worker_context(frame):
+             if (task is None or task.status != 'running' or task.current_run_id != context['run_id']
+                     or task.claim_lock != context['claim_lock']):
+                 raise RuntimeStoreError('stale_kanban_claim')
++            run = conn.execute('SELECT task_id,status,claim_lock,ended_at FROM task_runs WHERE id=?',
++                               (context['run_id'],)).fetchone()
++            if (run is None or tuple(run) != (task.id, 'running', context['claim_lock'], None)):
++                raise RuntimeStoreError('stale_kanban_claim')
+             # The dispatcher's spawned worker stays the run's pid (reclaim, timeout and operator
+             # kills target it; ``_watch_submitter`` ties this interpreter's life to it). The bound
+             # interpreter is recorded beside it so a sweep can tell when the attempt is truly gone.
+@@ -259,6 +263,8 @@ def bind_worker_context(frame):
+     _watch_submitter(Path(context['db']), context['run_id'])
+     os.environ.update(env)
+     os.chdir(context['workspace'])
++    from agent.origin_worker_custody import from_bound_frame
++    return from_bound_frame(frame, context)
+ 
+ 
+ _TURNS_DONE = threading.Event()
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index a4d71242e926f55734b13e0484938cd12dfabdc7..d1abdc08ffa7b3c4271d940d6826a5dd81c964bc 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1202,7 +1202,7 @@ def create_task(
+     validate_workspace: bool = False, validate_skills: bool = False,
+     human_request: Optional[dict] = None,
+     origin_intent: Optional[dict] = None, chat_origin: Optional[str] = None,
+-    native_origin: Optional[dict] = None,
++    native_origin: Optional[object] = None,
+     requires: Optional[list[str]] = None,
+     lint_blocked: bool = True, runs_on: Optional[Iterable[str]] = None, require_declaration: bool = False,
+     placement_policy: Optional[str] = None,
+diff --git a/hermes_cli/kanban_origin_native.py b/hermes_cli/kanban_origin_native.py
+index 1fe2f0774885522e6281078fe91f361638a5ab29..1837ee568265ae8f2692d02b8e5c6c2efaddeda7 100644
+--- a/hermes_cli/kanban_origin_native.py
++++ b/hermes_cli/kanban_origin_native.py
+@@ -14,10 +14,11 @@ from hermes_cli.kanban_origin_ledger import validate_binding
+ 
+ def capture(creator_task_id, *, courier=False):
+     """Use admitted in-process custody, never environment or tool arguments."""
+-    if courier or creator_task_id:
+-        # Worker inheritance needs independently verified claim custody. A bare
+-        # HERMES_KANBAN_TASK is not a capability; refuse until that seam is bound.
++    if courier:
+         return None
++    if creator_task_id:
++        from agent.origin_worker_custody import capture as capture_worker
++        return capture_worker(creator_task_id)
+     from agent.origin_turn_custody import CapturedOrigin, origin
+     qualified = origin()
+     return CapturedOrigin(qualified) if qualified else None
+@@ -96,9 +97,11 @@ def _receipt(conn, task_id):
+ def record(conn, task_id, context, created_at):
+     """Called inside create_task's transaction; no event or sync projection."""
+     from agent.origin_turn_custody import CapturedOrigin
+-    captured = context if isinstance(context, CapturedOrigin) else None
+-    if captured is not None:
+-        context = captured.validated()
++    from agent.origin_worker_custody import CapturedWorkerOrigin
++    if type(context) not in (CapturedOrigin, CapturedWorkerOrigin):
++        return
++    captured = context
++    context = captured.validated(conn) if type(captured) is CapturedWorkerOrigin else captured.validated()
+     if context is None:
+         return
+     scope = _primary_scope(conn)
+@@ -124,7 +127,8 @@ def record(conn, task_id, context, created_at):
+                "task_record_key": f"{profile}/{board}/{task_id}"}
+     validate_binding(binding)
+     _install_revocation(conn)
+-    if captured is not None and captured.validated() is None:
++    checked = captured.validated(conn) if type(captured) is CapturedWorkerOrigin else captured.validated()
++    if checked != context:
+         return
+     conn.execute("INSERT INTO origin_native_receipts VALUES (?,?,?,?)",
+                  (task_id, json.dumps(binding, sort_keys=True), creator, created_at))
+diff --git a/tests/hermes_cli/origin_custody_support.py b/tests/hermes_cli/origin_custody_support.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..efbdec84af299ba81641130050a25592ea59519d
+--- /dev/null
++++ b/tests/hermes_cli/origin_custody_support.py
+@@ -0,0 +1,29 @@
++"""Real interactive admission for native-receipt fixtures."""
++from contextlib import contextmanager
++
++
++@contextmanager
++def interactive_capture(home, session_id):
++    from agent.origin_turn_custody import scope
++    from agent.turn_facade_lease import admit_durable_turn_lease
++    from hermes_cli.kanban_origin_native import capture
++    from hermes_state import SessionDB
++    db = SessionDB(home / 'state.db')
++    if db.get_session(session_id) is None:
++        db.create_session(session_id, source='desktop')
++    from tests.agent.test_cross_process_turn_lease import _agent_with_db
++    agent = _agent_with_db(db, session_id=session_id)
++    lease = admit_durable_turn_lease(agent, session_id=session_id, relay_turn_id='fixture',
++        task_context={'platform': 'desktop', 'session_id': session_id}, conversation_history=[]).lease
++    assert lease is not None
++    try:
++        lease.start()
++        with scope(lease):
++            value = capture(None)
++            assert value is not None
++            yield value
++    finally:
++        lease.stop_refresher()
++        lease.join_threads()
++        lease.release()
++        db.close()
+diff --git a/tests/hermes_cli/test_origin_native.py b/tests/hermes_cli/test_origin_native.py
+index b5490ea03b3f88e4fb639eec66aab5430c32e5a8..8e4ff059276205bf6e20fac9260d9c6b59832afa 100644
+--- a/tests/hermes_cli/test_origin_native.py
++++ b/tests/hermes_cli/test_origin_native.py
+@@ -17,6 +17,14 @@ def scope(monkeypatch):
+     return {"origin": {"gateway": "macbook", "profile": "default", "session": "chat-1"}}
+ 
+ 
++@pytest.fixture
++def capability(scope, tmp_path, monkeypatch):
++    from tests.hermes_cli.origin_custody_support import interactive_capture
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    with interactive_capture(tmp_path, "chat-1") as captured:
++        yield captured
++
++
+ def memory_tasks():
+     conn = sqlite3.connect(":memory:")
+     conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, created_on TEXT, created_at INTEGER)")
+@@ -26,13 +34,17 @@ def memory_tasks():
+     return conn
+ 
+ 
+-def test_transaction_and_inheritance(scope):
++def test_plain_mapping_is_not_a_native_capability(scope):
++    conn = memory_tasks()
++    native.record(conn, "t_root", dict(scope), 1)
++    assert native._receipt(conn, "t_root") is None
++
++
++def test_transaction_receipt_rollback(scope, capability):
+     conn = memory_tasks()
+     conn.execute("BEGIN")
+-    native.record(conn, "t_root", scope, 1)
+-    native.record(conn, "t_child", {"creator": "t_root"}, 2)
+-    assert native._receipt(conn, "t_child")["origin"] == scope["origin"]
+-    assert conn.execute("SELECT inherited_from FROM origin_native_receipts WHERE task_id='t_child'").fetchone()[0] == "t_root"
++    native.record(conn, "t_root", capability, 1)
++    assert native._receipt(conn, "t_root")["origin"] == scope["origin"]
+     conn.rollback()
+     assert native._receipt(conn, "t_root") is None
+ 
+@@ -45,15 +57,6 @@ def test_missing_receipt_and_synced_ancestry_cannot_authorize(scope):
+     assert native._receipt(conn, "t_child") is None
+ 
+ 
+-def test_foreign_parent_namespace_rejected(scope, monkeypatch):
+-    conn = memory_tasks()
+-    native.record(conn, "t_root", scope, 1)
+-    from hermes_cli import kanban_execution_observations
+-    monkeypatch.setattr(kanban_execution_observations, "board_owner_profile", lambda path: "other")
+-    native.record(conn, "t_child", {"creator": "t_root"}, 2)
+-    assert native._receipt(conn, "t_child") is None
+-
+-
+ @pytest.mark.parametrize("source", ["kanban", "cron", "oneshot", "subagent", None])
+ def test_capture_rejects_noninteractive(scope, monkeypatch, source):
+     from gateway import session_context
+diff --git a/tests/hermes_cli/test_origin_native_lifecycle.py b/tests/hermes_cli/test_origin_native_lifecycle.py
+index 6fd0bf41012907714fc80d1505ceabadff4b2510..f12b23ba450e9e881ce0baafef7bb7144f12a281 100644
+--- a/tests/hermes_cli/test_origin_native_lifecycle.py
++++ b/tests/hermes_cli/test_origin_native_lifecycle.py
+@@ -20,13 +20,23 @@ def store(tmp_path, monkeypatch):
+         task = kb.create_task(conn, title="native root")
+         assert native._primary_scope(conn) is not None, (sync._db_key(conn), str(kb.board_own_db_path("default")),
+             sync.board_mode(conn), [tuple(r) for r in conn.execute("SELECT board_id,gateway_id,mode FROM kanban_sync_state")])
+-        native.record(conn, task, {"origin": origin}, 1)
++        from tests.hermes_cli.origin_custody_support import interactive_capture
++        with interactive_capture(home, fixtures.CHAT) as captured:
++            assert captured["origin"] == origin
++            native.record(conn, task, captured, 1)
+         conn.commit()
+         binding = native._receipt(conn, task)
+         assert binding is not None
+         yield home, conn, task, binding
+ 
+ 
++@pytest.fixture
++def live_origin(store):
++    from tests.hermes_cli.origin_custody_support import interactive_capture
++    with interactive_capture(store[0], fixtures.CHAT) as captured:
++        yield captured
++
++
+ def test_deleted_receipt_cannot_authorize_or_inherit(store):
+     _, conn, task, binding = store
+     conn.execute("DELETE FROM tasks WHERE id=?", (task,))
+@@ -69,23 +79,24 @@ def test_normal_task_update_preserves_receipt(store):
+ 
+ 
+ @pytest.mark.parametrize("mode", ["replica", "link", "off"])
+-def test_mode_change_refuses_reads_and_new_receipts(store, mode):
++def test_mode_change_refuses_reads_and_new_receipts(store, live_origin, mode):
+     _, conn, _, binding = store
++    child = kb.create_task(conn, title="untrusted")
+     conn.execute("UPDATE kanban_sync_state SET mode=?", (mode,))
+     conn.commit()
+     assert native.lookup(binding["origin"], binding["owner"], gateway="here") is None
+-    native.record(conn, "untrusted", {"origin": binding["origin"]}, 2)
+-    assert native._receipt(conn, "untrusted") is None
++    native.record(conn, child, live_origin, 2)
++    assert native._receipt(conn, child) is None
+ 
+ 
+-def test_shadow_copy_cannot_mint_receipt(store, tmp_path):
+-    _, conn, task, binding = store
++def test_shadow_copy_cannot_mint_receipt(store, live_origin, tmp_path):
++    _, conn, task, _ = store
+     path = tmp_path / "sync-shadow" / "default.db"
+     path.parent.mkdir()
+     with sqlite3.connect(path) as shadow:
+         conn.backup(shadow)
+         shadow.execute("DELETE FROM origin_native_receipts")
+-        native.record(shadow, task, {"origin": binding["origin"]}, 2)
++        native.record(shadow, task, live_origin, 2)
+         assert native._receipt(shadow, task) is None
+ 
+ 
+diff --git a/tests/hermes_cli/test_origin_worker_custody.py b/tests/hermes_cli/test_origin_worker_custody.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3bdd478580d48328ba7e4d2d91688a24a6fc1cc7
+--- /dev/null
++++ b/tests/hermes_cli/test_origin_worker_custody.py
+@@ -0,0 +1,138 @@
++"""Adopted worker custody intersects the real facade lease and native creation."""
++import json
++import os
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_origin_native as native
++from tests.tools import test_kanban_worker_created_chats as fixtures
++
++
++@pytest.fixture
++def worker(tmp_path, monkeypatch):
++    from agent.runtime_session_store import RuntimeSessionStore
++    from gateway import session_kanban
++    from hermes_cli import kanban_db_sync as sync, kanban_origin
++    from hermes_state import SessionDB
++    from hermes_state_runtime import (begin_runtime_epoch, register_worker_execution, adopt_worker_execution,
++                                      mutate_worker_execution, worker_turn_lease)
++    from tests.agent.test_cross_process_turn_lease import _agent_with_db
++    from tests.hermes_cli.origin_custody_support import interactive_capture
++    from tests.hermes_cli.kanban_sync_support import FakeLeaseClient
++    monkeypatch.setattr(sync, '_LEASE_CLIENT', FakeLeaseClient())
++    home = fixtures.make_home(tmp_path, monkeypatch)
++    monkeypatch.setattr(kanban_origin, 'gateway_names', lambda: ('here', []))
++    monkeypatch.setattr(session_kanban, '_watch_submitter', lambda *a: None)
++    monkeypatch.setattr(os, 'chdir', lambda *a: None)
++    monkeypatch.setattr('agent.turn_liveness.resolve_turn_liveness_settings', lambda cfg: (None, 1.0))
++    monkeypatch.setattr('agent.relay_cwd.resolve_relay_scope_cwds', lambda *a: ('', ''))
++    with kbc.connect_closing() as conn:
++        sync.set_mode(conn, 'primary')
++        with interactive_capture(home, fixtures.CHAT) as captured:
++            parent = kb.create_task(conn, title='root', assignee='default', native_origin=captured)
++        assert native._receipt(conn, parent) is not None
++        task = kb.claim_task(conn, parent, claimer='fixture-lock', ttl_seconds=3600)
++        assert task is not None
++        context = dict(task_id=parent, board='default', db=str(kb.kanban_db_path()), run_id=task.current_run_id,
++                       claim_lock=task.claim_lock, workspace=str(home), workspaces_root=str(home), profile='default',
++                       branch=None, tenant=None, goal_mode=False, max_runtime_seconds=3600)
++    db = SessionDB(home / 'state.db')
++    scope = dict(epoch=begin_runtime_epoch(db, instance_id='worker-fixture'), execution_id='native-worker',
++                 session_id=fixtures.WORKER, generation=0)
++    register_worker_execution(db, **scope, kind='kanban', adoption_secret='secret')
++    adopted = adopt_worker_execution(db, **scope, adoption_secret='secret')
++    def rpc(method, **params):
++        if method == 'worker.turnLease':
++            return worker_turn_lease(db, **params)
++        return mutate_worker_execution(db, **params)
++    store = RuntimeSessionStore(rpc, scope, home / 'outbox', adopted)
++    frame = dict(scope=scope, home=str(home), policy=dict(source='kanban', kanban_json=json.dumps(context)))
++    capability = session_kanban.bind_worker_context(frame)
++    agent = _agent_with_db(store, session_id=fixtures.WORKER, platform='kanban')
++    # Same explicit post-construction handoff as the private adopted worker.
++    assert capability is not None
++    capability.bind_agent(agent)
++    agent._test_original_worker_custody = capability
++    try:
++        yield agent, store, db, context, frame
++    finally:
++        store.close()
++        db.close()
++
++
++def test_bound_capability_cannot_be_rebound_to_another_agent(worker):
++    from tests.agent.test_cross_process_turn_lease import _agent_with_db
++    agent, store, _, _, _ = worker
++    other = _agent_with_db(store, session_id=agent.session_id, platform='kanban')
++    with pytest.raises(ValueError, match='invalid_worker_origin_agent'):
++        agent._test_original_worker_custody.bind_agent(other)
++
++
++def test_bind_facade_and_creation_inherit_native_origin(worker, monkeypatch, capsys):
++    from concurrent.futures import ThreadPoolExecutor
++    from tools.thread_context import propagate_context_to_thread
++    agent, store, _, context, _ = worker
++    assert not hasattr(store, 'db_path')
++    observed = []
++    def loop(*args, **kwargs):
++        capture = native.capture(context['task_id'])
++        assert capture is not None
++        with ThreadPoolExecutor(max_workers=1) as pool:
++            child = pool.submit(propagate_context_to_thread(fixtures.create), 'tool', monkeypatch, capsys).result()
++        with kbc.connect_closing() as conn:
++            binding = native._receipt(conn, child)
++            assert binding['origin']['session'] == fixtures.CHAT
++            assert conn.execute('SELECT inherited_from FROM origin_native_receipts WHERE task_id=?', (child,)).fetchone()[0] == context['task_id']
++        observed.append(capture)
++        return dict(final_response='ok', messages=[], failed=False)
++    monkeypatch.setattr('agent.conversation_loop.run_conversation', loop)
++    assert agent.run_conversation('create')['final_response'] == 'ok'
++    assert len(observed) == 1
++    assert observed[0].validated() is None
++    assert native.capture(context['task_id']) is None
++
++
++@pytest.mark.parametrize('change', ['release', 'session', 'store'])
++def test_release_during_final_owner_lease_read_refuses(worker, monkeypatch, change):
++    from agent.origin_turn_custody import _current
++    agent, store, _, context, _ = worker
++    read = store.session_turn_lease_expires_at
++    def loop(*args, **kwargs):
++        lease = _current.get()[0]
++        count = 0
++        def releasing(*args):
++            nonlocal count
++            expiry = read(*args)
++            count += 1
++            if count == 2:
++                if change == 'release':
++                    lease.stop_refresher()
++                elif change == 'session':
++                    agent.session_id = 'different-session'
++                else:
++                    agent._session_db = object()
++            return expiry
++        monkeypatch.setattr(store, 'session_turn_lease_expires_at', releasing)
++        assert native.capture(context['task_id']) is None
++        return dict(final_response='ok', messages=[], failed=False)
++    monkeypatch.setattr('agent.conversation_loop.run_conversation', loop)
++    agent.run_conversation('release during capture')
++
++
++def test_adopted_execute_hands_capability_to_constructed_agent(tmp_path, monkeypatch):
++    """Wiring proof alongside the real bind/facade/store/creation proof above."""
++    from types import SimpleNamespace
++    from gateway import session_kanban
++    from tests.gateway.test_managed_worker_route_key import _execute
++    from tests.gateway.test_managed_turn_contract import assignment
++    frame, _ = assignment(tmp_path, monkeypatch)
++    bound = []
++    capability = SimpleNamespace(bind_agent=lambda agent: bound.append(agent))
++    monkeypatch.setattr(session_kanban, 'bind_worker_context', lambda frame: capability)
++    def turns(agent, frame, history):
++        assert bound == [agent]
++        return dict(final_response='ok', completed=True)
++    monkeypatch.setattr(session_kanban, 'run_worker_turns', turns)
++    _execute(frame, monkeypatch)
++    assert len(bound) == 1
+diff --git a/tests/hermes_cli/test_origin_worker_refusals.py b/tests/hermes_cli/test_origin_worker_refusals.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..27853b2d799f52ec7babce2bef11b4c7b69ca4f6
+--- /dev/null
++++ b/tests/hermes_cli/test_origin_worker_refusals.py
+@@ -0,0 +1,184 @@
++"""Refusal and transaction fences for adopted native worker inheritance."""
++import json
++import os
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_origin_native as native
++from tests.hermes_cli import test_origin_worker_custody as helpers
++
++worker = helpers.worker
++
++
++@pytest.mark.parametrize('change', ['task_expired', 'run_expired', 'task_status', 'run_status', 'task_run',
++                                  'task_lock', 'run_lock', 'run_task', 'run_ended', 'bound_pid', 'bound_lock'])
++@pytest.mark.parametrize('phase', ['capture', 'transaction'])
++def test_claim_changes_revoke_capture_and_creation(worker, monkeypatch, change, phase):
++    agent, _, _, context, _ = worker
++    def change_claim(conn):
++        statements = {
++            'task_expired': ('UPDATE tasks SET claim_expires=0 WHERE id=?', context['task_id']),
++            'run_expired': ('UPDATE task_runs SET claim_expires=0 WHERE id=?', context['run_id']),
++            'task_status': ("UPDATE tasks SET status='done' WHERE id=?", context['task_id']),
++            'run_status': ("UPDATE task_runs SET status='done' WHERE id=?", context['run_id']),
++            'task_run': ('UPDATE tasks SET current_run_id=NULL WHERE id=?', context['task_id']),
++            'task_lock': ("UPDATE tasks SET claim_lock='other' WHERE id=?", context['task_id']),
++            'run_lock': ("UPDATE task_runs SET claim_lock='other' WHERE id=?", context['run_id']),
++            'run_task': ("UPDATE task_runs SET task_id='wrong-task' WHERE id=?", context['run_id']),
++            'run_ended': ('UPDATE task_runs SET ended_at=1 WHERE id=?', context['run_id']),
++        }
++        if change.startswith('bound_'):
++            from gateway import session_kanban
++            payload = dict(pid=-1 if change == 'bound_pid' else os.getpid(),
++                           claim_lock='other' if change == 'bound_lock' else context['claim_lock'])
++            assert session_kanban._bound_worker_matches(conn, context)
++            kb._append_event(conn, context['task_id'], 'worker_bound', payload, run_id=context['run_id'])
++        else:
++            sql, value = statements[change]
++            # The other task exists so foreign-key enforcement remains enabled.
++            if change == 'run_task':
++                other = kb.create_task(conn, title='different creator')
++                conn.execute('UPDATE task_runs SET task_id=? WHERE id=?', (other, value))
++            else:
++                conn.execute(sql, (value,))
++    def loop(*args, **kwargs):
++        captured = native.capture(context['task_id'])
++        assert captured is not None
++        with kbc.connect_closing() as conn:
++            if phase == 'capture':
++                with kb.write_txn(conn):
++                    change_claim(conn)
++                assert native.capture(context['task_id']) is None
++            else:
++                # The mutation is deliberately uncommitted: a separate reader
++                # sees the OLD valid claim, whereas the creation connection must
++                # reject it. This also exercises nested create_task transactions.
++                with kb.write_txn(conn):
++                    change_claim(conn)
++                    child = kb.create_task(conn, title='no authority', native_origin=captured)
++                    assert native._receipt(conn, child) is None
++        return dict(final_response='ok', messages=[], failed=False)
++    monkeypatch.setattr('agent.conversation_loop.run_conversation', loop)
++    agent.run_conversation('test claim fence')
++
++
++@pytest.mark.parametrize('change', ['wrong_creator', 'wrong_agent', 'store', 'session', 'scope', 'lease_expired',
++                                  'lease_revoked', 'delegated', 'pid', 'home', 'profile', 'gateway', 'nested',
++                                  'owner_unavailable', 'epoch'])
++def test_worker_custody_intersection(worker, monkeypatch, change):
++    from agent import origin_turn_custody
++    from agent.delegation_context import delegated_child_context
++    from types import SimpleNamespace
++    agent, store, db, context, _ = worker
++    def loop(*args, **kwargs):
++        captured = native.capture(context['task_id'])
++        assert captured is not None
++        if change == 'wrong_creator':
++            assert native.capture('other-task') is None
++            return dict(final_response='ok', messages=[], failed=False)
++        if change in ('delegated', 'nested'):
++            manager = delegated_child_context() if change == 'delegated' else origin_turn_custody.scope(None)
++            with manager:
++                assert native.capture(context['task_id']) is None
++                assert captured.validated() is None
++            assert captured.validated() is not None
++            return dict(final_response='ok', messages=[], failed=False)
++        from agent.runtime_session_store import WorkerPersistenceError
++        lease = origin_turn_custody._current.get()[0]
++        def unavailable(*args):
++            raise WorkerPersistenceError('owner_unavailable')
++        def replace_epoch():
++            from hermes_state_runtime import begin_runtime_epoch
++            begin_runtime_epoch(db, instance_id='replacement-owner')
++            # The replaced owner cannot accept old worker writes. Cleanup belongs
++            # to the fixture's new owner, not the stale worker's write journal.
++            monkeypatch.setattr(store, 'release_session_turn_lease',
++                lambda sid, holder, **kw: db.release_session_turn_lease(sid, holder))
++        with monkeypatch.context() as patch:
++            mutations = {
++                'wrong_agent': lambda: patch.setattr(lease, 'agent', SimpleNamespace(**vars(agent))),
++                'store': lambda: patch.setattr(agent, '_session_db', object()),
++                'session': lambda: patch.setattr(agent, 'session_id', 'different-session'),
++                'scope': lambda: patch.setitem(store.scope, 'generation', 100),
++                'lease_expired': lambda: patch.setattr(store, 'session_turn_lease_expires_at', lambda *a: 0),
++                'lease_revoked': lambda: db.release_session_turn_lease(agent.session_id, agent._active_session_turn_lease_holder),
++                'owner_unavailable': lambda: patch.setattr(store, 'session_turn_lease_expires_at', unavailable),
++                'epoch': replace_epoch,
++                'pid': lambda: patch.setattr(os, 'getpid', lambda: -1),
++                'home': lambda: patch.setenv('HERMES_HOME', str(db.db_path.parent / 'other')),
++                'profile': lambda: patch.setattr('hermes_cli.profiles.get_active_profile_name', lambda: 'other'),
++                'gateway': lambda: patch.setattr('hermes_cli.kanban_origin.gateway_names', lambda: ('other', [])),
++            }
++            mutations[change]()
++            assert native.capture(context['task_id']) is None
++            assert captured.validated() is None
++        return dict(final_response='ok', messages=[], failed=False)
++    monkeypatch.setattr('agent.conversation_loop.run_conversation', loop)
++    agent.run_conversation('test intersection')
++
++
++@pytest.mark.parametrize('field', ['task_id', 'run_id', 'claim_lock'])
++def test_bind_rejects_changed_adopted_claim(worker, field):
++    from gateway.session_kanban import bind_worker_context
++    from hermes_state_runtime import RuntimeStoreError
++    _, _, _, context, frame = worker
++    altered = dict(context)
++    altered[field] = 999999 if field == 'run_id' else 'wrong'
++    frame = dict(frame, policy=dict(frame['policy'], kanban_json=json.dumps(altered)))
++    with pytest.raises(RuntimeStoreError):
++        bind_worker_context(frame)
++
++
++@pytest.mark.parametrize('change', ['missing', 'namespace', 'foreign_origin'])
++def test_parent_requires_exact_local_native_receipt(worker, monkeypatch, change):
++    agent, _, _, context, _ = worker
++    def loop(*args, **kwargs):
++        captured = native.capture(context['task_id'])
++        assert captured is not None
++        with kbc.connect_closing() as conn:
++            binding = native._receipt(conn, context['task_id'])
++            if change == 'missing':
++                conn.execute('DELETE FROM origin_native_receipts WHERE task_id=?', (context['task_id'],))
++                # Real synced discovery rows remain; they must not restore authority.
++                from hermes_cli import kanban_chat_links
++                kanban_chat_links.reconcile(conn, 'default', 'here', ledger=False)
++            else:
++                if change == 'namespace':
++                    binding['owner']['profile'] = 'other'
++                    binding['task_record_key'] = 'other/default/' + context['task_id']
++                else:
++                    binding['origin']['gateway'] = 'foreign'
++                conn.execute('UPDATE origin_native_receipts SET binding_json=? WHERE task_id=?',
++                             (json.dumps(binding), context['task_id']))
++            conn.commit()
++            assert captured.validated() is not None  # Claim is still live.
++            child = kb.create_task(conn, title='no parent authority', native_origin=captured)
++            assert native._receipt(conn, child) is None
++        return dict(final_response='ok', messages=[], failed=False)
++    monkeypatch.setattr('agent.conversation_loop.run_conversation', loop)
++    agent.run_conversation('test parent receipt')
++
++
++@pytest.mark.parametrize('change', ['claim', 'turn'])
++def test_revoke_during_parent_receipt_read_refuses(worker, monkeypatch, change):
++    agent, _, db, context, _ = worker
++    read = native._receipt
++    def loop(*args, **kwargs):
++        captured = native.capture(context['task_id'])
++        assert captured is not None
++        def revoke(conn, task_id):
++            binding = read(conn, task_id)
++            if task_id == context['task_id']:
++                if change == 'claim':
++                    conn.execute('UPDATE tasks SET claim_expires=0 WHERE id=?', (task_id,))
++                else:
++                    db.release_session_turn_lease(agent.session_id, agent._active_session_turn_lease_holder)
++            return binding
++        monkeypatch.setattr(native, '_receipt', revoke)
++        with kbc.connect_closing() as conn:
++            child = kb.create_task(conn, title='revoked at receipt read', native_origin=captured)
++            assert read(conn, child) is None
++        return dict(final_response='ok', messages=[], failed=False)
++    monkeypatch.setattr('agent.conversation_loop.run_conversation', loop)
++    agent.run_conversation('revoke during persistence')
+-- 
+2.43.0
+

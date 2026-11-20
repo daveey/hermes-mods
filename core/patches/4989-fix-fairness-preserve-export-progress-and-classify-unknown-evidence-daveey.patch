@@ -1,0 +1,237 @@
+From c4c0f1dac0cb1cc9feb059223e1a6bce163e5856 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 15:34:05 +0000
+Subject: [PATCH] fix(fairness): preserve export progress and classify unknown
+ evidence [daveey]
+
+Review fixes: replace oversized lifecycle rows with explicit oversize loss while atomically advancing the journal cursor; use finite source-time validation for huge JSON integers; distinguish unknown trigger integrity from observed trigger loss. Pin current journal behaviour and exercise first/middle/last oversized rows plus forged capture CLI classification. Correct the writer docstring: caller-sized batches are not a runtime queue memory guarantee. RED: overflow2, oversized3, trigger2. GREEN:307 fairness tests; all21 checks.
+---
+ hermes_cli/kanban_fairness_payloads.py        |  3 +-
+ hermes_cli/kanban_fairness_segments.py        |  6 +++-
+ hermes_cli/kanban_fairness_store.py           | 27 +++++++++-----
+ .../test_kanban_fairness_journal.py           |  4 +--
+ .../test_kanban_fairness_payloads.py          | 35 ++++++++++++++++++
+ .../test_kanban_fairness_store_hardening.py   | 36 +++++++++++++++++++
+ .../test_kanban_fairness_vertical.py          |  7 +---
+ 7 files changed, 99 insertions(+), 19 deletions(-)
+
+diff --git a/hermes_cli/kanban_fairness_payloads.py b/hermes_cli/kanban_fairness_payloads.py
+index 03d233ed02cea897bcd096ad5fa3aae1b2374fa5..5c34e1bcbdc325cd6c777fe09abba904cc1345ea 100644
+--- a/hermes_cli/kanban_fairness_payloads.py
++++ b/hermes_cli/kanban_fairness_payloads.py
+@@ -138,7 +138,8 @@ def _source_identity(value):
+ def _source_time(value):
+     if isinstance(value, bool) or not isinstance(value, (int, float)):
+         return False
+-    return math.isfinite(value)
++    _finite(value, "raw_b64 source time")
++    return True
+ 
+ 
+ def _validate_source_document(raw):
+diff --git a/hermes_cli/kanban_fairness_segments.py b/hermes_cli/kanban_fairness_segments.py
+index bd3a8c407732aa008ec426909ebc64e79d0980f6..bf0decc163831b6db107f7f78cabe4d681fa8e8d 100644
+--- a/hermes_cli/kanban_fairness_segments.py
++++ b/hermes_cli/kanban_fairness_segments.py
+@@ -137,7 +137,11 @@ def source_rows(cuts):
+ 
+ 
+ def append_records(out: Path, records, *, max_bytes: int = MAX_CAPTURE_BYTES, _metadata=None) -> dict:
+-    """Append one bounded batch. Caller counts rejection as loss; one consumer owns the directory."""
++    """Append a caller-sized batch; rejection is loss. One consumer owns the directory.
++
++    Segment and capture byte ceilings do not bound transient batch memory. Runtime callers must
++    bound their own queue and batch sizes; this writer materializes encoded lines and segments.
++    """
+     if type(max_bytes) is not int or not 0 < max_bytes <= MAX_CAPTURE_BYTES:
+         raise ValueError("max_bytes outside capture bound")
+     if (out / MANIFEST).exists():
+diff --git a/hermes_cli/kanban_fairness_store.py b/hermes_cli/kanban_fairness_store.py
+index 43a4154aa5dd5b65e67ab1ff1e865e0913345c29..08b4f3a16abc5b36de2630ea2fece56474e9bddd 100644
+--- a/hermes_cli/kanban_fairness_store.py
++++ b/hermes_cli/kanban_fairness_store.py
+@@ -16,7 +16,7 @@ from typing import Optional
+ 
+ from hermes_cli import kanban_fairness_journal as journal
+ from hermes_cli import kanban_fairness_segments as segments
+-from hermes_cli.kanban_fairness_schema import VERSION, decode_owner, make_record
++from hermes_cli.kanban_fairness_schema import MAX_PAYLOAD_BYTES, VERSION, decode_owner, make_record
+ from hermes_cli.kanban_fairness_segments import append_records, seal_records
+ 
+ __all__ = ["append_records", "drain", "load", "seal_records", "write_manifest"]
+@@ -78,10 +78,15 @@ def drain(conn: sqlite3.Connection, out: Path) -> dict:
+         return receipts
+     if (out / MANIFEST).exists():
+         return receipts
+-    if state.get("trigger_integrity") is not True and not any(g["code"] == "trigger_loss" for g in receipts["gaps"]):
+-        _gap(receipts, "trigger_loss", "capture triggers are missing or changed, or seal integrity is unknown")
++    if state.get("trigger_integrity") is not True:
++        previous_gaps = len(receipts["gaps"])
++        if state.get("trigger_integrity") is False:
++            _gap(receipts, "trigger_loss", "capture triggers are missing or changed")
++        else:
++            _gap(receipts, "trigger_integrity_unknown", "journal does not attest capture trigger integrity")
+         # Preserve newly observed gaps even when no new rows arrive.
+-        _write(out / RECEIPTS, segments.encoded(receipts))
++        if len(receipts["gaps"]) != previous_gaps:
++            _write(out / RECEIPTS, segments.encoded(receipts))
+     while True:
+         rows = list(journal.rows(conn, receipts["journal_seq"], limit=128))
+         if not rows:
+@@ -93,13 +98,19 @@ def drain(conn: sqlite3.Connection, out: Path) -> dict:
+         try:
+             for db_seq, kind, wall_ms, task_id, op, fields in rows:
+                 seq += 1
++                record_kind = "opening" if kind == "opening" else "row_change"
++                payload = {"task_id": task_id, "op": op, "fields": json.loads(fields),
++                           "journal_seq": db_seq, "journal_kind": kind,
++                           "database_uid": receipts["database_uid"], "source_uid": None}
++                if len(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")) > MAX_PAYLOAD_BYTES:
++                    record_kind = "loss"
++                    # These are exporter-epoch sequence bounds, not durable journal sequence IDs.
++                    payload = {"reason": "oversize", "count": 1, "first_seq": seq, "last_seq": seq,
++                               "start_wall_ns": wall_ms * 1_000_000, "end_wall_ns": wall_ms * 1_000_000}
+                 records.append(make_record(
+                     capture_id=state["capture_id"], source_gateway=receipts["source_gateway"],
+                     board_uid=receipts["board_uid"], source_epoch=epoch, seq=seq,
+-                    kind="opening" if kind == "opening" else "row_change", wall_ns=wall_ms * 1_000_000,
+-                    payload={"task_id": task_id, "op": op, "fields": json.loads(fields),
+-                             "journal_seq": db_seq, "journal_kind": kind,
+-                             "database_uid": receipts["database_uid"], "source_uid": None}))
++                    kind=record_kind, wall_ns=wall_ms * 1_000_000, payload=payload))
+             receipts = append_records(out, records, _metadata={"journal_seq": rows[-1][0]})
+         except (ValueError, OSError) as exc:
+             _gap(receipts, "export_failed", type(exc).__name__)
+diff --git a/tests/hermes_cli/test_kanban_fairness_journal.py b/tests/hermes_cli/test_kanban_fairness_journal.py
+index d9db9a2885a697e2101258792c36b705f463d45c..beae3f0b4cbbe6e22a5d06c51d39cd68a9974785 100644
+--- a/tests/hermes_cli/test_kanban_fairness_journal.py
++++ b/tests/hermes_cli/test_kanban_fairness_journal.py
+@@ -109,9 +109,7 @@ def test_seal_stops_capture_and_survives_a_reopen(conn, tmp_path):
+         assert journal.status(again)["triggers"] == []
+         assert journal.status(again)["stored"] == manifest["journal"]["stored"]
+     capture = store.load(out)
+-    expected_gaps = {"source_identity_unknown", "clock_unknown", "source_uid_unknown"}
+-    if journal.status(conn).get("trigger_integrity") is not True:
+-        expected_gaps.add("trigger_loss")
++    expected_gaps = {"source_identity_unknown", "clock_unknown", "source_uid_unknown", "trigger_integrity_unknown"}
+     assert {g["code"] for g in capture["gaps"]} == expected_gaps
+     assert len(manifest["segments"]) == 2
+     assert [r["seq"] for r in capture["records"]] == list(range(1, len(capture["records"]) + 1))
+diff --git a/tests/hermes_cli/test_kanban_fairness_payloads.py b/tests/hermes_cli/test_kanban_fairness_payloads.py
+index 30284e9316fa3411fce867071b0004c21940cde4..5f34065fae2e229dc27826fafe473ce3576220f2 100644
+--- a/tests/hermes_cli/test_kanban_fairness_payloads.py
++++ b/tests/hermes_cli/test_kanban_fairness_payloads.py
+@@ -249,6 +249,7 @@ BAD_RAW = [
+     _j(version=2), _j(version=True), _j(version=1.0),
+     _j(board=""), _j(board=" "), _j(board=1), _j(board="b" * 1025), _j(source_revision=None),
+     _j(observed_at="9"), _j(valid_until=True), _j(owners={}), _j(owners=["x"]),
++    _j(valid_until=10**400), _j(owners=[_owner(expires_at=10**400)]),
+     _j(owners=[_owner(extra="secret")]),
+     _j(owners=[{k: v for k, v in _owner().items() if k != "ref"}]),
+     _j(owners=[_owner(source="other")]), _j(owners=[_owner(source=["core-lane"])]),
+@@ -282,3 +283,37 @@ def test_owner_generation_redacted_receipt_keeps_digest_without_bytes():
+     payload = urgency(raw, outcome="invalid", raw_b64=None, raw_complete=False, redacted=True,
+                       owner_ids=[], reason="invalid_source")
+     assert record("owner_generation", payload)["payload"] == payload
++
++
++@pytest.mark.parametrize("field", ["valid_until", "expires_at"])
++def test_huge_source_time_forged_capture_is_incomplete(tmp_path, field):
++    import importlib.util
++    from pathlib import Path
++
++    from hermes_cli import kanban_fairness_segments as seg
++    from hermes_cli import kanban_fairness_store as store
++
++    item = record("owner_generation", urgency())
++    seg.append_records(tmp_path, [item])
++    manifest = seg.seal_records(tmp_path, expected_sources=seg.receipts(tmp_path)["sources"])
++    doc = source_doc()
++    if field == "valid_until":
++        doc[field] = 10**400
++    else:
++        doc["owners"][0][field] = 10**400
++    item["payload"] = urgency(json.dumps(doc).encode())
++    data = seg.encoded(item) + b"\n"
++    entry = manifest["segments"][0]
++    (tmp_path / entry["name"]).write_bytes(data)
++    entry.update(bytes=len(data), sha256=hashlib.sha256(data).hexdigest())
++    manifest["bytes"] = len(data)
++    manifest["final_seal"] = seg.final_seal(manifest)
++    (tmp_path / seg.MANIFEST).write_bytes(seg.encoded(manifest))
++    assert store.load(tmp_path)["gaps"]
++    spec = importlib.util.spec_from_file_location(
++        "fairness_overflow_cli", Path(__file__).resolve().parents[2] / "scripts" / "kanban_fairness.py")
++    assert spec is not None and spec.loader is not None
++    cli = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(cli)
++    assert cli.main(["report", "--input", str(tmp_path), "--mode", "live",
++                     "--output", str(tmp_path / "report")]) == 2
+diff --git a/tests/hermes_cli/test_kanban_fairness_store_hardening.py b/tests/hermes_cli/test_kanban_fairness_store_hardening.py
+index e4fe13515eb2125d4f1c60170b6620b9d467673b..9fcb4dc8b67e7ea9f5bc98a1a5d3b6b5b7b325fd 100644
+--- a/tests/hermes_cli/test_kanban_fairness_store_hardening.py
++++ b/tests/hermes_cli/test_kanban_fairness_store_hardening.py
+@@ -45,6 +45,42 @@ def test_real_no_gap_roundtrip(tmp_path):
+     assert store.load(other)["gaps"] == []
+ 
+ 
++@pytest.mark.parametrize("position", [0, 3, 6])
++def test_oversize_journal_row_exports_loss_without_stalling(tmp_path, monkeypatch, position):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_fairness_journal as journal
++
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    out = tmp_path / "capture"
++    with kbc.connect_closing() as conn:
++        journal.arm(conn, "capture")
++        for index in range(7):
++            kb.create_task(conn, title="fixture", assignee="a",
++                           idempotency_key="x" * 300_000 if index == position else f"key-{index}")
++        rows = list(journal.rows(conn, 0))
++        assert len(rows) == 14
++        result = store.drain(conn, out)
++        assert result["journal_seq"] == rows[-1][0]
++        assert store.drain(conn, out) == result
++        store.write_manifest(conn, out, board="default", assumptions={}, policy={})
++    capture = store.load(out)
++    losses = [r for r in capture["records"] if r["kind"] == "loss"]
++    assert len(losses) == 1
++    assert losses[0]["payload"]["reason"] == "oversize"
++    assert losses[0]["payload"]["count"] == 1
++    exported = [r for r in capture["records"] if r["kind"] != "loss"]
++    expected = [r[0] for r in rows if len(r[-1].encode("utf-8")) < 256 * 1024]
++    assert [r["payload"]["journal_seq"] for r in exported] == expected
++    assert len(exported) == 13
++    assert capture["gaps"]  # Loss never certifies complete coverage.
++    assert "export_failed" not in {g["code"] for g in capture["gaps"]}
++
++
+ @pytest.mark.parametrize("value", [None, [], 3, "bad", {"segments": []}])
+ def test_malformed_manifest_and_receipts_fail_closed(tmp_path, value):
+     (tmp_path / seg.MANIFEST).write_text(json.dumps(value))
+diff --git a/tests/hermes_cli/test_kanban_fairness_vertical.py b/tests/hermes_cli/test_kanban_fairness_vertical.py
+index 5d62b4f6b7c0a53770593ff9ce284478d8da471c..22eeb3e385f90bcf994f781ab952013347b297b7 100644
+--- a/tests/hermes_cli/test_kanban_fairness_vertical.py
++++ b/tests/hermes_cli/test_kanban_fairness_vertical.py
+@@ -91,12 +91,7 @@ def test_dispatch_to_report(kanban_home, all_assignees_spawnable, tmp_path, caps
+     capsys.readouterr()
+ 
+     capture = store.load(out)
+-    expected_gaps = {"source_identity_unknown", "clock_unknown", "source_uid_unknown"}
+-    with kbc.connect_closing() as again:
+-        state = journal.status(again)
+-        assert state is not None
+-        if state.get("trigger_integrity") is not True:
+-            expected_gaps.add("trigger_loss")
++    expected_gaps = {"source_identity_unknown", "clock_unknown", "source_uid_unknown", "trigger_integrity_unknown"}
+     assert {g["code"] for g in capture["gaps"]} == expected_gaps
+     eps = metrics.episodes(capture["records"], armed_s=capture["manifest"]["window"]["armed_ms"] / 1000,
+                            err=0)
+-- 
+2.43.0
+

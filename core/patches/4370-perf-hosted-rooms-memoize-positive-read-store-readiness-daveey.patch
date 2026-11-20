@@ -1,0 +1,254 @@
+From 89fdb9c7d2ad952646dccbd869b4aa2a806b1920 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 23:11:31 +0000
+Subject: [PATCH] perf(hosted-rooms): memoize positive read-store readiness
+ [daveey]
+
+Every hosted-room supervisor polls list_rooms every five seconds. Opening a
+fresh connection also repeated every table_info, index and legacy-import
+readiness probe, despite no schema changes. Cache only a proven True result
+per process, keyed by resolved path, device, inode and schema_version. Keep
+access locked and bounded to 128 paths; bracket open with file identity so a
+replacement during open cannot inherit its predecessor's memo.
+
+No change to _connect, migrations, write paths, or poll interval. No connection
+is retained across cycles: SQLite open/close cost remains.
+
+Proof:
+- RED: unchanged-store and post-repair warm-read tests failed on the original;
+  dropped-index repair, same-cookie new-inode replacement and never-cache-False
+  controls retained.
+- GREEN: initial four targeted files passed 59 tests. Extended regression suite
+  covers replacement during open, bounded eviction and cross-thread reuse.
+- CPU microbenchmark (Linux worker, Python 3.14.9, process_time_ns): seven
+  alternating before/after batches of 500 list_rooms calls each, 20 warmups,
+  disposable unchanged shared-state.db, asserting room counts each call.
+  Baseline is the exact _read_connection from 05ba9149f1f1c063c83123ba675ec4ead1550819;
+  all other code and fixture state identical. Median microseconds/call:
+  empty store 564.33 -> 364.73 (35.37% lower); ten rooms 627.94 -> 402.35
+  (35.93% lower). This is component CPU, not live supervisor CPU acceptance.
+  Opening connections still costs CPU. The <=0.7%-of-one-core live budget
+  belongs to the originating re-measure card, after normal core update;
+  no production gateway was restarted or re-measured here.
+
+Rollback: revert this commit; no schema/config changes.
+---
+ gateway/hosted_rooms.py                       |  35 ++++-
+ .../gateway/test_hosted_rooms_ready_cache.py  | 147 ++++++++++++++++++
+ 2 files changed, 180 insertions(+), 2 deletions(-)
+ create mode 100644 tests/gateway/test_hosted_rooms_ready_cache.py
+
+diff --git a/gateway/hosted_rooms.py b/gateway/hosted_rooms.py
+index a32138f6e5aa5dc4e7dc9abd4a98834fece774eb..62b2edfc7aca0a86bd7b13f8799c20e050dc24a2 100644
+--- a/gateway/hosted_rooms.py
++++ b/gateway/hosted_rooms.py
+@@ -11,6 +11,7 @@ import hashlib
+ import json
+ import re
+ import sqlite3
++import threading
+ from contextlib import closing
+ from functools import partial
+ from pathlib import Path
+@@ -482,13 +483,43 @@ def _connect(db_path: DbPath) -> sqlite3.Connection:
+         initialize=partial(_initialize_store, db_path=path), lock_retries=_JOURNAL_MODE_LOCK_RETRIES)
+ 
+ 
++_READY_STORES: dict[Path, tuple[int, int, int]] = {}
++_READY_STORES_LOCK = threading.Lock()
++_READY_STORES_LIMIT = 128
++
++
++def _read_store_ready(conn: sqlite3.Connection, path: Path, identity: tuple[int, int]) -> bool:
++    """Memoize only proven readiness, fenced by pre-open file identity and schema cookie."""
++    current = path.stat()
++    if identity != (current.st_dev, current.st_ino):
++        return _store_ready(conn, path)
++    key = (*identity, conn.execute("PRAGMA schema_version").fetchone()[0])
++    with _READY_STORES_LOCK:
++        if _READY_STORES.get(path) == key:
++            return True
++    if not _store_ready(conn, path):
++        return False
++    with _READY_STORES_LOCK:
++        _READY_STORES[path] = key
++        if len(_READY_STORES) > _READY_STORES_LIMIT:
++            del _READY_STORES[next(iter(_READY_STORES))]
++    return True
++
++
+ def _read_connection(db_path: DbPath) -> sqlite3.Connection:
+     """Open the room store without steady-state journal or migration writes."""
+-    path = Path(db_path)
++    path = Path(db_path).resolve()
+     if not path.is_file():
+         _connect(path).close()
++    # Capture before opening: replacement must never label an old connection with a new inode.
++    stat = path.stat()
+     conn = open_sqlite(path)
+-    if not _store_ready(conn, path):
++    try:
++        ready = _read_store_ready(conn, path, (stat.st_dev, stat.st_ino))
++    except BaseException:
++        conn.close()
++        raise
++    if not ready:
+         conn.close()
+         _connect(path).close()
+         conn = open_sqlite(path)
+diff --git a/tests/gateway/test_hosted_rooms_ready_cache.py b/tests/gateway/test_hosted_rooms_ready_cache.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6a3d9f105d194924fd10843b63bb920ff3a5bfc0
+--- /dev/null
++++ b/tests/gateway/test_hosted_rooms_ready_cache.py
+@@ -0,0 +1,147 @@
++"""Readiness memo must avoid schema work without hiding repairs."""
++
++import shutil
++import sqlite3
++from contextlib import closing
++
++from gateway import hosted_rooms as rooms
++from gateway import hosted_rooms_legacy_import as legacy
++
++
++def trace_reads(monkeypatch):
++    statements = []
++    original = rooms.open_sqlite
++
++    def traced(path):
++        conn = original(path)
++        conn.set_trace_callback(statements.append)
++        return conn
++
++    monkeypatch.setattr(rooms, "open_sqlite", traced)
++    return statements
++
++
++def table_probes(statements):
++    return [sql for sql in statements if sql.upper().startswith("PRAGMA TABLE_INFO")]
++
++
++def test_unchanged_second_read_skips_schema_and_import_checks(tmp_path, monkeypatch):
++    db = tmp_path / "shared-state.db"
++    rooms.list_rooms(db)
++    statements = trace_reads(monkeypatch)
++
++    def unexpected(*args):
++        raise AssertionError("unchanged store must skip the legacy import check")
++
++    monkeypatch.setattr(legacy, "settled", unexpected)
++    assert rooms.list_rooms(db) == []
++    assert not table_probes(statements)
++    assert sum(sql.upper() == "PRAGMA SCHEMA_VERSION" for sql in statements) == 1
++
++
++def test_dropped_required_index_rechecks_and_repairs(tmp_path, monkeypatch):
++    original = tmp_path / "original.db"
++    rooms.list_rooms(original)
++    db = tmp_path / "copy.db"
++    shutil.copyfile(original, db)
++    rooms.list_rooms(db)
++    with closing(sqlite3.connect(db)) as conn:
++        conn.execute(f"DROP INDEX {rooms._KIND_INDEX}")
++        conn.commit()
++    statements = trace_reads(monkeypatch)
++    assert rooms.list_rooms(db) == []
++    assert table_probes(statements)
++    with closing(sqlite3.connect(db)) as conn:
++        assert rooms._schema_is_current(conn)
++    rooms.list_rooms(db)  # memoize the repaired schema
++    statements.clear()
++    assert rooms.list_rooms(db) == []
++    assert not table_probes(statements)
++
++
++def test_replaced_inode_rechecks_even_with_same_schema_version(tmp_path, monkeypatch):
++    db = tmp_path / "store.db"
++    rooms.list_rooms(db)
++    old_inode = db.stat().st_ino
++    with closing(sqlite3.connect(db)) as conn:
++        version = conn.execute("PRAGMA schema_version").fetchone()[0]
++    replacement = tmp_path / "replacement.db"
++    shutil.copyfile(db, replacement)
++    with closing(sqlite3.connect(replacement)) as conn:
++        conn.execute(f"DROP INDEX {rooms._KIND_INDEX}")
++        conn.execute(f"PRAGMA schema_version = {version}")
++        conn.commit()
++    replacement.replace(db)
++    assert db.stat().st_ino != old_inode
++    statements = trace_reads(monkeypatch)
++    assert rooms.list_rooms(db) == []
++    assert table_probes(statements)
++    with closing(sqlite3.connect(db)) as conn:
++        assert rooms._schema_is_current(conn)
++
++
++def test_not_ready_is_never_memoized(tmp_path, monkeypatch):
++    db = tmp_path / "store.db"
++    rooms._connect(db).close()  # initialize without a read memo
++    checks = []
++    original_open = rooms.open_sqlite
++
++    def not_ready(conn, path):
++        checks.append(path)
++        return False
++
++    monkeypatch.setattr(rooms, "_store_ready", not_ready)
++    # A repair that has not settled yet must be retried by the next read.
++    monkeypatch.setattr(rooms, "_connect", original_open)
++    assert rooms.list_rooms(db) == []
++    assert rooms.list_rooms(db) == []
++    assert len(checks) == 2
++
++
++def test_replacement_during_open_does_not_use_old_memo(tmp_path, monkeypatch):
++    db = tmp_path / "store.db"
++    rooms.list_rooms(db)
++    replacement = tmp_path / "replacement.db"
++    shutil.copyfile(db, replacement)
++    with closing(sqlite3.connect(replacement)) as conn:
++        version = conn.execute("PRAGMA schema_version").fetchone()[0]
++        conn.execute(f"DROP INDEX {rooms._KIND_INDEX}")
++        conn.execute(f"PRAGMA schema_version = {version}")
++        conn.commit()
++    original = rooms.open_sqlite
++
++    def replace_then_open(path):
++        if replacement.exists():
++            replacement.replace(db)
++        return original(path)
++
++    monkeypatch.setattr(rooms, "open_sqlite", replace_then_open)
++    assert rooms.list_rooms(db) == []
++    with closing(sqlite3.connect(db)) as conn:
++        assert rooms._schema_is_current(conn)
++
++
++def test_memo_is_bounded_and_evicted_store_is_rechecked(tmp_path, monkeypatch):
++    monkeypatch.setattr(rooms, "_READY_STORES", {})
++    monkeypatch.setattr(rooms, "_READY_STORES_LIMIT", 2)
++    stores = [tmp_path / f"{i}.db" for i in range(3)]
++    for db in stores:
++        rooms.list_rooms(db)
++    assert len(rooms._READY_STORES) == 2
++    statements = trace_reads(monkeypatch)
++    rooms.list_rooms(stores[0])
++    assert table_probes(statements)
++
++
++def test_concurrent_reads_share_positive_memo(tmp_path, monkeypatch):
++    from concurrent.futures import ThreadPoolExecutor
++
++    db = tmp_path / "store.db"
++    rooms.list_rooms(db)
++
++    def unexpected(*args):
++        raise AssertionError("all threads must share the ready memo")
++
++    monkeypatch.setattr(rooms, "_store_ready", unexpected)
++    with ThreadPoolExecutor(max_workers=4) as executor:
++        assert list(executor.map(rooms.list_rooms, [db] * 16)) == [[]] * 16
+-- 
+2.43.0
+

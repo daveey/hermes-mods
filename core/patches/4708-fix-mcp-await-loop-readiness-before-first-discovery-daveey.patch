@@ -1,0 +1,243 @@
+From 96805b87ee309ddbfec7aaacbe6d5968bc3d0602 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 02:34:51 +0000
+Subject: [PATCH] fix(mcp): await loop readiness before first discovery
+ [daveey]
+
+Thread.start does not guarantee run_forever has started. Wait for a callback on the loop before admitting discovery, and coordinate failed-start cleanup with the owned thread. Controlled gateway startup interleavings reproduce initial create request_failed and first-prompt admitted_turn_failed; historical CI did not retain underlying daemon traces. Add deterministic readiness, thread-start failure, late-start cleanup, and stopped-readiness regressions. No RPC budgets or retry policies change.
+---
+ tests/tools/test_mcp_loop_startup.py | 172 +++++++++++++++++++++++++++
+ tools/mcp_tool_loop.py               |  38 +++++-
+ 2 files changed, 208 insertions(+), 2 deletions(-)
+ create mode 100644 tests/tools/test_mcp_loop_startup.py
+
+diff --git a/tests/tools/test_mcp_loop_startup.py b/tests/tools/test_mcp_loop_startup.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..372785873b69d76a003bfeb1028d6d3c3f57addd
+--- /dev/null
++++ b/tests/tools/test_mcp_loop_startup.py
+@@ -0,0 +1,172 @@
++"""MCP admission must wait for the owned loop, not merely Thread.start."""
++import asyncio
++import threading
++from types import SimpleNamespace
++
++from tests.waiting import wait_until
++
++
++def test_first_call_waits_until_loop_can_accept_work(monkeypatch):
++    from tools import mcp_tool as origin
++    from tools import mcp_tool_loop as plumbing
++
++    assert origin._mcp_loop is None
++    entered, release, waiting, finished = (threading.Event() for _ in range(4))
++    real_new = asyncio.new_event_loop
++    loops, errors, results = [], [], []
++
++    class ReadyEvent(threading.Event):
++        def wait(self, timeout=None):
++            waiting.set()
++            return super().wait(timeout)
++
++    def new_loop():
++        loop = real_new()
++        loops.append(loop)
++        run = loop.run_forever
++
++        def delayed_run():
++            entered.set()
++            assert release.wait(10), "test did not release owned loop"
++            run()
++
++        loop.run_forever = delayed_run
++        return loop
++
++    async def answer():
++        return asyncio.get_running_loop()
++
++    def caller():
++        try:
++            plumbing._ensure_mcp_loop()
++            results.append(plumbing._run_on_mcp_loop(answer, timeout=5))
++        except BaseException as exc:
++            errors.append(exc)
++        finally:
++            finished.set()
++
++    monkeypatch.setattr(plumbing, "threading", SimpleNamespace(Lock=threading.Lock, Thread=threading.Thread, Event=ReadyEvent))
++    monkeypatch.setattr(plumbing.asyncio, "new_event_loop", new_loop)
++    worker = threading.Thread(target=caller)
++    worker.start()
++    try:
++        assert entered.wait(5)
++        # Either startup waits for actual readiness, or the old caller already failed.
++        assert wait_until(lambda: waiting.is_set() or finished.is_set(), timeout=5)
++        assert not finished.is_set(), f"admission returned before loop readiness: {errors}"
++        release.set()
++        worker.join(10)
++        assert not worker.is_alive()
++        assert not errors
++        assert results == loops
++        plumbing._ensure_mcp_loop()
++        assert len(loops) == 1
++    finally:
++        release.set()
++        worker.join(10)
++        # Also reap the real loop on the RED path, after the delayed start resumes.
++        for loop in loops:
++            if not loop.is_closed():
++                loop.call_soon_threadsafe(loop.stop)
++        thread = origin._mcp_thread
++        if thread is not None:
++            thread.join(10)
++            assert not thread.is_alive()
++        for loop in loops:
++            if not loop.is_closed():
++                loop.close()
++        origin._mcp_loop = origin._mcp_thread = None
++
++
++def test_failed_thread_start_closes_unpublished_loop(monkeypatch):
++    import pytest
++    from tools import mcp_tool as origin
++    from tools import mcp_tool_loop as plumbing
++
++    loop = asyncio.new_event_loop()
++
++    class FailedThread(threading.Thread):
++        def start(self):
++            raise RuntimeError("cannot start owned thread")
++
++    monkeypatch.setattr(plumbing.asyncio, "new_event_loop", lambda: loop)
++    monkeypatch.setattr(plumbing, "threading", SimpleNamespace(Lock=threading.Lock, Thread=FailedThread, Event=threading.Event))
++    with pytest.raises(RuntimeError, match="cannot start owned thread"):
++        plumbing._ensure_mcp_loop()
++    assert loop.is_closed()
++    assert origin._mcp_loop is origin._mcp_thread is None
++
++
++def test_readiness_failure_reaps_late_start(monkeypatch):
++    import pytest
++    from tools import mcp_tool as origin
++    from tools import mcp_tool_loop as plumbing
++
++    entered, release = threading.Event(), threading.Event()
++    loop = asyncio.new_event_loop()
++    run = loop.run_forever
++    threads = []
++
++    def delayed_run():
++        entered.set()
++        assert release.wait(10)
++        run()
++
++    class NotReady(threading.Event):
++        def wait(self, timeout=None):
++            assert entered.wait(5)
++            return False  # deterministically exhaust startup, without a wall-clock sleep
++
++    class OwnedThread(threading.Thread):
++        def __init__(self, **kwargs):
++            super().__init__(**kwargs)
++            threads.append(self)
++
++    loop.run_forever = delayed_run
++    monkeypatch.setattr(plumbing.asyncio, "new_event_loop", lambda: loop)
++    monkeypatch.setattr(plumbing, "threading", SimpleNamespace(Lock=threading.Lock, Thread=OwnedThread, Event=NotReady))
++    try:
++        with pytest.raises(RuntimeError, match="did not become ready"):
++            plumbing._ensure_mcp_loop()
++        assert origin._mcp_loop is origin._mcp_thread is None
++    finally:
++        release.set()
++        for thread in threads:
++            thread.join(10)
++            assert not thread.is_alive()
++    assert loop.is_closed()
++
++
++def test_ready_callback_does_not_publish_an_already_stopped_loop(monkeypatch):
++    import pytest
++    from tools import mcp_tool as origin
++    from tools import mcp_tool_loop as plumbing
++
++    loop = asyncio.new_event_loop()
++    threads = []
++    loop.call_soon(loop.stop)
++
++    class StoppedReady(threading.Event):
++        def wait(self, timeout=None):
++            result = super().wait(timeout)
++            threads[0].join(5)
++            assert not threads[0].is_alive()
++            return result
++
++    class OwnedThread(threading.Thread):
++        def __init__(self, **kwargs):
++            super().__init__(**kwargs)
++            threads.append(self)
++
++    monkeypatch.setattr(plumbing.asyncio, "new_event_loop", lambda: loop)
++    monkeypatch.setattr(plumbing, "threading", SimpleNamespace(Lock=threading.Lock, Thread=OwnedThread, Event=StoppedReady))
++    try:
++        with pytest.raises(RuntimeError, match="did not become ready"):
++            plumbing._ensure_mcp_loop()
++        assert origin._mcp_loop is origin._mcp_thread is None
++        assert loop.is_closed()
++    finally:
++        for thread in threads:
++            thread.join(5)
++        loop.close()
++        origin._mcp_loop = origin._mcp_thread = None
+diff --git a/tools/mcp_tool_loop.py b/tools/mcp_tool_loop.py
+index 20648a8ba6d59b32d53e91b9dfddde66dc1a3f3b..2f6e1f68148a2a61d11d9e7bcc95fecc94ec0ffa 100644
+--- a/tools/mcp_tool_loop.py
++++ b/tools/mcp_tool_loop.py
+@@ -290,8 +290,42 @@ def _ensure_mcp_loop():
+             return
+         loop = _origin._mcp_loop = asyncio.new_event_loop()
+         loop.set_exception_handler(_mcp_loop_exception_handler)
+-        _origin._mcp_thread = threading.Thread(target=loop.run_forever, name="mcp-event-loop", daemon=True)
+-        _origin._mcp_thread.start()
++        ready = threading.Event()
++        startup_lock = threading.Lock()
++        abandoned = exited = False
++
++        def run():
++            nonlocal exited
++            try:
++                loop.run_forever()
++            finally:
++                # Startup failure and thread exit agree on exactly one closer.
++                # Never take _core._lock here: the starting caller holds it.
++                with startup_lock:
++                    exited = True
++                    if abandoned:
++                        loop.close()
++
++        # Thread.start only confirms the thread exists. Publish readiness from an
++        # actual loop callback before discovery can schedule its first coroutine.
++        loop.call_soon(ready.set)
++        thread = _origin._mcp_thread = threading.Thread(target=run, name="mcp-event-loop", daemon=True)
++        try:
++            thread.start()
++            if not ready.wait(5) or not loop.is_running():
++                raise RuntimeError("MCP event loop did not become ready")
++        except BaseException:
++            _origin._mcp_loop = _origin._mcp_thread = None
++            with startup_lock:
++                abandoned = True
++                if exited or thread.ident is None:
++                    loop.close()
++                else:
++                    # The delayed thread will stop and close when it gets CPU.
++                    # Cleanup must not replace the original startup failure.
++                    with contextlib.suppress(RuntimeError):
++                        loop.call_soon_threadsafe(loop.stop)
++            raise
+ 
+ 
+ def _stop_mcp_loop(*, only_if_idle: bool = False) -> bool:
+-- 
+2.43.0
+

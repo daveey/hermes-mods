@@ -1,0 +1,141 @@
+From 46b6362dbdb30e2a91ace9db2f85c2ab610e0bf0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 02:48:43 +0000
+Subject: [PATCH] fix(outcomes): reject empty card lists contradicted by
+ sidebar counts [daveey]
+
+Problem: a chat painted done while its sidebar still counted an open remote
+triage card (t_c6870e151f5c5d26).
+Why: outcome derivation accepted an empty stale-friendly task list as proof
+of no work. The remote list can return a warm cache before fingerprint
+validation, whereas sidebar counts use a strict projection read. Sharing a
+source did not guarantee sharing its snapshot. No count/list agreement was
+required before declared or inferred completion.
+Detection gap: read-exception tests covered unknown boards, not successful
+stale-empty reads. Existing shared-source fixes did not cover cache skew.
+
+Confirm active/blocked counts across the compression lineage only when the
+list is empty. A disagreement or unreadable counts uses card_read_failed,
+never done; preserve normal decision/wait precedence and stale display speed.
+A real stale-cache regression exercises recovery to waiting on the next read.
+
+Historical boundary: hub logs near 02:04/02:08 contain no target turn-end or
+card-read exception. This reproduces a possible cache-skew mechanism and
+closes the demonstrated invariant gap, without claiming proof of the exact
+historical cache entry or attributing it to the preceding 429 notice.
+
+RED: seven regressions returned done on unchanged main.
+GREEN: 117 session outcome tests; all other importing consumers exercised,
+with remote-card fixture updated to allow strict count confirmation.
+Full scripts/check passed before publication.
+---
+ hermes_state_outcome.py                       | 10 +++-
+ tests/hermes_state/test_session_outcome.py    | 56 +++++++++++++++++++
+ .../tui_gateway/test_remote_card_outcomes.py  |  3 +-
+ 3 files changed, 67 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index 36769515aa2506eb5854afac8b19159c508e111e..c7ab1ceff661f14ff5f99a68ec470e171b23e2b8 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -330,7 +330,15 @@ def _card_items(ids: list[str]) -> tuple[list[dict], list[dict]]:
+     from hermes_cli.kanban_session_activity import LISTED_STATUSES, session_tasks
+ 
+     decisions, waits = [], []
+-    for card in session_tasks(ids, LISTED_STATUSES, stale_ok=True):
++    cards = session_tasks(ids, LISTED_STATUSES, stale_ok=True)
++    if not cards:
++        # The display list may be a stale-empty projection while the sidebar counts
++        # already know about open work. Absence is not completion without agreement.
++        from hermes_cli.kanban_session_activity import active_task_counts, blocked_task_counts
++        active, blocked = active_task_counts(), blocked_task_counts()
++        if any(active.get(sid, 0) or blocked.get(sid, 0) for sid in ids):
++            raise ValueError("kanban card list is empty but sidebar counts retain open work")
++    for card in cards:
+         tid = str(card.get("id") or "")
+         request = card.get("human_request")
+         if isinstance(request, str):
+diff --git a/tests/hermes_state/test_session_outcome.py b/tests/hermes_state/test_session_outcome.py
+index 61f60cbb80870d61fd5be1d6fe4857178b31429d..7bcc6148097b2dc90b34d8708109f08dff8afa73 100644
+--- a/tests/hermes_state/test_session_outcome.py
++++ b/tests/hermes_state/test_session_outcome.py
+@@ -694,6 +694,62 @@ def test_busy_card_read_cannot_derive_done(db, board, monkeypatch, verdict, prio
+         assert (out["kind"], out["reason"]) == ("unresolved", "card_read_failed")
+ 
+ 
++@pytest.mark.parametrize("status", ["triage", "running", "blocked"])
++@pytest.mark.parametrize("declared", [False, True])
++def test_empty_card_list_cannot_override_open_counts(db, board, monkeypatch, status, declared):
++    turn(db)
++    if declared:
++        so.declare_outcome("chat", {"kind": "done", "summary": SUMMARY}, db=db)
++    add_card(board, "t_0a6a9f59d9af4492", "chat", status,
++             HUMAN_REQUEST if status == "blocked" else None)
++    # Counts retain an open obligation while the independently cached list misses it.
++    assert ksa.active_task_counts().get("chat", 0) + ksa.blocked_task_counts().get("chat", 0) == 1
++    monkeypatch.setattr(ksa, "session_tasks", lambda *a, **kw: [])
++    out = so.derive_outcome("chat", db=db)
++    assert (out["kind"], out.get("reason")) == ("unresolved", "card_read_failed")
++
++
++def test_empty_card_list_checks_compression_ancestor_counts(db, board, monkeypatch):
++    turn(db)
++    db.end_session("chat", "compression")
++    db.create_session("tip", source="desktop", parent_session_id="chat")
++    db.append_message("tip", role="assistant", content=SUMMARY)
++    add_card(board, "t_0a6a9f59d9af4492", "chat", "triage")
++    monkeypatch.setattr(ksa, "session_tasks", lambda *a, **kw: [])
++    out = so.derive_outcome("tip", db=db)
++    assert (out["kind"], out.get("reason")) == ("unresolved", "card_read_failed")
++
++
++def test_stale_empty_remote_projection_is_not_completion(db, monkeypatch):
++    turn(db)
++    scope = ksa._origin_scope()
++    card = {"id": "t_0a6a9f59d9af4492", "key": "worker-4/default/default/t_0a6a9f59d9af4492",
++            "gateway": "worker-4", "profile": "default", "board": "default", "session": "chat",
++            "status": "triage", "title": "remote work", "unfinished": True}
++    monkeypatch.setattr(ksa, "_links_cache", {scope: (0, scope, ("old",), [], [])})
++    monkeypatch.setattr(ksa, "_links_fingerprint", lambda: ("new",))
++    monkeypatch.setattr(ksa, "_project_remote_links", lambda: [card])
++    monkeypatch.setattr(ksa, "_refresh_links_in_background", lambda scope: None)
++    monkeypatch.setattr(ksa, "_remote_cards", lambda ids, statuses, stale_ok: ksa._remote_links(stale_ok))
++    # Exercise the real stale-list/strict-count paths, not a mocked empty task API.
++    assert ksa.session_tasks(["chat"], stale_ok=True) == []
++    out = so.derive_outcome("chat", db=db)
++    assert (out["kind"], out.get("reason")) == ("unresolved", "card_read_failed")
++    assert ksa.active_task_counts()["chat"] == 1
++    assert so.derive_outcome("chat", db=db)["kind"] == "waiting"
++
++
++def test_empty_counts_failure_is_not_completion(db, monkeypatch):
++    turn(db)
++
++    def unreadable():
++        raise sqlite3.OperationalError("counts unavailable")
++
++    monkeypatch.setattr(ksa, "active_task_counts", unreadable)
++    out = so.derive_outcome("chat", db=db)
++    assert (out["kind"], out.get("reason")) == ("unresolved", "card_read_failed")
++
++
+ def test_same_unfinished_reply_with_the_card_counted_is_waiting(db, board):
+     add_card(board, "t_01a1c7b8ebe8316f", "chat", "ready")
+     so.register_outcome_judge(lambda sid, text: True)
+diff --git a/tests/tui_gateway/test_remote_card_outcomes.py b/tests/tui_gateway/test_remote_card_outcomes.py
+index a430ea39773fe5a649f92e55328e4e97c9ab266e..eb7b98db3d9ccd9bdaf4d5712747a06e6255853c 100644
+--- a/tests/tui_gateway/test_remote_card_outcomes.py
++++ b/tests/tui_gateway/test_remote_card_outcomes.py
+@@ -14,7 +14,8 @@ CHAT = helpers.CHAT
+ def remote(monkeypatch):
+     rows = []
+     def read(ids, statuses, stale_ok):
+-        assert stale_ok is True
++        # Display lists stay stale-friendly; empty outcomes also confirm strict counts.
++        assert isinstance(stale_ok, bool)
+         assert statuses == ksa.LISTED_STATUSES
+         return list(rows)
+     monkeypatch.setattr(ksa, "_remote_cards", read)
+-- 
+2.43.0
+

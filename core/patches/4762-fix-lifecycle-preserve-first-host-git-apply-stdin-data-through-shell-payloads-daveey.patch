@@ -1,0 +1,145 @@
+From cda946efa0cd11a82d2b3dc8e3370119492af989 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 05:09:03 +0000
+Subject: [PATCH] fix(lifecycle): preserve first-host git apply stdin data
+ through shell payloads [daveey]
+
+A shell -c wrapper consumed the same hop counter as a further SSH host,
+so the conservative nested allowlist refused the first-host git apply
+shape added to an otherwise permitted SSH command. Track first-host
+provenance through shell payloads without resetting the recursion budget.
+
+Keep unknown payload readers fail-closed: only exact git apply argv gains
+first-host parity. Additional SSH hops, source /dev/stdin, Python launchers,
+shell readers, and git options remain conservative. This deliberately does
+not make arbitrary first-host payload commands permissive.
+
+Proof: RED on a13b9b4c919fdf8c9bdac03402aface48569b15b: four wrapped
+patch consumers failed while the bare consumer passed. GREEN: all 67
+lifecycle guard files, 10774 tests passed. Includes all existing multi-hop
+controls, first-host/second-host boundary controls, recursion cap, and
+15 real Bash/git-apply flag/wrapper combinations. scripts/check --base
+origin/main passed.
+
+Follow-up to PR #3319 review 5949526143; task t_9ed3b550778430cd.
+---
+ cron/lifecycle_guard_nested_shells.py         | 16 +++++-
+ .../test_lifecycle_guard_session_aliases.py   | 53 +++++++++++++++++++
+ 2 files changed, 67 insertions(+), 2 deletions(-)
+
+diff --git a/cron/lifecycle_guard_nested_shells.py b/cron/lifecycle_guard_nested_shells.py
+index 016c674d8b10fd3db6b3c99019291ca98e63792f..b4b7106a64e41e3bafbf2206f6771668de045d42 100644
+--- a/cron/lifecycle_guard_nested_shells.py
++++ b/cron/lifecycle_guard_nested_shells.py
+@@ -261,7 +261,9 @@ def _hop_data_command(name: Optional[str], arguments: list[str]) -> bool:
+     return name in _HOP_DATA_COMMANDS
+ 
+ 
+-def _remote_reads_stdin(remote: list[str], hops: int = 1) -> bool:
++def _remote_reads_stdin(
++    remote: list[str], hops: int = 1, *, first_host: Optional[bool] = None,
++) -> bool:
+     """Whether an ssh remote command (its words, as ssh joins them) hands stdin to a shell:
+     none (a login shell), unparsable, any segment running a shell that reads stdin, or a
+     further hop whose own input is such a shell (another ``ssh``), or a user switch (``sudo``,
+@@ -270,6 +272,8 @@ def _remote_reads_stdin(remote: list[str], hops: int = 1) -> bool:
+     (``python3 -``, ``cat``) reads the file as data (self-heal lifecycleguard-6d64a5ee3d48).
+     Past the first hop that is an allowlist (``_HOP_DATA_COMMANDS``): any other command, a
+     shell's script operand included (``bash /dev/stdin``), counts as a stdin shell."""
++    if first_host is None:
++        first_host = hops == 1
+     if not remote:
+         return True
+     if hops > _MAX_SSH_HOPS:
+@@ -288,7 +292,8 @@ def _remote_reads_stdin(remote: list[str], hops: int = 1) -> bool:
+                 return True
+             # A -c payload inherits the stdin: follow it like a hop (`bash -c bash`,
+             # `sh -c "exec sh"`; review 5911756789 B1), under the same depth cap.
+-            if kind == "payload" and _remote_reads_stdin([value or ""], hops + 1):
++            if kind == "payload" and _remote_reads_stdin(
++                    [value or ""], hops + 1, first_host=first_host):
+                 return True
+             if kind == "script" and hops > 1:
+                 return True  # `bash /dev/stdin`, `sh -- -`: not modelled past the first hop
+@@ -297,6 +302,13 @@ def _remote_reads_stdin(remote: list[str], hops: int = 1) -> bool:
+             return True  # an ssh hop feeding a shell, or a user switch's shell (`su -l`, `sudo -i`)
+         if name in ("sudo", "su", "runuser", "doas"):
+             return True  # a user switch on the remote side: fail closed rather than model it
++        # A first-host -c wrapper must not turn plain `git apply` patch data into
++        # shell code. Keep all unknown payload commands conservative: treating every
++        # payload as a bare first hop would also allow `source /dev/stdin`. Only this
++        # exact argv is proven here; options/aliases/other subcommands stay closed.
++        if (first_host and index is not None and name == "git"
++                and _split_redirections(view[index + 1:])[0] == ["apply"]):
++            continue
+         if hops > 1 and index is not None and name != "ssh" and not _hop_data_command(
+                 name, _split_redirections(view[index + 1:])[0]):
+             return True  # past the first hop only known data consumers read stdin as data
+diff --git a/tests/cron/test_lifecycle_guard_session_aliases.py b/tests/cron/test_lifecycle_guard_session_aliases.py
+index 75ea32546c81d111d4150a3eec1cbbf57de91717..61bdf3df6b53823da7f28b830859e98c5f05352e 100644
+--- a/tests/cron/test_lifecycle_guard_session_aliases.py
++++ b/tests/cron/test_lifecycle_guard_session_aliases.py
+@@ -871,7 +871,60 @@ def test_multi_hop_ssh_data_consumer_reads_stdin_as_data(tmp_path, live_kanban_d
+             False, None), (shape, names)
+ 
+ 
++@pytest.mark.parametrize("payload", [
++    "cd /tmp && git apply", "bash -c 'cd /tmp && git apply'",
++    "bash -lc 'cd /tmp && git apply'", "sh -c 'git apply'",
++    "bash -c \"sh -c 'git apply'\"",
++])
++def test_first_hop_payload_patch_is_data(tmp_path, live_kanban_db, payload):
++    import shlex
++
++    patch_file = tmp_path / "fix.patch"
++    patch_file.write_text(f"t ( bash {live_kanban_db} )\n")
++    command = f"ssh h1 {shlex.quote(payload)} < {patch_file}"
++    for names in (frozenset(), frozenset({"zz"}), None):
++        assert scan_gateway_lifecycle(command, cwd=str(tmp_path), session_aliases=names) == (
++            False, None)
++
++
++@pytest.mark.parametrize("prefix", ["", "env ", "timeout 5 ", "nice ", "command "])
++@pytest.mark.parametrize("flags", ["-c", "-ec", "-o pipefail -c"])
++def test_first_host_patch_wrapper_real_bash(tmp_path, live_kanban_db, prefix, flags):
++    import shlex
++
++    from tools.environments.local import build_subprocess_env
++
++    body = f"t ( bash {live_kanban_db} )\n"
++    patch_file = tmp_path / "fix.patch"
++    patch_file.write_text("diff --git a/proof.txt b/proof.txt\nnew file mode 100644\n"
++                          "--- /dev/null\n+++ b/proof.txt\n@@ -0,0 +1 @@\n+" + body)
++    payload = f"{prefix}bash {flags} 'git apply'"
++    with patch_file.open() as stream:
++        result = subprocess.run(["/bin/bash", "--noprofile", "--norc", "-c", payload],
++                                stdin=stream, cwd=tmp_path, env=build_subprocess_env(),
++                                capture_output=True, text=True, encoding="utf-8",
++                                timeout=10, check=False)
++    assert result.returncode == 0, result.stderr
++    assert (tmp_path / "proof.txt").read_text() == body
++    command = f"ssh h1 {shlex.quote(payload)} < {patch_file}"
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
++
++
++def test_first_host_patch_exception_preserves_budget_and_all_segments():
++    from cron.lifecycle_guard_nested_shells import _MAX_SSH_HOPS, _remote_reads_stdin
++
++    assert _remote_reads_stdin(["git apply; source /dev/stdin"], 2, first_host=True)
++    assert _remote_reads_stdin(["git apply"], _MAX_SSH_HOPS + 1, first_host=True)
++    assert not _remote_reads_stdin(["git apply"], _MAX_SSH_HOPS, first_host=True)
++    assert _remote_reads_stdin(["git apply"], 2)
++
++
+ _MULTI_HOP_SHELLS = [
++    "ssh h1 'ssh h2 git apply' < {script}",
++    "ssh h1 \"bash -c 'ssh h2 git apply'\" < {script}",
++    "ssh h1 \"ssh h2 'bash -c git'\" < {script}",
++    "ssh h1 \"bash -c 'git -c alias.apply=!bash apply'\" < {script}",
++    "ssh h1 \"bash -c 'source /dev/stdin; git apply'\" < {script}",
+     "ssh h1 'ssh h2' < {script}",  # the last hop has no command: a remote login shell
+     "ssh h1 'ssh h2 bash -s' < {script}",
+     "ssh h1 \"ssh h2 'bash -l'\" < {script}",
+-- 
+2.43.0
+

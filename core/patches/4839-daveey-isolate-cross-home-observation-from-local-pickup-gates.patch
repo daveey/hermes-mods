@@ -1,0 +1,300 @@
+From a3affdb6c440190e92530a2bc984a1ac6750a630 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 10:24:26 +0000
+Subject: [PATCH] [daveey] isolate cross-home observation from local pickup
+ gates
+
+Keep held-home incident evidence stable across heartbeats; exercise actual dispatcher wiring, freshness boundaries and failure isolation. Document custody and transfer boundaries.
+
+Proof: 33 home tests + 73 existing pickup/held tests; 274 importing-consumer tests. Eight exact-source predicate mutants killed by existing assertions with eight positive baselines (16 cases). Full scripts/check: 21 checks OK. Real fresh hub sweep returned no candidates: both historical acceptance targets are already done on hub. Original pre-rehome evidence recovery remains open on t_0fdfb1afcb75b725; no historical replay claim.
+---
+ docs/kanban-home-stall.md                     |  37 +++++
+ hermes_cli/kanban_pickup_stall.py             |  12 +-
+ hermes_cli/kanban_pickup_stall_home.py        |  23 ++-
+ .../test_kanban_pickup_stall_home.py          | 147 ++++++++++++++++++
+ 4 files changed, 213 insertions(+), 6 deletions(-)
+ create mode 100644 docs/kanban-home-stall.md
+
+diff --git a/docs/kanban-home-stall.md b/docs/kanban-home-stall.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..7fba74635908aa648ae818f6a7f7578a5d599af0
+--- /dev/null
++++ b/docs/kanban-home-stall.md
+@@ -0,0 +1,37 @@
++# Overdue home-owned transitions
++
++The hub's pickup-stall sweep also observes the full Board replica for home-owned
++transitions. Local pickup being disabled or drained does not disable this pass.
++The existing `overdue_wake` per-card diagnostic only renders an explanation; it
++cannot file a repair incident on behalf of an offline home.
++
++A scheduled card qualifies when its current canonical wake/backstop is **more than
++30 minutes** overdue. A todo card qualifies when all parents are done and the last
++parent's completion is more than 30 minutes old. Missing parents, undated completion,
++spent or missing parks, terminal cards, and human-only parks do not qualify.
++
++The home must be held, revoked, or have no Board event in the preceding 30 minutes.
++A recent event excludes an otherwise live home, but does not override a hold or
++revocation. The observer requires a fresh completed replica pull and fresh machine
++registry evidence; stale observer state is never evidence of remote silence.
++Scans are bounded to once a minute per replica identity.
++
++One open incident is reused per home under the authenticated hub alarm prefix
++`pickup-stall:hub:home-overdue-<home>:`. It follows existing pickup-alarm creator,
++assignee and placement rules. Repeated passes comment instead of creating a second
++card; elapsed age and held-home heartbeats alone do not churn subsequent comments.
++A closed incident allows a new incident if the condition persists. Active incidents
++are not automatically archived: an agent may still be verifying transfer custody.
++
++Every listed row includes its title, overdue age and latest continuation checkpoint.
++Machine-only WIP detection is deliberately conservative: paths or unpublished-work
++language require inspection, and no checkpoint is unknown rather than portable.
++The incident requests the supported hub-admin batched rehome route, preserving
++status, wake time/check, links and comments. The route's own eligibility and custody
++checks remain authoritative. This detector never revokes/unholds machines, invents
++death proof, or transfers cards itself. A transfer refusal or uncertain custody must
++be listed with its reason.
++
++Implementation: `hermes_cli/kanban_pickup_stall_home.py`, called from
++`kanban_pickup_stall.sweep`. Tests:
++`bash scripts/run_tests.sh tests/hermes_cli/test_kanban_pickup_stall_home.py`.
+diff --git a/hermes_cli/kanban_pickup_stall.py b/hermes_cli/kanban_pickup_stall.py
+index 9cce5a39efae5798e563db6d60d1813878faef79..a85efc8e9915d3d7275eaf49ab6e8b1ec8532a10 100644
+--- a/hermes_cli/kanban_pickup_stall.py
++++ b/hermes_cli/kanban_pickup_stall.py
+@@ -621,22 +621,24 @@ def sweep(conn, *, now: Optional[float] = None) -> list[str]:
+     """The detector pass (see the module doc). Returns the repair card ids now open for stalled cards."""
+     from hermes_cli import kanban_db_sync as sync
+     from hermes_cli import kanban_worker_node as wn
+-    if sync.board_mode(conn) != "primary" or wn.pickup_mode() is None:
++    if sync.board_mode(conn) != "primary":
+         return []
++    from hermes_cli import kanban_pickup_stall_home as home_stalls
++    stranded = home_stalls.observe(conn, now_ms=_now_ms(now))
++    if wn.pickup_mode() is None:
++        return stranded
+     from hermes_cli.kanban_gateway_drain import dispatch_paused
+     if dispatch_paused():
+-        return []  # a draining gateway runs no pickup, so it writes no fresh evidence to judge a stall by
++        return stranded  # local pickup evidence stops; cross-home observation is independent
+     _prune(conn, _now_ms(now))
+     own = wn._own(conn)
+     from hermes_cli import kanban_pickup_stall_held as held  # own default-placement cards on a held machine
+-    stranded = held.sweep(conn, own, now_ms=_now_ms(now))
++    stranded += held.sweep(conn, own, now_ms=_now_ms(now))
+     replica = wn.open_replica(conn)
+     if replica is None:
+         return stranded
+     try:
+         resolve_sweep(conn, replica, own, now_ms=_now_ms(now))
+-        from hermes_cli import kanban_pickup_stall_home as home_stalls
+-        stranded += home_stalls.periodic_sweep(conn, replica, own, now_ms=_now_ms(now))
+         cards = stalled(conn, replica, own, now=now)
+     finally:
+         replica.close()
+diff --git a/hermes_cli/kanban_pickup_stall_home.py b/hermes_cli/kanban_pickup_stall_home.py
+index 34092e9c539360f43a0153e4e385c5cf61f390b9..4285f999a06ca8205c3d713a4a630386afbb507c 100644
+--- a/hermes_cli/kanban_pickup_stall_home.py
++++ b/hermes_cli/kanban_pickup_stall_home.py
+@@ -72,7 +72,8 @@ def overdue(replica, machines: dict, *, now: float) -> dict[str, list[dict[str,
+         groups.setdefault(home, []).append({
+             "id": row["id"], "title": row["title"], "tenant": row["tenant"],
+             "status": row["status"], "since": since,
+-            "home_evidence": f"held={held}, revoked={revoked}, no Board event within 30 minutes={silent}",
++            "home_evidence": (f"held={held}, revoked={revoked}" if held or revoked
++                              else "no Board event within 30 minutes"),
+             "checkpoint": checkpoint_evidence(replica, row["id"]),
+         })
+     return {home: sorted(cards, key=lambda c: (c["since"], c["id"]))
+@@ -95,6 +96,26 @@ HOWTO = (
+ _NEXT_SCAN: dict[tuple, float] = {}
+ 
+ 
++def observe(conn, *, now_ms: int) -> list[str]:
++    """Observe independently of local pickup admission and isolate failures."""
++    from hermes_cli import kanban_pickup_stall as kps
++    from hermes_cli import kanban_worker_node as wn
++    try:
++        own = wn._own(conn)
++        if own != kps.OPERATOR_LANE:
++            return []
++        replica = wn.open_replica(conn)
++        if replica is None:
++            return []
++        try:
++            return periodic_sweep(conn, replica, own, now_ms=now_ms)
++        finally:
++            replica.close()
++    except Exception:  # health: allow BLE001 -- observer failure must not suppress ready-card alarms
++        kps._log.warning("kanban dispatcher: home-stall observation failed", exc_info=True)
++        return []
++
++
+ def periodic_sweep(conn, replica, own: str, *, now_ms: int) -> list[str]:
+     """Bound the full event aggregation to once a minute per observer board."""
+     from hermes_cli.kanban_sweep_gate import file_identity
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall_home.py b/tests/hermes_cli/test_kanban_pickup_stall_home.py
+index 1d1523d3c305be55b32c01b166d066efec82b20a..58e1cc1426a2c9e3b600cbc5db0d80886dc484d5 100644
+--- a/tests/hermes_cli/test_kanban_pickup_stall_home.py
++++ b/tests/hermes_cli/test_kanban_pickup_stall_home.py
+@@ -14,6 +14,13 @@ from hermes_cli import kanban_worker_node as wn
+ NOW = 2_000_000_000
+ 
+ 
++@pytest.fixture(autouse=True)
++def isolated_home(tmp_path, monkeypatch):
++    monkeypatch.setenv("HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setattr(subject, "_NEXT_SCAN", {})
++
++
+ @pytest.fixture
+ def replica():
+     conn = sqlite3.connect(":memory:")
+@@ -197,3 +204,143 @@ def test_legacy_backstop_and_current_park(replica):
+                     "VALUES ('one','scheduled',?,?,'worker-2')",
+                     (json.dumps({"wake_at": NOW + 3600}), NOW - 10))
+     assert not subject.overdue(replica, {}, now=NOW)
++
++
++@pytest.mark.parametrize("age", [600, -5])
++def test_replica_freshness_includes_exact_boundaries(replica, local, age):
++    card(replica)
++    replica.execute("UPDATE kanban_sync_state SET pulled_at=?", (NOW - age,))
++    [tid] = subject.sweep(local, replica, "hub", now_ms=NOW * 1000)
++    task = kb.get_task(local, tid)
++    assert task is not None
++    assert task.created_by == kps.DETECTOR
++
++
++def test_registry_requires_fresh_evidence(replica, local, monkeypatch):
++    card(replica)
++    calls = []
++
++    def registry(*, require_fresh=False):
++        calls.append(require_fresh)
++        # A stale cached registry must not authorize the home-silence alarm.
++        return None if require_fresh else {"machines": {"worker-2": {"hold": True}}}
++
++    monkeypatch.setattr(wn, "registry", registry)
++    assert subject.sweep(local, replica, "hub", now_ms=NOW * 1000) == []
++    assert calls == [True]
++    assert local.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
++
++
++def test_held_home_heartbeats_do_not_churn_incident_comments(replica, local):
++    card(replica)
++    [tid] = subject.sweep(local, replica, "hub", now_ms=NOW * 1000)
++    assert subject.sweep(local, replica, "hub", now_ms=(NOW + 60) * 1000) == [tid]
++    comments = kb.list_comments(local, tid)
++    assert len(comments) == 1
++    replica.execute("INSERT INTO task_events(kind, created_at, origin_gateway) "
++                    "VALUES ('heartbeat', ?, 'worker-2')", (NOW + 61,))
++    assert subject.sweep(local, replica, "hub", now_ms=(NOW + 120) * 1000) == [tid]
++    assert [c.body for c in kb.list_comments(local, tid)] == [c.body for c in comments]
++    replica.execute("DELETE FROM task_events WHERE kind='heartbeat'")
++    assert subject.sweep(local, replica, "hub", now_ms=(NOW + 180) * 1000) == [tid]
++    assert [c.body for c in kb.list_comments(local, tid)] == [c.body for c in comments]
++
++
++@pytest.mark.parametrize("park", ["missing", "spent-woken", "spent-claimed"])
++def test_missing_or_spent_park_does_not_reuse_old_wake(replica, local, monkeypatch, park):
++    from hermes_cli import kanban_continuation as continuation
++
++    monkeypatch.setattr(continuation.time, "time", lambda: NOW)
++    card(replica)
++    if park == "missing":
++        replica.execute("DELETE FROM task_events WHERE task_id='one'")
++    else:
++        kind = continuation.CONTINUATION_WOKEN_EVENT if park == "spent-woken" else "claimed"
++        replica.execute("INSERT INTO task_events(task_id, kind, created_at, origin_gateway) "
++                        "VALUES ('one', ?, ?, 'worker-2')", (kind, NOW - 10))
++    assert subject.sweep(local, replica, "hub", now_ms=NOW * 1000) == []
++    assert local.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
++
++
++@pytest.fixture
++def observer_replica(replica, local, monkeypatch):
++    from hermes_cli import kanban_db_sync as sync
++
++    card(replica)
++    replica.commit()
++    opened = []
++
++    def open_replica(conn):
++        assert conn is local
++        copy = sqlite3.connect(":memory:")
++        copy.row_factory = sqlite3.Row
++        replica.backup(copy)
++        opened.append(copy)
++        return copy
++
++    monkeypatch.setattr(sync, "board_mode", lambda conn: "primary")
++    monkeypatch.setattr(wn, "_own", lambda conn: "hub")
++    monkeypatch.setattr(wn, "open_replica", open_replica)
++    return opened
++
++
++@pytest.mark.parametrize("pickup,draining", [(None, False), (None, True), ("pinned", True)])
++def test_dispatcher_observes_homes_before_pickup_admission(
++        local, observer_replica, monkeypatch, pickup, draining):
++    from hermes_cli import kanban_gateway_drain as drain
++
++    monkeypatch.setattr(wn, "pickup_mode", lambda: pickup)
++    monkeypatch.setattr(drain, "dispatch_paused", lambda: draining)
++    [tid] = kps.sweep(local, now=NOW)
++    task = kb.get_task(local, tid)
++    assert task is not None
++    assert "Home transitions overdue on worker-2" in task.title
++    assert task.created_by == kps.DETECTOR
++    assert len(observer_replica) == 1
++    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
++        observer_replica[0].execute("SELECT 1")
++
++
++@pytest.mark.parametrize("failure", ["open", "scan"])
++def test_observer_failure_does_not_suppress_ready_alarm(
++        local, observer_replica, monkeypatch, failure):
++    from hermes_cli import kanban_gateway_drain as drain
++    from hermes_cli import kanban_pickup_stall_held as held
++
++    monkeypatch.setattr(wn, "pickup_mode", lambda: "pinned")
++    monkeypatch.setattr(drain, "dispatch_paused", lambda: False)
++    monkeypatch.setattr(held, "sweep", lambda *a, **kw: [])
++    monkeypatch.setattr(kps, "resolve_sweep", lambda *a, **kw: [])
++    ready = {"id": "ready-card", "title": "ready title", "tenant": None,
++             "since_ms": (NOW - 1200) * 1000,
++             "skip": {"reason": "profile_ineligible", "detail": "missing profile",
++                      "first_at": (NOW - 1200) * 1000, "last_at": NOW * 1000, "passes": 1}}
++    monkeypatch.setattr(kps, "stalled", lambda *a, **kw: [ready])
++
++    def fail(*a, **kw):
++        raise RuntimeError("observer unavailable")
++
++    if failure == "open":
++        original_open = wn.open_replica
++        calls = []
++
++        def fail_first(conn):
++            calls.append(conn)
++            if len(calls) == 1:
++                return fail()
++            return original_open(conn)
++
++        monkeypatch.setattr(wn, "open_replica", fail_first)
++    else:
++        monkeypatch.setattr(subject, "periodic_sweep", fail)
++
++    [tid] = kps.sweep(local, now=NOW)
++    task = kb.get_task(local, tid)
++    assert task is not None
++    assert "ready-card" in task.title
++    assert "profile_ineligible" in (task.body or "")
++    assert task.created_by == kps.DETECTOR
++    assert len(observer_replica) == (1 if failure == "open" else 2)
++    for conn in observer_replica:
++        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
++            conn.execute("SELECT 1")
+-- 
+2.43.0
+

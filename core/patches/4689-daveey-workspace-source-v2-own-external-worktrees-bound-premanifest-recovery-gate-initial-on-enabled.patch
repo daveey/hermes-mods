@@ -1,0 +1,475 @@
+From bc764301c0f74cae379a0a6d19b8d04dcb893f8d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 11:58:10 +0000
+Subject: [PATCH] [daveey] workspace_source v2: own external worktrees, bound
+ premanifest recovery, gate initial on enabled
+
+Review t_6ed792ebc90606ce on PR #3307:
+
+- P1: initial registration checks other live tasks' source-journal paths
+  (not only tasks.workspace_path) and rechecks inside the observation write
+  transaction, so two scratch tasks cannot register one external worktree.
+  A definitely refused observation and done/archived tasks own nothing.
+- P2: premanifest predecessor recovery takes the resolver's materialize
+  budget through local git reads and the origin proof; artifact verification
+  reuses the recovered predecessor instead of re-proving it; the resolver
+  checks the budget before a successful return (zero-artifact included).
+- P3: register_initial refuses source_disabled before persistence or RPC
+  when kanban.workspace_source is disabled (heartbeat surface covered).
+
+Tests: tests/hermes_cli/test_kanban_source_ownership_budget.py (9; RED 7 on
+the previous head, the 2 controls pass on both).
+---
+ hermes_cli/kanban_source_artifact_launch.py   |  18 +-
+ hermes_cli/kanban_source_registration.py      |  81 ++++++--
+ hermes_cli/kanban_source_resolver.py          |  10 +-
+ .../test_kanban_source_ownership_budget.py    | 195 ++++++++++++++++++
+ 4 files changed, 279 insertions(+), 25 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_source_ownership_budget.py
+
+diff --git a/hermes_cli/kanban_source_artifact_launch.py b/hermes_cli/kanban_source_artifact_launch.py
+index cd4919ae52fabcdeaf6eca1a85044c56e6352e57..530fdb53c3d38c00f1e18c04716be6d56580c712 100644
+--- a/hermes_cli/kanban_source_artifact_launch.py
++++ b/hermes_cli/kanban_source_artifact_launch.py
+@@ -14,16 +14,22 @@ def _transport(conn, bound):
+     return artifacts.bounded_transport(hub, bound), sync._state(conn)["board_id"]
+ 
+ 
+-def verify(conn, task_id, snapshot, bound):
+-    """Incoming manifest wins over stale host selections; revision0 uses exact predecessor."""
++def verify(conn, task_id, snapshot, bound, *, predecessor_run_uid=None):
++    """Incoming manifest wins over stale host selections; revision0 uses exact predecessor.
++
++    The resolver passes the predecessor it already proved under ``bound``; recovering it
++    here is the fallback for direct callers and is capped by the same budget.
++    """
+     try:
+         if snapshot.manifest_value is not None:
+             entries = snapshot.manifest().artifacts
+         else:
+-            from dataclasses import asdict
+-            from hermes_cli import kanban_source_registration as registration
+-            previous = registration.predecessor_for_grant(conn, task_id, snapshot.grant, asdict(snapshot.custody))
+-            entries = artifacts.selected(conn, task_id, previous.run_uid) or []
++            if predecessor_run_uid is None:
++                from dataclasses import asdict
++                from hermes_cli import kanban_source_registration as registration
++                predecessor_run_uid = registration.predecessor_for_grant(
++                    conn, task_id, snapshot.grant, asdict(snapshot.custody), bound=bound).run_uid
++            entries = artifacts.selected(conn, task_id, predecessor_run_uid) or []
+         if not entries:
+             return
+         hub, board = _transport(conn, bound)
+diff --git a/hermes_cli/kanban_source_registration.py b/hermes_cli/kanban_source_registration.py
+index 1c5e069b1d47a5d907a5fc9665758592ea5d8da2..8568e011a4939af47c2c2447ff8b92644654e2d0 100644
+--- a/hermes_cli/kanban_source_registration.py
++++ b/hermes_cli/kanban_source_registration.py
+@@ -15,6 +15,7 @@ from hermes_cli import kanban_db_sync as sync
+ from hermes_cli import kanban_source_board as board
+ from hermes_cli import kanban_source_launch as launch
+ from hermes_cli import kanban_workspace_source as ws
++from hermes_cli.kanban_source_publish import _Deadline
+ 
+ 
+ def _refuse(detail: str) -> NoReturn:
+@@ -34,32 +35,70 @@ def _current(conn, task_id):
+     return int(row[0]), uid, machine
+ 
+ 
+-def _local_path(conn, task_id, path):
+-    dest = Path(path).resolve()
++def _source_owner(conn, task_id, path) -> str | None:
++    """Another live task whose durable source observation names ``path``.
++
++    Scratch registration keeps ``tasks.workspace_path`` at the scratch cwd, so the external
++    worktree's owner is only in the local source journal. A definitely refused observation
++    attached nothing and owns nothing; pending, attached and retained ones keep the path.
++    """
++    try:
++        row = conn.execute("SELECT r.task_id FROM kanban_source_runs r JOIN tasks t ON t.id = r.task_id "
++                           "WHERE r.path = ? AND r.task_id != ? AND r.state != 'refused' "
++                           "AND t.status NOT IN ('done', 'archived') LIMIT 1", (path, task_id)).fetchone()
++    except sqlite3.OperationalError:
++        return None
++    return row[0] if row else None
++
++
++def _owned_elsewhere(conn, task_id, path) -> None:
+     from hermes_cli.kanban_source_resolver import _occupied_by_other_task
+-    if _occupied_by_other_task(conn, task_id, str(dest)) is not None:
++    if _occupied_by_other_task(conn, task_id, path) is not None or _source_owner(conn, task_id, path) is not None:
+         _refuse("source belongs to another active task")
++
++
++def _git(bound, path, *args):
++    """Read-only git, capped by the caller's materialize budget when one is given."""
++    if bound is None:
++        return launch._git(str(path), *args)
++    out = bound.git(path, *args, check=False)
++    return out.stdout.strip() if out.returncode == 0 else None
++
++
++class _BudgetDeadline(_Deadline):
++    """The resolver's materialize budget in the publisher's proof-deadline shape."""
++
++    def __init__(self, bound):
++        self.bound = bound
++
++    def left(self, cap: float = 60.0) -> float:
++        return min(self.bound.left(), cap)
++
++
++def _local_path(conn, task_id, path, bound=None):
++    dest = Path(path).resolve()
++    _owned_elsewhere(conn, task_id, str(dest))
+     if not (dest / ".git").is_file():
+         _refuse("source must be a linked worktree (git -C <configured clone> worktree add), not a clone")
+-    branch = launch._git(str(dest), "symbolic-ref", "-q", "--short", "HEAD")
++    branch = _git(bound, dest, "symbolic-ref", "-q", "--short", "HEAD")
+     task = conn.execute("SELECT branch_name FROM tasks WHERE id=?", (task_id,)).fetchone()
+     expected = (task[0] or "").strip() if task else ""
+     if branch != (expected or f"wt/{task_id}"):
+         _refuse(f"worktree branch {branch or '(detached)'} is not this task's branch {expected or f'wt/{task_id}'}")
+     registered = False
+     for clone in ws.settings().clones.values():
+-        listing = launch._git(str(clone), "worktree", "list", "--porcelain")
++        listing = _git(bound, clone, "worktree", "list", "--porcelain")
+         if listing and any(line == f"worktree {dest}" for line in listing.splitlines()):
+             registered = True
+     if not registered:
+         _refuse("worktree is not a linked worktree of any clone in kanban.workspace_source.clones")
+-    head = launch._git(str(dest), "rev-parse", "--verify", "HEAD")
++    head = _git(bound, dest, "rev-parse", "--verify", "HEAD")
+     if not head:
+         _refuse("worktree has no readable HEAD")
+     return str(dest), branch, head
+ 
+ 
+-def recover_local(conn: sqlite3.Connection, task_id: str, identity: dict) -> board.AttachedRun:
++def recover_local(conn: sqlite3.Connection, task_id: str, identity: dict, *, bound=None) -> board.AttachedRun:
+     """Locate exact durable observation; never use custody.attached_run_uid or latest sorting."""
+     machine = sync._state(conn)["gateway_id"]
+     if not isinstance(identity, dict) or identity.get("task_id") != task_id or identity.get("machine") != machine:
+@@ -74,16 +113,21 @@ def recover_local(conn: sqlite3.Connection, task_id: str, identity: dict) -> boa
+     run = board.attached_run(conn, rows[0][0])
+     if run is None or run.machine != machine or run.source_protocol != 2 or run.manifest_revision != 0 or not run.path:
+         _refuse("observation is not this machine's premanifest protocol-2 source")
+-    _local_path(conn, task_id, run.path)
+-    validate_identity(run)
++    _local_path(conn, task_id, run.path, bound)
++    validate_identity(run, bound=bound)
+     return run
+ 
+ 
+-def source_identity(path: str, source_kind: str) -> dict:
+-    """Reuse publisher clone proof; bind a local observation to its repository and common-dir."""
++def source_identity(path: str, source_kind: str, *, bound=None) -> dict:
++    """Reuse publisher clone proof; bind a local observation to its repository and common-dir.
++
++    With ``bound`` (the resolver's materialize budget) every proof call is capped by what is left of it, and a
++    spent budget raises the resolver's ``materialize_timeout`` rather than an identity refusal.
++    """
+     from hermes_cli import kanban_source_publish as publish
+     try:
+-        clone = publish.prove_origin(path, ws.settings())
++        clone = publish.prove_origin(path, ws.settings(),
++                                     deadline=_BudgetDeadline(bound) if bound is not None else None)
+     except publish.PublishRefused as exc:
+         _refuse(f"source repository proof failed: {exc}")
+     return identity_from_clone(clone, source_kind)
+@@ -101,12 +145,12 @@ def match_manifest(identity: dict, manifest: dict) -> None:
+         _refuse("source repository or kind differs from manifest")
+ 
+ 
+-def validate_identity(run: board.AttachedRun, *, current=None) -> dict:
++def validate_identity(run: board.AttachedRun, *, current=None, bound=None) -> dict:
+     expected_kind = (run.manifest or {}).get("source_kind") or (run.source_identity or {}).get("source_kind", "scratch_external")
+     if not run.path:
+         _refuse("source observation has no path")
+     if current is None:
+-        current = source_identity(run.path, expected_kind)
++        current = source_identity(run.path, expected_kind, bound=bound)
+     if run.source_identity != current:
+         _refuse("source repository, common-dir or kind changed since observation")
+     if run.manifest:
+@@ -134,6 +178,8 @@ def _persist_observation(conn, run: board.AttachedRun, *, predecessor=None) -> b
+             _initial_lane(conn, run.task_id, run.run_id)
+         prior = board.attached_run(conn, run.run_id)
+         if prior is None:
++            # Recheck ownership under the writer lock so two registrations of one path serialize here.
++            _owned_elsewhere(conn, run.task_id, run.path)
+             board.record_run(conn, run, allow_nested=True)
+             prior = run
+         fields = ("task_id", "run_uid", "machine", "path", "branch", "mode", "source_protocol", "manifest_revision",
+@@ -174,6 +220,8 @@ def register_initial(conn: sqlite3.Connection, task_id: str, source_path: str, *
+     A tool surface passes its dispatcher-bound run; the observation transaction
+     rechecks that the same run is still current, so the binding holds to commit.
+     """
++    if not ws.settings().enabled:
++        raise launch.AttachRefused("source_disabled", "kanban.workspace_source is disabled on this host")
+     run_id, uid, machine = _current(conn, task_id)
+     if expected_run_id is not None and run_id != expected_run_id:
+         _refuse("caller run is not the task's current run")
+@@ -196,7 +244,8 @@ def register_initial(conn: sqlite3.Connection, task_id: str, source_path: str, *
+     return board.attached_run(conn, run_id)
+ 
+ 
+-def predecessor_for_grant(conn: sqlite3.Connection, task_id: str, grant: dict, custody: dict) -> board.AttachedRun:
++def predecessor_for_grant(conn: sqlite3.Connection, task_id: str, grant: dict, custody: dict, *,
++                          bound=None) -> board.AttachedRun:
+     """Read-only recovery, bound to the exact current grant and its retained custody."""
+     _run_id, uid, machine = _current(conn, task_id)
+     if not isinstance(grant, dict):
+@@ -211,7 +260,7 @@ def predecessor_for_grant(conn: sqlite3.Connection, task_id: str, grant: dict, c
+     if (custody.get("source_protocol") != 2 or custody.get("manifest_revision") != 0
+             or custody.get("source_holder") != machine or custody.get("state") != "retained"):
+         _refuse("not same-holder retained premanifest custody")
+-    previous = recover_local(conn, task_id, grant.get("source_predecessor"))
++    previous = recover_local(conn, task_id, grant.get("source_predecessor"), bound=bound)
+     if custody.get("retained_run_uid") != previous.run_uid:
+         _refuse("grant predecessor does not match retained custody")
+     if previous.run_uid == uid:
+diff --git a/hermes_cli/kanban_source_resolver.py b/hermes_cli/kanban_source_resolver.py
+index 1e797075b770718e2a51a0130f789b331f7162f9..d50f0664bfd669bcebe7f10763b4cccb2c84a9b2 100644
+--- a/hermes_cli/kanban_source_resolver.py
++++ b/hermes_cli/kanban_source_resolver.py
+@@ -30,6 +30,8 @@ class ResolvedSource:
+     mode: str  # holder_reuse | return_home | materialized
+     repository: Optional[str] = None
+     source_kind: Optional[str] = None
++    # A premanifest resume's recovered predecessor, so artifact verification reuses its bounded proof.
++    predecessor_run_uid: Optional[str] = None
+ 
+     def event_payload(self, *, holder: Optional[str], run_uid: Optional[str]) -> dict:
+         return {"hostname": socket.gethostname(), "holder": holder, "run_uid": run_uid, "repository": self.repository,
+@@ -190,9 +192,10 @@ def resolve_source_workspace(conn: sqlite3.Connection, task: Any, snapshot: Sour
+         from hermes_cli.kanban_source_artifact_launch import verify
+         from hermes_cli.kanban_source_launch import AttachRefused
+         try:
+-            verify(conn, task.id, snapshot, bound)
++            verify(conn, task.id, snapshot, bound, predecessor_run_uid=resolved.predecessor_run_uid)
+         except AttachRefused as exc:
+             raise WorkspaceSourceRefusal("source_identity_refused", exc.detail) from exc
++    bound.left()  # succeed only inside the budget, including a zero-artifact premanifest recovery
+     return resolved
+ 
+ 
+@@ -209,11 +212,12 @@ def _resolve_source_workspace(conn, task, snapshot, *, me, cfg, bound, lookup):
+         from hermes_cli import kanban_source_registration as registration
+         from hermes_cli.kanban_source_launch import AttachRefused
+         try:
+-            previous = registration.predecessor_for_grant(conn, task.id, snapshot.grant, asdict(custody))
++            previous = registration.predecessor_for_grant(conn, task.id, snapshot.grant, asdict(custody), bound=bound)
+         except AttachRefused as exc:
+             raise WorkspaceSourceRefusal("source_identity_refused", exc.detail) from exc
+         return ResolvedSource(path=previous.path, branch=previous.branch, commit=None,
+-                              manifest_revision=0, mode="resume", source_kind="scratch_external")
++                              manifest_revision=0, mode="resume", source_kind="scratch_external",
++                              predecessor_run_uid=previous.run_uid)
+     if custody is not None and custody.source_holder == me:
+         local = _local_holder_copy(bound, task, manifest, cfg)
+         if local is not None:
+diff --git a/tests/hermes_cli/test_kanban_source_ownership_budget.py b/tests/hermes_cli/test_kanban_source_ownership_budget.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0934c891109859fc2bd043fe9f049ddf512c9bab
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_source_ownership_budget.py
+@@ -0,0 +1,195 @@
++"""PR #3307 review fixes: external source ownership, the materialize budget, and the host gate.
++
++Real Git and SQLite; only the Board transport is the fake from ``kanban_source_support``.
++"""
++from __future__ import annotations
++
++import contextlib
++import json
++from dataclasses import replace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_source_board as board
++from hermes_cli import kanban_source_launch as launch
++from hermes_cli import kanban_source_registration as reg
++from hermes_cli import kanban_source_resolver as resolver
++from hermes_cli import kanban_workspace_source as ws
++from tests.hermes_cli import test_kanban_source_dispatch_v2 as dispatch
++from tests.hermes_cli import test_kanban_source_registration as helpers
++
++setup = helpers.setup
++
++
++def _source_calls(b):
++    return [c for c in b.calls if c[0] not in ("acquire", "renew", "release")]
++
++
++def _second_task(conn, tmp_path, branch):
++    other = kb.create_task(conn, title="other source owner", assignee="worker")
++    scratch = tmp_path / "scratch-other"
++    scratch.mkdir()
++    conn.execute("UPDATE tasks SET branch_name=?, workspace_kind='scratch', workspace_path=? WHERE id=?",
++                 (branch, str(scratch), other))
++    conn.commit()
++    assert kb.claim_task(conn, other, ttl_seconds=900, claimer=f"{kb._host_prefix()}:2")
++    return other
++
++
++# --- P1: one external worktree has one live owner ---------------------------------------------------------------
++
++def test_second_task_cannot_register_an_owned_external_worktree(setup, tmp_path):
++    conn, _b, tid, source, _scratch, _home, _clone = setup
++    first = reg.register_initial(conn, tid, str(source))
++    other = _second_task(conn, tmp_path, first.branch)
++    with pytest.raises(launch.AttachRefused) as exc:
++        reg.register_initial(conn, other, str(source))
++    assert "another active task" in exc.value.detail
++    assert board.attached_run(conn, kb.get_task(conn, other).current_run_id) is None
++    assert board.attached_run(conn, kb.get_task(conn, tid).current_run_id).state == "attached"
++
++
++def test_concurrent_registration_is_refused_inside_the_observation_transaction(setup, tmp_path, monkeypatch):
++    """B passes the early check; A registers the same path before B's write: B's transaction refuses."""
++    conn, b, tid, source, _scratch, _home, _clone = setup
++    other = _second_task(conn, tmp_path, f"wt/{tid}")
++    original = reg.source_identity
++    raced = []
++
++    def racing_identity(path, kind, **kwargs):
++        if not raced:
++            raced.append(True)
++            reg.register_initial(conn, tid, str(source))  # the competing registration commits first
++        return original(path, kind, **kwargs)
++
++    monkeypatch.setattr(reg, "source_identity", racing_identity)
++    with pytest.raises(launch.AttachRefused) as exc:
++        reg.register_initial(conn, other, str(source))
++    assert raced and "another active task" in exc.value.detail
++    assert board.attached_run(conn, kb.get_task(conn, other).current_run_id) is None
++    assert board.attached_run(conn, kb.get_task(conn, tid).current_run_id).state == "attached"
++    attaches = [kw for name, kw in _source_calls(b) if kw.get("mode") == "initial"]
++    assert len(attaches) == 1, attaches
++
++
++def test_a_definitely_refused_observation_owns_nothing(setup, tmp_path):
++    conn, b, tid, source, _scratch, _home, _clone = setup
++    b.refuse["source_attach"] = "initial_attach_refused"
++    with pytest.raises(launch.AttachRefused) as exc:
++        reg.register_initial(conn, tid, str(source))
++    assert not exc.value.uncertain
++    assert board.attached_run(conn, kb.get_task(conn, tid).current_run_id).state == "refused"
++    b.refuse.clear()
++    other = _second_task(conn, tmp_path, f"wt/{tid}")
++    assert reg.register_initial(conn, other, str(source)).state == "attached"
++
++
++def test_a_finished_task_releases_its_external_worktree(setup, tmp_path):
++    conn, _b, tid, source, _scratch, _home, _clone = setup
++    reg.register_initial(conn, tid, str(source))
++    conn.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
++    conn.commit()
++    other = _second_task(conn, tmp_path, f"wt/{tid}")
++    assert reg.register_initial(conn, other, str(source)).state == "attached"
++
++
++# --- P2: premanifest recovery stays inside the materialize budget -----------------------------------------------
++
++def _premanifest(conn, tid, source):
++    first = reg.register_initial(conn, tid, str(source))
++    dispatch.successor(conn, tid)
++    snapshot, _ = dispatch.grant_snapshot(conn, tid, first)
++    return first, snapshot
++
++
++def test_premanifest_recovery_refuses_past_the_budget(setup, monkeypatch):
++    conn, _b, tid, source, _scratch, _home, _clone = setup
++    first, snapshot = _premanifest(conn, tid, source)
++    now = [0.0]
++    original = reg.source_identity
++    proofs = []
++
++    def expensive_identity(*args, **kwargs):
++        proofs.append(kwargs.get("bound"))
++        result = original(*args, **kwargs)
++        now[0] += 30
++        return result
++
++    monkeypatch.setattr(reg, "source_identity", expensive_identity)
++    cfg = replace(ws.settings(), materialize_timeout_s=1)
++    with pytest.raises(ws.WorkspaceSourceRefusal) as exc:
++        resolver.resolve_source_workspace(conn, kb.get_task(conn, tid), snapshot, me=first.machine, cfg=cfg,
++                                          clock=lambda: now[0])
++    assert exc.value.code == "materialize_timeout"
++    assert len(proofs) == 1, "artifact verification must reuse the resolver's recovered predecessor"
++    assert proofs[0] is not None, "the identity proof must run under the materialize budget"
++
++
++def test_premanifest_recovery_inside_the_budget_proves_once(setup, monkeypatch):
++    conn, _b, tid, source, _scratch, _home, _clone = setup
++    first, snapshot = _premanifest(conn, tid, source)
++    original = reg.source_identity
++    proofs = []
++
++    def counted(*args, **kwargs):
++        proofs.append(kwargs.get("bound"))
++        return original(*args, **kwargs)
++
++    monkeypatch.setattr(reg, "source_identity", counted)
++    cfg = replace(ws.settings(), materialize_timeout_s=60)
++    resolved = resolver.resolve_source_workspace(conn, kb.get_task(conn, tid), snapshot, me=first.machine, cfg=cfg)
++    assert resolved.path == str(source) and resolved.mode == "resume"
++    assert resolved.predecessor_run_uid == first.run_uid
++    assert len(proofs) == 1 and proofs[0] is not None
++
++
++def test_spent_budget_during_recovery_git_is_a_timeout_not_an_identity_refusal(setup):
++    conn, _b, tid, source, _scratch, _home, _clone = setup
++    first, snapshot = _premanifest(conn, tid, source)
++    now = [0.0]
++
++    def clock():
++        now[0] += 5  # every budget read costs 5 s of a 1 s budget
++        return now[0]
++
++    cfg = replace(ws.settings(), materialize_timeout_s=1)
++    with pytest.raises(ws.WorkspaceSourceRefusal) as exc:
++        resolver.resolve_source_workspace(conn, kb.get_task(conn, tid), snapshot, me=first.machine, cfg=cfg,
++                                          clock=clock)
++    assert exc.value.code == "materialize_timeout"
++
++
++# --- P3: initial registration honours the host gate -------------------------------------------------------------
++
++def test_disabled_host_refuses_initial_before_persistence_or_rpc(setup, monkeypatch):
++    conn, b, tid, source, _scratch, _home, _clone = setup
++    cfg = replace(ws.settings(), enabled=False, requested=False)
++    monkeypatch.setattr(ws, "settings", lambda: cfg)
++    before = len(_source_calls(b))
++    with pytest.raises(launch.AttachRefused) as exc:
++        reg.register_initial(conn, tid, str(source))
++    assert exc.value.code == "source_disabled"
++    assert board.attached_run(conn, kb.get_task(conn, tid).current_run_id) is None
++    assert len(_source_calls(b)) == before
++
++
++def test_disabled_host_refuses_heartbeat_registration(setup, monkeypatch):
++    from tools import kanban_tools as kt
++    conn, b, tid, source, _scratch, _home, _clone = setup
++    run_id = kb.get_task(conn, tid).current_run_id
++    cfg = replace(ws.settings(), enabled=False, requested=False)
++    monkeypatch.setattr(ws, "settings", lambda: cfg)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++
++    @contextlib.contextmanager
++    def board_context(*a, **k):
++        yield kb, conn
++
++    monkeypatch.setattr(kt, "_board", board_context)
++    before = len(_source_calls(b))
++    out = json.loads(kt._handle_heartbeat({"task_id": tid, "note": "adopt", "source_path": str(source)}))
++    assert "source_disabled" in out.get("error", ""), out
++    assert board.attached_run(conn, run_id) is None
++    assert len(_source_calls(b)) == before
+-- 
+2.43.0
+

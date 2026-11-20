@@ -1,0 +1,142 @@
+From 69de22f30785bdb2efe51a7d1942e8c50ef892c9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 05:02:54 +0000
+Subject: [PATCH] [daveey] Warm pnpm Nix hash validation without trusting
+ cached output
+
+The pnpm job still downloaded its full toolchain on every run and timed out as cancelled after20m. Restore the flake store read-only, materialize the fixed-output path, then rebuild it so a stale declared hash cannot mask a changed lockfile. Bound both passes together at15m, preserving hash mismatch diagnostics and failure semantics.
+
+Proof: four new tests fail before implementation; 73 focused workflow tests pass afterwards. scripts/check --base origin/main passes. Prior flake timeout live branch44236124317 exits124 and concludes failure. Live pnpm restore/rebuild and consecutive main green runs remain acceptance gates.
+---
+ .github/workflows/nix.yml          | 23 ++++++++-----
+ scripts/ci/check_pnpm_deps_hash.sh | 20 +++++++++++
+ tests/ci/test_nix_pnpm_cache.py    | 55 ++++++++++++++++++++++++++++++
+ 3 files changed, 89 insertions(+), 9 deletions(-)
+ create mode 100644 scripts/ci/check_pnpm_deps_hash.sh
+ create mode 100644 tests/ci/test_nix_pnpm_cache.py
+
+diff --git a/.github/workflows/nix.yml b/.github/workflows/nix.yml
+index fcfce1d192ba78c6d5dc005a28094764c838f803..ef43af8b6e07efbaf01c4c008919f35d5bd26314 100644
+--- a/.github/workflows/nix.yml
++++ b/.github/workflows/nix.yml
+@@ -92,16 +92,21 @@ jobs:
+           extra_nix_config: |
+             experimental-features = nix-command flakes
+ 
+-      # fetchPnpmDeps is a fixed-output derivation: a pnpm-lock.yaml change needs a
+-      # new nix/pnpm-deps-hash. flake-check fails too, with the hash buried in its
+-      # log; this job fails fast and names the hash Nix computed.
++      # Reuse flake-check's dependency closure, but never save from this job:
++      # concurrent writers would race for the same immutable cache key.
++      - name: Restore the Nix store for hash validation
++        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
++        with:
++          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'nix/**', 'pyproject.toml', 'uv.lock') }}
++          restore-prefixes-first-match: nix-${{ runner.os }}-
++          save: false
++          purge: false
++
++      # A restored fixed-output path alone cannot validate pnpm-lock.yaml.
++      # Materialize then rebuild it; report hash mismatches on either pass.
++      # Leave five minutes for setup/restore/cleanup before the job deadline.
+       - name: Check nix/pnpm-deps-hash
+-        run: |
+-          set -o pipefail
+-          if nix build .#pnpm-deps --no-link --print-build-logs 2>&1 | tee "$RUNNER_TEMP/pnpm-deps.log"; then exit 0; fi
+-          got=$(sed -n 's/^ *got: *\(sha256-[A-Za-z0-9+/=]*\)$/\1/p' "$RUNNER_TEMP/pnpm-deps.log")
+-          [ -n "$got" ] && echo "::error file=nix/pnpm-deps-hash::pnpm-lock.yaml changed the pnpm store. Set nix/pnpm-deps-hash to $got (or run: nix run .#update-pnpm-lockfile)"
+-          exit 1
++        run: timeout --kill-after=30s 15m bash scripts/ci/check_pnpm_deps_hash.sh
+ 
+   flake-check:
+     name: nix flake check
+diff --git a/scripts/ci/check_pnpm_deps_hash.sh b/scripts/ci/check_pnpm_deps_hash.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..bb8f05d8fb2c3887435e0d7f10a5ebf5bbed10c1
+--- /dev/null
++++ b/scripts/ci/check_pnpm_deps_hash.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++# Called under GNU timeout by nix.yml; the entire validation shares one deadline.
++set -euo pipefail
++
++check_hash() {
++  if nix build .#pnpm-deps --no-link --print-build-logs "$@" 2>&1 | tee "$RUNNER_TEMP/pnpm-deps.log"; then
++    return 0
++  fi
++  got=$(sed -n 's/^ *got: *\(sha256-[A-Za-z0-9+/=]*\)$/\1/p' "$RUNNER_TEMP/pnpm-deps.log")
++  if [ -n "$got" ]; then
++    echo "::error file=nix/pnpm-deps-hash::pnpm-lock.yaml changed the pnpm store. Set nix/pnpm-deps-hash to $got (or run: nix run .#update-pnpm-lockfile)"
++  fi
++  return 1
++}
++
++# Materialize first: --rebuild requires an existing output on a cold store.
++check_hash
++# A fixed-output store path is keyed by the declared hash, not pnpm-lock.yaml.
++# Never accept the restored output alone: rebuild and verify its actual bytes.
++check_hash --rebuild
+diff --git a/tests/ci/test_nix_pnpm_cache.py b/tests/ci/test_nix_pnpm_cache.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..406e27be572bf00cf594df39f975ab65d30523a5
+--- /dev/null
++++ b/tests/ci/test_nix_pnpm_cache.py
+@@ -0,0 +1,55 @@
++"""Cached fixed-output paths must not bypass the pnpm hash check."""
++
++import os
++from pathlib import Path
++import subprocess
++
++import pytest
++from ruamel.yaml import YAML
++
++ROOT = Path(__file__).resolve().parents[2]
++SCRIPT = ROOT / 'scripts/ci/check_pnpm_deps_hash.sh'
++
++
++def test_pnpm_restores_without_saving_and_bounds_validation():
++    doc = YAML(typ='safe').load((ROOT / '.github/workflows/nix.yml').read_text())
++    job = doc['jobs']['pnpm-deps-hash']
++    cache = next(s for s in job['steps'] if 'cache-nix-action@' in s.get('uses', ''))
++    shared = next(s for s in doc['jobs']['flake-check']['steps']
++                  if 'cache-nix-action@' in s.get('uses', ''))
++    assert cache['uses'] == shared['uses']
++    assert cache['with']['primary-key'] == shared['with']['primary-key']
++    assert cache['with']['restore-prefixes-first-match'] == 'nix-${{ runner.os }}-'
++    assert cache['with']['save'] is False
++    assert cache['with']['purge'] is False
++    step = next(s for s in job['steps'] if s.get('name') == 'Check nix/pnpm-deps-hash')
++    assert step['run'] == 'timeout --kill-after=30s 15m bash scripts/ci/check_pnpm_deps_hash.sh'
++    assert job['timeout-minutes'] == 20
++    assert not step.get('continue-on-error', False)
++
++
++@pytest.mark.parametrize('fail_call', [0, 1, 2])
++def test_validation_rebuilds_cached_output_and_reports_mismatch(tmp_path, fail_call):
++    fake = tmp_path / 'nix'
++    fake.write_text('''#!/bin/bash
++printf '%s\\n' "$*" >> "$RUNNER_TEMP/calls"
++count=$(wc -l < "$RUNNER_TEMP/calls")
++if [ "$count" = "$FAIL_CALL" ]; then
++  printf '       got:    sha256-AAAA=\\n' >&2
++  exit 1
++fi
++''')
++    fake.chmod(0o755)
++    env = dict(os.environ, PATH=f'{tmp_path}:{os.environ["PATH"]}',
++               RUNNER_TEMP=str(tmp_path), FAIL_CALL=str(fail_call))
++    result = subprocess.run(['bash', str(SCRIPT)], env=env, capture_output=True,
++                            text=True, encoding='utf-8', timeout=5, check=False)
++    calls = (tmp_path / 'calls').read_text().splitlines()
++    assert calls[0] == 'build .#pnpm-deps --no-link --print-build-logs'
++    if fail_call != 1:
++        assert calls[1] == 'build .#pnpm-deps --no-link --print-build-logs --rebuild'
++    assert len(calls) == (1 if fail_call == 1 else 2)
++    assert result.returncode == (1 if fail_call else 0)
++    if fail_call:
++        assert '::error file=nix/pnpm-deps-hash::' in result.stdout
++        assert 'sha256-AAAA=' in result.stdout
+-- 
+2.43.0
+

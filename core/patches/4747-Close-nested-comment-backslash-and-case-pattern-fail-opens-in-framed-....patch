@@ -1,0 +1,153 @@
+From b29d7248a7c2caafe2e83ee8a8681ef908ca814d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 14:23:48 +0000
+Subject: [PATCH] Close nested-comment backslash and case-pattern fail-opens in
+ framed ${...}
+
+Review 5903484091 found two more ways a command after a newline inside a
+$(...) nested in a ${...} word escaped the logical-line split:
+
+- A nested comment ending in a backslash (`$(true #c \<NL>bash ./r.sh)`):
+  _command_span kept the comment text when shlex_quotes was off, so its
+  trailing backslash joined the next line as a continuation. The comment
+  is now kept without that backslash, as root _scan already does.
+- A case pattern's `)` (`$(case x in x) true<NL>bash ./r.sh;; esac)`)
+  closed the substitution early. _command_span now tracks `case ... esac`
+  in command position, so a pattern `)` does not end the frame.
+
+_parameter_span also reports bare newlines as breaks, so a nested frame a
+walker misreads still fails closed as an unframed scan does.
+
+16 new RUN rows with clean twins; 12 are red at dabfa7b191.
+---
+ cron/lifecycle_guard_lines.py                 | 57 ++++++++++++++++---
+ .../test_lifecycle_guard_nested_comments.py   | 18 ++++++
+ 2 files changed, 67 insertions(+), 8 deletions(-)
+
+diff --git a/cron/lifecycle_guard_lines.py b/cron/lifecycle_guard_lines.py
+index b7d0e7e44e3df54112fe3de6896a80e8a10f20d6..7d4e5f190f19e59ebeb4870db1e5fef92118acfd 100644
+--- a/cron/lifecycle_guard_lines.py
++++ b/cron/lifecycle_guard_lines.py
+@@ -61,16 +61,32 @@ def _command_span(text: str, start: int, *, shlex_quotes: bool,
+     depth = 1
+     word_start = True
+     parts = ["$("]
++    # Depths at which an open `case` waits for its `esac`: there a bare `)` ends a pattern,
++    # not the substitution (`$(case x in x) true;; esac)`).
++    case_depths: list[int] = []
++    at_command = True
++    last_word = ""
+     while pos < len(text):
+         char = text[pos]
+         if char == "#" and word_start:
+             end = text.find("\n", pos)
+             end = len(text) if end < 0 else end
+-            if shlex_quotes:
+-                parts.append(text[copied:pos])
+-                copied = end
+-            pos = end
++            parts.append(text[copied:pos])
++            if not shlex_quotes:
++                # A comment's trailing backslash continues nothing (the newline still ends
++                # it), so it must not survive into a later continuation join.
++                parts.append(text[pos:end].rstrip("\r").rstrip("\\"))
++            pos = copied = end
+             continue
++        if word_start and char not in _WORD_BREAKS:
++            word = _plain_word(text, pos)
++            if word == "case" and at_command:
++                case_depths.append(depth)
++            elif (word == "esac" and case_depths and case_depths[-1] == depth
++                  and (at_command or last_word == "in")):
++                case_depths.pop()
++            at_command = word in _COMMAND_PREFIX_WORDS
++            last_word = word
+         if char == "\\":
+             if text[pos + 1:pos + 2] != "\n":
+                 word_start = False
+@@ -100,10 +116,15 @@ def _command_span(text: str, start: int, *, shlex_quotes: bool,
+         elif char == "(":
+             depth += 1
+         elif char == ")":
+-            depth -= 1
+-            if not depth:
+-                pos += 1
+-                break
++            if case_depths and case_depths[-1] == depth:
++                at_command = True  # a case pattern ends; its command list follows
++            else:
++                depth -= 1
++                if not depth:
++                    pos += 1
++                    break
++        if char in _COMMAND_BREAKS:
++            at_command = True
+         word_start = char in _WORD_BREAKS
+         pos += 1
+     parts.append(text[copied:pos])
+@@ -145,6 +166,10 @@ def _parameter_span(text: str, start: int, *, shlex_quotes: bool,
+         if char == "'":
+             pos = _quoted_end(text, pos + 1, char, escapes=False)
+             continue
++        if char == "\n" and breaks is not None:
++            # Fail closed as an unframed scan does: should a nested frame end early (a
++            # construct its walker misreads), the newline after it still ends the line.
++            breaks.append(_out_len(parts) + pos - copied)
+         if text.startswith(("${", "$("), pos):
+             stack.append("}" if text[pos + 1] == "{" else ")")
+             pos += 2
+@@ -196,6 +221,22 @@ def _expansion(text: str, pos: int, *, in_double: bool, shlex_quotes: bool,
+ 
+ # Characters after which an unquoted `#` starts a word, so a comment (bash's metacharacters).
+ _WORD_BREAKS = frozenset(" \t\n;&|()<>")
++# Characters after which the next word is in command position (a reserved word is recognized).
++_COMMAND_BREAKS = frozenset(";&|(\n")
++# Reserved words after which the next word is still in command position.
++_COMMAND_PREFIX_WORDS = frozenset({
++    "if", "then", "else", "elif", "do", "while", "until", "!", "{", "time",
++})
++_PLAIN_WORD = re.compile(r"!|\{|[A-Za-z_][A-Za-z0-9_]*")
++
++
++def _plain_word(text: str, pos: int) -> str | None:
++    """The unquoted word starting at *pos* when it is a bare name (a candidate reserved word)."""
++    match = _PLAIN_WORD.match(text, pos)
++    if match is None or (match.end() < len(text) and text[match.end()] not in _WORD_BREAKS):
++        return None
++    return match.group()
++
+ # A backslash-newline continuation and the indentation after it (what the regex scans collapse).
+ _CONTINUATION = re.compile(r"\\\r?\n[ \t]*")
+ 
+diff --git a/tests/cron/test_lifecycle_guard_nested_comments.py b/tests/cron/test_lifecycle_guard_nested_comments.py
+index c428ae45d012b138dab3051477c85f1ced1a64c0..0054751f3f69e1a0763d338a8ea79e490f65f847 100644
+--- a/tests/cron/test_lifecycle_guard_nested_comments.py
++++ b/tests/cron/test_lifecycle_guard_nested_comments.py
+@@ -73,6 +73,24 @@ NEWLINE_FRAMES = [
+     "echo ${x:-$(echo ${y:-$(true\n{cmd})})}",
+     "echo $(echo ${x:-$(true\n{cmd})})",
+     "echo ${x:-$(true\ntrue\n{cmd})}",
++    # A nested comment's trailing backslash continues nothing: the newline still ends it.
++    "echo ${x:-$(echo #c \\\n{cmd})}",
++    "echo ${x:-$(true #\\\n{cmd})}",
++    "echo ${x:-$(true #\\\\\n{cmd})}",
++    "echo ${x:-${y:-$(true #\\\n{cmd})}}",
++    "echo ${x:-$(echo ${y:-$(true #c \\\n{cmd})})}",
++    "echo ${x:-$(true #c \\\r\n{cmd})}",
++    # A case pattern's `)` does not close the substitution.
++    "echo ${x:-$(case x in x) true\n{cmd};; esac)}",
++    "echo ${x:-$(case x in x) true;; esac\n{cmd})}",
++    "echo ${x:-$(case x in (x) true\n{cmd};; esac)}",
++    "echo ${x:-$(case x in x) true #it's\n{cmd};; esac)}",
++    "echo ${x:-$(case x in a|x) true\n{cmd};; esac)}",
++    "echo ${x:-$(case x in\nx) true\n{cmd};; esac)}",
++    "echo ${x:-$(true; case x in x) true\n{cmd};; esac)}",
++    "echo ${x:-$(echo $(case x in x) true\n{cmd};; esac))}",
++    "echo ${x:-$(case x in x) case y in y) true\n{cmd};; esac;; esac)}",
++    "echo ${x:-$(case x in x) true;; esac; true\n{cmd})}",
+     # A quoted newline inside the nested substitution is data, not a separator.
+     "echo ${x:-$(echo \"a\nb\")}\n{cmd}",
+     "echo ${x:-$(echo 'a\nb')}; {cmd}",
+-- 
+2.43.0
+

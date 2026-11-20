@@ -1,0 +1,237 @@
+From 35b38abe95c4ccefc7f93e492249a455f17b0e9e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 21:17:59 -0800
+Subject: [PATCH] fix(desktop): Archived view review nits from PR #3550
+
+The exact-head review of #3550 (card t_0ff65d149587e578) approved it with
+three non-blocking behaviour nits. Fixed here:
+
+- the sidebar load-more row stayed disabled for a new scope until a read
+  stranded by the scope switch came back (up to the 60 s list timeout):
+  the row's own-click flag now also needs the store's loading flag;
+- Settings: a row unarchived or deleted while a Load more was out left
+  the row that shifted into the previous window unlisted until the next
+  click: the same pages are read again;
+- Settings: removed rows were remembered by bare session id, so removing
+  one profile's row hid another profile's row with the same id on later
+  pages: they are keyed by connection, profile and id like the cursor.
+
+Tests: sessions-settings.test.tsx (removal during a load-more; same id in
+two profiles), chat-sidebar.integration.test.tsx (row enabled for the new
+scope while the old read is stranded). The two settings tests were run
+against the code without the fix and failed.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .../src/app/chat/sidebar/archived-view.ts     |  6 +-
+ .../sidebar/chat-sidebar.integration.test.tsx | 28 ++++++++
+ .../app/settings/sessions-settings.test.tsx   | 71 +++++++++++++++++++
+ .../src/app/settings/sessions-settings.tsx    | 18 ++++-
+ 4 files changed, 118 insertions(+), 5 deletions(-)
+
+diff --git a/apps/desktop/src/app/chat/sidebar/archived-view.ts b/apps/desktop/src/app/chat/sidebar/archived-view.ts
+index 55a2c23da4df6adabf637f863bfbb70fa75c5d49..10ba7055686aa2df909bd0dd180ea428e4ea8207 100644
+--- a/apps/desktop/src/app/chat/sidebar/archived-view.ts
++++ b/apps/desktop/src/app/chat/sidebar/archived-view.ts
+@@ -45,8 +45,10 @@ export function useArchivedView(active: boolean) {
+     firstLoad: loading && sessions.length === 0,
+     hasMore,
+     loadMore,
+-    /** A click's own read, not a background refresh: that must not disable the row. */
+-    loadingMore,
++    /** A click's own read, not a background refresh: that must not disable the row.
++     *  Tied to the store's flag too, so a read stranded by a scope switch (the
++     *  store drops its flag at once) does not hold the new scope's row disabled. */
++    loadingMore: loadingMore && loading,
+     /** The Archived view's value while it is showing, the live list's otherwise. */
+     pick: <T>(archived: T, live: T): T => (active ? archived : live),
+     sessions
+diff --git a/apps/desktop/src/app/chat/sidebar/chat-sidebar.integration.test.tsx b/apps/desktop/src/app/chat/sidebar/chat-sidebar.integration.test.tsx
+index d81757b83c38adc7585d43d7ed8188471bba32a3..5eb28764d0cdda970a65c9b20c4301c77fe0bd23 100644
+--- a/apps/desktop/src/app/chat/sidebar/chat-sidebar.integration.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/chat-sidebar.integration.test.tsx
+@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
+ import { MemoryRouter } from 'react-router'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
++import { $apiRequestScope } from '@/api/client'
+ import { group, split } from '@/components/pane-shell/tree/model'
+ import { $layoutTree, noteActiveTreeGroup } from '@/components/pane-shell/tree/store'
+ import { SidebarProvider } from '@/components/ui/sidebar'
+@@ -374,6 +375,33 @@ describe('ChatSidebar Archived view paging', () => {
+     expect(screen.queryByRole('button', { name: 'Load more' })).toBeNull()
+   })
+ 
++  it('does not keep the load-more row disabled for a new scope while the old read is stranded', async () => {
++    let stranded = false
++
++    listAllProfileSessions.mockReset().mockImplementation(async (...args: unknown[]) => {
++      if ((args[6] as number) > 0) {
++        stranded = true
++
++        // The old scope's second page never comes back within this test.
++        return new Promise(() => {})
++      }
++
++      return { sessions: [archivedRow('old-one', 'Old one')], total: 16_899 }
++    })
++
++    renderSidebar('/', 'chat')
++    await screen.findByText('Old one')
++    await act(async () => fireEvent.click(screen.getByRole('button', { name: 'Load more' })))
++    await waitFor(() => expect(stranded).toBe(true))
++
++    await act(async () => $apiRequestScope.setKey('connectionId', 'other-gateway'))
++
++    await waitFor(() =>
++      expect((screen.getByRole('button', { name: 'Load more' }) as HTMLButtonElement).disabled).toBe(false)
++    )
++    $apiRequestScope.setKey('connectionId', null)
++  })
++
+   it('does not call an archive that is still loading empty', async () => {
+     let finish!: (page: unknown) => void
+     listAllProfileSessions.mockReset().mockImplementation(() => new Promise(resolve => (finish = resolve)))
+diff --git a/apps/desktop/src/app/settings/sessions-settings.test.tsx b/apps/desktop/src/app/settings/sessions-settings.test.tsx
+index c91662034c57880e93feb900387044570d22e8b7..9586bd242d6a2cfdb6775f093487800a8ca01442 100644
+--- a/apps/desktop/src/app/settings/sessions-settings.test.tsx
++++ b/apps/desktop/src/app/settings/sessions-settings.test.tsx
+@@ -127,6 +127,77 @@ describe('SessionsSettings archived list paging', () => {
+     expect(screen.queryByText('chat a')).toBeNull()
+   })
+ 
++  it('reads again when a row is unarchived while a load-more is out', async () => {
++    const server = [archived('a'), archived('b'), archived('c')]
++    let release!: () => void
++
++    listAllProfileSessions.mockReset().mockImplementation(async (...args: unknown[]) => ({
++      sessions: server.slice((args[6] as number) / 500, (args[6] as number) / 500 + 1),
++      total: server.length
++    }))
++    vi.mocked(setSessionArchived).mockImplementation(async id => {
++      server.splice(
++        server.findIndex(row => row.id === id),
++        1
++      )
++
++      return { ok: true }
++    })
++
++    render(<SessionsSettings />)
++    await screen.findByText('chat a')
++
++    // The second page is held while 'a' is unarchived underneath it.
++    listAllProfileSessions.mockImplementationOnce(async () => {
++      const rows = server.slice(1, 2)
++
++      await new Promise<void>(resolve => (release = resolve))
++
++      return { sessions: rows, total: 3 }
++    })
++    await act(async () => fireEvent.click(screen.getByRole('button', { name: en.sidebar.loadMore })))
++    await act(async () => fireEvent.click(screen.getByRole('button', { name: en.settings.sessions.unarchive })))
++    await act(async () => release())
++
++    // Without the re-read the list is just 'b' with 'c' still offered; it must hold both.
++    expect(await screen.findByText('chat c')).toBeTruthy()
++    expect(screen.getByText('chat b')).toBeTruthy()
++    expect(screen.queryByText('chat a')).toBeNull()
++  })
++
++  it("keeps another profile's row with the same id after one is unarchived", async () => {
++    const mine = { ...archived('same'), profile: 'default', title: 'mine' }
++    const theirs = { ...archived('same'), profile: 'work', title: 'theirs' }
++    const server = [mine, theirs, archived('z')]
++
++    listAllProfileSessions.mockReset().mockImplementation(async (...args: unknown[]) => ({
++      sessions: (args[6] as number) === 0 ? server.slice(0, 2) : server.slice(2),
++      total: 500 + server.length
++    }))
++    vi.mocked(setSessionArchived).mockImplementation(async (_id, _archived, profile) => {
++      server.splice(
++        server.findIndex(row => row.profile === profile),
++        1
++      )
++
++      return { ok: true }
++    })
++
++    const { container } = render(<SessionsSettings />)
++    await screen.findByText('mine')
++
++    const row = container.querySelector('#archived-session-same') as HTMLElement
++
++    const unarchive = Array.from(row.querySelectorAll('button')).find(button =>
++      button.textContent?.includes(en.settings.sessions.unarchive)
++    ) as HTMLElement
++
++    await act(async () => fireEvent.click(unarchive))
++    await act(async () => fireEvent.click(screen.getByRole('button', { name: en.sidebar.loadMore })))
++
++    expect(await screen.findByText('theirs')).toBeTruthy()
++  })
++
+   it('lists automated archived rows too, whatever the sidebar preference', async () => {
+     render(<SessionsSettings />)
+ 
+diff --git a/apps/desktop/src/app/settings/sessions-settings.tsx b/apps/desktop/src/app/settings/sessions-settings.tsx
+index 0b1309da33dacc7840a0babd03d03b9348affbf1..ba14e4e6467f5b63233f563bb1a7a6c3269d04fb 100644
+--- a/apps/desktop/src/app/settings/sessions-settings.tsx
++++ b/apps/desktop/src/app/settings/sessions-settings.tsx
+@@ -46,6 +46,8 @@ function newSessionShortcut(): null | string {
+ 
+ const DEFAULT_AUTO_ARCHIVE_DAYS = 3
+ 
++const rowIdentity = (row: SessionInfo): string => `${row.connection_id || ''}\0${row.profile || 'default'}\0${row.id}`
++
+ interface SessionsSettingsProps {
+   subpage?: string
+ }
+@@ -80,6 +82,7 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
+   const [paging] = useState(() => ({
+     cursor: null as ArchivedPager | null,
+     pages: 0,
++    // Keyed like the cursor's rows: two profiles can hold the same session id.
+     removed: new Set<string>(),
+     removedAtStart: 0,
+     started: false
+@@ -108,8 +111,17 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
+ 
+         paging.cursor = pager
+         paging.pages = pages
++
++        if (paging.removed.size !== removedAtStart) {
++          // A row was removed while this read was out: its offsets are already
++          // off by one, so read the same pages again rather than list a gap.
++          await readPages(0)
++
++          return
++        }
++
+         // The cursor back-fills live pins onto an archived page; this list is archived rows only.
+-        setLocalSessions(pager.sessions.filter(row => row.archived && !paging.removed.has(row.id)))
++        setLocalSessions(pager.sessions.filter(row => row.archived && !paging.removed.has(rowIdentity(row))))
+         setHasMore(pager.hasMore)
+       } catch (err) {
+         notifyError(err, s.failedLoad)
+@@ -143,7 +155,7 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
+ 
+       try {
+         await setSessionArchived(session.id, false, session.profile)
+-        paging.removed.add(session.id)
++        paging.removed.add(rowIdentity(session))
+         setLocalSessions(prev => prev.filter(s => s.id !== session.id))
+         // Surface it again in the sidebar without waiting for a full refresh, and
+         // lift any optimistic eviction so the grouped tree shows it again too.
+@@ -185,7 +197,7 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
+         // stored tip and the durable lineage root — the journal keys on the
+         // stored id and the row may carry either.
+         purgeInFlightTurnJournals([session.id, session._lineage_root_id])
+-        paging.removed.add(session.id)
++        paging.removed.add(rowIdentity(session))
+         setLocalSessions(prev => prev.filter(s => s.id !== session.id))
+         triggerHaptic('warning')
+       } catch (err) {
+-- 
+2.43.0
+

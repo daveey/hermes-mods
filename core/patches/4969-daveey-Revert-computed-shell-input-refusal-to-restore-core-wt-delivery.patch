@@ -1,0 +1,2736 @@
+From 2ebcffa34a070db398736d31144f1a747a404844 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 11:32:55 +0000
+Subject: [PATCH] [daveey] Revert computed-shell-input refusal to restore
+ core-wt delivery
+
+Incident rollback of core PR #3358 (d5ade1e8d1, 96d430503f,
+1a3c872921), restoring the pre-change lifecycle scanner.
+
+Problem: state push run 44509204936 and PR run 44510576609 fail
+CoreWtLifecycleGuardTest.test_deliver_passes_the_local_backend_lifecycle_scan.
+The same refusal is live on updated gateways.
+
+Why: the new uncertainty check treats quote-harvested fragments such as
+`bash -c $(printf '%q' ` as shell programs with computed input. The actual
+core-wt script also has computed Python selection with literal variable-held
+code and piped input. All are newly refused despite being normal helper code.
+A state-only quoting reshape uncovered more uncertainty and variable-candidate
+depth refusals; it is not a safe bounded incident fix.
+
+Root (happened): uncertainty checks were added to conservative/speculative
+shell interpretations without preserving the real helper's compatibility.
+Root (not caught): the state integration assertion runs against core main
+only after landing; core's focused guard tests did not cover these helper
+shapes. Add reduced compatibility witnesses to core alongside the rollback.
+Recurrence: the same state test already covered an earlier remote-read-budget
+regression; this failure is substitution-output uncertainty, not that budget.
+
+Tradeoff: this deliberately restores pre-#3358 behavior, including its known
+fail-open for unresolved substitution output. It is containment, not the
+final implementation of computed-input hardening. Reintroduction must pass
+the unchanged real state helper test and the new compatibility witnesses.
+
+Proof: unchanged state tests.test_core_wt_lifecycle_guard fails against
+#3358 and passes both tests against this rollback (clean delivery and an
+appended gateway restart refusal). No state helper changes are shipped.
+---
+ cron/lifecycle_guard.py                       |  90 +--
+ cron/lifecycle_guard_nested_shells.py         |   7 +-
+ cron/lifecycle_guard_output.py                |  70 +--
+ cron/lifecycle_guard_shebang.py               |  32 -
+ cron/lifecycle_guard_substitution_output.py   | 585 ------------------
+ cron/lifecycle_guard_substitutions.py         |   5 +-
+ cron/lifecycle_guard_variables.py             |  12 +-
+ .../test_lifecycle_guard_computed_program.py  | 177 ------
+ ...st_lifecycle_guard_core_worktree_compat.py |  33 +
+ .../test_lifecycle_guard_direct_python.py     | 124 ----
+ ..._lifecycle_guard_direct_python_computed.py |  69 ---
+ ...test_lifecycle_guard_function_variables.py |   4 +-
+ ...st_lifecycle_guard_interpreter_identity.py | 129 ----
+ ...est_lifecycle_guard_loop_cache_contract.py |  50 --
+ .../test_lifecycle_guard_quoted_provenance.py | 235 -------
+ ...ifecycle_guard_substitution_adversarial.py |   5 +-
+ ...cle_guard_substitution_branch_witnesses.py | 131 ----
+ ...e_guard_substitution_dispatch_witnesses.py |  25 -
+ ...cycle_guard_substitution_function_files.py |  38 --
+ ...lifecycle_guard_substitution_loop_files.py |  31 -
+ ...e_guard_substitution_mutation_witnesses.py |  81 ---
+ ...est_lifecycle_guard_substitution_output.py | 387 ------------
+ 22 files changed, 78 insertions(+), 2242 deletions(-)
+ delete mode 100644 cron/lifecycle_guard_shebang.py
+ delete mode 100644 cron/lifecycle_guard_substitution_output.py
+ delete mode 100644 tests/cron/test_lifecycle_guard_computed_program.py
+ create mode 100644 tests/cron/test_lifecycle_guard_core_worktree_compat.py
+ delete mode 100644 tests/cron/test_lifecycle_guard_direct_python.py
+ delete mode 100644 tests/cron/test_lifecycle_guard_direct_python_computed.py
+ delete mode 100644 tests/cron/test_lifecycle_guard_interpreter_identity.py
+ delete mode 100644 tests/cron/test_lifecycle_guard_loop_cache_contract.py
+ delete mode 100644 tests/cron/test_lifecycle_guard_quoted_provenance.py
+ delete mode 100644 tests/cron/test_lifecycle_guard_substitution_branch_witnesses.py
+ delete mode 100644 tests/cron/test_lifecycle_guard_substitution_dispatch_witnesses.py
+ delete mode 100644 tests/cron/test_lifecycle_guard_substitution_function_files.py
+ delete mode 100644 tests/cron/test_lifecycle_guard_substitution_loop_files.py
+ delete mode 100644 tests/cron/test_lifecycle_guard_substitution_mutation_witnesses.py
+ delete mode 100644 tests/cron/test_lifecycle_guard_substitution_output.py
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index 8c994cfa976a9025bb3b39d06c0402a6d13eaf79..4d0d0bf81170aa4f344c24a3d43fd59c6673e599 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -889,13 +889,10 @@ def _runs_under_uv(segment: list[str], index: int) -> bool:
+                for position, token in enumerate(segment[:index]))
+ 
+ 
+-def _split_redirections(
+-    arguments: list[str], *, opened: Optional[dict[str, str]] = None,
+-) -> tuple[list[str], list[str]]:
+-    """Follow ordered fd bindings; an optional caller-owned map carries inherited fds."""
++def _split_redirections(arguments: list[str]) -> tuple[list[str], list[str]]:
++    """Strip redirections and follow opened inputs through ordered fd copies/moves to stdin."""
+     kept: list[str] = []
+-    if opened is None:
+-        opened = {}
++    opened: dict[str, str] = {}
+     index = 0
+     while index < len(arguments):
+         match = redirection_parts(arguments[index], _REDIRECTION)
+@@ -1317,8 +1314,8 @@ def _iter_option_values(segment: list[str], start: int, option: str) -> Iterator
+ 
+ def _references_at(
+     segment: list[str], index: int, cwd: Optional[str], piped: Optional[list[str]] = None,
+-) -> Iterator[tuple[Path, bool]]:
+-    """Yield ``(path, direct_invocation)``; *piped* are files a pipe feeds to
++) -> Iterator[Path]:
++    """Yield the scripts the token at *index* executes, if any; *piped* are files a pipe feeds to
+     its stdin, run by a shell given no script operand (or ``-s``)."""
+     if index >= len(segment):
+         return
+@@ -1327,7 +1324,7 @@ def _references_at(
+ 
+     if executable_name in {".", "source"}:
+         if len(segment) > index + 1:
+-            yield from ((path, False) for path in _resolved_or_nothing(segment[index + 1], cwd))
++            yield from _resolved_or_nothing(segment[index + 1], cwd)
+         return
+ 
+     if executable_name in _SHELL_EXECUTABLES:
+@@ -1338,29 +1335,29 @@ def _references_at(
+         # the options (`bash clean.sh --rcfile x`) it is only the script's argument.
+         for arg_index in range(min(operand_index, len(arguments)) - 1):
+             if arguments[arg_index] in _SHELL_LONG_OPTIONS_WITH_VALUES:
+-                yield from ((path, False) for path in _resolved_or_nothing(arguments[arg_index + 1], cwd))
++                yield from _resolved_or_nothing(arguments[arg_index + 1], cwd)
+         if command_string:
+             return
+         if operand_index < len(arguments):
+-            yield from ((path, False) for path in _resolved_or_nothing(arguments[operand_index], cwd))
++            yield from _resolved_or_nothing(arguments[operand_index], cwd)
+         else:
+             reads_stdin = True
+         if reads_stdin:
+             for source in stdin or piped or []:
+-                yield from ((path, False) for path in _resolved_or_nothing(source, cwd))
++                yield from _resolved_or_nothing(source, cwd)
+         return
+ 
+     # A bare "/" is pathlib's division operator in Python sources, not an executable; resolving it
+     # hits the filesystem root and fails the regular-file check, hard-blocking innocent .py scripts.
+     if executable.strip("/") and ("/" in executable or executable.endswith((".sh", ".bash", ".zsh"))):
+-        yield from ((path, True) for path in _resolved_or_nothing(executable, cwd))
++        yield from _resolved_or_nothing(executable, cwd)
+ 
+ 
+-def _iter_referenced_script_invocations(
++def _iter_referenced_shell_scripts(
+     command: str, *, cwd: Optional[str] = None, call_arguments: bool = False,
+     alias_names: frozenset[str] = frozenset(),
+-) -> Iterator[tuple[Path, bool]]:
+-    """Yield scripts with direct-versus-forced-shell provenance. Each segment is read at the
++) -> Iterator[Path]:
++    """Yield scripts executed directly or through a POSIX shell. Each segment is read at the
+     original token AND at the peeled wrapper target, both with and without leading reserved words
+     (`time`, `!`, `then`, `{`, …) — additive on purpose: peeling must never REMOVE
+     a reference (a local ``./timeout`` is a script, not the coreutils wrapper). With
+@@ -1384,12 +1381,6 @@ def _iter_referenced_script_invocations(
+                     yield from _references_at(view, target, cwd, piped)
+ 
+ 
+-def _iter_referenced_shell_scripts(command: str, **kwargs) -> Iterator[Path]:
+-    """Path-only discovery view for callers that do not need invocation provenance."""
+-    for path, _direct in _iter_referenced_script_invocations(command, **kwargs):
+-        yield path
+-
+-
+ # CPython short options that take a value (glued `-Wignore` or the next token), and the ones after
+ # which no script FILE runs (`-c` inline code, `-m` module).
+ _PYTHON_VALUE_SHORT_OPTIONS = frozenset("WX")
+@@ -1628,8 +1619,8 @@ def _read_script_for_scanning(script_path: str) -> tuple[str, Optional[str]]:
+ def _walk_candidates(
+     command: str, walk_command: str, *, cwd: Optional[str], executed: bool,
+     budget: _LifecycleScanBudget,
+-) -> Iterator[tuple[Path, bool, bool, bool]]:
+-    """``(path, executed, python_source, direct_invocation)`` for every reference, executed
++) -> Iterator[tuple[Path, bool, bool]]:
++    """``(path, executed, python_source)`` for every path *command* references, executed
+     candidates first.
+ 
+     Paths named only inside a masked body are still READ: an interpreter body that hands
+@@ -1650,35 +1641,34 @@ def _walk_candidates(
+     """
+     names = budget.alias_names or frozenset()
+     entries = [
+-        (path, executed, False, direct)
+-        for path, direct in _iter_referenced_script_invocations(walk_command, cwd=cwd, alias_names=names)
++        (path, executed, False)
++        for path in _iter_referenced_shell_scripts(walk_command, cwd=cwd, alias_names=names)
+     ]
+     entries += [
+-        (path, executed, True, direct)
+-        for path, direct in _iter_referenced_script_invocations(
++        (path, executed, True)
++        for path in _iter_referenced_shell_scripts(
+             walk_command, cwd=cwd, call_arguments=True, alias_names=names)
+     ]
+     if walk_command != command:
+         entries += [
+-            (path, False, False, direct)
++            (path, False, False)
+             for call_arguments in (False, True)
+-            for path, direct in _iter_referenced_script_invocations(
++            for path in _iter_referenced_shell_scripts(
+                 command, cwd=cwd, call_arguments=call_arguments, alias_names=names)
+         ]
+-    for path, candidate_executed, call_argument, direct in entries:
+-        yield path, candidate_executed and (budget.alias_names is None or not call_argument), False, direct
++    for path, candidate_executed, call_argument in entries:
++        yield path, candidate_executed and (budget.alias_names is None or not call_argument), False
+     # Python candidates are never executed (fail-closed) entries, so the unmasked text, a superset
+     # of the masked view, finds them all.
+     for path in _iter_python_interpreter_scripts(command, cwd=cwd):
+-        yield path, False, True, False
++        yield path, False, True
+ 
+ 
+ def _contains_unsafe_gateway_action(
+     command: str, *, cwd: Optional[str], depth: int, visited: set[object], budget: _LifecycleScanBudget,
+     read_remote_script: Optional[_ReadRemoteScriptFn] = None, executed: bool = True,
+     source: Optional[str] = None, covered_quote_scope: Optional[tuple] = None,
+-    variable_source: bool = True, preserve_cwd: bool = False, computed_input: bool = True,
+-    anchored_splice_only: bool = False,
++    variable_source: bool = True, preserve_cwd: bool = False,
+ ) -> bool:
+     """``executed=False`` means *command* is the content of a file that is only MENTIONED in inert
+     (masked) text: it is still scanned for a literal lifecycle command, but "could not scan" (budget,
+@@ -1697,12 +1687,7 @@ def _contains_unsafe_gateway_action(
+         text: str, cwd: Optional[str], executed: bool, source: Optional[str], python_source: bool = False,
+         nested: bool = False, covered_quotes: Optional[tuple] = None, variable_source: bool = True,
+         preserve_source_cwd: bool = preserve_cwd,
+-        file_computed_input: Optional[bool] = None, anchored_splice_only: bool = False,
+     ) -> bool:
+-        # Text derived from the current text inherits its computed-input mode; a file visit
+-        # decides its own (``file_computed_input``), so a nested script is never covered.
+-        # Speculative-quote splice narrowing does not inherit: a referenced file and a
+-        # nested shell program keep the full splice check unless they qualify themselves.
+         if python_source:
+             return _python_source_is_unsafe(text, budget)
+         with shell_scope(budget, nested):
+@@ -1711,9 +1696,6 @@ def _contains_unsafe_gateway_action(
+                 read_remote_script=read_remote_script, executed=executed, source=source,
+                 covered_quote_scope=covered_quotes, variable_source=variable_source,
+                 preserve_cwd=preserve_source_cwd,
+-                computed_input=(computed_input if file_computed_input is None
+-                                else file_computed_input),
+-                anchored_splice_only=anchored_splice_only,
+             )
+ 
+     # The walks below must see the same masked view `_direct_lifecycle_scan` sees (#110422): a
+@@ -1745,8 +1727,8 @@ def _contains_unsafe_gateway_action(
+     # A nested shell's script may be a path the ordinary candidates never name: a stdin file
+     # redirected into `su -l bob`, `doas -s`, `sudo -i` or `ssh host` (review 5903452583 B1). It
+     # comes from the executed view, so it is executed, and is walked first in both scopes.
+-    nested_only = ((path, executed, False, False) for path in sorted(nested_scripts))
+-    for script_path, candidate_executed, python_source, direct in itertools.chain(nested_only, _walk_candidates(
++    nested_only = ((path, executed, False) for path in sorted(nested_scripts))
++    for script_path, candidate_executed, python_source in itertools.chain(nested_only, _walk_candidates(
+             command, walk_command, cwd=cwd, executed=executed, budget=budget)):
+         # Do not touch a FileProvider path even to discover whether the file is hydrated.
+         if _on_cloud_path(script_path):
+@@ -1760,8 +1742,7 @@ def _contains_unsafe_gateway_action(
+         resolved = _resolve_lenient(script_path)
+         scopes = unvisited_scopes(visited, budget, resolved, python_source=python_source,
+                                   nested=resolved in nested_scripts, executed=candidate_executed,
+-                                  working_directory=str(cwd or Path.cwd()) if preserve_cwd else None,
+-                                  direct_invocation=direct)
++                                  working_directory=str(cwd or Path.cwd()) if preserve_cwd else None)
+         if not scopes:
+             continue
+         if not budget.charge_path():
+@@ -1796,26 +1777,13 @@ def _contains_unsafe_gateway_action(
+                 continue
+         if not script_text:
+             continue
+-        # A directly invoked Python-shebang file is still walked as shell text, exactly as
+-        # before the computed-input check existed (never promoted to Python source: the
+-        # interpreter name is not proof). Only that new uncertainty check is withheld from
+-        # its text, so prose/backticks in Python source cannot newly refuse. Forced
+-        # shell/source/stdin visits keep their own keys and the full check.
+-        from cron.lifecycle_guard_shebang import checks_computed_input
+-
+-        file_computed_input = checks_computed_input(direct, script_text)
+         # Startup sources retain the invoking shell's cwd; legacy script walks use the script directory.
+         if any(recurse(
+             script_text, script_working_directory(resolved, cwd, preserve_cwd), candidate_executed,
+             f"`{script_path}`", python_source, nested=nested,
+-            file_computed_input=file_computed_input,
+         ) for nested, _key in scopes):
+             return True
+-    from cron.lifecycle_guard_substitution_output import scan_computed_shell_input
+-
+-    return scan_computed_shell_input(
+-        walk_command, executed=executed, budget=budget, recurse=recurse, cwd=cwd, source=source,
+-        enabled=computed_input, anchored_only=anchored_splice_only)
++    return False
+ 
+ 
+ def scan_gateway_lifecycle(
+diff --git a/cron/lifecycle_guard_nested_shells.py b/cron/lifecycle_guard_nested_shells.py
+index 4f15a467e8a70915650241c53fcd01464ea3474f..de0c8135dbe658af9fd34d7889f59819ffd255d2 100644
+--- a/cron/lifecycle_guard_nested_shells.py
++++ b/cron/lifecycle_guard_nested_shells.py
+@@ -61,16 +61,13 @@ def shell_scope(budget: _LifecycleScanBudget, nested: bool) -> contextlib.Abstra
+ def unvisited_scopes(
+     visited: set[object], budget: _LifecycleScanBudget, resolved: Path, *, python_source: bool,
+     nested: bool, executed: bool = True, working_directory: Optional[str] = None,
+-    direct_invocation: bool = False,
+ ) -> list[tuple[bool, tuple]]:
+     """``(nested, visit key)`` for each scope *resolved* still needs a walk in. A shell walk
+     depends on its scope (alias names, heredoc masking), so ``visited`` keys carry it: a path one
+     reference hands to a nested shell and another to the session shell is walked in both scopes
+     (review 5897863903 B1), the session one exactly as before. A shell walk in any scope subsumes
+     the file's Python regex scan, never the reverse; the caller also records ``key[:2]``, the
+-    scope-free ``(resolved, "shell")`` mark, for that. Direct invocations have separate keys:
+-    their shebang is not known until the read, and a Python visit cannot cover a later forced
+-    shell/source/stdin walk of the same resolved file."""
++    scope-free ``(resolved, "shell")`` mark, for that."""
+     if python_source:
+         seen = (resolved, "python") in visited or (resolved, "shell") in visited
+         return [] if seen else [(False, (resolved, "python"))]
+@@ -81,7 +78,7 @@ def unvisited_scopes(
+     for flag, scope in wanted:
+         # A mention does not cover an execution walk: only the latter
+         # resolves variable sinks and fails closed on referenced scan caps.
+-        key = (resolved, "direct" if direct_invocation else "shell", scope, budget.integer_context)
++        key = (resolved, "shell", scope, budget.integer_context)
+         if working_directory is not None:
+             key += (working_directory,)
+         keys.setdefault(key if executed else (*key, "mention"), flag)
+diff --git a/cron/lifecycle_guard_output.py b/cron/lifecycle_guard_output.py
+index 05b09ea6041573b1573795d5c4b3bc60b2130a54..0c99c357176edd677e5c07d381c192a7b6482329 100644
+--- a/cron/lifecycle_guard_output.py
++++ b/cron/lifecycle_guard_output.py
+@@ -14,61 +14,6 @@ from cron.lifecycle_guard_arith_words import iter_arithmetic_word_payloads, may_
+ 
+ _QUOTED_LITERAL_RES = (re.compile(r"(?='([^']+)')"), re.compile(r'(?="([^"]+)")'))
+ _ARGUMENT_PRINTERS = frozenset({"echo", "printf"})
+-# Metacharacters that are literal inside single quotes. Letters stay so a
+-# quoted shell name can still certify a sink (`| 'bash'`).
+-_SINGLE_QUOTE_META = frozenset("|&;<>()$`{}")
+-# Any output process or coprocess denies the speculative-quote narrowing, whatever it runs.
+-_PROC_SUB_SINK = re.compile(r">\s*>\(|\bcoproc\b")
+-
+-
+-def mask_single_quoted_metacharacters(text: str) -> str:
+-    """Blank shell metacharacters inside single-quoted spans of *text*.
+-
+-    Fail closed (return *text* unchanged) when quote state is unreliable: a
+-    heredoc opener, an ANSI-C quote, or an unbalanced quote. Double-quoted
+-    spans are never masked; their substitutions stay live.
+-    """
+-    from cron.lifecycle_guard_lines import strip_shell_comments
+-
+-    if "<<" in text or "$'" in text:
+-        return text
+-    stripped = strip_shell_comments(text)
+-    result: list[str] = []
+-    single = double = escaped = False
+-    for char in stripped:
+-        if single:
+-            if char == "'":
+-                single = False
+-                result.append(char)
+-            else:
+-                result.append("_" if char in _SINGLE_QUOTE_META else char)
+-            continue
+-        result.append(char)
+-        if escaped:
+-            escaped = False
+-        elif char == "\\":
+-            escaped = True
+-        elif char == '"':
+-            double = not double
+-        elif char == "'" and not double:
+-            single = True
+-    if single or double:
+-        return text
+-    return "".join(result)
+-
+-
+-def quote_aware_shell_sink(command: str) -> bool:
+-    """Whether *command* feeds output to a shell outside single-quoted literals.
+-
+-    A backtick or pipe inside single quotes is data, not evidence that a
+-    harvested quote is executed. Unreliable quote state keeps the quote-blind
+-    certificate.
+-    """
+-    from tools.shell_heredoc import output_reaches_shell
+-
+-    masked = mask_single_quoted_metacharacters(command)
+-    return (output_reaches_shell(masked, binding_source=command)
+-            or _PROC_SUB_SINK.search(masked) is not None)
+ 
+ 
+ def quote_scope(cwd, executed, budget) -> tuple:
+@@ -77,7 +22,7 @@ def quote_scope(cwd, executed, budget) -> tuple:
+ 
+ 
+ def iter_recursive_payloads(command, nested_texts, *, cwd, executed, budget, covered_scope):
+-    """Yield payload, nested-shell, quote coverage, variable provenance, printer line.
++    """Yield payload, nested-shell, quote coverage, and shell-variable provenance.
+ 
+     Printed strings/overlapping quote spans are conservative candidates, not
+     original shell syntax. Resolving their standalone ``$log`` as a command would
+@@ -90,24 +35,21 @@ def iter_recursive_payloads(command, nested_texts, *, cwd, executed, budget, cov
+         command, aliases_defined=budget.aliases_defined,
+     )
+     for payload in nested_texts:
+-        yield payload, True, None, True, False
++        yield payload, True, None, True
+     for payload in guard._iter_shell_command_payloads(command):
+-        yield payload, False, None, True, False
++        yield payload, False, None, True
+     integer_context = budget.integer_context
+     for payload in iter_arithmetic_word_payloads(command, integer_context=integer_context):
+-        yield payload, False, None, False, False
++        yield payload, False, None, False
+     # Snapshot after preceding nested-shell walks; shared budget state may have changed.
+     scope = quote_scope(cwd, executed, budget)
+     for payload, raw_quote in iter_printed_shell_payloads(
+             command, include_quoted=covered_scope != scope):
+-        # Printer lines are decoded data, not syntax. Mark them so a parent
+-        # without a real sink can drop placeholder splices without treating
+-        # the line as a raw quote (that would omit its own quote walk).
+-        yield payload, False, scope if raw_quote else None, False, not raw_quote
++        yield payload, False, scope if raw_quote else None, False
+     # Quoted eval text can establish attributes needed by the parent's later assignments.
+     if budget.integer_context and not integer_context:
+         for payload in iter_arithmetic_word_payloads(command, integer_context=True):
+-            yield payload, False, None, False, False
++            yield payload, False, None, False
+ 
+ 
+ def iter_printed_shell_payloads(
+diff --git a/cron/lifecycle_guard_shebang.py b/cron/lifecycle_guard_shebang.py
+deleted file mode 100644
+index f0f6993bf371892fd47f79fbd55f335e179979a0..0000000000000000000000000000000000000000
+--- a/cron/lifecycle_guard_shebang.py
++++ /dev/null
+@@ -1,32 +0,0 @@
+-"""Literal Python shebang recognition. Not interpreter proof: callers keep the shell walk."""
+-import re
+-
+-
+-_PYTHON = re.compile(r"(?:/[^\s'\"\\$`]+/)?(?:python(?:\d+(?:\.\d+)*)?|pypy3?)\Z")
+-_FLAGS = frozenset({'-u', '-B', '-E', '-I', '-s', '-S'})
+-
+-
+-def is_python_shebang(text: str) -> bool:
+-    """Recognize only literal Python shebangs with non-program-selecting flags.
+-
+-    Unknown env options, assignments, quoting and CPython -c/-m stay shell-walked.
+-    env without -S accepts exactly one program word (the kernel's single argument).
+-    """
+-    if not text.startswith('#!'):
+-        return False
+-    words = text.partition('\n')[0][2:].split()
+-    if not words:
+-        return False
+-    if words[0] in ('/usr/bin/env', '/bin/env'):
+-        words = words[1:]
+-        if words[:1] == ['-S']:
+-            words = words[1:]
+-        elif len(words) != 1:
+-            return False
+-    return bool(words and _PYTHON.fullmatch(words[0])
+-                and all(word in _FLAGS for word in words[1:]))
+-
+-
+-def checks_computed_input(direct_invocation: bool, text: str) -> bool:
+-    """False only for the text of a directly invoked literal-Python-shebang file."""
+-    return not (direct_invocation and is_python_shebang(text))
+diff --git a/cron/lifecycle_guard_substitution_output.py b/cron/lifecycle_guard_substitution_output.py
+deleted file mode 100644
+index 0cca6c47068707cbf59a44f3178a48b8f8c137c9..0000000000000000000000000000000000000000
+--- a/cron/lifecycle_guard_substitution_output.py
++++ /dev/null
+@@ -1,585 +0,0 @@
+-"""Fail closed when an unevaluated command output supplies a shell's code/file.
+-
+-Never execute substitutions or trust builtin-looking producer names: functions can
+-replace them. Arithmetic output is separately marked, since it is numeric rather
+-than arbitrary shell code. Existing walks still inspect the substitution bodies.
+-"""
+-from __future__ import annotations
+-
+-import re
+-
+-from cron.lifecycle_guard_substitutions import separate_substitutions
+-from cron.lifecycle_guard_variables import _ASSIGNMENT, _DECLARATIONS
+-
+-_OUTPUT = '\x00command-output'
+-# `eval "$(hermes-core-wt env)"` is the fleet's way to put a core worktree's
+-# tools on PATH; the tool prints one `export PATH=...` line. The name is trusted
+-# like the word `python3`: bare or under ~/.hermes/bin, sole argument `env`,
+-# the whole quoted eval operand. A command that defines the name or assigns
+-# HOME/PATH keeps the refusal.
+-_PATH_EXPORT = re.compile(
+-    r'(?<![\w$\\.-])eval[ \t]+"\$\((?:(?:~|\$HOME|\$\{HOME\}|/home/[\w.-]+|/Users/[\w.-]+)'
+-    r'/\.hermes/bin/)?hermes-core-wt env\)"(?=[ \t]*(?:[;&|\n>)]|[0-9]?>|$))')
+-_PATH_EXPORT_DENY = re.compile(
+-    r'hermes-core-wt\s*\(|function\s+hermes-core-wt|alias\b[^;\n]*hermes-core-wt='
+-    r'|(?<![\w])(?:HOME|PATH)\+?=')
+-_VARIABLE_REFERENCE = re.compile(r'\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})')
+-
+-
+-def _input_words(
+-    words: list[str], opened: dict[str, str] | None = None,
+-) -> tuple[list[str], list[str]]:
+-    """Reuse final-fd binding semantics, treating here-string bytes as an input."""
+-    from cron import lifecycle_guard as guard
+-    from cron.lifecycle_guard_words import redirection_parts
+-
+-    inputs = []
+-    for word in words:
+-        match = redirection_parts(word, guard._REDIRECTION)
+-        if match is not None and match[1] == '<<<':
+-            fd, _, target = match
+-            word = fd + '<' + target
+-        inputs.append(word)
+-    return guard._split_redirections(inputs, opened=opened)
+-
+-
+-def _unanchored_splice(pattern: str) -> bool:
+-    """True when *pattern* is only ``.*`` separators, so it matches every name."""
+-    return pattern.replace(".*", "") == ""
+-
+-
+-def _defer_sibling(deferred: list | None, consumer: str, word: str) -> bool:
+-    """Defer ``<output>/literal/tail``: only the leading directory is computed.
+-
+-    ``. "$HERE/lib.sh"`` is how a script loads its sibling. The caller resolves
+-    the literal tail against the walk's directory and scans what it finds; a
+-    tail that names no file there stays uncertain."""
+-    if deferred is None or not word.startswith(_OUTPUT + '/'):
+-        return False
+-    tail = word[len(_OUTPUT) + 1:]
+-    if (not tail or tail.startswith('/') or _OUTPUT in tail or set('$`*?[]{}~\\\n') & set(tail)
+-            or '..' in tail.split('/')):
+-        return False
+-    if (consumer, tail) not in deferred:
+-        deferred.append((consumer, tail))
+-    return True
+-
+-
+-def _defer_literal_code(deferred, arguments, operand, bindings, *, plain: bool) -> bool | None:
+-    """``$PY -c 'literal'``: scan the code instead of refusing every computed interpreter.
+-
+-    Applies when the options and the code are literal, the code has no
+-    expansion left for the parent to fill, and no descriptor other than
+-    stdout/stderr is bound, so the only unknown is the program. *plain* is the
+-    caller's "-c without -s or a stdin word". ``None`` means it does not apply."""
+-    if (deferred is None or not plain or not set(bindings) <= {'1', '2'}
+-            or operand >= len(arguments)
+-            or any(_OUTPUT in word for word in arguments[:operand + 1])
+-            or set('$`') & set(arguments[operand])):
+-        return None
+-    if any(_OUTPUT in word for word in bindings.values()):
+-        return True
+-    if ('code', arguments[operand]) not in deferred:
+-        deferred.append(('code', arguments[operand]))
+-    return False
+-
+-
+-def _bare_absolute(word: str, quiet: bool) -> bool:
+-    """``/Users/<out>`` with no argument, pipe or stdin binding (*quiet*).
+-
+-    An absolute literal directory whose last component alone is computed has no
+-    shell invocation syntax, like a bare ``<out>``. A relative splice or one
+-    with computed directories (``s/<out>/<out>/``) keeps the shell match."""
+-    return (quiet and word.startswith('/') and word.endswith('/' + _OUTPUT)
+-            and word.count(_OUTPUT) == 1)
+-
+-
+-def _sourced_is_computed(name, program, arguments, deferred) -> bool:
+-    """``.``/``source`` read their first operand, ``eval`` every argument."""
+-    selected = arguments if name == 'eval' else arguments[:1]
+-    if _OUTPUT in program:
+-        return True
+-    if name != 'eval' and selected and _defer_sibling(deferred, '.', selected[0]):
+-        return False
+-    return any(_OUTPUT in word for word in selected)
+-
+-
+-def _shell_input_words(arguments, operand, stdin, name, deferred, *, code, reads_stdin):
+-    """The words a shell reads as options, code, script or stdin.
+-
+-    Unknown option output may change the option layout or inject a code input.
+-    A script operand with only a computed directory is deferred instead."""
+-    selected = arguments[:operand]
+-    script = (not code and not reads_stdin and operand < len(arguments)
+-              and not any(_OUTPUT in word for word in selected)
+-              and _defer_sibling(deferred, name, arguments[operand]))
+-    if (code or not reads_stdin) and not script:
+-        selected += arguments[operand:operand + 1]
+-    if not code and (reads_stdin or operand >= len(arguments)):
+-        selected += stdin
+-    return selected
+-
+-
+-def _shell_input_is_computed(
+-    view: list[str], piped: list[str], *, opened: dict[str, str] | None = None,
+-    depth: int = 0, anchored_only: bool = False, deferred: list[tuple[str, str]] | None = None,
+-) -> bool:
+-    from cron import lifecycle_guard as guard
+-
+-    # An empty output can join a shell name or a transparent wrapper's name.
+-    # Keep the original words for input uncertainty and scan the empty-output
+-    # interpretation additively; this is not a claim about the actual output.
+-    bindings = dict(opened or {})
+-    if piped:
+-        bindings['0'] = '\n'.join(piped)
+-    # Redirections are syntax, never executable words (including before or
+-    # between wrappers). Apply them in order before locating the consumer.
+-    view, _ = _input_words(view, bindings)
+-    empty = [word.replace(_OUTPUT, '') for word in view]
+-    index = guard._executed_command_index(empty)
+-    if index is None:
+-        return False
+-    while not empty[index] and _OUTPUT in view[index]:
+-        # Unknown programs with shell invocation syntax are possible shells.
+-        arguments, stdin = _input_words(view[index + 1:], dict(bindings))
+-        operand, code, reads_stdin = guard._shell_options_end(arguments, 'bash')
+-        literal = _defer_literal_code(deferred, arguments, operand, bindings,
+-                                      plain=code and not reads_stdin and not stdin)
+-        if literal is not None:
+-            return literal
+-        if code or reads_stdin or stdin or piped:
+-            return True
+-        # Also consider an absent word before a literal shell, without
+-        # treating an empty prefix before Python as a shell consumer.
+-        index += 1
+-        if index >= len(view):
+-            return False
+-    name = guard._executable_name(empty[index])
+-    arguments, stdin = _input_words(view[index + 1:], bindings)
+-    if name in {'.', 'source', 'eval'}:
+-        return _sourced_is_computed(name, view[index], arguments, deferred)
+-    if _OUTPUT in view[index]:
+-        # The output may fill a *nonempty* executable splice. Only classify
+-        # names compatible with a shell/wrapper, not py$(...)thon or data.
+-        pattern = '.*'.join(re.escape(part) for part in guard._executable_name(view[index]).split(_OUTPUT))
+-        shells = guard._SHELL_EXECUTABLES | {'.', 'source', 'eval'}
+-        # A placeholder-only basename (`s/<out>/<out>/` → Path.name is the
+-        # placeholder → pattern `.*`) matches every shell. That is evidence on
+-        # a real command word, and not evidence inside a raw quote the parent
+-        # does not feed to a shell. Anchored splices (`b<out>ash`) still match.
+-        narrowed = anchored_only and _unanchored_splice(pattern)
+-        bare = _bare_absolute(view[index], not (arguments or stdin or piped or '0' in bindings))
+-        if not narrowed and not bare and any(re.fullmatch(pattern, candidate) for candidate in shells):
+-            return True
+-        # A computed wrapper name is not itself a shell sink. Interpret each
+-        # compatible wrapper with the existing option/operand peeling rules.
+-        if not narrowed:
+-            for wrapper in guard._TRANSPARENT_COMMAND_PREFIXES:
+-                if re.fullmatch(pattern, wrapper):
+-                    candidate = view[:index] + [wrapper] + view[index + 1:]
+-                    consumer = guard._executed_command_index(candidate)
+-                    if consumer is not None and guard._executable_name(candidate[consumer]) in shells:
+-                        return True
+-                    if _shell_input_is_computed(
+-                            candidate, [], opened=bindings, depth=depth,
+-                            anchored_only=anchored_only, deferred=deferred):
+-                        return True
+-    if name not in guard._SHELL_EXECUTABLES:
+-        return False
+-    operand, code, reads_stdin = guard._shell_options_end(arguments, name)
+-    # Unknown option output may change the option layout or inject a code input.
+-    selected = _shell_input_words(arguments, operand, stdin, name, deferred,
+-                                  code=code, reads_stdin=reads_stdin)
+-    if any(_OUTPUT in word for word in selected):
+-        return True
+-    if code and operand < len(arguments) and any(_OUTPUT in word for word in bindings.values()):
+-        # -c selects code, but that code can launch another stdin shell. Carry
+-        # the final fd map into its commands; explicit redirects still override.
+-        if depth >= 16:
+-            return True
+-        return _contexts_are_computed(
+-            arguments[operand], opened=bindings, depth=depth + 1,
+-            anchored_only=anchored_only, deferred=deferred)
+-    return False
+-
+-
+-def _contexts_are_computed(command, *, opened=None, depth=0, alias_names=frozenset(),
+-                           anchored_only=False, deferred=None) -> bool:
+-    """Attach descriptor provenance to the existing scope/pipeline feed walk.
+-
+-    Flattened segment contexts cannot carry persistent redirects: a child close
+-    must not close the parent's fd, nor may a child open taint its parent. Reuse
+-    the feed walk's group and operator events rather than parsing shell syntax
+-    for a second time.
+-    """
+-    from cron import lifecycle_guard as guard
+-    from cron.lifecycle_guard_groups import _LineWalk, _walk, heredoc_scripts, join_continued_lines
+-
+-    def peel(words):
+-        # Decoded quoted keywords are command names, not shell grammar. The
+-        # shared legacy peeler otherwise turns `"if" exec 3<&-` into a close.
+-        end = next((i for i, word in enumerate(words) if getattr(word, 'quoted', False)), len(words))
+-        return guard._peel_reserved_words(words[:end])
+-
+-    def join(left, right):
+-        # Only output provenance matters here. A may-join must not erase a
+-        # computed binding when the other path closes/rebinds that descriptor.
+-        result = dict(left)
+-        for fd, value in right.items():
+-            if fd not in result or _OUTPUT in value:
+-                result[fd] = value
+-        return result
+-
+-    loop_entries = {}
+-    function_effects = {}
+-    function_entries = {}
+-
+-    class DescriptorWalk(_LineWalk):
+-        def __init__(self, *args, **kwargs):
+-            super().__init__(*args, **kwargs)
+-            self.bindings = dict(opened or {})
+-            self.command_start = dict(self.bindings)
+-            self.pipeline = None
+-            self.fd_frames = []
+-            self.computed = False
+-            self.conditional = False
+-            self.function_pending = None
+-            self.function_header = False
+-            self.case_patterns = set()
+-            self.last_operator = None
+-            self.branch_exits = {}
+-            self.local_aliases = set(alias_names)
+-
+-        def open_group(self, closer, outer=None, feed=None):
+-            function = self.function_pending if outer is None else None
+-            self.function_pending = None
+-            group = super().open_group(closer, outer=outer, feed=feed)
+-            self.fd_frames.append((group, dict(self.bindings), self.pipeline, self.command_start,
+-                                   self.conditional, function))
+-            if closer == 'esac':
+-                self.case_patterns.add(group.ordinal)
+-            if function:
+-                self.bindings = join(self.bindings, function_entries.get(function, {}))
+-            if closer == 'done':
+-                self.bindings = join(self.bindings, loop_entries.get(group.ordinal, {}))
+-            self.command_start = dict(self.bindings)
+-            self.pipeline = None
+-            self.conditional = False
+-            return group
+-
+-        def open_segment_groups(self):
+-            if self.groups_open:
+-                return
+-            prefix = self.segment[:peel(self.segment)]
+-            if prefix and prefix[0] == 'function':
+-                self.function_pending = str(self.segment[1]) if len(self.segment) > 1 else None
+-            for word in prefix:
+-                closer = {'{': '}', 'if': 'fi', 'while': 'done', 'until': 'done'}.get(word)
+-                if closer:
+-                    self.open_group(closer)
+-            rest = self.segment[len(prefix):]
+-            if rest and not getattr(rest[0], 'quoted', False):
+-                closer = {'for': 'done', 'select': 'done', 'case': 'esac'}.get(rest[0])
+-                if closer:
+-                    self.open_group(closer)
+-            self.groups_open = True
+-
+-        def restore_groups(self):
+-            while self.fd_frames and not any(self.fd_frames[-1][0] is g for g in self.groups):
+-                group, parent, pipeline, start, conditional, function = self.fd_frames.pop()
+-                if self.pipeline is not None:
+-                    self.bindings = dict(self.pipeline)
+-                if function:
+-                    # Definitions do not run. Save their may-effects separately
+-                    # and reapply them only when a command invokes the name.
+-                    effects = function_effects.setdefault(function, {})
+-                    # Literal file bindings also identify a computed command
+-                    # as a possible stdin shell. Retain them monotonically,
+-                    # without promoting harmless files to output provenance.
+-                    function_effects[function] = join(effects, self.bindings)
+-                    self.bindings = parent
+-                elif group.closer == ')':
+-                    self.bindings = parent
+-                else:
+-                    self.bindings = join(self.branch_exits.pop(group.ordinal, {}), self.bindings)
+-                    if group.closer == 'done':
+-                        entry = loop_entries.setdefault(group.ordinal, {})
+-                        # Literal file inputs also identify a computed program
+-                        # as a possible shell on the next iteration. Keep their
+-                        # provenance rather than upgrading them to output code.
+-                        loop_entries[group.ordinal] = join(entry, self.bindings)
+-                    if function or conditional or group.closer in ('fi', 'done', 'esac'):
+-                        # Definitions/branches/zero-iteration loops cannot
+-                        # certify a close. Their possible opens remain visible
+-                        # conservatively, including a later function invocation.
+-                        self.bindings = join(parent, self.bindings)
+-                self.pipeline, self.command_start = pipeline, start
+-                self.conditional = conditional
+-
+-        def word(self, token):
+-            syntax = not getattr(token, 'quoted', False)
+-            if self.fd_frames and self.fd_frames[-1][0].ordinal in self.case_patterns:
+-                if not (syntax and token == 'esac'):
+-                    return
+-                self.case_patterns.discard(self.fd_frames[-1][0].ordinal)
+-            if syntax and token in ('else', 'elif') and not self.segment and self.fd_frames:
+-                # The next branch starts with the entry state, not the preceding
+-                # branch's strong close. Retain both possible outcomes.
+-                group, parent, *_ = self.fd_frames[-1]
+-                self.branch_exits[group.ordinal] = join(
+-                    self.branch_exits.get(group.ordinal, {}), self.bindings)
+-                self.bindings = dict(parent)
+-            if not syntax and token in ('}', 'fi', 'done', 'esac'):
+-                self.segment.append(token)
+-            else:
+-                super().word(token)
+-            self.restore_groups()
+-
+-        def flush(self):
+-            for segment, call_argument, piped in super().flush():
+-                if not call_argument:
+-                    views = guard._command_segment_views(segment)
+-                    for view in views:
+-                        self.computed |= _shell_input_is_computed(
+-                            view, piped, opened=self.bindings, depth=depth,
+-                            anchored_only=anchored_only, deferred=deferred)
+-                    candidate = dict(self.bindings)
+-                    arguments, _ = _input_words(segment[peel(segment):], candidate)
+-                    index = guard._executed_command_index(arguments)
+-                    if index is not None:
+-                        name = arguments[index]
+-                        # Dynamic dispatch can invoke any locally defined helper.
+-                        # Keep these may-effects local to descriptor uncertainty;
+-                        # they are not literal variable/alias value candidates.
+-                        if name == 'alias':
+-                            self.local_aliases.update(
+-                                word.split('=', 1)[0] for word in arguments[index + 1:] if '=' in word)
+-                        dynamic = ('$' in name or _OUTPUT in name or name in self.local_aliases)
+-                        if (name == 'eval' and arguments[index + 1:]) or dynamic:
+-                            targets = function_effects
+-                        else:
+-                            targets = {name: function_effects[name]} if name in function_effects else {}
+-                        for target, effects in targets.items():
+-                            function_entries[target] = join(
+-                                function_entries.get(target, {}), candidate)
+-                            self.bindings = join(self.bindings, effects)
+-                    if arguments == ['exec']:
+-                        self.bindings = join(self.bindings, candidate) if self.conditional else candidate
+-                yield segment, call_argument, piped
+-
+-        def operator(self, operator):
+-            # Case patterns are not subshells. The shared flat walker splits
+-            # ;& and ;;& into punctuation events; join every arm at those exits
+-            # and seed later arms with both entry and fallthrough provenance.
+-            case_words = self.segment[peel(self.segment):]
+-            if (case_words[:1] == ['case']
+-                    and not getattr(case_words[0], 'quoted', False)):
+-                self.open_segment_groups()
+-                self.segment = []
+-                self.groups_open = False
+-            case = self.fd_frames[-1] if self.fd_frames and self.fd_frames[-1][0].closer == 'esac' else None
+-            if case:
+-                group, parent, *_ = case
+-                if group.ordinal in self.case_patterns:
+-                    if operator == ')':
+-                        self.case_patterns.discard(group.ordinal)
+-                    self.last_operator = operator
+-                    return
+-                if operator == ';;' or (operator == '&' and self.last_operator == ';'):
+-                    yield from self.flush()
+-                    self.branch_exits[group.ordinal] = join(
+-                        self.branch_exits.get(group.ordinal, {}), self.bindings)
+-                    self.bindings = join(parent, self.branch_exits[group.ordinal])
+-                    self.case_patterns.add(group.ordinal)
+-                    self.last_operator = operator
+-                    return
+-            self.last_operator = operator
+-            # Save before the first member runs; a group may already have run
+-            # by the time its following pipe operator is encountered.
+-            start = dict(self.command_start)
+-            header_words = self.segment[peel(self.segment):]
+-            # Bash (outside POSIX mode) permits punctuation in function names.
+-            # This is a may-definition, not an identifier-validity certificate.
+-            header = (operator == '(' and len(header_words) == 1
+-                      and bool(header_words[0])
+-                      and not any(ch in header_words[0] for ch in '$<>='))
+-            if operator == '(' and self.segment[:1] == ['function']:
+-                header = True
+-            name = (str(self.segment[1]) if self.segment[:1] == ['function'] and len(self.segment) > 1
+-                    else str(header_words[0]) if header_words else None)
+-            end_header = operator == ')' and self.function_header
+-            yield from super().operator(operator)
+-            self.restore_groups()
+-            if header:
+-                self.function_header = name
+-            elif end_header:
+-                self.function_pending = self.function_header
+-                self.function_header = False
+-            if operator in ('&&', '||'):
+-                self.conditional = True
+-            elif operator not in ('(', ')'):
+-                self.conditional = False
+-            if operator in ('|', '|&'):
+-                if self.pipeline is None:
+-                    self.pipeline = start
+-                self.bindings = dict(self.pipeline)
+-                self.command_start = dict(self.bindings)
+-            elif operator not in ('(', ')'):
+-                if self.pipeline is not None:
+-                    self.bindings = dict(self.pipeline)
+-                    self.pipeline = None
+-                elif operator == '&':
+-                    self.bindings = start
+-                self.command_start = dict(self.bindings)
+-
+-    callables = (guard._cat_operands, guard._cat_relays_stdin,
+-                 lambda segment: guard._opens_call_arguments(segment) and alias_names.isdisjoint(segment),
+-                 peel, lambda words: _input_words(words)[1])
+-    for script in heredoc_scripts(command):
+-        tokens = [token for line in join_continued_lines(guard._iter_command_token_lists(script))
+-                  for token in (*line, ';')]
+-        # Preserve the feed tracker's look-ahead for redirects after a group
+-        # closer and writers surrounding a process substitution.
+-        probe = _LineWalk(*callables)
+-        for _ in _walk(probe, tokens):
+-            pass
+-        loop_entries.clear()
+-        function_effects.clear()
+-        function_entries.clear()
+-        while True:
+-            previous = {ordinal: dict(fds) for ordinal, fds in loop_entries.items()}
+-            previous_functions = {name: dict(fds) for name, fds in function_effects.items()}
+-            previous_entries = {name: dict(fds) for name, fds in function_entries.items()}
+-            walk = DescriptorWalk(*callables, redirected=probe.found_redirections,
+-                                  writers=probe.found_writers)
+-            for _ in _walk(walk, tokens):
+-                if walk.computed:
+-                    return True
+-            if walk.computed:
+-                return True
+-            if (loop_entries == previous and function_effects == previous_functions
+-                    and function_entries == previous_entries):
+-                break
+-    return False
+-
+-
+-def _mark_variables(text: str, uncertain: set[str]) -> str:
+-    """Replace active scalar references only, not single-quoted/escaped data."""
+-    result = []
+-    single = double = escaped = False
+-    index = 0
+-    while index < len(text):
+-        ch = text[index]
+-        if not single and not escaped and ch == '$':
+-            match = _VARIABLE_REFERENCE.match(text, index)
+-            if match and (match[1] or match[2]) in uncertain:
+-                result.append(_OUTPUT)
+-                index = match.end()
+-                continue
+-        result.append(ch)
+-        if escaped:
+-            escaped = False
+-        elif ch == '\\' and not single:
+-            escaped = True
+-        elif ch == "'" and not double:
+-            single = not single
+-        elif ch == '"' and not single:
+-            double = not double
+-        index += 1
+-    return ''.join(result)
+-
+-
+-def computed_shell_input(command: str, alias_names: frozenset[str], *,
+-                         anchored_only: bool = False,
+-                         deferred: list[tuple[str, str]] | None = None) -> tuple[bool, str | None]:
+-    """Return uncertainty and an additive empty-output scan, only for executed text.
+-
+-    *deferred* collects ``('code', text)`` for literal ``-c`` code given to a
+-    computed program with no stdin feed, and ``(consumer, tail)`` for a script
+-    operand whose leading directory alone is computed. The caller scans each;
+-    without the list both stay uncertain."""
+-    from cron import lifecycle_guard as guard
+-    from cron.lifecycle_guard_lines import strip_shell_comments
+-    from cron.lifecycle_guard_substitutions import normalize_ansi_c_quotes
+-
+-    if not _PATH_EXPORT_DENY.search(command):
+-        # Same text the empty-output reading produces; the body is still walked
+-        # as an executed command by the substitution scan.
+-        command = _PATH_EXPORT.sub('eval ""', command)
+-    outer, _ = separate_substitutions(command, output_placeholder=_OUTPUT)
+-    if _OUTPUT not in outer:
+-        return False, None
+-    # Normalize only this uncertainty view. Keep the original empty-output
+-    # interpretation separate for the existing executable-evidence walk.
+-    binding_view = strip_shell_comments(normalize_ansi_c_quotes(outer))
+-    # Uncertainty is a separate, local may-fact, never a literal value in the
+-    # shared VariableCandidates store. Join assignments conservatively (also
+-    # through functions/branches), and propagate scalar aliases to a fixed point.
+-    uncertain: set[str] = set()
+-    # Every growing round adds a name from a finite set of assignment LHSs;
+-    # exhausting an arbitrary round budget is not evidence of a shell sink.
+-    while True:
+-        marked = _mark_variables(binding_view, uncertain) if uncertain else binding_view
+-        contexts = list(guard._iter_segment_contexts(marked, alias_names))
+-        previous = set(uncertain)
+-        for segment, call_argument, _ in contexts:
+-            if call_argument:
+-                continue
+-            words = segment[guard._peel_reserved_words(segment):]
+-            words = guard._split_redirections(words)[0]
+-            bindings = words[1:] if words and words[0] in _DECLARATIONS else words
+-            for word in bindings:
+-                match = _ASSIGNMENT.fullmatch(word)
+-                if match:
+-                    if _OUTPUT in match[2]:
+-                        uncertain.add(match[1])
+-                elif not word.startswith('-'):
+-                    break
+-        if previous == uncertain:
+-            break
+-    if _contexts_are_computed(marked, alias_names=alias_names, anchored_only=anchored_only,
+-                              deferred=deferred):
+-        return True, None
+-    return False, outer.replace(_OUTPUT, '')
+-
+-
+-def scan_computed_shell_input(command, *, executed, budget, recurse, cwd, source,
+-                              enabled=True, anchored_only=False) -> bool:
+-    """Add uncertainty/empty-output coverage after the ordinary evidence walks.
+-
+-    *enabled* is False only inside the text of a directly invoked Python-shebang
+-    file. *anchored_only* drops placeholder-only basename splices; callers set
+-    it for a raw quote the parent does not feed to a shell."""
+-    if not executed or not enabled:
+-        return False
+-    import os
+-    import shlex
+-
+-    from cron import lifecycle_guard as guard
+-
+-    deferred: list[tuple[str, str]] = []
+-    uncertain, empty_output = computed_shell_input(
+-        command, budget.alias_names or frozenset(), anchored_only=anchored_only, deferred=deferred)
+-    texts = []
+-    for consumer, value in deferred:
+-        if consumer == 'code':
+-            # A computed program may be a shell: its literal code is shell evidence.
+-            texts.append(value)
+-            continue
+-        # A sibling path: the tail must name a file in the walk's directory (a
+-        # script walk's directory is the script's own). Cloud paths are never
+-        # probed; the recursion refuses them.
+-        path = os.path.join(str(cwd or os.getcwd()), value)
+-        if not (guard._on_cloud_path(guard.Path(path)) or os.path.isfile(path)):
+-            uncertain = True
+-            break
+-        texts.append(f'{consumer} {shlex.quote(path)}')
+-    if uncertain:
+-        budget.refusal = 'the shell input depends on unresolved command substitution output'
+-        return True
+-    if any(recurse(text, cwd, executed, source, variable_source=False) for text in texts):
+-        return True
+-    # This guessed interpretation is executable evidence, not a literal binding
+-    # source: HB=$(producer) must not become a shared, invented HB='' fact.
+-    return empty_output is not None and recurse(
+-        empty_output, cwd, executed, source, variable_source=False)
+diff --git a/cron/lifecycle_guard_substitutions.py b/cron/lifecycle_guard_substitutions.py
+index 410c467711a50877da78433826c9e3ca0a88491f..a27c1803cd588b319d597f772df8a394c67422a1 100644
+--- a/cron/lifecycle_guard_substitutions.py
++++ b/cron/lifecycle_guard_substitutions.py
+@@ -350,8 +350,7 @@ def _paren_end(text: str, start: int, nesting: int = 0) -> int:
+ 
+ 
+ def separate_substitutions(text: str, *, _nesting: int = 0,
+-                           empty_unquoted: bool = False,
+-                           output_placeholder: str = SUBSTITUTION) -> tuple[str, list[str]]:
++                           empty_unquoted: bool = False) -> tuple[str, list[str]]:
+     """Return the outer text and executed bodies, before redirection/line splitting.
+ 
+     Single quotes and comments are inert. Double quotes still execute expansions.
+@@ -395,7 +394,7 @@ def separate_substitutions(text: str, *, _nesting: int = 0,
+             else:
+                 bodies.append(body)
+             out.append(_EMPTY_SUBSTITUTION if empty_unquoted and not quote and not arithmetic
+-                       else SUBSTITUTION if arithmetic else output_placeholder)
++                       else SUBSTITUTION)
+             index = end
+             continue
+         if quote:
+diff --git a/cron/lifecycle_guard_variables.py b/cron/lifecycle_guard_variables.py
+index 677e0528d637351a52c3fe223457a82f9fcaa91a..77aa22640d02adbdca6a542ca51c3851007f4900 100644
+--- a/cron/lifecycle_guard_variables.py
++++ b/cron/lifecycle_guard_variables.py
+@@ -26,19 +26,13 @@ def scan_variable_payloads(command, *, cwd, executed, budget, recurse, source, v
+ 
+ def scan_recursive_payloads(command, nested_texts, *, cwd, executed, budget,
+                             covered_scope, recurse, source):
+-    from cron.lifecycle_guard_output import iter_recursive_payloads, quote_aware_shell_sink
++    from cron.lifecycle_guard_output import iter_recursive_payloads
+ 
+-    # A raw quote or a decoded printer line is speculative when this text does
+-    # not feed output to a shell outside single quotes. Only that visit drops
+-    # placeholder-only basename splices. Nested shell programs, variable
+-    # expansions, and arithmetic words keep the full splice check.
+-    certified = quote_aware_shell_sink(command)
+-    for payload, nested, covered, variable_source, printed_line in iter_recursive_payloads(
++    for payload, nested, covered, variable_source in iter_recursive_payloads(
+             command, nested_texts, cwd=cwd, executed=executed,
+             budget=budget, covered_scope=covered_scope):
+-        speculative_quote = (covered is not None or printed_line) and not certified
+         if recurse(payload, cwd, executed, source, nested=nested, covered_quotes=covered,
+-                   variable_source=variable_source, anchored_splice_only=speculative_quote):
++                   variable_source=variable_source):
+             return True
+     return False
+ 
+diff --git a/tests/cron/test_lifecycle_guard_computed_program.py b/tests/cron/test_lifecycle_guard_computed_program.py
+deleted file mode 100644
+index 4d999601a1e3f30f7e309e9c9b3279f6ad822f2d..0000000000000000000000000000000000000000
+--- a/tests/cron/test_lifecycle_guard_computed_program.py
++++ /dev/null
+@@ -1,177 +0,0 @@
+-"""A computed program or directory prefix is scanned, not refused outright.
+-
+-Refusing every ``$PY -c '...'`` and every ``. "$HERE/lib.sh"`` blocked the fleet's
+-own tools (``hermes-core-python``, ``scripts/run_tests.sh``, ``source ./activate``).
+-The literal part is still shell evidence: it is scanned, and anything the parent
+-could still change keeps the refusal.
+-"""
+-from __future__ import annotations
+-
+-import subprocess
+-
+-import pytest
+-
+-from cron.lifecycle_guard import scan_gateway_lifecycle
+-from tests.cron import test_lifecycle_guard_fd_redirections as fixtures
+-
+-REASON = 'substitution output'
+-
+-# Real bash runs the fake `hermes gateway restart`; the scan must refuse.
+-RUN = [
+-    "X=$(echo bash); $X -c './r.sh'",
+-    "X=$(echo bash); $X -c 'source ./r.sh'",
+-    "X=$(echo bash); $X -c 'hermes gateway restart'",
+-    "$(echo bash) -c 'hermes gateway restart'",
+-    "X=$(echo bash); nohup $X -c 'hermes gateway restart' >/dev/null 2>&1",
+-    'X=$(echo bash); S=./r.sh; $X -c "source $S"',
+-    "X=$(echo bash); export S=./r.sh; $X -c 'source $S'",
+-    "X=$(echo bash); $X -c 'bash' < ./r.sh",
+-    "X=$(echo bash); cat ./r.sh | $X -c 'bash'",
+-    "X=$(echo bash); exec 3< ./r.sh; $X -c 'bash <&3'",
+-    "X=$(echo bash); $X -c 'bash <&3' 3< ./r.sh",
+-    "X=$(echo bash); { $X -c 'bash'; } < ./r.sh",
+-    'X=$(echo bash); $X -c "$(cat ./r.sh)"',
+-    '. "$(pwd)/r.sh"',
+-    'H=$(pwd); . "$H/r.sh"',
+-    'source "$(echo .)/r.sh"',
+-    'bash "$(pwd)/r.sh"',
+-    'sh -e "$(pwd)/r.sh"',
+-    '. "$(pwd)/sub/../r.sh"',
+-    '. "$(pwd)/$(echo r.sh)"',
+-    '. "$(pwd)/sub/calls.sh"',
+-    '/bin/$(echo bash) < ./r.sh',
+-    'cat ./r.sh | /bin/$(echo bash)',
+-    '/bin/$(echo bash) ./r.sh',
+-]
+-
+-# Real bash exits 0 without touching the marker; the scan must allow.
+-CLEAN = [
+-    "PY=$(command -v python3); $PY -c 'print(1)'",
+-    "PY=$(command -v python3); \"$PY\" -I -c 'import os\nprint(os.sep)' 2>&1 | tail -1",
+-    "PY=$(command -v python3) && timeout 20 $PY -c 'print(1)' > out.log 2>&1; echo rc=$?",
+-    'H=$(pwd); . "$H/lib.sh"',
+-    'H="$(cd "$(dirname "$BASH_SOURCE")" && pwd)"; source "$H/sub/lib2.sh"',
+-    'bash "$(pwd)/lib.sh"',
+-    'account="/Users/$(id -un)"; echo "$account"',
+-    # An unrelated eval sink certifies every quote as a possible payload.
+-    'run() { eval "$1"; }; account="/Users/$(id -un)"; echo "$account"',
+-]
+-
+-
+-@pytest.fixture(autouse=True)
+-def _private_home_and_complete_walk(tmp_path, monkeypatch, caplog):
+-    """Resolve `~` and PATH inside the test tree, and reject a verdict that
+-    comes from the walker's failure fallback instead of from the scan."""
+-    monkeypatch.setenv('HOME', str(tmp_path))
+-    monkeypatch.setenv('PATH', f"{tmp_path / 'bin'}:/usr/bin:/bin")
+-    yield
+-    assert 'walk failed' not in caplog.text
+-
+-
+-def _siblings(tmp_path):
+-    fixtures._tree(tmp_path)
+-    (tmp_path / 'r.sh').chmod(0o755)
+-    (tmp_path / 'lib.sh').write_text('FOO=1\n')
+-    home_bin = tmp_path / '.hermes' / 'bin'
+-    home_bin.mkdir(parents=True)
+-    (home_bin / 'hermes-core-wt').write_text('#!/bin/sh\necho "export CORE_WT=1"\n')
+-    (home_bin / 'hermes-core-wt').chmod(0o755)
+-    (tmp_path / 'sub').mkdir()
+-    (tmp_path / 'sub' / 'lib2.sh').write_text('BAR=2\n')
+-    (tmp_path / 'sub' / 'calls.sh').write_text(f'bash {tmp_path}/r.sh\n')
+-    # Stand-ins for the fleet tool: the honest one prints an export line.
+-    for directory, body in (('bin', 'echo "export CORE_WT=1"'), ('evil', f'cat {tmp_path}/r.sh')):
+-        (tmp_path / directory).mkdir(exist_ok=True)
+-        tool = tmp_path / directory / 'hermes-core-wt'
+-        tool.write_text(f'#!/bin/sh\n{body}\n')
+-        tool.chmod(0o755)
+-
+-
+-@pytest.mark.parametrize('command', [
+-    'eval "$(hermes-core-wt env)"',
+-    'cd . && eval "$(hermes-core-wt env)" >/dev/null 2>&1; echo ok | tail -1',
+-    'export A="b c" D=e; eval "$(hermes-core-wt env)"; echo ok && echo ok',
+-])
+-def test_core_worktree_path_export_is_allowed(tmp_path, command):
+-    _siblings(tmp_path)
+-    assert not fixtures._bash_runs(tmp_path, command)
+-    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
+-    home = command.replace('hermes-core-wt env', '~/.hermes/bin/hermes-core-wt env')
+-    assert scan_gateway_lifecycle(home, cwd=str(tmp_path)) == (False, None)
+-
+-
+-@pytest.mark.parametrize('command', [
+-    'hermes-core-wt() { cat ./r.sh; }; eval "$(hermes-core-wt env)"',
+-    'function hermes-core-wt { cat ./r.sh; }; eval "$(hermes-core-wt env)"',
+-    'PATH="$PWD/evil:$PATH"; eval "$(hermes-core-wt env)"',
+-    'export PATH="$PWD/evil:$PATH"; eval "$(hermes-core-wt env)"',
+-    'eval "$(hermes-core-wt env; cat ./r.sh)"',
+-    'eval "$(evil/hermes-core-wt env)"',
+-    'eval "$(./evil/hermes-core-wt env)"',
+-    'eval "$(cat ./r.sh)"',
+-])
+-def test_path_export_trust_does_not_cover_other_eval_input(tmp_path, command):
+-    _siblings(tmp_path)
+-    assert fixtures._bash_runs(tmp_path, command), 'bash must run the restart, or the row proves nothing'
+-    assert scan_gateway_lifecycle(command, cwd=str(tmp_path))[0]
+-
+-
+-@pytest.mark.parametrize('command', [
+-    'eval "$(hermes-core-wt env --json)"',
+-    'eval "$(hermes-core-wt env)" "$(cat ./r.sh)"',
+-    'eval "$(hermes-core-wt env)" > /dev/null "$(cat ./r.sh)"',
+-    'eval $(hermes-core-wt env)',
+-    'eval "$(hermes-core-wt  env)"',
+-    'HOME=/tmp/x; eval "$(~/.hermes/bin/hermes-core-wt env)"',
+-    'eval "$(/tmp/.hermes/bin/hermes-core-wt env)"',
+-    'noteval "$(hermes-core-wt env)"; bash -c "$(hermes-core-wt env)"',
+-])
+-def test_path_export_trust_is_exact(tmp_path, command):
+-    _siblings(tmp_path)
+-    unsafe, reason = scan_gateway_lifecycle(command, cwd=str(tmp_path))
+-    assert unsafe and reason and REASON in reason, (unsafe, reason)
+-
+-
+-@pytest.mark.parametrize('command', RUN)
+-def test_real_shell_runs_and_scan_refuses(tmp_path, command):
+-    _siblings(tmp_path)
+-    assert fixtures._bash_runs(tmp_path, command), 'bash must run the restart, or the row proves nothing'
+-    assert scan_gateway_lifecycle(command, cwd=str(tmp_path))[0]
+-
+-
+-@pytest.mark.parametrize('command', CLEAN)
+-def test_clean_computed_program_and_sibling_are_allowed(tmp_path, command):
+-    _siblings(tmp_path)
+-    marker = tmp_path / 'marker'
+-    result = subprocess.run(
+-        ['/bin/bash'], input=command + '\n', text=True, encoding='utf-8',
+-        capture_output=True, timeout=20, check=False, cwd=tmp_path,
+-        env={'PATH': f"{tmp_path / 'bin'}:/usr/bin:/bin", 'MARKER': str(marker),
+-             'HOME': str(tmp_path)})
+-    assert result.returncode == 0, result.stderr
+-    assert not marker.exists()
+-    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
+-
+-
+-@pytest.mark.parametrize('command', [
+-    '. "$(pwd)/missing.sh"',
+-    '. "$(pwd)/sub/../lib.sh"',
+-    'bash "$(pwd)/missing.sh"',
+-    '. "$(pwd)/"',
+-    '. "$(pwd)/$X"',
+-    '. "$(pwd)/*.sh"',
+-    'bash $(echo -c) "$(pwd)/lib.sh"',
+-    "X=$(echo bash); $X $(echo -c) 'true' < ./lib.sh",
+-    "X=$(echo bash); $X -s < ./lib.sh",
+-])
+-def test_unresolved_sibling_or_option_stays_uncertain(tmp_path, command):
+-    _siblings(tmp_path)
+-    unsafe, reason = scan_gateway_lifecycle(command, cwd=str(tmp_path))
+-    assert unsafe and reason and REASON in reason
+-
+-
+-def test_known_limit_a_directory_prefix_is_not_followed(tmp_path):
+-    """Only the walk's own directory is searched for the literal tail. A prefix
+-    that evaluates elsewhere is not followed, as before this check existed."""
+-    _siblings(tmp_path)
+-    assert scan_gateway_lifecycle('. "$(echo /nonexistent)/lib.sh"', cwd=str(tmp_path)) == (False, None)
+diff --git a/tests/cron/test_lifecycle_guard_core_worktree_compat.py b/tests/cron/test_lifecycle_guard_core_worktree_compat.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6eff0359fe5301d94da27a121a488ee462b9473d
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_core_worktree_compat.py
+@@ -0,0 +1,33 @@
++"""Compatibility witnesses from the core-worktree delivery helper."""
++from cron.lifecycle_guard import scan_gateway_lifecycle
++
++
++def test_core_worktree_ssh_quote_fragments_are_not_programs(tmp_path):
++    script = tmp_path / "helper.sh"
++    script.write_text('''#!/bin/bash
++hub_sh() {
++  local s="$1"; shift
++  ssh some-host "bash -c $(printf '%q' "$s") probe $(printf '%q ' "$@")"
++}
++s='printf ok'
++hub_sh "$s"
++''')
++    assert scan_gateway_lifecycle(f"bash {script}") == (False, None)
++    script.write_text(script.read_text() + "\nhermes gateway restart\n")
++    assert scan_gateway_lifecycle(f"bash {script}") == (True, None)
++
++
++def test_core_worktree_python_watchdog_is_not_unknown_shell(tmp_path):
++    script = tmp_path / "helper.sh"
++    script.write_text('''#!/bin/bash
++PY3="$(command -v /usr/bin/python3 || command -v python3)"
++read -r -d '' TRANSFER_BOUND_PY <<'PY' || true
++import sys
++sys.exit(0)
++PY
++transfer_bounded() {
++  "$PY3" -c "$TRANSFER_BOUND_PY" "$@"
++}
++transfer_bounded 120
++''')
++    assert scan_gateway_lifecycle(f"bash {script}") == (False, None)
+diff --git a/tests/cron/test_lifecycle_guard_direct_python.py b/tests/cron/test_lifecycle_guard_direct_python.py
+deleted file mode 100644
+index 6efcc0e2313cf87b9f104367f5e59e03d44f57e7..0000000000000000000000000000000000000000
+--- a/tests/cron/test_lifecycle_guard_direct_python.py
++++ /dev/null
+@@ -1,124 +0,0 @@
+-"""Direct Python-shebang files keep the shell walk minus the computed-input check.
+-
+-All operational payloads are scanned as text only, never dispatched.
+-"""
+-import shlex
+-
+-import pytest
+-
+-from cron.lifecycle_guard import scan_gateway_lifecycle
+-
+-
+-DOC = '''"""The caller's documentation.
+-This is NOT "unreachable"; this is the route that works with the caller's
+-credentials.
+-Targets come from `helper`; `$VAR`, quotes and heredocs travel as written.
+-The caller's arguments remain data.
+-"""
+-print(1)
+-note = 'bash -c "`helper`"'
+-'''
+-LIFECYCLE = ' '.join(['hermes', 'gateway', 'restart'])
+-
+-
+-@pytest.mark.parametrize('shebang', ['#!/usr/bin/python3', '#!/usr/bin/env python3',
+-                                     '#!/usr/bin/env -S python3 -u'])
+-@pytest.mark.parametrize('prefix', ['', 'env ', 'timeout 10 ', 'command ', 'nohup '])
+-def test_direct_python_docstring_is_not_shell(tmp_path, shebang, prefix):
+-    path = tmp_path / 'wrapper'
+-    path.write_text(shebang + '\n' + DOC)
+-    assert scan_gateway_lifecycle(prefix + shlex.quote(str(path))) == (False, None)
+-
+-
+-@pytest.mark.parametrize('invocation', ['bash {p}', 'source {p}', '. {p}',
+-                                       'bash < {p}', 'cat {p} | bash', 'bash -l {p}'])
+-@pytest.mark.parametrize('direct_first', [False, True])
+-@pytest.mark.parametrize('remote', [False, True])
+-def test_shebang_does_not_hide_forced_shell_visit(tmp_path, invocation, direct_first, remote):
+-    # Python sees a string. Bash expands its backticks; the guard must walk inner.sh.
+-    inner = tmp_path / 'inner.sh'
+-    inner.write_text(LIFECYCLE + '\n')
+-    path = tmp_path / 'wrapper'
+-    text = '#!/usr/bin/env python3\n"""`bash ' + str(inner) + '`"""\n'
+-    if not remote:
+-        path.write_text(text)
+-    quoted = shlex.quote(str(path))
+-    command = invocation.format(p=quoted)
+-    if direct_first:
+-        # Force the direct visit before the outer command's forced-shell candidate walk.
+-        first = tmp_path / 'first.sh'
+-        first.write_text(quoted + '\n')
+-        command = 'bash ' + shlex.quote(str(first)) + '; ' + command
+-    reader = lambda candidate: text if candidate == str(path) else None
+-    assert scan_gateway_lifecycle(command, read_remote_script=reader)[0] is True
+-
+-
+-@pytest.mark.parametrize('remote', [False, True])
+-def test_direct_python_preserves_lifecycle_scan(tmp_path, remote):
+-    path = tmp_path / 'wrapper'
+-    text = '#!/usr/bin/env python3\nimport os\nos.system(' + repr(LIFECYCLE) + ')\n'
+-    if not remote:
+-        path.write_text(text)
+-    reader = lambda candidate: text if candidate == str(path) else None
+-    assert scan_gateway_lifecycle(str(path), read_remote_script=reader)[0] is True
+-
+-
+-@pytest.mark.parametrize('shebang', ['', '#!' + '/bin/bash', '#!/usr/bin/env unknown',
+-                                     '#!/usr/bin/env -S python3 -c pass',
+-                                     ' #!/usr/bin/python3'])
+-def test_unproven_shebang_keeps_shell_walk(tmp_path, shebang):
+-    path = tmp_path / 'wrapper'
+-    path.write_text(shebang + '\n' + DOC)
+-    assert scan_gateway_lifecycle(str(path))[0] is True
+-
+-
+-def test_remote_direct_wrapper_and_forbidden_argument(tmp_path):
+-    path = tmp_path / 'remote-wrapper'
+-    reader = lambda candidate: '#!/usr/bin/env python3\n' + DOC if candidate == str(path) else None
+-    safe = str(path) + " worker -- 'hermes kanban dispatch --dry-run --json'"
+-    assert scan_gateway_lifecycle(safe, read_remote_script=reader) == (False, None)
+-    assert scan_gateway_lifecycle(str(path) + ' worker -- ' + shlex.quote(LIFECYCLE),
+-                                  read_remote_script=reader)[0] is True
+-
+-
+-@pytest.mark.parametrize('line', [
+-    '#!/usr/bin/python3.12', '#!/usr/local/bin/python', '#!/usr/bin/pypy3',
+-    '#!/usr/bin/python3 -u', '#!/usr/bin/env python3',
+-    '#!/usr/bin/env -S python3 -u -B -E -I -s -S',
+-])
+-def test_python_shebang_allowlist(line):
+-    from cron.lifecycle_guard_shebang import is_python_shebang
+-
+-    assert is_python_shebang(line + '\n' + DOC)
+-
+-
+-@pytest.mark.parametrize('line', [
+-    '', '#!', '#!   ', '#!/bin/sh', ' #!/usr/bin/python3',
+-    '#!/usr/bin/env', '#!/usr/bin/env -S', '#!/usr/bin/env -i python3',
+-    '#!/usr/bin/env python3 -u', '#!/usr/bin/env -S python3 -m os',
+-    '#!/usr/bin/env -S python3 -c pass', '#!/usr/bin/env -S python3 script.py',
+-    '#!/usr/bin/env -S python3 --unknown', '#!/usr/bin/env FOO=1 python3',
+-    '#!/usr/bin/env -S "python3"', '#!/usr/bin/env -S $PYTHON',
+-    '#!/usr/bin/python3-not', '#!/usr/bin/python3.exe',
+-])
+-def test_unknown_shebang_is_not_certified(line):
+-    from cron.lifecycle_guard_shebang import is_python_shebang
+-
+-    assert not is_python_shebang(line + '\n' + DOC)
+-
+-
+-def test_direct_python_retains_data_sink_masking(tmp_path):
+-    path = tmp_path / 'looks-like-shell.sh'
+-    path.write_text('#!/usr/bin/env python3\n' +
+-                    f'"""Usage notes:\n    grep -c \'{LIFECYCLE}\' gateway.log\n"""\n')
+-    assert scan_gateway_lifecycle(str(path)) == (False, None)
+-
+-
+-def test_direct_unknown_contents_still_fail_closed(monkeypatch, tmp_path):
+-    from cron import lifecycle_guard
+-
+-    monkeypatch.setattr(lifecycle_guard, '_MAX_REFERENCED_SCRIPT_BYTES', 100)
+-    path = tmp_path / 'big-wrapper'
+-    path.write_text('#!/usr/bin/env python3\n' + '# data\n' * 100)
+-    unsafe, refusal = scan_gateway_lifecycle(str(path))
+-    assert unsafe and refusal and str(path) in refusal
+diff --git a/tests/cron/test_lifecycle_guard_direct_python_computed.py b/tests/cron/test_lifecycle_guard_direct_python_computed.py
+deleted file mode 100644
+index 6f83f060ecc5e0cdf8ea25efd710d029d1c5df0e..0000000000000000000000000000000000000000
+--- a/tests/cron/test_lifecycle_guard_direct_python_computed.py
++++ /dev/null
+@@ -1,69 +0,0 @@
+-"""A directly invoked Python-shebang file keeps its shell walk; only the computed-input
+-uncertainty check is withheld from its own text (so the verdict equals the pre-check one)."""
+-import shlex
+-
+-import pytest
+-
+-from cron.lifecycle_guard import scan_gateway_lifecycle
+-from cron.lifecycle_guard_shebang import is_python_shebang
+-
+-UNCERTAIN = 'the shell input depends on unresolved command substitution output'
+-PYTHON_HEADERS = ['#!/usr/bin/env python3', '#!/usr/bin/python3', '#!/usr/bin/env -S python3 -u']
+-# The guard reads file text only. These lines stand for Python source (prose, backticks)
+-# that the shell walk reads as a shell consumer fed by substitution output.
+-DOC = 'import sys\nbash $(echo ./r.sh)\n'
+-
+-
+-def _script(tmp_path, name, text):
+-    path = tmp_path / name
+-    path.write_text(text, encoding='utf-8')
+-    path.chmod(0o700)
+-    return shlex.quote(str(path))
+-
+-
+-@pytest.mark.parametrize('header', PYTHON_HEADERS)
+-@pytest.mark.parametrize('wrapper', ['', 'command ', 'env ', 'timeout 3 ', 'nohup '])
+-def test_direct_python_shebang_documentation_is_not_newly_refused(tmp_path, header, wrapper):
+-    program = _script(tmp_path, 'tool', header + '\n' + DOC)
+-    assert scan_gateway_lifecycle(wrapper + program + " w -- 'x --dry-run'") == (False, None)
+-
+-
+-def test_compound_direct_invocations_stay_allowed(tmp_path):
+-    program = _script(tmp_path, 'tool', PYTHON_HEADERS[0] + '\n' + DOC)
+-    command = f"printf x | python3 -c 'import sys'; {program} a -- 'x'; {program} b -- 'x'"
+-    assert scan_gateway_lifecycle(command) == (False, None)
+-
+-
+-@pytest.mark.parametrize('header', PYTHON_HEADERS)
+-def test_direct_python_shebang_is_never_promoted_past_the_shell_walk(tmp_path, header):
+-    # The interpreter word is not proof (PATH shadow): literal lifecycle text still refuses.
+-    program = _script(tmp_path, 'tool', header + '\nimport sys\nhermes gateway restart\n')
+-    assert scan_gateway_lifecycle(program) == (True, None)
+-
+-
+-@pytest.mark.parametrize('form', ['bash {p}', 'sh {p}', 'source {p}', '. {p}', 'bash < {p}',
+-                                  'cat {p} | bash', '{p}; bash {p}', 'bash {p}; {p}'])
+-def test_forced_shell_visits_of_the_same_file_keep_the_check(tmp_path, form):
+-    program = _script(tmp_path, 'tool', PYTHON_HEADERS[0] + '\n' + DOC)
+-    assert scan_gateway_lifecycle(form.format(p=program)) == (True, UNCERTAIN)
+-
+-
+-@pytest.mark.parametrize('header', ['#!/usr/bin/env bash', '#!/bin/sh', '', '#!/usr/bin/env python3 -c',
+-                                    '#!/usr/bin/env FOO=1 python3', '#!/usr/bin/env -S bash python3'])
+-def test_other_direct_files_keep_the_check(tmp_path, header):
+-    text = (header + '\n' if header else '') + 'bash $(echo ./r.sh)\n'
+-    program = _script(tmp_path, 'tool', text)
+-    assert not is_python_shebang(text)
+-    assert scan_gateway_lifecycle(program) == (True, UNCERTAIN)
+-
+-
+-def test_script_referenced_from_a_direct_python_file_is_not_covered(tmp_path):
+-    nested = _script(tmp_path, 'nested.sh', 'bash $(echo ./r.sh)\n')
+-    program = _script(tmp_path, 'tool', PYTHON_HEADERS[0] + f'\nimport sys\nbash {nested}\n')
+-    assert scan_gateway_lifecycle(program) == (True, UNCERTAIN)
+-
+-
+-def test_command_line_computed_input_next_to_a_direct_python_file_still_refuses(tmp_path):
+-    program = _script(tmp_path, 'tool', PYTHON_HEADERS[0] + '\n' + DOC)
+-    assert scan_gateway_lifecycle(f'{program}; bash $(echo ./r.sh)') == (True, UNCERTAIN)
+-    assert scan_gateway_lifecycle(f'bash $(echo {program})') == (True, UNCERTAIN)
+diff --git a/tests/cron/test_lifecycle_guard_function_variables.py b/tests/cron/test_lifecycle_guard_function_variables.py
+index 81ac49df95b7414edacfc4606eea22bb412e90f0..d520dc14584a1f25c0b6aff5775a4715186afe6d 100644
+--- a/tests/cron/test_lifecycle_guard_function_variables.py
++++ b/tests/cron/test_lifecycle_guard_function_variables.py
+@@ -80,11 +80,11 @@ def test_printed_variable_is_not_original_shell_syntax():
+         'echo "$log" | bash', [], cwd=None, executed=True,
+         budget=_LifecycleScanBudget(), covered_scope=None))
+     assert payloads
+-    assert all(not item[3] for item in payloads)
++    assert all(not item[-1] for item in payloads)
+     shell = list(iter_recursive_payloads(
+         "bash -c 'f() { $P; }; f'", [], cwd=None, executed=True,
+         budget=_LifecycleScanBudget(), covered_scope=None))
+-    assert any(item[0] == 'f() { $P; }; f' and item[3] for item in shell)
++    assert any(item[0] == 'f() { $P; }; f' and item[-1] for item in shell)
+ 
+ 
+ def test_variable_discovery_skips_plain_text_without_tokenizing(monkeypatch):
+diff --git a/tests/cron/test_lifecycle_guard_interpreter_identity.py b/tests/cron/test_lifecycle_guard_interpreter_identity.py
+deleted file mode 100644
+index 231f1aa456b6b823b4da0a72a57a75636e10d243..0000000000000000000000000000000000000000
+--- a/tests/cron/test_lifecycle_guard_interpreter_identity.py
++++ /dev/null
+@@ -1,129 +0,0 @@
+-"""A Python-looking shebang is not proof of the executed interpreter.
+-
+-Direct-wrapper compatibility remains open: these tests require conservative
+-shell scanning, not a path/name exemption. Only private fake Hermes runs.
+-"""
+-import ast
+-import random
+-import shlex
+-import shutil
+-import subprocess
+-import sys
+-
+-import pytest
+-
+-from cron.lifecycle_guard import scan_gateway_lifecycle
+-from tools.environments.local import build_subprocess_env
+-
+-
+-@pytest.fixture
+-def shell_fixture(tmp_path):
+-    bash = shutil.which('bash')
+-    assert bash
+-    bin_dir = tmp_path / 'bin'
+-    bin_dir.mkdir()
+-    (bin_dir / 'bash').symlink_to(bash)
+-    (bin_dir / 'python3').symlink_to(bash)
+-    marker = tmp_path / 'marker'
+-    fake = bin_dir / 'hermes'
+-    fake.write_text('#!' + bash + '\nprintf "%s\\n" "$*" >> "$MARKER"\n', encoding='utf-8')
+-    fake.chmod(0o700)
+-    inner = tmp_path / 'inner.sh'
+-    inner.write_text('hermes gateway restart\n', encoding='utf-8')
+-    env = build_subprocess_env(
+-        base={}, inherit_profile_home=False, scrub_secrets=False,
+-        extra={'PATH': str(bin_dir), 'HOME': str(tmp_path),
+-               'HERMES_HOME': str(tmp_path / 'home'), 'TMPDIR': str(tmp_path),
+-               'LANG': 'C.UTF-8', 'MARKER': str(marker)},
+-    )
+-    return bash, bin_dir, marker, inner, env
+-
+-
+-def run_marker(command, tmp_path, fixture, expected):
+-    bash, _, marker, _, env = fixture
+-    marker.unlink(missing_ok=True)
+-    result = subprocess.run(
+-        [bash, '--noprofile', '--norc', '-c', command], cwd=tmp_path,
+-        env=env, capture_output=True, text=True, encoding='utf-8', timeout=3,
+-        check=False,
+-    )
+-    # Bash can fail AFTER expansion; the marker, not exit status, is the oracle.
+-    assert marker.exists() is expected, (command, result.stderr)
+-    if expected:
+-        assert marker.read_text(encoding='utf-8') == 'gateway restart\n'
+-    else:
+-        assert result.returncode == 0, result.stderr
+-
+-
+-@pytest.mark.platforms('linux')
+-@pytest.mark.parametrize('header_kind', ['absolute-symlink', 'env-path', 'env-split-path'])
+-def test_interpreter_shadow_requires_shell_scan(tmp_path, shell_fixture, header_kind):
+-    _, bin_dir, _, inner, _ = shell_fixture
+-    headers = {
+-        'absolute-symlink': '#!' + str(bin_dir / 'python3'),
+-        'env-path': '#!/usr/bin/env python3',
+-        'env-split-path': '#!/usr/bin/env -S python3 -u',
+-    }
+-    script = tmp_path / 'wrapper'
+-    text = headers[header_kind] + '\n"""`bash ' + str(inner) + '`"""\n'
+-    ast.parse(text)  # Even valid Python can execute substitutions under Bash.
+-    script.write_text(text, encoding='utf-8')
+-    script.chmod(0o700)
+-    direct = shlex.quote(str(script))
+-    # Pin the real Python executable; PATH's python3 is deliberately Bash.
+-    explicit = shlex.quote(sys.executable) + ' ' + direct
+-    run_marker(explicit, tmp_path, shell_fixture, False)
+-    assert scan_gateway_lifecycle(explicit) == (False, None)
+-    run_marker(direct, tmp_path, shell_fixture, True)
+-    assert scan_gateway_lifecycle(direct)[0] is True
+-
+-
+-@pytest.mark.parametrize('invocation', ['bash {p}', 'source {p}', '. {p}',
+-                                       'bash < {p}', 'cat {p} | bash', 'bash -l {p}'])
+-@pytest.mark.parametrize('direct_first', [False, True])
+-@pytest.mark.parametrize('remote', [False, True])
+-def test_forced_shell_visit_is_not_hidden(tmp_path, invocation, direct_first, remote):
+-    inner = tmp_path / 'inner.sh'
+-    inner.write_text('hermes gateway restart\n', encoding='utf-8')
+-    script = tmp_path / 'wrapper'
+-    text = '#!/usr/bin/env python3\n"""`bash ' + str(inner) + '`"""\n'
+-    if not remote:
+-        script.write_text(text, encoding='utf-8')
+-    p = shlex.quote(str(script))
+-    command = invocation.format(p=p)
+-    if direct_first:
+-        first = tmp_path / 'first.sh'
+-        first.write_text(p + '\n', encoding='utf-8')
+-        command = 'bash ' + shlex.quote(str(first)) + '; ' + command
+-    reader = lambda candidate: text if candidate == str(script) else None
+-    assert scan_gateway_lifecycle(command, read_remote_script=reader)[0] is True
+-
+-
+-@pytest.mark.parametrize('invocation', ['bash --rcfile {p} -i -c :',
+-                                       'bash --init-file {p} -i -c :', 'su -l nobody < {p}'])
+-def test_startup_and_nested_stdin_ignore_python_header(tmp_path, invocation):
+-    inner = tmp_path / 'inner.sh'
+-    inner.write_text('hermes gateway restart\n', encoding='utf-8')
+-    script = tmp_path / 'startup'
+-    script.write_text('#!/usr/bin/env python3\n"""`bash ' + str(inner) + '`"""\n',
+-                      encoding='utf-8')
+-    # Scan only: never launch an interactive shell, su, or a remote command.
+-    assert scan_gateway_lifecycle(invocation.format(p=shlex.quote(str(script))))[0]
+-
+-
+-@pytest.mark.platforms('linux')
+-def test_seeded_explicit_python_and_forced_shell_controls(tmp_path, shell_fixture):
+-    _, _, _, inner, _ = shell_fixture
+-    cases = []
+-    for index, header in enumerate(['', '#!/usr/bin/env python3',
+-                                    '#!/usr/bin/env -S python3 -u']):
+-        script = tmp_path / ('program-' + str(index))
+-        script.write_text(header + '\n"""`bash ' + str(inner) + '`"""\n', encoding='utf-8')
+-        p = shlex.quote(str(script))
+-        cases.append((shlex.quote(sys.executable) + ' -B ' + p, False))
+-        for command in [f'bash {p}', f'source {p}', f'bash < {p}']:
+-            cases.append((command, True))
+-    random.Random(2350).shuffle(cases)
+-    for command, expected in cases:
+-        run_marker(command, tmp_path, shell_fixture, expected)
+-        assert scan_gateway_lifecycle(command)[0] is expected, command
+diff --git a/tests/cron/test_lifecycle_guard_loop_cache_contract.py b/tests/cron/test_lifecycle_guard_loop_cache_contract.py
+deleted file mode 100644
+index 1979a5237ba5d25a7cbcc6eecc75dbb00b358175..0000000000000000000000000000000000000000
+--- a/tests/cron/test_lifecycle_guard_loop_cache_contract.py
++++ /dev/null
+@@ -1,50 +0,0 @@
+-"""White-box historical loop-cache contract, not a shell reachability witness."""
+-import inspect
+-
+-import pytest
+-
+-from cron import lifecycle_guard_groups as groups
+-from cron import lifecycle_guard_substitution_output as output
+-
+-
+-@pytest.mark.parametrize('prior', ['first.sh', output._OUTPUT + ':first'])
+-@pytest.mark.parametrize('next_binding', [None, 'second.sh'])
+-def test_loop_cache_retains_historical_descriptor(monkeypatch, prior, next_binding):
+-    """A later helper transition must not erase an accumulated may-fact.
+-
+-    Capture a real walker/cache, then inject the next close transition. This tests
+-    the helper contract, not reachability across sweeps of one unchanged script.
+-    """
+-    captured = []
+-    original_walk = groups._walk
+-
+-    def capture(walk, tokens):
+-        if hasattr(walk, 'restore_groups'):
+-            captured.append(walk)
+-        yield from original_walk(walk, tokens)
+-
+-    monkeypatch.setattr(groups, '_walk', capture)
+-    assert output._contexts_are_computed(
+-        'while :; do exec 3<"' + prior + '"; done') is False
+-    template = captured[-1]
+-    cache = inspect.getclosurevars(type(template).restore_groups).nonlocals['loop_entries']
+-    assert cache == {0: {'3': prior}}
+-
+-    walk = type(template)(template.cat_operands, template.cat_relays_stdin,
+-                          template.opens_call_arguments, template.peel_reserved_words,
+-                          template.stdin_redirections)
+-    group = walk.open_group('done')
+-    assert group.ordinal == 0
+-    assert walk.bindings == {'3': prior}
+-    redirect = '3<&-' if next_binding is None else '3<' + next_binding
+-    assert output._input_words(['exec', redirect], walk.bindings)[0] == ['exec']
+-    assert walk.bindings == ({} if next_binding is None else {'3': next_binding})
+-    assert walk.groups.pop() is group
+-    walk.restore_groups()
+-
+-    assert cache == {0: {'3': prior}}, 'historical loop may-fact was erased'
+-    next_walk = type(template)(template.cat_operands, template.cat_relays_stdin,
+-                               template.opens_call_arguments, template.peel_reserved_words,
+-                               template.stdin_redirections)
+-    next_walk.open_group('done')
+-    assert next_walk.bindings == {'3': prior}
+diff --git a/tests/cron/test_lifecycle_guard_quoted_provenance.py b/tests/cron/test_lifecycle_guard_quoted_provenance.py
+deleted file mode 100644
+index 5e1f0594889cbd5745adc27f1da0ee04b05475fd..0000000000000000000000000000000000000000
+--- a/tests/cron/test_lifecycle_guard_quoted_provenance.py
++++ /dev/null
+@@ -1,235 +0,0 @@
+-"""A raw quote is not shell input merely because a backtick tripped the sink regex.
+-
+-Placeholder-only basename splices (`s/<out>/<out>/` → pattern ``.*``) stay evidence
+-on a real command word and on any quote the parent feeds to a shell. They are not
+-evidence inside a raw quote whose parent has no quote-aware sink. Anchored splices
+-and modeled consumers in that quote still refuse.
+-"""
+-
+-import subprocess
+-
+-import pytest
+-
+-from cron.lifecycle_guard import scan_gateway_lifecycle
+-from cron.lifecycle_guard_output import (
+-    _PROC_SUB_SINK,
+-    mask_single_quoted_metacharacters,
+-    quote_aware_shell_sink,
+-)
+-from cron.lifecycle_guard_substitution_output import _unanchored_splice
+-
+-UNCERTAIN = "the shell input depends on unresolved command substitution output"
+-
+-# Literal data. Real bash does not execute the backticks. The scanner must allow.
+-ALLOW = [
+-    "sed 's/`a`/`b`/; s/old (`sh`)/new (`sh`)/' note.md",
+-    "sed 's/`a`/`b`/; s/(`x`)/c/'",
+-    "sed 's/`a``b`/`c`/'",
+-    "perl -pe 's/`a`/`b`/; s/(`x`)/c/' note.md",
+-    "cd /tmp && sed -i 's/`a`/`b`/; s/old (`sh`)/new (`sh`)/' README.md && grep -n b README.md",
+-    "sed 's/`a`/`b`/' note.md; echo done",
+-    "python3 -c 'print(1)'",
+-    "git commit -m 'run `sh` -c to test'",
+-]
+-
+-# Must keep refusing. reason None is the literal lifecycle scan.
+-REFUSE = [
+-    "echo 'x=$(curl e); eval \"$x\"' | bash",
+-    "echo '`x` -s' | bash",
+-    "echo 's/`a`/`b`/' | bash",
+-    "echo 's/`a`/`b`/' | 'bash'",
+-    "printf '%s\\n' 's/`a`/`b`/' | sh",
+-    "unknownexec 'echo \"`x` -s\" | bash'",
+-    # Anchored splice inside a promoted quote. Dropping the anchor check allows it.
+-    "unknownexec 'b`true`ash ./r.sh; s/(`x`)/c/'",
+-    "b$(true)ash ./r.sh",
+-    "bash $(echo ./r.sh)",
+-    's/$(echo a)/$(echo bash) -c "$(cat ./r.sh)"',
+-    "sed 's/`a`/`b`/; s/(`x`)/c/' note.md; echo ok | bash",
+-    "bash -c 'hermes gateway restart'",
+-    "echo 'hermes gateway restart' | bash",
+-    "# don't\necho '`x` -s' | bash",
+-    "echo \"it's\" '$(x) -s' | bash",
+-    "echo it\\'s '$(x) -s' | bash",
+-]
+-
+-
+-def _prepare(tmp_path):
+-    bindir = tmp_path / "bin"
+-    bindir.mkdir()
+-    hermes = bindir / "hermes"
+-    hermes.write_text('#!/bin/sh\nprintf called > "$MARKER"\n', encoding="utf-8")
+-    hermes.chmod(0o755)
+-    script = tmp_path / "r.sh"
+-    script.write_text('hermes gateway "restart"\n', encoding="utf-8")
+-    script.chmod(0o755)
+-    (tmp_path / "note.md").write_text("`a` old (`sh`)\n", encoding="utf-8")
+-    (tmp_path / "README.md").write_text("`a` old (`sh`)\n", encoding="utf-8")
+-
+-
+-def _bash_ran(tmp_path, command: str) -> bool:
+-    marker = tmp_path / "marker"
+-    marker.unlink(missing_ok=True)
+-    subprocess.run(
+-        ["/bin/bash", "--noprofile", "--norc"],
+-        input=command + "\n",
+-        text=True,
+-        capture_output=True,
+-        timeout=20,
+-        check=False,
+-        cwd=tmp_path,
+-        env={
+-            "PATH": f"{tmp_path / 'bin'}:/usr/bin:/bin",
+-            "MARKER": str(marker),
+-            "HOME": str(tmp_path),
+-            "LANG": "C.UTF-8",
+-        },
+-    )
+-    return marker.exists()
+-
+-
+-@pytest.mark.parametrize("command", ALLOW)
+-def test_literal_quoted_backticks_stay_allowed(command):
+-    assert scan_gateway_lifecycle(command) == (False, None)
+-
+-
+-@pytest.mark.parametrize("command", REFUSE)
+-def test_shell_fed_and_anchored_computed_input_still_refuses(command):
+-    unsafe, reason = scan_gateway_lifecycle(command)
+-    assert unsafe, command
+-    assert reason in (None, UNCERTAIN)
+-
+-
+-def test_sed_program_does_not_execute_its_backticks(tmp_path):
+-    _prepare(tmp_path)
+-    command = "sed 's/`a`/`b`/; s/old (`sh`)/new (`sh`)/' note.md"
+-    assert not _bash_ran(tmp_path, command)
+-    result = subprocess.run(
+-        ["/bin/bash", "--noprofile", "--norc", "-c", command],
+-        text=True,
+-        capture_output=True,
+-        timeout=20,
+-        check=False,
+-        cwd=tmp_path,
+-        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "LANG": "C.UTF-8"},
+-    )
+-    assert result.returncode == 0, result.stderr
+-    assert result.stdout == "`b` new (`sh`)\n"
+-    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
+-
+-
+-def test_quoted_payload_fed_to_bash_runs_and_refuses(tmp_path):
+-    _prepare(tmp_path)
+-    command = "echo 'hermes gateway restart' | bash"
+-    assert _bash_ran(tmp_path, command)
+-    assert scan_gateway_lifecycle(command, cwd=str(tmp_path))[0] is True
+-
+-
+-def test_shadowed_unknown_executor_runs_and_scan_still_refuses(tmp_path):
+-    """Basename is not a binding. A function of that name evals the argument."""
+-    _prepare(tmp_path)
+-    scanned = "unknownexec 'echo \"`x` -s\" | bash'"
+-    executed = (
+-        'x() { hermes gateway restart; }; unknownexec() { eval "$1"; }; ' + scanned
+-    )
+-    assert _bash_ran(tmp_path, executed)
+-    unsafe, reason = scan_gateway_lifecycle(scanned, cwd=str(tmp_path))
+-    assert unsafe and reason == UNCERTAIN
+-
+-
+-def test_referenced_script_does_not_inherit_quote_narrowing(tmp_path):
+-    """A file reached from a speculative quote keeps placeholder-only splices.
+-
+-    The quote is promoted by ``(`x`)`` and the parent has no quote-aware sink.
+-    A clean script stays allowed; the splice script must still refuse. Inheriting
+-    the quote narrowing into the file visit allows the splice script.
+-    """
+-    _prepare(tmp_path)
+-    command = "sed 'bash ./danger.sh; s/(`x`)/c/'"
+-    (tmp_path / "danger.sh").write_text(":\n", encoding="utf-8")
+-    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
+-    (tmp_path / "danger.sh").write_text(
+-        's/$(echo a)/$(echo bash) -c "$(cat ./r.sh)"\n', encoding="utf-8"
+-    )
+-    unsafe, reason = scan_gateway_lifecycle(command, cwd=str(tmp_path))
+-    assert unsafe and reason == UNCERTAIN
+-
+-
+-def test_unanchored_splice_covers_adjacent_placeholders():
+-    assert _unanchored_splice(".*")
+-    assert _unanchored_splice(".*.*")
+-    assert not _unanchored_splice("b.*ash")
+-    assert not _unanchored_splice(".*sh")
+-
+-
+-def test_quote_mask_keeps_letters_and_fails_closed():
+-    masked = mask_single_quoted_metacharacters("echo 's/`a`/`b`/' | 'bash'")
+-    assert "bash" in masked
+-    assert "`" not in masked.split("|", 1)[0]
+-    assert quote_aware_shell_sink("echo 's/`a`/`b`/' | 'bash'")
+-    assert not quote_aware_shell_sink("sed 's/`a`/`b`/' note.md")
+-    # Heredoc / ANSI-C / unbalanced: unchanged, so a later mutant that masks them
+-    # changes these bytes. The sink regex only promotes `` `) ``, so these strings
+-    # are not scanner-verdict witnesses by themselves.
+-    heredoc = "sed 's/(`x`)/c/; s/<<//'"
+-    ansic = "sed $'s/(`x`)/y/'"
+-    unbalanced = "sed 's/`a`/`b`/"
+-    assert mask_single_quoted_metacharacters(heredoc) == heredoc
+-    assert mask_single_quoted_metacharacters(ansic) == ansic
+-    assert mask_single_quoted_metacharacters(unbalanced) == unbalanced
+-    balanced = "sed 's/`a`/`b`/'"
+-    assert mask_single_quoted_metacharacters(balanced) != balanced
+-    assert "`" not in mask_single_quoted_metacharacters(balanced)
+-    assert _PROC_SUB_SINK.search("coproc bash")
+-    assert _PROC_SUB_SINK.search("echo hi > >(sh)")
+-
+-
+-def test_printer_line_without_a_real_sink_is_data():
+-    """printf is not a shell. The quote-blind regex still yields the printer line."""
+-    command = "printf '%s\\n' 's/`a`/`b`/; s/(`x`)/c/'"
+-    assert scan_gateway_lifecycle(command) == (False, None)
+-    unsafe, reason = scan_gateway_lifecycle(command + " | bash")
+-    assert unsafe and reason == UNCERTAIN
+-
+-
+-def test_process_substitution_keeps_a_computed_program(tmp_path):
+-    """``>(bash)`` is a sink the quote-blind pipe regex does not name."""
+-    _prepare(tmp_path)
+-    literal = "echo 'hermes gateway restart' > >(bash); wait"
+-    assert _bash_ran(tmp_path, literal)
+-    assert scan_gateway_lifecycle(literal, cwd=str(tmp_path))[0] is True
+-    computed = "echo 's/$(echo a)/$(echo bash) -c \"$(cat ./r.sh)\"' > >(bash)"
+-    unsafe, reason = scan_gateway_lifecycle(computed, cwd=str(tmp_path))
+-    assert unsafe and reason == UNCERTAIN
+-    assert scan_gateway_lifecycle("echo 's/`a`/`b`/' > >(bash)")[1] == UNCERTAIN
+-    assert scan_gateway_lifecycle("echo 'sed program' > >(bash)") == (False, None)
+-    # The redirection inside a quote is data. Harvesting it refuses the splice.
+-    assert scan_gateway_lifecycle("echo 's/`a`/`b`/; s/(`x`)/c/' '> >(bash)'") == (
+-        False,
+-        None,
+-    )
+-
+-
+-@pytest.mark.parametrize("wrapper", ["", "command ", "env ", "nice "])
+-def test_wrapper_does_not_invent_or_hide_a_sink(wrapper):
+-    data = f"{wrapper}sed 's/`a`/`b`/; s/(`x`)/c/' note.md"
+-    assert scan_gateway_lifecycle(data) == (False, None)
+-    fed = f"{wrapper}echo 's/`a`/`b`/' | bash"
+-    unsafe, reason = scan_gateway_lifecycle(fed)
+-    assert unsafe and reason == UNCERTAIN
+-    nested = f"( {fed} )"
+-    unsafe, reason = scan_gateway_lifecycle(nested)
+-    assert unsafe and reason == UNCERTAIN
+-
+-
+-@pytest.mark.parametrize("tool", ["sed", "perl -pe"])
+-@pytest.mark.parametrize("program", ["s/`a`/`b`/", "s/`a`/`b`/; s/(`sh`)/x/"])
+-@pytest.mark.parametrize("sink", ["", " | 'bash'", " | bash"])
+-def test_data_command_cross_sink(tool, program, sink):
+-    if sink:
+-        command = f"echo '{program}'{sink}"
+-        unsafe, reason = scan_gateway_lifecycle(command)
+-        assert unsafe and reason == UNCERTAIN
+-    else:
+-        command = f"{tool} '{program}' note.md"
+-        assert scan_gateway_lifecycle(command) == (False, None)
+diff --git a/tests/cron/test_lifecycle_guard_substitution_adversarial.py b/tests/cron/test_lifecycle_guard_substitution_adversarial.py
+index 80cee672661cb2e1754f798afcbb4bcb0065f8e6..328407eb699133cf5672c1fad966a9bfb7c98091 100644
+--- a/tests/cron/test_lifecycle_guard_substitution_adversarial.py
++++ b/tests/cron/test_lifecycle_guard_substitution_adversarial.py
+@@ -54,10 +54,7 @@ def test_empty_expansions_mixed_with_present_quoted_arguments(tmp_path, command)
+     runs = _bash_runs(tmp_path, command)
+     if '"" -s' in command:
+         assert not runs
+-        # The output is not evaluated by preflight: a function named true can
+-        # supply a script operand even though the literal builtin emits nothing.
+-        unsafe, reason = scan_gateway_lifecycle(command, cwd=str(tmp_path))
+-        assert unsafe and reason and 'substitution output' in reason
++        assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
+         return
+     assert runs
+     assert scan_gateway_lifecycle(command, cwd=str(tmp_path))[0]
+diff --git a/tests/cron/test_lifecycle_guard_substitution_branch_witnesses.py b/tests/cron/test_lifecycle_guard_substitution_branch_witnesses.py
+deleted file mode 100644
+index 13f1a12d6b80400cee1256e67ea03ecb7b96e8f9..0000000000000000000000000000000000000000
+--- a/tests/cron/test_lifecycle_guard_substitution_branch_witnesses.py
++++ /dev/null
+@@ -1,131 +0,0 @@
+-"""Branch witnesses for lifecycle_guard_substitution_output mutation survivors.
+-
+-Each case is run in an isolated child that only calls ``computed_shell_input``
+-(or the named helper); no input is ever executed by a shell. A hang, import
+-error or crash is reported as a distinct failure so it cannot pass as a kill.
+-Ids are matrix mutant numbers. M069/M099/M166 are proven equivalent and have no
+-test; M106 does not exist on this head; M171 is deliberately excluded.
+-"""
+-import json
+-import os
+-import subprocess
+-import sys
+-from pathlib import Path
+-
+-import pytest
+-
+-_REPO_ROOT = Path(__file__).resolve().parents[2]
+-
+-_CHILD = '''
+-import json, sys
+-from types import SimpleNamespace
+-from cron.lifecycle_guard_substitution_output import computed_shell_input
+-kind, command, aliases = json.loads(sys.argv[1])
+-if kind == 'input':
+-    try:
+-        out = repr(computed_shell_input(command, frozenset(aliases))[0])
+-    except Exception as exc:
+-        out = 'EXC:' + type(exc).__name__
+-elif kind == 'depth':
+-    from cron.lifecycle_guard_substitution_output import _shell_input_is_computed
+-    out = repr([_shell_input_is_computed(['bash', '-c', 'true'], [], depth=d) for d in (15, 16)])
+-else:
+-    from cron.lifecycle_guard_substitution_output import scan_computed_shell_input
+-    budget = SimpleNamespace(alias_names=frozenset(aliases), refusal=None)
+-    result = scan_computed_shell_input(
+-        command, executed=True, budget=budget,
+-        recurse=lambda *a, **k: False, cwd='.', source='s')
+-    out = repr((result, budget.refusal is not None))
+-print('RESULT=' + out)
+-'''
+-
+-
+-def _safe_env() -> dict:
+-    env = {'PYTHONUTF8': '1', 'PYTHONIOENCODING': 'utf-8', 'PYTHONPATH': str(_REPO_ROOT)}
+-    for key in ('PATH', 'HOME', 'SYSTEMROOT', 'LANG', 'LC_ALL'):
+-        if key in os.environ:
+-            env[key] = os.environ[key]
+-    return env
+-
+-
+-def _run(kind: str, command: str, aliases=()) -> str:
+-    try:
+-        done = subprocess.run(
+-            [sys.executable, '-c', _CHILD, json.dumps([kind, command, list(aliases)])],
+-            cwd=_REPO_ROOT, env=_safe_env(), capture_output=True,
+-            text=True, encoding='utf-8', errors='replace', timeout=20, check=False,
+-        )
+-    except subprocess.TimeoutExpired:
+-        pytest.fail(f'TIMEOUT (not a witness result) for {command!r}')
+-    lines = [x for x in done.stdout.splitlines() if x.startswith('RESULT=')]
+-    assert lines, f'child crashed rc={done.returncode}: {done.stderr[-500:]}'
+-    return lines[-1][len('RESULT='):]
+-
+-
+-def _case(mutant, command, expected, aliases=(), tag=''):
+-    return pytest.param(command, expected, tuple(aliases), id=f'{mutant}{tag}')
+-
+-
+-_C = 'echo $(true); '
+-_X = 'exec 3<<<"$(echo code)"'
+-
+-CASES = [
+-    _case('M022', _C + 'bash -sc "$(echo c)"', True),
+-    _case('M022', _C + 'bash -c -s "$(echo c)"', True, tag='-c-s'),
+-    _case('M022', _C + 'bash -s -c "$(echo c)"', True, tag='-s-c'),
+-    _case('M024', _C + 'bash -c <<<"$(echo c)"', False),
+-    _case('M024', _C + 'bash -sc <<<"$(echo c)"', False, tag='-sc'),
+-    _case('M026', _C + 'bash -c <<<"$(echo c)"', False),
+-    _case('M041', 'cat f.sh | $(true) foo <&-', True),
+-    _case('M041', 'cat f.sh | $(true) foo 0<&-', True, tag='-fd0'),
+-    _case('M078', _C + 'if true; then exec 0<clean.sh; fi; $(true) foo', True),
+-    _case('M078', _C + '{ true; exec 0<clean.sh; }; $(true) foo', True, tag='-brace'),
+-    _case('M078', _C + 'true && exec 0<clean.sh; $(true) foo', True, tag='-and'),
+-    _case('M085', _C + '"case" x in x) ' + _X + ';; esac; bash <&3', True),
+-    _case('M085', _X + '; "for" x in a; do exec 3<&-; done; bash <&3', False, tag='-for'),
+-    _case('M094', _C + '{ ' + _X + '; "else"; bash <&3; }', True),
+-    _case('M096', _C + '{ ' + _X + '; echo else; bash <&3; }', True),
+-    _case('M097', _C + 'else; bash <&3', False),
+-    _case('M103', _C + 'case x in x) ' + _X + '; bash <&3;; esac', True),
+-    _case('M104', _X + '; echo; (true x); { exec 3<&-; }; bash <&3', False),
+-    _case('M107', _C + 'function f; ( c d ) ; { ' + _X + '; }; bash <&3', True),
+-    _case('M108', _C + 'x=(a b); { ' + _X + '; }; bash <&3', True),
+-    _case('M108', _C + 'a=1 f() { ' + _X + '; }; f; bash <&3', True, tag='-assign'),
+-    _case('M116', _X + '; if (bash <&3); then :; fi', True),
+-    _case('M116', _X + '; ! (bash <&3)', True, tag='-bang'),
+-    _case('M116', _X + '; time (bash <&3)', True, tag='-time'),
+-    _case('M117', _X + '; t (bash <&3)', True, aliases=('t',)),
+-    _case('M121', _C + 'g() { bash <&3; exec 3<&-; }; f() { g; exec 3<&-; }; ' + _X + '; f', True),
+-    _case('M129', _C + 'comm$(true)', False),
+-    _case('M129', _C + 'ex$(true)', False, tag='-ex'),
+-    _case('M129', _C + '$(true)and', False, tag='-suffix'),
+-    _case('M139', _C + '{ true; true & ' + _X + '; bash <&3; }', True),
+-    _case('M142', _C + '! time f() { ' + _X + '; }; f; bash <&3', True),
+-    _case('M143', _C + 'function () { ' + _X + '; }; bash <&3', True),
+-    _case('M147', 'X=$(echo code); echo "it\'s"; bash -c $X', True),
+-    _case('M152', 'echo X=$(true); bash -c "$X"', False),
+-    _case('M155', 'exec 0<<<"$(echo c)"; case x in x) :;; "esac"|bash) :;; esac', False),
+-    _case('M156', 'exec 0<<<"$(echo c)"; case x in x) :;; bash) :;; esac', False),
+-    _case('M159', _C + 'case x in x) true; true && ' + _X + '; bash <&3;; esac', True),
+-    _case('M160', _C + 'case x in x) true & ' + _X + '; bash <&3;; esac', True),
+-    _case('M165', 'X=$(echo code); echo \'a"b\'; bash -c $X', True),
+-    # M110/M111: MALFORMED-INPUT CHARACTERIZATION ONLY. No valid-shell witness
+-    # is known; these pin the current fail-safe result on invalid shell syntax.
+-    _case('M110-malformed', _C + 'f ( ; { ' + _X + '; } ) ; bash <&3', False),
+-    _case('M111-malformed', _C + 'function f; ) { ' + _X + '; }; bash <&3', False),
+-]
+-
+-
+-@pytest.mark.parametrize(('command', 'expected', 'aliases'), CASES)
+-def test_branch_witness(command, expected, aliases):
+-    assert _run('input', command, aliases) == repr(expected)
+-
+-
+-def test_m027_depth_guard_without_output_binding():
+-    # Depth 16 must stay False when no OUTPUT binding exists; a mutant that
+-    # drops the any(_OUTPUT ...) clause returns True.
+-    assert _run('depth', '') == '[False, False]'
+-
+-
+-def test_m074_alias_names_budget_refusal():
+-    assert _run('scan', 'exec 3<<<"$(echo code)"; t (bash <&3)', ('t',)) == '(True, True)'
+diff --git a/tests/cron/test_lifecycle_guard_substitution_dispatch_witnesses.py b/tests/cron/test_lifecycle_guard_substitution_dispatch_witnesses.py
+deleted file mode 100644
+index 6205946b2a9bb961935160b68b31dd28e38d61b0..0000000000000000000000000000000000000000
+--- a/tests/cron/test_lifecycle_guard_substitution_dispatch_witnesses.py
++++ /dev/null
+@@ -1,25 +0,0 @@
+-"""Dynamic-dispatch policy witnesses, including conservative may-effects.
+-
+-Malformed expanded/equals headers are parser-policy controls, not claims about
+-executable Bash syntax. Repeated definitions deliberately retain may-effects.
+-"""
+-import pytest
+-
+-from cron.lifecycle_guard_substitution_output import computed_shell_input
+-
+-
+-@pytest.mark.parametrize(('command', 'expected'), [
+-    ('f() { exec 3<<<"$(cat ./r.sh)"; }; f() { exec 3<&-; }; exec 3<&-; f; bash <&3', True),
+-    ('f() { exec 3<<<"$(cat ./r.sh)"; }; exec 3<&-; $(printf f); bash <&3', True),
+-    ('f() { exec 3<<<"$(cat ./r.sh)"; }; exec 3<&-; eval; bash <&3', False),
+-    ('function case { exec 3<<<"$(cat ./r.sh)"; }; exec 3<&-; "case"; bash <&3', True),
+-    ('=() { exec 3<<<"$(cat ./r.sh)"; }; exec 3<&-; =; bash <&3', False),
+-    ('"$f"() { exec 3<<<"$(cat ./r.sh)"; }; exec 3<&-; "$f"; bash <&3', False),
+-    ('function f() { exec 3<<<"$(cat ./r.sh)"; }; exec 3<&-; f; bash <&3', True),
+-    # Malformed syntax controls only, not executable-shell safety witnesses.
+-    ('"a<b"() { exec 3<<<"$(cat ./r.sh)"; }; exec 3<&-; "a<b"; bash <&3', False),
+-    ('"a>b"() { exec 3<<<"$(cat ./r.sh)"; }; exec 3<&-; "a>b"; bash <&3', False),
+-    ('f( ""() { exec 3<<<"$(cat ./r.sh)"; }; exec 3<&-; f; bash <&3', True),
+-])
+-def test_dispatch_policy_witness(command, expected):
+-    assert computed_shell_input(command, frozenset())[0] is expected
+diff --git a/tests/cron/test_lifecycle_guard_substitution_function_files.py b/tests/cron/test_lifecycle_guard_substitution_function_files.py
+deleted file mode 100644
+index 3dda7889651e8196337f062764986f899713004a..0000000000000000000000000000000000000000
+--- a/tests/cron/test_lifecycle_guard_substitution_function_files.py
++++ /dev/null
+@@ -1,38 +0,0 @@
+-"""Function-defined literal-file descriptor effects must reach computed commands.
+-
+-`f() { exec 0<./r.sh; }; f; $(printf bash)` runs bash on r.sh in real Bash; the
+-function effect saved only command-output bindings, dropping the file input.
+-Fake hermes only (helpers._tree installs a marker-writing stub).
+-"""
+-import pytest
+-
+-from cron.lifecycle_guard import scan_gateway_lifecycle
+-from cron.lifecycle_guard_substitution_output import computed_shell_input
+-from tests.cron import test_lifecycle_guard_fd_redirections as helpers
+-
+-RUNS = [
+-    'f() { exec 0<./r.sh; }; f; $(printf bash)',
+-    'function f { exec 0<./r.sh; }; f; $(printf bash)',
+-    'f() { exec 0<./r.sh; }; f; `printf bash`',
+-    'f() { exec 0<./r.sh; }; g() { f; }; g; $(printf bash)',
+-    'f() { exec 0<./r.sh; }; g() { f; }; f; g; $(printf bash)',
+-    'f() { exec 0<./clean.py; }; g() { exec 0<./r.sh; }; f; g; $(printf bash)',
+-]
+-CLEAN = [
+-    'f() { exec 0<./r.sh; }; f; exec 0<&-; $(printf bash)',
+-]
+-
+-
+-@pytest.mark.parametrize('command', RUNS)
+-def test_function_file_binding_reaches_computed_command(tmp_path, command):
+-    helpers._tree(tmp_path)
+-    assert helpers._bash_runs(tmp_path, command)
+-    assert computed_shell_input(command, frozenset())[0]
+-    assert scan_gateway_lifecycle(command, cwd=str(tmp_path))[0]
+-
+-
+-@pytest.mark.parametrize('command', CLEAN)
+-def test_function_file_binding_not_applied_when_closed(tmp_path, command):
+-    helpers._tree(tmp_path)
+-    assert not helpers._bash_runs(tmp_path, command)
+-    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
+diff --git a/tests/cron/test_lifecycle_guard_substitution_loop_files.py b/tests/cron/test_lifecycle_guard_substitution_loop_files.py
+deleted file mode 100644
+index 3a352b2a8a59cf6e8cb26ea469acb596ed1afed3..0000000000000000000000000000000000000000
+--- a/tests/cron/test_lifecycle_guard_substitution_loop_files.py
++++ /dev/null
+@@ -1,31 +0,0 @@
+-"""File-fed computed commands need descriptor facts from earlier iterations."""
+-import pytest
+-
+-from cron.lifecycle_guard import scan_gateway_lifecycle
+-from cron.lifecycle_guard_substitution_output import computed_shell_input
+-from tests.cron import test_lifecycle_guard_fd_redirections as helpers
+-
+-
+-@pytest.mark.parametrize('loop', ['for i in 1 2', 'i=0; while ((i++ < 2))'])
+-def test_file_binding_reaches_computed_command_on_backedge(tmp_path, loop):
+-    helpers._tree(tmp_path)
+-    command = f'{loop}; do $(printf bash); exec 0<./r.sh; done'
+-    assert helpers._bash_runs(tmp_path, command)
+-    assert computed_shell_input(command, frozenset())[0]
+-    assert scan_gateway_lifecycle(command, cwd=str(tmp_path))[0]
+-
+-
+-@pytest.mark.parametrize('consumer', ['python3', 'cat'])
+-def test_loop_file_binding_does_not_taint_known_data_consumers(tmp_path, consumer):
+-    helpers._tree(tmp_path)
+-    (tmp_path / 'data').write_text('pass\n', encoding='utf-8')
+-    command = f'for i in 1 2; do {consumer}; exec 0<./data; echo $(true); done'
+-    assert not helpers._bash_runs(tmp_path, command)
+-    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
+-
+-
+-def test_loop_final_close_removes_file_input(tmp_path):
+-    helpers._tree(tmp_path)
+-    command = 'for i in 1 2; do exec 0<&-; $(printf bash); exec 0<./r.sh; done'
+-    assert not helpers._bash_runs(tmp_path, command)
+-    assert computed_shell_input(command, frozenset())[0] is False
+diff --git a/tests/cron/test_lifecycle_guard_substitution_mutation_witnesses.py b/tests/cron/test_lifecycle_guard_substitution_mutation_witnesses.py
+deleted file mode 100644
+index a605305f6e778c06dc2cbbd317724bdc6bd78589..0000000000000000000000000000000000000000
+--- a/tests/cron/test_lifecycle_guard_substitution_mutation_witnesses.py
++++ /dev/null
+@@ -1,81 +0,0 @@
+-"""Regression witnesses for substitution-output uncertainty branches."""
+-import subprocess
+-import sys
+-from pathlib import Path
+-
+-import pytest
+-
+-_REPO_ROOT = Path(__file__).resolve().parents[2]
+-
+-
+-def _assert_isolated_script_completes(script: str, label: str) -> None:
+-    """Run helper code in a child. A hung helper fails the assertion, not the runner."""
+-    try:
+-        completed = subprocess.run(
+-            [sys.executable, '-c', script],
+-            cwd=_REPO_ROOT,
+-            capture_output=True,
+-            text=True,
+-            encoding='utf-8',
+-            timeout=10,
+-            check=False,
+-        )
+-    except subprocess.TimeoutExpired:
+-        completed = None
+-    assert completed is not None, f'isolated child did not complete for {label}'
+-    assert completed.returncode == 0, completed.stderr
+-
+-
+-def _assert_isolated_child_completes(command: str, expected: bool) -> None:
+-    script = (
+-        'from cron.lifecycle_guard_substitution_output import computed_shell_input\n'
+-        f'assert computed_shell_input({command!r}, frozenset())[0] is {expected}\n'
+-    )
+-    _assert_isolated_script_completes(script, command)
+-
+-
+-@pytest.mark.parametrize(('command', 'expected'), [
+-    ('exec 3<<<"$(echo code)"; "" -c :', False),
+-    ('exec 3<<<"$(echo code)"; bash "bash <&3"', False),
+-    ('exec 3<<<"$(echo code)"; $(true) -s', True),
+-    ('source clean.sh "$(echo data)"', False),
+-    ('eval : "$(echo code)"', True),
+-    ('e$(true)val :', True),
+-    ('data$(echo name) bash clean.sh', False),
+-    ('X=$(echo code); bash -c "$Y"', False),
+-    ('exec 0<<<"$(echo code)"; bash -s arg', True),
+-    # M120: drop `function_effects == previous_functions`. The fixpoint stops
+-    # early, so the later function redefinition's $(...) exec 3 is missed.
+-    ('echo $(true); f; f() { exec 3<<<"$(echo code)"; }; bash <&3', True),
+-    # M170: drop-filter `_OUTPUT in value`. A clean fd 3 from f() is wrongly
+-    # marked as computed output, so the original returns False.
+-    ('echo $(true); f() { exec 3<clean.sh; }; f; bash <&3', False),
+-    # M122: drop `match`. With no match, `match[1]` raises TypeError.
+-    ('X=$(echo code); echo "$?"', False),
+-])
+-def test_mutation_witnesses(command, expected):
+-    _assert_isolated_child_completes(command, expected)
+-
+-
+-def test_single_quoted_backslash_does_not_escape_next_quote():
+-    command = "X=$(echo code); bash -c '" + chr(92) + "'" + '"$X"'
+-    _assert_isolated_child_completes(command, True)
+-
+-
+-def test_depth_guard_is_fail_closed_at_budget():
+-    script = (
+-        'from cron.lifecycle_guard_substitution_output import _OUTPUT, _shell_input_is_computed\n'
+-        "assert _shell_input_is_computed(['bash', '-c', ':'], [], opened={'3': _OUTPUT}, depth=16)\n"
+-        "assert not _shell_input_is_computed(['bash', '-c', ':'], [], opened={'3': _OUTPUT}, depth=15)\n"
+-    )
+-    _assert_isolated_script_completes(script, 'depth-guard')
+-
+-
+-@pytest.mark.parametrize('command', [
+-    # M031: negate `previous == uncertain` — empty growth never breaks.
+-    pytest.param('echo $(true)', id='M031'),
+-    # M066: negate descriptor-walk loop/function/entry convergence.
+-    pytest.param('echo $(true); :', id='M066'),
+-])
+-def test_fixpoint_loops_complete_in_isolated_child(command):
+-    _assert_isolated_child_completes(command, False)
+diff --git a/tests/cron/test_lifecycle_guard_substitution_output.py b/tests/cron/test_lifecycle_guard_substitution_output.py
+deleted file mode 100644
+index f24ec14dbb1fc9c4f1ea3fa4f2ce6672220f90fe..0000000000000000000000000000000000000000
+--- a/tests/cron/test_lifecycle_guard_substitution_output.py
++++ /dev/null
+@@ -1,387 +0,0 @@
+-"""Computed shell inputs must not disappear at the substitution boundary."""
+-from __future__ import annotations
+-
+-import subprocess
+-
+-import pytest
+-
+-from cron.lifecycle_guard import scan_gateway_lifecycle
+-from tests.cron import test_lifecycle_guard_fd_redirections as fixtures
+-
+-
+-RUN = [
+-    'exec 3<<<"$(cat ./r.sh)"; (exec 3<&-); bash <&3',
+-    'exec 3<<<"$(cat ./r.sh)"; exec 3<&- | cat; bash <&3',
+-    'bash -c "bash <&3" 3<<<"$(cat ./r.sh)"',
+-    'exec 3<<<"$(cat ./r.sh)"; bash -c "bash <&3"',
+-    'ba$(echo s)h ./r.sh',
+-    'X=$(cat ./r.sh); bash -c "$X"',
+-    'exec 3<<<"$(cat ./r.sh)"; bash <&3',
+-    'bash -c bash <<<"$(cat ./r.sh)"',
+-    '/bin/ba$(echo s)h ./r.sh',
+-    'X=$(cat ./r.sh); Y=${X}; bash -c "$Y"',
+-    'export X=$(cat ./r.sh); bash -c "$X"',
+-    'X=$(echo ./r.sh); bash "$X"',
+-    'X=$(echo bash); "$X" < ./r.sh',
+-    'X=$(cat ./r.sh); bash <<<"$X"',
+-    'X=$(cat ./r.sh); exec 3<<<"$X"; bash <&3',
+-    'exec 3<<<"$(cat ./r.sh)"; exec 4<&3; bash <&4',
+-    'exec 3<<<"$(cat ./r.sh)"; bash <&3-',
+-    'exec 3<<<"$(cat ./r.sh)"; bash -c bash <&3',
+-    'bash -c "bash -c bash" <<<"$(cat ./r.sh)"',
+-    'bash -c "cat | bash" <<<"$(cat ./r.sh)"',
+-    'X=$(cat ./r.sh); # an apostrophe does not quote the next line: \'\n bash -c "$X"',
+-    'en$(echo v) bash ./r.sh',
+-    'ti$(echo me) bash ./r.sh',
+-    'exec 3<<<"$(cat ./r.sh)"; { exec 3<&-; } | cat; bash <&3',
+-    'exec 3<<<"$(cat ./r.sh)"; cat | { exec 3<&-; }; bash <&3',
+-    'exec 3<<<"$(cat ./r.sh)"; (exec 3<&- | cat); bash <&3',
+-    'b$(true)ash ./r.sh', 'bash ./r$(true).sh',
+-    'bash $(echo ./r.sh)', 'bash `echo ./r.sh`',
+-    'source $(echo ./r.sh)', '. `echo ./r.sh`',
+-    'eval "$(cat ./r.sh)"', 'bash -c "$(cat ./r.sh)"',
+-    'bash <<< "$(cat ./r.sh)"',
+-    'env bash $(echo ./r.sh)', 'command bash $(echo ./r.sh)',
+-    'if true; then bash $(echo ./r.sh); fi',
+-    'bash -ec "$(cat ./r.sh)"', 'bash -o errexit $(echo ./r.sh)',
+-    'bash --rcfile $(echo ./r.sh) -ic exit',
+-    'bash < $(echo ./r.sh)', 'bash 3<<< "$(cat ./r.sh)" <&3',
+-    './r$(true).sh',
+-    '$(echo bash) -c "$(cat ./r.sh)"',
+-    '$(echo bash) < ./r.sh',
+-    '$(echo env) bash -c "$(cat ./r.sh)"',
+-    '$(echo -n ba)$(echo sh) <<< "$(cat ./r.sh)"',
+-    'cat ./r.sh | $(echo bash)',
+-    'true() { echo ./r.sh; }; bash $(true) "" -s < ./r.sh',
+-    'if true; then exec 3<<<"$(cat ./r.sh)"; else exec 3<&-; fi; bash <&3',
+-    'for x in 1 2; do if test "$x" = 2; then bash <&3; fi; exec 3<<<"$(cat ./r.sh)"; done',
+-    'exec 3<<<"$(cat ./r.sh)"; if false; then exec 3<&-; else bash <&3; fi',
+-    'exec 3<<<"$(cat ./r.sh)"; if false; then exec 3<&-; elif true; then bash <&3; fi',
+-]
+-
+-
+-@pytest.mark.parametrize('command', RUN)
+-def test_real_shell_executes_computed_input(tmp_path, command):
+-    fixtures._tree(tmp_path)
+-    (tmp_path / 'r.sh').chmod(0o755)
+-    assert fixtures._bash_runs(tmp_path, command)
+-    assert (tmp_path / 'marker').read_text() == 'called'
+-    assert scan_gateway_lifecycle(command, cwd=str(tmp_path))[0]
+-
+-
+-@pytest.mark.parametrize('command', RUN[4:8])
+-@pytest.mark.parametrize('dangerous', [False, True])
+-def test_review_shapes_have_real_execution_and_clean_twins(tmp_path, command, dangerous):
+-    fixtures._tree(tmp_path)
+-    if not dangerous:
+-        (tmp_path / 'r.sh').write_text(':\n')
+-    marker = tmp_path / 'marker'
+-    result = subprocess.run(
+-        ['/bin/bash'], input=command + '\n', text=True, encoding='utf-8',
+-        capture_output=True, timeout=20, check=False, cwd=tmp_path,
+-        env={'PATH': f"{tmp_path / 'bin'}:/usr/bin:/bin", 'MARKER': str(marker),
+-             'HOME': str(tmp_path)})
+-    assert (result.returncode, result.stdout, result.stderr) == (0, '', '')
+-    assert marker.read_text() == 'called' if dangerous else not marker.exists()
+-    # Clean computed shell inputs are intentionally uncertain too: the scanner
+-    # does not run cat/echo (both can be shadowed by functions) to certify bytes.
+-    unsafe, reason = scan_gateway_lifecycle(command, cwd=str(tmp_path))
+-    assert unsafe and reason and 'substitution output' in reason
+-
+-
+-@pytest.mark.parametrize('count', [15, 16, 17, 32])
+-@pytest.mark.parametrize('shell_sink', [False, True])
+-def test_variable_dependency_closure_is_sink_sensitive(tmp_path, count, shell_sink):
+-    fixtures._tree(tmp_path)
+-    command = ('X0=$(cat ./r.sh); '
+-               + '; '.join(f'X{i}=$X{i-1}' for i in range(1, count))
+-               + (f'; bash -c "$X{count-1}"' if shell_sink else '; python3 -c "print(1)"'))
+-    assert fixtures._bash_runs(tmp_path, command) == shell_sink
+-    unsafe, reason = scan_gateway_lifecycle(command, cwd=str(tmp_path))
+-    assert unsafe == shell_sink
+-    assert bool(reason) == shell_sink
+-
+-
+-@pytest.mark.parametrize('command, stdout', [
+-    ('exec 3<./clean.sh; case x in x) exec 3<<<"$(cat ./r.sh)";; *) exec 3<&-;; esac; exec 3<./clean.sh; bash <&3', ''),
+-    ('exec 3<./clean.sh; (case x in x) exec 3<<<"$(cat ./r.sh)";; esac); bash <&3', ''),
+-    ('exec 3<./clean.sh; case x in x) exec 3<<<"$(cat ./r.sh)";; esac; python3 -c "pass" <&3', ''),
+-    ('if true; then exec 3<<<"$(cat ./r.sh)"; exec 3<./clean.sh; bash <&3; fi', ''),
+-    ('for x in 1 2; do exec 3<<<"$(cat ./r.sh)"; exec 3<./clean.sh; bash <&3; done', ''),
+-    ('exec 3<<<"$(cat ./r.sh)"; if false; then exec 3<&-; fi; python3 -c "pass" <&3', ''),
+-    ('exec 3<<<"$(cat ./r.sh)"; f() { exec 3<&-; }; cat <&3 > /dev/null', ''),
+-    ('en$(echo v) python3 -c "print(1)"', '1\n'),
+-    ('en$(echo v) echo data', 'data\n'),
+-    ('exec 3<./clean.sh; (exec 3<<<"$(cat ./r.sh)"); bash <&3', ''),
+-    ('exec 3<./clean.sh; { exec 3<<<"$(cat ./r.sh)"; } | cat; bash <&3', ''),
+-    ('exec 3<./clean.sh; cat | { exec 3<<<"$(cat ./r.sh)"; }; bash <&3', ''),
+-])
+-def test_scope_and_wrapper_controls_execute_cleanly(tmp_path, command, stdout):
+-    fixtures._tree(tmp_path)
+-    (tmp_path / 'clean.sh').write_text(':\n')
+-    marker = tmp_path / 'marker'
+-    result = subprocess.run(
+-        ['/bin/bash'], input=command + '\n', text=True, capture_output=True,
+-        timeout=20, check=False, cwd=tmp_path,
+-        env={'PATH': f"{tmp_path / 'bin'}:/usr/bin:/bin", 'MARKER': str(marker),
+-             'HOME': str(tmp_path)})
+-    assert (result.returncode, result.stdout, result.stderr) == (0, stdout, '')
+-    assert not marker.exists()
+-    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
+-
+-
+-@pytest.mark.parametrize('middle', [
+-    'if false; then exec 3<&-; fi',
+-    'if false; then exec 3<./clean.sh; fi',
+-    'false && exec 3<&-',
+-    'true || exec 3<&-',
+-    'false && { exec 3<&-; }',
+-    'f() { exec 3<&-; }',
+-    'function f { exec 3<&-; }',
+-    'function f() { exec 3<&-; }',
+-    'f()\n{ exec 3<&-; }',
+-    'if false; then exec 3<&-; else :; fi',
+-    'while false; do exec 3<&-; done',
+-    'until true; do exec 3<&-; done',
+-    'for x in; do exec 3<&-; done',
+-    'if true; then :; else exec 3<&-; fi',
+-    'if false; then :; elif false; then exec 3<&-; fi',
+-    '"if" exec 3<&-',
+-    'if true; then "fi" exec 3<&-; fi',
+-])
+-@pytest.mark.parametrize('dangerous', [False, True])
+-def test_skipped_descriptor_updates_preserve_may_input(tmp_path, middle, dangerous):
+-    fixtures._tree(tmp_path)
+-    for name in ('if', 'fi'):
+-        executable = tmp_path / 'bin' / name
+-        executable.write_text('#!/bin/sh\n:\n')
+-        executable.chmod(0o755)
+-    (tmp_path / 'clean.sh').write_text(':\n')
+-    if not dangerous:
+-        (tmp_path / 'r.sh').write_text(':\n')
+-    command = 'exec 3<<<"$(cat ./r.sh)"; ' + middle + '; bash <&3'
+-    marker = tmp_path / 'marker'
+-    result = subprocess.run(
+-        ['/bin/bash'], input=command + '\n', text=True, encoding='utf-8',
+-        capture_output=True, timeout=20, check=False, cwd=tmp_path,
+-        env={'PATH': f"{tmp_path / 'bin'}:/usr/bin:/bin", 'MARKER': str(marker),
+-             'HOME': str(tmp_path)})
+-    assert (result.returncode, result.stdout, result.stderr) == (0, '', '')
+-    assert marker.read_text() == 'called' if dangerous else not marker.exists()
+-    unsafe, reason = scan_gateway_lifecycle(command, cwd=str(tmp_path))
+-    assert unsafe and reason and 'substitution output' in reason
+-
+-
+-@pytest.mark.parametrize('middle', [
+-    'if false; then exec 3<&-; fi; exec 3<./clean.sh',
+-    'false && exec 3<&-; exec 3<./clean.sh',
+-    'f() { exec 3<&-; }; exec 3<./clean.sh',
+-    'while false; do exec 3<&-; done; exec 3<./clean.sh',
+-    '{ exec 3<./clean.sh; }',
+-])
+-def test_unconditional_descriptor_override_after_uncertain_scope(tmp_path, middle):
+-    fixtures._tree(tmp_path)
+-    (tmp_path / 'clean.sh').write_text(':\n')
+-    command = 'exec 3<<<"$(cat ./r.sh)"; ' + middle + '; bash <&3'
+-    assert not fixtures._bash_runs(tmp_path, command)
+-    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
+-
+-
+-@pytest.mark.parametrize('definition', ['f()', 'function f', 'function f()'])
+-@pytest.mark.parametrize('override', ['exec 3<./clean.sh', 'exec 3<&-'])
+-def test_function_call_reapplies_descriptor_effects(tmp_path, definition, override):
+-    fixtures._tree(tmp_path)
+-    (tmp_path / 'clean.sh').write_text(':\n')
+-    command = f'{definition} {{ exec 3<<<"$(cat ./r.sh)"; }}; {override}; f; bash <&3'
+-    assert fixtures._bash_runs(tmp_path, command)
+-    unsafe, reason = scan_gateway_lifecycle(command, cwd=str(tmp_path))
+-    assert unsafe and reason and 'substitution output' in reason
+-
+-
+-@pytest.mark.parametrize('ending', [';;', ';&', ';;&'])
+-def test_case_arms_preserve_descriptor_exits(tmp_path, ending):
+-    fixtures._tree(tmp_path)
+-    (tmp_path / 'clean.sh').write_text(':\n')
+-    # Fallthrough variants use a nonmatching second pattern, and a third arm
+-    # that closes the fd only on paths Bash does not take.
+-    second = ': ' if ending == ';&' else 'exec 3<./clean.sh '
+-    command = ('exec 3<./clean.sh; case x in x) exec 3<<<"$(cat ./r.sh)"'
+-               + ending + ' y) ' + second + ';; z) exec 3<&-;; esac; bash <&3')
+-    assert fixtures._bash_runs(tmp_path, command)
+-    unsafe, reason = scan_gateway_lifecycle(command, cwd=str(tmp_path))
+-    assert unsafe and reason and 'substitution output' in reason
+-
+-
+-@pytest.mark.parametrize('middle', [
+-    'case x in x) exec 3<<<"$(cat ./r.sh)";; *) exec 3<./clean.sh;; esac',
+-    'case x in (x|y) exec 3<<<"$(cat ./r.sh)";; *) exec 3<&-;; esac',
+-    'case x in x) case y in y) exec 3<<<"$(cat ./r.sh)";; esac;; *) exec 3<&-;; esac',
+-    'g() { f; }; f() { exec 3<<<"$(cat ./r.sh)"; }; g',
+-    'f() { exec 3<&4; }; exec 4<<<"$(cat ./r.sh)"; f',
+-])
+-@pytest.mark.parametrize('dangerous', [False, True])
+-def test_compound_fd_effects_have_clean_computed_twins(tmp_path, middle, dangerous):
+-    fixtures._tree(tmp_path)
+-    (tmp_path / 'clean.sh').write_text(':\n')
+-    if not dangerous:
+-        (tmp_path / 'r.sh').write_text(':\n')
+-    command = 'exec 3<./clean.sh; ' + middle + '; bash <&3'
+-    assert fixtures._bash_runs(tmp_path, command) == dangerous
+-    unsafe, reason = scan_gateway_lifecycle(command, cwd=str(tmp_path))
+-    assert unsafe and reason and 'substitution output' in reason
+-
+-
+-@pytest.mark.parametrize('suffix', [
+-    'bash <&3', 'f; exec 3<./clean.sh; bash <&3',
+-    '(f); bash <&3', 'f | cat; bash <&3',
+-    'f; python3 -c "pass" <&3', 'f; cat <&3 >/dev/null',
+-])
+-def test_function_descriptor_controls(tmp_path, suffix):
+-    fixtures._tree(tmp_path)
+-    (tmp_path / 'clean.sh').write_text(':\n')
+-    command = 'f() { exec 3<<<"$(cat ./r.sh)"; }; exec 3<./clean.sh; ' + suffix
+-    assert not fixtures._bash_runs(tmp_path, command)
+-    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
+-
+-
+-@pytest.mark.parametrize('middle', [
+-    '{ case x in x) exec 3<<<"$(cat ./r.sh)";; esac; }',
+-    'if true; then case x in x) exec 3<<<"$(cat ./r.sh)";; esac; fi',
+-    'for i in 1; do case x in x) exec 3<<<"$(cat ./r.sh)";; esac; done',
+-    'f() { case x in x) exec 3<<<"$(cat ./r.sh)";; esac; }; f',
+-    'f() case x in x) exec 3<<<"$(cat ./r.sh)";; esac; f',
+-    'my-f() { exec 3<<<"$(cat ./r.sh)"; }; my-f',
+-    'f.x() { exec 3<<<"$(cat ./r.sh)"; }; f.x',
+-    'function my-f { exec 3<<<"$(cat ./r.sh)"; }; my-f',
+-    'f() { exec 3<<<"$(cat ./r.sh)"; }; eval f',
+-    'f() { exec 3<<<"$(cat ./r.sh)"; }; n=f; $n',
+-    'f() { exec 3<<<"$(cat ./r.sh)"; }; shopt -s expand_aliases; alias g=f\ng',
+-])
+-@pytest.mark.parametrize('suffix', [
+-    'bash <&3', 'exec 3<./clean.sh; bash <&3',
+-    'python3 -c "pass" <&3', 'cat <&3 >/dev/null',
+-])
+-def test_prefixed_case_and_function_dispatch(tmp_path, middle, suffix):
+-    fixtures._tree(tmp_path)
+-    (tmp_path / 'clean.sh').write_text(':\n')
+-    # A definition-time open must not be mistaken for the invocation effect.
+-    middle = middle.replace('}; ', '}; exec 3<./clean.sh; ')
+-    command = 'exec 3<./clean.sh; ' + middle + '\n' + suffix
+-    runs = suffix == 'bash <&3'
+-    assert fixtures._bash_runs(tmp_path, command) == runs
+-    unsafe, reason = scan_gateway_lifecycle(command, cwd=str(tmp_path))
+-    assert unsafe == runs
+-    if runs:
+-        assert reason and 'substitution output' in reason
+-
+-
+-def test_guard_never_runs_the_producer(tmp_path):
+-    command = 'X=$(touch producer-ran); bash -c "$X"'
+-    unsafe, reason = scan_gateway_lifecycle(command, cwd=str(tmp_path))
+-    assert unsafe and reason and 'substitution output' in reason
+-    assert not (tmp_path / 'producer-ran').exists()
+-
+-
+-@pytest.mark.parametrize('command', [
+-    '2>/dev/$(echo null) stdbuf -o0 python3 ./clean.py',
+-    'command 2>/dev/$(echo null) python3 ./clean.py',
+-    'en$(echo v) python3 -c "print(1)"',
+-    'en$(echo v) echo data',
+-    'ti$(echo me) python3 -c "print(1)"',
+-    'exec 3<./clean.sh; (exec 3<<<"$(cat ./r.sh)"); bash <&3',
+-    'exec 3<./clean.sh; exec 3<<<"$(cat ./r.sh)" | cat; bash <&3',
+-    'exec 3<./clean.sh; cat | exec 3<<<"$(cat ./r.sh)"; bash <&3',
+-    'X0=$(echo data); ' + '; '.join(f'X{i}=$X{i-1}' for i in range(1, 16)) + '; python3 -c "print(1)"',
+-    'python3 $(echo ./clean.py)', 'python3 ./clean$(true).py',
+-    'py$(true)thon3 ./clean.py', 'python3 -c "$(cat ./clean.py)"',
+-    'python3 <<< "$(cat ./clean.py)"',
+-    'echo $(echo ./clean.py)', 'echo bash $(echo ./clean.py)',
+-    "echo 'bash $(echo ./clean.py)'", 'bash ./clean.sh $(echo data)',
+-    'bash -c : $(echo data)', 'bash -s $(echo data) < ./clean.sh',
+-    'bash <<< "$(echo data)" < ./clean.sh',
+-    'bash 2>$(echo ./log) ./clean.sh',
+-    'bash ./clean$((1+1)).sh',
+-    'X=$(cat ./clean.py); python3 -c "$X"',
+-    'X=$(cat ./clean.py); echo "$X"',
+-    'X=$(cat ./clean.py); bash -c : "$X"',
+-    "X=$(cat ./clean.py); bash -c 'echo $X'",
+-    r'X=$(cat ./clean.py); bash -c "echo \$X"',
+-    "echo X=$(cat ./clean.py); bash -c '$X'",
+-    'exec 3<<<"$(cat ./clean.py)"; python3 <&3',
+-    'exec 3<<<"$(cat ./clean.py)"; bash <&3 < ./clean.sh',
+-    'exec 3<<<"$(cat ./clean.py)"; exec 3<./clean.sh; bash <&3',
+-    'exec 3<<<"$(cat ./clean.py)"; exec 3<&-; bash <&3',
+-    'exec 3<<<"$(cat ./clean.py)"; exec 4<&3-; bash <&3',
+-    'bash 3<<<"$(cat ./clean.py)" -c :; bash <&3',
+-    'bash -c : <<<"$(cat ./clean.py)"',
+-    'bash -c python3 <<<"$(cat ./clean.py)"',
+-    'bash -c "bash < ./clean.sh" <<<"$(cat ./clean.py)"',
+-])
+-def test_non_shell_inputs_remain_allowed(tmp_path, command):
+-    fixtures._tree(tmp_path)
+-    (tmp_path / 'clean.sh').write_text(':\n')
+-    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
+-
+-
+-def test_uncertainty_is_named(tmp_path):
+-    unsafe, reason = scan_gateway_lifecycle('bash $(echo missing.sh)', cwd=str(tmp_path))
+-    assert unsafe and reason and 'substitution output' in reason
+-
+-
+-@pytest.mark.parametrize('command', [
+-    'bash -c "echo $(date)"', 'eval "$(ssh-agent -s)"',
+-    'bash <<< "echo $(date)"',
+-])
+-def test_unknown_output_is_not_evaluated(command):
+-    # Even common benign producers can be functions. This is an explicit
+-    # uncertainty refusal, not a claim that their output restarts the gateway.
+-    unsafe, reason = scan_gateway_lifecycle(command)
+-    assert unsafe and reason and 'substitution output' in reason
+-
+-
+-@pytest.mark.parametrize(('command', 'uncertain', 'variant'), [
+-    ('echo $(true)', False, 'echo '),
+-    ('echo $((1+1))', False, None),
+-    ('f(bash $(echo script))', False, 'f(bash )'),
+-    ('A=$(true)', False, 'A='),
+-    ('bash $(echo script)', True, None),
+-    ('source $(echo script)', True, None),
+-    ('eval "$(echo code)"', True, None),
+-    ('b$(true)ash clean.sh', True, None),
+-    ('$(echo bash) -c :', True, None),
+-    ('bash -s $(echo data)', False, 'bash -s '),
+-    ('bash <<< "$(echo code)" < clean.sh', False, 'bash <<< "" < clean.sh'),
+-    ('bash 3<<< "$(echo code)" <&3', True, None),
+-    ('python3 $(echo clean.py)', False, 'python3 '),
+-])
+-def test_output_classification(command, uncertain, variant):
+-    from cron.lifecycle_guard_substitution_output import computed_shell_input
+-
+-    assert computed_shell_input(command, frozenset()) == (uncertain, variant)
+-
+-
+-@pytest.mark.parametrize('prefix', ['', 'prefix'])
+-def test_empty_output_does_not_invent_literal_bindings(prefix):
+-    from cron import lifecycle_guard as guard
+-
+-    budget = guard._LifecycleScanBudget(frozenset())
+-    command = f'HB={prefix}$(true); "$HB" data "$(cat missing)"'
+-    assert not guard._contains_unsafe_gateway_action(
+-        command, cwd=None, depth=0, visited=set(), budget=budget)
+-    assert 'HB' not in budget.variable_candidates.values
+-
+-
+-def test_empty_output_script_keeps_real_variable_discovery(tmp_path):
+-    fixtures._tree(tmp_path)
+-    (tmp_path / 'wrapper.sh').write_text('R=./r.sh; "$R"\n')
+-    command = './wrapper$(true).sh'
+-    assert scan_gateway_lifecycle(command, cwd=str(tmp_path))[0]
+-
+-
+-def test_mentioned_file_has_no_output_uncertainty():
+-    from cron import lifecycle_guard as guard
+-
+-    budget = guard._LifecycleScanBudget(frozenset())
+-    assert not guard._contains_unsafe_gateway_action(
+-        'bash $(echo missing.sh)', cwd=None, depth=0, visited=set(),
+-        budget=budget, executed=False)
+-- 
+2.43.0
+

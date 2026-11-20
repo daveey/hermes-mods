@@ -1,0 +1,716 @@
+From 53e2d620b66642413cdb1c2a71d21654a8dc0b9e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 21:05:35 -0800
+Subject: [PATCH] fix(sessions): let a list leave automated rows out before
+ paging
+
+Follow-up to the paged Archived view. On 2026-11-17 the Archived view's
+first 500-row page held 92 of the user's own chats; the rest were
+auto-archived bot runs from the mini's bb-* profiles (15,432 of 16,899
+archived rows), which the sidebar then hid. The same rows are what made
+a page slow: the Desktop reads each registry backend 100 rows per
+request, so 500 bot rows per profile is five round trips each, and a
+deeper page re-reads that prefix.
+
+Why it was not caught: "automated" was only ever a stamp on rows already
+fetched, so no list could be sized or counted without them.
+
+- backend: /api/sessions and /api/profiles/sessions take
+  automated=exclude. Per store, automated_listing_exclusion() turns the
+  profile's own policy into SQL: a "*" profile contributes nothing;
+  otherwise every source spelling the store holds that the automated
+  stamp would flag is excluded, so filter and stamp agree row for row.
+  Rows and total both shrink. The policy is part of the all-profiles
+  scan cache key, since config.yaml changes without a state.db write.
+  Default stays "include".
+- desktop: the sidebar's Archived cursor sends automated=exclude while
+  "Show automated & test sessions" is off, and the view starts over at
+  one page when that preference flips. A backend that predates the
+  option ignores it; its rows are still hidden client-side as before.
+  Settings > Archived sessions still lists every archived row.
+
+Behaviour to know: with the option on, a pinned or needs-attention
+automated row is left out too (the live sidebar keeps those); turning
+"Show automated & test sessions" on lists them.
+
+Tests: tests/hermes_cli/test_sessions_automated_exclude.py (both routes,
+"*" profile, explicit sources, other-case spelling, interactive
+allowlist, combined with exclude_sources, live list, pinned row, policy
+change without a db write, invalid value, no policy);
+sidebar-archive.test.ts (filter sent / not sent, restart on flip, no
+fetch while closed); sessions-settings.test.tsx (settings asks for every
+row); api/sessions.test.ts (query string);
+profile-session-routing.test.ts (the merge already forwards query
+params to the primary and registry backends; this pins it).
+
+Not measured end to end: the page time in the app, which needs all three
+gateways on this code. Measured on this Mac's store in-process: the
+archived list is 0.4 s warm either way, so the 12 s was the fan-out, not
+the query. Not changed: registry backends are still read 100 rows per
+request, and a deeper page still re-reads its prefix.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .../electron/profile-session-routing.test.ts  |  30 ++++
+ apps/desktop/src/api/sessions.test.ts         |  18 +-
+ apps/desktop/src/api/sessions.ts              |   8 +-
+ .../app/settings/sessions-settings.test.tsx   |   8 +
+ .../src/app/settings/sessions-settings.tsx    |   3 +-
+ .../desktop/src/store/sidebar-archive.test.ts |  72 +++++++-
+ apps/desktop/src/store/sidebar-archive.ts     |  25 ++-
+ hermes_cli/session_listing.py                 |  27 +++
+ hermes_cli/web_routers/profiles.py            |  25 ++-
+ hermes_cli/web_routers/sessions.py            |  23 ++-
+ .../test_sessions_automated_exclude.py        | 168 ++++++++++++++++++
+ 11 files changed, 388 insertions(+), 19 deletions(-)
+ create mode 100644 tests/hermes_cli/test_sessions_automated_exclude.py
+
+diff --git a/apps/desktop/electron/profile-session-routing.test.ts b/apps/desktop/electron/profile-session-routing.test.ts
+index 82549f1f303fe97f8180aeb4c916f0a9a33f62d9..42caf17044c9803f27b0f8987677e4da4df43d57 100644
+--- a/apps/desktop/electron/profile-session-routing.test.ts
++++ b/apps/desktop/electron/profile-session-routing.test.ts
+@@ -1892,3 +1892,33 @@ test('profileNamesOf: the named profiles of a /api/profiles listing, in order; a
+   assert.deepEqual(profileNamesOf(null), [])
+   assert.deepEqual(profileNamesOf(undefined), [])
+ })
++
++test('the automated filter reaches every backend the unified list reads', async () => {
++  // The Archived view asks for pages without automated rows; a source that never
++  // hears the option pages its bot rows back in.
++  const asked: string[] = []
++  const searchParams = new URLSearchParams({ limit: '500', offset: '0', archived: 'only', automated: 'exclude' })
++
++  const record = async (path: string) => {
++    asked.push(path)
++
++    return { sessions: [], total: 0, profile_totals: {} }
++  }
++
++  await fetchPrimaryProfileSessions(searchParams, (_profile, path) => record(path), { prefixForMerge: true })
++  await fetchPrimaryProfileSessions(searchParams, (_profile, path) => record(path))
++  await fetchRegistrySessionRows(
++    [
++      { connectionId: 'gw', kind: 'remote', backends: [{ descriptor: 'remote', profileLabel: null }] },
++      { connectionId: 'mini', kind: 'local', backends: [{ descriptor: 'bb', profileLabel: 'bb-dev' }] }
++    ],
++    searchParams,
++    (_descriptor, path) => record(path)
++  )
++
++  assert.equal(asked.length >= 4, true)
++
++  for (const path of asked) {
++    assert.equal(new URL(path, 'http://x').searchParams.get('automated'), 'exclude', path)
++  }
++})
+diff --git a/apps/desktop/src/api/sessions.test.ts b/apps/desktop/src/api/sessions.test.ts
+index 1ac5c47011420e666638b3f5be60780a2a77a5b4..60f5cfa97915c3c320ddd2b07ed9bce441830480 100644
+--- a/apps/desktop/src/api/sessions.test.ts
++++ b/apps/desktop/src/api/sessions.test.ts
+@@ -27,7 +27,8 @@ const {
+   setSessionArchived,
+   setSessionPinnedRemote,
+   setSessionUnreadRemote,
+-  listSidebarSessions
++  listSidebarSessions,
++  listAllProfileSessions
+ } = await import('./sessions')
+ 
+ const hermesApi = vi.mocked(client.hermesApi)
+@@ -116,6 +117,21 @@ describe('session write reconnect safety', () => {
+   })
+ })
+ 
++describe('listAllProfileSessions automated rows', () => {
++  it('asks the backend to leave automated rows out only when told to', async () => {
++    hermesApi.mockResolvedValue({ sessions: [], total: 0 })
++
++    await listAllProfileSessions(500, 0, 'only', 'recent', 'all', { automated: 'exclude' }, 500)
++    await listAllProfileSessions(500, 0, 'only', 'recent', 'all', {}, 0)
++
++    const paths = hermesApi.mock.calls.map(([request]) => request.path)
++
++    expect(paths[0]).toContain('archived=only')
++    expect(paths[0]).toContain('&automated=exclude')
++    expect(paths[1]).not.toContain('automated')
++  })
++})
++
+ describe('deleteSession profile scoping', () => {
+   it('scopes the DELETE to the owning profile in the URL (object owner)', async () => {
+     // Regression: the sidebar "All Profiles" delete sent the profile only via
+diff --git a/apps/desktop/src/api/sessions.ts b/apps/desktop/src/api/sessions.ts
+index b28bb7fd02ab696413729cc6dfbdf12794f26bbb..71738423894d36ae29cb2339efa58d5679a94160 100644
+--- a/apps/desktop/src/api/sessions.ts
++++ b/apps/desktop/src/api/sessions.ts
+@@ -134,6 +134,9 @@ export async function listSessions(
+ export interface SessionSourceFilter {
+   source?: string
+   excludeSources?: string[]
++  /** 'exclude' leaves out the rows each store's own policy marks automated, before paging and
++   *  in `total` (a backend that predates the option ignores it and returns them). */
++  automated?: 'exclude'
+ }
+ 
+ export async function listAllProfileSessions(
+@@ -151,11 +154,14 @@ export async function listAllProfileSessions(
+     ? `&exclude_sources=${encodeURIComponent(filter.excludeSources.join(','))}`
+     : ''
+ 
++  const automatedParam = filter.automated ? `&automated=${filter.automated}` : ''
++
+   const result = await hermesApi<PaginatedSessions>({
+     ...profileScoped(),
+     path:
+       `/api/profiles/sessions?limit=${limit}&offset=${Math.max(0, offset)}&min_messages=${Math.max(0, minMessages)}` +
+-      `&archived=${archived}&order=${order}&profile=${encodeURIComponent(profile)}${sourceParam}${excludeParam}`,
++      `&archived=${archived}&order=${order}&profile=${encodeURIComponent(profile)}${sourceParam}${excludeParam}` +
++      automatedParam,
+     timeoutMs: SESSION_LIST_REQUEST_TIMEOUT_MS
+   })
+ 
+diff --git a/apps/desktop/src/app/settings/sessions-settings.test.tsx b/apps/desktop/src/app/settings/sessions-settings.test.tsx
+index 67b0f7db61e1232e01fa9db250f41b0ac1b35858..c91662034c57880e93feb900387044570d22e8b7 100644
+--- a/apps/desktop/src/app/settings/sessions-settings.test.tsx
++++ b/apps/desktop/src/app/settings/sessions-settings.test.tsx
+@@ -127,6 +127,14 @@ describe('SessionsSettings archived list paging', () => {
+     expect(screen.queryByText('chat a')).toBeNull()
+   })
+ 
++  it('lists automated archived rows too, whatever the sidebar preference', async () => {
++    render(<SessionsSettings />)
++
++    await screen.findByText('archived room')
++
++    expect(listAllProfileSessions).toHaveBeenCalledWith(500, 0, 'only', 'recent', 'all', {}, 0)
++  })
++
+   it('offers no load-more when the first page is the whole archive', async () => {
+     render(<SessionsSettings />)
+ 
+diff --git a/apps/desktop/src/app/settings/sessions-settings.tsx b/apps/desktop/src/app/settings/sessions-settings.tsx
+index 516249ac11a4f4317fde1d1b294b0b27d4321834..0b1309da33dacc7840a0babd03d03b9348affbf1 100644
+--- a/apps/desktop/src/app/settings/sessions-settings.tsx
++++ b/apps/desktop/src/app/settings/sessions-settings.tsx
+@@ -92,7 +92,8 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
+       // next page would skip a row per removal: read again from the top.
+       const stale = paging.removed.size !== paging.removedAtStart
+       const removedAtStart = paging.removed.size
+-      const pager = paging.cursor && !stale ? paging.cursor : createArchivedPager()
++      // Every archived row, automated ones too: this is where the archive is managed.
++      const pager = paging.cursor && !stale ? paging.cursor : createArchivedPager(true)
+       let pages = pager === paging.cursor ? paging.pages : 0
+ 
+       try {
+diff --git a/apps/desktop/src/store/sidebar-archive.test.ts b/apps/desktop/src/store/sidebar-archive.test.ts
+index 9419235f5bb29da0194f47461c0695dc043ed84f..61bb517ae34a7ef9347654f752d5130b4ec2e2fe 100644
+--- a/apps/desktop/src/store/sidebar-archive.test.ts
++++ b/apps/desktop/src/store/sidebar-archive.test.ts
+@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
+ import { $apiRequestScope } from '@/api/client'
+ import type { SessionInfo } from '@/types/hermes'
+ 
+-import { $sidebarShowArchived } from './layout'
++import { $sidebarShowArchived, $sidebarShowAutomated } from './layout'
+ import {
+   $archivedSessions,
+   $archivedSessionsHasMore,
+@@ -45,7 +45,7 @@ const page = (from: number, count: number): SessionInfo[] =>
+ 
+ /** Read a cursor to its end, as a caller that wants the whole archive would. */
+ async function listEveryArchivedSession(): Promise<SessionInfo[]> {
+-  const pager = createArchivedPager()
++  const pager = createArchivedPager(true)
+ 
+   while (pager.hasMore) {
+     await pager.next()
+@@ -58,6 +58,8 @@ let scopeSerial = 0
+ 
+ beforeEach(() => {
+   $sidebarShowArchived.set(false)
++  // Automated rows included unless a test says otherwise: the plain `{}` filter.
++  $sidebarShowAutomated.set(true)
+   // A fresh scope per test: the switch drops the previous test's cursor and page count.
+   $apiRequestScope.set({ connectionId: `reset-${(scopeSerial += 1)}`, profile: null })
+   $apiRequestScope.set({ connectionId: null, profile: null })
+@@ -411,6 +413,72 @@ describe('archived view paging', () => {
+   })
+ })
+ 
++// 2026-11-17: 15,432 of 16,899 archived rows were bot runs the sidebar then hid; 92 of the
++// first 500 were the user's own.
++describe('archived view and automated rows', () => {
++  it('asks for pages without automated rows while they are hidden', async () => {
++    $sidebarShowAutomated.set(false)
++    listAllProfileSessions.mockResolvedValue({ sessions: page(0, 2), total: 2 })
++
++    await loadArchivedSessions()
++
++    expect(listAllProfileSessions).toHaveBeenCalledWith(
++      PAGE_SIZE,
++      0,
++      'only',
++      'recent',
++      'all',
++      { automated: 'exclude' },
++      0
++    )
++  })
++
++  it('asks for every row while automated sessions are shown', async () => {
++    listAllProfileSessions.mockResolvedValue({ sessions: page(0, 2), total: 2 })
++
++    await loadArchivedSessions()
++
++    expect(listAllProfileSessions).toHaveBeenCalledWith(PAGE_SIZE, 0, 'only', 'recent', 'all', {}, 0)
++  })
++
++  it('starts the open view over when the preference flips, back at one page', async () => {
++    $sidebarShowArchived.set(true)
++    listAllProfileSessions.mockImplementation(async (...args: unknown[]) => ({
++      sessions: page(args[6] as number, PAGE_SIZE),
++      total: 4 * PAGE_SIZE
++    }))
++    await loadArchivedSessions()
++    await loadMoreArchivedSessions()
++    listAllProfileSessions.mockClear()
++
++    $sidebarShowAutomated.set(false)
++
++    expect($archivedSessions.get()).toEqual([])
++    await vi.waitFor(() => expect($archivedSessions.get()).toHaveLength(PAGE_SIZE))
++    expect(listAllProfileSessions).toHaveBeenCalledTimes(1)
++    expect(listAllProfileSessions).toHaveBeenCalledWith(
++      PAGE_SIZE,
++      0,
++      'only',
++      'recent',
++      'all',
++      { automated: 'exclude' },
++      0
++    )
++  })
++
++  it('drops the loaded rows without fetching when the preference flips with the view closed', async () => {
++    listAllProfileSessions.mockResolvedValue({ sessions: page(0, 2), total: 2 })
++    await loadArchivedSessions()
++    listAllProfileSessions.mockClear()
++
++    $sidebarShowAutomated.set(false)
++
++    expect($archivedSessions.get()).toEqual([])
++    expect(listAllProfileSessions).not.toHaveBeenCalled()
++  })
++})
++
+ describe('createArchivedPager read to the end', () => {
+   it('keeps paging when a live pin displaced the last archived row', async () => {
+     listAllProfileSessions
+diff --git a/apps/desktop/src/store/sidebar-archive.ts b/apps/desktop/src/store/sidebar-archive.ts
+index 4aa4a53654b3762bc7d19400f996ba0cbede4310..a6a66a068a3bc91bd91b1af594f12f7006a3abf6 100644
+--- a/apps/desktop/src/store/sidebar-archive.ts
++++ b/apps/desktop/src/store/sidebar-archive.ts
+@@ -5,7 +5,7 @@ import { $apiRequestScope } from '@/api/client'
+ import { listAllProfileSessions } from '@/api/sessions'
+ import type { SessionInfo } from '@/types/hermes'
+ 
+-import { $sidebarShowArchived } from './layout'
++import { $sidebarShowArchived, $sidebarShowAutomated } from './layout'
+ import { $sessions } from './session'
+ 
+ // The backend's `/api/profiles/sessions` page cap (`le=500`). The Electron
+@@ -50,8 +50,15 @@ export interface ArchivedPager {
+  * along even past the end, so once the cursor has covered `total`, a page
+  * with no new archived row ends it too: a row archived or reordered mid-load
+  * can leave the distinct count short for good.
++ *
++ * `includeAutomated: false` asks for pages without the rows each store marks
++ * automated. Bot profiles hold most of a deep archive, so leaving them in
++ * buries the user's own chats pages down. That drops every automated row,
++ * including the pinned or needs-attention ones the live sidebar would keep:
++ * those are listed again with "Show automated & test sessions" on.
+  */
+-export function createArchivedPager(): ArchivedPager {
++export function createArchivedPager(includeAutomated: boolean): ArchivedPager {
++  const filter = includeAutomated ? {} : ({ automated: 'exclude' } as const)
+   const seen = new Set<string>()
+   let archivedCount = 0
+   let offset = 0
+@@ -72,7 +79,7 @@ export function createArchivedPager(): ArchivedPager {
+       return pager.sessions
+     }
+ 
+-    const page = await listAllProfileSessions(ARCHIVED_FETCH_PAGE_SIZE, 0, 'only', 'recent', 'all', {}, offset)
++    const page = await listAllProfileSessions(ARCHIVED_FETCH_PAGE_SIZE, 0, 'only', 'recent', 'all', filter, offset)
+     const archivedBefore = archivedCount
+     const sessions = [...pager.sessions]
+ 
+@@ -159,7 +166,7 @@ async function runArchiveLoad(extend: boolean): Promise<void> {
+     for (let pass = 0; pass < 2 && current(); pass += 1) {
+       const continued = pager !== null
+       const firstLoad = $archivedSessions.get().length === 0
+-      pager ??= createArchivedPager()
++      pager ??= createArchivedPager($sidebarShowAutomated.get())
+ 
+       while (read < wantedPages && pager.hasMore && current()) {
+         const shown = $archivedSessions.get()
+@@ -253,6 +260,14 @@ $apiRequestScope.listen(() => {
+   }
+ 
+   observedScope = scope
++  restartArchivedView()
++})
++
++// The loaded pages were asked for with or without automated rows; the other
++// answer is a different list, not a filter over this one.
++$sidebarShowAutomated.listen(restartArchivedView)
++
++function restartArchivedView(): void {
+   // Strand whatever is reading the old scope: it may neither publish nor
+   // count its pages against the new one.
+   archiveGeneration += 1
+@@ -266,7 +281,7 @@ $apiRequestScope.listen(() => {
+   if ($sidebarShowArchived.get()) {
+     void loadArchivedSessions()
+   }
+-})
++}
+ 
+ /** Spend on a session — provider-reported price when we have one, our own
+  *  estimate otherwise. */
+diff --git a/hermes_cli/session_listing.py b/hermes_cli/session_listing.py
+index 827d34688eb45e622282a983feb3333dd3e155e2..a925957f8a25964b14dd102de19f7e559780011d 100644
+--- a/hermes_cli/session_listing.py
++++ b/hermes_cli/session_listing.py
+@@ -208,6 +208,33 @@ def stamp_automated(
+     return rows
+ 
+ 
++def automated_policy_key(policy: AutomatedSourcePolicy) -> tuple[tuple[str, ...], tuple[str, ...]]:
++    """*policy* as a hashable cache-key part: a cached list made with ``automated=exclude`` is only
++    valid for the policy it was made under, and config.yaml changes without touching state.db."""
++    return tuple(policy), tuple(policy.interactive)
++
++
++def automated_listing_exclusion(
++    hermes_home: str | Path, db: Any, policy: AutomatedSourcePolicy | None = None,
++) -> tuple[bool, list[str]]:
++    """``(skip_store, exclude_sources)`` for a list that leaves automated rows out in SQL, so they
++    neither fill its pages nor count in its total [daveey]. ``skip_store``: the policy marks every
++    session automated (``"*"``), the store contributes nothing. Otherwise every source spelling the
++    store holds that :func:`is_automated_source` flags, so the SQL filter and the ``automated``
++    stamp agree row for row (the stamp folds case, ``NOT IN`` does not). A row with no source is
++    kept, as the stamp keeps it. Pinned rows are not exempt: the pin back-fill obeys the filter.
++    Why: 2026-11-17, 15,432 auto-archived bot rows in two profiles sat between a user's own
++    archived chats, 34 pages deep."""
++    if policy is None:
++        policy = automated_session_sources(hermes_home)
++    if not policy:
++        return False, []
++    if AUTOMATED_ALL_SOURCES in policy:
++        return True, []
++    held = db.session_count_by_source(include_archived=True)
++    return False, sorted(src for src in held if is_automated_source(src, policy))
++
++
+ def subagent_listing_scope(
+     hermes_home: str | Path, *, source: str | None = None, sources: list[str] | None = None,
+     exclude_sources: list[str] | None = None,
+diff --git a/hermes_cli/web_routers/profiles.py b/hermes_cli/web_routers/profiles.py
+index a74b27369f749249b88af6dc9050d1f9b2e914ba..17f30e8ef90be4be1f06b8ef0124c53a093cd4a8 100644
+--- a/hermes_cli/web_routers/profiles.py
++++ b/hermes_cli/web_routers/profiles.py
+@@ -30,7 +30,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
+ 
+ from fastapi import APIRouter, HTTPException, Query
+ 
+-from hermes_cli.session_listing import automated_session_sources, stamp_automated, subagent_listing_scope
++from hermes_cli.session_listing import (
++    automated_listing_exclusion, automated_policy_key, automated_session_sources, stamp_automated,
++    subagent_listing_scope)
+ from hermes_cli.profile_session_scan_cache import ProfileSessionScanCache
+ from hermes_cli.web_deps import late
+ from hermes_cli.config import get_process_hermes_home
+@@ -436,13 +438,17 @@ def get_profiles_sessions(
+     # over-fetches ``limit + offset``.
+     limit: int = Query(20, ge=0, le=500), offset: int = Query(0, ge=0), min_messages: int = 0,
+     archived: str = "exclude", order: str = "recent", profile: str = "all",
+-    source: str | None = None, sources: str | None = None, exclude_sources: str | None = None, full: bool = False):
++    source: str | None = None, sources: str | None = None, exclude_sources: str | None = None, full: bool = False,
++    automated: str = "include"):
+     """Unified, read-only session list aggregated across ALL profiles: opens each profile's
+     ``state.db`` directly (no dashboard backend per profile) and tags rows with their owning
+     ``profile``. Rows omit ``system_prompt`` / ``model_config`` unless ``full=1`` — same
+-    projection as ``/api/sessions``."""
++    projection as ``/api/sessions``. ``automated=exclude`` leaves out, per profile, the rows its
++    own automated-source policy marks automated (a wholly automated profile contributes nothing)."""
+     if archived not in ("exclude", "only", "include"):
+         raise HTTPException(status_code=400, detail="archived must be one of: exclude, only, include")
++    if automated not in ("include", "exclude"):
++        raise HTTPException(status_code=400, detail="automated must be one of: include, exclude")
+     if order not in ("created", "recent"):
+         raise HTTPException(status_code=400, detail="order must be one of: created, recent")
+ 
+@@ -472,10 +478,19 @@ def get_profiles_sessions(
+             exclude_sources=_csv_list(exclude_sources) or None)
+             if home is not None else (False, filters["exclude_sources"]))
+         scoped = {**filters, "exclude_sources": exclude, "include_subagents": include_subagents}
+-        cache_key = (per_profile, order, full, tuple(
++        # The policy is read here, not in the cached read: it lives in config.yaml, which changes
++        # without moving state.db's data_version, so it has to be part of the key.
++        policy = automated_session_sources(home) if automated == "exclude" and home is not None else None
++        cache_key = (per_profile, order, full, automated_policy_key(policy) if policy is not None else None, tuple(
+             (key, tuple(value) if isinstance(value, list) else value) for key, value in scoped.items()))
+ 
+-        def _read(db):
++        def _read(db, scoped=scoped, home=home, policy=policy):
++            if policy is not None:
++                skip, automated_sources = automated_listing_exclusion(home, db, policy)
++                if skip:
++                    return [], 0
++                scoped = {**scoped, "exclude_sources": sorted(
++                    {*(scoped["exclude_sources"] or []), *automated_sources}) or None}
+             rows = db.list_sessions_rich(
+                 limit=per_profile, offset=0, order_by_last_active=order == "recent",
+                 # Same SQL-level blob skip as /api/sessions.
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index b71ee5f260b6285c9a49d2f11f778ea18df504d9..f278faa03245112da6138d700e514f86dbd72b82 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -20,7 +20,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
+ from fastapi.encoders import jsonable_encoder
+ from fastapi.responses import StreamingResponse
+ 
+-from hermes_cli.session_listing import stamp_automated, subagent_listing_scope
++from hermes_cli.session_listing import automated_listing_exclusion, stamp_automated, subagent_listing_scope
+ from hermes_cli.session_list_flight import SESSION_LIST_CACHE, data_stamp
+ from hermes_cli.web_deps import late
+ from hermes_cli.web_read_coalescing import coalesced_read
+@@ -212,9 +212,12 @@ def get_sessions(
+     limit: int = Query(20, ge=0, le=100), offset: int = Query(0, ge=0), min_messages: int = 0,
+     archived: str = "exclude", order: str = "created", source: str | None = None, sources: str | None = None,
+     exclude_sources: str | None = None, cwd_prefix: str | None = None, full: bool = False,
+-    profile: Optional[str] = None):
++    automated: str = "include", profile: Optional[str] = None):
+     """List sessions.
+ 
++    ``automated=exclude`` leaves out the rows this store's ``sessions.automated_sources`` /
++    ``interactive_sources`` policy marks automated, before paging and in ``total``.
++
+     ``order=recent`` sorts by latest activity across the compression chain, so
+     a long-running chat stays on page one after it auto-compresses onto a fresh
+     id.  Rows omit ``system_prompt`` / ``model_config`` unless ``full=1``.
+@@ -224,7 +227,11 @@ def get_sessions(
+             status_code=400, detail="archived must be one of: exclude, only, include")
+     if order not in ("created", "recent"):
+         raise HTTPException(status_code=400, detail="order must be one of: created, recent")
+-    args = (limit, offset, min_messages, archived, order, source, sources, exclude_sources, cwd_prefix, full, profile)
++    if automated not in ("include", "exclude"):
++        raise HTTPException(status_code=400, detail="automated must be one of: include, exclude")
++    # ``profile`` stays last: the cache key and the payload both read this tuple by position.
++    args = (limit, offset, min_messages, archived, order, source, sources, exclude_sources, cwd_prefix, full,
++            automated, profile)
+     try:
+         db_path = _session_db_path_for_profile(profile)
+     except HTTPException:  # an unknown profile: the uncached path raises the same 400/404
+@@ -269,7 +276,8 @@ list_router.add_api_route("/api/sessions", _sessions_http, methods=["GET"])
+ 
+ 
+ def _list_sessions_payload(
+-    limit, offset, min_messages, archived, order, source, sources, exclude_sources, cwd_prefix, full, profile,
++    limit, offset, min_messages, archived, order, source, sources, exclude_sources, cwd_prefix, full,
++    automated, profile,
+ ) -> dict:
+     """The ``GET /api/sessions`` body for already-validated params (uncached)."""
+     profile_name = _cron_profile_home(profile)[0] if profile else None
+@@ -285,6 +293,13 @@ def _list_sessions_payload(
+             include_subagents, exclude_list = subagent_listing_scope(
+                 Path(db.db_path).parent, source=source or None, sources=source_list or None,
+                 exclude_sources=_csv(exclude_sources) or None)
++            if automated == "exclude":
++                skip, automated_sources = automated_listing_exclusion(Path(db.db_path).parent, db)
++                if skip:
++                    skipped = profile_name or _cron_default_profile()
++                    return {"sessions": [], "total": 0, "limit": limit, "offset": offset, "storage": (
++                        {skipped: STORAGE_CORRUPT} if storage_state(db.db_path) == STORAGE_CORRUPT else {})}
++                exclude_list = sorted({*(exclude_list or []), *automated_sources})
+             scope = dict(
+                 source=source or None, sources=source_list or None,
+                 exclude_sources=exclude_list or None, cwd_prefix=(cwd_prefix or None),
+diff --git a/tests/hermes_cli/test_sessions_automated_exclude.py b/tests/hermes_cli/test_sessions_automated_exclude.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..15ba750ea0effc8857bf525fd8175cdcd45ce761
+--- /dev/null
++++ b/tests/hermes_cli/test_sessions_automated_exclude.py
+@@ -0,0 +1,168 @@
++"""``automated=exclude`` on the session lists: automated rows leave the pages and the total in SQL.
++
++2026-11-17: the Desktop Archived view paged 16,899 archived rows, 15,432 of them bot runs that
++its own filter then hid. The list has to be able to leave them out before paging.
++"""
++
++import pytest
++
++
++@pytest.fixture
++def homes(tmp_path, monkeypatch, _isolate_hermes_home):
++    """A default home (humans + one automated source) and a wholly automated ``bot`` profile."""
++    from hermes_cli import profiles
++    from hermes_constants import get_hermes_home
++
++    default_home = get_hermes_home()
++    profiles_root = default_home / "profiles"
++    bot_home = profiles_root / "bot"
++    for home in (default_home, bot_home):
++        home.mkdir(parents=True, exist_ok=True)
++    (default_home / "config.yaml").write_text(
++        "sessions:\n  automated_sources: [kanban]\n", encoding="utf-8")
++    (bot_home / "config.yaml").write_text(
++        "sessions:\n  automated_sources: ['*']\n", encoding="utf-8")
++    monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: default_home)
++    monkeypatch.setattr(profiles, "_get_profiles_root", lambda: profiles_root)
++    return {"default": default_home, "bot": bot_home}
++
++
++@pytest.fixture
++def client(monkeypatch, homes):
++    from starlette.testclient import TestClient
++
++    import hermes_state
++    from hermes_cli.web_server import _SESSION_HEADER_NAME, _SESSION_TOKEN, app
++
++    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", homes["default"] / "state.db")
++    c = TestClient(app)
++    c.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
++    return c
++
++
++def _seed(home, session_id, source, *, archived=True):
++    from hermes_state import SessionDB
++
++    db = SessionDB(db_path=home / "state.db")
++    try:
++        db.create_session(session_id=session_id, source=source)
++        db.append_message(session_id=session_id, role="user", content="hi")
++        if archived:
++            db.set_session_archived(session_id, True)
++    finally:
++        db.close()
++
++
++def _listed(response):
++    assert response.status_code == 200, response.text
++    body = response.json()
++    return sorted(row["id"] for row in body["sessions"]), body["total"]
++
++
++@pytest.fixture
++def seeded(homes):
++    _seed(homes["default"], "mine-1", "desktop")
++    _seed(homes["default"], "mine-2", "cli")
++    _seed(homes["default"], "card-run", "kanban")
++    _seed(homes["bot"], "bot-1", "desktop")
++    _seed(homes["bot"], "bot-2", "desktop")
++    return homes
++
++
++def test_all_profiles_archived_list_leaves_automated_rows_out_of_rows_and_total(client, seeded):
++    route = "/api/profiles/sessions?profile=all&archived=only&limit=50&order=recent"
++
++    assert _listed(client.get(route)) == (["bot-1", "bot-2", "card-run", "mine-1", "mine-2"], 5)
++
++    response = client.get(route + "&automated=exclude")
++
++    assert _listed(response) == (["mine-1", "mine-2"], 2)
++    assert response.json()["profile_totals"] == {"default": 2, "bot": 0}
++
++
++def test_automated_rows_do_not_take_page_positions(client, seeded):
++    """The point of filtering in SQL: page 1 of size 2 is two human rows, not whatever is newest."""
++    route = "/api/profiles/sessions?profile=all&archived=only&limit=2&order=recent&automated=exclude"
++
++    assert _listed(client.get(route)) == (["mine-1", "mine-2"], 2)
++
++
++def test_single_store_list_honours_the_same_option(client, seeded):
++    assert _listed(client.get("/api/sessions?archived=only&limit=50")) == (["card-run", "mine-1", "mine-2"], 3)
++    assert _listed(client.get("/api/sessions?archived=only&limit=50&automated=exclude")) == (["mine-1", "mine-2"], 2)
++    # A wholly automated store answers with nothing rather than with its rows.
++    assert _listed(client.get("/api/sessions?archived=only&limit=50&profile=bot")) == (["bot-1", "bot-2"], 2)
++    assert _listed(client.get("/api/sessions?archived=only&limit=50&profile=bot&automated=exclude")) == ([], 0)
++
++
++def test_interactive_allowlist_excludes_every_other_source_the_store_holds(client, homes):
++    (homes["default"] / "config.yaml").write_text(
++        "sessions:\n  interactive_sources: [desktop]\n", encoding="utf-8")
++    _seed(homes["default"], "mine-1", "desktop")
++    _seed(homes["default"], "probe", "oneshot")
++    _seed(homes["default"], "card-run", "kanban")
++
++    for route in ("/api/sessions?archived=only&limit=50", "/api/profiles/sessions?profile=default&archived=only&limit=50"):
++        assert _listed(client.get(route + "&automated=exclude")) == (["mine-1"], 1)
++
++
++def test_caller_exclusions_and_the_option_combine(client, seeded):
++    route = "/api/profiles/sessions?profile=all&archived=only&limit=50&automated=exclude&exclude_sources=cli"
++
++    assert _listed(client.get(route)) == (["mine-1"], 1)
++
++
++def test_live_lists_take_the_option_too(client, homes):
++    _seed(homes["default"], "live-mine", "desktop", archived=False)
++    _seed(homes["default"], "live-card", "kanban", archived=False)
++
++    assert _listed(client.get("/api/sessions?limit=50&automated=exclude")) == (["live-mine"], 1)
++
++
++@pytest.mark.parametrize("route", ["/api/sessions", "/api/profiles/sessions"])
++def test_unknown_value_is_refused(client, seeded, route):
++    assert client.get(f"{route}?automated=maybe").status_code == 400
++
++
++def test_no_policy_means_nothing_is_excluded(client, homes):
++    (homes["default"] / "config.yaml").write_text("{}\n", encoding="utf-8")
++    _seed(homes["default"], "mine-1", "desktop")
++    _seed(homes["default"], "card-run", "kanban")
++
++    assert _listed(client.get("/api/sessions?archived=only&limit=50&automated=exclude")) == (["card-run", "mine-1"], 2)
++
++
++def test_a_policy_change_takes_effect_without_a_database_write(client, seeded):
++    """The all-profiles scan is cached until state.db changes; the policy is in config.yaml."""
++    route = "/api/profiles/sessions?profile=all&archived=only&limit=50&order=recent&automated=exclude"
++    assert _listed(client.get(route)) == (["mine-1", "mine-2"], 2)
++
++    for home in seeded.values():
++        (home / "config.yaml").write_text("{}\n", encoding="utf-8")
++
++    assert _listed(client.get(route)) == (["bot-1", "bot-2", "card-run", "mine-1", "mine-2"], 5)
++
++
++def test_a_stored_spelling_in_another_case_is_excluded_like_it_is_stamped(client, homes):
++    _seed(homes["default"], "mine-1", "desktop")
++    _seed(homes["default"], "card-run", "Kanban")
++
++    plain = client.get("/api/sessions?archived=only&limit=50").json()
++    assert {row["id"]: row["automated"] for row in plain["sessions"]} == {"mine-1": False, "card-run": True}
++    assert _listed(client.get("/api/sessions?archived=only&limit=50&automated=exclude")) == (["mine-1"], 1)
++
++
++def test_a_pinned_automated_row_is_left_out_too(client, homes):
++    """Stated behaviour, not an accident: the pin back-fill obeys the same filter."""
++    from hermes_state import SessionDB
++
++    _seed(homes["default"], "mine-1", "desktop")
++    _seed(homes["default"], "card-run", "kanban")
++    db = SessionDB(db_path=homes["default"] / "state.db")
++    try:
++        assert db.set_session_pinned("card-run", True)
++    finally:
++        db.close()
++
++    assert "card-run" in _listed(client.get("/api/sessions?archived=only&limit=50"))[0]
++    assert _listed(client.get("/api/sessions?archived=only&limit=50&automated=exclude")) == (["mine-1"], 1)
+-- 
+2.43.0
+

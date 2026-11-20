@@ -1,0 +1,209 @@
+From d974a70b6dbc1f996afcc9a9a2848386711076c5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 01:20:05 +0000
+Subject: [PATCH] [daveey] Defer hub claims when admission screening is
+ unavailable
+
+---
+ hermes_cli/kanban_hub_admission_claim.py      | 24 ++++++++-------
+ .../test_kanban_denied_claim_disposition.py   | 29 +++++++++++++++++++
+ .../test_kanban_hub_admission_claim.py        | 18 +++++-------
+ .../test_kanban_hub_claim_wake_race.py        |  2 +-
+ 4 files changed, 51 insertions(+), 22 deletions(-)
+
+diff --git a/hermes_cli/kanban_hub_admission_claim.py b/hermes_cli/kanban_hub_admission_claim.py
+index 02f9d9993686f77d214cd59087735d67278ad967..f996248d77f37f803feb913d7a36d2e0043ee87d 100644
+--- a/hermes_cli/kanban_hub_admission_claim.py
++++ b/hermes_cli/kanban_hub_admission_claim.py
+@@ -15,14 +15,14 @@ The screen covers ready and review because a scheduled continuation can resume e
+ * deny: re-placed on the worker queue (the pickup deny route, never ``machine:worker-N``) with a ``moved`` event
+   citing the verdict, so it is not claimed here;
+ * deny of a card that must stay (structural restriction, ``host_repo``, a hub worktree in the brief, an unlocated
+-  hub-local wake_check, or no worker queue fits): the verdict carries ``kept: <reason>``. A probe registered on
++  hub-local wake_check, or home-coordination gate): the verdict carries ``kept: <reason>``. A probe registered on
+   this gateway stays here independently of the ready card's execution; unknown legacy probe custody stays local.
+   A fleet probe in :data:`PORTABLE_WAKE_PROBES` (or ``kanban.placement.portable_wake_probes``) is also portable;
+ * an earlier deny is resolved immediately, including a card bounced back to this hub's machine pin: re-evaluate
+   the structural/pickup constraints, record a current keep or move before claiming, without a new judge call;
+   unchanged keep dispositions do not append duplicate events on each screen;
+-* judge unavailable: claimed as before, warning logged, nothing recorded (judged at its next ready). Failing open
+-  here keeps a judge outage from freezing the hub; only pre-gate cards reach this path.
++* judge unavailable: defer unjudged candidates, warning logged, nothing recorded (judged next tick).
++  Previously admitted cards continue; a deny with no queue and no structural keep also defers.
+ * deferred (``Counts.deferred_ids``, left out of this tick's claims and judged next tick): a card edited while the
+   judge ran (its verdict belongs to a stale snapshot, so none is recorded), and every card past
+   :data:`MAX_JUDGED_PER_TICK` judge calls (each may take the judge's 30 s timeout; a ~27-card backlog at rollout
+@@ -46,7 +46,7 @@ from typing import Any, Optional
+ _log = logging.getLogger(__name__)
+ 
+ ENTRY = "claim"
+-NO_QUEUE = "no worker queue fits"
++
+ WINDOW_SECONDS = 7 * 86400
+ MAX_JUDGED_PER_TICK = 3  # judge calls per dispatcher tick; the rest wait, unclaimed, for the next tick
+ # A wake_check that reads hub-local state (Hermes home, a hub worktree) is probed where the card lives.
+@@ -190,6 +190,7 @@ def screen(conn: sqlite3.Connection, *, cfg: Optional[dict] = None, budget: int
+             continue
+         if down:
+             counts.unavailable += 1
++            counts.defer(tid)
+             continue
+         if calls >= budget:
+             counts.defer(tid)
+@@ -198,12 +199,13 @@ def screen(conn: sqlite3.Connection, *, cfg: Optional[dict] = None, budget: int
+         fields = pickup.card_fields(card, board)
+         try:
+             found = judge.admit({"title": fields["title"], "body": fields["body"]})
+-        except Exception:  # health: allow BLE001 -- a failed judge is unavailable: claimed as before, unjudged
++        except Exception:  # health: allow BLE001 -- a failed judge is unavailable: defer unjudged candidates
+             found = judge.Verdict()
+         if not found.admit and found.why == judge.Verdict().why:
+             down = True  # one outage per tick: never one judge timeout per card
+             counts.unavailable += 1
+-            _log.warning("hub admission: judge unavailable at claim for %s; claiming pre-gate cards unjudged "
++            counts.defer(tid)
++            _log.warning("hub admission: judge unavailable at claim for %s; deferring unjudged cards "
+                          "this tick", tid)
+             continue
+         counts.judged += 1
+@@ -338,13 +340,13 @@ def screened_lanes(conn: sqlite3.Connection, dry_run: bool, review_enabled: bool
+ 
+ 
+ def safe_screen(conn: sqlite3.Connection) -> frozenset:
+-    """Dispatcher seam: the ids this tick must not claim. A failed screen never stops the tick (the cards are
+-    claimed as before)."""
++    """Dispatcher seam: a failed screen cannot turn an unresolved deny into permission to claim."""
+     try:
+         return screen(conn).deferred_ids
+-    except Exception:  # health: allow BLE001 -- claim-time admission is a backstop; local dispatch continues
+-        _log.warning("hub admission: claim screen failed", exc_info=True)
+-        return frozenset()
++    except Exception:  # health: allow BLE001 -- defer the frozen lanes instead of bypassing admission
++        _log.warning("hub admission: claim screen failed; deferring ready/review claims", exc_info=True)
++        return frozenset(row[0] for row in conn.execute(
++            "SELECT id FROM tasks WHERE status IN ('ready', 'review')"))
+ 
+ 
+ def unjudged_claims(conn: sqlite3.Connection, own: str, *, now: Optional[float] = None,
+diff --git a/tests/hermes_cli/test_kanban_denied_claim_disposition.py b/tests/hermes_cli/test_kanban_denied_claim_disposition.py
+index b49de13e60999aa8393c297456038ad79055c662..8ec4885f2f259c40d2f8109101e4b19e6981b977 100644
+--- a/tests/hermes_cli/test_kanban_denied_claim_disposition.py
++++ b/tests/hermes_cli/test_kanban_denied_claim_disposition.py
+@@ -126,6 +126,35 @@ def test_denied_without_queue_or_structural_keep_is_deferred(gws, hub_judge, mon
+     assert not any(event.get("kept") for event in support._events(hub.conn, tid, "hub_admission"))
+ 
+ 
++def test_failed_screen_defers_candidates_instead_of_claiming_denies(gws, monkeypatch):
++    hub, _worker, svc = gws
++    tid = support._hub_card(hub)
++    deny(hub, tid)
++
++    def broken(_conn):
++        raise RuntimeError("screen unavailable")
++
++    monkeypatch.setattr(hac, "screen", broken)
++    support._tick(hub)
++    assert support._holder(svc, tid) != support.HUB
++
++
++def test_judge_outage_defers_all_unjudged_candidates(gws, monkeypatch):
++    from hermes_cli import kanban_hub_admission as judge
++    hub, _worker, svc = gws
++    tids = [support._hub_card(hub, title=f"unjudged {n}") for n in range(2)]
++    calls = []
++
++    def unavailable(*_args, **_kwargs):
++        calls.append(True)
++        return judge.Verdict()
++
++    monkeypatch.setattr(judge, "admit", unavailable)
++    support._tick(hub)
++    assert all(support._holder(svc, tid) != support.HUB for tid in tids)
++    assert len(calls) == 1
++
++
+ def test_create_home_override_is_explicit_keep():
+     from hermes_cli import kanban_hub_admission_placement as placement
+     result = placement.pool_route(
+diff --git a/tests/hermes_cli/test_kanban_hub_admission_claim.py b/tests/hermes_cli/test_kanban_hub_admission_claim.py
+index e828d058e8e31f4a6f51031c1b32fe2e9ea1c586..1bdd83ec2ec5c665d5046957168b2e96fba04f50 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission_claim.py
++++ b/tests/hermes_cli/test_kanban_hub_admission_claim.py
+@@ -7,7 +7,7 @@ pin sweep moved 7 such hub-local cards off the hub by hand after their runs (all
+ were waiting. The hub dispatcher now judges a ready, label-less hub card with no verdict before it claims it:
+ admitted runs here, denied is re-placed on the worker queue (``moved``, never claimed), a denied card that
+ must stay (host workspace, host_repo, a hub worktree or hub-local wake_check) runs here with ``kept``, and an
+-unavailable judge fails open (claimed, no verdict, judged next time).
++unavailable judge defers unjudged cards until a later tick.
+ """
+ from __future__ import annotations
+ 
+@@ -219,7 +219,7 @@ def test_a_deny_no_worker_can_claim_is_kept_home_with_the_action_reason(gws, hub
+     assert "kept=1 home=1" in caplog.text
+ 
+ 
+-def test_an_unavailable_judge_fails_open_once_per_tick(gws, monkeypatch, caplog):
++def test_an_unavailable_judge_defers_once_per_tick(gws, monkeypatch, caplog):
+     hub, _worker, svc = gws
+     calls = []
+ 
+@@ -232,7 +232,7 @@ def test_an_unavailable_judge_fails_open_once_per_tick(gws, monkeypatch, caplog)
+         _tick(hub)
+     assert len(calls) == 1  # one outage per tick, not one judge timeout per card
+     for tid in tids:
+-        assert _holder(svc, tid) == HUB, tid  # fail open: a judge outage never freezes the hub
++        assert _holder(svc, tid) != HUB, tid  # outage is not an admission disposition
+         assert _events(hub.conn, tid, "hub_admission") == []  # no verdict: judged at its next ready
+     assert "hub admission: claim screen judged=0 denied=0 moved=0 kept=0 home=0 unavailable=3" in caplog.text
+ 
+@@ -242,7 +242,7 @@ def test_an_unavailable_verdict_is_not_recorded(gws, monkeypatch):
+     monkeypatch.setattr(judge, "admit", lambda card, hub_reason=None: judge.Verdict())
+     tid = _hub_card(hub)
+     _tick(hub)
+-    assert _holder(svc, tid) == HUB and _events(hub.conn, tid, "hub_admission") == []
++    assert _holder(svc, tid) != HUB and _events(hub.conn, tid, "hub_admission") == []
+ 
+ 
+ @pytest.mark.parametrize("prior", [
+@@ -494,10 +494,9 @@ def test_event_change_before_apply_invalidates_the_decision(gws, hub_judge, monk
+ 
+ def test_unjudged_claims_is_empty_before_the_gate_and_ignores_later_verdicts(gws, monkeypatch):
+     hub, _worker, _svc = gws
+-    monkeypatch.setattr(judge, "admit", lambda card, hub_reason=None: judge.Verdict())  # outage: fail open
+     early = _hub_card(hub, title="claimed before any verdict existed")
+-    _tick(hub)
+-    hub.round()
++    with kb.write_txn(hub.conn):
++        kb._append_event(hub.conn, early, "claimed", {"holder": HUB})
+     assert hac.unjudged_claims(hub.conn, HUB) == []  # no verdict on this board yet: the gate is not live
+     with kb.write_txn(hub.conn):  # a verdict recorded after the claim does not make that claim judged
+         kb._append_event(hub.conn, early, "hub_admission", {"admit": True, "entry": "move"})
+@@ -560,10 +559,9 @@ def test_unjudged_claims_counts_hub_claims_without_a_prior_verdict(gws, hub_judg
+     judged = _hub_card(hub, title="judged")
+     _tick(hub)
+     assert hac.unjudged_claims(hub.conn, HUB) == []
+-    monkeypatch.setattr(judge, "admit", lambda card, hub_reason=None: judge.Verdict())  # outage: fail open
+     unjudged = _hub_card(hub, title="unjudged")
+-    _tick(hub)
+-    hub.round()  # the Board's lease ``claimed`` event (holder=hub) arrives with the next feed
++    with kb.write_txn(hub.conn):  # historical bypass, independent of the fail-closed dispatcher
++        kb._append_event(hub.conn, unjudged, "claimed", {"holder": HUB})
+     assert [tid for tid, _at in hac.unjudged_claims(hub.conn, HUB)] == [unjudged]
+     assert hac.unjudged_claims(hub.conn, HUB, now=time.time() + hac.WINDOW_SECONDS + 60) == []  # aged out
+     assert judged != unjudged
+diff --git a/tests/hermes_cli/test_kanban_hub_claim_wake_race.py b/tests/hermes_cli/test_kanban_hub_claim_wake_race.py
+index 0ae72396c241a56bccae49ca18d16fdf01ba24bb..91399bb72756ba5d7e0578379764431bee727765 100644
+--- a/tests/hermes_cli/test_kanban_hub_claim_wake_race.py
++++ b/tests/hermes_cli/test_kanban_hub_claim_wake_race.py
+@@ -118,7 +118,7 @@ def test_review_wake_preserves_screen_outcomes(gws, hub_judge, monkeypatch, outc
+     elif outcome == "budget":
+         monkeypatch.setattr(hac, "safe_screen", lambda conn: hac.screen(conn, budget=0).deferred_ids)
+     result = helpers._tick(hub)
+-    assert (helpers._holder(svc, tid) == helpers.HUB) == (outcome in {"keep", "unavailable"})
++    assert (helpers._holder(svc, tid) == helpers.HUB) == (outcome == "keep")
+     verdicts = helpers._events(hub.conn, tid, "hub_admission")
+     if outcome == "keep":
+         assert verdicts[0]["kept"] == "wake_check reads a hub-local path"
+-- 
+2.43.0
+

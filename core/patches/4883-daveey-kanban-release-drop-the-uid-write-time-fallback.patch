@@ -1,0 +1,237 @@
+From 3530fa197891a9c56536c570f5f48456038665da Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 21:06:18 +0000
+Subject: [PATCH] [daveey] kanban release: drop the uid write-time fallback
+
+Adversarial review broke both versions of `_same_write`: a sync-enable uid
+backfill that lands within 2 s after a legacy comment write makes backfilled
+uids indistinguishable from write-time ones, and an eventless same-author row
+(specify/decompose `_insert_comment`) can then cover a foreign comment that has
+not synced. No time bound separates the two, so the legacy fallback goes back
+to its created_at rule unchanged, with its original tests.
+
+Kept: the redaction-aware transcript proof and add_comment stamping the row
+inside the write lock (new rows and events agree; new events also carry
+comment_uid). Legacy lock-drift events written before this stay unprovable
+for --seen releases; the 60-minute form without --seen still applies.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_release_comments.py         |  40 +-----
+ .../test_kanban_release_imported_comments.py  | 120 +-----------------
+ 2 files changed, 6 insertions(+), 154 deletions(-)
+
+diff --git a/hermes_cli/kanban_release_comments.py b/hermes_cli/kanban_release_comments.py
+index 30f60f13e0f08657945bad1881df0543d25324e3..ad09e0ae2025fe1880b74c7e5a362854e130ea61 100644
+--- a/hermes_cli/kanban_release_comments.py
++++ b/hermes_cli/kanban_release_comments.py
+@@ -5,7 +5,6 @@ import json
+ import os
+ import shlex
+ import time
+-import uuid
+ from datetime import UTC, datetime
+ 
+ UNREAD_EXIT = 4
+@@ -156,8 +155,7 @@ def _resolve(rows, event, payload, *, local_writer=False):
+     Legacy synced events have no portable reference. Require acknowledgement of
+     every plausible same-time/author row rather than guess among collisions.
+     The timestamp tolerance covers the writer crossing a second between inserts;
+-    UUIDv7 write times cover legacy rows stamped before the write lock (``_same_write``).
+-    Body length cannot disambiguate because add_comment strips stored text.
++    body length cannot disambiguate because add_comment strips stored text.
+     """
+     if payload.get("comment_uid"):
+         return [r for r in rows if "uid" in r.keys() and r["uid"] == payload["comment_uid"]]
+@@ -168,44 +166,10 @@ def _resolve(rows, event, payload, *, local_writer=False):
+         # the second timestamp. Local run provenance makes its integer usable.
+         return [r for r in rows if r["id"] == payload.get("comment_id")
+                 and r["author"] == payload["author"].strip()]
+-    return [r for r in rows if (abs(r["created_at"] - event["created_at"]) <= 1 or _same_write(r, event))
++    return [r for r in rows if abs(r["created_at"] - event["created_at"]) <= 1
+             and (not payload.get("author") or r["author"] == payload["author"].strip())]
+ 
+ 
+-def _uuid7_ms(uid):
+-    """Millisecond write time a UUIDv7 carries; None for any other value."""
+-    try:
+-        value = uuid.UUID(str(uid))
+-    except (ValueError, TypeError, AttributeError):
+-        return None
+-    return value.int >> 80 if value.version == 7 else None
+-
+-
+-def _same_write(row, event):
+-    """Row and event written in one ``add_comment`` transaction, proven by write clocks.
+-
+-    Legacy ``add_comment`` stamped the row's ``created_at`` before waiting for the
+-    write lock and the event's after it, so the integers drift by seconds (5 s and
+-    7 s seen live) while the UUIDv7 uids, minted inside the transaction, sit
+-    milliseconds apart. A uid only records the write when it was minted then: the
+-    sync-enable backfill gives every old row and event a uid of the enable instant,
+-    so the event's uid time must agree with its own ``created_at`` (a floor, so
+-    within [0, 2 s)), the row must be stamped at most ``_LOCK_DRIFT`` before the
+-    event, and the two uids within a second.
+-    """
+-    keys = row.keys()
+-    row_ms = _uuid7_ms(row["uid"]) if "uid" in keys else None
+-    event_ms = _uuid7_ms(event["uid"]) if "uid" in event.keys() else None
+-    if row_ms is None or event_ms is None:
+-        return False
+-    minted_at_write = 0 <= event_ms - event["created_at"] * 1000 < 2000
+-    drift = event["created_at"] - row["created_at"]
+-    return minted_at_write and 0 <= drift <= _LOCK_DRIFT and abs(row_ms - event_ms) <= 1000
+-
+-
+-_LOCK_DRIFT = 60  # seconds a legacy row stamp may precede its event (write-lock wait)
+-
+-
+ def cli_guard(args, tid, verb):
+     """Build a transactional precondition using the CLI's inherited caller identity."""
+     return lambda conn: check(conn, tid, session=os.environ.get("HERMES_SESSION_ID"),
+diff --git a/tests/hermes_cli/test_kanban_release_imported_comments.py b/tests/hermes_cli/test_kanban_release_imported_comments.py
+index 0754bda76b9af84f447f30bab6cbc13878abf26f..5f225d48919d40b31bbee5aa609a268607298944 100644
+--- a/tests/hermes_cli/test_kanban_release_imported_comments.py
++++ b/tests/hermes_cli/test_kanban_release_imported_comments.py
+@@ -167,12 +167,8 @@ def test_delayed_legacy_local_writer(board, entry, broken, capsys):
+                 payload["author"] = "another"
+             if broken == "unhashable_run":
+                 payload["writer_run_id"] = [run]
+-            # Both clocks drift 21 s: with co-minted uids the row is provable by write time alone
+-            # (test_legacy_lock_drift_resolves_by_uid_write_time), and this test is about run provenance.
+-            row_ms = int(conn.execute("SELECT created_at FROM task_comments WHERE id=?", (cid,)).fetchone()[0]) * 1000
+-            conn.execute("UPDATE task_comments SET uid=? WHERE id=?", (_uid_at(row_ms), cid))
+-            conn.execute("UPDATE task_events SET created_at=created_at+21, uid=?, payload=? "
+-                         "WHERE task_id=? AND kind='commented'", (_uid_at(row_ms + 21000), json.dumps(payload), board))
++            conn.execute("UPDATE task_events SET created_at=created_at+21, payload=? "
++                         "WHERE task_id=? AND kind='commented'", (json.dumps(payload), board))
+             if broken != "no_claim":
+                 kb._append_event(conn, board, "claimed", {
+                     "holder": "peer" if broken == "foreign" else "owner", "run_uid": "writer-run"})
+@@ -215,53 +211,9 @@ def test_legacy_ambiguous_same_second_lists_all_candidates(board, capsys, monkey
+     assert ok, output
+ 
+ 
+-def _uid_at(ms):
+-    from hermes_cli.kanban_db_sync import uuid7
+-    raw = uuid7().replace("-", "")
+-    h = f"{ms:012x}" + raw[12:]
+-    return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
+-
+-
+-def _lock_drift(tid, drift_s, uid_gap_ms):
+-    """t_0b716b01a47db7f6 shape: no comment_uid, no transcript, row stamped `drift_s` before its event."""
+-    enable_sync(tid)
+-    cid = comment(tid, session="peer-session", age=8 * 86400, body="Ladder run note from a subagent")
+-    with kbc.connect_closing() as conn:
+-        row = conn.execute("SELECT * FROM task_comments WHERE id=?", (cid,)).fetchone()
+-        ms = (row["created_at"] + drift_s) * 1000 + 300  # live shape: both uids minted at the event time
+-        with kbc.write_txn(conn):
+-            conn.execute("UPDATE task_comments SET uid=? WHERE id=?", (_uid_at(ms), cid))
+-            ev = conn.execute("SELECT id, payload FROM task_events WHERE task_id=? AND kind='commented' "
+-                              "AND json_extract(payload, '$.comment_id')=?", (tid, cid)).fetchone()
+-            payload = json.loads(ev["payload"])
+-            payload.pop("comment_uid", None)
+-            payload.pop("writer_run_id", None)
+-            payload.pop("writer_run_uid", None)
+-            conn.execute("UPDATE task_events SET created_at=?, uid=?, payload=? WHERE id=?",
+-                         (row["created_at"] + drift_s, _uid_at(ms + uid_gap_ms), json.dumps(payload), ev["id"]))
+-    return cid
+-
+-
+-@pytest.mark.parametrize("entry", ["promote", "unblock", "tool"])
+-@pytest.mark.parametrize("drift_s,uid_gap_ms", [(5, 6), (7, 1)])
+-def test_legacy_lock_drift_resolves_by_uid_write_time(board, entry, drift_s, uid_gap_ms, capsys):
+-    """Replay of the two live events (5 s / 6 ms and 7 s / 1 ms): proven by uid time, acknowledged by --seen."""
+-    cid = _lock_drift(board, drift_s, uid_gap_ms)
+-    ok, output = release(board, entry, capsys, cid - 1)
+-    assert not ok and "Ladder run note" in output and "data unavailable" not in output, output
+-    ok, output = release(board, entry, capsys, cid)
+-    assert ok, output
+-
+-
+-@pytest.mark.parametrize("uid_gap_ms", [1500, 60000])
+-def test_legacy_uid_time_far_apart_stays_missing(board, uid_gap_ms, capsys):
+-    cid = _lock_drift(board, 5, uid_gap_ms)
+-    ok, output = release(board, "promote", capsys, cid + 1000)
+-    assert not ok and "data unavailable" in output, output
+-
+-
+ def test_comment_row_is_stamped_inside_the_write_lock(board, monkeypatch):
+-    """The producer half: a 5 s wait for the write lock no longer separates row and event stamps."""
++    """add_comment stamps the row after the write lock, like its event: a 5 s lock wait no longer
++    separates the two (t_0b716b01a47db7f6's legacy events drifted 5 s and 7 s and stay unprovable)."""
+     import contextlib
+     clock = [1794426069.0]
+     monkeypatch.setattr(time, "time", lambda: clock[0])
+@@ -280,67 +232,3 @@ def test_comment_row_is_stamped_inside_the_write_lock(board, monkeypatch):
+         ev_at = conn.execute("SELECT created_at FROM task_events WHERE task_id=? AND kind='commented' "
+                              "AND json_extract(payload, '$.comment_id')=?", (board, cid)).fetchone()[0]
+     assert row_at == ev_at == 1794426074
+-
+-
+-def _uid_salted(ms, salt):
+-    h = f"{ms:012x}" + f"7{salt:03x}" + "8" + f"{salt:03x}" + f"{salt:012x}"
+-    return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
+-
+-
+-@pytest.mark.parametrize("entry", ["promote", "unblock", "tool"])
+-@pytest.mark.parametrize("row_age", [8 * 86400, 2 * 86400 + 30])
+-def test_backfilled_uids_never_bind_a_spare_row(board, entry, row_age, capsys):
+-    """Adversarial review of #3629: sync-enable backfill mints one instant for old rows and events.
+-
+-    An eventless row (``_insert_comment``: specify, decompose) by the same author must not stand in
+-    for a foreign comment that has not synced, however close the backfilled uids are.
+-    """
+-    enable_sync(board)
+-    now = int(time.time())
+-    enabled_ms = (now - 3600) * 1000
+-    spare = sync.RemoteChange(1, "task_comments", _uid_salted(enabled_ms + 2, 1), "upsert",
+-                              {"task_id": board, "author": "default",
+-                               "body": "Specified -- updated body and promoted to todo.",
+-                               "created_at": now - row_age}, 1, "", "peer")
+-    payload = {"author": "default", "len": 40, "comment_id": 77, "writer_kind": "agent",
+-               "writer_session": "peer-session"}
+-    event = sync.RemoteChange(2, "task_events", _uid_salted(enabled_ms + 5, 2), "upsert",
+-                              {"task_id": board, "kind": "commented", "created_at": now - 2 * 86400,
+-                               "payload": json.dumps(payload)}, 1, "", "peer")
+-    with kbc.connect_closing() as conn:
+-        assert sync.apply_remote_changes(conn, [spare, event], new_cursor=2, observers=False).applied == 2
+-        spare_id = conn.execute("SELECT id FROM task_comments WHERE uid=?", (spare.uid,)).fetchone()[0]
+-    before = snapshot(board)
+-    ok, output = release(board, entry, capsys, spare_id)
+-    assert not ok and "Comment data unavailable" in output, output
+-    assert snapshot(board) == before
+-
+-
+-@pytest.mark.parametrize("drift_s", [-2, 61])
+-def test_uid_rule_bounds_row_drift(board, drift_s, capsys):
+-    """Co-minted uids alone do not bind a row stamped after its event or more than a lock wait before it."""
+-    cid = _lock_drift(board, drift_s, 6)
+-    ok, output = release(board, "promote", capsys, cid + 1000)
+-    assert not ok and "data unavailable" in output, output
+-
+-
+-@pytest.mark.parametrize("entry", ["promote", "unblock", "tool"])
+-@pytest.mark.parametrize("variant", ["wrong_author", "non_v7_event", "non_v7_row"])
+-def test_uid_rule_needs_author_and_v7_uids(board, entry, variant, capsys):
+-    """The live lock-drift shape stays missing when the author differs or either uid is not UUIDv7."""
+-    import uuid
+-    cid = _lock_drift(board, 5, 6)
+-    with kbc.connect_closing() as conn:
+-        with kbc.write_txn(conn):
+-            ev = conn.execute("SELECT id, payload FROM task_events WHERE task_id=? AND kind='commented' "
+-                              "AND json_extract(payload, '$.comment_id')=?", (board, cid)).fetchone()
+-            if variant == "wrong_author":
+-                payload = json.loads(ev["payload"])
+-                payload["author"] = "another"
+-                conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), ev["id"]))
+-            elif variant == "non_v7_event":
+-                conn.execute("UPDATE task_events SET uid=? WHERE id=?", (str(uuid.uuid4()), ev["id"]))
+-            else:
+-                conn.execute("UPDATE task_comments SET uid=? WHERE id=?", (str(uuid.uuid4()), cid))
+-    ok, output = release(board, entry, capsys, cid + 1000)
+-    assert not ok and "data unavailable" in output, output
+-- 
+2.43.0
+

@@ -1,0 +1,136 @@
+From 32a521235ccd14b1c01913ee74c19c01be90f907 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 05:36:27 +0000
+Subject: [PATCH] [daveey] test substitutions in parameter and
+ redirection-target words
+
+Audit t_fa2a221efce6a4e2's MacBook oracle (installed core 2ba8ec415a, bash
+3.2.57 and 5.3.9) showed scan_gateway_lifecycle allowing
+  echo "${x:-$(bash SCRIPT)}"
+  echo 1 >"$(bash SCRIPT)"
+while bash ran SCRIPT (a 23-byte `hermes gateway restart` against a fake
+hermes, or an over-cap script) under all five prefixes. Root cause: the walk
+never traversed command-substitution bodies; only unquoted `$(` was caught,
+by shlex's `(` punctuation. PR #2859 (landed as e93c6c8b67..6b554713f2,
+cron/lifecycle_guard_substitutions.py) added that traversal.
+
+These real-bash regressions pin the word contexts #2859 left untested:
+parameter `:-`, `:=`, `:+`, `#` (quoted, unquoted and inner-quoted), quoted
+`>`, `>>`, `<`, `2>` targets, quoted args/assignments and here-strings, each
+with `$()` and backticks across the plain/midword/comment-quote/heredoc/ANSI
+prefixes, plus apostrophes inside double quotes, over-cap scripts failing
+closed, clean-script and single-quoted/escaped inert controls.
+
+RED on pre-#2859 main 35fe1cfce3: 167 of 327 failed (real-bash harness:
+230 of 240 executed rows allowed). GREEN on current main: 327 passed, 0 of
+240 rows allowed; direct `bash SCRIPT` still refused, benign forms allowed.
+Exact-line mutants of the landed traversal, 7/7 killed: no body walk, double
+quotes inert, backticks skipped, double quotes untracked, any `#` a comment,
+`$'` untracked, dq backtick `\"` unescape dropped.
+---
+ ...t_lifecycle_guard_substitution_contexts.py | 93 +++++++++++++++++++
+ 1 file changed, 93 insertions(+)
+ create mode 100644 tests/cron/test_lifecycle_guard_substitution_contexts.py
+
+diff --git a/tests/cron/test_lifecycle_guard_substitution_contexts.py b/tests/cron/test_lifecycle_guard_substitution_contexts.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4a55471125af7dc7b1478134b2c79bd5f1cf708d
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_substitution_contexts.py
+@@ -0,0 +1,93 @@
++"""Command substitutions inside parameter expansions and redirection targets are walked.
++
++Real bash (3.2 and 5.x) runs the substitution in ``"${x:-$(bash S)}"`` and ``>"$(bash S)"``
++before the outer command, even when the redirection then fails. Each row runs real bash with a
++fake ``hermes`` on PATH first, so a row that bash would not execute proves nothing.
++"""
++from __future__ import annotations
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from tests.cron.test_lifecycle_guard_fd_redirections import _bash_runs, _tree
++
++PREFIXES = {
++    'plain': '',
++    'midword': 'echo a#b; ',
++    'comment-quote': "echo hi # it's\n",
++    'heredoc': "cat <<'EOF'\ndon't\nEOF\n",
++    'ansi': "printf %s $'it\\'s'\n",
++}
++WORDS = {
++    'param-default': 'echo "${{x:-{p}}}"',
++    'param-assign': 'echo "${{x:={p}}}"',
++    'param-alternate': 'x=1; echo "${{x:+{p}}}"',
++    'param-strip': 'x=a; echo "${{x#{p}}}"',
++    'param-unquoted': 'echo ${{x:-{p}}}',
++    'param-inner-quoted': 'echo ${{x:-"{p}"}}',
++    'redir-out': 'echo 1 >"{p}"',
++    'redir-append': 'echo 1 >>"{p}"',
++    'redir-in': 'cat <"{p}"',
++    'redir-stderr': 'echo 1 2>"{p}"',
++    'quoted-arg': 'echo "{p}"',
++    'quoted-assign': 'x="{p}"',
++    'here-string': 'cat <<<"{p}"',
++    # An apostrophe inside double quotes is literal; it must not start a single-quoted span.
++    'param-apostrophe': 'echo "it\'s ${{x:-{p}}}"',
++    'redir-apostrophe': 'echo 1 >"it\'s{p}"',
++}
++PAYLOADS = {'dollar': '$({s})', 'backtick': '`{s}`'}
++
++
++def _rows(script: str, words=WORDS):
++    return [pytest.param(PREFIXES[pre] + words[w].format(p=PAYLOADS[p].format(s=script)),
++                         id=f'{pre}-{w}-{p}')
++            for pre in PREFIXES for w in words for p in PAYLOADS]
++
++
++@pytest.mark.parametrize('command', _rows('bash ./r.sh'))
++def test_substitution_in_word_context_refused(tmp_path, command):
++    _tree(tmp_path)
++    assert _bash_runs(tmp_path, command), 'bash must run the restart, or the row proves nothing'
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path))[0] is True
++
++
++@pytest.mark.parametrize('command', _rows(
++    'bash ./r.sh', {k: WORDS[k] for k in ('param-default', 'redir-out')}))
++def test_oversize_script_in_word_context_fails_closed(tmp_path, command):
++    _tree(tmp_path)
++    (tmp_path / 'r.sh').write_text('touch ./ran\n' + '#' * (1 << 20) + '\n')
++    _bash_runs(tmp_path, command)
++    assert (tmp_path / 'ran').exists(), 'bash must run the oversize script'
++    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert unsafe or 'larger than the scan cap' in (refusal or '')
++
++
++@pytest.mark.parametrize('command', [
++    r'echo 1 >"`bash \"./r.sh\"`"',
++    r'x="`bash \"./r.sh\"`"',
++])
++def test_double_quoted_backtick_unescapes_quotes(tmp_path, command):
++    _tree(tmp_path)
++    assert _bash_runs(tmp_path, command)
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path))[0] is True
++
++
++@pytest.mark.parametrize('command', _rows('python3 ./clean.py'))
++def test_clean_substitution_in_word_context_allowed(tmp_path, command):
++    _tree(tmp_path)
++    assert not _bash_runs(tmp_path, command)
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
++
++
++@pytest.mark.parametrize('command', [
++    "echo '${x:-$(bash ./r.sh)}'",
++    "echo 1 >'$(bash ./r.sh)'",
++    r'echo "${x:-\$(bash ./r.sh)}"',
++    r'echo 1 >"\$(bash ./r.sh)"',
++    r"echo $'${x:-$(bash ./r.sh)}'",
++])
++def test_inert_substitution_text_in_word_context_allowed(tmp_path, command):
++    _tree(tmp_path)
++    assert not _bash_runs(tmp_path, command)
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
+-- 
+2.43.0
+

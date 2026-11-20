@@ -1,0 +1,423 @@
+From 3d2037301117f02c0d76ca79427b0066d2d763e4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 15:16:51 +0000
+Subject: [PATCH] [daveey] Narrow exact dashboard bookkeeping reads and reuse
+ episode payloads
+
+Card E stage7: retain unmarked wide task rows after typed bookkeeping comparison, avoid dispatch-priority traversal for ID fetches, use correlated heartbeat marks and covering tuple run inventories, and reuse pure episode payload decoding. Clock/config/replica projection remains live. No acceptance or polling changes.
+
+Proof: seven regression failures on parent code; 202 broader consumer tests and 42 final-head focused tests green. scripts/check all20 green. Scale FAIL: pinned-WAL changed-list GET grows 5.347ms to8.057ms (1.5068262577x > unchanged1.5x); other nine steady-state scale gates pass. Harness exit0 was not acceptance: its report exposes the failure. Live <=0.8% remains unmet; prior stage6 1.121438406% remains authoritative. This PR is an unlanded candidate awaiting owning-card failure disposition, exact-head independent review and CI.
+---
+ hermes_cli/kanban_db_connect.py               |  28 ++++
+ hermes_cli/kanban_db_sync.py                  |   3 +
+ hermes_cli/kanban_diagnostic_history.py       |  10 ++
+ hermes_cli/kanban_diagnostics.py              |   9 +-
+ plugins/kanban/dashboard/board_incremental.py |  47 +++++-
+ plugins/kanban/dashboard/board_read.py        |   8 +-
+ plugins/kanban/dashboard/board_run_history.py |  19 ++-
+ tests/plugins/test_kanban_board_e7.py         | 156 ++++++++++++++++++
+ 8 files changed, 264 insertions(+), 16 deletions(-)
+ create mode 100644 tests/plugins/test_kanban_board_e7.py
+
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 7e3226698f62e9fad23b67c8d73b968f2a31dc09..437c96cce8ce9b95e6a3fa1b72089daf5b908b87 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -1274,9 +1274,37 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
+             pass  # a read-only (delegated-child) opener: the next writer stamps; inheritance has a fallback
+ 
+     _rebuild_drifted_tables(conn)
++    ensure_run_bookkeeping_index(conn)
+     _ensure_notify_sub_triggers(conn)
+ 
+ 
++# [daveey] Covering index for the board GET's exact run-bookkeeping overlay
++# (``plugins/kanban/dashboard/board_run_history._signatures``): every refresh after a commit re-reads these
++# columns for every run of every displayed card, because P2 does not mark bookkeeping-only writes. Without
++# it each of those ~2k runs is a seek into a wide (summary/metadata) table row: 3.7 ms of SQL on the hub
++# board versus 1.3 ms from this index. Its columns are ``kanban_activity_revision.BOOKKEEPING_COLUMNS
++# ['task_runs']`` that exist in the file; ``sync_version`` appears once sync installs it, which re-runs this.
++RUN_BOOKKEEPING_INDEX = "idx_runs_task_bookkeeping"
++_RUN_BOOKKEEPING_ORDER = ("claim_lock", "claim_expires", "last_heartbeat_at", "worker_pid", "worker_started_at",
++                          "sync_version")
++
++
++def ensure_run_bookkeeping_index(conn: sqlite3.Connection) -> None:
++    """Create (or re-create for a new column set) :data:`RUN_BOOKKEEPING_INDEX`. No write when it is current."""
++    cols = {row[1] for row in conn.execute("PRAGMA table_info(task_runs)")}
++    if not {"id", "task_id"} <= cols:
++        return
++    want = [c for c in _RUN_BOOKKEEPING_ORDER if c in cols]
++    ddl = f"CREATE INDEX {RUN_BOOKKEEPING_INDEX} ON task_runs(task_id, id{''.join(', ' + c for c in want)})"
++    found = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
++                         (RUN_BOOKKEEPING_INDEX,)).fetchone()
++    if found is not None and found[0] == ddl:
++        return
++    if found is not None:
++        conn.execute(f"DROP INDEX {RUN_BOOKKEEPING_INDEX}")
++    conn.execute(ddl)
++
++
+ def _ensure_notify_sub_triggers(conn: sqlite3.Connection) -> None:
+     """Stamp ``created_event_id`` on every new notify row (after any rebuild, which drops a table's triggers): the
+     sibling-leg rules read it to tell an event written before the row existed from one it delivered. [daveey]"""
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 3fe56a59dbe62c4c1530efbf015612efbaf3a2a6..b976a7339182935710c608d56225a0ffead81167 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -462,6 +462,9 @@ def apply_sync_schema_steps(conn: sqlite3.Connection) -> None:
+         _add_column_if_missing(conn, table, column, ddl)
+     for table in _UID_TABLES:
+         conn.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_uid ON {table}(uid)")
++    # task_runs.sync_version joins the board's run-bookkeeping covering index.
++    from hermes_cli.kanban_db_connect import ensure_run_bookkeeping_index
++    ensure_run_bookkeeping_index(conn)
+ 
+ 
+ def live_without_install(conn: sqlite3.Connection, db_path: str) -> bool:
+diff --git a/hermes_cli/kanban_diagnostic_history.py b/hermes_cli/kanban_diagnostic_history.py
+index 6e560359211798476d8896fe41f18d31a063d6cf..eb30a3a62ee08ab7f7f1142fb0d30de60f1f760b 100644
+--- a/hermes_cli/kanban_diagnostic_history.py
++++ b/hermes_cli/kanban_diagnostic_history.py
+@@ -83,6 +83,16 @@ class EventHistory(tuple):
+         ordered = sorted(self, key=lambda ev: (_event_ts(ev), _task_field(ev, "id", 0) or 0), reverse=True)
+         return next(((ev,) for ev in ordered if _event_kind(ev) in bounds), ())
+ 
++    @cached_property
++    def episode_skip(self):
++        """``_episode_skip`` of this snapshot, read-only: its JSON payload is parsed once, not per rule."""
++        from hermes_cli.kanban_diagnostics import _event_kind, _parse_payload
++        from hermes_cli.kanban_dispatch_skip import EVENT
++        if not self.quota_candidates or _event_kind(self.quota_candidates[0]) != EVENT:
++            return MappingProxyType({})
++        payload = _parse_payload(self.quota_candidates[0])
++        return MappingProxyType(payload) if isinstance(payload, dict) else payload
++
+     @cached_property
+     def latest_parking(self):
+         from hermes_cli.kanban_diagnostics import _latest_parking_event
+diff --git a/hermes_cli/kanban_diagnostics.py b/hermes_cli/kanban_diagnostics.py
+index 48fc621aefd1a11cd9d310cd05064c1c9bc847f2..c754b46d82b0f2aec7965f31b1123b17ed988f5b 100644
+--- a/hermes_cli/kanban_diagnostics.py
++++ b/hermes_cli/kanban_diagnostics.py
+@@ -12,7 +12,7 @@ from __future__ import annotations
+ 
+ from types import MappingProxyType
+ from dataclasses import asdict, dataclass, field
+-from typing import Any, Callable, Iterable, Optional
++from typing import Any, Callable, Iterable, Mapping, Optional
+ import json
+ import time
+ from hermes_cli.kanban_diagnostic_history import EventHistory
+@@ -796,13 +796,14 @@ def _foreign_machines(task, cfg) -> list[str]:
+             if str(l).startswith("machine:") and str(l).split(":", 1)[1] != own]
+ 
+ 
+-def _episode_skip(events) -> dict:
++def _episode_skip(events) -> Mapping:
+     """Payload of the current ready episode's latest ``dispatch_skipped`` (``kanban_dispatch_skip``), or {} when a
+     later episode event (or none) ends it. Same episode bounds as its reader."""
++    if isinstance(events, EventHistory):
++        return events.episode_skip
+     from hermes_cli.kanban_dispatch_skip import EVENT, _episode_kinds
+     bounds = _episode_kinds() | {EVENT}
+-    ordered = (events.quota_candidates if isinstance(events, EventHistory) else
+-               sorted(events or [], key=lambda ev: (_event_ts(ev), _task_field(ev, "id", 0) or 0), reverse=True))
++    ordered = sorted(events or [], key=lambda ev: (_event_ts(ev), _task_field(ev, "id", 0) or 0), reverse=True)
+     for ev in ordered:
+         if _event_kind(ev) not in bounds:
+             continue
+diff --git a/plugins/kanban/dashboard/board_incremental.py b/plugins/kanban/dashboard/board_incremental.py
+index 57532f8c6450124d698b7fbcf913709a5e42f2b5..aeff83b8b557f2b37246e26e739e913d8b9db3f6 100644
+--- a/plugins/kanban/dashboard/board_incremental.py
++++ b/plugins/kanban/dashboard/board_incremental.py
+@@ -10,6 +10,7 @@ The caller holds one read snapshot around the change cursor and this materializa
+ from __future__ import annotations
+ 
+ import functools
++import marshal
+ import sqlite3
+ from dataclasses import asdict
+ from typing import Callable, Optional
+@@ -45,10 +46,50 @@ def done_epoch(row) -> Optional[int]:
+ def _fetch(conn, filters: dict, ids: list) -> dict:
+     if not ids:
+         return {}
+-    rows = kanban_db.list_task_rows(conn, extra_where=f"id IN ({_ph(ids)})", extra_params=tuple(ids), **filters)
++    # Keyed by ID, so any cheap order will do: the default dispatch order evaluates a
++    # recursive effective-priority subquery per row (most of this read's cost).
++    rows = kanban_db.list_task_rows(conn, extra_where=f"id IN ({_ph(ids)})", extra_params=tuple(ids),
++                                    order_by="created", **filters)
+     return {kanban_db._lossy_text(r["id"]): r for r in rows}
+ 
+ 
++def _bookkeeping_overlay(conn, filters: dict, pcards: dict, changed: list, retained: Optional[dict]) -> dict:
++    """``{task id: current row}`` for displayed and marked IDs, re-reading whole rows only when needed.
++
++    Under a trusted P2 cursor an unmarked task can only have moved in its
++    ``BOOKKEEPING_COLUMNS`` (claim, lease, heartbeat and sync clocks): every other column write
++    marks it. So one narrow indexed read of those columns, compared typed (``marshal``: 1, 1.0
++    and True differ) with the retained row, decides which unmarked rows are still exact; marked,
++    moved or missing rows are read in full. Without retained rows (the first delta after a full
++    read built by an older materializer) every row is read in full, as before.
++    """
++    from hermes_cli.kanban_activity_revision import BOOKKEEPING_COLUMNS
++
++    changed_set = set(changed)
++    want = sorted(changed_set | set(pcards))
++    keep = [tid for tid in pcards if tid not in changed_set]
++    if retained is None or not keep or any(tid not in retained for tid in keep):
++        return _fetch(conn, filters, want)
++    keys = tuple(retained[keep[0]].keys())
++    cols = [c for c in keys if c in BOOKKEEPING_COLUMNS["tasks"]]
++    if any(tuple(retained[tid].keys()) != keys for tid in keep):
++        return _fetch(conn, filters, want)
++    at = [keys.index(c) for c in cols]
++    narrow = {kanban_db._lossy_text(r[0]): tuple(r)[1:] for r in kanban_db.list_task_rows(
++        conn, columns=", ".join(("id", *cols)), extra_where=f"id IN ({_ph(keep)})", extra_params=tuple(keep),
++        order_by="created", **filters)}
++    by_id, reread = {}, set(changed)
++    for tid in keep:
++        row = retained[tid]
++        now = narrow.get(tid)
++        if now is not None and marshal.dumps(now, 2) == marshal.dumps(tuple(row[i] for i in at), 2):
++            by_id[tid] = row
++        else:
++            reread.add(tid)
++    by_id.update(_fetch(conn, filters, sorted(reread)))
++    return by_id
++
++
+ def _rollups(conn, ids) -> dict[str, dict]:
+     """Content-only aggregates for invalidated displayed tasks."""
+     ids = list(ids)
+@@ -224,7 +265,9 @@ def delta(conn, filters: dict, done_limit, diagnostic_inputs: Callable, prev: di
+     if len(changed) > MAX_CHANGED:
+         return None
+     pcards = {t.id: (t, f, e) for t, f, e in prev["cards"]}
+-    by_id = _fetch(conn, filters, sorted(set(changed) | set(pcards)))
++    retained_rows = ({kanban_db._lossy_text(r["id"]): r for r in prev["diag_inputs"][0]}
++                     if prev.get("diag_inputs") else None)
++    by_id = _bookkeeping_overlay(conn, filters, pcards, changed, retained_rows)
+     if set(pcards) - set(changed) - set(by_id):
+         return None
+     done = _done_window(inc, by_id, changed, cap)
+diff --git a/plugins/kanban/dashboard/board_read.py b/plugins/kanban/dashboard/board_read.py
+index 71f47bc905255a4c0f23a53a474451a6caecf381..76d5f7faa7fbcc0aede182dde47f1c4c3e23e4b3 100644
+--- a/plugins/kanban/dashboard/board_read.py
++++ b/plugins/kanban/dashboard/board_read.py
+@@ -78,11 +78,13 @@ def _unmarked_event_marks(conn: sqlite3.Connection, row_ids: list) -> dict[str,
+     if not row_ids:
+         return {}
+     kinds = ",".join(["?"] * len(UNREAD_EVENT_KINDS))
++    # Correlated aggregates: one range seek per task on (kind, task_id, id). A LEFT JOIN +
++    # GROUP BY over the same index cost about 4x as much (same counts and maxima).
++    match = f"FROM task_events e WHERE e.kind IN ({kinds}) AND e.task_id = w.task_id"
+     return {r[0]: (r[1], r[2]) for r in conn.execute(
+         f"WITH wanted(task_id) AS (VALUES {','.join(['(?)'] * len(row_ids))}) "
+-        "SELECT w.task_id, COUNT(e.id), MAX(e.id) FROM wanted w LEFT JOIN task_events e "
+-        f"ON e.task_id = w.task_id AND e.kind IN ({kinds}) GROUP BY w.task_id",
+-        (*row_ids, *UNREAD_EVENT_KINDS))}
++        f"SELECT w.task_id, (SELECT COUNT(*) {match}), (SELECT MAX(e.id) {match}) FROM wanted w",
++        (*row_ids, *UNREAD_EVENT_KINDS, *UNREAD_EVENT_KINDS))}
+ 
+ 
+ def fresh(value):
+diff --git a/plugins/kanban/dashboard/board_run_history.py b/plugins/kanban/dashboard/board_run_history.py
+index f0dc2c366e49e04d3662bab4b605598a0a00481e..b52d16452c99b9ca895d0470c2cc1886b0ae3f17 100644
+--- a/plugins/kanban/dashboard/board_run_history.py
++++ b/plugins/kanban/dashboard/board_run_history.py
+@@ -1,5 +1,7 @@
+ """P2-retained run snapshots with an exact per-read bookkeeping overlay."""
++import itertools
+ import marshal
++import operator
+ from types import MappingProxyType
+ 
+ # P2 excludes these run columns. Even historical terminal runs need the overlay:
+@@ -82,10 +84,13 @@ def _signatures(conn, task_ids, columns) -> dict:
+     if not task_ids:
+         return {}
+     selected = ", ".join(("task_id", "id", *columns))
+-    grouped = {}
+-    for row in conn.execute(
+-            f"SELECT {selected} FROM task_runs "
+-            f"WHERE task_id IN ({','.join('?' for _ in task_ids)}) ORDER BY task_id, id",
+-            tuple(task_ids)):
+-        grouped.setdefault(row[0], []).append(tuple(row)[1:])
+-    return {tid: marshal.dumps(rows, 2) for tid, rows in grouped.items()}
++    # Plain tuples, grouped in C: every GET after a bookkeeping commit reads every run of
++    # every displayed card here, and per-row Row objects were most of its cost.
++    cur = conn.cursor()
++    cur.row_factory = None
++    rows = cur.execute(
++        f"SELECT {selected} FROM task_runs "
++        f"WHERE task_id IN ({','.join('?' for _ in task_ids)}) ORDER BY task_id, id",
++        tuple(task_ids)).fetchall()
++    return {tid: marshal.dumps([row[1:] for row in group], 2)
++            for tid, group in itertools.groupby(rows, key=operator.itemgetter(0))}
+diff --git a/tests/plugins/test_kanban_board_e7.py b/tests/plugins/test_kanban_board_e7.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0aa81c3668b8b46fc679bf481c7fa6f769161108
+--- /dev/null
++++ b/tests/plugins/test_kanban_board_e7.py
+@@ -0,0 +1,156 @@
++"""Stage7 removes repeated SQL/projection work without weakening exact reads."""
++import json
++import sqlite3
++from types import MappingProxyType
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_diagnostics as kd
++from plugins.kanban.dashboard import board_incremental as bi
++from plugins.kanban.dashboard import board_read as br
++from tests.plugins import test_kanban_board_incremental as helpers
++
++board = helpers.board
++
++
++def test_episode_payload_is_decoded_once_but_clock_remains_live(monkeypatch):
++    events = kd.EventHistory([{'id': 1, 'kind': 'dispatch_skipped', 'created_at': 10,
++                               'payload': json.dumps({'reason': 'pinned_quota_wall', 'until': 100})}])
++    calls = []
++    original = kd._parse_payload
++    def parse(event):
++        calls.append(event)
++        return original(event)
++    monkeypatch.setattr(kd, '_parse_payload', parse)
++    assert kd._pinned_quota_hold_until(events, 99) == 100
++    assert kd._pinned_quota_hold_until(events, 100) is None
++    assert kd._pinned_quota_hold_until(events, 90) == 100
++    assert len(calls) == 1
++    newer = kd.EventHistory([*events, {'id': 2, 'kind': 'claimed', 'created_at': 11, 'payload': '{}'}])
++    assert kd._episode_skip(newer) == kd._episode_skip(tuple(newer))
++
++
++def test_proxy_identity_does_not_hide_mutable_backing(monkeypatch):
++    source = {'ended_at': 10}
++    runs = [MappingProxyType(source)]
++    events = kd.EventHistory([])
++    monkeypatch.setattr(kd, '_last_ready_entry_ts', lambda _e, r: r[0]['ended_at'])
++    assert events.ready_floor(runs) == 10
++    source['ended_at'] = 20
++    assert events.ready_floor(runs) == 20
++
++
++def test_incremental_fetch_avoids_dispatch_priority_walk(board, monkeypatch):
++    ids, _ = helpers._seed()
++    original = kb.list_task_rows
++    orders = []
++    def read(conn, **kwargs):
++        orders.append(kwargs.get('order_by'))
++        return original(conn, **kwargs)
++    monkeypatch.setattr(kb, 'list_task_rows', read)
++    conn = kbc.connect()
++    try:
++        result = bi._fetch(conn, {}, ids)
++        assert set(result) == set(ids)
++        assert orders == ['created']
++    finally:
++        conn.close()
++
++
++@pytest.mark.parametrize('column,value', [('last_heartbeat_at', 123), ('worker_pid', 321),
++                                         ('claim_expires', 222), ('title', 'changed')])
++def test_delta_reads_only_moved_wide_rows(board, monkeypatch, column, value):
++    ids, _ = helpers._seed()
++    helpers._read(board)
++    fetched = []
++    original = bi._fetch
++    def fetch(conn, filters, ids):
++        fetched.extend(ids)
++        return original(conn, filters, ids)
++    monkeypatch.setattr(bi, '_fetch', fetch)
++    conn = kbc.connect()
++    try:
++        conn.execute(f'UPDATE tasks SET {column} = ? WHERE id = ?', (value, ids[0]))
++        conn.commit()
++        result = helpers._stable(helpers._read(board))
++        assert set(fetched) == {ids[0]}
++        assert result == helpers._cold(board)
++    finally:
++        conn.close()
++
++
++def test_run_covering_index_upgrades_and_settles():
++    conn = sqlite3.connect(':memory:')
++    try:
++        conn.execute('CREATE TABLE task_runs(id INTEGER PRIMARY KEY, task_id TEXT, claim_lock TEXT, '
++                     'claim_expires INTEGER, last_heartbeat_at INTEGER, worker_pid INTEGER, worker_started_at INTEGER)')
++        kbc.ensure_run_bookkeeping_index(conn)
++        conn.execute('ALTER TABLE task_runs ADD COLUMN sync_version INTEGER')
++        kbc.ensure_run_bookkeeping_index(conn)
++        columns = [row[2] for row in conn.execute('PRAGMA index_info(idx_runs_task_bookkeeping)')]
++        assert columns == ['task_id', 'id', 'claim_lock', 'claim_expires', 'last_heartbeat_at',
++                           'worker_pid', 'worker_started_at', 'sync_version']
++        version = conn.execute('PRAGMA schema_version').fetchone()[0]
++        kbc.ensure_run_bookkeeping_index(conn)
++        assert conn.execute('PRAGMA schema_version').fetchone()[0] == version
++        plan = conn.execute('EXPLAIN QUERY PLAN SELECT task_id,id,claim_lock,claim_expires,last_heartbeat_at,'
++                            'worker_pid,worker_started_at,sync_version FROM task_runs '
++                            "WHERE task_id IN ('a','b') ORDER BY task_id,id").fetchall()
++        assert any('COVERING INDEX idx_runs_task_bookkeeping' in row[3] for row in plan)
++    finally:
++        conn.close()
++
++
++def test_overlay_without_retained_rows_uses_exact_fetch(board):
++    ids, _ = helpers._seed()
++    conn = kbc.connect()
++    try:
++        result = bi._bookkeeping_overlay(conn, {}, dict.fromkeys(ids), [], None)
++        assert {k: tuple(v) for k, v in result.items()} == {
++            k: tuple(v) for k, v in bi._fetch(conn, {}, ids).items()}
++    finally:
++        conn.close()
++
++
++def test_schema_change_and_deleted_row_match_full_read(board):
++    ids, _ = helpers._seed()
++    helpers._read(board)
++    conn = kbc.connect()
++    try:
++        conn.execute('ALTER TABLE tasks ADD COLUMN e7_new_column TEXT')
++        conn.execute('DELETE FROM tasks WHERE id = ?', (ids[-1],))
++        conn.commit()
++        assert helpers._stable(helpers._read(board)) == helpers._cold(board)
++    finally:
++        conn.close()
++
++
++def test_sync_schema_installs_same_covering_index(board):
++    from hermes_cli import kanban_db_sync
++    conn = kbc.connect()
++    try:
++        kanban_db_sync.apply_sync_schema_steps(conn)
++        columns = [r[2] for r in conn.execute('PRAGMA index_info(idx_runs_task_bookkeeping)')]
++        assert 'sync_version' in columns
++        before = conn.execute('PRAGMA schema_version').fetchone()[0]
++        kbc.ensure_run_bookkeeping_index(conn)
++        assert conn.execute('PRAGMA schema_version').fetchone()[0] == before
++    finally:
++        conn.close()
++
++
++def test_unmarked_event_marks_preserve_duplicates_and_empty_tasks():
++    conn = sqlite3.connect(':memory:')
++    conn.row_factory = sqlite3.Row
++    try:
++        conn.execute('CREATE TABLE task_events(id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT)')
++        from hermes_cli.kanban_activity_revision import UNREAD_EVENT_KINDS
++        kind = next(iter(UNREAD_EVENT_KINDS))
++        conn.executemany('INSERT INTO task_events VALUES (?,?,?)', [(1, 'a', kind), (2, 'a', kind),
++                                                                   (3, 'b', 'created')])
++        assert br._unmarked_event_marks(conn, ['a', 'b', 'missing']) == {
++            'a': (2, 2), 'b': (0, None), 'missing': (0, None)}
++    finally:
++        conn.close()
+-- 
+2.43.0
+

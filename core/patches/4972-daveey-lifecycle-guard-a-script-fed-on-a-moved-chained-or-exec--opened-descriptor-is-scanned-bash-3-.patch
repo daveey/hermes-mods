@@ -1,0 +1,331 @@
+From 516a47b4163f1fe03cd8d9af1b88b1d0051a1559 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 22:23:08 +0000
+Subject: [PATCH] [daveey] lifecycle guard: a script fed on a moved, chained or
+ `exec`-opened descriptor is scanned (`bash 3<r.sh <&3-`, `exec 3<r.sh; bash
+ <&3`)
+
+PR #2702 made `bash 3<r.sh <&3` block: `<&N` after `N<f` in the same
+command reads f. Sibling forms still fed r.sh to bash unscanned, and
+scan_gateway_lifecycle returned (False, None) for a script that restarts
+the gateway:
+
+- Move form `bash 3<r.sh <&3-` / `0<&3-`: the target `3-` was looked up
+  as-is and is never a key.
+- `bash 3<r.sh 0>&3`: `0>&3` is dup2(3, 0) like `0<&3`.
+- Chains: `bash 3<r.sh 4<&3 <&4`, `4<&3- <&4`.
+- A descriptor opened by an earlier `exec` with only redirections, which
+  keeps it open in the shell for later commands on the same line or later
+  lines: `exec 3<r.sh; bash <&3`, `exec 3<r.sh && bash <&3`,
+  `exec 3<r.sh; cat <&3 | bash`, `exec 3<r.sh; { bash; } <&3`,
+  `exec 3<r.py; python3 <&3`, `exec <r.sh; bash <&0`.
+- A redirection in command position (`3<r.sh bash <&3`,
+  `3<r.sh cat <&3 | bash`, `exec 3<r.sh bash <&3`): the hoist moved it to
+  the end, after the `<&3` that reads it.
+
+Fix:
+- New cron/lifecycle_guard_fds.py (lifecycle_guard.py sits at its
+  FILE_LINES cap) holds REDIRECTION and split_redirections, now driven by
+  one descriptor table (apply_redirection): `<`/`<>` open, `<&N`, `<&N-`
+  and `0>&N` copy (a move also closes N), anything else clears.
+- carry_exec_descriptors keeps the table across the lines of one command
+  (`_iter_segment_contexts`): a redirection-only `exec` updates it (read
+  wherever it stands, in a subshell or branch too: fail closed, the file
+  is only scanned), and a later `<&N` the command did not set itself is
+  rewritten to `< f`. Fast path when nothing is open and no `exec` token.
+- _command_segment_views adds an in-order hoist (command-position
+  redirections right after the command word, ahead of the command's own)
+  before the existing end-hoist, which positional readers (`source x`,
+  `launchctl submit`) still use.
+
+Still allowed: `bash <&3 3<r.sh` (not open yet), `bash <&3; exec 3<r.sh`
+(opened later), a clean script, the command's own `3<clean.sh` over a carried
+`3<r.sh`, a carried descriptor closed (`exec 3<&-`), re-pointed or moved
+away, `exec 3<r.sh true; bash <&3`, `bash 3<r.sh >&3`.
+
+RED/GREEN: tests/cron/test_lifecycle_guard_descriptor_carry.py: 32 failed /
+17 passed with cron/ at the #2702 head be63ac710f, 49 passed at head.
+tests/cron + the five lifecycle-guard suites outside it via
+run_tests.sh: 244 files, 3424 passed, 0 failed, 9 skipped. The 8000-line
+heredoc timing test stays at base speed (~2.1 s vs ~2.0 s standalone).
+
+Card: t_78b1ff930ed8af7c (found reviewing PR #2702, review 5898640962).
+---
+ cron/lifecycle_guard.py                       |   5 +-
+ cron/lifecycle_guard_fds.py                   |  94 ++++++++++++
+ .../test_lifecycle_guard_descriptor_carry.py  | 139 ++++++++++++++++++
+ 3 files changed, 237 insertions(+), 1 deletion(-)
+ create mode 100644 cron/lifecycle_guard_fds.py
+ create mode 100644 tests/cron/test_lifecycle_guard_descriptor_carry.py
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index 4d0d0bf81170aa4f344c24a3d43fd59c6673e599..3306d78e461e45595aa76a22f6f31fc45776dfcf 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -25,6 +25,7 @@ from cron.lifecycle_guard_groups import (
+     heredoc_scripts, heredoc_views_overflow, iter_script_segment_contexts, join_continued_lines)
+ from cron.lifecycle_guard_words import REDIRECTION as _REDIRECTION
+ from cron.lifecycle_guard_words import redirection_parts, tokenize_redirections
++from cron.lifecycle_guard_fds import carry_exec_descriptors
+ from cron.lifecycle_guard_lines import join_line_continuations
+ # Lines a printer may print, walked as the sink's command (moved out for FILE_LINES).
+ from cron.lifecycle_guard_printf import printed_argument_lines as _printed_argument_lines
+@@ -793,7 +794,9 @@ def _iter_segment_contexts(
+         return _opens_call_arguments(segment) and alias_names.isdisjoint(segment)
+     for script in heredoc_scripts(command):
+         yield from iter_script_segment_contexts(
+-            join_continued_lines(_iter_command_token_lists(script)),
++            carry_exec_descriptors(
++                join_continued_lines(_iter_command_token_lists(script)), pattern=_REDIRECTION,
++                peel_reserved_words=_peel_reserved_words, control_chars=_CONTROL_CHARS),
+             cat_operands=_cat_operands, cat_relays_stdin=_cat_relays_stdin,
+             opens_call_arguments=opens_call, peel_reserved_words=_peel_reserved_words,
+             stdin_redirections=lambda words: _split_redirections(words)[1])
+diff --git a/cron/lifecycle_guard_fds.py b/cron/lifecycle_guard_fds.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..90ecfe6ea7a20253bbd49154173d07cafe812c43
+--- /dev/null
++++ b/cron/lifecycle_guard_fds.py
+@@ -0,0 +1,94 @@
++"""Carry redirection-only exec file descriptors into later script commands.
++
++Keep lexical redirection metadata intact; quoted operator-shaped arguments are data.
++The caller's existing ordered fd resolver handles each command's local redirections.
++"""
++from __future__ import annotations
++
++from collections.abc import Callable, Iterable, Iterator
++import re
++
++from cron.lifecycle_guard_words import ShellWord, redirection_parts
++
++
++def _redirections(words: list[str], pattern: re.Pattern[str]):
++    index = 0
++    while index < len(words):
++        parts = redirection_parts(words[index], pattern)
++        start, index = index, index + 1
++        if parts is None:
++            continue
++        fd, operator, target = parts
++        if not target and index < len(words):
++            target = words[index]
++            index += 1
++        yield start, index, (fd, operator, target)
++
++
++def _apply(table: dict[str, str], fd: str, operator: str, target: str) -> None:
++    fd = fd or ("0" if operator.startswith("<") else "1")
++    source = target.removesuffix("-")
++    value = table.get(source) if operator in ("<&", ">&") else None
++    table.pop(fd, None)
++    if operator in ("<", "<>") and target:
++        table[fd] = target
++    elif value is not None:
++        table[fd] = value
++    if operator in ("<&", ">&") and target.endswith("-"):
++        table.pop(source, None)
++    if operator in ("&>", "&>>"):
++        table.pop("2", None)
++
++
++def _carry_segment(segment: list[str], table: dict[str, str], command: int,
++                   pattern: re.Pattern[str]) -> list[str]:
++    found = list(_redirections(segment[command + 1:], pattern))
++    if segment[command:command + 1] == ["exec"] and sum(
++            end - start for start, end, _ in found) == len(segment) - command - 1:
++        for _, _, parts in found:
++            _apply(table, *parts)
++        return segment
++    out: list[str] = []
++    local = dict(table)
++    position = 0
++    for start, end, (fd, operator, target) in _redirections(segment, pattern):
++        source = target.removesuffix("-")
++        value = local.get(source) if operator in ("<&", ">&") else None
++        if value is not None:
++            out.extend(segment[position:start])
++            destination = fd or ("0" if operator.startswith("<") else "1")
++            out.append(ShellWord(destination + "<", (destination, "<", "")))
++            out.append(ShellWord(value, None))
++            # A moved source is closed after copying, including same-fd moves.
++            if target.endswith("-"):
++                out.append(ShellWord(source + "<&-", (source, "<&", "-")))
++            position = end
++        _apply(local, fd, operator, target)
++    out.extend(segment[position:])
++    return out
++
++
++def carry_exec_descriptors(
++    lines: Iterable[list[str]], *, pattern: re.Pattern[str],
++    peel_reserved_words: Callable[[list[str]], int], control_chars: frozenset[str],
++) -> Iterator[list[str]]:
++    """Resolve inherited fd copies in script order, without changing pipeline boundaries.
++
++    Redirection-only execs in branches/groups are conservatively carried too. Each
++    script gets its own table, so heredoc bodies cannot rebind their enclosing script.
++    """
++    table: dict[str, str] = {}
++    for tokens in lines:
++        if not table and "exec" not in tokens:
++            yield tokens
++            continue
++        out: list[str] = []
++        segment: list[str] = []
++        for token in [*tokens, ";"]:
++            if not (token and set(token) <= control_chars):
++                segment.append(token)
++                continue
++            out.extend(_carry_segment(segment, table, peel_reserved_words(segment), pattern))
++            out.append(token)
++            segment = []
++        yield out[:-1]
+diff --git a/tests/cron/test_lifecycle_guard_descriptor_carry.py b/tests/cron/test_lifecycle_guard_descriptor_carry.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f7626f13ec722a8f10866c9fd50410828f0b151a
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_descriptor_carry.py
+@@ -0,0 +1,139 @@
++"""A script fed on a descriptor moved, chained or opened by an earlier ``exec`` is read
++(t_78b1ff930ed8af7c).
++
++``bash 3<f.sh <&3`` was blocked, but the move form ``bash 3<f.sh <&3-`` (target ``3-``) and a
++descriptor opened by an earlier ``exec`` (``exec 3<f.sh; bash <&3``) let ``bash`` read ``f.sh``
++unscanned. So did ``0>&3`` (``dup2(3, 0)`` like ``0<&3``), a chain (``4<&3 <&4``) and a
++redirection written before the command (``3<f.sh bash <&3``), which the hoist moved after the
++``<&3`` that reads it.
++"""
++
++from __future__ import annotations
++
++import shlex
++
++import pytest
++
++from cron import lifecycle_guard
++from cron.lifecycle_guard import scan_gateway_lifecycle
++
++# Assembled so this file's own text never carries the literal command.
++LIFECYCLE = " ".join(["hermes", "gateway", "re" + "start"])
++
++
++@pytest.fixture
++def files(tmp_path) -> dict[str, str]:
++    sh = tmp_path / "r.sh"
++    sh.write_text(f"#!/bin/sh\necho hi\n{LIFECYCLE}\n", encoding="utf-8")
++    py = tmp_path / "r.py"
++    py.write_text(f"import os\nos.system({LIFECYCLE!r})\n", encoding="utf-8")
++    clean_sh = tmp_path / "clean.sh"
++    clean_sh.write_text("echo ok\n", encoding="utf-8")
++    return {name: shlex.quote(str(path)) for name, path in
++            {"sh": sh, "py": py, "clean_sh": clean_sh}.items()}
++
++
++@pytest.mark.parametrize(
++    "template",
++    [
++        # The card's move form.
++        "bash 3<{sh} <&3-",
++        "bash 3<{sh} 0<&3-",
++        "bash 3< {sh} <& 3-",
++        # Other ways one command puts the opened file on stdin.
++        "bash 3<{sh} 0>&3",
++        "bash 3<{sh} 4<&3 <&4",
++        "bash 3<{sh} 4<&3- <&4",
++        "3<{sh} bash <&3",
++        "3<{sh} cat <&3 | bash",
++        "exec 3<{sh} bash <&3",
++        "cat 3<{sh} <&3- | bash",
++        "python3 3<{py} <&3-",
++        # The card's cross-command form: `exec` with only redirections keeps them open.
++        "exec 3<{sh}; bash <&3",
++        "exec 3<{sh}\nbash <&3",
++        "exec 3< {sh}; bash 0<& 3",
++        "exec 3<{sh} && bash <&3",
++        "exec 3<{sh}; bash <&3-",
++        "exec 3<{sh}; bash 0>&3",
++        "exec 3<{sh} 4<&3; bash <&4",
++        "exec 3<{sh}; exec 4<&3-; bash <&4",
++        "exec 3<{sh}; exec 4<&3; exec 3<&-; bash <&4",
++        "exec 3<{sh}; cat <&3 | bash",
++        "exec 3<{sh}; {{ bash; }} <&3",
++        "exec 3<{py}; python3 <&3",
++        "exec <{sh}; bash <&0",
++        "{{ exec 3<{sh}; }}; bash <&3",
++        "if true; then exec 3<{sh}; fi; bash <&3",
++        "exec 3<{clean_sh}; exec 3<{sh}; bash <&3",
++        "exec 3<{sh}; bash 4<&3- <&4",
++        "exec 3<{sh}; bash -s '3<&-' <&3",
++        "exec 3<{sh}; bash -s '3>/dev/null' <&3",
++        "exec 3<{sh}; bash -s <&3 '0<&-'",
++        "exec 3<{sh}; bash -s <&3 '0>/dev/null'",
++        "exec 3<{sh}; bash 1>&3 <&1",
++    ],
++)
++def test_descriptor_fed_script_is_scanned(files, template):
++    assert scan_gateway_lifecycle(template.format(**files)) == (True, None)
++
++
++@pytest.mark.parametrize(
++    "template",
++    [
++        # A duplication before the open reads nothing: the descriptor is not open yet.
++        "bash <&3 3<{sh}",
++        "bash <&3- 3<{sh}",
++        "bash <&3; exec 3<{sh}",
++        # A clean script stays clean on every path.
++        "bash 3<{clean_sh} <&3-",
++        "exec 3<{clean_sh}; bash <&3",
++        "exec 3<{clean_sh}; bash <&3-",
++        # The command's own open wins over the carried one.
++        "exec 3<{sh}; bash 3<{clean_sh} <&3",
++        # Closed, re-pointed or moved away before the read.
++        "exec 3<{sh}; exec 3<&-; bash <&3",
++        "exec 3<{sh}; exec 3>/dev/null; bash <&3",
++        "exec 3<{sh}; exec 3<{clean_sh}; bash <&3",
++        "exec 3<{sh}; exec 4<&3-; bash <&3",
++        # Another descriptor, or none, reads no carried file.
++        "exec 3<{sh}; bash <&4",
++        "exec 3<{sh}; bash",
++        # `exec` that runs a command replaces the shell: its redirections are that command's.
++        "exec 3<{sh} true; bash <&3",
++        # A writing duplication on stdout is not stdin.
++        "bash 3<{sh} >&3",
++        "exec 3<{sh}; bash >&3",
++        "exec 3<{sh}; bash <&3 <{clean_sh}",
++        "exec 3<{sh}; bash 4<&3- <&3",
++        "exec 3<{sh}; bash 3<&3- <&3",
++        "exec 3<{sh}; bash 3>&- <&3",
++        "exec 3<{sh}; bash '<&3'",
++        "exec '3<{sh}'; bash <&3", 
++    ],
++)
++def test_unread_or_clean_descriptor_stays_allowed(files, template):
++    assert scan_gateway_lifecycle(template.format(**files)) == (False, None)
++
++
++def test_in_order_hoist_keeps_shell_order():
++    hoist = lifecycle_guard._hoist_command_redirections
++    assert hoist(["3<f", "bash", "<&3"]) == ["bash", "3<f", "<&3"]
++    assert hoist(["sudo", "<", "f", "bash", "-x"]) == [
++        "sudo", "bash", "<", "f", "-x"]
++    assert hoist(["<"]) == ["<"]
++
++
++@pytest.mark.parametrize(
++    ("arguments", "stdin"),
++    [
++        (["3<f", "<&3-"], ["f"]),
++        (["3<f", "0>&3"], ["f"]),
++        (["3<f", "4<&3-", "<&3"], []),
++        (["3<f", ">&3"], []),
++        (["<&3", "3<f"], []),
++        (["<", "f", "<&0"], ["f"]),
++    ],
++)
++def test_split_redirections_follows_descriptors(arguments, stdin):
++    assert lifecycle_guard._split_redirections(arguments) == ([], stdin)
+-- 
+2.43.0
+

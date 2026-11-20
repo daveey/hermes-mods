@@ -1,0 +1,342 @@
+From f65ca629e4b1f8b278517ad815adab8251ce0f23 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 23:40:55 -0800
+Subject: [PATCH] [daveey] CI: affected-test selection follows import-time
+ imports; full suite runs 12 slices
+
+Pull request CI took 14 min at p50 (p90 15.4, 60 green runs on 2026-11-18), nearly all of it the
+eight Python slices at 10-11 min each. Two causes:
+
+1. scripts/ci/affected_tests.py almost never selected. It followed function-level imports at every
+   depth, which ties the source tree into one cycle: 80% of source modules reached 96% of the test
+   files, over the 40% full-suite cutoff, so 54 of 60 pull requests ran the full suite ("9690 of
+   10047 test files affected" for a 3-file change). Now a file under tests/ counts for every import
+   it holds; a source module passes a change on through import-time imports only, except that a
+   source module naming the changed module in a function-level import is itself affected (one hop).
+   `if TYPE_CHECKING:` imports never count. Replaying the last 80 merged pull requests on this tree:
+   69 select affected files (median 9% of the suite, p90 31%), 11 still run the full suite.
+   Given up: a test that reaches the change only through a function-level import two or more source
+   modules away runs on the main push, not on the pull request.
+
+2. The suite grew from ~7.2 h to ~12.9 h of per-file time since the eight slices were sized
+   (2026-10-29). MAX_SLICES and the tests.yml default go to 12 (~65 min of files, ~7-8 min a slice);
+   SLICE_SECONDS drops to 16 x 240 so an affected slice is no larger than a full-suite one.
+   upstream-sync.yml passes its own eight-slice list and its required job names, unchanged.
+
+Proof: tests/ci/test_affected_tests.py 44 passed (new cases: import-time closure through a class body,
+async def, one function-level hop and no second, TYPE_CHECKING bare and negated, a lazily importing hub), tests/ci/test_fast_runner_routing.py 19 passed,
+tests/ci/test_detect_planner_checkout.py 2 passed, run with hermes-core-wt test --local on macOS;
+ruff clean. Not run here: scripts/check and the Linux suite.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .github/workflows/tests.yml          | 19 +++----
+ .github/workflows/upstream-sync.yml  |  3 +-
+ scripts/ci/affected_tests.py         | 71 ++++++++++++++++++++++----
+ tests/ci/test_affected_tests.py      | 74 +++++++++++++++++++++++++---
+ tests/ci/test_fast_runner_routing.py |  4 +-
+ 5 files changed, 143 insertions(+), 28 deletions(-)
+
+diff --git a/.github/workflows/tests.yml b/.github/workflows/tests.yml
+index 3f870b19065de7ee0278ed4863831ad72b87431b..2e31387942d937104cddf5cea8420b155c96ba5c 100644
+--- a/.github/workflows/tests.yml
++++ b/.github/workflows/tests.yml
+@@ -18,7 +18,7 @@ on:
+         description: JSON list of slice numbers, 1..N (ci.yaml detect sizes it from test_durations.json).
+         type: string
+         required: false
+-        default: '[1, 2, 3, 4, 5, 6, 7, 8]'
++        default: '[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]'
+       python:
+         description: >-
+           Run the Python slices and the Termux assembly lane. false runs only the e2e lanes below
+@@ -57,22 +57,23 @@ concurrency:
+ 
+ jobs:
+   test:
+-    # Eight slices, each on its own autoscaled VM (tfgar-tests: one on-demand
+-    # c7a.2xlarge per job, terminated after it; metta#29975, runner session).
+-    # Measured 2026-10-29 with two slices on the shared hermes-hub pool: 42 min
+-    # run + 19 min p50 queue per slice, ~75% of all CI runner-hours. The suite is
+-    # ~7.2 h of per-file wall time; split 8 ways by run_tests_parallel.py's LPT on
+-    # test_durations.json that is ~55 min of files per slice, ~7 min at -j 16
++    # Twelve slices, each on its own 8 vCPU Blacksmith VM. Eight were sized on
++    # 2026-10-29 for ~7 min a slice; by 2026-11-18 the suite had grown from ~7.2 h
++    # to ~12.9 h of per-file wall time and a slice ran 10-11 min (worst 13.8),
++    # so a full run took 14 min. Twelve is ~65 min of files per slice by
++    # run_tests_parallel.py's split, ~7-8 min at -j 16
+     # (2 x nproc on 8 vCPU; the VM is not in a shared CPU slice, so
+     # test_workers.py falls back to 2 x nproc). run_tests_parallel.py partitions
+     # from the checkout alone, so all slices agree on the split.
++    # Before 2026-10-29, two slices on the shared hermes-hub pool ran 42 min
++    # + 19 min p50 queue each, ~75% of all CI runner-hours.
+     #
+     # Pull requests usually run one slice of affected files (ci.yaml detect sizes the
+-    # matrix, scripts/ci/affected_tests.py); every other event runs all eight.
++    # matrix, scripts/ci/affected_tests.py); every other event runs all twelve.
+     if: inputs.python
+     name: Run tests (${{ inputs.python_changed != '' && 'affected, ' || '' }}${{ matrix.slice }}/${{ strategy.job-total }})
+     runs-on: blacksmith-4vcpu-ubuntu-2404
+-    # ~10 min expected; 30 leaves room for a cold cache or a dilated file.
++    # ~7-8 min expected; 30 leaves room for a cold cache or a dilated file.
+     timeout-minutes: 30
+     strategy:
+       fail-fast: false
+diff --git a/.github/workflows/upstream-sync.yml b/.github/workflows/upstream-sync.yml
+index 8703d96c92bbac8db5c979b78a14656d7379c293..f4258ea9079c53fe3baa9c27b974799538446acd 100644
+--- a/.github/workflows/upstream-sync.yml
++++ b/.github/workflows/upstream-sync.yml
+@@ -25,7 +25,8 @@ jobs:
+     with:
+       commit: ${{ github.sha }}
+       python_changed: ''
+-      # tests.yml's 30 min job timeout is sized for 8 slices; two slices (~45 min each) were
++      # tests.yml's 30 min job timeout fits 8 slices (its default is 12; scripts/ci/upstream_sync.py
++      # REQUIRED_JOBS names these eight, so keep the list explicit); two slices (~45 min each) were
+       # cancelled at the timeout on every candidate.
+       python_slices: '[1, 2, 3, 4, 5, 6, 7, 8]'
+       e2e: true
+diff --git a/scripts/ci/affected_tests.py b/scripts/ci/affected_tests.py
+index 742cf5a09534915728a814637cf8e26055901830..6751d965c781e8f5cb712cca5515ffaffc84a09a 100755
+--- a/scripts/ci/affected_tests.py
++++ b/scripts/ci/affected_tests.py
+@@ -10,8 +10,11 @@ Prints a JSON plan on stdout: {"mode": "full" | "affected" | "none", "reason", "
+ 
+ Selection, unioned:
+   1. changed test files that the full suite would run;
+-  2. the transitive import closure: every test file that imports, at any depth through the repo's own
+-     modules, a changed module (stdlib `ast`, imports inside functions count, `import a.b` counts a and a.b);
++  2. the import closure (stdlib `ast`, `import a.b` counts a and a.b): every test file that reaches a
++     changed module through the repo's own modules. A file under tests/ counts for every import it holds.
++     A source module passes a change on through its import-time imports only (not function bodies),
++     except that a source module naming the changed module in a function-level import is itself
++     affected (one hop). `if TYPE_CHECKING:` imports never count. See `importers`;
+   3. string references to a changed module ("pkg.mod" / "pkg.mod.attr": monkeypatch and mock.patch targets);
+   4. tests whose text names a changed file by repo path or by a distinctive basename (scripts run by path,
+      workflow YAML, .ts/.mjs read or spawned by Python tests);
+@@ -53,8 +56,8 @@ FULL_FRACTION = 0.4
+ # Basenames too generic to mean one file when a test mentions them.
+ GENERIC = {"__init__.py", "README.md", "index.ts", "index.js", "main.py", "utils.py", "config.py", "cli.py",
+            "package.json", "SKILL.md", "types.ts", "constants.py"}
+-SLICE_SECONDS = 16 * 300  # one slice: 16 workers x ~5 min of per-file wall time
+-MAX_SLICES = 8  # tests.yml's full-suite matrix (one tfgar-tests VM per slice)
++SLICE_SECONDS = 16 * 240  # one affected slice holds about what a full-suite slice does (~12.9 h / MAX_SLICES)
++MAX_SLICES = 12  # tests.yml's full-suite matrix (one 8 vCPU Blacksmith VM per slice)
+ DEFAULT_FILE_SECONDS = 3.0
+ 
+ 
+@@ -85,18 +88,42 @@ def tracked_py(repo: Path) -> list[str]:
+     return [f for f in out.splitlines() if f and "node_modules/" not in f]
+ 
+ 
+-def imports_of(repo: Path, rel: str, modules: set[str]) -> set[str]:
++def _import_nodes(tree: ast.AST, lazy: bool):
++    """Import statements in `tree` that can run. `if TYPE_CHECKING:` bodies never do (the else branch
++    counts). lazy=False also leaves out function bodies: what is left runs when the module is imported."""
++    stack = [tree]
++    while stack:
++        node = stack.pop()
++        if isinstance(node, (ast.Import, ast.ImportFrom)):
++            yield node
++        elif not lazy and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
++            continue
++        elif isinstance(node, ast.If) and (
++                (isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING")
++                or (isinstance(node.test, ast.Attribute) and node.test.attr == "TYPE_CHECKING")):
++            stack.extend(node.orelse)  # only the bare test: `not TYPE_CHECKING` / `TYPE_CHECKING or X` can run
++        else:
++            stack.extend(ast.iter_child_nodes(node))
++
++
++def _parse(repo: Path, rel: str) -> ast.AST | None:
+     try:
+-        tree = ast.parse((repo / rel).read_text(encoding="utf-8-sig", errors="replace"))
++        return ast.parse((repo / rel).read_text(encoding="utf-8-sig", errors="replace"))
+     except (OSError, SyntaxError, ValueError):
++        return None
++
++
++def imports_of(repo: Path, rel: str, modules: set[str], lazy: bool = True, tree: ast.AST | None = None) -> set[str]:
++    tree = tree or _parse(repo, rel)
++    if tree is None:
+         return set()
+     me = module_name(rel) or ""
+     package = me if rel.endswith("__init__.py") else me.rpartition(".")[0]
+     names: set[str] = set()
+-    for node in ast.walk(tree):
++    for node in _import_nodes(tree, lazy):
+         if isinstance(node, ast.Import):
+             names.update(alias.name for alias in node.names)
+-        elif isinstance(node, ast.ImportFrom):
++        else:
+             base = node.module or ""
+             if node.level:
+                 parts = package.split(".") if package else []
+@@ -115,17 +142,41 @@ def imports_of(repo: Path, rel: str, modules: set[str]) -> set[str]:
+ 
+ 
+ def importers(repo: Path, changed_modules: set[str]) -> set[str]:
+-    """Every tracked .py file that imports a changed module, directly or through other repo modules."""
++    """Every tracked .py file a changed module can reach through the import graph.
++
++    A file under tests/ counts for any import it holds, function bodies included. A source module passes a
++    change on only through the imports that run when it is imported, with one exception: a source module
++    that names a changed module in a function-level import is itself affected (one hop), and passes that on
++    through import-time imports like any other. Following function-level imports at every depth ties the
++    source tree into one cycle (2026-11-18: 80% of source modules reached 96% of the suite, so 54 of 60
++    pull requests ran the full suite; with this rule 69 of the last 80 merged pull requests select a
++    median 9% of it). What this gives up: a test that reaches the change only through a function-level
++    import two or more source modules away runs on the main push, not on the pull request.
++    """
+     files = tracked_py(repo)
+     by_module = {m: f for f in files if (m := module_name(f))}
+     modules = set(by_module)
+     reverse: dict[str, set[str]] = {}
++    lazy_reverse: dict[str, set[str]] = {}
+     for f in files:
+-        for dep in imports_of(repo, f, modules):
++        is_test = f.startswith("tests/")
++        tree = _parse(repo, f)  # one parse serves both walks
++        eager = imports_of(repo, f, modules, lazy=is_test, tree=tree)
++        for dep in eager:
+             reverse.setdefault(dep, set()).add(f)
++        if not is_test:
++            for dep in imports_of(repo, f, modules, tree=tree) - eager:
++                lazy_reverse.setdefault(dep, set()).add(f)
+     seen_files: set[str] = set()
+     frontier = [m for m in changed_modules if m in modules]
+     seen_modules = set(frontier)
++    first_hop = {f for m in frontier for f in lazy_reverse.get(m, ())}
++    for f in first_hop:
++        seen_files.add(f)
++        m = module_name(f)
++        if m and m not in seen_modules:
++            seen_modules.add(m)
++            frontier.append(m)
+     while frontier:
+         for f in reverse.get(frontier.pop(), ()):
+             if f in seen_files:
+diff --git a/tests/ci/test_affected_tests.py b/tests/ci/test_affected_tests.py
+index cb0acc616f7f94cdf658c3257b43f3398316e446..1f8e6dfcad43e81146c790edfc81e7c993a91878 100644
+--- a/tests/ci/test_affected_tests.py
++++ b/tests/ci/test_affected_tests.py
+@@ -25,12 +25,29 @@ def repo(tmp_path):
+         "pkg/__init__.py": "",
+         "pkg/core.py": "VALUE = 1\n",
+         "pkg/mid.py": "from pkg import core\n",
+-        "pkg/top.py": "def f():\n    import pkg.mid\n",  # function-level import still counts
++        "pkg/top.py": "def f():\n    import pkg.mid\n",  # function-level import: one hop from pkg.mid
++        "pkg/typed.py": "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    from pkg import core\n"
++                        "else:\n    from pkg import alt\n",
++        "pkg/alt.py": "Y = 1\n",
++        "pkg/klass.py": "class K:\n    from pkg import mid\n",  # class bodies run at import
++        "pkg/coro.py": "async def f():\n    from pkg import mid\n",
++        "pkg/lazy_a.py": "def f():\n    from pkg import alt\n",
++        "pkg/lazy_b.py": "def f():\n    from pkg import lazy_a\n",
++        "pkg/negated.py": "from typing import TYPE_CHECKING\nif not TYPE_CHECKING:\n    from pkg import alt\n",
+         "pkg/other.py": "X = 2\n",
+         "scripts/tool.sh": "echo hi\n",
+         "tests/__init__.py": "",
+         "tests/pkg/test_top.py": "from pkg import top\n",
+         "tests/pkg/test_other.py": "import pkg.other\n",
++        "tests/pkg/test_typed.py": "import pkg.typed\n",
++        "tests/pkg/test_klass.py": "import pkg.klass\n",
++        "tests/pkg/test_coro.py": "import pkg.coro\n",
++        "tests/pkg/test_lazy_a.py": "import pkg.lazy_a\n",
++        "tests/pkg/test_lazy_b.py": "import pkg.lazy_b\n",
++        "tests/pkg/test_negated.py": "import pkg.negated\n",
++        "tests/pkg/test_lazy.py": "def test():\n    from pkg import mid\n",
++        "tests/pkg/helper.py": "def make():\n    import pkg.core\n",
++        "tests/pkg/test_helper.py": "from tests.pkg import helper\n",
+         "tests/pkg/test_patch.py": "def test(monkeypatch):\n    monkeypatch.setattr('pkg.core.VALUE', 2)\n",
+         "tests/pkg/test_script.py": "SCRIPT = 'scripts/tool.sh'\n",
+         "tests/pkg/test_scan.py": "from pathlib import Path\nFILES = list(Path('.').rglob('*.py'))\n",
+@@ -74,10 +91,55 @@ def test_renamed_setup_emits_full_cli_plan(repo, tmp_path, changed):
+     assert outputs["mode"] == "full" and "tests/conftest.py" in outputs["reason"]
+ 
+ 
+-def test_transitive_and_function_level_importers_run(repo):
+-    # core <- mid <- top (inside a function) <- test_top
+-    assert {"tests/pkg/test_top.py", "tests/pkg/test_patch.py"} <= _files(repo, ["pkg/core.py"])
+-    assert "tests/pkg/test_other.py" not in _files(repo, ["pkg/core.py"])
++def test_import_time_closure_and_one_function_level_hop(repo):
++    core = _files(repo, ["pkg/core.py"])
++    # core <- mid (import time) <- test_lazy (a test's own function-level import counts)
++    assert {"tests/pkg/test_lazy.py", "tests/pkg/test_patch.py"} <= core
++    # core <- mid <- klass (class body, two modules away, so only an import-time edge reaches it)
++    assert "tests/pkg/test_klass.py" in core
++    # core <- mid <- coro (inside `async def`): a function body like any other, so it stops.
++    assert "tests/pkg/test_coro.py" not in core
++    # tests/ helpers count for every import too: core <- helper (in a function) <- test_helper
++    assert "tests/pkg/test_helper.py" in core
++    # core <- mid <- top (inside a function): the second source hop is function-level, so it stops.
++    assert "tests/pkg/test_top.py" not in core
++    assert "tests/pkg/test_other.py" not in core
++    # mid <- top (inside a function) <- test_top: one function-level hop from the changed module counts.
++    assert "tests/pkg/test_top.py" in _files(repo, ["pkg/mid.py"])
++
++
++def test_type_checking_imports_do_not_pass_a_change_on(repo):
++    # typed imports core only under TYPE_CHECKING; the else branch (alt) runs at import.
++    assert "tests/pkg/test_typed.py" not in _files(repo, ["pkg/core.py"])
++    alt = _files(repo, ["pkg/alt.py"])
++    assert "tests/pkg/test_typed.py" in alt
++    # `if not TYPE_CHECKING:` runs at import: only the bare test is skipped.
++    assert "tests/pkg/test_negated.py" in alt
++
++
++def test_two_function_level_hops_stop(repo):
++    # alt <- lazy_a (in a function): one hop, selected. lazy_a <- lazy_b (in a function): a second one, not.
++    alt = _files(repo, ["pkg/alt.py"])
++    assert "tests/pkg/test_lazy_a.py" in alt
++    assert "tests/pkg/test_lazy_b.py" not in alt
++
++
++def test_one_hub_with_function_level_imports_does_not_select_the_suite(repo):
++    # A dispatcher that lazily imports every command used to pull every test of every command
++    # into a change to one of them.
++    _write(repo, {"pkg/hub.py": "def run(n):\n    import pkg.cmd_a, pkg.cmd_b\n",
++                  "pkg/cmd_a.py": "from pkg import hub\n", "pkg/cmd_b.py": "from pkg import hub\n",
++                  "pkg/leaf.py": "X = 1\n", "pkg/uses_leaf.py": "from pkg import leaf\n",
++                  "tests/pkg/test_cmd_a.py": "import pkg.cmd_a\n", "tests/pkg/test_cmd_b.py": "import pkg.cmd_b\n",
++                  "tests/pkg/test_hub.py": "import pkg.hub\n", "tests/pkg/test_uses_leaf.py": "import pkg.uses_leaf\n"})
++    _write(repo, {"pkg/cmd_a.py": "from pkg import hub, uses_leaf\n"})
++    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
++    leaf = _files(repo, ["pkg/leaf.py"])
++    assert {"tests/pkg/test_uses_leaf.py", "tests/pkg/test_cmd_a.py"} <= leaf
++    # cmd_a <- hub is function-level and two hops from leaf: hub's and cmd_b's tests stay out.
++    assert not {"tests/pkg/test_hub.py", "tests/pkg/test_cmd_b.py"} & leaf
++    # A change to cmd_a itself is one function-level hop from hub: hub's importers run.
++    assert {"tests/pkg/test_hub.py", "tests/pkg/test_cmd_b.py"} <= _files(repo, ["pkg/cmd_a.py"])
+ 
+ 
+ @pytest.fixture
+@@ -204,7 +266,7 @@ def test_explicit_full_and_empty_diff(repo):
+ 
+ 
+ def test_slices_follow_measured_durations(repo):
+-    (repo / "test_durations.json").write_text(json.dumps({"tests/pkg/test_top.py": 3 * at.SLICE_SECONDS}))
++    (repo / "test_durations.json").write_text(json.dumps({"tests/pkg/test_lazy.py": 3 * at.SLICE_SECONDS}))
+     assert at.plan(repo, ["pkg/core.py"])["slices"] == min(4, at.MAX_SLICES)
+     assert at.plan(repo, ["pkg/other.py"])["slices"] == 1
+     assert at.slices_for(100 * at.SLICE_SECONDS) == at.MAX_SLICES
+diff --git a/tests/ci/test_fast_runner_routing.py b/tests/ci/test_fast_runner_routing.py
+index d247d5cefda7a3cc52f9b62f412ef42342e406a1..1f6d13ae17326b6a0629715a6d51344a93a2d75b 100644
+--- a/tests/ci/test_fast_runner_routing.py
++++ b/tests/ci/test_fast_runner_routing.py
+@@ -345,10 +345,10 @@ def test_python_slices_match_their_matrix():
+     job = wf["jobs"]["test"]
+     assert job["strategy"]["matrix"]["slice"] == "${{ fromJSON(inputs.python_slices) }}"
+     default = wf["on"]["workflow_call"]["inputs"]["python_slices"]["default"]
+-    assert default == "[1, 2, 3, 4, 5, 6, 7, 8]"
++    assert default == "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]"
+     # The planner's full-suite slice count is the same matrix (scripts/ci/affected_tests.py).
+     planner = (ROOT / "scripts" / "ci" / "affected_tests.py").read_text(encoding="utf-8")
+-    assert "MAX_SLICES = 8 " in planner
++    assert "MAX_SLICES = 12 " in planner
+     run = next(step for step in job["steps"] if step.get("name") == "Run tests")
+     assert run["env"]["HERMES_TEST_SLICE"] == "${{ matrix.slice }}/${{ strategy.job-total }}"
+     assert "${{ matrix.slice }}/${{ strategy.job-total }}" in job["name"]
+-- 
+2.43.0
+

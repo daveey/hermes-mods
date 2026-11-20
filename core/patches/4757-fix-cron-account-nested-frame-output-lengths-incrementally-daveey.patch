@@ -1,0 +1,142 @@
+From 9f97bafd946a0676f4a515716a38f539b109d7b7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 12:17:31 +0000
+Subject: [PATCH] fix(cron): account nested frame output lengths incrementally
+ [daveey]
+
+Nested parameter and command walkers recalculated the total fragment length
+for each nested span, even when no break offsets were requested. Repeated
+command substitutions, backticks and ANSI-C words therefore made accounting
+quadratic within the existing line cap. Keep append-only fragments with a
+cached length while preserving plain-list _out_len and walker contracts.
+
+At reviewed PR #2925 head 69e236270b the deterministic 64-KiB operation budget
+fails for both walkers and all three span families, with and without breaks
+(12 failures). All 16 regression cases pass with this accounting change,
+including normalized newline offsets. Complete discovered lifecycle and
+arithmetic consumers: 10716 passed across 69 files. No cap/refusal/parser
+semantics changes. Fresh independent exact-head review belongs to the
+existing landing owner t_60e1b62eed385db5.
+---
+ cron/lifecycle_guard_lines.py                 | 23 ++++++--
+ .../test_lifecycle_guard_frame_accounting.py  | 52 +++++++++++++++++++
+ 2 files changed, 72 insertions(+), 3 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_frame_accounting.py
+
+diff --git a/cron/lifecycle_guard_lines.py b/cron/lifecycle_guard_lines.py
+index 110186fd89b7c23b83ca4a3f4d25f82eca01c87f..78110c59e17063bfb408b6321f7d925bddef6f6b 100644
+--- a/cron/lifecycle_guard_lines.py
++++ b/cron/lifecycle_guard_lines.py
+@@ -12,6 +12,7 @@ from __future__ import annotations
+ 
+ import re
+ import shlex
++from collections.abc import Iterable
+ 
+ from cron.lifecycle_guard_printf import decode_c_escapes
+ 
+@@ -295,7 +296,7 @@ def _walk_command_span(text: str, start: int, shlex_quotes: bool,
+     pos = copied = start
+     depth = 1
+     word_start = True
+-    parts = ["$("]
++    parts = _OutputParts("$(")
+     cases = _CaseClauses()
+     docs = _HereDocs()
+     math = _ArithmeticContext()
+@@ -384,7 +385,7 @@ def _parameter_span(text: str, start: int, *, shlex_quotes: bool,
+     """
+     stack = ["}"]
+     pos = copied = start
+-    parts = [text[start - 2:start]]
++    parts = _OutputParts(text[start - 2:start])
+     while pos < len(text) and stack:
+         char = text[pos]
+         if char == "`" or text.startswith("$'", pos) or (
+@@ -427,8 +428,24 @@ def _parameter_span(text: str, start: int, *, shlex_quotes: bool,
+     return pos, "".join(parts)
+ 
+ 
++class _OutputParts(list[str]):
++    """Append-only frame fragments with constant-time output-offset accounting."""
++
++    def __init__(self, initial: str) -> None:
++        super().__init__([initial])
++        self.length = len(initial)
++
++    def append(self, part: str) -> None:
++        super().append(part)
++        self.length += len(part)
++
++    def extend(self, parts: Iterable[str]) -> None:
++        for part in parts:
++            self.append(part)
++
++
+ def _out_len(parts: list[str]) -> int:
+-    return sum(map(len, parts))
++    return parts.length if isinstance(parts, _OutputParts) else sum(map(len, parts))
+ 
+ 
+ def _shift_breaks(breaks: list[int] | None, nested: list[int] | None, offset: int) -> None:
+diff --git a/tests/cron/test_lifecycle_guard_frame_accounting.py b/tests/cron/test_lifecycle_guard_frame_accounting.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..55e21ad5f3e1cb84e8b6ffa5afe59a1d067de613
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_frame_accounting.py
+@@ -0,0 +1,52 @@
++"""Bound nested-frame accounting work without wall-clock-sensitive assertions."""
++
++import builtins
++
++import pytest
++
++from cron import lifecycle_guard_lines as lines
++from cron.lifecycle_guard import _MAX_LIFECYCLE_SCAN_LINE_BYTES
++
++
++@pytest.mark.parametrize("opener,closer,walker", [
++    ("${", "}", lines._parameter_span),
++    ("$(", ")", lines._command_span),
++])
++@pytest.mark.parametrize("unit", ["$(a)", "`a`", "$'a'"])
++@pytest.mark.parametrize("collect_breaks", [False, True])
++def test_nested_frame_length_work_is_linear(monkeypatch, opener, closer, walker,
++                                            unit, collect_breaks):
++    # Exactly the existing line cap; neither admission nor refusal policy changes.
++    count = (_MAX_LIFECYCLE_SCAN_LINE_BYTES - 3) // len(unit)
++    text = opener + unit * count
++    text += " " * (_MAX_LIFECYCLE_SCAN_LINE_BYTES - len(text) - 1) + closer
++    calls = 0
++
++    def counted_len(value):
++        nonlocal calls
++        calls += 1
++        # Abort quadratic RED runs early, rather than spend minutes summing fragments.
++        assert calls <= 50 * _MAX_LIFECYCLE_SCAN_LINE_BYTES
++        return builtins.len(value)
++
++    monkeypatch.setattr(lines, "len", counted_len, raising=False)
++    breaks = [] if collect_breaks else None
++    end, span = walker(text, 2, shlex_quotes=False, breaks=breaks)
++    assert (end, span) == (len(text), text)
++    assert breaks == ([] if collect_breaks else None)
++
++
++@pytest.mark.parametrize("opener,closer,walker", [
++    ("${", "}", lines._parameter_span),
++    ("$(", ")", lines._command_span),
++])
++@pytest.mark.parametrize("shlex_quotes", [False, True])
++def test_break_offsets_follow_normalized_fragments(opener, closer, walker, shlex_quotes):
++    # Comments shrink and ANSI-C decoding changes widths before later newlines.
++    body = "$(echo a # removed\\\ntrue)\n`a`$'\\x61'\n" * 20
++    text = opener + body + closer
++    breaks = []
++    end, span = walker(text, 2, shlex_quotes=shlex_quotes, breaks=breaks)
++    assert end == len(text)
++    assert breaks == [i for i, char in enumerate(span) if char == "\n"]
++    assert walker(text, 2, shlex_quotes=shlex_quotes) == (end, span)
+-- 
+2.43.0
+

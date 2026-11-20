@@ -1,0 +1,374 @@
+From 48f2f4a2dd3f0bceee894b5a3840c643f03b4a96 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 04:28:23 +0000
+Subject: [PATCH] [daveey] Share annotation narrow replica inventories across
+ origin scopes
+
+The display holder gave every origin its own raw replica reader and semantic
+inventory, repeating identical O(N) work across eight scopes. Share a bounded
+path-level inventory, serialize raw/token snapshot acquisition, and carry only
+64 generations of changed keys (not historical token maps). Lagging scope
+selectors union retained changes; gaps, rebuilt file/connection generations,
+errors and reset conservatively rebuild. Skip the sequence scan only when the
+same fenced connection has unchanged data_version and total_changes.
+
+Strict readers, exact renewal, publication and the 10s/20s bounds are unchanged.
+This is a measured partial CPU reduction, NOT completion of t_3fe574bcd5c5dd01.
+
+Proof: eight-scope decode RED16 vs2; unchanged SQL-scan RED; 28 consumer files,
+371 tests green before final history-boundary parameterization; focused9 green.
+Last-delta-only history mutant killed. Full scripts/check passes.
+Diagnostic eight-key board/shadow-churn replay (150 windows per tier) improves
+small/large mean44.063/203.664ms to13.320/38.757ms. With420256512-byte WAL:
+13.739/36.480ms. Zero liveness-only key moves; scale ratios2.91/2.66 still FAIL
+1.5x. Only default seeded linked rows; not full-holder acceptance. Last deployed
+P1 remains25.7823% holder and0.343916% poll; no budget or renewal waiver.
+---
+ hermes_cli/kanban_annotation_inventory.py     |  80 +++++++++
+ hermes_cli/kanban_annotation_narrow.py        |  17 +-
+ hermes_cli/kanban_annotation_reader.py        |   5 +-
+ .../test_kanban_annotation_shared.py          | 157 ++++++++++++++++++
+ 4 files changed, 251 insertions(+), 8 deletions(-)
+ create mode 100644 hermes_cli/kanban_annotation_inventory.py
+ create mode 100644 tests/hermes_cli/test_kanban_annotation_shared.py
+
+diff --git a/hermes_cli/kanban_annotation_inventory.py b/hermes_cli/kanban_annotation_inventory.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5851e605db1209542b32306e03e6f4fad2728536
+--- /dev/null
++++ b/hermes_cli/kanban_annotation_inventory.py
+@@ -0,0 +1,80 @@
++"""Shared display-only replica inventory; never a strict renewal certificate."""
++from __future__ import annotations
++
++import threading
++from collections import OrderedDict, deque
++
++from hermes_cli.kanban_annotation_reader import ReplicaReader
++from hermes_cli.kanban_annotation_semantic import TaskTokens
++
++_CAP = 8
++_HISTORY = 64
++_lock = threading.Lock()
++_inventories: OrderedDict[str, Inventory] = OrderedDict()
++
++
++class Inventory:
++    """Serialized raw reads and semantic deltas, bounded by path and generation.
++
++    History holds changed keys, not old O(N) token maps. A missing cursor or a
++    rebuilt reader returns an unknown delta, forcing the scope's full selector.
++    Each read still checks the connection/file fences; no TTL certifies content.
++    """
++
++    def __init__(self):
++        self.reader = ReplicaReader()
++        self.tokens = TaskTokens()
++        self.epoch = object()
++        self.generation = 0
++        self.history = deque(maxlen=_HISTORY)
++
++    def read(self, conn, path, cursor):
++        snapshot = self.reader.read(conn, path)
++        previous = self.tokens._tokens
++        tokens = self.tokens.advance(snapshot.rows)
++        if tokens is not previous:
++            if self.tokens.changed is None:
++                self.epoch = object()
++                self.history.clear()
++            self.generation += 1
++            self.history.append((self.generation, self.tokens.changed))
++        changed = self.since(cursor)
++        return snapshot, tokens, (self.epoch, self.generation), changed
++
++    def since(self, cursor):
++        if cursor is None or cursor[0] is not self.epoch:
++            return None
++        generation = cursor[1]
++        if generation == self.generation:
++            return frozenset()
++        if not self.history or not self.history[0][0] - 1 <= generation < self.generation:
++            return None
++        changed = set()
++        for current, keys in self.history:
++            if current > generation:
++                if keys is None:
++                    return None
++                changed.update(keys)
++        return frozenset(changed)
++
++
++def read(conn, path, cursor):
++    """Return one atomic raw/token snapshot and changes since this scope's cursor."""
++    key = str(path)
++    with _lock:
++        inventory = _inventories.get(key)
++        if inventory is None:
++            inventory = _inventories[key] = Inventory()
++        _inventories.move_to_end(key)
++        while len(_inventories) > _CAP:
++            _inventories.popitem(last=False)
++        try:
++            return inventory.read(conn, path, cursor)
++        except Exception:  # health: allow BLE001 -- discard every shared derivative before caller's exact fallback
++            _inventories.pop(key, None)
++            raise
++
++
++def reset():
++    with _lock:
++        _inventories.clear()
+diff --git a/hermes_cli/kanban_annotation_narrow.py b/hermes_cli/kanban_annotation_narrow.py
+index 20a60a4d55969b3cce3f9ce1c60e37cc0573f7fb..d9bad18d31a83720de252bbd36d2f73ace65ee2d 100644
+--- a/hermes_cli/kanban_annotation_narrow.py
++++ b/hermes_cli/kanban_annotation_narrow.py
+@@ -34,6 +34,7 @@ import math
+ import threading
+ import time
+ from pathlib import Path
++from types import MappingProxyType
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -90,11 +91,9 @@ class _ScopeState:
+     def clear(self) -> None:
+         """Drop every derived view (never the lock): a failed read is never reused."""
+         from hermes_cli.kanban_annotation_dependencies import DependencySelector
+-        from hermes_cli.kanban_annotation_reader import ReplicaReader
+-        from hermes_cli.kanban_annotation_semantic import TaskTokens
+ 
+-        self.reader = ReplicaReader()
+-        self.tokens = TaskTokens()
++        self.cursor: tuple | None = None
++        self.token_base: MappingProxyType | None = None
+         self.selector = DependencySelector()
+         self.memo: tuple | None = None  # (selection object, its digest)
+         self.ledger_memo: tuple | None = None  # (fence, LedgerSnapshot)
+@@ -117,11 +116,13 @@ def _state(scope: tuple[str, ...]) -> _ScopeState:
+ 
+ 
+ def reset() -> None:
++    from hermes_cli import kanban_annotation_inventory as inventory
+     from hermes_cli import kanban_annotation_local as local
+ 
+     with _states_lock:
+         _states.clear()
+     local.reset()
++    inventory.reset()
+ 
+ 
+ def _ledger_path() -> Path:
+@@ -131,6 +132,7 @@ def _ledger_path() -> Path:
+ 
+ 
+ def _origin_part(state: _ScopeState, profile: str, now: float) -> list:
++    from hermes_cli import kanban_annotation_inventory as inventory
+     from hermes_cli import kanban_annotation_ledger as kal
+     from hermes_cli import kanban_session_activity as ksa
+ 
+@@ -140,11 +142,11 @@ def _origin_part(state: _ScopeState, profile: str, now: float) -> list:
+     with ksa.cached_ro(Path(hub), busy_budget=0) as conn:
+         conn.execute("BEGIN")
+         try:
+-            snap = state.reader.read(conn, hub)
++            snap, tokens, cursor, changed = inventory.read(conn, hub, state.cursor)
+         finally:
+             conn.rollback()
+     rows = snap.rows
+-    tokens = state.tokens.advance(rows)
++
+     ledger_path = _ledger_path()
+     if ledger_path.is_file():
+         with ksa.cached_ro(ledger_path, busy_budget=0) as lconn:
+@@ -169,7 +171,8 @@ def _origin_part(state: _ScopeState, profile: str, now: float) -> list:
+     else:
+         current, ledger_token, owner_keys = (), "absent", ()
+     selection = state.selector.select(rows, tokens, snap.gateway, profile, owner_keys=owner_keys,
+-                                      changed=state.tokens.changed, base=state.tokens.base)
++                                      changed=changed, base=state.token_base)
++    state.cursor, state.token_base = cursor, tokens
+     if state.memo is None or state.memo[0] is not selection:
+         stats["selections"] += 1
+         digest = hashlib.sha256(json.dumps([[list(k), t] for k, t in selection], separators=(",", ":"),
+diff --git a/hermes_cli/kanban_annotation_reader.py b/hermes_cli/kanban_annotation_reader.py
+index 6d39c382522e7883f3d55c8595a72d4d0fc0bddb..78607e7064703e9e83aa66a8324327f5681cce41 100644
+--- a/hermes_cli/kanban_annotation_reader.py
++++ b/hermes_cli/kanban_annotation_reader.py
+@@ -95,7 +95,10 @@ class ReplicaReader:
+         # hermes_hub stamps every replica task write with the server log's seq (upsert/insert) and deletes rows
+         # outright, so (count, max seq, seq total) - a ~1.5 ms covering scan of replica_poll_metadata - moves on
+         # every task change. Unmoved: the ~30 ms full probe (a 19k-row data scan on worker-6) is skipped.
+-        seq_probe = tuple(conn.execute(_SEQ_PROBE).fetchone())
++        # A kept, fenced connection with no commits needs no inventory scan.
++        # This remains display-only: exact renewal never consumes this snapshot.
++        seq_probe = (self._seq_probe if base is not None and version == self._version
++                     else tuple(conn.execute(_SEQ_PROBE).fetchone()))
+         unchanged = base is not None and (version == self._version or seq_probe == self._seq_probe)
+         probe = self._probe if unchanged else tuple(conn.execute(_PROBE).fetchone())
+         if probe[0] != probe[1]:
+diff --git a/tests/hermes_cli/test_kanban_annotation_shared.py b/tests/hermes_cli/test_kanban_annotation_shared.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a89243f8e3d915b6132d54a4f3bcb47dabe4d983
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_annotation_shared.py
+@@ -0,0 +1,157 @@
++"""Cross-scope narrow probes share work without feeding strict publication."""
++import pytest
++
++from hermes_cli import kanban_annotation_narrow as narrow
++from hermes_cli import kanban_annotation_semantic as semantic
++from hermes_cli import kanban_replica_rows as rr
++from tests.hermes_cli import test_kanban_annotation_narrow as helpers
++
++hub = helpers.hub
++
++
++def _key(profile):
++    scope = ("home", profile, "kh", "hub", "mail")
++    result = narrow.key(scope, ("hubsig", ("board", 1)), [])
++    assert result is not None
++    return result
++
++
++def test_eight_scopes_decode_one_inventory(hub, monkeypatch):
++    calls = []
++    original = semantic.task_token
++
++    def counted(task):
++        calls.append(task["id"])
++        return original(task)
++
++    monkeypatch.setattr(semantic, "task_token", counted)
++    for i in range(8):
++        _key(str(i))
++    assert len(calls) == 2
++    calls.clear()
++    hub("UPDATE replica SET data=?,seq=:seq WHERE key=?",
++        (helpers._task("t_other", status="done"), helpers.OTHER))
++    for i in range(8):
++        _key(str(i))
++    assert calls == ["t_other"]
++
++
++def test_skipped_generations_catch_up_without_full_selection(hub):
++    before = _key("prof")
++    state = narrow._state(helpers.SCOPE)
++    scans = state.selector.full_scans
++    for status in ("todo", "blocked", "done"):
++        hub("UPDATE replica SET data=?,seq=:seq WHERE key=?",
++            (helpers._task("t_linked", sessions=[helpers.LINK], status=status), helpers.LINKED))
++        _key("other")
++    after = _key("prof")
++    assert after != before
++    assert state.selector.full_scans == scans
++    narrow.reset()
++    assert _key("prof") == after
++
++
++def test_catch_up_unions_different_keys_and_removals(hub):
++    before = _key("prof")
++    state = narrow._state(helpers.SCOPE)
++    scans = state.selector.full_scans
++    hub("DELETE FROM replica WHERE key=?", (helpers.LINKED,))
++    _key("other")
++    hub("UPDATE replica SET data=?,seq=:seq WHERE key=?",
++        (helpers._task("t_other", sessions=[helpers.LINK]), helpers.OTHER))
++    _key("other")
++    after = _key("prof")
++    assert after != before
++    assert state.selector.full_scans == scans
++    narrow.reset()
++    assert _key("prof") == after
++
++
++def test_error_discards_shared_inventory_and_reset_rebuilds(hub, monkeypatch):
++    _key("prof")
++    _key("other")
++    hub("UPDATE replica SET data='{broken',seq=:seq WHERE key=?", (helpers.LINKED,))
++    assert helpers.key() is None
++    hub("UPDATE replica SET data=?,seq=:seq WHERE key=?",
++        (helpers._task("t_linked", sessions=[helpers.LINK], status="done"), helpers.LINKED))
++    other = _key("other")  # this scope still holds its pre-error cursor
++    recovered = _key("prof")
++    narrow.reset()
++    assert _key("other") == other
++    calls = []
++    original = semantic.task_token
++
++    def counted(task):
++        calls.append(task["id"])
++        return original(task)
++
++    monkeypatch.setattr(semantic, "task_token", counted)
++    narrow.reset()
++    assert _key("prof") == recovered
++    assert len(calls) == 2
++
++
++@pytest.mark.parametrize("generations,full_scans", [(64, 0), (65, 1)])
++def test_history_overflow_forces_full_selection(hub, generations, full_scans):
++    _key("prof")
++    state = narrow._state(helpers.SCOPE)
++    scans = state.selector.full_scans
++    for index in range(generations):
++        hub("UPDATE replica SET data=?,seq=:seq WHERE key=?",
++            (helpers._task("t_linked", sessions=[helpers.LINK], title=str(index)), helpers.LINKED))
++        _key("other")
++    after = _key("prof")
++    assert state.selector.full_scans == scans + full_scans
++    narrow.reset()
++    assert _key("prof") == after
++
++
++def test_unchanged_shared_reader_skips_inventory_sql(hub):
++    from hermes_cli import kanban_annotation_reader as reader
++    from hermes_cli import kanban_session_activity as ksa
++
++    _key("prof")
++    statements = []
++    path = ksa._hub_db_path()
++    assert path is not None
++    with ksa.cached_ro(path, busy_budget=0) as conn:
++        conn.set_trace_callback(statements.append)
++    try:
++        _key("other")
++    finally:
++        with ksa.cached_ro(path, busy_budget=0) as conn:
++            conn.set_trace_callback(None)
++    assert reader._SEQ_PROBE not in statements
++    assert reader._PROBE not in statements
++
++
++def test_snapshot_survives_other_scope_advance_and_reset(hub, monkeypatch):
++    from hermes_cli import kanban_annotation_inventory as inventory
++
++    before = _key("prof")
++    state = narrow._state(helpers.SCOPE)
++    original = state.selector.select
++    interleaved = []
++
++    def select(*args, **kwargs):
++        if not interleaved:
++            interleaved.append(True)
++            hub("UPDATE replica SET data=?,seq=:seq WHERE key=?",
++                (helpers._task("t_linked", sessions=[helpers.LINK], status="done"), helpers.LINKED))
++            _key("other")
++            inventory.reset()
++        return original(*args, **kwargs)
++
++    monkeypatch.setattr(state.selector, "select", select)
++    assert _key("prof") == before  # snapshot captured before the interleaved commit
++    after = _key("prof")
++    assert after != before
++    narrow.reset()
++    assert _key("prof") == after
++
++
++def test_narrow_does_not_populate_strict_rows_cache(hub):
++    before = dict(rr._views)
++    _key("prof")
++    _key("other")
++    assert rr._views == before
+-- 
+2.43.0
+

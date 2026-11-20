@@ -1,0 +1,242 @@
+From 907c9ecea4905877fcb26b7ce13a461c42a05c5b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 22:38:02 +0000
+Subject: [PATCH] fix(kanban): let released containment history retain, delete
+ and export safely [daveey]
+
+---
+ hermes_cli/kanban_containment_connections.py  |  6 ++
+ hermes_cli/kanban_containment_guard.py        | 36 ++++++-
+ hermes_cli/kanban_db.py                       |  8 +-
+ hermes_cli/kanban_transfer.py                 |  2 +
+ .../test_kanban_containment_retention.py      | 96 +++++++++++++++++++
+ 5 files changed, 146 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_containment_retention.py
+
+diff --git a/hermes_cli/kanban_containment_connections.py b/hermes_cli/kanban_containment_connections.py
+index 1cf58071674d57c1374142e14f42d178def4767f..1a935ad6388fe71db04082fd7d54aa1bac9ba845 100644
+--- a/hermes_cli/kanban_containment_connections.py
++++ b/hermes_cli/kanban_containment_connections.py
+@@ -50,3 +50,9 @@ def drop_held(conn: sqlite3.Connection, rows: list) -> list:
+ 
+ def refusal(conn: sqlite3.Connection, task_id: str) -> str | None:
+     return "containment_pending: scoped resume-contained required" if held(conn, task_id) else None
++
++
++def released_history_delete(conn: sqlite3.Connection, task_id: str):
++    """Delete custody: only for a task whose containment is verifiably released."""
++    from hermes_cli.kanban_containment_guard import released_history_delete as scoped
++    return scoped(conn, task_id, verify_release=lambda receipt, stop: verifier(conn, receipt, stop))
+diff --git a/hermes_cli/kanban_containment_guard.py b/hermes_cli/kanban_containment_guard.py
+index 7a3d502d3cf83c1e767c40507871ef9d745d3b4a..662501f514b3776a43a1d74712f11d59a12fcb65 100644
+--- a/hermes_cli/kanban_containment_guard.py
++++ b/hermes_cli/kanban_containment_guard.py
+@@ -15,6 +15,7 @@ from typing import Any
+ from hermes_cli.kanban_containment_state import reduce_events
+ 
+ _WRITE: contextvars.ContextVar[tuple[int, str] | None] = contextvars.ContextVar("containment_write", default=None)
++_DELETE: contextvars.ContextVar[tuple[int, str] | None] = contextvars.ContextVar("containment_delete", default=None)
+ 
+ 
+ @contextlib.contextmanager
+@@ -33,6 +34,37 @@ def authorized_write(conn: sqlite3.Connection, task_id: str) -> Iterator[None]:
+         _WRITE.reset(token)
+ 
+ 
++@contextlib.contextmanager
++def released_history_delete(conn: sqlite3.Connection, task_id: str, *, verify_release: Callable | None = None) -> Iterator[None]:
++    """Scoped custody for deleting a task's protected history with the task.
++
++    Refuses (containment_pending) while the task is held for any reason, so
++    active/unverified/unobserved containment keeps its history. Once released
++    and verified, the history goes away only together with its task.
++    """
++    if pending(conn, task_id, verify_release=verify_release):
++        raise sqlite3.IntegrityError("containment_pending")
++    token = _DELETE.set((id(conn), task_id))
++    try:
++        yield
++    finally:
++        _DELETE.reset(token)
++    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='containment_observations'").fetchone():
++        conn.execute("DELETE FROM containment_observations WHERE task_id=?", (task_id,))
++
++
++def inert_snapshot(conn: sqlite3.Connection) -> None:
++    """Private snapshot copies only: stub fence functions so raw scrubs can run.
++
++    Never use on a live board connection; history rows are preserved so the
++    importing board re-derives the hold from the events themselves.
++    """
++    for name, arity in (("kanban_containment_held", 1), ("kanban_containment_write", 1), ("kanban_containment_delete", 1),
++                        ("kanban_containment_sync_task", 1), ("kanban_containment_sync_event", 4),
++                        ("kanban_containment_sync_edge", 2), ("kanban_containment_cache_write", 0)):
++        conn.create_function(name, arity, lambda *a: 0)
++
++
+ def pending(conn: sqlite3.Connection, task_id: str, *, verify_release: Callable | None = None) -> bool:
+     """Read only; old no-UID histories remain held rather than inventing identity."""
+     columns = {r[1] for r in conn.execute("PRAGMA table_info(task_events)")}
+@@ -63,6 +95,8 @@ def register(conn: sqlite3.Connection, *, verify_release: Callable | None = None
+     """Register per-connection functions without schema writes or network I/O."""
+     conn.create_function("kanban_containment_held", 1,
+                          lambda task: int(pending(conn, task, verify_release=verify_release)))
++    conn.create_function("kanban_containment_delete", 1,
++                         lambda task: int(conn.in_transaction and _DELETE.get() == (id(conn), task)))
+     conn.create_function("kanban_containment_write", 1,
+                          lambda task: int(conn.in_transaction and _WRITE.get() == (id(conn), task)))
+     from hermes_cli import kanban_containment_replica as replica
+@@ -119,7 +153,7 @@ def _triggers(conn: sqlite3.Connection) -> None:
+         "event_insert": ("BEFORE INSERT ON task_events",
+                          f"NEW.kind IN {protected} AND NOT {permit}(NEW.task_id) "
+                          f"AND NOT kanban_containment_sync_event({new_uid},NEW.task_id,NEW.kind,NEW.payload)"),
+-        "event_delete": ("BEFORE DELETE ON task_events", f"OLD.kind IN {protected}"),
++        "event_delete": ("BEFORE DELETE ON task_events", f"OLD.kind IN {protected} AND NOT kanban_containment_delete(OLD.task_id)"),
+     }
+     same = " AND ".join(f'OLD."{c}" IS NEW."{c}"' for c in columns if c != "uid")
+     uid_fill = (f"OLD.uid IS NULL AND NEW.uid IS NOT NULL AND ({same})" if "uid" in columns else "0")
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index a220ff847d1da49d073d54d05071cab5fde8f852..6c65092e12a5b7fb46ad8fd051f9b7c6788fed35 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3522,7 +3522,12 @@ def specify_triage_task(
+ def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
+     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
+     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
++    from hermes_cli.kanban_containment_connections import released_history_delete
+     for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
++        if table == "task_events":
++            with released_history_delete(conn, task_id):
++                conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
++            continue
+         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
+     with contextlib.suppress(sqlite3.OperationalError):  # board predating condition wakes
+         conn.execute("DELETE FROM task_wake_checks WHERE task_id = ?", (task_id,))
+@@ -3692,7 +3697,8 @@ def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3
+     cutoff = int(time.time()) - _retention_seconds(older_than_seconds)
+     with write_txn(conn):
+         cur = conn.execute(
+-            "DELETE FROM task_events WHERE created_at < ? AND kind NOT IN ('decomposed', 'origin_intent_recorded') "
++            "DELETE FROM task_events WHERE created_at < ? AND kind NOT IN ('decomposed', 'origin_intent_recorded', "
++            "'contained', 'containment_released') "
+             "AND task_id IN (SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
+         )
+     return int(cur.rowcount or 0)
+diff --git a/hermes_cli/kanban_transfer.py b/hermes_cli/kanban_transfer.py
+index e0eda383864b5b829d04aacc3e10c12badd59811..c09fdae73c12a2cb9c2f54e3048ad3eb44b0bdd1 100644
+--- a/hermes_cli/kanban_transfer.py
++++ b/hermes_cli/kanban_transfer.py
+@@ -68,6 +68,8 @@ def _snapshot_db(source: Path, target: Path) -> None:
+ 
+ 
+ def _scrub_local_state(conn: sqlite3.Connection) -> None:
++    from hermes_cli.kanban_containment_guard import inert_snapshot
++    inert_snapshot(conn)
+     """Strip machine-local runtime state (claims, PIDs, and above all the
+     gateway chat ids subscribed to task events). Caller owns the transaction.
+     Run on export and again on import (an archive is untrusted input)."""
+diff --git a/tests/hermes_cli/test_kanban_containment_retention.py b/tests/hermes_cli/test_kanban_containment_retention.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..af337e11dd64ca02cdc86318cc88ccc1f529ee3a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_containment_retention.py
+@@ -0,0 +1,96 @@
++"""Retention, deletion and export over released containment history."""
++from __future__ import annotations
++
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from tests.hermes_cli import test_kanban_containment_lifecycle as lc
++
++board = lc.board
++
++
++def _released_done(conn):
++    relay, _consumer, authority, target, spec = lc.setup(conn)
++    episode = lc.contain(conn, relay, target, spec)["episode"]
++    assert lc.release(conn, target, episode, authority)["status"] == "ready"
++    assert kb.claim_task(conn, relay, claimer="default") is not None
++    assert kb.complete_task(conn, relay, summary="Finished after release")
++    return relay
++
++
++def _protected(conn, task):
++    return conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind IN "
++                        "('contained','containment_released')", (task,)).fetchone()[0]
++
++
++def test_gc_events_prunes_board_and_retains_protected_history(board):
++    relay = _released_done(board)
++    other = kb.create_task(board, title="Unrelated", assignee="default")
++    assert kb.claim_task(board, other, claimer="default")
++    assert kb.complete_task(board, other, summary="done")
++    before = _protected(board, relay)
++    assert before == 2
++    time.sleep(1.2)
++    assert kb.gc_events(board, older_than_seconds=0) > 0
++    assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=?", (other,)).fetchone()[0] == 0
++    assert _protected(board, relay) == before
++
++
++def test_released_task_deletes_with_its_history(board):
++    from hermes_cli.kanban_db_archive import archive_task
++    relay = _released_done(board)
++    assert archive_task(board, relay)
++    assert kb.delete_archived_task(board, relay)
++    assert kb.get_task(board, relay) is None
++    assert _protected(board, relay) == 0
++    assert board.execute("SELECT COUNT(*) FROM containment_observations WHERE task_id=?", (relay,)).fetchone()[0] == 0
++
++
++def test_active_containment_keeps_history_and_cannot_be_deleted(board):
++    relay, _consumer, _authority, target, spec = lc.setup(board)
++    lc.contain(board, relay, target, spec)
++    target = target["task_id"]
++    with pytest.raises(sqlite3.IntegrityError, match="containment_pending"):
++        with kb.write_txn(board):
++            kb._delete_task_relations(board, target)
++    assert _protected(board, target) == 1
++    with pytest.raises(sqlite3.IntegrityError, match="containment_pending"):
++        board.execute("DELETE FROM task_events WHERE task_id=?", (target,))
++    with pytest.raises(sqlite3.IntegrityError, match="containment_pending"):
++        kb.delete_task(board, target)
++    assert kb.get_task(board, target) is not None and _protected(board, target) == 1
++
++
++def test_export_board_with_containment_triggers(board, tmp_path):
++    from hermes_cli import kanban_transfer as transfer
++    _released_done(board)
++    assert transfer.export_board("default", tmp_path / "out.tar.gz")
++
++
++def test_sync_delete_of_released_task_applies_and_active_one_is_refused(board, monkeypatch):
++    from gateway.session_context import scoped_current_session_id
++    from hermes_cli import kanban_containment_service as service
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli.kanban_containment_connections import held
++    from tests.hermes_cli import test_kanban_containment_remote as rm
++
++    relay, authority, session, _hub = rm.setup(board, monkeypatch)
++    child = board.execute("SELECT child_id FROM task_links WHERE parent_id=?", (relay,)).fetchone()[0]
++    rm.adopt(board, monkeypatch, relay, session)
++    with scoped_current_session_id(session):
++        stop = service.contain(board, task_id=child, authority=authority, summary="Fixture")
++    change = sync.RemoteChange(seq=1, table="tasks", uid=child, op="delete", fields={}, version=999,
++                               hlc="", origin_gateway="home")
++    cursor = sync.sync_state(board)["cursor"]
++    with pytest.raises(sqlite3.IntegrityError, match="containment_pending"):
++        sync.apply_remote_changes(board, [change], new_cursor=cursor, board="fixture")
++    assert kb.get_task(board, child) is not None and _protected(board, child) == 1
++    rm.adopt(board, monkeypatch, authority, session)
++    with scoped_current_session_id(session):
++        assert service.resume(board, task_id=child, episode=stop["episode"])["status"] == "ready"
++    assert not held(board, child)
++    sync.apply_remote_changes(board, [change], new_cursor=cursor, board="fixture")
++    assert kb.get_task(board, child) is None and _protected(board, child) == 0
+-- 
+2.43.0
+

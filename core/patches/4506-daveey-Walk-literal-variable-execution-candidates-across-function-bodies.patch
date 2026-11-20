@@ -1,0 +1,214 @@
+From 75cc83423b0f9f4200db74171f8c16351fad5d8d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 23:11:31 +0000
+Subject: [PATCH] [daveey] Walk literal variable execution candidates across
+ function bodies
+
+Retain additive literal assignment candidates across sourced scripts, pairing only command, eval and shell operands. Strip redirect targets and leave dynamic assignment evaluation to the existing walk. Bound every emitted payload with the existing recursion budget. Real Bash differential tests replace Hermes with a harmless marker function; baseline misses 10 of the original 18 execution cases.
+---
+ cron/lifecycle_guard.py                       | 15 ++--
+ cron/lifecycle_guard_variables.py             | 86 +++++++++++++++++++
+ ...test_lifecycle_guard_function_variables.py | 57 ++++++++++++
+ 3 files changed, 152 insertions(+), 6 deletions(-)
+ create mode 100644 cron/lifecycle_guard_variables.py
+ create mode 100644 tests/cron/test_lifecycle_guard_function_variables.py
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index 7f0d6ea9c62192b3d9342c92b9a5bad40f8c08c1..dd488b6117a4964c799d4b1c3148bf49e919349d 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -515,6 +515,7 @@ class _LifecycleScanBudget:
+         "refusal",
+         "remote_reads_remaining",
+         "separator_lines",
++        "variable_candidates",
+     )
+ 
+     def __init__(self, session_aliases: Optional[frozenset[str]] = frozenset(), *,
+@@ -530,6 +531,9 @@ class _LifecycleScanBudget:
+         self.overrun: Optional[str] = None
+         # Message-only: newlines a caller added when joining the root text (cron's empty-prompt
+         # join). Charged like any line, never reported as the text's own; spent on the first charge.
++        from cron.lifecycle_guard_variables import VariableCandidates
++
++        self.variable_candidates = VariableCandidates()
+         self.separator_lines = separator_lines
+         # Alias names that may expand in walked text: the ones the command's shell already holds
+         # (*session_aliases*, see `scan_gateway_lifecycle`), or ``None`` when any name may be an
+@@ -1676,13 +1680,12 @@ def _contains_unsafe_gateway_action(
+             walk_command, include_quoted=covered_quote_scope != quote_scope(cwd, executed, budget)))))
+     nested_texts, nested_scripts = collect_nested_shell_inputs(
+         command, walk_command, cwd=cwd, budget=budget, session_payloads=session_payloads)
+-    from cron.lifecycle_guard_output import iter_recursive_payloads
++    from cron.lifecycle_guard_variables import scan_recursive_payloads
+ 
+-    for payload, nested, covered in iter_recursive_payloads(
+-            walk_command, nested_texts, cwd=cwd, executed=executed,
+-            budget=budget, covered_scope=covered_quote_scope):
+-        if recurse(payload, cwd, executed, source, nested=nested, covered_quotes=covered):
+-            return True
++    if scan_recursive_payloads(
++            walk_command, nested_texts, cwd=cwd, executed=executed, budget=budget,
++            covered_scope=covered_quote_scope, recurse=recurse, source=source):
++        return True
+ 
+     # A nested shell's script may be a path the ordinary candidates never name: a stdin file
+     # redirected into `su -l bob`, `doas -s`, `sudo -i` or `ssh host` (review 5903452583 B1). It
+diff --git a/cron/lifecycle_guard_variables.py b/cron/lifecycle_guard_variables.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..665bb667c2983f98960053c9b583a42f5df394fa
+--- /dev/null
++++ b/cron/lifecycle_guard_variables.py
+@@ -0,0 +1,86 @@
++"""Conservative, additive execution candidates for scalar shell variables.
++
++This is not a shell-state evaluator: retain every possible assignment and match it
++only to execution operands, including function bodies discovered in sourced files.
++Never use this approximation to mask input or prove that a command is safe.
++"""
++from __future__ import annotations
++
++import re
++import shlex
++
++_ASSIGNMENT = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", re.DOTALL)
++_BINDING_HINT = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*=")
++_VARIABLE = re.compile(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})\Z")
++_DECLARATIONS = frozenset({'export', 'readonly', 'local', 'declare', 'typeset'})
++_SHELLS = frozenset({'bash', 'sh', 'zsh', 'dash', 'ksh', 'source', '.'})
++
++
++def scan_recursive_payloads(command, nested_texts, *, cwd, executed, budget,
++                            covered_scope, recurse, source):
++    from cron.lifecycle_guard_output import iter_recursive_payloads
++
++    if executed:
++        for payload, payload_cwd in budget.variable_candidates.payloads(command, cwd):
++            if recurse(payload, payload_cwd, True, source):
++                return True
++    for payload, nested, covered in iter_recursive_payloads(
++            command, nested_texts, cwd=cwd, executed=executed,
++            budget=budget, covered_scope=covered_scope):
++        if recurse(payload, cwd, executed, source, nested=nested, covered_quotes=covered):
++            return True
++    return False
++
++
++class VariableCandidates:
++    def __init__(self):
++        self.values: dict[str, set[str]] = {}
++        self.sinks: set[tuple[str, tuple[str, ...], int, str | None]] = set()
++        self.emitted: set[tuple[str, str | None]] = set()
++
++    def payloads(self, command, cwd):
++        from cron import lifecycle_guard as guard
++
++        if '$' not in command and not _BINDING_HINT.search(command):
++            return
++        for segment in guard._iter_command_segments(command):
++            words = segment[guard._peel_reserved_words(segment):]
++            words = guard._split_redirections(words)[0]
++            # Assignment arguments of ordinary commands are data, not bindings.
++            assignment_words = words[1:] if words and words[0] in _DECLARATIONS else words
++            for word in assignment_words:
++                match = _ASSIGNMENT.fullmatch(word)
++                if match:
++                    # Dynamic values are not literal bindings: substitutions are
++                    # traversed by the ordinary walk, never reinterpreted here.
++                    if not any(char in match[2] for char in '$`'):
++                        self.values.setdefault(match[1], set()).add(match[2])
++                elif not word.startswith('-'):
++                    break
++            index = guard._executed_command_index(words)
++            if index is None:
++                continue
++            argv = tuple(words[index:])
++            name = guard._executable_name(argv[0])
++            positions = range(len(argv)) if name in _SHELLS | {'eval'} else range(1)
++            for position in positions:
++                match = _VARIABLE.fullmatch(argv[position])
++                if match:
++                    self.sinks.add((match[1] or match[2], argv, position, cwd))
++        # Snapshot: recursive consumers can add bindings and sinks while yielding.
++        for variable, argv, position, sink_cwd in tuple(self.sinks):
++            for value in tuple(self.values.get(variable, ())):
++                if position == 0:
++                    # Include both field-split command text and a quoted executable
++                    # (the tokenizer intentionally does not retain quote provenance).
++                    variants = (value + ' ' + shlex.join(argv[1:]),
++                                shlex.join((value, *argv[1:])))
++                elif argv[0] == 'eval':
++                    variants = (' '.join((*argv[1:position], value, *argv[position + 1:])),)
++                else:
++                    variants = (shlex.join((*argv[:position], value, *argv[position + 1:])),)
++                for payload in variants:
++                    key = payload, sink_cwd
++                    if key not in self.emitted:
++                        self.emitted.add(key)
++                        yield key
+diff --git a/tests/cron/test_lifecycle_guard_function_variables.py b/tests/cron/test_lifecycle_guard_function_variables.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..20755c24692fdb81ff0b13c1e413b63c4dee32d3
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_function_variables.py
+@@ -0,0 +1,57 @@
++"""Real Bash differentials for variable-indirect function execution."""
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++
++
++@pytest.mark.parametrize("body,value", [
++    ('$P', 'bash big.sh'), ('eval "$P"', 'bash big.sh'), ('bash "$P"', 'big.sh'),
++])
++@pytest.mark.parametrize("invocation", ['f', 'x=$(f +%s)', 'x=$((1 - $(f +%s)))'])
++@pytest.mark.parametrize("sourced", [False, True])
++@pytest.mark.parametrize("name", ['f', 'date'])
++def test_function_variable_executes(tmp_path, body, value, invocation, sourced, name):
++    invocation = invocation.replace('f', name)
++    # A shell function replaces the real Hermes executable: no service is touched.
++    (tmp_path / 'big.sh').write_text('#' + 'x' * (1024 * 1024) + '\nhermes gateway restart\n')
++    definition = f'{name}() {{ {body}; }};'
++    if sourced:
++        (tmp_path / 'lib.sh').write_text(definition)
++        definition = '. ./lib.sh;'
++    command = f'{definition} export P=\'{value}\'; {invocation}'
++    proof = subprocess.run(
++        ['bash', '--noprofile', '--norc', '-c',
++         'hermes() { printf RUN > marker; printf 0; }; export -f hermes; ' + command],
++        cwd=tmp_path, capture_output=True, timeout=10, check=False,
++    )
++    assert proof.returncode == 0, proof.stderr
++    assert (tmp_path / 'marker').read_text() == 'RUN'
++    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert unsafe
++    assert refusal and 'cap' in refusal
++
++
++@pytest.mark.parametrize("value", ['bash big.sh', 'big.sh'])
++def test_redirect_variable_is_not_executed(tmp_path, value):
++    (tmp_path / 'big.sh').write_text('x' * (1024 * 1024 + 1))
++    command = f'gh() {{ command gh "$@" >"$log"; }}; log=\'{value}\'; gh --version'
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
++
++
++@pytest.mark.parametrize('body', ['$P', '${P}', 'eval "$P"', 'bash "$P"'])
++@pytest.mark.parametrize('binding', ['P', 'export P'])
++def test_sourced_bindings_pair_with_previously_seen_function(tmp_path, body, binding):
++    (tmp_path / 'big.sh').write_text('#' + 'x' * (1024 * 1024 + 1))
++    value = 'big.sh' if body == 'bash "$P"' else 'bash big.sh'
++    (tmp_path / 'values.sh').write_text(f"{binding}='{value}'\n")
++    command = f'f() {{ {body}; }}; . ./values.sh; f'
++    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert unsafe and refusal and 'cap' in refusal
++
++
++def test_variable_state_does_not_leak_between_scans(tmp_path):
++    (tmp_path / 'big.sh').write_text('#' + 'x' * (1024 * 1024 + 1))
++    assert scan_gateway_lifecycle("P='bash big.sh'", cwd=str(tmp_path)) == (False, None)
++    assert scan_gateway_lifecycle('f() { $P; }; f', cwd=str(tmp_path)) == (False, None)
+-- 
+2.43.0
+

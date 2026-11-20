@@ -1,0 +1,162 @@
+From dece1661d173c99ad370428ee83d056cac233046 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 16:38:58 +0000
+Subject: [PATCH] Walk compound-command stdin redirects and heredocs into
+ nested login shells
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A login shell inside a brace group, subshell, if/while/for/case reads that
+compound command's stdin redirection or heredoc ({ su -l bob; } < f,
+( su -l bob ) <<< T, if …; fi <<E). With a stdin-reading nested startup
+shell anywhere in the command, walk every compound closer's stdin input in
+nested scope (fail closed: group extent and inner overrides are not
+tracked). /dev/null feeds a login shell nothing and is no longer refused.
+---
+ cron/lifecycle_guard_nested_shells.py         | 33 +++++++++++--
+ .../test_lifecycle_guard_session_aliases.py   | 48 +++++++++++++++++++
+ 2 files changed, 76 insertions(+), 5 deletions(-)
+
+diff --git a/cron/lifecycle_guard_nested_shells.py b/cron/lifecycle_guard_nested_shells.py
+index ec99838682c5fa11a78a4392c8014f500c196a6f..bb5a6bbd96053623a1d500549c3ddb489281370f 100644
+--- a/cron/lifecycle_guard_nested_shells.py
++++ b/cron/lifecycle_guard_nested_shells.py
+@@ -27,6 +27,7 @@ from cron.lifecycle_guard import (
+     _shell_options_end,
+     _split_redirections,
+ )
++from cron.lifecycle_guard_groups import _CLOSERS
+ 
+ if TYPE_CHECKING:
+     from cron.lifecycle_guard import _LifecycleScanBudget
+@@ -362,11 +363,20 @@ def _iter_nested_shell_inputs(
+         return
+     from tools.shell_heredoc import iter_heredoc_bodies
+ 
++    classified = [(view, _nested_shell_input(view))
++                  for view in _iter_command_segment_views(walk_command)]
++    # Such a shell inside a compound command reads that command's stdin redirections and
++    # heredocs (`{ su -l bob; } < f`, `( su -l bob ) <<< T`, `if …; then su -l bob; fi <<E`).
++    # Where the group opens is not tracked (it may be lines earlier), nor whether the shell's own
++    # redirection overrides it: with a stdin-reading one anywhere, every compound command's
++    # redirections count, failing closed.
++    grouped = any(found == ("stdin", None) for _view, found in classified)
+     for owner, body in (iter_heredoc_bodies(command) if heredocs else ()):
+-        if _feeds_nested_shell(owner):
++        if _feeds_nested_shell(owner) or (grouped and _closes_compound(owner or "")):
+             yield body, None
+-    for view in _iter_command_segment_views(walk_command):
+-        found = _nested_shell_input(view)
++    for view, found in classified:
++        if grouped and _compound_redirections(view):
++            yield from _redirected_shell_inputs(view, cwd=cwd)
+         if found is None:
+             continue
+         kind, value = found
+@@ -382,7 +392,8 @@ def _iter_nested_shell_inputs(
+ def _redirected_shell_inputs(
+     view: list[str], *, cwd: Optional[str],
+ ) -> Iterator[tuple[Optional[str], Optional[Path]]]:
+-    """Keep stdin redirections in the consuming shell's scope, not the session's."""
++    """Keep stdin redirections in the consuming shell's scope, not the session's. ``/dev/null``
++    feeds the shell nothing (and is no regular file to walk)."""
+     words = iter(view)
+     for word in words:
+         match = _REDIRECTION.match(word)
+@@ -394,6 +405,18 @@ def _redirected_shell_inputs(
+             continue
+         if operator == "<<<":
+             yield target, None
+-        elif operator in ("<", "<>"):
++        elif operator in ("<", "<>") and target != "/dev/null":
+             for path in _resolved_or_nothing(target, cwd):
+                 yield None, path
++
++
++def _compound_redirections(view: list[str]) -> bool:
++    """Whether *view* holds only a compound command's closers and its redirections (``} < f``,
++    ``done <<< T``, and after a ``)`` just the redirections: ``< f``)."""
++    return all(word in _CLOSERS for word in _split_redirections(view)[0])
++
++
++def _closes_compound(owner: str) -> bool:
++    """Whether a heredoc's *owner* text is a compound command's closer (``} <<'E'``, ``fi <<E``):
++    the body is then the stdin of the commands that compound command holds."""
++    return any(_compound_redirections(view) for view in _iter_command_segment_views(owner))
+diff --git a/tests/cron/test_lifecycle_guard_session_aliases.py b/tests/cron/test_lifecycle_guard_session_aliases.py
+index 10baaf15f5272c736f557ecb8f8445a661449f9d..071d7c8273e0537aefb14c0556894ec6d380383a 100644
+--- a/tests/cron/test_lifecycle_guard_session_aliases.py
++++ b/tests/cron/test_lifecycle_guard_session_aliases.py
+@@ -291,6 +291,30 @@ _NESTED_FOREIGN_SHELLS = [
+     "sudo -u bob -i < {script}",
+     "ssh host < {script}",
+     "ssh -p 22 host bash -s < {script}",
++    # A compound command's stdin redirection or heredoc reaches the login shell inside it
++    # (PR #2911 review follow-up). Pre-existing: base walked none of these in nested scope.
++    "{{ su -l bob; }} < {script}",
++    "( su -l bob ) < {script}",
++    "{{ su -l bob; }} <<< 't ( bash {db} )'",
++    "( su -l bob ) <<< 't ( bash {db} )'",
++    "{{ su -l bob; }} <<'EOF'\nt ( bash {db} )\nEOF",
++    "{{ su -l bob; }} <<-EOF\n\tt ( bash {db} )\n\tEOF",
++    "if true; then su -l bob; fi < {script}",
++    "if true; then su -l bob; fi <<'EOF'\nt ( bash {db} )\nEOF",
++    "while read l; do su -l bob; done < {script}",
++    "while read l; do su -l bob; done <<'EOF'\nt ( bash {db} )\nEOF",
++    "for x in 1; do su -l bob; done < {script}",
++    "case x in x) su -l bob;; esac < {script}",
++    "{{ su -l bob; }} 0< {script}",
++    "{{ su -l bob; }} <> {script}",
++    "{{ true; {{ su -l bob; }}; }} < {script}",
++    "{{\nsu -l bob\n}} < {script}",  # the group opens lines before its redirection
++    "{{\nsu -l bob\n}} <<'EOF'\nt ( bash {db} )\nEOF",
++    "{{ bash -l; }} < {script}",
++    "{{ sudo -i; }} < {script}",
++    "{{ doas -s; }} < {script}",
++    "{{ ssh host; }} < {script}",
++    "{{ su -l bob < /dev/null; }} < {script}",  # fails closed: own redirections are not tracked
+ ]
+ 
+ 
+@@ -339,6 +363,21 @@ def test_nested_login_shell_body_treats_names_as_unknown(tmp_path, live_kanban_d
+     "sudo cat < {script}",
+     "doas cat < {script}",
+     "ssh host cat < {script}",
++    # A compound command's redirection with no login shell inside keeps the session's names.
++    "{{ cat; }} < {script}",
++    "( bash ) < {script}",
++    "{{ bash -s; }} <<< 't ( bash {db} )'",
++    "{{ cat; }} <<'EOF'\nt ( bash {db} )\nEOF",
++    "while read l; do echo \"$l\"; done < {script}",
++    "{{ su -l bob; }} 3< {script}",  # not stdin
++    # A login shell reading stdin elsewhere does not make other commands' input its own.
++    "su -l bob < /dev/null; cat < {script}",
++    "su -l bob < /dev/null; cat <<'EOF'\nt ( bash {db} )\nEOF",
++    "su -l bob -c true; {{ cat; }} < {script}",
++    # /dev/null feeds a login shell nothing.
++    "su -l bob < /dev/null",
++    "ssh host < /dev/null",
++    "{{ su -l bob; }} < /dev/null",
+ ])
+ def test_plain_child_shell_keeps_session_names(tmp_path, live_kanban_db, shape):
+     """Controls: no login/interactive shell, so the session's names still decide (#2358)."""
+@@ -463,6 +502,15 @@ def test_nested_shell_input_shapes():
+     assert found == []  # *walk_command* holds the segments; *command* only its heredocs
+     text = "bash -l -c 'x ( y )'; bash -c 'z'"
+     assert list(_iter_nested_shell_inputs(text, text, cwd="/")) == [("x ( y )", None)]
++    from cron.lifecycle_guard_nested_shells import _closes_compound
++
++    for owner in (" } <<'E'", "} <<'E'", " fi <<E", " done <<-E", " esac <<E", " <<E", "} } <<E"):
++        assert _closes_compound(owner), owner
++    for owner in ("cat <<'E'", "su -l bob <<'E'", "echo } <<E", "x=} <<E"):
++        assert not _closes_compound(owner), owner
++    # Benign input through a compound command into a login shell stays allowed.
++    benign = "{ su -l bob; } < /dev/null; { su -l bob; } <<< 'echo hi'"
++    assert list(_iter_nested_shell_inputs(benign, benign, cwd="/")) == [("echo hi", None)]
+ 
+ 
+ # PR #2560 review 5897863903 B1: one script referenced both by a nested login shell and by the
+-- 
+2.43.0
+

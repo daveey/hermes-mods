@@ -1,0 +1,829 @@
+From 13a2e18b6261c04a78ea1f5b3181a825d592fc65 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:44:06 +0000
+Subject: [PATCH] [daveey] Queue pickup alarms on workers with authenticated
+ source exclusion
+
+Separate capacity from eligibility: keep normal capability/profile gates and queue on pool:worker, never use a free hub as fallback. Enforce source provenance at pickup and local dispatch; Board companion PR134 fences authenticated creation identity and reservation/lease grants. Preserve the shared resource observer identity. Proof: source/placement/detector focused green, 152 consumer regression tests pass after pool fixture migration; baseline source regression was red. No admission_claim changes or production evidence-card edits.
+---
+ hermes_cli/kanban_pickup_alarm_identity.py    |  27 ++
+ hermes_cli/kanban_pickup_stall.py             |  39 +--
+ hermes_cli/kanban_worker_node.py              |  15 +-
+ .../test_kanban_pickup_alarm_placement.py     | 261 +++++++-----------
+ .../test_kanban_pickup_held_budget.py         |   1 +
+ .../test_kanban_pickup_quota_held.py          |   1 +
+ .../test_kanban_pickup_source_exclusion.py    |  76 +++++
+ tests/hermes_cli/test_kanban_pickup_stall.py  |  10 +
+ .../test_kanban_pickup_stall_held.py          |   4 +-
+ .../test_kanban_pickup_stall_lifted.py        |   1 +
+ .../test_kanban_pickup_stall_repin.py         |  40 ++-
+ .../test_kanban_pickup_stall_reservation.py   |   1 +
+ .../test_kanban_pickup_stall_resolve.py       |   1 +
+ .../test_worker_resources_unknown_alarm.py    |   1 +
+ 14 files changed, 267 insertions(+), 211 deletions(-)
+ create mode 100644 hermes_cli/kanban_pickup_alarm_identity.py
+ create mode 100644 tests/hermes_cli/test_kanban_pickup_source_exclusion.py
+
+diff --git a/hermes_cli/kanban_pickup_alarm_identity.py b/hermes_cli/kanban_pickup_alarm_identity.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..88420fb9fc32302bc89eae856393ee6654718e66
+--- /dev/null
++++ b/hermes_cli/kanban_pickup_alarm_identity.py
+@@ -0,0 +1,27 @@
++"""Pickup alarm source exclusion, matching the Board's pickup_alarm.ts contract. [daveey]
++
++The Board stamps created_on from the authenticated gateway and fences changes to
++these detector identity fields. No caller-supplied list of excluded machines is used.
++Before that authoritative creation is pulled, missing provenance fails closed.
++"""
++from __future__ import annotations
++
++import re
++from typing import Any, Mapping
++
++# The resource-admission observer shares the detector identity and pool producer.
++_KEY = re.compile(r"(?:pickup-stall:([a-z0-9][a-z0-9-]{0,63}):[A-Za-z0-9._-]+|"
++                  r"worker-resources-unknown:([a-z0-9][a-z0-9-]{0,63})):([1-9][0-9]*)")
++
++
++def refusal(card: Mapping[str, Any], machine: str) -> str | None:
++    """Refuse the source or malformed detector-like rows; ordinary cards are unchanged."""
++    key = card.get("idempotency_key")
++    detector = card.get("created_by") == "pickup-stall-detector"
++    if not detector and not (isinstance(key, str) and key.startswith(("pickup-stall:", "worker-resources-unknown:"))):
++        return None
++    match = _KEY.fullmatch(key) if isinstance(key, str) else None
++    source = (match[1] or match[2]) if match else None
++    if not detector or source is None or source != card.get("created_on"):
++        return "pickup_stall_provenance"
++    return "pickup_stall_source" if source == machine else None
+diff --git a/hermes_cli/kanban_pickup_stall.py b/hermes_cli/kanban_pickup_stall.py
+index af0ed9e230b51145bdd60181c48c50db9644aea5..4398906a294862497726c17b1a440b82686fd1e7 100644
+--- a/hermes_cli/kanban_pickup_stall.py
++++ b/hermes_cli/kanban_pickup_stall.py
+@@ -320,38 +320,17 @@ def _profile_label(assignee: Optional[str]) -> str:
+ def alarm_placement(own: str, machines: Optional[Mapping[str, Mapping[str, Any]]], *, assignee: Optional[str],
+                     requires: tuple[str, ...] = _REQUIRES, now_ms: Optional[int] = None,
+                     ) -> tuple[Optional[list[str]], str]:
+-    """``(runs_on, why)`` for an alarm about machine ``own``; never ``machine:<own>``. ``machines`` is the registry
+-    (None: unreadable). In order: an eligible-now non-hub host (:func:`_can_host` and :func:`_ready_now`) with the
+-    most free slots; the eligible-now hub; the hub operator lane; any other host; any card-copying host, even held (hub
+-    first: it runs the alarm when that hold ends, not ``own``'s). With no other such machine enrolled, None
+-    (default placement): the registry offers nowhere else."""
+-    from hermes_cli import kanban_worker_node as wn
+-    now_ms = _now_ms() if now_ms is None else now_ms
++    """Queue on the capable worker pool, regardless of current capacity or registry availability.
++
++    Negative eligibility is enforced independently from these positive labels by
++    kanban_pickup_alarm_identity and the Board's authenticated detector provenance gate.
++    A free hub is never a reason to pin an alarm there.
++    """
+     from hermes_cli.kanban_placement_coordination import requirement_label
+     need = {requirement_label(r) for r in requires} | {_profile_label(assignee)}
+-    if machines is None:
+-        if own != OPERATOR_LANE:
+-            return [f"machine:{OPERATOR_LANE}"], f"the machine registry is unreadable from {own}: hub operator lane"
+-        # The hub carries no capability:hub-write, so this label set never lands back on it.
+-        return sorted(need | {HUB_ACCESS}), "the registry is unreadable from the hub: any worker with hub access"
+-    hosts = {n: e for n, e in machines.items() if _can_host(n, e, own, need)}
+-    now = sorted(n for n, e in hosts.items() if _ready_now(e, now_ms))
+-    if now:
+-        best = min(now, key=lambda n: (n == OPERATOR_LANE, -(_free_slots(hosts[n]) or 0), n))
+-        free = _free_slots(hosts[best])
+-        return [f"machine:{best}"], (f"{best} is active, unheld, not draining"
+-                                     + (f" and has {free} free card slot(s)" if free is not None else ""))
+-    if OPERATOR_LANE in hosts:
+-        return [f"machine:{OPERATOR_LANE}"], "no other machine is eligible now: hub operator lane"
+-    if hosts:
+-        best = min(hosts, key=lambda n: (-(_free_slots(hosts[n]) or 0), n))
+-        return [f"machine:{best}"], f"no other machine is eligible now; {best} is unheld and will free up first"
+-    held = sorted((n != OPERATOR_LANE, n) for n, e in machines.items() if n != own and e
+-                  and e.get("state", "active") == "active" and wn.advertises_pickup(e))
+-    if held:
+-        name = held[0][1]
+-        return [f"machine:{name}"], f"every other machine is held or lacks access; {name} takes it when free"
+-    return None, f"no other machine copies cards: default placement (the registry offers nowhere but {own})"
++    return sorted(need | {"pool:worker", HUB_ACCESS}), (
++        f"queued for a capable pool worker other than authenticated stalled source {own}; "
++        "capacity and registry availability do not change eligibility")
+ 
+ 
+ def _stranded(runs_on: Any, own: str, machines: Optional[Mapping[str, Mapping[str, Any]]], need: set[str]) -> bool:
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index cb0a0ef727280e5d7b9889146150713e1a363fec..b3eaf3aaab14dcf2643779300b8b97e9b1737501 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -269,6 +269,9 @@ def effective_labels(entry: Optional[Mapping[str, Any]], name: str) -> set[str]:
+ 
+ def eligible(card: Mapping[str, Any], me: str, machines: Mapping[str, Mapping[str, Any]]) -> Optional[str]:
+     """None when this machine may ask for the card's lease, else the Board's refusal reason it would get."""
++    from hermes_cli.kanban_pickup_alarm_identity import refusal
++    if reason := refusal(card, me):
++        return reason
+     entry = machines.get(me) or {}
+     if entry.get("hold"):
+         return "held"
+@@ -434,10 +437,18 @@ def local_refusals(conn: sqlite3.Connection, status: str) -> dict[str, str]:
+         return out
+     own = _own(conn)
+     rows = conn.execute(
+-        "SELECT id, runs_on, created_on, workspace_kind FROM tasks WHERE status = ? AND claim_lock IS NULL "
+-        "AND (runs_on IS NOT NULL OR (created_on IS NOT NULL AND created_on != ?))", (status, own)).fetchall()
++        "SELECT id, runs_on, created_on, created_by, idempotency_key, workspace_kind FROM tasks "
++        "WHERE status = ? AND claim_lock IS NULL "
++        "AND (runs_on IS NOT NULL OR (created_on IS NOT NULL AND created_on != ?) "
++        "OR created_by = 'pickup-stall-detector' OR idempotency_key LIKE 'pickup-stall:%' "
++        "OR idempotency_key LIKE 'worker-resources-unknown:%')",
++        (status, own)).fetchall()
+     if not rows:
+         return out
++    from hermes_cli.kanban_pickup_alarm_identity import refusal
++    for row in rows:
++        if reason := refusal(dict(row), own):
++            out[row["id"]] = reason
+     reg = registry()
+     if not reg:
+         return out
+diff --git a/tests/hermes_cli/test_kanban_pickup_alarm_placement.py b/tests/hermes_cli/test_kanban_pickup_alarm_placement.py
+index 81bd4020abfa50b055331428fbb33044bac3741a..a6df3adac5bb2ac1d04bb730a52f894dcd19b84f 100644
+--- a/tests/hermes_cli/test_kanban_pickup_alarm_placement.py
++++ b/tests/hermes_cli/test_kanban_pickup_alarm_placement.py
+@@ -1,10 +1,7 @@
+-"""A pickup-stall alarm about machine M never waits on M. [daveey]
++"""Pickup alarms queue for capable pool workers, never their provenance source. [daveey]
+ 
+-t_01a1ce5f6ddc72f6 (2026-11-12): the detector pinned every alarm ``runs_on=[machine:<M>]``. M is the machine taking no
+-Board work (a registry hold, or no spawn slot: ``budget_exhausted``), so "Pickup held on worker-2" sat ready and
+-unclaimed for the whole hold, and nobody re-placed the cards its body said to re-place. The alarm now lands on another
+-machine eligible now (or the hub operator lane), carries M's machine-local evidence in its body, and an open legacy
+-alarm still pinned to M is re-pinned. Same fake-Board two-gateway harness as ``test_kanban_pickup_stall``.
++Placement is independent of transient registry availability and capacity. Healthy legacy pins remain untouched;
++stranded pins move to the pool queue. Same fake-Board gateway harness as ``test_kanban_pickup_stall``.
+ """
+ from __future__ import annotations
+ 
+@@ -22,10 +19,12 @@ WORKER, HUB = support.WORKER, support.HUB
+ OTHER = "worker-2"
+ svc, gws = support.svc, support.gws
+ NEED = ["capability:file", "capability:kanban", "capability:terminal", "profile:default"]
++QUEUE = sorted([*NEED, "capability:hub-write", "pool:worker"])
++NOW = 1_800_000_000_000
+ 
+ 
+ def _worker(name, **kw):
+-    return {"name": name, "state": "active", "labels": ["linux", *NEED, "capability:hub-write"], "pinned_only": False,
++    return {"name": name, "state": "active", "labels": ["linux", *QUEUE], "pinned_only": False,
+             "max_card_runs": 10, "hold": False, "pickup": "explicit", "metrics": {"active_card_runs": 2}, **kw}
+ 
+ 
+@@ -35,9 +34,8 @@ def _hub(**kw):
+ 
+ 
+ def _registry(monkeypatch, *, held=False, other=True, hub=None):
+-    """The harness re-reads ``support.MACHINES`` on every ``enter``: M (worker-1), optionally an eligible worker-2."""
+-    me = {**support.MACHINES[WORKER], "hold": held}
+-    monkeypatch.setitem(support.MACHINES, WORKER, me)
++    """Gateway.enter re-reads this registry on every pass."""
++    monkeypatch.setitem(support.MACHINES, WORKER, _worker(WORKER, hold=held))
+     if other:
+         monkeypatch.setitem(support.MACHINES, OTHER, _worker(OTHER))
+     if hub is not None:
+@@ -53,9 +51,7 @@ def _pin(conn, tid):
+     return _runs_on(conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (tid,)).fetchone())
+ 
+ 
+-# --- the two causes, end to end (both fail on the old machine:<own> pin) ------------------------------------------
+-
+-def test_a_hold_alarm_lands_on_another_eligible_machine_with_the_evidence(gws, monkeypatch):
++def test_a_hold_alarm_joins_the_worker_pool_with_the_evidence(gws, monkeypatch):
+     hub, worker = gws
+     _registry(monkeypatch, held=True)
+     a, b = stall._pinned(hub, title="a"), stall._pinned(hub, title="b")
+@@ -67,20 +63,20 @@ def test_a_hold_alarm_lands_on_another_eligible_machine_with_the_evidence(gws, m
+     kps.sweep(worker.conn)
+     [card] = stall._repairs(worker.conn)
+     assert "held" in card["title"].lower()
+-    assert _runs_on(card) == [f"machine:{OTHER}"]
++    assert _runs_on(card) == QUEUE
+     assert f"machine:{WORKER}" not in (card["runs_on"] or "")
+     body = card["body"]
+-    # Host-local evidence travels in the body: the skip rows, M's registry entry and replica path.
+     assert f"- {a} (" in body and "last skip hold" in body
+     [line_b] = [ln for ln in body.splitlines() if ln.startswith(f"- {b} (")]
+-    assert "last skip hold" in line_b  # each target's own skip row, not only the oldest's
++    assert "last skip hold" in line_b
+     assert f"Registry entry for {WORKER}" in body and "hold=True" in body
+     assert str(wn._replica_path(worker.conn)) in body and "On this host" not in body
++    kps.sweep(worker.conn)
++    assert [r["id"] for r in stall._repairs(worker.conn)] == [card["id"]]  # dedupe
+ 
+ 
+-def test_a_queue_full_alarm_lands_on_another_eligible_machine(gws, monkeypatch):
++def test_a_queue_full_alarm_joins_the_worker_pool(gws, monkeypatch):
+     hub, worker = gws
+-    # A free hub must not win over a capable worker with only one free slot.
+     _registry(monkeypatch, hub=_hub())
+     monkeypatch.setitem(support.MACHINES, OTHER, _worker(OTHER, metrics={"active_card_runs": 9}))
+     old, new = stall._pinned(hub, title="oldest"), stall._pinned(hub, title="newer")
+@@ -92,20 +88,22 @@ def test_a_queue_full_alarm_lands_on_another_eligible_machine(gws, monkeypatch):
+     worker.tick(max_spawn=0)
+     [card] = stall._repairs(worker.conn)
+     assert "queue" in card["title"].lower()
+-    assert _runs_on(card) == [f"machine:{OTHER}"]
++    assert _runs_on(card) == QUEUE
+     assert "last skip budget_exhausted" in card["body"] and "no spawn slot on worker-1" in card["body"]
+ 
+ 
+-def test_the_alarm_is_claimed_by_the_hub_while_the_stalled_machine_is_held(tmp_path, monkeypatch, svc):
+-    """The operator lane really copies and leases it: M stays held, the hub runs the alarm."""
++def test_another_worker_claims_the_alarm_after_the_source_regains_capacity(tmp_path, monkeypatch, svc):
++    """Recovery makes the source match every queue label, but only another worker may lease its alarm."""
+     from hermes_cli import kanban_db_dispatch as kbd
+     from hermes_cli import kanban_db_sync as sync
+     monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
+     sync.consume_dispatcher_wake()
+     hub = support.Gateway(tmp_path, HUB, svc, monkeypatch, pickup="explicit")
+     worker = support.Gateway(tmp_path, WORKER, svc, monkeypatch, pickup="true")
++    other = support.Gateway(tmp_path, OTHER, svc, monkeypatch, pickup="explicit")
+     try:
+-        _registry(monkeypatch, held=True, other=False, hub=_hub())
++        _registry(monkeypatch, held=True, hub=_hub())
++        monkeypatch.setitem(support.MACHINES, WORKER, _worker(WORKER, hold=True))
+         tid = stall._pinned(hub)
+         hub.round()
+         worker.round()
+@@ -113,38 +111,30 @@ def test_the_alarm_is_claimed_by_the_hub_while_the_stalled_machine_is_held(tmp_p
+         wn.pickup(worker.conn, budget=4)
+         stall._age(worker, tid, 900)
+         [alarm] = kps.sweep(worker.conn)
+-        assert _pin(worker.conn, alarm) == [f"machine:{HUB}"]
+-        worker.round()  # push the alarm
+-        hub.round()     # the hub's replica sees it
+-        hub.tick()      # pickup imports it, the Board grants the lease
+-        assert kb.get_task(hub.conn, alarm).status == "running"
+-        assert kb.get_task(worker.conn, tid) is None  # the held machine still took nothing
++        assert _pin(worker.conn, alarm) == QUEUE
++        worker.round()
++        row = svc.board(support.BOARD)["rows"]["tasks"][alarm]
++        assert row["created_by"] == kps.DETECTOR and row["created_on"] == WORKER
++        assert row["idempotency_key"].startswith(f"pickup-stall:{WORKER}:")
++        monkeypatch.setitem(support.MACHINES, WORKER, _worker(WORKER, metrics={"active_card_runs": 0}))
++        worker.enter()
++        assert set(QUEUE) <= wn.effective_labels(support.MACHINES[WORKER], WORKER)
++        assert wn.eligible(row, WORKER, support.MACHINES) == "pickup_stall_source"
++        # Exercise pickup without the detector's separate hold-lift resolution sweep archiving the alarm.
++        wn.pickup(worker.conn, budget=4)
++        assert alarm not in svc.board(support.BOARD)["leases"]
++        assert kb.get_task(worker.conn, alarm).status != "running"
++        other.round()
++        other.tick()
++        assert kb.get_task(other.conn, alarm).status == "running"
++        assert svc.board(support.BOARD)["leases"][alarm]["holder"] == OTHER
+     finally:
+-        for g in (hub, worker):
++        for g in (hub, worker, other):
+             g.conn.close()
+         sync.set_lease_client(None)
+         wn.set_registry_fetch(None)
+ 
+ 
+-def test_an_open_legacy_alarm_pinned_to_the_stalled_machine_is_re_pinned_once(gws, monkeypatch):
+-    hub, worker = gws
+-    _registry(monkeypatch, held=True)
+-    tid = stall._pinned(hub)
+-    worker.round()
+-    worker.enter()
+-    wn.pickup(worker.conn, budget=4)
+-    stall._age(worker, tid, 900)
+-    [alarm] = kps.sweep(worker.conn)
+-    with kb.write_txn(worker.conn):  # what the old code filed
+-        wn.set_runs_on(worker.conn, alarm, [f"machine:{WORKER}"])
+-    assert kps.sweep(worker.conn) == [alarm]
+-    assert _pin(worker.conn, alarm) == [f"machine:{OTHER}"]
+-    notes = [c.body for c in kb.list_comments(worker.conn, alarm) if "Re-placed" in c.body]
+-    assert len(notes) == 1 and f"machine:{WORKER}" in notes[0]
+-    kps.sweep(worker.conn)
+-    assert len([c for c in kb.list_comments(worker.conn, alarm) if "Re-placed" in c.body]) == 1  # no churn
+-
+-
+ def _held_alarm(gws, monkeypatch, **registry):
+     hub, worker = gws
+     _registry(monkeypatch, held=True, **registry)
+@@ -161,22 +151,34 @@ def _replaced(conn, alarm):
+     return [c.body for c in kb.list_comments(conn, alarm) if "Re-placed" in c.body]
+ 
+ 
++def test_an_open_legacy_alarm_pinned_to_the_stalled_machine_is_re_pinned_once(gws, monkeypatch):
++    worker, alarm = _held_alarm(gws, monkeypatch)
++    with kb.write_txn(worker.conn):
++        wn.set_runs_on(worker.conn, alarm, [f"machine:{WORKER}"])
++    assert kps.sweep(worker.conn) == [alarm]
++    assert _pin(worker.conn, alarm) == QUEUE
++    notes = _replaced(worker.conn, alarm)
++    assert len(notes) == 1 and f"machine:{WORKER}" in notes[0]
++    kps.sweep(worker.conn)
++    assert len(_replaced(worker.conn, alarm)) == 1
++
++
+ def test_an_alarm_on_a_healthy_machine_stays_when_a_better_one_appears(gws, monkeypatch):
+     worker, alarm = _held_alarm(gws, monkeypatch)
+-    assert _pin(worker.conn, alarm) == [f"machine:{OTHER}"]
++    with kb.write_txn(worker.conn):  # explicitly seed the healthy legacy pin under test
++        wn.set_runs_on(worker.conn, alarm, [f"machine:{OTHER}"])
+     monkeypatch.setitem(support.MACHINES, "worker-3", _worker("worker-3", metrics={"active_card_runs": 0}))
+-    worker.enter()  # re-read the registry
+-    assert kps.alarm_placement(WORKER, wn.registry()["machines"], assignee="default")[0] == ["machine:worker-3"]
++    worker.enter()
++    assert kps.alarm_placement(WORKER, wn.registry()["machines"], assignee="default")[0] == QUEUE
+     kps.sweep(worker.conn)
+     assert _pin(worker.conn, alarm) == [f"machine:{OTHER}"] and not _replaced(worker.conn, alarm)
+ 
+ 
+ @pytest.mark.parametrize("assignee", [None, ""])
+ def test_an_alarm_with_no_assignee_is_judged_as_profile_default_and_not_re_pinned(gws, monkeypatch, assignee):
+-    # t_01a1d32a914ed152: the Board reads a NULL/empty assignee as profile:default; ``profile:None``/``profile:``
+-    # made the healthy pin look stranded, so it moved to the newly better machine with a Re-placed comment.
+     worker, alarm = _held_alarm(gws, monkeypatch)
+     with kb.write_txn(worker.conn):
++        wn.set_runs_on(worker.conn, alarm, [f"machine:{OTHER}"])
+         worker.conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (assignee, alarm))
+     monkeypatch.setitem(support.MACHINES, "worker-3", _worker("worker-3", metrics={"active_card_runs": 0}))
+     worker.enter()
+@@ -184,24 +186,26 @@ def test_an_alarm_with_no_assignee_is_judged_as_profile_default_and_not_re_pinne
+     assert _pin(worker.conn, alarm) == [f"machine:{OTHER}"] and not _replaced(worker.conn, alarm)
+ 
+ 
+-def test_a_stranded_alarm_already_on_the_only_choice_is_not_re_commented(gws, monkeypatch):
++def test_a_queued_alarm_is_not_re_commented_when_no_worker_is_available(gws, monkeypatch):
+     worker, alarm = _held_alarm(gws, monkeypatch, other=False, hub=_hub(hold=True))
+-    assert _pin(worker.conn, alarm) == [f"machine:{HUB}"]  # held too, but not the stalled machine
++    assert _pin(worker.conn, alarm) == QUEUE
+     kps.sweep(worker.conn)
+     kps.sweep(worker.conn)
+     assert not _replaced(worker.conn, alarm)
+ 
+ 
++def test_a_hold_alarm_resolves_when_the_source_hold_lifts(gws, monkeypatch):
++    worker, alarm = _held_alarm(gws, monkeypatch)
++    monkeypatch.setitem(support.MACHINES, WORKER, {**support.MACHINES[WORKER], "hold": False})
++    worker.enter()
++    kps.sweep(worker.conn)
++    assert kb.get_task(worker.conn, alarm).status == "archived"
++    assert len(stall._repairs(worker.conn)) == 1
++
++
+ @pytest.mark.parametrize("state", ["running", "claimed"])
+ def test_a_claimed_or_running_alarm_is_never_re_pinned(gws, monkeypatch, state):
+-    hub, worker = gws
+-    _registry(monkeypatch, held=True)
+-    tid = stall._pinned(hub)
+-    worker.round()
+-    worker.enter()
+-    wn.pickup(worker.conn, budget=4)
+-    stall._age(worker, tid, 900)
+-    [alarm] = kps.sweep(worker.conn)
++    worker, alarm = _held_alarm(gws, monkeypatch)
+     with kb.write_txn(worker.conn):
+         wn.set_runs_on(worker.conn, alarm, [f"machine:{WORKER}"])
+         if state == "running":
+@@ -210,118 +214,49 @@ def test_a_claimed_or_running_alarm_is_never_re_pinned(gws, monkeypatch, state):
+             worker.conn.execute("UPDATE tasks SET claim_lock = 'x' WHERE id = ?", (alarm,))
+     kps.sweep(worker.conn)
+     assert _pin(worker.conn, alarm) == [f"machine:{WORKER}"]
++    assert not _replaced(worker.conn, alarm)
+ 
+ 
+-# --- alarm_placement: one test per condition (each kills its mutant) ---------------------------------------------
+-
+-NOW = 1_800_000_000_000
+-
+-
+-def _place(machines, own=WORKER):
+-    return kps.alarm_placement(own, machines, assignee="default", now_ms=NOW)[0]
+-
+-
+-def _pool(**entries):
+-    """The hub is full by default, so it only wins where a test frees it."""
+-    return {"hub": _hub(last_seen=NOW, metrics={"active_card_runs": 7}), **entries}
+-
+-
+-@pytest.mark.parametrize("change", [
+-    {"state": "retired"}, {"hold": True}, {"pickup": None},
+-    {"labels": ["linux", "capability:file", "capability:terminal", "profile:default", "capability:hub-write"]},
+-    {"labels": ["linux", *NEED]},  # a worker without hub access
+-])
+-def test_a_machine_that_cannot_host_is_skipped(change):
+-    pool = _pool(**{"worker-2": _worker("worker-2", last_seen=NOW, **change),
+-                    "worker-3": _worker("worker-3", last_seen=NOW, metrics={"active_card_runs": 9})})
+-    assert _place(pool) == ["machine:worker-3"]
+-
+-
+-@pytest.mark.parametrize("change", [
+-    {"metrics": {"active_card_runs": 0, "drain_active": 1}},
+-    {"last_seen": NOW - 301_000},  # past kps.FRESH_SECONDS (300)
+-    {"metrics": {"active_card_runs": 10}},
++@pytest.mark.parametrize("machines", [
++    None, {},
++    {WORKER: _worker(WORKER)},
++    {HUB: _hub()},
++    {OTHER: _worker(OTHER)},
++    {OTHER: _worker(OTHER, hold=True)},
++    {OTHER: _worker(OTHER, state="retired")},
++    {OTHER: _worker(OTHER, pickup=None)},
++    {OTHER: _worker(OTHER, labels=["linux"])},
++    {OTHER: _worker(OTHER, last_seen=NOW - 301_000)},
++    {OTHER: _worker(OTHER, metrics={"active_card_runs": 10})},
++    {OTHER: _worker(OTHER, metrics={"drain_active": 1})},
++    {OTHER: _worker(OTHER), "worker-3": _worker("worker-3", metrics={"active_card_runs": 0})},
+ ])
+-def test_a_machine_not_ready_now_is_skipped(change):
+-    pool = _pool(**{"worker-2": _worker("worker-2", last_seen=NOW, metrics={"active_card_runs": 0}),
+-                    "worker-3": _worker("worker-3", last_seen=NOW, metrics={"active_card_runs": 9})})
+-    pool["worker-2"].update(change)
+-    assert _place(pool) == ["machine:worker-3"]
+-
+-
+-def test_the_stalled_machine_itself_is_never_chosen_even_when_it_looks_best():
+-    pool = _pool(**{WORKER: _worker(WORKER, last_seen=NOW, metrics={"active_card_runs": 0}),
+-                    "worker-3": _worker("worker-3", last_seen=NOW, metrics={"active_card_runs": 9})})
+-    assert _place(pool) == ["machine:worker-3"]
+-
+-
+-def test_the_most_free_slots_wins_then_the_name():
+-    pool = _pool(**{"worker-3": _worker("worker-3", last_seen=NOW, metrics={"active_card_runs": 8}),
+-                    "worker-4": _worker("worker-4", last_seen=NOW, metrics={"active_card_runs": 3}),
+-                    "worker-5": _worker("worker-5", last_seen=NOW, metrics={"active_card_runs": 3})})
+-    pool["hub"]["metrics"] = {"active_card_runs": 7}  # full
+-    assert _place(pool) == ["machine:worker-4"]
+-
+-
+-def test_the_hub_lane_when_no_machine_is_eligible_now():
+-    # worker-3 has more free slots but is stale: not eligible now, yet it would win the any-host fallback.
+-    pool = _pool(**{"worker-3": _worker("worker-3", last_seen=NOW - 301_000, metrics={"active_card_runs": 5})})
+-    pool["hub"]["metrics"] = {"active_card_runs": 7, "drain_active": 1}
+-    assert _place(pool) == ["machine:hub"]
+-
+-
+-def test_a_full_machine_is_not_eligible_now_so_the_hub_lane_wins():
+-    pool = _pool(**{"worker-3": _worker("worker-3", last_seen=NOW, metrics={"active_card_runs": 10})})
+-    pool["hub"]["metrics"] = {"active_card_runs": 0, "drain_active": 1}
+-    assert _place(pool) == ["machine:hub"]
+-
+-
+-def test_an_unheld_full_machine_when_neither_is_eligible():
+-    pool = _pool(**{"worker-3": _worker("worker-3", last_seen=NOW, metrics={"active_card_runs": 10})})
+-    pool["hub"]["hold"] = True
+-    assert _place(pool) == ["machine:worker-3"]
+-
+-
+-def test_with_no_host_it_waits_on_another_held_machine_hub_first_never_the_stalled_one():
+-    pool = {"hub": {**_hub(), "hold": True}, "gpu-1": _worker("gpu-1", hold=True),
+-            WORKER: _worker(WORKER, last_seen=NOW)}
+-    assert _place(pool) == ["machine:hub"]  # "gpu-1" sorts first: the hub wins by rule, not by name
+-    del pool["hub"]
+-    assert _place(pool) == ["machine:gpu-1"]
+-
+-
+-def test_with_no_other_machine_that_copies_cards_it_takes_default_placement():
+-    assert _place({"hub": {**_hub(), "pickup": None}, WORKER: _worker(WORKER)}) is None
+-
+-
+-def test_an_unreadable_registry_sends_a_worker_alarm_to_the_hub_lane_and_a_hub_alarm_off_the_hub():
+-    assert _place(None) == ["machine:hub"]
+-    off_hub = _place(None, own=HUB) or []
+-    assert "capability:hub-write" in off_hub  # the hub carries no hub-write label, so it never matches
+-    assert not wn.effective_labels(_hub(), HUB) >= set(off_hub)
+-
+-
+-def test_an_alarm_about_the_hub_lands_on_a_worker():
+-    pool = _pool(**{"worker-3": _worker("worker-3", last_seen=NOW)})
+-    assert _place(pool, own=HUB) == ["machine:worker-3"]
++@pytest.mark.parametrize("own", [WORKER, HUB])
++def test_alarm_placement_is_a_stable_worker_queue_regardless_of_registry(machines, own):
++    runs_on, why = kps.alarm_placement(own, machines, assignee="default", now_ms=NOW)
++    assert runs_on == QUEUE
++    assert why
++    assert not any(label.startswith("machine:") for label in runs_on)
+ 
+ 
+ @pytest.mark.parametrize("assignee", [None, ""])
+ def test_a_null_or_empty_assignee_needs_profile_default_like_the_board(assignee):
+-    pool = _pool(**{"worker-3": _worker("worker-3", last_seen=NOW)})
+-    assert kps.alarm_placement(WORKER, pool, assignee=assignee, now_ms=NOW)[0] == ["machine:worker-3"]
+-    off_hub = kps.alarm_placement(HUB, None, assignee=assignee, now_ms=NOW)[0] or []
+-    assert "profile:default" in off_hub and not {"profile:None", "profile:"} & set(off_hub)
++    assert kps.alarm_placement(WORKER, None, assignee=assignee, now_ms=NOW)[0] == QUEUE
++
++
++def test_queue_placement_preserves_explicit_profile_and_requirements():
++    runs_on, _ = kps.alarm_placement(WORKER, None, assignee="reviewer", requires=("terminal", "file"))
++    assert runs_on == sorted(["capability:terminal", "capability:file", "capability:hub-write",
++                              "pool:worker", "profile:reviewer"])
+ 
+ 
+ @pytest.mark.parametrize("runs_on,machines,want", [
+-    ([f"machine:{WORKER}"], None, True),  # pinned to M: stranded even with no registry
+-    (["machine:worker-3"], None, False),  # unknown without a registry: left alone
++    ([f"machine:{WORKER}"], None, True),
++    (["machine:worker-3"], None, False),
+     (["machine:worker-3"], {"worker-3": _worker("worker-3")}, False),
+     (["machine:worker-3"], {"worker-3": _worker("worker-3", hold=True)}, True),
+-    (["machine:worker-3"], {}, True),  # left the registry
+-    (sorted([*NEED, "capability:hub-write"]), {}, False),  # a label set is never stranded
++    (["machine:worker-3"], {}, True),
++    (QUEUE, {}, False),
+ ])
+ def test_stranded(runs_on, machines, want):
+     assert kps._stranded(json.dumps(runs_on), WORKER, machines, set(NEED)) is want
+-
+diff --git a/tests/hermes_cli/test_kanban_pickup_held_budget.py b/tests/hermes_cli/test_kanban_pickup_held_budget.py
+index 5e62220aa78f1154cd3ac1a8ad8582e910940159..d316e4e653e17587b1927d46ea704c53354b6328 100644
+--- a/tests/hermes_cli/test_kanban_pickup_held_budget.py
++++ b/tests/hermes_cli/test_kanban_pickup_held_budget.py
+@@ -11,6 +11,7 @@ from hermes_cli import kanban_worker_node as wn
+ from hermes_cli.kanban_db_connect import write_txn
+ from hermes_cli.kanban_db_events import append_event
+ from tests.hermes_cli import test_kanban_worker_node as support
++from tests.hermes_cli.test_kanban_pickup_stall import alarm_worker_pool
+ 
+ svc = support.svc
+ gws = support.gws
+diff --git a/tests/hermes_cli/test_kanban_pickup_quota_held.py b/tests/hermes_cli/test_kanban_pickup_quota_held.py
+index 9f629743400e42b188ce6d5d17bed8f45f8099f4..cc8ce0027fc093f3d6200fe63d777b1e6a71462b 100644
+--- a/tests/hermes_cli/test_kanban_pickup_quota_held.py
++++ b/tests/hermes_cli/test_kanban_pickup_quota_held.py
+@@ -13,6 +13,7 @@ from hermes_cli import kanban_db_dispatch as kbd
+ from hermes_cli import kanban_pickup_stall as kps
+ from hermes_cli import kanban_worker_node as wn
+ from tests.hermes_cli import test_kanban_worker_node as support
++from tests.hermes_cli.test_kanban_pickup_stall import alarm_worker_pool
+ 
+ svc = support.svc
+ gws = support.gws
+diff --git a/tests/hermes_cli/test_kanban_pickup_source_exclusion.py b/tests/hermes_cli/test_kanban_pickup_source_exclusion.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..10c093f5949c432b95f809e79dbb12a1529b4aba
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pickup_source_exclusion.py
+@@ -0,0 +1,76 @@
++"""Pool eligibility is independent of capacity and excludes the authenticated source."""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_pickup_stall as stall
++from hermes_cli import kanban_worker_node as wn
++
++
++def alarm(**changes):
++    return {"created_by": "pickup-stall-detector", "created_on": "worker-1",
++            "idempotency_key": "pickup-stall:worker-1:queue-full:1794700000000",
++            "workspace_kind": "scratch", "runs_on": json.dumps(["pool:worker"]), **changes}
++
++
++def test_full_pool_free_hub_still_queues_without_machine_pin():
++    labels, _ = stall.alarm_placement("worker-1", {
++        "worker-1": {"max_card_runs": 1, "metrics": {"active_card_runs": 1}},
++        "hub": {"state": "active", "pickup": "explicit", "labels": ["profile:default",
++                "capability:terminal", "capability:file", "capability:kanban"],
++                "max_card_runs": 7, "metrics": {"active_card_runs": 0}},
++    }, assignee="default")
++    assert set(labels) == {"pool:worker", "capability:hub-write", "profile:default",
++                           "capability:terminal", "capability:file", "capability:kanban"}
++    assert not any(label.startswith("machine:") for label in labels)
++
++
++def test_unreadable_registry_queues_on_worker_pool():
++    labels, _ = stall.alarm_placement("worker-1", None, assignee="default")
++    assert "pool:worker" in labels
++    assert not any(label.startswith("machine:") for label in labels)
++
++
++@pytest.mark.parametrize("key", ["pickup-stall:worker-1:queue-full:1794700000000",
++                                 "worker-resources-unknown:worker-1:1794700000000"])
++def test_source_cannot_pick_up_even_after_capacity_returns(key):
++    registry = {name: {"labels": ["pool:worker"], "max_card_runs": 2,
++                       "metrics": {"active_card_runs": 0}} for name in ("worker-1", "worker-2")}
++    assert wn.eligible(alarm(idempotency_key=key), "worker-1", registry) == "pickup_stall_source"
++    assert wn.eligible(alarm(idempotency_key=key), "worker-2", registry) is None
++
++
++@pytest.mark.parametrize("changes", [
++    {"created_on": None}, {"created_on": "worker-3"}, {"created_by": "default"},
++    {"idempotency_key": None}, {"idempotency_key": "pickup-stall:worker-1:queue-full:bad"},
++    {"idempotency_key": "worker-resources-unknown:worker-3:1794700000000"},
++    {"created_by": "default", "idempotency_key": "worker-resources-unknown:worker-1:1794700000000"},
++])
++def test_detector_like_rows_without_trusted_provenance_fail_closed(changes):
++    registry = {"worker-2": {"labels": ["pool:worker"]}}
++    assert wn.eligible(alarm(**changes), "worker-2", registry) == "pickup_stall_provenance"
++
++
++def test_normal_cards_have_no_negative_placement_policy():
++    registry = {"worker-1": {"labels": ["pool:worker"]}}
++    assert wn.eligible(alarm(created_by="default", idempotency_key="ordinary"), "worker-1", registry) is None
++
++
++@pytest.mark.parametrize("origin,reason", [("worker-1", "pickup_stall_source"),
++                                          (None, "pickup_stall_provenance")])
++def test_local_dispatch_refuses_without_labels_or_registry(monkeypatch, origin, reason):
++    from hermes_cli import kanban_worker_placement as wp
++    monkeypatch.setattr(wp, "local_refusals", lambda *a: {})
++    monkeypatch.setattr(wn.sync, "board_mode", lambda *a: "primary")
++    monkeypatch.setattr(wn, "_own", lambda *a: "worker-1")
++    monkeypatch.setattr(wn, "registry", lambda: None)
++    with sqlite3.connect(":memory:") as conn:
++        conn.row_factory = sqlite3.Row
++        conn.execute("CREATE TABLE tasks (id, runs_on, created_on, created_by, idempotency_key, "
++                     "workspace_kind, status, claim_lock)")
++        conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
++                     ("alarm", None, origin, "pickup-stall-detector",
++                      "pickup-stall:worker-1:queue-full:1794700000000", "scratch", "ready", None))
++        assert wn.local_refusals(conn, "ready") == {"alarm": reason}
++
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall.py b/tests/hermes_cli/test_kanban_pickup_stall.py
+index cc2b63157dad5670370f44f6fbb6c276e339854f..d9984a1da3fdefb58a7dc38cc6c776c473bbf3d8 100644
+--- a/tests/hermes_cli/test_kanban_pickup_stall.py
++++ b/tests/hermes_cli/test_kanban_pickup_stall.py
+@@ -24,6 +24,16 @@ svc = support.svc
+ gws = support.gws
+ 
+ 
++@pytest.fixture(autouse=True)
++def alarm_worker_pool(monkeypatch):
++    monkeypatch.setitem(support.MACHINES, "worker-2", {
++        "name": "worker-2", "state": "active", "pickup": "explicit", "hold": False,
++        "labels": ["pool:worker", "profile:default", "capability:hub-write",
++                   "capability:terminal", "capability:file", "capability:kanban"],
++        "max_card_runs": 12, "metrics": {"active_card_runs": 12},
++    })
++
++
+ def _pinned(hub, title="pinned to the worker", to=WORKER):
+     return support._hub_card(hub, title=title, runs_on=[f"machine:{to}"])
+ 
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall_held.py b/tests/hermes_cli/test_kanban_pickup_stall_held.py
+index 0c3de90c6851f83ced0603afe36b98dbe274b98b..a8088c42b95ed8eb9c213b070c0f7b445404e6c9 100644
+--- a/tests/hermes_cli/test_kanban_pickup_stall_held.py
++++ b/tests/hermes_cli/test_kanban_pickup_stall_held.py
+@@ -20,6 +20,7 @@ from hermes_cli import kanban_db_dispatch as kbd
+ from hermes_cli import kanban_db_sync as sync
+ from hermes_cli import kanban_worker_node as wn
+ from tests.hermes_cli import test_kanban_worker_node as support
++from tests.hermes_cli import test_kanban_pickup_alarm_placement as place
+ from tests.hermes_cli.kanban_sync_fake_board import FakeService
+ 
+ HELD, FREE = "worker-6", "worker-1"
+@@ -33,6 +34,7 @@ def _machines(t0: float, *, free_pickup="explicit", held=True) -> dict:
+             "hold_reason": "worker-core-rollout: aaaaaaaaaaaa -> bbbbbbbbbbbb; drain only; release by 23:59Z"} \
+         if held else {"hold": False}
+     return {
++        "worker-3": place._worker("worker-3"),
+         "hub": {"name": "hub", "state": "active", "labels": ["linux"], "pinned_only": False, "max_card_runs": None,
+                 "hold": False},
+         HELD: {"name": HELD, "state": "active", "labels": LABELS, "pinned_only": False, "max_card_runs": 10,
+@@ -120,7 +122,7 @@ def test_t3_one_alarm_after_the_threshold_for_a_default_card_only_the_held_creat
+     assert f"held {HELD}" in alarm["title"] and tid in alarm["title"]
+     assert f"- {tid} (" in alarm["body"] and "default placement" in alarm["body"]
+     assert alarm["human_request"] is None
+-    assert json.loads(alarm["runs_on"]) == [f"machine:{FREE}"]  # never on the held machine
++    assert json.loads(alarm["runs_on"]) == place.QUEUE  # source exclusion keeps it off the held machine
+     assert alarm["idempotency_key"].startswith(f"pickup-stall:{HELD}:held-default:")
+     from hermes_cli import kanban_pickup_stall_repin as repin
+     held.round()  # the alarm runs elsewhere: it and the target are read from the Board replica, as there
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall_lifted.py b/tests/hermes_cli/test_kanban_pickup_stall_lifted.py
+index 333ecdfc5bde68d17d8424c039ec992362f56f51..e2cb42e0628b199bfafcb94ea249fc5b018dab55 100644
+--- a/tests/hermes_cli/test_kanban_pickup_stall_lifted.py
++++ b/tests/hermes_cli/test_kanban_pickup_stall_lifted.py
+@@ -20,6 +20,7 @@ from tests.hermes_cli import test_kanban_worker_node as support
+ WORKER = support.WORKER
+ svc = support.svc
+ gws = support.gws
++alarm_worker_pool = base.alarm_worker_pool
+ 
+ 
+ def _registry(**fields):
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall_repin.py b/tests/hermes_cli/test_kanban_pickup_stall_repin.py
+index 589c4a14ed56f4e9c5edbc8c39f8a7ad622dda2e..336438c0773712fe4d26a9d22bdee2bb12d54a37 100644
+--- a/tests/hermes_cli/test_kanban_pickup_stall_repin.py
++++ b/tests/hermes_cli/test_kanban_pickup_stall_repin.py
+@@ -32,7 +32,8 @@ fleet = oc.fleet
+ 
+ 
+ def _worker(name, **kw):
+-    return place._worker(name, last_seen=NOW, **kw)
++    # Target-card helpers are not pooled by default; only _pooled opts into that lane.
++    return place._worker(name, last_seen=NOW, labels=["linux", *place.NEED, "capability:hub-write"], **kw)
+ 
+ 
+ def _machines(**over):
+@@ -350,7 +351,8 @@ def test_every_need_site_maps_access_names_to_their_attested_labels(name, label)
+     assert label in rp._need({"requires": json.dumps([name]), "assignee": "default"})
+     assert label in rn.required_labels({"requires": json.dumps([name]), "assignee": "default"})
+     machines = {X: {**_worker(X), "labels": ["linux", label, "profile:default"]}}
+-    assert kps.alarm_placement(M, machines, assignee="default", requires=(name,), now_ms=NOW)[0] == [f"machine:{X}"]
++    assert kps.alarm_placement(M, machines, assignee="default", requires=(name,), now_ms=NOW)[0] == sorted(
++        {label, "profile:default", "capability:hub-write", POOL})
+ 
+ 
+ @pytest.mark.parametrize("assignee", [None, ""])
+@@ -389,38 +391,46 @@ def test_the_scope_never_reads_or_writes_a_hold():
+ 
+ @pytest.fixture
+ def held(tmp_path, monkeypatch, svc):
+-    """worker-1 (M) is held; the hub runs its alarm and holds the stalled cards; worker-2 is eligible now."""
++    """worker-1 is held; worker-3 runs its alarm; worker-2 is the eligible target."""
+     from hermes_cli import kanban_db_dispatch as kbd
+     from hermes_cli import kanban_db_sync as sync
+     monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
+     sync.consume_dispatcher_wake()
+     hub = support.Gateway(tmp_path, support.HUB, svc, monkeypatch, pickup="explicit")
+     worker = support.Gateway(tmp_path, M, svc, monkeypatch, pickup="true")
+-    # worker-2 has no hub-write, so the alarm goes to the hub lane, but the cards it lists may go to worker-2.
++    runner = support.Gateway(tmp_path, "worker-3", svc, monkeypatch, pickup="explicit")
++    # Separate the capable alarm runner from the non-pooled target worker.
+     place._registry(monkeypatch, held=True, other=False, hub=place._hub())
+     monkeypatch.setitem(support.MACHINES, X, {**place._worker(X), "labels": ["linux", *place.NEED]})
++    monkeypatch.setitem(support.MACHINES, "worker-3", place._worker("worker-3"))
+     try:
+-        a, b = stall._pinned(hub, title="a"), stall._pinned(hub, title="b")
+-        hub.round()
++        # Local-move coverage: the alarm runner owns these targets, though they are pinned to M.
++        # Foreign-owned targets use the separately tested operator-call route below.
++        a, b = stall._pinned(runner, title="a"), stall._pinned(runner, title="b")
++        runner.round()
+         worker.round()
+         worker.enter()
+         wn.pickup(worker.conn, budget=4)
+         stall._age(worker, a, 900)
+         stall._age(worker, b, 700)
+         [alarm] = kps.sweep(worker.conn)
+-        assert place._pin(worker.conn, alarm) == [f"machine:{support.HUB}"]
++        assert place._pin(worker.conn, alarm) == place.QUEUE
+         worker.round()
+-        hub.round()
+-        hub.tick()
+-        assert kb.get_task(hub.conn, alarm).status == "running"
+-        unlisted = stall._pinned(hub, title="never listed")
+-        hub.enter()
++        runner.round()
++        runner.tick()
++        assert kb.get_task(runner.conn, alarm).status == "running"
++        # Drain further pickup on the runner without interrupting its claimed alarm.
++        # Only worker-2 may accept the target work in the move tests below.
++        monkeypatch.setitem(support.MACHINES, "worker-3", {**support.MACHINES["worker-3"], "hold": True})
++        unlisted = stall._pinned(runner, title="never listed")
++        runner.round()
++        runner.enter()
+         monkeypatch.setenv("HERMES_KANBAN_TASK", alarm)
+-        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb._current_run_id(hub.conn, alarm)))
++        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb._current_run_id(runner.conn, alarm)))
+         monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+-        yield hub, worker, alarm, (a, b), unlisted
++        yield runner, worker, alarm, (a, b), unlisted
+     finally:
+-        for g in (hub, worker):
++        for g in (hub, worker, runner):
+             g.conn.close()
+         sync.set_lease_client(None)
+         wn.set_registry_fetch(None)
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall_reservation.py b/tests/hermes_cli/test_kanban_pickup_stall_reservation.py
+index 011502d261f3e40ab54797e136425b7ce8746b57..6ef7636c5e62e4885a4ded1ada8e01da478d7ee9 100644
+--- a/tests/hermes_cli/test_kanban_pickup_stall_reservation.py
++++ b/tests/hermes_cli/test_kanban_pickup_stall_reservation.py
+@@ -22,6 +22,7 @@ from tests.hermes_cli import test_kanban_pickup_stall as base
+ WORKER = base.WORKER
+ gws = base.gws
+ svc = base.svc
++alarm_worker_pool = base.alarm_worker_pool
+ 
+ 
+ def _observed(worker, tid, ago, runs_on):
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall_resolve.py b/tests/hermes_cli/test_kanban_pickup_stall_resolve.py
+index c50ff88a3590de7fae8e3391cbb8a120ab092998..25f2758612676a05b8af7c5441a2125a6dea6d9c 100644
+--- a/tests/hermes_cli/test_kanban_pickup_stall_resolve.py
++++ b/tests/hermes_cli/test_kanban_pickup_stall_resolve.py
+@@ -23,6 +23,7 @@ from tests.hermes_cli import test_kanban_worker_node as support
+ WORKER = support.WORKER
+ svc = support.svc
+ gws = support.gws
++alarm_worker_pool = base.alarm_worker_pool
+ _HOLD = dict(hold_owner="ops@hub", hold_reason="disk migration")
+ 
+ 
+diff --git a/tests/hermes_cli/test_worker_resources_unknown_alarm.py b/tests/hermes_cli/test_worker_resources_unknown_alarm.py
+index 869f4808d90883710eb0f20de85a49a7087ad699..9937d347a0a495aa2692547800ddb43469bedbff 100644
+--- a/tests/hermes_cli/test_worker_resources_unknown_alarm.py
++++ b/tests/hermes_cli/test_worker_resources_unknown_alarm.py
+@@ -19,6 +19,7 @@ from hermes_cli import worker_compute_capacity as capacity
+ from hermes_cli import worker_resource_admission as admission
+ from hermes_cli import worker_resources_unknown_alarm as alarm
+ from tests.hermes_cli import test_kanban_worker_node as support
++from tests.hermes_cli.test_kanban_pickup_stall import alarm_worker_pool
+ 
+ WORKER = support.WORKER
+ svc = support.svc
+-- 
+2.43.0
+

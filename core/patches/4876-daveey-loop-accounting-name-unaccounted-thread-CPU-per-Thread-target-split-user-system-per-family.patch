@@ -1,0 +1,505 @@
+From 8260661392e1eb546ba345fce4f8f7c5200d2ae4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 20:25:49 +0000
+Subject: [PATCH] [daveey] loop accounting: name unaccounted thread CPU per
+ Thread target, split user/system per family
+
+---
+ hermes_cli/loop_accounting.py                 | 153 +++++++++++-
+ .../test_loop_accounting_thread_targets.py    | 221 ++++++++++++++++++
+ 2 files changed, 366 insertions(+), 8 deletions(-)
+ create mode 100644 tests/hermes_cli/test_loop_accounting_thread_targets.py
+
+diff --git a/hermes_cli/loop_accounting.py b/hermes_cli/loop_accounting.py
+index 102221540933a6f29aa5a3c8a1b98edfb95dc1a2..09440c65fbb0f99522f5abaee0e47950af220b7a 100644
+--- a/hermes_cli/loop_accounting.py
++++ b/hermes_cli/loop_accounting.py
+@@ -60,6 +60,12 @@ start; their sum matches ``process.cpu_s - process.accounted_cpu_s``). Residual
+ coroutine>`` (main-loop CPU outside any pass; 64 names then ``loop_cb/other``). A scope books only the CPU
+ its nested passes did not. ``loop_accounting.scopes`` / ``loop_accounting.callbacks`` (config.yaml, both
+ default on) switch the instrumentation off; hub A/B cost of both on: about +0.09% of a core.
++``families[f]`` also carries ``user_s`` / ``system_s`` (thread CPU split; a high system share is kernel time
++in wakeups and locks, not Python). ``residual.targets`` names the same unaccounted CPU per plain
++``threading.Thread(target=fn)`` (``module.qualname``, 64 names then ``other``; live threads at snapshot time,
++ended threads at the end of ``run``). It is an overlay, not additive with ``families``/``exited``.
++``loop_accounting.thread_targets`` (default on) switches it off; cost is one ``Thread.run`` wrapper: about
++3-6 µs of CPU per thread lifecycle (``tests/hermes_cli/test_loop_accounting_thread_targets.py`` pins <= 50 µs).
+ 
+ **Cost.** One pass is two ``thread_time`` and two ``perf_counter`` reads, a thread-local depth and one
+ uncontended lock: a few microseconds (``tests/hermes_cli/test_loop_accounting_bench.py`` pins <= 20 µs).
+@@ -143,6 +149,9 @@ _stats: dict[str, _Stat] = {}
+ _thread_accounted: dict[int, float] = {}  # native thread id -> CPU of its outermost passes
+ _local = threading.local()
+ _exited_tids: collections.deque = collections.deque()  # tids whose thread ended; folded under _lock
++_thread_targets: dict[int, str] = {}  # native id -> target name of a live ``threading.Thread`` we wrapped
++_target_exited: dict[str, dict[str, float]] = {}  # target name -> CPU/accounted CPU of its ended threads
++_thread_split: dict[int, tuple[float, float]] = {}  # native id -> (user_s, system_s) of the last Darwin read
+ _started_at = time.time()
+ _state: dict[str, Any] = {"role": None, "thread": None, "stop": None, "pid": os.getpid()}
+ # Bumped by the at-fork hook in the child, with the child's thread and wall clocks at the fork: a pass opened
+@@ -388,6 +397,12 @@ def _clk_tck() -> float:
+ 
+ 
+ def _proc_stat_cpu(path: str, hz: float) -> Optional[tuple[str, float]]:
++    got = _proc_stat_split(path, hz)
++    return None if got is None else (got[0], got[1] + got[2])
++
++
++def _proc_stat_split(path: str, hz: float) -> Optional[tuple[str, float, float]]:
++    """(comm, user seconds, system seconds) from a ``/proc/.../stat`` file."""
+     try:
+         with open(path, encoding="ascii", errors="replace") as fh:
+             raw = fh.read()
+@@ -398,7 +413,7 @@ def _proc_stat_cpu(path: str, hz: float) -> Optional[tuple[str, float]]:
+     if len(fields) < 13:
+         return None
+     comm = head.partition("(")[2]
+-    return comm, (int(fields[11]) + int(fields[12])) / hz
++    return comm, int(fields[11]) / hz, int(fields[12]) / hz
+ 
+ 
+ _FAMILY_SUFFIX = re.compile(r"([_\-\s]\d+|[_\-\s]?0x[0-9a-fA-F]+|[_\-\s][0-9a-fA-F]{8,})+$")
+@@ -438,14 +453,18 @@ def _darwin_thread_cpu() -> list[tuple[int, str, float]]:
+         if got <= 0:
+             return []
+         out = []
++        split: dict[int, tuple[float, float]] = {}
+         for i in range(got // 8):
+             info = _ThreadInfo()
+             if lib.proc_pidinfo(pid, 15, ids[i], ctypes.addressof(info), ctypes.sizeof(info)) <= 0:  # THREADID64INFO
+                 continue
+             out.append((int(ids[i]), info.name.decode("utf-8", "replace"), (info.user + info.system) / 1e9))  # pth_*_time are already ns
++            split[int(ids[i])] = (info.user / 1e9, info.system / 1e9)
+         total = sum(c for _, _, c in out)
+         if total > (os.times().user + os.times().system) * 1.25 + 1.0:
+             return []
++        _thread_split.clear()
++        _thread_split.update(split)  # user/system split of the same read, for thread_cpu()
+         return out
+     except Exception:  # health: allow BLE001 -- best effort; no per-thread counters is a documented state
+         return []
+@@ -467,16 +486,20 @@ def thread_cpu() -> list[dict[str, Any]]:
+     except OSError:
+         tids = []
+     for tid in sorted(tids):
+-        got = _proc_stat_cpu(f"{task_dir}/{tid}/stat", hz)
++        got = _proc_stat_split(f"{task_dir}/{tid}/stat", hz)
+         if got is None:
+             continue
+-        comm, cpu = got
+-        out.append({"tid": tid, "name": names.get(tid, comm), "cpu_s": round(cpu, 3),
++        comm, user, system = got
++        out.append({"tid": tid, "name": names.get(tid, comm), "cpu_s": round(user + system, 3),
++                    "user_s": round(user, 3), "system_s": round(system, 3),
+                     "accounted_cpu_s": round(accounted_by.get(tid, 0.0), 6)})
+     if not tids and sys.platform == "darwin":
+         for tid, name, cpu in _darwin_thread_cpu():
+-            out.append({"tid": tid, "name": names.get(tid) or name or "?", "cpu_s": round(cpu, 3),
+-                        "accounted_cpu_s": round(accounted_by.get(tid, 0.0), 6)})
++            row = {"tid": tid, "name": names.get(tid) or name or "?", "cpu_s": round(cpu, 3),
++                   "accounted_cpu_s": round(accounted_by.get(tid, 0.0), 6)}
++            if tid in _thread_split:
++                row["user_s"], row["system_s"] = (round(v, 3) for v in _thread_split[tid])
++            out.append(row)
+         tids = [t["tid"] for t in out]
+     if not tids:  # no per-thread counters: list live accounted threads only (exited ones fold in snapshot())
+         for tid, acc in sorted(accounted_by.items()):
+@@ -563,8 +586,13 @@ def _residual(threads: list[dict[str, Any]], process_cpu: float, accounted_total
+         f["threads"] += 1
+         f["cpu_s"] += cpu
+         f["accounted_cpu_s"] += t["accounted_cpu_s"]
++        if t.get("user_s") is not None:
++            f["user_s"] = f.get("user_s", 0.0) + t["user_s"]
++            f["system_s"] = f.get("system_s", 0.0) + (t.get("system_s") or 0.0)
+     with _lock:
+         exited_acc = _state.get("exited_accounted", 0.0)
++        live_targets = dict(_thread_targets)
++        gone_targets = {k: dict(v) for k, v in _target_exited.items()}
+     exited = {"cpu_s": max(0.0, process_cpu - live), "accounted_cpu_s": exited_acc}
+     total = 0.0
+     for f in list(fams.values()) + [exited]:
+@@ -572,10 +600,45 @@ def _residual(threads: list[dict[str, Any]], process_cpu: float, accounted_total
+         total += f["unaccounted_cpu_s"]
+         for k in ("cpu_s", "accounted_cpu_s", "unaccounted_cpu_s"):
+             f[k] = round(f[k], 6)
+-    out.update(families=fams, exited=exited, unaccounted_cpu_s=round(total, 6))
++        for k in ("user_s", "system_s"):
++            if k in f:
++                f[k] = round(f[k], 6)
++    out.update(families=fams, exited=exited, unaccounted_cpu_s=round(total, 6),
++               targets=_targets_residual(threads, live_targets, gone_targets))
+     return out
+ 
+ 
++def _targets_residual(threads: list[dict[str, Any]], live: dict[int, str],
++                      gone: dict[str, dict[str, float]]) -> dict[str, dict[str, Any]]:
++    """The same unaccounted CPU seen per ``threading.Thread`` target (``instrument_thread_targets``): live
++    threads from this snapshot's per-thread CPU, ended ones from their final reading. An overlay on
++    ``families`` / ``exited``, NOT additive with them (a target's threads are also in their family or in
++    ``exited``); each thread's unaccounted CPU is clamped at 0 on its own."""
++    rows: dict[str, dict[str, float]] = {}
++
++    def row(key: str) -> dict[str, float]:
++        return rows.setdefault(key, {"live_threads": 0, "exited_threads": 0, "cpu_s": 0.0,
++                                     "accounted_cpu_s": 0.0, "unaccounted_cpu_s": 0.0})
++
++    for t in threads:
++        key = live.get(t["tid"])
++        if key is None:
++            continue
++        r = row(key)
++        cpu = t["cpu_s"] or 0.0
++        r["live_threads"] += 1
++        r["cpu_s"] += cpu
++        r["accounted_cpu_s"] += t["accounted_cpu_s"]
++        r["unaccounted_cpu_s"] += max(0.0, cpu - t["accounted_cpu_s"])
++    for key, g in gone.items():
++        r = row(key)
++        r["exited_threads"] += g["threads"]
++        r["cpu_s"] += g["cpu_s"]
++        r["accounted_cpu_s"] += g["accounted_cpu_s"]
++        r["unaccounted_cpu_s"] += g["unaccounted_cpu_s"]
++    return {k: {n: (round(v, 6) if isinstance(v, float) else v) for n, v in r.items()} for k, r in rows.items()}
++
++
+ def _role_guess() -> str:
+     try:
+         from hermes_cli.observability.shared_metrics_process import current_process_kind
+@@ -756,6 +819,8 @@ def reset() -> None:
+         _exited_tids.clear()
+         _cb_stats.clear()
+         _cb_cache.clear()
++        _thread_targets.clear()
++        _target_exited.clear()
+         _state.pop("exited_accounted", None)
+ 
+ 
+@@ -950,8 +1015,75 @@ def instrument_callbacks() -> bool:
+     return True
+ 
+ 
++MAX_TARGET_KEYS = 64  # distinct thread targets; later ones fold into TARGET_OTHER
++TARGET_OTHER = "other"
++
++
++def _target_key(target: Any) -> str:
++    """Name of a ``Thread`` target (``module.qualname``; a lambda also gets its line number)."""
++    name = _callable_name(target)
++    code = getattr(getattr(target, "__func__", target), "__code__", None)
++    if name.endswith("<lambda>") and code is not None:
++        name = f"{name}:{code.co_firstlineno}"
++    return name
++
++
++def instrument_thread_targets() -> bool:
++    """Name the CPU of every plain ``threading.Thread(target=fn)`` that ends up in no scope, per ``fn``
++    (``residual.targets``). Wraps ``Thread.run`` once; a thread costs one lock round at its start and one at
++    its end and nothing in between: a live thread's CPU is read at snapshot time and its final CPU when ``run``
++    returns, so a daemon loop that never exits is still named. Subclasses that override ``run`` (AnyIO
++    workers) and threads without a ``target`` are not wrapped. At most ``MAX_TARGET_KEYS`` names, then
++    ``other``. Idempotent."""
++    if _instrumented.get("threads"):
++        return False
++    _instrumented["threads"] = True
++    orig = threading.Thread.run
++
++    def run(self):
++        target = getattr(self, "_target", None)
++        if target is None:
++            return orig(self)
++        tid = _native_id()
++        key: Optional[str]
++        try:
++            key = _target_key(target)
++            with _lock:
++                if key not in _target_exited and key not in _thread_targets.values():
++                    if len({*_thread_targets.values(), *_target_exited}) >= MAX_TARGET_KEYS:
++                        key = TARGET_OTHER
++                _thread_targets[tid] = key
++        except Exception:  # health: allow BLE001 -- naming a thread must never stop it
++            key = None
++            logger.debug("loop accounting: thread target not named", exc_info=True)
++        try:
++            return orig(self)
++        finally:
++            if key is not None:
++                try:
++                    cpu = _thread_time()
++                    with _lock:
++                        acc = _thread_accounted.get(tid, 0.0)
++                        if _thread_targets.get(tid) == key:
++                            del _thread_targets[tid]
++                        g = _target_exited.setdefault(key, {"threads": 0, "cpu_s": 0.0, "accounted_cpu_s": 0.0,
++                                                            "unaccounted_cpu_s": 0.0})
++                        g["threads"] += 1
++                        g["cpu_s"] += cpu
++                        g["accounted_cpu_s"] += min(acc, cpu)
++                        g["unaccounted_cpu_s"] += max(0.0, cpu - acc)
++                except Exception:  # health: allow BLE001 -- accounting must never break a thread's exit
++                    logger.debug("loop accounting: thread exit booking failed", exc_info=True)
++
++    run._la_orig = orig  # type: ignore[attr-defined]
++    threading.Thread.run = run  # type: ignore[method-assign]
++    return True
++
++
+ def uninstrument() -> None:
+-    """Undo :func:`instrument_executors` / :func:`instrument_callbacks` (tests)."""
++    """Undo :func:`instrument_executors` / :func:`instrument_callbacks` / :func:`instrument_thread_targets` (tests)."""
++    if _instrumented.pop("threads", None):
++        threading.Thread.run = threading.Thread.run._la_orig  # type: ignore[attr-defined,method-assign]
+     if _instrumented.pop("executors", None):
+         import asyncio.base_events as be
+         be.BaseEventLoop.run_in_executor = be.BaseEventLoop.run_in_executor._la_orig  # type: ignore[attr-defined]
+@@ -1016,9 +1148,12 @@ def instrument() -> None:
+         instrument_plugins()
+     if _setting("callbacks", CALLBACKS_DEFAULT):
+         instrument_callbacks()
++    if _setting("thread_targets", THREAD_TARGETS_DEFAULT):
++        instrument_thread_targets()
+ 
+ 
+ CALLBACKS_DEFAULT = True
++THREAD_TARGETS_DEFAULT = True  # per-target thread naming: two lock rounds per thread lifetime, see the docstring
+ 
+ 
+ def _after_fork_child() -> None:
+@@ -1028,6 +1163,8 @@ def _after_fork_child() -> None:
+     _thread_accounted.clear()
+     _cb_stats.clear()
+     _cb_cache.clear()
++    _thread_targets.clear()
++    _target_exited.clear()
+     _started_at = time.time()
+     _state.pop("exited_accounted", None)
+     _state.update(thread=None, stop=None, pid=os.getpid(), role=None)
+diff --git a/tests/hermes_cli/test_loop_accounting_thread_targets.py b/tests/hermes_cli/test_loop_accounting_thread_targets.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..933cb408dcaaaace6a8d2e21d413c9cb736ae1e4
+--- /dev/null
++++ b/tests/hermes_cli/test_loop_accounting_thread_targets.py
+@@ -0,0 +1,221 @@
++"""Loop accounting: per-``threading.Thread``-target residual (t_f7d0cc07f75cd099)."""
++
++from __future__ import annotations
++
++import threading
++import time
++
++import pytest
++
++from hermes_cli import loop_accounting as la
++
++linux_procfs = pytest.mark.platforms("linux")  # per-thread CPU via procfs
++
++
++@pytest.fixture(autouse=True)
++def _fresh(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
++    la.stop()
++    la.reset()
++    yield
++    la.uninstrument()
++    la.stop()
++    la.reset()
++
++
++def _burn(seconds: float) -> None:
++    end = time.thread_time() + seconds
++    while time.thread_time() < end:
++        pass
++
++
++def _hold(name: str, target) -> threading.Event:
++    """Start a thread running ``target`` that then stays alive until the returned event is set."""
++    done, release = threading.Event(), threading.Event()
++
++    def body() -> None:
++        target()
++        done.set()
++        release.wait(30)
++
++    # ``body`` is the Thread target, so wrap it: the key is body's qualname for every _hold thread.
++    th = threading.Thread(target=body, name=name, daemon=True)
++    th.start()
++    assert done.wait(30)
++    return release
++
++
++def unscoped_daemon_loop():
++    _burn(0.4)
++
++
++def test_run_is_wrapped_once_and_restored():
++    orig = threading.Thread.run
++    assert la.instrument_thread_targets() is True
++    assert la.instrument_thread_targets() is False
++    assert threading.Thread.run is not orig
++    la.uninstrument()
++    assert threading.Thread.run is orig
++
++
++@linux_procfs
++def test_live_unscoped_target_cpu_is_named_and_scoped_is_not():
++    la.instrument_thread_targets()
++    release = threading.Event()
++    done = threading.Event()
++
++    def unscoped_worker():
++        _burn(0.4)
++        done.set()
++        release.wait(30)
++
++    done2 = threading.Event()
++
++    def scoped_worker():
++        with la.pass_("tt.scoped"):
++            _burn(0.4)
++        done2.set()
++        release.wait(30)
++
++    for fn in (unscoped_worker, scoped_worker):
++        threading.Thread(target=fn, daemon=True).start()
++    assert done.wait(30) and done2.wait(30)
++    try:
++        targets = la.snapshot()["residual"]["targets"]
++    finally:
++        release.set()
++    un = next(v for k, v in targets.items() if k.endswith(".unscoped_worker"))
++    sc = next(v for k, v in targets.items() if k.endswith(".scoped_worker"))
++    assert abs(un["unaccounted_cpu_s"] - 0.4) <= 0.04
++    assert un["live_threads"] == 1
++    assert sc["unaccounted_cpu_s"] <= 0.04 and sc["accounted_cpu_s"] >= 0.35
++
++
++@linux_procfs
++def test_exited_thread_lands_in_its_target_exited_count():
++    la.instrument_thread_targets()
++
++    def short_lived():
++        _burn(0.2)
++
++    th = threading.Thread(target=short_lived)
++    th.start()
++    th.join()
++    targets = la.snapshot()["residual"]["targets"]
++    row = next(v for k, v in targets.items() if k.endswith("short_lived"))
++    assert row["exited_threads"] == 1 and row["live_threads"] == 0
++    assert abs(row["unaccounted_cpu_s"] - 0.2) <= 0.04
++    assert row["unaccounted_cpu_s"] >= 0.0
++
++
++@linux_procfs
++def test_nested_scopes_are_not_counted_twice_in_a_target():
++    la.instrument_thread_targets()
++
++    def nested():
++        with la.scope("tt.outer"):
++            with la.pass_("tt.inner"):
++                _burn(0.3)
++            _burn(0.1)
++
++    th = threading.Thread(target=nested)
++    th.start()
++    th.join()
++    row = next(v for k, v in la.snapshot()["residual"]["targets"].items() if k.endswith("nested"))
++    assert 0.38 <= row["accounted_cpu_s"] <= 0.45  # once, not 0.7
++    assert row["unaccounted_cpu_s"] <= 0.05
++
++
++def test_target_names_are_bounded_and_lambdas_are_told_apart():
++    la.instrument_thread_targets()
++    fns = []
++    for i in range(la.MAX_TARGET_KEYS + 5):
++        ns: dict = {}
++        exec(f"def f{i}():\n    pass\n", {"__name__": "gen"}, ns)
++        fns.append(ns[f"f{i}"])
++    for fn in fns:
++        th = threading.Thread(target=fn)
++        th.start()
++        th.join()
++    with la._lock:
++        names = set(la._target_exited)
++    assert len(names) <= la.MAX_TARGET_KEYS + 1
++    assert la.TARGET_OTHER in names
++    a = la._target_key(lambda: None)
++    b = la._target_key(lambda: None)
++    assert a != b
++
++
++def test_threads_without_target_and_failing_targets_still_run_and_book():
++    la.instrument_thread_targets()
++
++    class Sub(threading.Thread):
++        def run(self):
++            self.ran = True
++
++    s = Sub()
++    s.start()
++    s.join()
++    assert s.ran
++
++    def boom():
++        raise ValueError("x")
++
++    errs = []
++    old = threading.excepthook
++    threading.excepthook = lambda a: errs.append(a.exc_type)
++    try:
++        th = threading.Thread(target=boom)
++        th.start()
++        th.join()
++    finally:
++        threading.excepthook = old
++    assert errs == [ValueError]
++    assert any(k.endswith("boom") for k in la._target_exited)
++    assert not la._thread_targets
++
++
++def test_flag_off_leaves_thread_run_alone(monkeypatch):
++    orig = threading.Thread.run
++    monkeypatch.setattr(la, "_setting", lambda key, default: False if key == "thread_targets" else default)
++    la.instrument()
++    assert threading.Thread.run is orig
++
++
++@linux_procfs
++def test_user_system_split_matches_cpu_and_family_sum_still_reconciles():
++    la.instrument_thread_targets()
++    release = _hold("tt-split_1", lambda: _burn(0.3))
++    try:
++        snap = la.snapshot()
++    finally:
++        release.set()
++    for t in snap["threads"]:
++        assert abs(t["user_s"] + t["system_s"] - t["cpu_s"]) <= 0.011
++    res = snap["residual"]
++    fam = res["families"]["tt-split"]
++    assert fam["user_s"] + fam["system_s"] == pytest.approx(fam["cpu_s"], abs=0.02)
++    total = sum(f["unaccounted_cpu_s"] for f in res["families"].values()) + res["exited"]["unaccounted_cpu_s"]
++    assert total == pytest.approx(res["unaccounted_cpu_s"], abs=1e-3)
++
++
++def test_thread_start_overhead_is_small():
++    """One wrapped thread lifecycle adds two lock rounds: pin the added cost under 50 µs per thread."""
++    def noop():
++        pass
++
++    def per_thread(n: int) -> float:
++        best = float("inf")
++        for _ in range(3):
++            t0 = time.perf_counter()
++            for _ in range(n):
++                th = threading.Thread(target=noop)
++                th.start()
++                th.join()
++            best = min(best, (time.perf_counter() - t0) / n)
++        return best
++
++    base = per_thread(300)
++    la.instrument_thread_targets()
++    on = per_thread(300)
++    assert on - base <= 50e-6, f"{(on - base) * 1e6:.1f} µs added per thread"
+-- 
+2.43.0
+

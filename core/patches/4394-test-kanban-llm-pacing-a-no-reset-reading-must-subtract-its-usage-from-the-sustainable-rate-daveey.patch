@@ -1,0 +1,118 @@
+From d61fa0eb4d66048d1d40cdc3f512c77318a11c3a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 05:10:19 +0000
+Subject: [PATCH] test(kanban-llm-pacing): a no-reset reading must subtract its
+ usage from the sustainable rate [daveey]
+
+Test gap from the post-merge audit of PR #3058 (t_76d6ed98dc6ce8bc; landed 9fe356932d):
+in hermes_cli/kanban_llm_pacing.py `_sustainable`, replacing
+`max(0.0, cfg.target - used) / WINDOW_SECONDS[kind]` (reading is None or reset_at is None)
+with `cfg.target / WINDOW_SECONDS[kind]` survived all pacing tests, because every
+reset_at=None fixture used 0% usage. A 40%-used no-reset window then looked like a fresh
+window and the pool factor was overestimated. Test-only; no production change.
+
+New tests/hermes_cli/test_kanban_llm_pacing_missing_reset.py (9 cases, hand-derived
+%/h expected values, not the production formula): five_hour at 0/40/94/95/99% used
+(>= target boundary and clamp), a seven_day case, a PACED-vs-OPEN flip with the
+admit_limit consequence (8 vs 12), and ordinary-reset / reserved-account controls.
+
+Proof (python 3.14.9 test env, pytest -rs, 0 skipped):
+- baseline: new file 9 passed; with the 4 existing pacing files 54 passed.
+- mutant A (`cfg.target / WINDOW_SECONDS[kind]`): new file 8 failed / 1 passed (the
+  used=0 case, which is the old behaviour); the 4 existing files still 45 passed (the gap).
+- mutant B (drop the max(0, ...) clamp): 2 failed (used=99 case, over-target test).
+---
+ .../test_kanban_llm_pacing_missing_reset.py   | 81 +++++++++++++++++++
+ 1 file changed, 81 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_llm_pacing_missing_reset.py
+
+diff --git a/tests/hermes_cli/test_kanban_llm_pacing_missing_reset.py b/tests/hermes_cli/test_kanban_llm_pacing_missing_reset.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..30e656eb88f41c7d32574c3751868cd87c68a888
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_llm_pacing_missing_reset.py
+@@ -0,0 +1,81 @@
++"""A reading with no reset still spends its usage: sustainable = (target - used) / window (t_1b02aad01d226e1b). [daveey]
++
++Post-merge audit of PR #3058 (t_76d6ed98dc6ce8bc): replacing ``max(0.0, cfg.target - used) / WINDOW_SECONDS[kind]``
++by ``cfg.target / WINDOW_SECONDS[kind]`` in ``_sustainable`` survived every pacing test, because each fixture whose
++reading has ``reset_at=None`` used 0%. A no-reset window that is already 40% used then looked like a fresh full window
++and the pool factor was overestimated. Expected values below are hand-derived percent-per-hour arithmetic, not
++recomputed with the production formula.
++"""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_llm_pacing as lp
++
++HOUR, DAY = 3600.0, 86400.0
++NOW = 1_800_000_000.0
++# Every account stays a headroom account (reserve above 100%), so a no-reset reading near/over target still counts.
++CFG = lp.PacingConfig(reserve={lp.FIVE_HOUR: 101.0, lp.SEVEN_DAY: 101.0})
++
++
++def _pool(kind, burner_used, burner_before, burner_reset_in, idle_used):
++    """``burner`` has a reset and a measured burn; ``idle`` has ``idle_used`` percent and NO reset, so it burns 0."""
++    current = [lp.Reading(NOW, "burner", kind, burner_used, NOW + burner_reset_in),
++               lp.Reading(NOW, "idle", kind, idle_used, None)]
++    history = [lp.Reading(NOW - HOUR, "burner", kind, burner_before, NOW + burner_reset_in)]
++    return lp.pool_pace("anthropic", current, history, CFG)
++
++
++# five_hour: burner 60% used, 1 h to reset, 30 points over the last hour -> burn 30 %/h and sustainable
++# (95-60)/1h = 35 %/h. The no-reset account adds (95-used)/5h: 55/5 = 11 %/h at 40%, 0.2 %/h at 94%.
++# factor = (35 + idle %/h) / 30.
++@pytest.mark.parametrize("idle_used, expected", [
++    (0, (35 + 19) / 30),       # 1.8: a fresh window adds the full 95/5h = 19 %/h (the old behaviour, kept)
++    (40, (35 + 11) / 30),      # 1.5333: nonzero usage must be subtracted; the mutant gives 1.8
++    (94, (35 + 0.2) / 30),     # 1.1733: just under target
++    (95, 35 / 30),             # 1.1667: exactly at target adds nothing
++    (99, 35 / 30),             # 1.1667: past target clamps at zero, never subtracts from the others
++])
++def test_no_reset_five_hour_window_subtracts_its_usage(idle_used, expected):
++    pace = _pool(lp.FIVE_HOUR, 60, 30, HOUR, idle_used)
++    assert pace.factor == pytest.approx(round(expected, 4), abs=1e-4)
++    assert pace.state == lp.OPEN
++
++
++def test_no_reset_seven_day_window_subtracts_its_usage():
++    # burner: 30%, 3 days to reset, +3 points over the last hour -> burn 3 %/h; sustainable 65/72h = 0.9028 %/h.
++    # idle: 50% used, no reset -> 45/(7*24h) = 0.26786 %/h (a fresh window would add 95/168 = 0.5655 %/h).
++    pace = _pool(lp.SEVEN_DAY, 30, 27, 3 * DAY, 50)
++    assert pace.factor == pytest.approx((65 / 72 + 45 / 168) / 3, abs=1e-4)  # 0.3902; the mutant gives 0.4894
++    assert pace.factor == pytest.approx(0.3902, abs=1e-4)
++    assert pace.state == lp.PACED
++
++
++def test_no_reset_usage_decides_paced_versus_open_and_the_admission_limit():
++    """burner 60% (was 15% an hour ago, 1 h to reset): burn 45 %/h, sustainable 35 %/h. The no-reset account at
++    75% adds 20/5h = 4 %/h -> 39/45 = 0.8667: PACED. Treated as a fresh window (19 %/h) it would read 54/45 = 1.2 OPEN."""
++    pace = _pool(lp.FIVE_HOUR, 60, 15, HOUR, 75)
++    assert pace.state == lp.PACED
++    assert pace.factor == pytest.approx(0.8667, abs=1e-4)
++    assert lp.admit_limit(pace, 10, deferrable=False, cfg=CFG) == 8  # floor(10 * 0.8667); the mutant allows 12
++
++
++def test_no_reset_account_over_target_does_not_cancel_other_headroom():
++    """99% used with no reset: (95-99) must clamp to 0, not subtract 4/5h = 0.8 %/h from the burner's 35 %/h."""
++    pace = _pool(lp.FIVE_HOUR, 60, 30, HOUR, 99)
++    assert pace.factor == pytest.approx(round(35 / 30, 4), abs=1e-4)  # unclamped would be (35-0.8)/30 = 1.14
++
++
++def test_controls_a_reset_window_and_a_reserved_account_are_unchanged():
++    # Ordinary reset control: 60% with 1 h to reset -> (95-60)/1h = 35 %/h, no fallback to the full window.
++    current = [lp.Reading(NOW, "burner", lp.FIVE_HOUR, 60, NOW + HOUR)]
++    history = [lp.Reading(NOW - HOUR, "burner", lp.FIVE_HOUR, 30, NOW + HOUR)]
++    assert lp.pool_pace("anthropic", current, history, CFG).factor == pytest.approx(35 / 30, abs=1e-4)
++
++    # Reserved control (default reserve 80%): the 40%-used no-reset account is headroom, the 85% one is not.
++    default = lp.PacingConfig()
++    current = [lp.Reading(NOW, "burner", lp.FIVE_HOUR, 60, NOW + HOUR),
++               lp.Reading(NOW, "idle", lp.FIVE_HOUR, 40, None),
++               lp.Reading(NOW, "spent", lp.FIVE_HOUR, 85, None)]
++    pace = lp.pool_pace("anthropic", current, history, default)
++    assert pace.factor == pytest.approx((35 + 11) / 30, abs=1e-4)  # "spent" adds nothing
+-- 
+2.43.0
+

@@ -1,0 +1,293 @@
+From 9f236d888bed070d896e42a6c433710dbe8b7a15 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 08:10:53 +0000
+Subject: [PATCH] fix(kanban): prove key absence across moving Board snapshots
+ [daveey]
+
+A busy Board cannot hold one global head across all task pages. Cover the finite first-to-last page interval with contiguous authenticated full-row changes instead; reject every key match and all incomplete, failed, compacted or gapped feeds. Preserve the original 30-second bound, identity/absence gates and byte-retaining receipts. This is observational absence at the final cut, not a key reservation. No service deployment or production repair.
+
+Proof: original constant-head veto fails busy-board regression; 206 tests pass across all seven reserved-key consumers, scripts/check passes all 21 checks. Includes insert behind cursor, update, transient duplicate, malformed/missing/compacted feed, finite cut while writers advance and stale evidence. Operational repair remains t_22adfd77b74f44c1.
+---
+ hermes_cli/kanban_sync_key_evidence.py        |  54 +++++++
+ hermes_cli/kanban_sync_reserved_key.py        |  17 ++-
+ .../test_kanban_sync_key_evidence.py          | 135 ++++++++++++++++++
+ .../test_kanban_sync_reserved_key_snapshot.py |   4 +
+ 4 files changed, 205 insertions(+), 5 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_key_evidence.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_key_evidence.py
+
+diff --git a/hermes_cli/kanban_sync_key_evidence.py b/hermes_cli/kanban_sync_key_evidence.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ff85985c88bf00d1e6f99f6e5691d88bfe298c28
+--- /dev/null
++++ b/hermes_cli/kanban_sync_key_evidence.py
+@@ -0,0 +1,54 @@
++"""Conservative replacement-key absence across a moving Board snapshot. [daveey]
++
++A complete UID-ordered scan plus every change from its first head through its
++last head covers every live row at the latter cut. Inserts behind the scan cursor
++and edits to already-read rows are in that interval. We veto even transient key
++matches, rather than reconstructing state or treating deletions as permission.
++This is fresh observational evidence, not an atomic key reservation.
++"""
++from __future__ import annotations
++
++from typing import Any
++
++from hermes_cli.kanban_sync_client import HubError, Resync, SyncUnavailable
++
++MAX_FEED_PAGES = 500
++_INCOMPLETE = "authoritative_snapshot_incomplete"
++
++
++def cover_changes(hub: Any, board: str, key: str, first: int, cut: int) -> str | None:
++    """Prove the finite scan interval complete; never chase a continuously moving head."""
++    cursor = first
++    for _ in range(MAX_FEED_PAGES):
++        try:
++            page = hub.changes(board, cursor)
++        except (HubError, Resync, SyncUnavailable, OSError, AttributeError, ValueError) as exc:
++            return f"authoritative_snapshot_unavailable: {exc}"
++        if (not isinstance(page, dict) or page.get("resync") or page.get("error")
++                or type(page.get("head")) is not int or page["head"] < cut
++                or type(page.get("next")) is not int or type(page.get("more")) is not bool
++                or not isinstance(page.get("changes"), list)):
++            return _INCOMPLETE + ": malformed interval feed"
++        previous = cursor
++        for change in page["changes"]:
++            if (not isinstance(change, dict) or type(change.get("seq")) is not int
++                    or change["seq"] != previous + 1 or change["seq"] > page["head"]
++                    or not isinstance(change.get("uid"), str) or not change["uid"]
++                    or not isinstance(change.get("table"), str)
++                    or change.get("op") not in ("upsert", "delete", "lease")):
++                return _INCOMPLETE + ": malformed or gapped interval feed"
++            previous = change["seq"]
++            if change["table"] == "tasks" and change["op"] != "delete":
++                fields = change.get("fields")
++                if (change["op"] != "upsert" or not isinstance(fields, dict)
++                        or "idempotency_key" not in fields or fields.get("uid") != change["uid"]):
++                    return _INCOMPLETE + ": incomplete task change"
++                if fields["idempotency_key"] == key:
++                    return "replacement_key_in_remote_use"
++        if (page["next"] != previous or previous <= cursor
++                or (not page["more"] and previous != page["head"])):
++            return _INCOMPLETE + ": incomplete interval feed"
++        if previous >= cut:
++            return None
++        cursor = previous
++    return _INCOMPLETE + ": interval page cap reached"
+diff --git a/hermes_cli/kanban_sync_reserved_key.py b/hermes_cli/kanban_sync_reserved_key.py
+index 507e645f9a8f18058f0caa7abf06beb60aa7e62f..a7894b394dac9c849b67a641272db2dbe80f188f 100644
+--- a/hermes_cli/kanban_sync_reserved_key.py
++++ b/hermes_cli/kanban_sync_reserved_key.py
+@@ -19,7 +19,9 @@ Contract (``hermes kanban sync reserved-key TASK_ID --new-key KEY [--apply --exp
+   being dropped). The replacement key is non-empty, unreserved, unused locally and differs from the old one.
+ * **Fresh authenticated Board reads**: ``Hub.row_evidence`` for the card and *every* child identity must be
+   ``never_existed`` at floor 0 with no row and no tombstone, and an exhaustive paged ``Hub.snapshot_page('tasks')``
+-  must show no live Board card with the replacement key (an incomplete, malformed or failed scan refuses). Reads run
++  must show no live Board card with the replacement key. Moving page heads require contiguous authenticated changes
++  through the final page's head; any matching key in that interval vetoes, even if later removed. Incomplete,
++  malformed or failed reads refuse. This proves absence at that cut, not an atomic reservation. Reads run
+   with no write transaction open; the whole interval from the first read to the in-transaction veto, writer-lock wait
+   included, is bounded on the monotonic clock (``EVIDENCE_MAX_AGE_S``). The exact local inputs are re-read and
+   compared inside the write transaction that applies.
+@@ -288,24 +290,29 @@ def _remote_key_refusal(hub: Any, board: str, new_key: str) -> Optional[str]:
+     incomplete = "authoritative_snapshot_incomplete"
+     after = ""
+     snapshot_head = None
++    last_head = -1
+     for _ in range(MAX_SNAPSHOT_PAGES):
+         try:
+             page = hub.snapshot_page(board, "tasks", after)
+         except (HubError, SyncUnavailable, OSError, AttributeError, ValueError) as exc:
+             return f"authoritative_snapshot_unavailable: {exc}"
+-        if (not isinstance(page, dict) or not isinstance(page.get("rows"), list) or not isinstance(page.get("head"), int)
++        if (not isinstance(page, dict) or not isinstance(page.get("rows"), list) or type(page.get("head")) is not int
+                 or not isinstance(page.get("more"), bool) or not all(isinstance(r, dict) for r in page["rows"])):
+             return incomplete + ": malformed page"
+         if page.get("table") != "tasks":
+             return incomplete + ": table identity mismatch"
+         if snapshot_head is None:
+             snapshot_head = page["head"]
+-        if page["head"] != snapshot_head:
+-            return incomplete + ": snapshot head changed"
++        if page["head"] < max(0, last_head):
++            return incomplete + ": snapshot head regressed"
++        last_head = page["head"]
+         if any(r.get("idempotency_key") == new_key for r in page["rows"]):
+             return "replacement_key_in_remote_use"
+         if not page["more"]:
+-            return None
++            if page["head"] == snapshot_head:
++                return None
++            from hermes_cli.kanban_sync_key_evidence import cover_changes
++            return cover_changes(hub, board, new_key, snapshot_head, page["head"])
+         nxt = page.get("next")
+         if not isinstance(nxt, str) or nxt <= after:
+             return incomplete + ": page cursor does not advance"
+diff --git a/tests/hermes_cli/test_kanban_sync_key_evidence.py b/tests/hermes_cli/test_kanban_sync_key_evidence.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..086d08716cafdf37b15f9cde05d99c9d60de1715
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_key_evidence.py
+@@ -0,0 +1,135 @@
++"""Busy Board replacement-key evidence: finite-cut coverage, not a reservation."""
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_sync_key_evidence as evidence
++from hermes_cli import kanban_sync_reserved_key as rk
++from hermes_cli.kanban_sync_client import HubError, Resync, SyncUnavailable
++from tests.hermes_cli import test_kanban_sync_reserved_key as base
++from tests.hermes_cli.test_kanban_sync_reserved_key import BOARD, GOOD, ME, REASON, bad_card, dump
++
++kanban_home, live, svc = base.kanban_home, base.live, base.svc
++
++
++def change(seq, key=None, uid="a"):
++    return {"seq": seq, "table": "tasks", "uid": uid, "op": "upsert",
++            "fields": {"uid": uid, "idempotency_key": key}}
++
++
++def feed(changes, head=None, more=False):
++    end = changes[-1]["seq"] if changes else 10
++    return {"changes": changes, "head": end if head is None else head, "next": end, "more": more}
++
++
++def moving(hub, monkeypatch, changes):
++    # The second read misses inserts/edits behind its cursor. Only the feed can see them.
++    pages = {"": {"table": "tasks", "head": 10, "rows": [{"uid": "m", "idempotency_key": None}],
++                  "next": "m", "more": True},
++             "m": {"table": "tasks", "head": 12, "rows": [], "next": "m", "more": False}}
++    monkeypatch.setattr(hub, "snapshot_page", lambda b, t, after="": pages[after])
++    monkeypatch.setattr(hub, "changes", changes)
++
++
++def test_busy_board_finite_cut_without_chasing_writers(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    hub, calls = svc.hub(ME), []
++
++    def read(board, cursor):
++        assert board == BOARD
++        calls.append(cursor)
++        # Writers are still ahead of the cut, and the feed is still paginated.
++        return feed([change(cursor + 1)], head=100 + cursor, more=True)
++    moving(hub, monkeypatch, read)
++    before = dump(live)
++    report = rk.plan(live, hub, BOARD, tid, GOOD, REASON)
++    assert report["eligible"], report
++    assert calls == [10, 11]
++    assert dump(live) == before
++    result = rk.apply(live, hub, BOARD, tid, GOOD, report["token"], REASON)
++    assert result["action"] == "applied", result
++    assert calls == [10, 11, 10, 11]  # apply refreshes, not a cached preview
++
++
++@pytest.mark.parametrize("uid", ["a-new-behind-cursor", "m"])
++def test_insert_or_edit_behind_cursor_vetoes(live, svc, monkeypatch, uid):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    hub = svc.hub(ME)
++    moving(hub, monkeypatch, lambda *a: feed([change(11, GOOD, uid), change(12)]))
++    before = dump(live)
++    result = rk.apply(live, hub, BOARD, tid, GOOD, "old-preview", REASON)
++    assert result["refusal"] == "replacement_key_in_remote_use"
++    assert dump(live) == before
++
++
++def test_transient_duplicate_then_delete_still_vetoes():
++    changes = [change(11, GOOD), {"seq": 12, "table": "tasks", "uid": "a", "op": "delete", "fields": None}]
++    hub = SimpleNamespace(changes=lambda *a: feed(changes))
++    assert evidence.cover_changes(hub, BOARD, GOOD, 10, 12) == "replacement_key_in_remote_use"
++
++
++@pytest.mark.parametrize("page", [
++    None, {}, {"resync": True}, feed([]), feed([change(12)]),
++    feed([change(11)], head=12), feed([change(11)], head=9),
++    {**feed([change(11), change(12)]), "next": 13},
++    {**feed([change(11), change(12)]), "more": "false"},
++    feed([change(11), change(11)]),
++    feed([{**change(11), "fields": {"uid": "a"}}, change(12)]),
++    feed([{**change(11), "fields": None}, change(12)]),
++    feed([{**change(11), "fields": {"uid": "other", "idempotency_key": None}}, change(12)]),
++    feed([{**change(11), "op": "unknown"}, change(12)]),
++])
++def test_incomplete_or_malformed_feed_refuses(page):
++    hub = SimpleNamespace(changes=lambda *a: page)
++    assert evidence.cover_changes(hub, BOARD, GOOD, 10, 12).startswith("authoritative_snapshot_incomplete")
++
++
++@pytest.mark.parametrize("exc", [HubError(404, "absent"), Resync("compacted"), SyncUnavailable("down"), OSError("network")])
++def test_failed_or_compacted_feed_refuses(exc):
++    def read(*a):
++        raise exc
++    assert evidence.cover_changes(SimpleNamespace(changes=read), BOARD, GOOD, 10, 12).startswith(
++        "authoritative_snapshot_unavailable")
++
++
++def test_missing_service_and_bounded_feed_refuse(monkeypatch):
++    assert evidence.cover_changes(object(), BOARD, GOOD, 10, 12).startswith("authoritative_snapshot_unavailable")
++    monkeypatch.setattr(evidence, "MAX_FEED_PAGES", 1)
++    hub = SimpleNamespace(changes=lambda *a: feed([change(11)], head=12, more=True))
++    assert "page cap" in evidence.cover_changes(hub, BOARD, GOOD, 10, 12)
++
++
++@pytest.mark.parametrize("key", [None, GOOD])
++def test_service_interleaving_behind_real_page_cursor(svc, monkeypatch, key):
++    hub, b = svc.hub(ME), svc.board(BOARD)
++    for uid in ("m", "z"):
++        svc._put(b, "tasks", uid, {"idempotency_key": None}, ME, None, "")
++    original = hub.snapshot_page
++    calls = []
++
++    def page(board, table, after=""):
++        if after:
++            # A different writer inserts below the page cursor after page one.
++            svc._put(b, "tasks", "a", {"idempotency_key": key}, "other", None, "")
++        result = original(board, table, after, limit=1)
++        calls.append(result["head"])
++        return result
++    monkeypatch.setattr(hub, "snapshot_page", page)
++    result = rk._remote_key_refusal(hub, BOARD, GOOD)
++    assert calls == [2, 3]
++    assert result == ("replacement_key_in_remote_use" if key == GOOD else None)
++
++
++def test_feed_latency_counts_against_original_evidence_bound(live, svc, monkeypatch):
++    tid, _ = bad_card(live, svc, monkeypatch)
++    hub, clock = svc.hub(ME), [0.0]
++    monkeypatch.setattr(rk, "_mono", lambda: clock[0])
++
++    def read(*a):
++        clock[0] += rk.EVIDENCE_MAX_AGE_S + 1
++        return feed([change(11), change(12)])
++    moving(hub, monkeypatch, read)
++    before = dump(live)
++    result = rk.apply(live, hub, BOARD, tid, GOOD, "old-preview", REASON)
++    assert result["refusal"] == "evidence_interval_exceeded"
++    assert dump(live) == before
+diff --git a/tests/hermes_cli/test_kanban_sync_reserved_key_snapshot.py b/tests/hermes_cli/test_kanban_sync_reserved_key_snapshot.py
+index f8e9a343ee15798ce75613c1e08183a5a00d940d..cc1d417f35a524bd6841e343a0958dc0a07bba79 100644
+--- a/tests/hermes_cli/test_kanban_sync_reserved_key_snapshot.py
++++ b/tests/hermes_cli/test_kanban_sync_reserved_key_snapshot.py
+@@ -28,6 +28,8 @@ def test_snapshot_identity_refuses_preview_and_apply(live, svc, monkeypatch, fau
+         return page
+ 
+     monkeypatch.setattr(hub, "snapshot_page", snapshot)
++    # A moving scan is insufficient alone: no complete interval proof is available.
++    monkeypatch.setattr(hub, "changes", lambda *a: {})
+     report = helpers.plan_with(live, hub, tid)
+     assert not report["eligible"], report
+     assert report["refusal"].startswith("authoritative_snapshot_incomplete"), report
+@@ -47,6 +49,8 @@ def test_stable_tasks_snapshot_allows_recovery(live, svc, monkeypatch, head):
+         return {"head": head, "table": "tasks", "rows": [], "more": not after, "next": "a"}
+ 
+     monkeypatch.setattr(hub, "snapshot_page", snapshot)
++    # A moving scan is insufficient alone: no complete interval proof is available.
++    monkeypatch.setattr(hub, "changes", lambda *a: {})
+     report = helpers.plan_with(live, hub, tid)
+     assert report["eligible"], report
+     assert calls == ["", "a"]
+-- 
+2.43.0
+

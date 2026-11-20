@@ -1,0 +1,409 @@
+From 736425911e52f6d71911fef79a4febf0051e9ea1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 16:46:20 +0000
+Subject: [PATCH] fix(kanban): isolate receipt failures and bound payload
+ preflight [daveey]
+
+---
+ hermes_cli/kanban_fairness_runtime.py         | 83 +++++++++++++++--
+ hermes_cli/kanban_fairness_urgency.py         | 11 +--
+ hermes_cli/kanban_turn_urgency.py             |  8 +-
+ .../test_kanban_fairness_runtime.py           | 93 +++++++++++++++++++
+ .../test_kanban_urgency_receipts.py           | 77 +++++++++++++++
+ 5 files changed, 255 insertions(+), 17 deletions(-)
+
+diff --git a/hermes_cli/kanban_fairness_runtime.py b/hermes_cli/kanban_fairness_runtime.py
+index 926524b95ef5213589a94f4459495d4508ad9f2c..e0a761342deb63e4f52705c773e1ec1a2ebe3610 100644
+--- a/hermes_cli/kanban_fairness_runtime.py
++++ b/hermes_cli/kanban_fairness_runtime.py
+@@ -22,6 +22,7 @@ MAX_RECORDS = 1024
+ MAX_QUEUE_BYTES = 8 * 1024 * 1024
+ MAX_PAYLOAD_BYTES = 256 * 1024
+ _SESSIONS = {}
++_DEFAULT_HOME = None
+ 
+ 
+ def append_records(*args, **kwargs):
+@@ -38,9 +39,10 @@ def seal_records(*args, **kwargs):
+ 
+ def _key(board, home=None):
+     if home is None:
+-        from hermes_constants import get_hermes_home
++        from hermes_constants import get_hermes_home_override
+ 
+-        home = get_hermes_home()
++        # Startup resolves the fallback once. Context and environment reads do no IO.
++        home = get_hermes_home_override() or os.environ.get("HERMES_HOME") or _DEFAULT_HOME
+     return (os.getpid(), str(home), board)
+ 
+ 
+@@ -51,6 +53,17 @@ def enabled(*, board) -> bool:
+     return session is not None and not session.stopping.is_set()
+ 
+ 
++def invalidate(*, board):
++    """Fail closed after observation failure, without retrying the broken sink or IO.
++
++    Conservatively invalidate matching boards across profile scopes: losing evidence
++    is preferable to certifying a complete epoch after an unrecorded observation.
++    """
++    for session in tuple(_SESSIONS.values()):
++        if session.board == board:
++            session.abandoned.set()
++
++
+ def submit(*, board, kind, payload) -> bool:
+     """Observe only: callers must not describe an uncommitted write as committed."""
+     if not _SESSIONS:
+@@ -59,6 +72,51 @@ def submit(*, board, kind, payload) -> bool:
+     return session.enqueue(kind, payload) if session is not None else False
+ 
+ 
++class PayloadLimit(ValueError):
++    """A bounded preflight rejected this input before serialization."""
++
++
++def bounded_payload(payload):
++    """Reject huge/deep/nonprimitive inputs before JSON allocates an unbounded copy."""
++    pending = [iter((payload,))]
++    budget = MAX_PAYLOAD_BYTES
++    while pending:
++        if len(pending) > 32:
++            raise PayloadLimit("payload nesting limit")
++        try:
++            value = next(pending[-1])
++        except StopIteration:
++            pending.pop()
++            continue
++        budget -= 1
++        if type(value) is str:
++            budget -= len(value)
++        elif type(value) in (list, dict):
++            if len(value) > budget:
++                raise PayloadLimit("payload item limit")
++            if type(value) is dict:
++                for key in value:
++                    if type(key) is not str:
++                        raise ValueError("payload keys must be strings")
++                    budget -= len(key) + 1
++                    if budget < 0:
++                        raise PayloadLimit("payload key limit")
++                pending.append(iter(value.values()))
++            else:
++                pending.append(iter(value))
++        elif type(value) is int:
++            if value.bit_length() > 128:
++                raise PayloadLimit("payload integer limit")
++        elif value is not None and type(value) not in (bool, float):
++            raise ValueError("payload must contain JSON primitives")
++        if budget < 0:
++            raise PayloadLimit("payload size limit")
++    raw = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8")
++    if len(raw) > MAX_PAYLOAD_BYTES:
++        raise PayloadLimit("encoded payload limit")
++    return raw
++
++
+ class Session:
+     def __init__(self, settings, *, board, source_gateway, board_uid, clock_error_ns):
+         self.epoch = uuid.uuid4().hex
+@@ -100,13 +158,13 @@ class Session:
+             return False
+         try:
+             # Snapshot caller-owned data; at most one bounded record is handed to writer.
+-            raw = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8")
+-            if len(raw) > MAX_PAYLOAD_BYTES:
+-                self.loss["oversize"] += 1
+-                return False
++            raw = bounded_payload(payload)
+             payload = json.loads(raw)
+             self.record(kind, payload, 1)
+-        except (TypeError, ValueError, OverflowError, RecursionError):
++        except PayloadLimit:
++            self.loss["oversize"] += 1
++            return False
++        except (TypeError, ValueError, OverflowError, RecursionError, RuntimeError):
+             self.loss["unsupported"] += 1
+             return False
+         if not self.lock.acquire(blocking=False):
+@@ -163,14 +221,23 @@ class Session:
+         self.thread.join(min(2.0, max(0.0, timeout)))
+         if self.thread.is_alive():
+             self.abandoned.set()
+-        return self.sealed and not self.thread.is_alive()
++        for key, session in tuple(_SESSIONS.items()):
++            if session is self:
++                del _SESSIONS[key]
++        atexit.unregister(self.close)
++        return self.sealed and not self.abandoned.is_set() and not self.thread.is_alive()
+ 
+ 
+ def activate(config, *, home: Path, board: str, source_gateway: str, board_uid: str,
+              clock_error_ns=None):
++    global _DEFAULT_HOME
+     settings = resolve(config, home=home)
+     if settings is None:
+         return None
++    if not os.environ.get("HERMES_HOME"):
++        from hermes_constants import get_process_hermes_home
++
++        _DEFAULT_HOME = str(get_process_hermes_home())
+     key = _key(board, home)
+     if key in _SESSIONS:
+         raise ValueError("capture already active for this profile/board/process")
+diff --git a/hermes_cli/kanban_fairness_urgency.py b/hermes_cli/kanban_fairness_urgency.py
+index 958d674a1a74cb79d67156d3b80991739116c794..f9c9562a4c37e095169484c0b8ded877845d890b 100644
+--- a/hermes_cli/kanban_fairness_urgency.py
++++ b/hermes_cli/kanban_fairness_urgency.py
+@@ -20,7 +20,7 @@ def receipt(*, board, now_s, raw, outcome, owners):
+     # Reader accepts some source documents the evidence privacy allowlist forbids.
+     # Preserve actual owner_ids, but never pretend the exact-byte gate was met.
+     reason = None
+-    if outcome == "valid" and not safe:
++    if outcome in {"valid", "expired"} and not safe:
+         outcome, reason = "invalid", "source_not_allowlisted"
+     retain = safe and outcome != "invalid"
+     return dict(receipt_type="urgency_read", board=board, read_at_s=now_s, outcome=outcome,
+@@ -39,8 +39,7 @@ def emit(**observation):
+     try:
+         payload = receipt(**observation)
+         runtime.submit(board=observation["board"], kind="owner_generation", payload=payload)
+-    except (ValueError, TypeError, OverflowError, RecursionError):
+-        # Observation must never change an existing read result.
+-        runtime.submit(board=observation["board"], kind="loss", payload=dict(
+-            reason="unsupported", count=1, first_seq=None, last_seq=None,
+-            start_wall_ns=None, end_wall_ns=None))
++    except (ValueError, TypeError, OverflowError, RecursionError, OSError, RuntimeError):
++        # Do not retry a failed sink: it may fail again and change the read result.
++        # The in-memory invalidation prevents an apparently complete epoch seal.
++        runtime.invalidate(board=observation["board"])
+diff --git a/hermes_cli/kanban_turn_urgency.py b/hermes_cli/kanban_turn_urgency.py
+index 41d58c83479225836d680cb64b229d80bf0be47c..6368c06c924606f7badbbae0d52a5ba9a4a03496 100644
+--- a/hermes_cli/kanban_turn_urgency.py
++++ b/hermes_cli/kanban_turn_urgency.py
+@@ -67,11 +67,13 @@ def read_owners(*, board: str, now_s: float, path=None) -> set[str]:
+         or not _nonempty(value.get("source_revision"))
+         or not _finite_clock(observed)
+         or not _finite_clock(valid_until)
+-        or not observed <= now_s < valid_until <= observed + 120
++        or not observed <= valid_until <= observed + 120
++        or observed > now_s
+         or not isinstance(value.get("owners"), list)
+     ):
+-        expired = _finite_clock(valid_until) and valid_until <= now_s
+-        return result(outcome="expired" if expired else "invalid")
++        return result()
++    if valid_until <= now_s:
++        return result(outcome="expired")
+     if len(value["owners"]) > 4096:
+         return result()
+     owners = set()
+diff --git a/tests/hermes_cli/test_kanban_fairness_runtime.py b/tests/hermes_cli/test_kanban_fairness_runtime.py
+index 79047c57f9dfcc8ce4c2a2d9ac4043e971092cc3..12c6a1719d4142fc7fc1838b47bf7261146e92a2 100644
+--- a/tests/hermes_cli/test_kanban_fairness_runtime.py
++++ b/tests/hermes_cli/test_kanban_fairness_runtime.py
+@@ -2,6 +2,8 @@
+ import json
+ import threading
+ 
++import pytest
++
+ from hermes_cli import kanban_fairness_runtime as runtime
+ from hermes_cli.kanban_fairness_store import load
+ from hermes_cli.kanban_turn_urgency import read_owners
+@@ -14,6 +16,71 @@ def activate(tmp_path, monkeypatch):
+                             clock_error_ns=0)
+ 
+ 
++@pytest.mark.parametrize("value", ["x" * (runtime.MAX_PAYLOAD_BYTES + 1),
++                                   [None] * (runtime.MAX_PAYLOAD_BYTES + 1), 10**400])
++def test_oversize_is_rejected_before_serializing(monkeypatch, value):
++    monkeypatch.setattr(runtime.json, "dumps", lambda *a, **kw: pytest.fail("unbounded serialization"))
++    with pytest.raises(runtime.PayloadLimit):
++        runtime.bounded_payload({"value": value})
++
++
++def test_cycle_and_encoded_size_are_bounded():
++    cycle = []
++    cycle.append(cycle)
++    with pytest.raises(runtime.PayloadLimit):
++        runtime.bounded_payload(cycle)
++    with pytest.raises(runtime.PayloadLimit):
++        runtime.bounded_payload({"value": "\x01" * (runtime.MAX_PAYLOAD_BYTES // 2)})
++
++
++def test_rejected_payload_is_durable_loss(tmp_path, monkeypatch):
++    session = activate(tmp_path, monkeypatch)
++    assert not runtime.submit(board="default", kind="loss", payload={"huge": "x" * runtime.MAX_PAYLOAD_BYTES})
++    assert session.close()
++    records = load(session.out)["records"]
++    assert records[0]["kind"] == "loss"
++    assert records[0]["payload"]["reason"] == "oversize"
++
++
++def test_hot_lookup_never_resolves_home(tmp_path, monkeypatch):
++    import hermes_constants
++
++    session = activate(tmp_path, monkeypatch)
++    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: (_ for _ in ()).throw(
++        AssertionError("hot lookup must not resolve filesystem home")))
++    try:
++        assert runtime.enabled(board="default")
++        assert runtime.submit(board="default", kind="loss", payload=session.loss_payload("redaction", 1))
++        token = hermes_constants.set_hermes_home_override(tmp_path / "other")
++        try:
++            assert not runtime.enabled(board="default")
++            assert not runtime.submit(board="default", kind="loss", payload=session.loss_payload("redaction", 1))
++        finally:
++            hermes_constants.reset_hermes_home_override(token)
++    finally:
++        session.close()
++
++
++def test_close_releases_registration(tmp_path, monkeypatch):
++    session = activate(tmp_path, monkeypatch)
++    runtime.submit(board="default", kind="loss", payload=session.loss_payload("redaction", 1))
++    assert session.close()
++    replacement = activate(tmp_path, monkeypatch)
++    replacement.close()
++
++
++def test_observation_failure_prevents_seal(tmp_path, monkeypatch):
++    session = activate(tmp_path, monkeypatch)
++    runtime.submit(board="default", kind="loss", payload=session.loss_payload("redaction", 1))
++    def fail(**kw):
++        raise OSError("sink failed")
++    monkeypatch.setattr(runtime, "submit", fail)
++    assert read_owners(board="default", now_s=150, path=tmp_path / "missing") == set()
++    assert session.abandoned.is_set()
++    assert not session.close()
++    assert not (session.out / "manifest.json").exists()
++
++
+ def test_real_reader_writer_and_seal(tmp_path, monkeypatch):
+     session = activate(tmp_path, monkeypatch)
+     try:
+@@ -42,6 +109,32 @@ def test_writer_failure_stays_unsealed(tmp_path, monkeypatch):
+     assert not (session.out / "manifest.json").exists()
+ 
+ 
++def test_ten_thousand_submissions_do_not_wait_for_writer(tmp_path, monkeypatch):
++    entered, release = threading.Event(), threading.Event()
++    actual = runtime.append_records
++
++    def held(*args, **kwargs):
++        entered.set()
++        assert release.wait(10)
++        return actual(*args, **kwargs)
++
++    monkeypatch.setattr(runtime, "append_records", held)
++    monkeypatch.setattr(runtime, "MAX_RECORDS", 2)
++    session = activate(tmp_path, monkeypatch)
++    payload = session.loss_payload("redaction", 1)
++    try:
++        assert runtime.submit(board="default", kind="loss", payload=payload)
++        assert entered.wait(2)
++        results = [runtime.submit(board="default", kind="loss", payload=payload) for _ in range(10000)]
++        assert sum(results) == 2
++        assert session.loss["dropped"] == len(results) - sum(results)
++        assert session.bytes <= runtime.MAX_QUEUE_BYTES
++        assert not release.is_set()
++    finally:
++        release.set()
++        session.close()
++
++
+ def test_overflow_and_tail_are_bounded(tmp_path, monkeypatch):
+     entered, release = threading.Event(), threading.Event()
+     actual = runtime.append_records
+diff --git a/tests/hermes_cli/test_kanban_urgency_receipts.py b/tests/hermes_cli/test_kanban_urgency_receipts.py
+index 60af444cf571f08e2bc47a008fea4b2ea4d62bb8..f9cd6cd6b5f64871e7f9fb1a198123cbf816b56f 100644
+--- a/tests/hermes_cli/test_kanban_urgency_receipts.py
++++ b/tests/hermes_cli/test_kanban_urgency_receipts.py
+@@ -56,6 +56,83 @@ def test_real_read_receipt(tmp_path, monkeypatch, case, outcome, owners):
+         assert receipt["raw_sha256"] == hashlib.sha256(observed).hexdigest()
+ 
+ 
++@pytest.mark.parametrize("mutation,now,outcome", [
++    ({"version": 2}, 201, "invalid"),
++    ({"board": "other"}, 201, "invalid"),
++    ({"source_revision": ""}, 201, "invalid"),
++    ({"owners": "bad"}, 201, "invalid"),
++    ({"observed_at": 300}, 201, "invalid"),
++    ({"valid_until": 10**400}, 150, "invalid"),
++    ({}, float("nan"), "invalid_request"),
++])
++def test_invalid_is_not_mislabeled_expired(tmp_path, monkeypatch, mutation, now, outcome):
++    from hermes_cli import kanban_fairness_runtime as runtime
++
++    receipts = []
++    monkeypatch.setattr(runtime, "enabled", lambda **kw: True)
++    monkeypatch.setattr(runtime, "submit", lambda **kw: receipts.append(kw) or True)
++    value = document() | mutation
++    path = tmp_path / "owners.json"
++    path.write_text(json.dumps(value))
++    assert urgency.read_owners(board="default", now_s=now, path=path) == set()
++    assert urgency_payload(receipts[0]["payload"])["outcome"] == outcome
++
++
++@pytest.mark.parametrize("error", [ValueError, OSError, RuntimeError])
++def test_observation_failure_does_not_change_result(tmp_path, monkeypatch, error):
++    from hermes_cli import kanban_fairness_runtime as runtime
++
++    monkeypatch.setattr(runtime, "enabled", lambda **kw: True)
++
++    def fail(**kw):
++        raise error("evidence unavailable")
++
++    monkeypatch.setattr(runtime, "submit", fail)
++    path = tmp_path / "owners.json"
++    path.write_text(json.dumps(document()))
++    assert urgency.read_owners(board="default", now_s=150, path=path) == {"task"}
++
++
++@pytest.mark.parametrize("case,outcome,expected", [
++    ("duplicate", "invalid", {"task"}),
++    ("nan", "invalid", set()),
++    ("owner_expired", "expired", set()),
++    ("invalid_expired_owner", "invalid", set()),
++    ("io", "io_error", set()),
++    ("bad_board", "invalid_request", set()),
++])
++def test_reader_edge_receipts(tmp_path, monkeypatch, case, outcome, expected):
++    from hermes_cli import kanban_fairness_runtime as runtime
++
++    receipts = []
++    monkeypatch.setattr(runtime, "enabled", lambda **kw: True)
++    monkeypatch.setattr(runtime, "submit", lambda **kw: receipts.append(kw) or True)
++    value = document()
++    if case == "nan":
++        value["observed_at"] = float("nan")
++    if case in {"owner_expired", "invalid_expired_owner"}:
++        value["owners"][0]["expires_at"] = 149
++    if case == "invalid_expired_owner":
++        value["owners"][0]["source"] = "bad"
++    raw = json.dumps(value).encode()
++    if case == "duplicate":
++        raw = raw.replace(b'"version": 1', b'"version": 1, "version": 1')
++    path = tmp_path / "owners.json"
++    path.write_bytes(raw)
++    if case == "io":
++        path = tmp_path  # Real directory open failure, not a mocked reader.
++    board = "../invalid" if case == "bad_board" else "default"
++    result = urgency.read_owners(board=board, now_s=150, path=None if case == "bad_board" else path)
++    assert result == expected
++    payload = urgency_payload(receipts[0]["payload"])
++    assert payload["outcome"] == outcome
++    assert payload["owner_ids"] == sorted(result)
++    if case in {"duplicate", "nan", "invalid_expired_owner"}:
++        assert payload["redacted"] and payload["raw_b64"] is None
++    if case in {"io", "bad_board"}:
++        assert payload["raw_sha256"] is None and payload["raw_size"] is None
++
++
+ def test_disabled_does_not_build_receipt(tmp_path, monkeypatch):
+     from hermes_cli import kanban_fairness_runtime as runtime
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,625 @@
+From 9378691e53d6f0a1baca4e4befd83a4794de7d60 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 05:09:15 +0000
+Subject: [PATCH] fix(kanban): age outbox stalls by observed awake operation
+ identity [daveey]
+
+Wall-created age counted laptop sleep as opportunity to send; last-round health survived that gap. Keep wall status truthful, but require the same sendable unanswered op for 600 monotonic seconds. Persist boot-scoped board observations, incident and warning state; reset on identity loss, unreadable data, reboot or observation gaps over 600 awake seconds. Preserve held FIFO/stale-wake and answered retry exclusions and replica-age handoff.
+
+Proof: both entry paths failed before on 660 wall seconds with 60 awake seconds, now pass. Same-op awake stall, identity/ack/held/retry/read failure, boot and restart persistence, gap, memo validation, filing retry and delayed-read tests pass. Consumer suites passed (101 tests before final coverage additions); final suites and required CI recorded by ship. Fixtures do not establish deployed Mac behavior.
+---
+ hermes_cli/kanban_sync_outbox_age.py          | 119 +++++++-----
+ hermes_cli/kanban_sync_outbox_observation.py  |  88 +++++++++
+ .../test_kanban_sync_outbox_awake.py          | 176 ++++++++++++++++++
+ .../test_kanban_sync_outbox_observation.py    |  54 ++++++
+ .../test_kanban_sync_push_starvation.py       |  12 +-
+ 5 files changed, 403 insertions(+), 46 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_outbox_observation.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_outbox_awake.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_outbox_observation.py
+
+diff --git a/hermes_cli/kanban_sync_outbox_age.py b/hermes_cli/kanban_sync_outbox_age.py
+index 458337d0d9b99144c4a65c9dee2f95c2f3f57816..10882efa42d4577ef58717009bb10254345b1eff 100644
+--- a/hermes_cli/kanban_sync_outbox_age.py
++++ b/hermes_cli/kanban_sync_outbox_age.py
+@@ -4,17 +4,22 @@ Incident (2026-11-12, laptop-1, t_01a1d36ddcea59fe): 1747 local edits waited up
+ with ``attempts=0``, because the sync round was stuck draining a pull backlog before its push. ``sync status``
+ showed only a count, nothing alerted, and the stall surfaced only as downstream "ready with no worker" notices.
+ 
+-Three readers of one number, the age of the oldest pending op:
++Wall age remains diagnostic; alarms require a continuously observed sendable identity:
+ 
+ - ``hermes kanban sync status`` prints it (``oldest_pending_age_s``; every pending row).
+ - The sync loop logs a WARNING (:func:`after_round`, at most once per :data:`STALE_S` per board) when a round
+-  succeeded and an unanswered op is still older than :data:`STALE_S`.
+-- The dispatcher tick (:func:`check`) files ONE card per incident on the default board when the same op is that old
++  succeeded and the same unanswered op has been observed for :data:`STALE_S` awake seconds.
++- The dispatcher tick (:func:`check`) files ONE card per incident on the default board when that same op is observed
++  for :data:`STALE_S` awake seconds
+   and this process's sync loop is not failing (its last round succeeded, or a round has run for over
+   :data:`STALE_S`, which is the stuck-round shape of the incident). The incident ends when the op is answered; the
+   next one comments on the open card (at most hourly) or opens a new card once that card is done. A failing, stalled
+   or stopped loop is the replica-freshness check's (``kanban_sync_replica_age``), which the same tick runs next.
+ 
++Observations persist in each board's ``.outbox-age.json`` sidecar. A same-boot restart resumes them;
++another boot, unreadable/no sendable op, identity change, or >600 awake seconds without observation resets them.
++Both entry paths share the observation and report wall age, observed-awake age and op_id, never payloads.
++
+ "Unanswered" = pending with no ``retry_after``: the Board never told us to wait. A row the Board deferred
+ (``storage_error``, ``depends_on_rejected``) retries on its own backoff and logs its own reason; counting it would
+ alarm on a Board-side wait, not on a push that never runs.
+@@ -29,6 +34,7 @@ from pathlib import Path
+ from typing import Any, Callable, Iterable, Optional
+ 
+ from hermes_cli import kanban_sync_replica_age as replica_age  # the same tick's replica-freshness alarm
++from hermes_cli import kanban_sync_outbox_observation as observation
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -41,8 +47,7 @@ _COMMENT_EVERY = 3600
+ _LOCK = threading.Lock()
+ _LAST_OK: dict[str, bool] = {}  # board slug -> this process's last completed round for it succeeded
+ _ROUND_STARTED: list[Optional[float]] = [None]  # monotonic start of the loop's round in progress
+-_WARNED_AT: dict[str, float] = {}
+-_FILED: set[str] = set()
++
+ _NEXT_CHECK: list[float] = [0.0]
+ 
+ 
+@@ -84,20 +89,41 @@ def sendable_age_s(conn: sqlite3.Connection, path: Path, now: Optional[float] =
+     return _since(min(ages), now) if ages else None
+ 
+ 
+-def _age(path: Path) -> Optional[float]:
++def _sample(path: Path) -> Optional[tuple[str, float]]:
++    """Oldest sendable unanswered identity and wall age; unknown reads reset observation."""
+     from hermes_cli import kanban_db_connect as kbc
+     from hermes_cli import kanban_sync_backlog as backlog
+     if not Path(path).exists():
+-        return None  # never create a board file just to read its outbox
++        return None
+     try:
+         with kbc.connect_closing(path) as conn:
++            conn.row_factory = sqlite3.Row
++            rows = [dict(r) for r in conn.execute(
++                "SELECT * FROM kanban_sync_outbox WHERE state = 'pending' "
++                "AND (retry_after IS NULL OR retry_after <= ?) ORDER BY created_at, rowid", (int(time.time()),))]
+             if backlog.behind(path):
+-                return sendable_age_s(conn, path)
+-            return oldest_pending_age_s(conn, unanswered=True)
+-    except (sqlite3.Error, OSError):
++                rows, _ = backlog.sendable_before_head(conn, _NoBoardReads(), "", rows, backlog.evidence(path))
++            row = next((r for r in rows if r["retry_after"] is None), None)
++            return (row["op_id"], _since(row["created_at"])) if row else None
++    except (sqlite3.Error, OSError, ValueError, TypeError):
+         return None
+ 
+ 
++def _age(path: Path) -> Optional[float]:
++    sample = _sample(path)
++    return sample[1] if sample else None
++
++
++def _observed(path: Path, mono, age):
++    sample = _sample(path)
++    # Retain the age injection seam for callers suppressing outbox observations.
++    if age is not _age and age(path) is None:
++        sample = None
++    now = mono()  # sample and timestamp under the same observation lock
++    seen = observation.observe(path, sample[0] if sample else None, now)
++    return seen, sample[1] if sample else None, now
++
++
+ def round_started(mono: Callable[[], float] = time.monotonic) -> None:
+     """The sync loop starts a round (the dispatcher can then tell a round stuck for an hour from an idle loop)."""
+     with _LOCK:
+@@ -106,8 +132,8 @@ def round_started(mono: Callable[[], float] = time.monotonic) -> None:
+ 
+ def after_round(results: Iterable[Any], boards: Iterable[tuple[str, Path]], *,
+                 mono: Callable[[], float] = time.monotonic, age: Callable[[Path], Optional[float]] = _age) -> list[str]:
+-    """Record each board's round outcome and WARN when a good round left an unanswered op older than
+-    :data:`STALE_S`. Returns the boards warned about. Never raises."""
++    """Record round outcome and WARN after :data:`STALE_S` observed-awake seconds for one sendable op.
++    Returns the boards warned about. Never raises."""
+     warned: list[str] = []
+     try:
+         paths = dict(boards)
+@@ -118,19 +144,24 @@ def after_round(results: Iterable[Any], boards: Iterable[tuple[str, Path]], *,
+                 _LAST_OK[r.board] = not r.error
+         replica_age.note_round(results, mono=mono)  # the replica-freshness card names the last round's outcome
+         for r in results:
+-            if r.error or r.board not in paths:
+-                continue
+-            seconds = age(paths[r.board])
+-            if seconds is None or seconds < STALE_S:
+-                _WARNED_AT.pop(r.board, None)
+-                continue
+-            now = mono()
+-            if now - _WARNED_AT.get(r.board, now - STALE_S) < STALE_S:
++            if r.board not in paths:
+                 continue
+-            _WARNED_AT[r.board] = now
+-            warned.append(r.board)
+-            log.warning("kanban sync: %s: a local edit has waited %.0f s in the outbox although this round succeeded "
+-                        "(the Board has not seen it; `hermes kanban sync status` shows the outbox)", r.board, seconds)
++            path = paths[r.board]
++            with observation.LOCK:
++                if r.error:
++                    observation.observe(path, None, mono())
++                    continue
++                seen, seconds, now = _observed(path, mono, age)
++                if seen is None or now - seen.since < STALE_S:
++                    continue
++                if seen.warned_at is not None and now - seen.warned_at < STALE_S:
++                    continue
++                seen.warned_at = now
++                observation.remember(path, seen)
++                warned.append(r.board)
++                log.warning("kanban sync: %s: op %s has waited %.0f wall s / %.0f observed-awake s in the "
++                            "outbox although this round succeeded (`hermes kanban sync status` shows the outbox)",
++                            r.board, seen.op_id, seconds, now - seen.since)
+     except Exception:  # health: allow BLE001 -- an alarm must never stop the sync loop
+         log.warning("kanban sync: outbox age check failed", exc_info=True)
+     return warned
+@@ -161,26 +192,27 @@ def check(*, mono: Callable[[], float] = time.monotonic, file_fn: Optional[Calla
+     except Exception:  # health: allow BLE001 -- an alert must never break the dispatcher tick
+         log.warning("kanban: sync outbox age check failed", exc_info=True)
+         return []
+-    return _check_outbox(boards, now, file_fn, age) + replica_age.check(boards, now=now)
++    return _check_outbox(boards, mono, file_fn, age) + replica_age.check(boards, now=now)
+ 
+ 
+-def _check_outbox(boards: list[tuple[str, Path]], now: float, file_fn, age) -> list[str]:
++def _check_outbox(boards: list[tuple[str, Path]], mono, file_fn, age) -> list[str]:
+     try:
+         out = []
+         for slug, path in boards:
+-            seconds = age(path) if _loop_healthy(slug, now) else None
+-            if seconds is None or seconds < STALE_S:
+-                # Answered, or the loop is failing: incident over here. A failing, stalled or stopped loop is
+-                # alarmed by the replica-freshness check (kanban_sync_replica_age.check, run right after this).
+-                _FILED.discard(slug)
+-                continue
+-            if slug in _FILED:
+-                continue
+-            _FILED.add(slug)
+-            tid = (file_fn or report)(slug, f"board `{slug}`: the oldest unanswered outbox op is {seconds / 60:.0f} "
+-                                            f"min old while this host's sync loop is not failing")
+-            if tid:
+-                out.append(tid)
++            with observation.LOCK:
++                # Observe even before loop health is established: a stuck first round
++                # must not acquire an extra ten-minute delay. Replica-age covers failure.
++                seen, seconds, now = _observed(path, mono, age)
++                if not _loop_healthy(slug, now) or seen is None or now - seen.since < STALE_S or seen.filed:
++                    continue
++                detail = (f"board `{slug}`: oldest sendable unanswered op `{seen.op_id}`; "
++                          f"wall age {seconds / 60:.0f} min; observed-awake age {now - seen.since:.0f} s "
++                          "while this host's sync loop is not failing")
++                tid = (file_fn or report)(slug, detail)
++                if tid:
++                    seen.filed = True
++                    observation.remember(path, seen)
++                    out.append(tid)
+         return out
+     except Exception:  # health: allow BLE001 -- an alert must never break the dispatcher tick
+         log.warning("kanban: sync outbox age check failed", exc_info=True)
+@@ -217,7 +249,8 @@ def _report(conn: sqlite3.Connection, slug: str, detail: str, *, key: str = KEY,
+             kb.add_comment(conn, row[0], author, f"Again: {detail}")
+         return row[0]
+     body = body or (
+-        "A local edit on this host has waited over 10 minutes in the Kanban sync outbox, so the Board (and every "
++        "The same sendable local edit on this host has been observed for 10 awake minutes in the Kanban sync "
++        "outbox, so the Board (and every "
+         "worker leasing from it) has not seen it, although the sync loop is not failing.\n\n"
+         f"{detail}\n\n"
+         "Check: `hermes kanban sync status` (cursor, pending, oldest_pending_age_s) and agent.log `kanban sync:` "
+@@ -225,7 +258,7 @@ def _report(conn: sqlite3.Connection, slug: str, detail: str, *, key: str = KEY,
+         "(`hermes_cli/kanban_sync_backlog.py`), so an old op means push is not reached or not accepted. Done when "
+         "the op is answered and the cause is fixed (precedent: t_01a1d36ddcea59fe)."
+     )
+-    tid = kb.create_task(conn, title=title or f"Kanban sync: {slug} outbox holds a local edit unsent for over 10 min",
++    tid = kb.create_task(conn, title=title or f"Kanban sync: {slug} outbox holds a local edit unsent for 10 awake min",
+                          body=body, assignee="default", created_by=author, priority=50,
+                          idempotency_key=None if row else key)
+     if row:  # the previous card is finished: the key now names this one (newest wins)
+@@ -239,7 +272,7 @@ def reset() -> None:
+     with _LOCK:
+         _LAST_OK.clear()
+         _ROUND_STARTED[0] = None
+-    _WARNED_AT.clear()
+-    _FILED.clear()
++
+     _NEXT_CHECK[0] = 0.0
+     replica_age.reset()
++    observation.reset()
+diff --git a/hermes_cli/kanban_sync_outbox_observation.py b/hermes_cli/kanban_sync_outbox_observation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d145e651420b0214c80b8eb1d34e45df9774788d
+--- /dev/null
++++ b/hermes_cli/kanban_sync_outbox_observation.py
+@@ -0,0 +1,88 @@
++"""Boot-scoped, persisted awake observations of sendable outbox identities. [daveey]
++
++Like replica-age, resume within one boot only across bounded observation gaps.
++No op (including an unreadable outbox) ends the observation. Wall age is diagnostic,
++never a substitute for observing the same op. The caller serializes read/observe/claim.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import os
++import threading
++from dataclasses import asdict, dataclass
++from pathlib import Path
++from typing import Optional
++
++from hermes_cli import kanban_sync_replica_age as replica_age
++
++log = logging.getLogger(__name__)
++LOCK = threading.RLock()
++MAX_GAP_S = 600.0
++_SEEN: dict[str, Observation] = {}
++
++
++@dataclass
++class Observation:
++    op_id: str
++    since: float
++    seen_at: float
++    boot: Optional[str]
++    filed: bool = False
++    warned_at: Optional[float] = None
++
++
++def _path(path: Path) -> Path:
++    return path.with_suffix(".outbox-age.json")
++
++
++def _load(path: Path, now: float, boot: Optional[str]) -> Optional[Observation]:
++    try:
++        rec = json.loads(_path(path).read_text(encoding="utf-8-sig"))
++        seen = Observation(**rec)
++        if (boot is not None and seen.boot == boot and isinstance(seen.op_id, str)
++                and 0 <= seen.since <= seen.seen_at <= now
++                and now - seen.seen_at <= MAX_GAP_S
++                and type(seen.filed) is bool
++                and (seen.warned_at is None or seen.since <= seen.warned_at <= seen.seen_at)):
++            return seen
++    except (OSError, ValueError, TypeError):
++        pass
++    return None
++
++
++def remember(path: Path, seen: Optional[Observation]) -> None:
++    target = _path(path)
++    try:
++        if seen is None:
++            target.unlink(missing_ok=True)
++            return
++        temp = target.with_name(f"{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
++        temp.write_text(json.dumps(asdict(seen)), encoding="utf-8")
++        temp.replace(target)
++    except OSError:
++        log.debug("kanban sync: cannot persist outbox observation at %s", target, exc_info=True)
++
++
++def observe(path: Path, op_id: Optional[str], now: float) -> Optional[Observation]:
++    key = str(path.resolve())
++    boot = replica_age._boot_id()
++    seen = _SEEN.get(key)
++    if seen is None:
++        seen = _load(path, now, boot)
++    if op_id is None:
++        _SEEN.pop(key, None)
++        remember(path, None)
++        return None
++    if (seen is None or seen.op_id != op_id or seen.boot != boot
++            or not seen.seen_at <= now or now - seen.seen_at > MAX_GAP_S):
++        seen = Observation(op_id, now, now, boot)
++    seen.seen_at = now
++    _SEEN[key] = seen
++    remember(path, seen)
++    return seen
++
++
++def reset() -> None:
++    with LOCK:
++        _SEEN.clear()
+diff --git a/tests/hermes_cli/test_kanban_sync_outbox_awake.py b/tests/hermes_cli/test_kanban_sync_outbox_awake.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0422306db1eff594e4f3e178c440dbec1b699891
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_outbox_awake.py
+@@ -0,0 +1,176 @@
++"""Outbox alarms require an observed sendable identity in awake time."""
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_sync_backlog as backlog
++from hermes_cli import kanban_sync_outbox_age as alarm
++from tests.hermes_cli import test_kanban_sync_push_starvation as fixtures
++
++kanban_home = fixtures.kanban_home
++live = fixtures.live
++
++
++@pytest.fixture
++def host(live, kanban_home, monkeypatch):
++    alarm.reset()
++    backlog.reset()
++    clock = SimpleNamespace(wall=10000.0, mono=100.0)
++    monkeypatch.setattr(alarm.time, "time", lambda: clock.wall)
++    monkeypatch.setattr(alarm.replica_age, "check", lambda *a, **kw: [])
++    path = kanban_home / "kanban.db"
++    backlog.note(path, False)
++    kb.create_task(live, title="unsent")
++    live.execute("UPDATE kanban_sync_outbox SET created_at = ?", (clock.wall * 1000,))
++    boards = [("default", path)]
++    ok = [SimpleNamespace(board="default", error=None, behind=False)]
++    calls = []
++    def after():
++        return alarm.after_round(ok, boards, mono=lambda: clock.mono)
++    def check():
++        return alarm.check(boards=boards, mono=lambda: clock.mono,
++                           file_fn=lambda s, d: calls.append(d) or "t_alarm")
++    yield SimpleNamespace(clock=clock, after=after, check=check, calls=calls, conn=live, path=path)
++    alarm.reset()
++    backlog.reset()
++
++
++@pytest.mark.parametrize("entry", ["after", "check"])
++def test_sleep_wall_jump_does_not_alarm(host, entry):
++    assert host.after() == []
++    assert host.check() == []
++    host.clock.wall += 660
++    host.clock.mono += 60
++    assert getattr(host, entry)() == []
++    assert host.calls == []
++
++
++def _advance(host, seconds):
++    host.clock.wall += seconds
++    host.clock.mono += seconds
++
++
++@pytest.mark.parametrize("entry", ["after", "check"])
++def test_same_op_alarms_only_after_600_awake_seconds(host, entry, caplog):
++    assert host.after() == []
++    _advance(host, 599)
++    assert getattr(host, entry)() == []
++    _advance(host, 1 if entry == "after" else 60)
++    assert getattr(host, entry)() == (["default"] if entry == "after" else ["t_alarm"])
++    _advance(host, 60)
++    assert getattr(host, entry)() == []
++    text = caplog.text if entry == "after" else host.calls[0]
++    op_id = host.conn.execute("SELECT op_id FROM kanban_sync_outbox ORDER BY created_at, rowid").fetchone()[0]
++    assert op_id in text and "wall" in text and "observed-awake" in text
++
++
++@pytest.mark.parametrize("change", ["identity", "ack", "held", "retry", "unreadable"])
++def test_losing_sendable_identity_restarts_budget(host, change):
++    host.after()
++    _advance(host, 500)
++    assert host.check() == []
++    statements = {
++        "identity": "UPDATE kanban_sync_outbox SET op_id = op_id || '-replacement'",
++        "ack": "UPDATE kanban_sync_outbox SET state = 'acked'",
++        "held": "UPDATE kanban_sync_outbox SET table_name = 'task_runs'",
++        "retry": "UPDATE kanban_sync_outbox SET retry_after = 1",  # expired still answered
++        "unreadable": "ALTER TABLE kanban_sync_outbox RENAME TO hidden_outbox",
++    }
++    host.conn.execute(statements[change])
++    if change == "held":
++        backlog.note(host.path, True)
++    _advance(host, 60)
++    assert host.check() == []
++    if change == "unreadable":
++        host.conn.execute("ALTER TABLE hidden_outbox RENAME TO kanban_sync_outbox")
++    host.conn.execute("UPDATE kanban_sync_outbox SET state = 'pending', retry_after = NULL")
++    backlog.note(host.path, False)
++    _advance(host, 60)
++    assert host.after() == []
++    assert host.check() == []
++    _advance(host, 600)
++    assert host.check() == ["t_alarm"]
++
++
++@pytest.mark.parametrize("restart", [False, True])
++def test_observation_gap_over_bound_resets(host, restart):
++    host.after()
++    _advance(host, 500)
++    host.after()
++    if restart:
++        alarm.reset()
++    _advance(host, 601)
++    assert host.after() == []
++    assert host.check() == []
++
++
++def test_restart_same_boot_keeps_budget_and_incident(host):
++    host.after()
++    _advance(host, 500)
++    host.after()
++    alarm.reset()
++    _advance(host, 100)
++    assert host.after() == ["default"]
++    assert host.check() == ["t_alarm"]
++    alarm.reset()
++    _advance(host, 60)
++    assert host.after() == []
++    assert host.check() == []
++
++
++@pytest.mark.parametrize("boot", ["other-boot", None])
++def test_new_or_unknown_boot_cannot_resume(host, monkeypatch, boot):
++    host.after()
++    _advance(host, 500)
++    host.after()
++    alarm.reset()
++    monkeypatch.setattr(alarm.replica_age, "_boot_id", lambda: boot)
++    _advance(host, 100)
++    assert host.after() == []
++    assert host.check() == []
++
++
++def test_failed_report_is_retried_after_restart(host):
++    host.after()
++    _advance(host, 600)
++    assert alarm.check(boards=[("default", host.path)], mono=lambda: host.clock.mono,
++                       file_fn=lambda *a: None) == []
++    alarm.reset()
++    _advance(host, 60)
++    host.after()
++    assert host.check() == ["t_alarm"]
++
++
++def test_timestamp_is_taken_after_sampling(host, monkeypatch):
++    original = alarm._sample
++    def delayed(path):
++        _advance(host, 500)
++        return original(path)
++    monkeypatch.setattr(alarm, "_sample", delayed)
++    assert host.after() == []
++    monkeypatch.setattr(alarm, "_sample", original)
++    _advance(host, 100)
++    assert host.after() == []
++    assert host.check() == []
++
++
++@pytest.mark.parametrize("hold", ["fifo", "stale-wake", "future-retry"])
++def test_only_sendable_rows_contribute(host, hold):
++    ids = host.conn.execute("SELECT op_id, row_uid FROM kanban_sync_outbox ORDER BY created_at, rowid").fetchall()
++    first, uid = ids[0]
++    if hold == "fifo":
++        host.conn.execute("UPDATE kanban_sync_outbox SET table_name = 'task_runs' WHERE op_id = ?", (first,))
++    if hold == "stale-wake":
++        host.conn.execute("UPDATE tasks SET sync_version = 1")
++        host.conn.execute("UPDATE kanban_sync_outbox SET table_name = 'tasks', row_uid = ?, "
++                          "fields = '{\"status\":\"ready\"}'", (uid,))
++        backlog.round_evidence(host.path)[uid] = True
++    if hold == "future-retry":
++        host.conn.execute("UPDATE kanban_sync_outbox SET retry_after = ?", (host.clock.wall + 10000,))
++    backlog.note(host.path, True)
++    assert alarm._sample(host.path) is None
++    assert host.after() == []
++    _advance(host, 600)
++    assert host.after() == []
++    assert host.check() == []
+diff --git a/tests/hermes_cli/test_kanban_sync_outbox_observation.py b/tests/hermes_cli/test_kanban_sync_outbox_observation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8b3a12383a0ace9db3f37916dc88877d36e9d07a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_outbox_observation.py
+@@ -0,0 +1,54 @@
++"""Persistence is boot- and board-scoped, and never invents an observation."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_sync_outbox_observation as obs
++
++
++@pytest.fixture
++def memo(tmp_path, monkeypatch):
++    obs.reset()
++    monkeypatch.setattr(obs.replica_age, "_boot_id", lambda: "boot")
++    path = tmp_path / "board.db"
++    yield path
++    obs.reset()
++
++
++@pytest.mark.parametrize("patch", [
++    {"boot": "other"}, {"since": -1}, {"since": 501}, {"seen_at": 1001},
++    {"seen_at": 399}, {"since": float("nan")}, {"filed": "false"},
++    {"warned_at": 9999}, {"warned_at": "bad"}, {"op_id": []},
++])
++def test_invalid_persisted_observation_resets(memo, patch):
++    rec = dict(op_id="op", since=100, seen_at=500, boot="boot", filed=False, warned_at=None)
++    rec.update(patch)
++    obs._path(memo).write_text(json.dumps(rec), encoding="utf-8")
++    assert obs.observe(memo, "op", 1000).since == 1000
++
++
++@pytest.mark.parametrize("data", ["[]", "{", "null", "{}"])
++def test_unreadable_memo_starts_fresh(memo, data):
++    obs._path(memo).write_text(data, encoding="utf-8")
++    assert obs.observe(memo, "op", 1000).since == 1000
++
++
++def test_board_isolation_and_absence_remove_persistence(memo):
++    other = memo.with_name("other.db")
++    obs.observe(memo, "same-op", 100)
++    obs.observe(other, "same-op", 300)
++    obs.reset()
++    assert obs.observe(memo, "same-op", 500).since == 100
++    assert obs.observe(other, "same-op", 500).since == 300
++    assert obs.observe(memo, None, 600) is None
++    assert not obs._path(memo).exists()
++    obs.reset()
++    assert obs.observe(memo, "same-op", 700).since == 700
++
++
++def test_write_failure_preserves_in_memory_budget(memo, monkeypatch):
++    def denied(*a, **kw):
++        raise OSError("read only")
++    monkeypatch.setattr(type(memo), "write_text", denied)
++    assert obs.observe(memo, "op", 100).since == 100
++    assert obs.observe(memo, "op", 700).since == 100
+diff --git a/tests/hermes_cli/test_kanban_sync_push_starvation.py b/tests/hermes_cli/test_kanban_sync_push_starvation.py
+index 855dd158561c5dec5863bc9e056b517651970c09..564c4aec67b7948afad0df3d59bc896288663af3 100644
+--- a/tests/hermes_cli/test_kanban_sync_push_starvation.py
++++ b/tests/hermes_cli/test_kanban_sync_push_starvation.py
+@@ -531,6 +531,7 @@ def test_a_good_round_with_an_old_unanswered_op_warns_once_per_window(live, kanb
+     _age_rows(live, minutes=11)
+     ok = [ksc.RoundResult(board=BOARD, mode="primary")]
+     clock = [1000.0]
++    assert outbox_age.after_round(ok, [(BOARD, path)], mono=lambda: clock[0] - 600) == []
+     with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_sync_outbox_age"):
+         assert outbox_age.after_round(ok, [(BOARD, path)], mono=lambda: clock[0]) == [BOARD]
+         clock[0] += 60
+@@ -543,7 +544,8 @@ def test_a_good_round_with_an_old_unanswered_op_warns_once_per_window(live, kanb
+     assert outbox_age.after_round(ok, [(BOARD, path)], mono=lambda: clock[0] + 9999) == []
+ 
+ 
+-def test_the_dispatcher_files_one_card_per_stalled_outbox_incident(live, kanban_home):
++def test_the_dispatcher_files_one_card_per_stalled_outbox_incident(live, kanban_home, monkeypatch):
++    monkeypatch.setattr(outbox_age.replica_age, "check", lambda *a, **kw: [])
+     path = kanban_home / "kanban.db"
+     kb.create_task(live, title="stuck")
+     _age_rows(live, minutes=30)
+@@ -560,7 +562,9 @@ def test_the_dispatcher_files_one_card_per_stalled_outbox_incident(live, kanban_
+         return outbox_age.check(mono=lambda: clock[0], file_fn=file_fn, boards=boards)
+ 
+     assert tick() == []  # no round has completed in this process: nothing known about the loop
+-    outbox_age.after_round([ksc.RoundResult(board=BOARD, mode="primary")], boards)
++    outbox_age.after_round([ksc.RoundResult(board=BOARD, mode="primary")], boards, mono=lambda: clock[0])
++    for _ in range(9):
++        assert tick() == []
+     assert tick() == ["t_card1"]
+     assert tick() == []  # the same incident files once
+     with kbc.write_txn(live):
+@@ -568,6 +572,8 @@ def test_the_dispatcher_files_one_card_per_stalled_outbox_incident(live, kanban_
+     assert tick() == []  # answered: the incident ends
+     kb.create_task(live, title="stuck again")
+     _age_rows(live, minutes=30)
++    for _ in range(10):
++        assert tick() == []  # replacement identity gets its own awake observation
+     assert tick() == ["t_card2"]
+     assert "30 min" in filed[0]
+ 
+@@ -584,7 +590,7 @@ def test_a_round_stuck_past_the_window_counts_as_a_live_loop(live, kanban_home):
+     assert outbox_age.check(mono=lambda: 300.0, file_fn=lambda s, d: filed.append(d), boards=boards) == []
+     outbox_age.reset()
+     outbox_age.round_started(mono=lambda: 0.0)
+-    outbox_age.check(mono=lambda: outbox_age.STALE_S + 1, file_fn=lambda s, d: filed.append(d) or "t_x",
++    outbox_age.check(mono=lambda: 900.0, file_fn=lambda s, d: filed.append(d) or "t_x",
+                      boards=boards)
+     assert len(filed) == 1
+ 
+-- 
+2.43.0
+

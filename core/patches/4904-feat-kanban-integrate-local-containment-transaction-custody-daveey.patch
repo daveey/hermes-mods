@@ -1,0 +1,727 @@
+From 33b1138387e1bf4a1b0c0d96d650b0cf50dc0669 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 13:30:49 +0000
+Subject: [PATCH] feat(kanban): integrate local containment transaction custody
+ [daveey]
+
+Add inactive local-only lifecycle service with current run and graph scope checks, exact immutable release attestations, frozen in-flight producer baselines, atomic run end and spend-preserving release. Normalize append-owned causal envelopes and reset review recovery phase for both containment events. Synced ingress and public command registration remain disabled pending Board/courier integration; this commit is not delivery of the complete primitive.
+---
+ hermes_cli/kanban_containment_lifecycle.py    | 241 ++++++++++++++++++
+ hermes_cli/kanban_containment_state.py        |  14 +-
+ hermes_cli/kanban_db.py                       |   2 +-
+ hermes_cli/kanban_resume_exec.py              |   1 +
+ .../test_kanban_containment_envelope.py       |  62 +++++
+ .../test_kanban_containment_lifecycle.py      | 188 ++++++++++++++
+ .../test_kanban_containment_scope.py          | 131 ++++++++++
+ 7 files changed, 636 insertions(+), 3 deletions(-)
+ create mode 100644 hermes_cli/kanban_containment_lifecycle.py
+ create mode 100644 tests/hermes_cli/test_kanban_containment_envelope.py
+ create mode 100644 tests/hermes_cli/test_kanban_containment_lifecycle.py
+ create mode 100644 tests/hermes_cli/test_kanban_containment_scope.py
+
+diff --git a/hermes_cli/kanban_containment_lifecycle.py b/hermes_cli/kanban_containment_lifecycle.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..50ec689d2914f16d56f4b37b6c2302a96a7e28fd
+--- /dev/null
++++ b/hermes_cli/kanban_containment_lifecycle.py
+@@ -0,0 +1,241 @@
++"""Transaction owner for local non-human containment.
++
++Staged internal API, not registered with CLI/tools yet. Synced boards deliberately
++refuse: local attestations cannot substitute for authenticated Board custody.
++"""
++from __future__ import annotations
++
++import sqlite3
++import time
++from collections.abc import Mapping
++from typing import Any
++
++from hermes_cli import kanban_containment_guard as guard
++from hermes_cli.kanban_containment_policy import identity, policy
++from hermes_cli.kanban_containment_state import _payload, _stop, _uid, fingerprint, reduce_events
++
++
++class ContainmentRefused(ValueError):
++    """No authority, stale evidence, or unsupported synced capability."""
++
++    code = "containment_refused"
++
++
++def _local(conn: sqlite3.Connection) -> None:
++    exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_sync_state'").fetchone()
++    if exists and conn.execute("SELECT 1 FROM kanban_sync_state LIMIT 1").fetchone():
++        raise ContainmentRefused("synced containment capability is not installed")
++
++
++def install_local(conn: sqlite3.Connection) -> None:
++    """Install a local-only immutable verification ledger and storage backstop.
++
++    No network calls are made from SQLite UDFs. Successful local authorization is
++    committed with its release, then read by exact event/predicate fingerprints.
++    This ledger MUST NOT be imported as an authenticated remote proof.
++    """
++    _local(conn)
++    conn.execute("CREATE TABLE IF NOT EXISTS containment_attestations ("
++                 "task_id TEXT NOT NULL, receipt_uid TEXT PRIMARY KEY, episode_uid TEXT NOT NULL, "
++                 "receipt_sha256 TEXT NOT NULL, episode_sha256 TEXT NOT NULL)")
++    guard.install(conn, verify_release=lambda receipt, stop: verified_release(conn, receipt, stop))
++    for op in ("UPDATE", "DELETE"):
++        conn.execute(f"CREATE TRIGGER IF NOT EXISTS containment_attestation_{op.lower()} "
++                     f"BEFORE {op} ON containment_attestations BEGIN SELECT RAISE(ABORT,'containment_pending'); END")
++    conn.execute("CREATE TRIGGER IF NOT EXISTS containment_attestation_insert "
++                 "BEFORE INSERT ON containment_attestations WHEN NOT kanban_containment_write(NEW.task_id) "
++                 "BEGIN SELECT RAISE(ABORT,'containment_pending'); END")
++
++
++def verified_release(conn: sqlite3.Connection, receipt: Mapping[str, Any], stop: Mapping[str, Any]) -> bool:
++    """Local durable attestation; altered payloads and remapped IDs cannot match."""
++    data, frozen = _payload(receipt), _stop(stop)
++    if data is None or frozen is None:
++        return False
++    row = conn.execute("SELECT task_id,episode_uid,receipt_sha256,episode_sha256 "
++                       "FROM containment_attestations WHERE receipt_uid=?", (receipt.get("uid"),)).fetchone()
++    return bool(row and tuple(row) == (receipt.get("task_id"), stop.get("uid"), fingerprint(data), fingerprint(frozen)))
++
++
++def _events(conn: sqlite3.Connection, task: str) -> list[dict]:
++    return [dict(row) for row in conn.execute("SELECT * FROM task_events WHERE task_id=? "
++                                             "AND kind IN ('contained','containment_released')", (task,))]
++
++
++def _actor(conn: sqlite3.Connection, task: str, run_uid: str) -> None:
++    if not _uid(run_uid):
++        raise ContainmentRefused("actor requires a portable current run identity")
++    row = conn.execute("SELECT t.status,t.current_run_id,r.id,r.ended_at,r.claim_expires "
++                       "FROM tasks t JOIN task_runs r ON r.task_id=t.id WHERE t.id=? AND r.uid=?",
++                       (task, run_uid)).fetchone()
++    if (row is None or row[0] != "running" or row[1] != row[2] or row[3] is not None
++            or row[4] is None or row[4] <= time.time()):
++        raise ContainmentRefused("actor is not the current live claimed run")
++
++
++def _reachable(conn: sqlite3.Connection, parent: str, child: str) -> bool:
++    return conn.execute("WITH RECURSIVE descendants(id) AS (SELECT child_id FROM task_links WHERE parent_id=? "
++                        "UNION SELECT l.child_id FROM task_links l JOIN descendants d ON l.parent_id=d.id) "
++                        "SELECT 1 FROM descendants WHERE id=? LIMIT 1", (parent, child)).fetchone() is not None
++
++
++def _nominees(conn: sqlite3.Connection, target: dict, spec: dict) -> None:
++    for key in ("authority", "producer"):
++        nominee = spec.get(key)
++        if nominee is None:
++            continue
++        row = conn.execute("SELECT status FROM tasks WHERE id=?", (nominee["task_id"],)).fetchone()
++        if row is None or row[0] == "archived" or _reachable(conn, target["task_id"], nominee["task_id"]):
++            raise ContainmentRefused(f"{key} must exist independently of the contained task")
++
++
++def _baseline(conn: sqlite3.Connection, spec: dict) -> dict | None:
++    """Freeze the newest run even when it has not completed at containment."""
++    producer = spec.get("producer")
++    if producer is None:
++        return None
++    row = conn.execute("SELECT id,uid FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
++                       (producer["task_id"],)).fetchone()
++    if row is None:
++        return None
++    if not _uid(row["uid"]):
++        raise ContainmentRefused("producer baseline lacks a portable run identity")
++    event = conn.execute("SELECT uid FROM task_events WHERE task_id=? AND kind='completed' AND run_id=? "
++                         "ORDER BY id DESC LIMIT 1", (producer["task_id"], row["id"])).fetchone()
++    if event is not None and not _uid(event[0]):
++        raise ContainmentRefused("producer baseline lacks a portable event identity")
++    return {"run_uid": row["uid"], "event_uid": event[0] if event else None}
++
++
++def _producer(conn: sqlite3.Connection, spec: dict) -> dict | None:
++    producer = spec.get("producer")
++    if producer is None:
++        return None
++    row = conn.execute("SELECT e.id,e.uid,r.uid AS run_uid,t.status,r.outcome,r.ended_at "
++                       "FROM tasks t JOIN task_events e ON e.task_id=t.id "
++                       "JOIN task_runs r ON r.id=e.run_id AND r.task_id=t.id "
++                       "WHERE t.id=? AND e.kind='completed' ORDER BY e.id DESC LIMIT 1",
++                       (producer["task_id"],)).fetchone()
++    if row is None:
++        return None
++    if row["status"] != "done" or row["outcome"] != "completed" or row["ended_at"] is None:
++        return None
++    if not _uid(row["uid"]) or not _uid(row["run_uid"]):
++        raise ContainmentRefused("producer terminal evidence lacks portable identities")
++    # A newer run (even failed) makes the old completion stale; don't bless an old
++    # completed event solely because somebody reset the task row to done.
++    latest = conn.execute("SELECT id FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
++                          (producer["task_id"],)).fetchone()
++    event_run = conn.execute("SELECT run_id FROM task_events WHERE uid=?", (row["uid"],)).fetchone()
++    if latest is None or latest[0] != event_run[0]:
++        return None
++    return {"event_uid": row["uid"], "run_uid": row["run_uid"], "local_event_id": row["id"]}
++
++
++def _append(conn: sqlite3.Connection, task_id: str, kind: str, payload: dict) -> str:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_sync import uuid7
++    kb._append_event(conn, task_id, kind, payload)
++    row = conn.execute("SELECT id,uid,payload FROM task_events WHERE task_id=? ORDER BY id DESC LIMIT 1",
++                       (task_id,)).fetchone()
++    if _payload(dict(row)) != payload:
++        raise ContainmentRefused("unsupported containment event envelope")
++    uid = row["uid"] or uuid7()
++    if row["uid"] is None:
++        conn.execute("UPDATE task_events SET uid=? WHERE id=?", (uid, row["id"]))
++    return uid
++
++
++def contain_local(conn: sqlite3.Connection, *, target: dict, resume_policy: dict,
++                  actor_task: str, actor_run_uid: str, summary: str) -> dict:
++    """End an own run or contain an unclaimed descendant; no dependency release.
++
++    Only a live ancestor may contain a never-dispatched relay. The frozen resume
++    authority must not depend (even transitively) on that relay.
++    """
++    from hermes_cli import kanban_db as kb
++    target = identity(target)
++    spec = policy(resume_policy, target=target)
++    if not isinstance(summary, str) or not summary.strip() or len(summary) > 2000:
++        raise ContainmentRefused("containment requires a bounded handoff summary")
++    install_local(conn)
++    tid = target["task_id"]
++    with kb.write_txn(conn):
++        _local(conn)
++        _actor(conn, actor_task, actor_run_uid)
++        row = conn.execute("SELECT status,current_run_id,human_request FROM tasks WHERE id=?", (tid,)).fetchone()
++        if row is None or row[2] is not None:
++            raise ContainmentRefused("containment cannot replace an unknown task or human hold")
++        if actor_task == tid:
++            if row[0] != "running":
++                raise ContainmentRefused("own containment requires the current running task")
++        elif row[0] not in ("todo", "ready", "triage") or row[1] is not None or not _reachable(conn, actor_task, tid):
++            raise ContainmentRefused("foreign containment requires an unclaimed descendant")
++        if reduce_events(_events(conn, tid), verify_release=lambda r, s: verified_release(conn, r, s)) is not None:
++            raise ContainmentRefused("task is already contained; resume its exact episode")
++        _nominees(conn, target, spec)
++        baseline = _baseline(conn, spec)
++        payload = {"version": 1, "target": target, "policy": spec, "producer_baseline": baseline}
++        with guard.authorized_write(conn, tid):
++            kb._end_or_synthesize_run(conn, tid, outcome="contained", status="contained", summary=summary,
++                                      metadata={"containment": payload}, synthesize=False)
++            conn.execute("UPDATE tasks SET status='triage',current_run_id=NULL,completed_at=NULL,"
++                         "claim_lock=NULL,claim_expires=NULL,worker_pid=NULL,worker_started_at=NULL WHERE id=?", (tid,))
++            episode = _append(conn, tid, "contained", payload)
++    return {"task_id": tid, "status": "triage", "episode": episode, "resume_policy": spec}
++
++
++def resume_local(conn: sqlite3.Connection, *, target: dict, episode: str, actor_task: str,
++                 actor_run_uid: str, kind: str) -> dict:
++    """Resume an exact episode on scoped authority OR a new completed producer run.
++
++    An explicit call is the event producer: no periodic polling or timer wake.
++    Unknown, stale and offline/synced evidence refuses without recording release.
++    """
++    from hermes_cli import kanban_db as kb
++    target = identity(target)
++    install_local(conn)
++    tid = target["task_id"]
++    with kb.write_txn(conn):
++        _local(conn)
++        _actor(conn, actor_task, actor_run_uid)
++        events = _events(conn, tid)
++        hold = reduce_events(events, verify_release=lambda r, s: verified_release(conn, r, s))
++        stop = next((e for e in events if e["kind"] == "contained" and e["uid"] == episode), None)
++        if hold is None or hold.unresolved or episode not in hold.episodes or stop is None:
++            raise ContainmentRefused("unknown, stale or unresolved containment episode")
++        frozen = _stop(stop)
++        if frozen is None or frozen["target"] != target:
++            raise ContainmentRefused("containment target or frozen predicate changed")
++        _nominees(conn, target, frozen["policy"])
++        row = conn.execute("SELECT status,current_run_id,human_request FROM tasks WHERE id=?", (tid,)).fetchone()
++        if row is None or row[0] != "triage" or row[1] is not None or row[2] is not None:
++            raise ContainmentRefused("contained task changed custody")
++        if kind == "authority":
++            actor = frozen["policy"]["authority"]
++            if actor["task_id"] != actor_task:
++                raise ContainmentRefused("caller is not the episode's scoped authority")
++            evidence = {"kind": kind, kind: actor, "run_uid": actor_run_uid}
++        elif kind == "producer":
++            producer = _producer(conn, frozen["policy"])
++            baseline = frozen["producer_baseline"]
++            if producer is None or producer["local_event_id"] <= stop["id"] or (baseline is not None and any(
++                    producer[k] == baseline[k] for k in ("event_uid", "run_uid"))):
++                raise ContainmentRefused("producer requires genuinely new completed-run evidence")
++            evidence = {"kind": kind, kind: frozen["policy"][kind],
++                        **{k: producer[k] for k in ("event_uid", "run_uid")}}
++        else:
++            raise ContainmentRefused("unsupported resume predicate")
++        payload = {"version": 1, "episode": episode, "containment_sha256": fingerprint(frozen),
++                   "resume_status": "ready", "evidence": evidence}
++        with guard.authorized_write(conn, tid):
++            # Receipt and attestation share one transaction. An append, ledger
++            # or landing error rolls both back; no permission escapes a failure.
++            receipt_uid = _append(conn, tid, "containment_released", payload)
++            conn.execute("INSERT INTO containment_attestations VALUES (?,?,?,?,?)",
++                         (tid, receipt_uid, episode, fingerprint(payload), fingerprint(frozen)))
++            remaining = reduce_events(_events(conn, tid), verify_release=lambda r, s: verified_release(conn, r, s))
++            from hermes_cli.kanban_spend_decision import pending as spend_pending
++            landing = "triage" if remaining is not None or spend_pending(conn, tid) else kb._landing_status_after_parents(conn, tid)
++            conn.execute("UPDATE tasks SET status=? WHERE id=?", (landing, tid))
++    return {"task_id": tid, "status": landing, "episode": episode, "release": receipt_uid}
+diff --git a/hermes_cli/kanban_containment_state.py b/hermes_cli/kanban_containment_state.py
+index f334a13e965f8fadf39f0468cf4e830f6d4c7cba..6c4e9ddfdeb48fdb4addb11e0f72ee6f4e271272 100644
+--- a/hermes_cli/kanban_containment_state.py
++++ b/hermes_cli/kanban_containment_state.py
+@@ -37,7 +37,16 @@ def _payload(event: Mapping[str, Any]) -> dict | None:
+         value = json.loads(raw) if isinstance(raw, str) else raw
+     except ValueError:
+         return None
+-    return value if isinstance(value, dict) else None
++    if not isinstance(value, dict):
++        return None
++    # Append-owned transport evidence is not part of the frozen predicate. It
++    # must remain an object; unknown application keys still fail strict parsing.
++    value = dict(value)
++    for key in ("_recovery_history_v1", "_wake_episode_v1"):
++        if key in value:
++            if not isinstance(value.pop(key), dict):
++                return None
++    return value
+ 
+ 
+ def _stop(event: Mapping[str, Any]) -> dict | None:
+@@ -58,7 +67,8 @@ def _stop(event: Mapping[str, Any]) -> dict | None:
+     baseline = data["producer_baseline"]
+     if baseline is not None and ("producer" not in spec or not isinstance(baseline, dict)
+                                 or baseline.keys() != {"event_uid", "run_uid"}
+-                                or not all(_uid(v) for v in baseline.values())):
++                                or not _uid(baseline["run_uid"])
++                                or (baseline["event_uid"] is not None and not _uid(baseline["event_uid"]))):
+         return None
+     return data
+ 
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 0ed4b17d9fd1979c5e4b5397383cdb5f75c108c9..b810f858a9bcaecd055c543d170df22721c5a723 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1901,7 +1901,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
+         "WHERE task_id = ? AND kind IN ("
+         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
+         "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
+-        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', 'owner_restart_lost'"
++        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', 'owner_restart_lost', 'contained', 'containment_released'"
+         ") ORDER BY id DESC LIMIT 1", (task_id,),
+     ).fetchone()
+     payload = _json_dict(_row_get(row, "payload"))
+diff --git a/hermes_cli/kanban_resume_exec.py b/hermes_cli/kanban_resume_exec.py
+index 66fd26eb286bb09f684eced2c933dc6febceb2bb..527297ccc9e0e393b8261e7ffba49114911b4ad8 100644
+--- a/hermes_cli/kanban_resume_exec.py
++++ b/hermes_cli/kanban_resume_exec.py
+@@ -55,6 +55,7 @@ _LIFECYCLE_KINDS = (
+     "completed", "reopened", "review_requested", "review_reopened", "changes_requested", "archived",
+     "scheduled", "continued", "gave_up", "block_loop_detected", "supervisor_escalated",
+     "agent_block_escalated", "ask_rechecked", "dependency_wait", "reclaimed", "spawned",
++    "contained", "containment_released",
+ )
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_containment_envelope.py b/tests/hermes_cli/test_kanban_containment_envelope.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9b155862e70ef710e44e869df287b832c1127845
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_containment_envelope.py
+@@ -0,0 +1,62 @@
++"""Containment append envelopes and lifecycle phase recovery."""
++from __future__ import annotations
++
++import copy
++import json
++
++import pytest
++
++from hermes_cli import kanban_containment_state as state
++from hermes_cli import kanban_db as kb
++from tests.hermes_cli import test_kanban_containment_lifecycle as lifecycle
++from tests.hermes_cli import test_kanban_containment_state as fixtures
++
++board = lifecycle.board
++
++
++@pytest.mark.parametrize("key", ["_recovery_history_v1", "_wake_episode_v1"])
++def test_transport_envelope_is_not_a_new_predicate_or_release_authority(key):
++    stop = fixtures.stop()
++    receipt = fixtures.release(stop)
++    stop["payload"][key] = {"fixture": ["causal-head"]}
++    receipt["payload"][key] = {"fixture": ["other-head"]}
++    assert state.reduce_events([receipt, stop]) is not None  # envelope grants nothing
++    assert state.reduce_events([receipt, stop], verify_release=lambda *_: True) is None
++    assert state.fingerprint(state._stop(stop)) == receipt["payload"]["containment_sha256"]
++
++
++@pytest.mark.parametrize("key", ["_recovery_history_v1", "_wake_episode_v1"])
++@pytest.mark.parametrize("value", [None, [], "forged", True])
++def test_malformed_transport_metadata_is_unresolved_not_an_ignored_stop(key, value):
++    stop = fixtures.stop()
++    stop["payload"][key] = value
++    hold = state.reduce_events([stop])
++    assert hold is not None and hold.unresolved is True
++
++
++def test_nullable_event_baseline_still_requires_a_real_portable_run():
++    stop = fixtures.stop()
++    stop["payload"]["policy"]["producer"] = fixtures.PRODUCER
++    stop["payload"]["producer_baseline"] = {"run_uid": fixtures.STOP_UID, "event_uid": None}
++    assert state.reduce_events([stop]).unresolved is False
++    for field, value in (("run_uid", None), ("run_uid", 42), ("event_uid", 42)):
++        broken = copy.deepcopy(stop)
++        broken["payload"]["producer_baseline"][field] = value
++        assert state.reduce_events([broken]).unresolved is True
++
++
++@pytest.mark.parametrize("phase", ["contained", "containment_released"])
++def test_old_review_resume_cannot_survive_a_containment_episode(board, phase):
++    relay, _, authority, target, spec = lifecycle.setup(board)
++    with kb.write_txn(board):
++        kb._append_event(board, relay, "blocked", {"resume_status": "review"})
++    assert kb._resume_status_from_events(board, relay) == "review"
++    episode = lifecycle.contain(board, relay, target, spec)["episode"]
++    assert kb._resume_status_from_events(board, relay) == "ready"
++    stop = board.execute("SELECT * FROM task_events WHERE uid=?", (episode,)).fetchone()
++    assert "_recovery_history_v1" in json.loads(stop["payload"])
++    if phase == "containment_released":
++        lifecycle.release(board, target, episode, authority)
++        assert kb._resume_status_from_events(board, relay) == "ready"
++    from hermes_cli.kanban_recovery_history import head
++    assert head(board, relay)["kind"] == phase
+diff --git a/tests/hermes_cli/test_kanban_containment_lifecycle.py b/tests/hermes_cli/test_kanban_containment_lifecycle.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1dcb0875157fd1d9323b0e4f160cefe91130a839
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_containment_lifecycle.py
+@@ -0,0 +1,188 @@
++"""Transaction-level local containment integration; synced ingress stays gated."""
++from __future__ import annotations
++
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from tests.hermes_cli import test_kanban_containment_legacy_paths as legacy
++
++board = legacy.board
++
++
++def setup(conn):
++    from hermes_cli.kanban_db_sync import uuid7
++    relay, consumer = legacy._relay(conn)
++    authority = kb.create_task(conn, title="Authority fixture", assignee="default")
++    assert kb.claim_task(conn, authority, claimer="default") is not None
++    for table in ("task_events", "task_runs"):
++        if "uid" not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
++            conn.execute(f"ALTER TABLE {table} ADD COLUMN uid TEXT")
++        for row in conn.execute(f"SELECT id FROM {table} WHERE uid IS NULL").fetchall():
++            conn.execute(f"UPDATE {table} SET uid=? WHERE id=?", (uuid7(), row[0]))
++    target = {"board": "fixture", "gateway": "fixture-home", "task_id": relay}
++    spec = {"version": 1, "authority": {**target, "task_id": authority}}
++    return relay, consumer, authority, target, spec
++
++
++def run_uid(conn, task):
++    return conn.execute("SELECT uid FROM task_runs WHERE id=(SELECT current_run_id FROM tasks WHERE id=?)",
++                        (task,)).fetchone()[0]
++
++
++def contain(conn, relay, target, spec):
++    from hermes_cli import kanban_containment_lifecycle as lifecycle
++    return lifecycle.contain_local(conn, target=target, resume_policy=spec,
++                                   actor_task=relay, actor_run_uid=run_uid(conn, relay), summary="Fixture containment")
++
++
++def release(conn, target, episode, authority):
++    from hermes_cli import kanban_containment_lifecycle as lifecycle
++    return lifecycle.resume_local(conn, target=target, episode=episode, actor_task=authority,
++                                  actor_run_uid=run_uid(conn, authority), kind="authority")
++
++
++def test_local_containment_ends_only_run_preserving_dependency_and_counters(board):
++    from hermes_cli import kanban_containment_guard as guard
++    relay, consumer, authority, target, spec = setup(board)
++    before = legacy._edges(board)
++    board.execute("UPDATE tasks SET consecutive_failures=2 WHERE id=?", (relay,))
++    rid = kb.get_task(board, relay).current_run_id
++    result = contain(board, relay, target, spec)
++    assert result["status"] == "triage"
++    assert guard.pending(board, relay)
++    assert kb.get_task(board, relay).current_run_id is None
++    assert kb.get_task(board, consumer).status == "todo"
++    assert legacy._edges(board) == before
++    assert board.execute("SELECT consecutive_failures,human_request FROM tasks WHERE id=?", (relay,)).fetchone()[:] == (2, None)
++    row = board.execute("SELECT outcome,ended_at FROM task_runs WHERE id=?", (rid,)).fetchone()
++    assert row[0] == "contained" and row[1] is not None
++    kinds = {r[0] for r in board.execute("SELECT kind FROM task_events WHERE task_id=?", (relay,))}
++    assert not kinds.intersection({"completed", "review_requested", "scheduled", "blocked"})
++    result = release(board, target, result["episode"], authority)
++    assert result["status"] == "ready"
++    assert guard.pending(board, relay, verify_release=lifecycle_verifier(board)) is False
++    assert kb.get_task(board, consumer).status == "todo"
++    assert legacy._edges(board) == before
++
++
++def lifecycle_verifier(conn):
++    from hermes_cli.kanban_containment_lifecycle import verified_release
++    return lambda receipt, stop: verified_release(conn, receipt, stop)
++
++
++@pytest.mark.parametrize("case", ["wrong_actor", "stale_run", "unknown_episode", "changed_policy"])
++def test_resume_rejects_unauthorized_stale_or_tampered_evidence(board, case):
++    from hermes_cli import kanban_containment_lifecycle as lifecycle
++    relay, consumer, authority, target, spec = setup(board)
++    episode = contain(board, relay, target, spec)["episode"]
++    actor, uid = authority, run_uid(board, authority)
++    if case == "wrong_actor":
++        actor = consumer
++    elif case == "stale_run":
++        from hermes_cli.kanban_db_sync import uuid7
++        uid = uuid7()
++    elif case == "unknown_episode":
++        from hermes_cli.kanban_db_sync import uuid7
++        episode = uuid7()
++    else:
++        target = {**target, "board": "other"}
++    with pytest.raises(lifecycle.ContainmentRefused):
++        lifecycle.resume_local(board, target=target, episode=episode, actor_task=actor,
++                               actor_run_uid=uid, kind="authority")
++    assert kb.get_task(board, relay).status == "triage"
++    assert kb.get_task(board, consumer).status == "todo"
++
++
++@pytest.mark.parametrize("nominee", ["missing", "consumer"])
++def test_authority_must_exist_and_cannot_depend_on_contained_task(board, nominee):
++    from hermes_cli import kanban_containment_lifecycle as lifecycle
++    relay, consumer, _, target, spec = setup(board)
++    spec["authority"]["task_id"] = consumer if nominee == "consumer" else "t_da066fc02a25c3b2"
++    before = legacy._edges(board)
++    with pytest.raises(lifecycle.ContainmentRefused):
++        contain(board, relay, target, spec)
++    assert kb.get_task(board, relay).status == "running"
++    assert legacy._edges(board) == before
++
++
++def test_restart_release_attestation_is_exact_and_generic_unblock_stays_refused(board):
++    from hermes_cli import kanban_containment_guard as guard
++    from hermes_cli import kanban_containment_lifecycle as lifecycle
++    relay, _, authority, target, spec = setup(board)
++    episode = contain(board, relay, target, spec)["episode"]
++    with pytest.raises(sqlite3.IntegrityError, match="containment_pending"):
++        board.execute("UPDATE tasks SET status='ready' WHERE id=?", (relay,))
++    release(board, target, episode, authority)
++    path = board.execute("PRAGMA database_list").fetchone()[2]
++    with sqlite3.connect(path, isolation_level=None) as peer:
++        peer.row_factory = sqlite3.Row
++        lifecycle.install_local(peer)
++        assert guard.pending(peer, relay, verify_release=lifecycle_verifier(peer)) is False
++        stop = dict(peer.execute("SELECT * FROM task_events WHERE uid=?", (episode,)).fetchone())
++        receipt = dict(peer.execute("SELECT * FROM task_events WHERE kind='containment_released'").fetchone())
++        assert lifecycle.verified_release(peer, receipt, stop) is True
++        receipt["payload"] = json.loads(receipt["payload"])
++        receipt["payload"]["evidence"]["run_uid"] = episode
++        assert lifecycle.verified_release(peer, receipt, stop) is False
++        with pytest.raises(sqlite3.IntegrityError, match="containment_pending"):
++            peer.execute("DELETE FROM containment_attestations")
++
++
++def test_changed_producer_requires_new_completed_run_and_current_terminal_event(board):
++    from hermes_cli import kanban_containment_lifecycle as lifecycle
++    from hermes_cli.kanban_db_sync import uuid7
++    relay, consumer, authority, target, spec = setup(board)
++    producer = kb.create_task(board, title="Producer fixture", assignee="default")
++    spec["producer"] = {**target, "task_id": producer}
++    assert kb.claim_task(board, producer, claimer="default")
++    old_run = kb.get_task(board, producer).current_run_id
++    board.execute("UPDATE task_runs SET uid=? WHERE id=?", (uuid7(), old_run))
++    assert kb.complete_task(board, producer, summary="Old readiness")
++    board.execute("UPDATE task_events SET uid=? WHERE task_id=? AND kind='completed'", (uuid7(), producer))
++    episode = contain(board, relay, target, spec)["episode"]
++    args = dict(target=target, episode=episode, actor_task=authority,
++                actor_run_uid=run_uid(board, authority), kind="producer")
++    with pytest.raises(lifecycle.ContainmentRefused, match="new"):
++        lifecycle.resume_local(board, **args)
++    from hermes_cli.kanban_db_operator import reopen_done_task
++    assert reopen_done_task(board, producer, reason="New fixture evidence", actor="fixture")
++    assert kb.claim_task(board, producer, claimer="default")
++    new_run = kb.get_task(board, producer).current_run_id
++    board.execute("UPDATE task_runs SET uid=? WHERE id=?", (uuid7(), new_run))
++    assert kb.complete_task(board, producer, summary="New readiness")
++    board.execute("UPDATE task_events SET uid=? WHERE task_id=? AND kind='completed' AND uid IS NULL", (uuid7(), producer))
++    result = lifecycle.resume_local(board, **args)
++    assert result["status"] == "ready"
++    assert kb.get_task(board, consumer).status == "todo"
++
++
++def test_synced_state_is_refused_before_any_schema_or_lifecycle_write(board):
++    from hermes_cli import kanban_containment_lifecycle as lifecycle
++    relay, _, _, target, spec = setup(board)
++    board.execute("CREATE TABLE kanban_sync_state (id INTEGER)")
++    board.execute("INSERT INTO kanban_sync_state VALUES (1)")
++    before = board.total_changes
++    with pytest.raises(lifecycle.ContainmentRefused, match="capability"):
++        contain(board, relay, target, spec)
++    assert board.total_changes == before
++
++
++def test_failed_release_transaction_does_not_leave_a_durable_permission(board, monkeypatch):
++    from hermes_cli import kanban_containment_lifecycle as lifecycle
++    from hermes_cli import kanban_containment_guard as guard
++    relay, _, authority, target, spec = setup(board)
++    episode = contain(board, relay, target, spec)["episode"]
++    original = lifecycle._append
++    def fail(conn, task_id, kind, payload):
++        if kind == "containment_released":
++            raise RuntimeError("fixture write failure")
++        return original(conn, task_id, kind, payload)
++    monkeypatch.setattr(lifecycle, "_append", fail)
++    with pytest.raises(RuntimeError, match="fixture write failure"):
++        release(board, target, episode, authority)
++    assert board.execute("SELECT COUNT(*) FROM containment_attestations").fetchone()[0] == 0
++    assert guard.pending(board, relay, verify_release=lifecycle_verifier(board))
++    assert kb.get_task(board, relay).status == "triage"
+diff --git a/tests/hermes_cli/test_kanban_containment_scope.py b/tests/hermes_cli/test_kanban_containment_scope.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c6894e2de56fa3e96cfd381c08cbba8c8f722663
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_containment_scope.py
+@@ -0,0 +1,131 @@
++"""Scope, epoch, spend and partial-evidence controls for local containment."""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_containment_lifecycle as lifecycle
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_db_sync import uuid7
++from tests.hermes_cli import test_kanban_containment_lifecycle as helpers
++
++board = helpers.board
++
++
++@pytest.mark.parametrize("mutation,sql", [
++    ("missing_run", None),
++    ("ended", "UPDATE task_runs SET ended_at=1 WHERE id=?"),
++    ("expired", "UPDATE task_runs SET claim_expires=1 WHERE id=?"),
++    ("no_expiry", "UPDATE task_runs SET claim_expires=NULL WHERE id=?"),
++    ("task_not_running", "UPDATE tasks SET status='ready' WHERE current_run_id=?"),
++    ("different_current", "UPDATE tasks SET current_run_id=NULL WHERE current_run_id=?"),
++    ("malformed_uid", None),
++])
++def test_actor_must_be_current_live_lease_not_just_a_run_record(board, mutation, sql):
++    relay, _, _, target, spec = helpers.setup(board)
++    uid = {"missing_run": uuid7(), "malformed_uid": "invalid"}.get(mutation, helpers.run_uid(board, relay))
++    rid = kb.get_task(board, relay).current_run_id
++    if sql is not None:
++        board.execute(sql, (rid,))
++    with pytest.raises(lifecycle.ContainmentRefused, match="actor"):
++        lifecycle.contain_local(board, target=target, resume_policy=spec, actor_task=relay,
++                                actor_run_uid=uid, summary="Fixture")
++    assert not board.execute("SELECT 1 FROM task_events WHERE kind='contained'").fetchone()
++
++
++@pytest.mark.parametrize("summary", [None, "", " ", "a" * 2001])
++def test_containment_summary_is_bounded_before_installation(board, summary):
++    relay, _, _, target, spec = helpers.setup(board)
++    with pytest.raises(lifecycle.ContainmentRefused, match="summary"):
++        lifecycle.contain_local(board, target=target, resume_policy=spec, actor_task=relay,
++                                actor_run_uid=helpers.run_uid(board, relay), summary=summary)
++    assert not board.execute("SELECT 1 FROM sqlite_master WHERE name='containment_attestations'").fetchone()
++
++
++def test_live_ancestor_can_contain_unclaimed_relay_but_unrelated_actor_cannot(board):
++    relay, consumer, authority, target, spec = helpers.setup(board)
++    # No lifecycle shortcut is used to end the old relay fixture run.
++    assert kb.block_task(board, relay, reason="Fixture release")
++    board.execute("UPDATE tasks SET status='todo' WHERE id=?", (relay,))
++    actor_uid = helpers.run_uid(board, authority)
++    with pytest.raises(lifecycle.ContainmentRefused, match="descendant"):
++        lifecycle.contain_local(board, target=target, resume_policy=spec, actor_task=authority,
++                                actor_run_uid=actor_uid, summary="Fixture")
++    kb.link_tasks(board, authority, relay)
++    edges = helpers.legacy._edges(board)
++    contained = lifecycle.contain_local(board, target=target, resume_policy=spec, actor_task=authority,
++                                        actor_run_uid=actor_uid, summary="Fixture")
++    assert kb.get_task(board, authority).status == "running"
++    assert kb.get_task(board, consumer).status == "todo"
++    resumed = helpers.release(board, target, contained["episode"], authority)
++    assert resumed["status"] == "todo"  # the still-live authority parent is not satisfied by release
++    assert helpers.legacy._edges(board) == edges
++
++
++@pytest.mark.parametrize("field,value", [("human_request", "{}"), ("status", "done"), ("status", "archived")])
++def test_foreign_containment_does_not_overwrite_human_or_terminal_custody(board, field, value):
++    relay, _, authority, target, spec = helpers.setup(board)
++    assert kb.block_task(board, relay, reason="Fixture release")
++    kb.link_tasks(board, authority, relay)
++    board.execute(f"UPDATE tasks SET {field}=? WHERE id=?", (value, relay))
++    with pytest.raises(lifecycle.ContainmentRefused):
++        lifecycle.contain_local(board, target=target, resume_policy=spec, actor_task=authority,
++                                actor_run_uid=helpers.run_uid(board, authority), summary="Fixture")
++
++
++def test_containment_release_never_promotes_independent_spend_stop(board):
++    relay, _, authority, target, spec = helpers.setup(board)
++    with kb.write_txn(board):
++        kb._append_event(board, relay, "spend_budget_triaged", {"fixture": True})
++    before = [tuple(r) for r in board.execute("SELECT * FROM task_events WHERE kind='spend_budget_triaged'")]
++    episode = helpers.contain(board, relay, target, spec)["episode"]
++    result = helpers.release(board, target, episode, authority)
++    assert result["status"] == "triage"
++    assert before == [tuple(r) for r in board.execute("SELECT * FROM task_events WHERE kind='spend_budget_triaged'")]
++    assert not board.execute("SELECT 1 FROM task_events WHERE kind='promoted_manual'").fetchone()
++
++
++def test_finishing_preexisting_producer_run_is_not_new_readiness(board):
++    relay, _, authority, target, spec = helpers.setup(board)
++    producer = kb.create_task(board, title="Inflight producer fixture", assignee="default")
++    assert kb.claim_task(board, producer, claimer="default")
++    rid = kb.get_task(board, producer).current_run_id
++    puid = uuid7()
++    board.execute("UPDATE task_runs SET uid=? WHERE id=?", (puid, rid))
++    spec["producer"] = {**target, "task_id": producer}
++    episode = helpers.contain(board, relay, target, spec)["episode"]
++    frozen = json.loads(board.execute("SELECT payload FROM task_events WHERE uid=?", (episode,)).fetchone()[0])
++    assert frozen["producer_baseline"] == {"event_uid": None, "run_uid": puid}
++    assert kb.complete_task(board, producer, summary="Inflight run completed")
++    board.execute("UPDATE task_events SET uid=? WHERE task_id=? AND kind='completed'", (uuid7(), producer))
++    with pytest.raises(lifecycle.ContainmentRefused, match="new"):
++        lifecycle.resume_local(board, target=target, episode=episode, actor_task=authority,
++                               actor_run_uid=helpers.run_uid(board, authority), kind="producer")
++    assert kb.get_task(board, relay).status == "triage"
++
++
++def test_missing_producer_baseline_uid_refuses_without_ending_relay(board):
++    relay, _, authority, target, spec = helpers.setup(board)
++    spec["producer"] = {**target, "task_id": authority}
++    board.execute("UPDATE task_runs SET uid=NULL WHERE task_id=?", (authority,))
++    with pytest.raises(lifecycle.ContainmentRefused, match="baseline"):
++        helpers.contain(board, relay, target, spec)
++    assert kb.get_task(board, relay).status == "running"
++
++
++def test_repeated_contain_and_replayed_release_refuse_instead_of_minting_new_authority(board):
++    relay, _, authority, target, spec = helpers.setup(board)
++    # Ancestor actor remains live and so can actually exercise the duplicate branch.
++    assert kb.block_task(board, relay, reason="Fixture release")
++    board.execute("UPDATE tasks SET status='todo' WHERE id=?", (relay,))
++    kb.link_tasks(board, authority, relay)
++    args = dict(target=target, resume_policy=spec, actor_task=authority,
++                actor_run_uid=helpers.run_uid(board, authority), summary="Fixture")
++    first = lifecycle.contain_local(board, **args)
++    with pytest.raises(lifecycle.ContainmentRefused, match="already contained"):
++        lifecycle.contain_local(board, **args)
++    helpers.release(board, target, first["episode"], authority)
++    with pytest.raises(lifecycle.ContainmentRefused, match="stale"):
++        helpers.release(board, target, first["episode"], authority)
++    assert board.execute("SELECT COUNT(*) FROM containment_attestations").fetchone()[0] == 1
+-- 
+2.43.0
+

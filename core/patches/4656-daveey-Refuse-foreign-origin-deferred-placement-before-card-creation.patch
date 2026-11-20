@@ -1,0 +1,118 @@
+From fc1fdc1b17b83396d92c94fb186a54754882c8e2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 17:49:33 +0000
+Subject: [PATCH] [daveey] Refuse foreign-origin deferred placement before card
+ creation
+
+A deferred local placeholder has no accepted binding on its foreign origin gateway. Refuse this unsupported case before the task INSERT rather than parking forever after the parents finish. Preserve same-host/no-origin deferrals and immediate qualified forwarding.
+
+Proof: real kanban_create RED (1 failed, 5 passed), then canonical 5-file GREEN (61 passed); both guard conjunct removal mutants killed. Read-only replay of 16 live/replica DBs: 1205 deferred events, 0 qualified rows affected.
+---
+ .../tools/test_placement_qualified_callers.py | 47 ++++++++++++++-----
+ tools/kanban_tools.py                         |  2 +-
+ tools/kanban_tools_placement.py               |  8 +++-
+ 3 files changed, 42 insertions(+), 15 deletions(-)
+
+diff --git a/tests/tools/test_placement_qualified_callers.py b/tests/tools/test_placement_qualified_callers.py
+index 73109b6907bfcf8b564b8a709559dcffcb307d5b..d9d6ddddc02bf04405389b84a7179154fcbe2ab9 100644
+--- a/tests/tools/test_placement_qualified_callers.py
++++ b/tests/tools/test_placement_qualified_callers.py
+@@ -62,22 +62,43 @@ def test_qualified_transport_failure_never_creates_local(home, monkeypatch, exce
+         assert not conn.execute("SELECT 1 FROM tasks WHERE title='must not exist'").fetchone()
+ 
+ 
+-def test_deferred_retains_gateway_and_uses_current_deferred_creator(home, monkeypatch):
++def test_foreign_deferred_create_refuses_before_creating_placeholder(home, monkeypatch):
+     creator(monkeypatch)
+     monkeypatch.setattr(kp, "decide", lambda *a, **k: {"where": "local", "defer": "hub", "why": "parents"})
++    with kbc.connect_closing() as conn:
++        before = [tuple(row) for row in conn.execute("SELECT id FROM tasks ORDER BY id")]
+     out = json.loads(tools._handle_create({"title": "deferred child", "requires": []}))
++    assert out.get("created") is False, out
++    assert out["code"] == "placement_unavailable"
++    assert "foreign-origin deferred placement is unsupported" in out["error"]
++    assert "task_id" not in out
++    with kbc.connect_closing() as conn:
++        assert [tuple(row) for row in conn.execute("SELECT id FROM tasks ORDER BY id")] == before
++
++
++def test_foreign_origin_without_deferral_still_creates_local_card(home, monkeypatch):
++    creator(monkeypatch)
++    monkeypatch.setattr(kp, "decide", lambda *a, **k: {"where": "local", "why": "local marker"})
++    out = json.loads(tools._handle_create({"title": "local foreign child", "requires": []}))
++    assert out["ok"] is True, out
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, out["task_id"]) is not None
++        assert kpf.state(conn, out["task_id"]) is None
++
++
++@pytest.mark.parametrize("owner", ["local", "none"])
++def test_supported_deferred_create_still_records_placeholder(home, monkeypatch, owner):
++    tid = creator(monkeypatch)
++    with kbc.connect_closing() as conn:
++        conn.execute("DELETE FROM task_chat_links WHERE task_id=?", (tid,))
++        conn.commit()
++        if owner == "local":
++            helpers._link(conn, tid, "here", "default", helpers.CHAT)
++    monkeypatch.setattr(kp, "decide", lambda *a, **k: {"where": "local", "defer": "hub", "why": "parents"})
++    out = json.loads(tools._handle_create({"title": "supported deferred child", "requires": []}))
+     assert out["ok"] is True, out
+-    calls = []
+     with kbc.connect_closing() as conn:
+         st = kpf.state(conn, out["task_id"])
+-        assert st["origin_gateway"] == "macbook"
+-        fwd = kpf.Forwarder(conn, out["task_id"], 17)
+-        monkeypatch.setattr(provenance, "forwarding_authority", lambda c, t, r, **kw: calls.append((t, r)) or AUTHORITY)
+-        fwd.create = lambda a, **kw: kw
+-        result = fwd._create({}, "hub", st, "immutable-key")
+-        assert calls == [(out["task_id"], 17)]
+-        assert result["origin_gateway"] == "macbook"
+-        assert result["transport_key"] == "immutable-key"
+-        fwd._park_clock = lambda why: "requeued"
+-        assert fwd._cancel("authority refused") == "requeued"
+-        assert kpf.state(conn, out["task_id"])["origin_gateway"] == "macbook"
++        assert st["target"] == "hub"
++        assert st["origin_session"] == (helpers.CHAT if owner == "local" else None)
++        assert not st.get("origin_gateway")
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index d823e54815423887836cf467a592676e0e422689..cfb9336e625dfee596482baea55ccf0399f155ce 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1460,7 +1460,7 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+                                       hub_admission=decision.get("hub_admission"),
+                                       remedy=decision.get("remedy")), None
+         if target == "local":
+-            local = _local_placement(kp, view, decision, machine_ok=machine_ok, note_local_pin=note_local_pin)
++            local = _local_placement(kp, view, decision, machine_ok=machine_ok, note_local_pin=note_local_pin, origin_gateway=origin_gateway)
+             stranded = _runstate.stranded_create((local or {}).get("runs_on"))
+             return (tool_error(stranded, rejection="sync_not_running"), None) if stranded else (None, local)
+         self_gw = reg.self_gateway() or "local"
+diff --git a/tools/kanban_tools_placement.py b/tools/kanban_tools_placement.py
+index d37f5b6c2c03c1e9717e0bcdc6424905d8ab4c1a..564e854a4bec6b4e7a284d95059c74b78af9e730 100644
+--- a/tools/kanban_tools_placement.py
++++ b/tools/kanban_tools_placement.py
+@@ -148,7 +148,7 @@ def _with_admission(placement: dict, marker_placement) -> dict:
+     return {**placement, "hub_admission": verdict} if verdict else placement
+ 
+ 
+-def _local_placement(kp, view: dict, decision: dict, *, machine_ok, note_local_pin: bool) -> dict:
++def _local_placement(kp, view: dict, decision: dict, *, machine_ok, note_local_pin: bool, origin_gateway=None) -> dict:
+     """``placement`` for a card ``kp.decide`` kept on this gateway; every local decision says why. [daveey]
+ 
+     Pins, "needs ..." and plain local reasons used to return nothing, which left 41 of 148 MacBook cards
+@@ -156,6 +156,12 @@ def _local_placement(kp, view: dict, decision: dict, *, machine_ok, note_local_p
+     elsewhere without the pin also gets a ``note`` naming that target (the card is still created here).
+     """
+     why = decision.get("why") or ""
++    if decision.get("defer") and origin_gateway:
++        # A local placeholder has no accepted binding on the foreign chat owner;
++        # its own native run cannot attest that origin when the parents finish.
++        return {"where": "refuse", "pin": decision["defer"],
++                "why": "foreign-origin deferred placement is unsupported",
++                "remedy": "Create the card from the origin gateway, or wait for its parents and retry."}
+     if decision.get("hub_admission"):
+         # Admission already resolved the execution target; advisory re-deciding
+         # would make another model call and could discard the effective contract.
+-- 
+2.43.0
+

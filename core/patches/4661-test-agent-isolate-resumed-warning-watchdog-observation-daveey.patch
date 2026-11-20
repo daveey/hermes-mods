@@ -1,0 +1,160 @@
+From bf6447c04e90a4ab215de063481533a4b04747a6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 23:53:33 +0000
+Subject: [PATCH] test(agent): isolate resumed-warning watchdog observation
+ [daveey]
+
+The heartbeat fixture resumed during warning then assumed 20ms sleeps could
+never span the 300ms watchdog bound. A controlled pause at that sleep reproduces
+the line398 interrupt failure: a fresh stall, not a broken generation veto.
+
+Drive real watchdog ticks with consumer-local wall/monotonic clocks while
+retaining the real turn wrapper, activity updates, abort commit and lease
+refresher. Assert during-turn non-interruption and post-veto renewal. Cover
+same timestamps (generation-only veto) and a later real fresh-stall abort.
+Production watchdog policy and timeouts are unchanged.
+
+Proof: controlled old fixture RED (requested=True); canonical whole file
+13 passed, no retry. Removing pair veto kills all four cases; timestamp-only
+veto kills both same-stamp cases. scripts/check: 21 checks OK.
+---
+ tests/agent/test_turn_liveness_watchdog.py | 85 +++++++++++++++++-----
+ 1 file changed, 66 insertions(+), 19 deletions(-)
+
+diff --git a/tests/agent/test_turn_liveness_watchdog.py b/tests/agent/test_turn_liveness_watchdog.py
+index 9e4cd92fad6bd12f403d0b85a86481342aa5e0e6..d566b21048114669577df2dfe1aae2488a2d2f2d 100644
+--- a/tests/agent/test_turn_liveness_watchdog.py
++++ b/tests/agent/test_turn_liveness_watchdog.py
+@@ -337,8 +337,10 @@ def test_watchdog_stops_lease_renewal_when_interrupt_cannot_unwind_wedge(
+     # The lease row was still released when the turn finally unwound.
+     assert [e[0] for e in db.events][-1] == "release"
+ 
++@pytest.mark.parametrize("same_stamp", [False, True], ids=["new-stamp", "same-stamp"])
++@pytest.mark.parametrize("fresh_stall", [False, True], ids=["resumed", "later-fresh-stall"])
+ def test_watchdog_declines_abort_when_activity_resumes_during_warning(
+-    watchdog_config, monkeypatch, caplog
++    watchdog_config, monkeypatch, caplog, fresh_stall, same_stamp
+ ):
+     """#95663 review race: the watchdog sampled a stale activity clock, then
+     the turn resumed while the stall was being logged/emitted — before the
+@@ -349,27 +351,68 @@ def test_watchdog_declines_abort_when_activity_resumes_during_warning(
+     db = _DB()
+     agent = _agent_with_db(db)
+     agent._session_turn_lease_refresh_interval = 0.05
+-    resume_event = threading.Event()
+-    touched_event = threading.Event()
+-    t_start = time.time()
++    from types import SimpleNamespace
++
++    from agent import activity_tracking, session_activity, turn_liveness
++
++    # Own the consumer clocks and poll order, not the process-wide clock.
++    # A real scheduling gap between 20ms heartbeat sleeps can exceed the
++    # 300ms stall bound; that is a NEW legitimate stall, not a stale veto bug.
++    clock = SimpleNamespace(now=1000.0)
++    timer = SimpleNamespace(time=lambda: clock.now, monotonic=lambda: clock.now)
++    for module in (activity_tracking, session_activity, turn_liveness):
++        monkeypatch.setattr(module, "time", timer)
++    watchdogs = []
++
++    def capture_watchdog(watchdog):
++        watchdogs.append(watchdog)
++        return SimpleNamespace(cancel=lambda **_kwargs: None)
++
++    monkeypatch.setattr(turn_liveness.TurnLivenessWatchdog, "schedule", capture_watchdog)
++    renewed = threading.Event()
++    real_refresh = db.refresh_session_turn_lease
++
++    def refresh(*args, **kwargs):
++        result = real_refresh(*args, **kwargs)
++        if warning_seen:
++            renewed.set()
++        return result
++
++    db.refresh_session_turn_lease = refresh
++    warning_seen = []
+     interrupt_seen = {}
+ 
+     def stalled_then_resumed_loop(_agent, _message, _system, history, *_a, **_k):
+-        # Stall (zero activity) until the watchdog surfaces the stall. The
+-        # warning delivery itself is what unblocks the wedge: the turn
+-        # resumes DURING the warning window, before the commit point.
+-        assert resume_event.wait(10.0)
+-        _agent._touch_activity("turn resumed")
+-        touched_event.set()
+-        # Keep the turn alive a while so lease renewal is observable.
+-        while time.time() - t_start < 0.8:
+-            _agent._touch_activity("still alive")
+-            time.sleep(0.02)
++        watchdog, = watchdogs
++        clock.now += 0.5
++        assert watchdog._tick() is None  # real warning, then real stale veto
++        assert len(warning_seen) == 1
++        assert _agent._interrupt_requested is False
++        _agent._touch_activity("still alive")
++        # Assert renewal AFTER the veto, not merely some pre-stall refresh.
++        renewed.clear()
++        assert renewed.wait(10.0), "lease stopped after declined abort"
++        # Poll a fresh generation just below the bound without racing wall time.
++        clock.now += 0.25
++        assert watchdog._tick() is None
++        assert len(warning_seen) == 1
+         # Capture DURING the turn — the wrapper's finally clears any
+         # interrupt after the loop returns, so post-run assertions on the
+         # agent's interrupt state cannot prove the abort never happened.
+         interrupt_seen["requested"] = _agent._interrupt_requested
+         interrupt_seen["message"] = _agent._interrupt_message
++        assert interrupt_seen == {"requested": False, "message": None}
++        assert not _agent._hard_interrupt_requested.is_set()
++        if fresh_stall:
++            # A later genuine stall must still abort: do not freeze away
++            # the positive contract while isolating the stale observation.
++            agent._emit_warning = lambda _message: None
++            clock.now += 0.25
++            assert watchdog._tick() is False
++            assert _agent._interrupt_requested is True
++            assert _agent._hard_interrupt_requested.is_set()
++            assert "no progress" in _agent._interrupt_message
++            assert watchdog._commit_abort.__self__.refresh_tick() is False
+         return {
+             "final_response": "recovered",
+             "messages": history,
+@@ -382,15 +425,19 @@ def test_watchdog_declines_abort_when_activity_resumes_during_warning(
+         # the turn resumes. Hold the window open until the resumed activity
+         # has definitively landed on the clock, so the commit revalidation
+         # runs against the new generation.
+-        resume_event.set()
+-        assert touched_event.wait(10.0)
++        warning_seen.append(_message)
++        now = clock.now
++        if same_stamp:
++            # Coarse timestamps can repeat: generation alone must veto.
++            clock.now = agent._last_activity_ts
++        agent._touch_activity("turn resumed")
++        clock.now = now
+ 
+     agent._emit_warning = blocking_warning
+ 
+     with caplog.at_level(logging.ERROR, logger="agent.turn_liveness"):
+         result = _run_turn(agent, stalled_then_resumed_loop, monkeypatch)
+ 
+-    assert time.time() - t_start < 10.0
+     # The turn resumed and completed normally — it was NOT hard-cancelled
+     # mid-flight (the commit point declined the stale observation).
+     assert result["completed"] is True
+@@ -411,10 +458,10 @@ def test_watchdog_declines_abort_when_activity_resumes_during_warning(
+     # pre-fix tree the pre-commit surface itself logged the definitive
+     # "Force-aborting … stopping lease renewal" outcome — this assertion
+     # is what made that witness red.
+-    assert not any(
++    assert any(
+         "watchdog aborted turn" in record.getMessage()
+         for record in caplog.records
+-    ), "declined abort published a committed-abort settlement"
++    ) is fresh_stall, "abort settlement must describe only a later fresh stall"
+     assert not any(
+         "Force-aborting" in record.getMessage()
+         for record in caplog.records
+-- 
+2.43.0
+

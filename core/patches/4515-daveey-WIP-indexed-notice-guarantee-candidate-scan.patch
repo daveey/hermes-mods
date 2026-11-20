@@ -1,0 +1,201 @@
+From 47a0785626c72da3b2048d9fd9530f12b6f72c48 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 15:50:42 +0000
+Subject: [PATCH] [daveey] WIP: indexed notice-guarantee candidate scan
+
+---
+ hermes_state_common.py                        |  4 +
+ .../test_notice_candidates_index.py           | 80 +++++++++++++++++++
+ .../tui_gateway/test_notice_guarantee_idle.py |  2 +-
+ tui_gateway/kanban_unloaded_gates.py          |  2 +-
+ tui_gateway/notice_guarantee.py               | 31 ++++++-
+ 5 files changed, 116 insertions(+), 3 deletions(-)
+ create mode 100644 tests/tui_gateway/test_notice_candidates_index.py
+
+diff --git a/hermes_state_common.py b/hermes_state_common.py
+index 5aaa07e36d9f63b8fd0f04ce6a867e9fa01a06f0..c295c26e620d1acfcb197d3120dc88db278d009c 100644
+--- a/hermes_state_common.py
++++ b/hermes_state_common.py
+@@ -960,6 +960,10 @@ CREATE INDEX IF NOT EXISTS idx_messages_active_null
+ -- Logical-identity recovery (agent.transcript_repair._active_logical_message_row) runs inside the write lock.
+ CREATE INDEX IF NOT EXISTS idx_messages_session_uid
+     ON messages(session_id, message_uid) WHERE active = 1;
++-- The notice-guarantee candidate scan (tui_gateway.notice_guarantee) starts from the kanban-notice rows (a few
++-- thousand) instead of probing the last message of every session (tens of thousands) each 30 s pass.
++CREATE INDEX IF NOT EXISTS idx_messages_kanban_notice
++    ON messages(session_id, id) WHERE display_kind = 'kanban_notice';
+ CREATE INDEX IF NOT EXISTS idx_sessions_session_key
+     ON sessions(session_key, started_at DESC);
+ CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
+diff --git a/tests/tui_gateway/test_notice_candidates_index.py b/tests/tui_gateway/test_notice_candidates_index.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..93f76ac7257ad439d85c436e08fd1951f164f782
+--- /dev/null
++++ b/tests/tui_gateway/test_notice_candidates_index.py
+@@ -0,0 +1,80 @@
++"""The notice-guarantee candidate scan is driven by the (few) kanban-notice rows, not by every session. [daveey]
++
++On a 1.3M-message hub the per-session "last active message" probe ran for every one of 23k sessions each pass
++(0.56% of a core idle, H2 follow-up). The indexed form starts from ``idx_messages_kanban_notice`` and returns
++exactly the rows of the legacy form.
++"""
++from __future__ import annotations
++
++import time
++
++import pytest
++
++import hermes_state_outcome as so
++from hermes_state import SessionDB
++from hermes_state_common import _sql_session_last_active
++from tui_gateway import notice_guarantee as ng
++
++LEGACY = ng._CANDIDATES_SQL
++
++
++@pytest.fixture
++def db(tmp_path):
++    so._reset_hooks_for_tests()
++    handle = SessionDB(tmp_path / "state.db")
++    yield handle
++    handle.close()
++    so._reset_hooks_for_tests()
++
++
++def _notice(db, sid, text="n"):
++    return db.append_kanban_notice(sid, text, {"notice_id": f"{sid}:{text}", "display_text": text})
++
++
++def _rows(db, sql):
++    sql = sql.format(last_active=_sql_session_last_active("s"))
++    return sorted((tuple(r) for r in db._read_all(sql)), key=lambda r: r[0])
++
++
++def _populate(db):
++    for sid in ("tail", "answered", "archived", "muted", "compressed", "moved", "inactive", "tool_tail", "two"):
++        db.create_session(sid, "desktop")
++        db.append_message(sid, "user", f"hello {sid}")
++    _notice(db, "tail")
++    _notice(db, "answered")
++    db.append_message("answered", "assistant", "handled")
++    for sid in ("archived", "muted", "compressed", "moved"):
++        _notice(db, sid)
++    db._write_rowcount("UPDATE sessions SET archived = 1 WHERE id = 'archived'")
++    db._write_rowcount("UPDATE sessions SET muted = 1 WHERE id = 'muted'")
++    db._write_rowcount("UPDATE sessions SET end_reason = 'compression' WHERE id = 'compressed'")
++    db._write_rowcount("UPDATE sessions SET end_reason = 'moved_to_gateway:hub' WHERE id = 'moved'")
++    row = _notice(db, "inactive")
++    db._write_rowcount("UPDATE messages SET active = 0 WHERE id = ?", (row,))
++    _notice(db, "tool_tail")
++    db.append_message("tool_tail", "tool", "result")
++    _notice(db, "two", "first")
++    _notice(db, "two", "second")
++
++
++def test_indexed_candidates_equal_the_legacy_scan(db):
++    _populate(db)
++    expected = _rows(db, LEGACY)
++    assert {r[0] for r in expected} == {"tail", "two"}
++    assert _rows(db, ng.candidates_sql(db)) == expected
++
++
++def test_indexed_candidates_start_from_the_notice_index(db):
++    _populate(db)
++    sql = ng.candidates_sql(db).format(last_active=_sql_session_last_active("s"))
++    plan = " | ".join(str(r[-1]) for r in db._read_all("EXPLAIN QUERY PLAN " + sql))
++    assert "idx_messages_kanban_notice" in plan
++    assert "SCAN s" not in plan and "SCAN sessions" not in plan
++
++
++def test_without_the_index_the_legacy_form_is_used(db):
++    _populate(db)
++    db._write_rowcount("DROP INDEX idx_messages_kanban_notice")
++    assert ng.candidates_sql(db) == LEGACY
++    got = ng.candidates(db, time.time() + ng.GRACE_S + 1)
++    assert {c["sid"] for c in got} == {"tail", "two"}
+diff --git a/tests/tui_gateway/test_notice_guarantee_idle.py b/tests/tui_gateway/test_notice_guarantee_idle.py
+index a9c696b4275fb11e98a56e2ad055180e79cdaffa..8a9fde00c8e2ae23e30d98ec71a3fd4e97683289 100644
+--- a/tests/tui_gateway/test_notice_guarantee_idle.py
++++ b/tests/tui_gateway/test_notice_guarantee_idle.py
+@@ -18,7 +18,7 @@ def _trace(db):
+ 
+ 
+ def _scans(statements):
+-    return [s for s in statements if 'FROM sessions s' in s]
++    return [s for s in statements if 'sessions s' in s]
+ 
+ 
+ def test_unchanged_notice_candidates_do_not_rescan(db):
+diff --git a/tui_gateway/kanban_unloaded_gates.py b/tui_gateway/kanban_unloaded_gates.py
+index bde62b85524984fd39b1325f3f8fb54618d748c8..9c87e16db0b23aa6172fe40129d683a5d6ae5726 100644
+--- a/tui_gateway/kanban_unloaded_gates.py
++++ b/tui_gateway/kanban_unloaded_gates.py
+@@ -141,7 +141,6 @@ def _guarantee() -> Inputs:
+ 
+     keys, due = [], float('inf')
+     now = time.time()
+-    sql = ng._CANDIDATES_SQL.format(last_active=_sql_session_last_active('s'))
+     for path in _profile_paths():
+         with profile_store(path) as store:
+             if store is None:
+@@ -149,6 +148,7 @@ def _guarantee() -> Inputs:
+                 keys.append((str(path), None))
+                 continue
+             db = reader_of(store)
++            sql = ng.candidates_sql(db).format(last_active=_sql_session_last_active('s'))
+             digest = hashlib.blake2b(digest_size=16)
+             for row in rows(db, sql):
+                 meta = _decode(row['display_metadata'])
+diff --git a/tui_gateway/notice_guarantee.py b/tui_gateway/notice_guarantee.py
+index a543bf7125f691833680487e43e939b3fb24cb04..3dc24c17d0641b383f7ae637b5baa211e145fdc1 100644
+--- a/tui_gateway/notice_guarantee.py
++++ b/tui_gateway/notice_guarantee.py
+@@ -103,6 +103,34 @@ SELECT s.id AS sid, m.id AS msg_id, m.timestamp, m.content, m.display_metadata,
+    AND m.display_kind = 'kanban_notice'
+ """
+ 
++# Same rows as ``_CANDIDATES_SQL``, driven from the latest kanban-notice row of each session (the partial index
++# ``idx_messages_kanban_notice``) instead of the last message of every session; ``m.id = (...)`` keeps the
++# "a notice is the chat's last active message" test. 5.5x less work on a 1.3M-message store.
++_CANDIDATES_INDEXED_SQL = """
++SELECT s.id AS sid, m.id AS msg_id, m.timestamp, m.content, m.display_metadata,
++       {last_active} AS last_active
++  FROM (SELECT session_id, MAX(id) AS nid FROM messages INDEXED BY idx_messages_kanban_notice
++         WHERE display_kind = 'kanban_notice' AND active = 1 AND role IN ('user', 'assistant', 'tool')
++         GROUP BY session_id) n
++  JOIN sessions s ON s.id = n.session_id
++  JOIN messages m ON m.id = n.nid
++ WHERE s.archived = 0 AND COALESCE(s.muted, 0) = 0
++   AND COALESCE(s.end_reason, '') <> 'compression' AND COALESCE(s.end_reason, '') NOT LIKE 'moved_to_gateway:%'
++   AND m.id = (SELECT id FROM messages WHERE session_id = s.id AND active = 1
++                 AND role IN ('user', 'assistant', 'tool') ORDER BY id DESC LIMIT 1)
++"""
++
++
++def candidates_sql(db: Any) -> str:
++    """The indexed form when the store has ``idx_messages_kanban_notice`` (a build older than this one, or a
++    store not yet reconciled by a writer, does not: the legacy form is the same rows, only slower)."""
++    try:
++        has = db._read_one("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_kanban_notice'")
++    except Exception:  # health: allow BLE001 -- the legacy scan is always correct
++        return _CANDIDATES_SQL
++    return _CANDIDATES_INDEXED_SQL if has else _CANDIDATES_SQL
++
++
+ _STARTED_SQL = """
+ SELECT COUNT(*) FROM messages WHERE session_id IN (SELECT id FROM lineage) AND display_kind = 'kanban_notice'
+    AND json_valid(display_metadata) AND json_extract(display_metadata, '$.closeout.state') = 'started'
+@@ -116,8 +144,9 @@ def candidates(db: Any, now: float, only: Optional[set[str]] = None) -> list[dic
+     from hermes_state_common import _sql_session_last_active
+     from tui_gateway.notice_candidates import rows as candidate_rows
+     from tui_gateway.notice_fanout import _decode
+-    sql = _CANDIDATES_SQL.format(last_active=_sql_session_last_active("s"))
+     db = reader_of(db)  # the kept handle: a stable cache key (``notice_candidates`` keys on the reader object)
++    # ``only`` is an indexed lookup of a few chats: the legacy form already seeks them by id.
++    sql = (_CANDIDATES_SQL if only is not None else candidates_sql(db)).format(last_active=_sql_session_last_active("s"))
+     if only is not None:
+         ids = sorted(only)
+         if not ids:
+-- 
+2.43.0
+

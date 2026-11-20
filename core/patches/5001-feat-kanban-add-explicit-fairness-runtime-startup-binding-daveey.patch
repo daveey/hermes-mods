@@ -1,0 +1,485 @@
+From 53542d9f498887d7c4e6f2fa3e31f1ba9ddaee73 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 17:37:35 +0000
+Subject: [PATCH] feat(kanban): add explicit fairness runtime startup binding
+ [daveey]
+
+---
+ agent/managed_worker.py                       |   3 +-
+ docs/kanban-fairness-runtime.md               |  24 ++-
+ gateway/kanban_watchers.py                    |   4 +
+ hermes_cli/kanban_db_dispatch.py              |  24 +--
+ hermes_cli/kanban_dispatch_daemon.py          |  22 +++
+ hermes_cli/kanban_fairness_activation.py      | 155 ++++++++++++++++++
+ hermes_cli/kanban_ops.py                      |   3 +-
+ scripts/kanban_fairness.py                    |  22 +++
+ .../test_kanban_fairness_activation.py        | 110 +++++++++++++
+ 9 files changed, 342 insertions(+), 25 deletions(-)
+ create mode 100644 hermes_cli/kanban_dispatch_daemon.py
+ create mode 100644 hermes_cli/kanban_fairness_activation.py
+ create mode 100644 tests/hermes_cli/test_kanban_fairness_activation.py
+
+diff --git a/agent/managed_worker.py b/agent/managed_worker.py
+index d677e22dcc716f2e841ab77488d1a36a1724c3fa..b8a008df27fd1168eefc3acc9dbc43737c94e22a 100644
+--- a/agent/managed_worker.py
++++ b/agent/managed_worker.py
+@@ -378,7 +378,8 @@ def execute(frame, channel):
+     agent = None
+     completed = False
+     try:
+-        with policy_scope(policy, home=frame['home']):
++        from hermes_cli.kanban_fairness_activation import serving
++        with policy_scope(policy, home=frame['home']), serving(home=frame['home']):
+             agent = _construct_agent(frame, AIAgent, policy, model=policy.model, provider=policy.provider, base_url=policy.base_url,
+                 api_key=frame['api_key'], session_db=store, session_id=scope['session_id'],
+                 # delegate_task stays offered: each child is reserved by the owner under this
+diff --git a/docs/kanban-fairness-runtime.md b/docs/kanban-fairness-runtime.md
+index 360f0d4c8dd1a1d347a5eaf31bec81ae1ab75146..ea37474b78a737780821723d3ed03138bb02f414 100644
+--- a/docs/kanban-fairness-runtime.md
++++ b/docs/kanban-fairness-runtime.md
+@@ -23,9 +23,27 @@ unknown uncertainty remains null, not zero. An enabled capture ID must be a safe
+ is the profile's durable `kanban/evidence/<capture_id>`, never scratch. A byte limit
+ must be a positive integer no greater than 536870912; booleans are not integers here.
+ 
+-**Integration status:** the internal `activate()` API exists; production descriptor
+-arming, process-startup binding and assembled export are still integration work.
+-Do not use this document as an operational activation recipe.
++**Integration status:** draft explicit `runtime arm` / `runtime disarm` commands and
++startup bindings now exist. Root export/expected-epoch inventory and full production
++scope verification remain incomplete. Do not activate this draft on a live board.
++
++The descriptor pins profile home, board, capture directory/ID, supplied gateway/board
++UIDs, byte limit and nullable clock error. It is not inferred from hostnames or a
++worker's task. Arming does not activate the DB journal. Startup alone does not arm.
++A capture cannot be rearmed or replaced; use a fresh capture. Disarm renames the
++small descriptor and retains it and all evidence. A passive monitor outside scheduler
++locks notices the change on a 0.5-second poll and closes its consumer; filesystem
++stalls may delay noticing it, so no synchronous remote-stop guarantee is made.
++Turning config off prevents new consumers but does not replace explicit disarm for
++already-running consumers. The draft disarm command still needs the original capture
++ID/directory settings even when enabled is false.
++
++Bindings currently enter before standalone dispatch, before the daemon loop, during
++gateway dispatcher lease tenure, and around a managed tool-worker turn using live
++profile config (not the frozen session policy). No lazy IO is added to readers,
++submission, enabled checks or config loading. Profile-specific descriptors must be
++armed for their exact home; a root descriptor is not authority for another profile.
++Managed-worker/profile and multiplexed gateway scope still need end-to-end proof.
+ 
+ ## Actual reads and privacy
+ 
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index c5d72faea1cd9c4f4871c1f19a0dbe6ff27f4cd6..826310c23bef2b484f46d8855ec593f6a4c377d4 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -366,6 +366,8 @@ class GatewayKanbanWatchersMixin:
+         from gateway.kanban_dispatcher_health import DispatcherHealth
+         health = DispatcherHealth(getattr(self, "_kanban_dispatcher_lock_handle", None), interval=interval)
+         self._kanban_dispatcher_health = health
++        from hermes_cli.kanban_fairness_activation import boot
++        capture = await _to_thread_process_service(boot)
+         try:
+             # Initial delay so adapters are wired before workers spawn (matches the notifier).
+             await asyncio.sleep(5)
+@@ -470,6 +472,8 @@ class GatewayKanbanWatchersMixin:
+                 await self._sleep_until_tick_or_sync_wake(interval)
+ 
+         finally:
++            if capture is not None:
++                await _to_thread_process_service(capture.close)
+             self._release_kanban_dispatcher_lock()
+ 
+     async def _kanban_sync_watcher(self) -> None:
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 23861c4580397b709d239a2669ad34a9ca060c73..5492843baf7c5f2016497591b78a67c3773df6dc 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2738,26 +2738,10 @@ def run_daemon(
+                 with contextlib.suppress(ValueError, OSError):
+                     signal.signal(sig, _handle)
+ 
+-    while not stop_event.is_set():
+-        try:
+-            # Re-resolved every tick (config load is mtime-cached) so operator
+-            # edits apply without a restart.
+-            max_in_progress = resolve_max_in_progress(configured_max_in_progress())
+-            with contextlib.closing(_kbc.connect()) as conn:
+-                res = dispatch_once(
+-                    conn,
+-                    max_spawn=max_spawn,
+-                    max_in_progress=max_in_progress,
+-                    failure_limit=failure_limit,
+-                )
+-            if on_tick is not None:
+-                with contextlib.suppress(Exception):
+-                    on_tick(res)
+-        except Exception:
+-            # Don't let any single tick kill the daemon.
+-            import traceback
+-            traceback.print_exc()
+-        stop_event.wait(timeout=interval)
++    from hermes_cli.kanban_fairness_activation import serving
++    from hermes_cli.kanban_dispatch_daemon import run_loop
++    with serving():
++        run_loop(stop_event, interval, max_spawn, failure_limit, on_tick)
+ 
+ 
+ # Late-bound origin namespace (see module docstring); imported LAST so this
+diff --git a/hermes_cli/kanban_dispatch_daemon.py b/hermes_cli/kanban_dispatch_daemon.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..26f18e34a49bf595d3aa4fce3e6cc02f87c15222
+--- /dev/null
++++ b/hermes_cli/kanban_dispatch_daemon.py
+@@ -0,0 +1,22 @@
++"""Standalone dispatch loop, outside startup/signal handling. [daveey]"""
++import contextlib
++import traceback
++
++
++def run_loop(stop_event, interval, max_spawn, failure_limit, on_tick):
++    from hermes_cli import kanban_db_dispatch as dispatch
++    from hermes_cli import kanban_db_connect as connect
++
++    while not stop_event.is_set():
++        try:
++            # Config is mtime-cached but refreshed each tick, as before extraction.
++            maximum = dispatch.resolve_max_in_progress(dispatch.configured_max_in_progress())
++            with contextlib.closing(connect.connect()) as conn:
++                result = dispatch.dispatch_once(conn, max_spawn=max_spawn,
++                                                max_in_progress=maximum, failure_limit=failure_limit)
++            if on_tick is not None:
++                with contextlib.suppress(Exception):
++                    on_tick(result)
++        except Exception:  # health: allow BLE001 -- daemon tick boundary preserves traceback and continues service
++            traceback.print_exc()
++        stop_event.wait(timeout=interval)
+diff --git a/hermes_cli/kanban_fairness_activation.py b/hermes_cli/kanban_fairness_activation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..180a0a288acfd9217daa7f9d20a1a484d558af31
+--- /dev/null
++++ b/hermes_cli/kanban_fairness_activation.py
+@@ -0,0 +1,155 @@
++"""Explicit operator descriptor and startup-only runtime binding. [daveey]
++
++Config alone is inert. No reader/scorer/config-loader calls this module. A small
++monitor observes disarm outside scheduling locks; existing processes close within
++one poll plus the shared runtime shutdown allowance. No journal is auto-armed.
++"""
++from contextlib import contextmanager
++import json
++import logging
++import os
++from pathlib import Path
++import re
++import threading
++
++from hermes_cli.kanban_fairness_config import resolve
++from hermes_cli import kanban_fairness_budget as budget
++from hermes_cli import kanban_fairness_runtime as runtime
++from hermes_cli.kanban_fairness_schema import make_record
++
++NAME = "runtime-arm.json"
++DISARMED = "runtime-disarmed.json"
++MAX_DESCRIPTOR = 8192
++_LOCK = threading.Lock()
++_LOG = logging.getLogger(__name__)
++
++
++def _validate(value, settings, home):
++    keys = {"version", "capture_id", "directory", "max_bytes", "home", "board",
++            "source_gateway", "board_uid", "clock_error_ns"}
++    if (type(value) is not dict or set(value) != keys or type(value["version"]) is not int
++            or value["version"] != 1 or value["capture_id"] != settings.capture_id
++            or value["directory"] != str(settings.directory) or value["home"] != str(home)
++            or type(value["max_bytes"]) is not int or value["max_bytes"] != settings.max_bytes
++            or not isinstance(value["board"], str)
++            or re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", value["board"]) is None):
++        raise ValueError("invalid runtime arm scope")
++    # Reuse the frozen envelope identity rules, without persisting a synthetic event.
++    make_record(capture_id=settings.capture_id, source_gateway=value["source_gateway"],
++                board_uid=value["board_uid"], source_epoch="validation", seq=1, kind="loss",
++                wall_ns=0, mono_ns=None, clock_error_ns=value["clock_error_ns"],
++                payload=runtime.Session.loss_payload("clock_gap", 1))
++    return value
++
++
++def _read(path):
++    if path.is_symlink():
++        raise ValueError("runtime descriptor must not be a symlink")
++    with path.open("rb") as stream:
++        raw = stream.read(MAX_DESCRIPTOR + 1)
++    if len(raw) > MAX_DESCRIPTOR:
++        raise ValueError("runtime descriptor exceeds bound")
++    return raw
++
++
++def arm(config, *, home, board, source_gateway, board_uid, clock_error_ns=None):
++    """Explicit operator action; never invoked by startup/config loading."""
++    home = Path(home)
++    settings = resolve(config, home=home)
++    if settings is None:
++        raise ValueError("runtime capture config is disabled")
++    value = _validate(dict(version=1, capture_id=settings.capture_id,
++                          directory=str(settings.directory), max_bytes=settings.max_bytes,
++                          home=str(home), board=board, source_gateway=source_gateway,
++                          board_uid=board_uid, clock_error_ns=clock_error_ns), settings, home)
++    raw = json.dumps(value, sort_keys=True).encode("utf-8")
++    if len(raw) > MAX_DESCRIPTOR:
++        raise ValueError("runtime descriptor exceeds bound")
++    root = settings.directory
++    budget.initialize(root, settings.max_bytes)
++    with budget._locked(root):
++        if any((root / name).exists() for name in (NAME, DISARMED, "runtime")):
++            raise ValueError("runtime capture cannot be rearmed or replaced; use a fresh capture")
++        if budget._used(root) + len(raw) > budget._limit(root):
++            raise budget.BudgetExceeded("capture cannot hold runtime descriptor")
++        budget._write(root / NAME, raw)
++    return value
++
++
++def disarm(config, *, home):
++    """Retain the descriptor/evidence; revoke new boots and monitored consumers."""
++    raw = dict(config.get("kanban", {}).get("fairness_capture", {}))
++    raw["enabled"] = True  # permit rollback after the config was disabled
++    settings = resolve({"kanban": {"fairness_capture": raw}}, home=Path(home))
++    root = settings.directory
++    with budget._locked(root):
++        if (root / NAME).exists():
++            os.replace(root / NAME, root / DISARMED)
++
++
++def _monitor(session, path, expected):
++    while not session.stopping.wait(0.5):
++        try:
++            unchanged = _read(path) == expected
++        except (OSError, ValueError):
++            unchanged = False
++        if not unchanged:
++            session.close()
++            return
++
++
++def start(config, *, home):
++    """Startup-only, idempotent binding. Disabled path performs no capture IO."""
++    home = Path(home)
++    settings = resolve(config, home=home)
++    if settings is None:
++        return None
++    with _LOCK:
++        try:
++            raw = _read(settings.directory / NAME)
++        except FileNotFoundError:
++            return None
++        value = _validate(json.loads(raw), settings, home)
++        # Never repair missing/invalid budget on an armed production capture.
++        if budget._limit(settings.directory) != settings.max_bytes:
++            raise ValueError("runtime arm budget mismatch")
++        key = runtime._key(value["board"], home)
++        if key in runtime._SESSIONS:
++            return runtime._SESSIONS[key]
++        session = runtime.activate(config, home=home, board=value["board"],
++                                   source_gateway=value["source_gateway"], board_uid=value["board_uid"],
++                                   clock_error_ns=value["clock_error_ns"])
++        from agent.memory_provider import spawn_context_thread
++
++        session.activation_monitor = spawn_context_thread(
++            lambda: _monitor(session, settings.directory / NAME, raw),
++            name="fairness-arm-monitor", daemon=True, passive=True)
++        session.activation_monitor.start()
++        return session
++
++
++def boot(config=None, *, home=None):
++    """Production startup: evidence failure cannot refuse normal queue service."""
++    try:
++        if config is None:
++            from hermes_cli.config import load_config
++
++            config = load_config()
++        if home is None:
++            from hermes_constants import get_hermes_home
++
++            home = get_hermes_home()
++        return start(config, home=home)
++    except (OSError, ValueError, TypeError, RuntimeError) as exc:
++        _LOG.warning("fairness runtime startup incomplete (%s)", type(exc).__name__)
++        return None
++
++
++@contextmanager
++def serving(config=None, *, home=None):
++    session = boot(config, home=home)
++    try:
++        yield session
++    finally:
++        if session is not None:
++            session.close()
+diff --git a/hermes_cli/kanban_ops.py b/hermes_cli/kanban_ops.py
+index d3cb5cb3da2b1613bf756b4b6d6ec401fa7868fc..85d09598db32532f7c7208386be816d570f47a7c 100644
+--- a/hermes_cli/kanban_ops.py
++++ b/hermes_cli/kanban_ops.py
+@@ -93,7 +93,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
+     except Exception:
+         default_assignee = max_in_progress_per_profile = max_in_progress = None
+         max_spawn = getattr(args, "max", None)
+-    with kbc.connect_closing() as conn:
++    from hermes_cli.kanban_fairness_activation import serving
++    with serving(), kbc.connect_closing() as conn:
+         res = kbd.dispatch_once(
+             conn,
+             dry_run=args.dry_run,
+diff --git a/scripts/kanban_fairness.py b/scripts/kanban_fairness.py
+index ff57cbc72b21e26c6373012829d91bb9aa9050ae..a8e4338fd5364fcc0ee5c965c8b7ccc2f9db0cf4 100644
+--- a/scripts/kanban_fairness.py
++++ b/scripts/kanban_fairness.py
+@@ -170,9 +170,31 @@ def _export(args) -> int:
+     return 0
+ 
+ 
++def _runtime(args) -> int:
++    from hermes_cli import kanban_fairness_activation as activation
++    from hermes_cli.config import load_config
++    from hermes_constants import get_hermes_home
++
++    config, home = load_config(), get_hermes_home()
++    if args.action == "arm":
++        activation.arm(config, home=home, board=args.board, source_gateway=args.source_gateway,
++                       board_uid=args.board_uid, clock_error_ns=args.clock_error_ns)
++    else:
++        activation.disarm(config, home=home)
++    _emit({"runtime": args.action, "acceptance_ready": False})
++    return 0
++
++
+ def _parser() -> argparse.ArgumentParser:
+     parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
+     sub = parser.add_subparsers(dest="command", required=True)
++    runtime = sub.add_parser("runtime")
++    runtime.add_argument("action", choices=("arm", "disarm"))
++    runtime.add_argument("--board", default="default")
++    runtime.add_argument("--source-gateway")
++    runtime.add_argument("--board-uid")
++    runtime.add_argument("--clock-error-ns", type=int, default=None)
++    runtime.set_defaults(run=_runtime)
+     capture = sub.add_parser("capture")
+     capture.add_argument("action", choices=("arm", "status", "drain", "seal", "clear"))
+     capture.add_argument("--out", required=True)
+diff --git a/tests/hermes_cli/test_kanban_fairness_activation.py b/tests/hermes_cli/test_kanban_fairness_activation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0fac7a200e97da30bd58474fe3d33af924c1762b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_fairness_activation.py
+@@ -0,0 +1,110 @@
++"""Explicit operator arming is distinct from config and runtime startup."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_fairness_runtime as runtime
++from hermes_cli.kanban_turn_urgency import read_owners
++from hermes_cli.kanban_fairness_store import load
++
++
++def config(tmp_path):
++    return {"kanban": {"fairness_capture": {"enabled": True, "capture_id": "fixture",
++                                           "directory": str(tmp_path / "capture")}}}
++
++
++def test_disabled_and_unarmed_startup_do_not_activate(tmp_path, monkeypatch):
++    from hermes_cli import kanban_fairness_activation as activation
++    monkeypatch.setattr(runtime, "activate", lambda *a, **kw: pytest.fail("must stay inert"))
++    assert activation.start({}, home=tmp_path) is None
++    assert activation.start(config(tmp_path), home=tmp_path) is None
++    assert not (tmp_path / "capture").exists()
++
++
++def test_real_start_read_disarm_preserves_receipts(tmp_path, monkeypatch):
++    from hermes_cli import kanban_fairness_activation as activation
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    cfg = config(tmp_path)
++    activation.arm(cfg, home=tmp_path, board="default", source_gateway="gw", board_uid="board")
++    session = activation.start(cfg, home=tmp_path)
++    try:
++        assert session is not None
++        assert activation.start(cfg, home=tmp_path) is session
++        assert runtime.enabled(board="default")
++        assert read_owners(board="default", now_s=150, path=tmp_path / "missing") == set()
++        activation.disarm(cfg, home=tmp_path)
++        session.activation_monitor.join(3)
++        assert not session.activation_monitor.is_alive()
++        assert not runtime.enabled(board="default")
++        session.thread.join(2)
++        capture = load(session.out)
++        assert capture["records"][0]["payload"]["outcome"] == "missing"
++        assert session.identity["clock_error_ns"] is None
++        assert activation.start(cfg, home=tmp_path) is None
++        assert session.out.exists()
++    finally:
++        session.close()
++
++
++@pytest.mark.parametrize("field,value", [("board", "../bad"), ("source_gateway", ""),
++                                         ("board_uid", ""), ("clock_error_ns", -1)])
++def test_bad_identity_never_arms(tmp_path, field, value):
++    from hermes_cli import kanban_fairness_activation as activation
++    args = dict(board="default", source_gateway="gw", board_uid="board", clock_error_ns=None)
++    args[field] = value
++    with pytest.raises(ValueError):
++        activation.arm(config(tmp_path), home=tmp_path, **args)
++    assert not (tmp_path / "capture").exists()
++
++
++def test_descriptor_scope_and_budget_must_match(tmp_path, monkeypatch):
++    from hermes_cli import kanban_fairness_activation as activation
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    cfg = config(tmp_path)
++    activation.arm(cfg, home=tmp_path, board="default", source_gateway="gw", board_uid="board")
++    descriptor = tmp_path / "capture" / activation.NAME
++    data = json.loads(descriptor.read_bytes())
++    data["capture_id"] = "other"
++    descriptor.write_text(json.dumps(data))
++    with pytest.raises(ValueError):
++        activation.start(cfg, home=tmp_path)
++    assert not (tmp_path / "capture" / "runtime").exists()
++
++
++@pytest.mark.parametrize("enabled", [False, True])
++def test_real_daemon_binds_before_dispatch_and_closes(tmp_path, monkeypatch, enabled):
++    import threading
++    from hermes_cli import kanban_db_dispatch as dispatch
++    from hermes_cli import kanban_fairness_activation as activation
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    cfg = config(tmp_path)
++    if enabled:
++        activation.arm(cfg, home=tmp_path, board="default", source_gateway="gw", board_uid="board")
++    else:
++        cfg = {}
++    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
++    stop = threading.Event()
++    seen = []
++    def tick(conn, **kw):
++        seen.append(runtime.enabled(board="default"))
++        read_owners(board="default", now_s=150, path=tmp_path / "missing")
++        stop.set()
++    monkeypatch.setattr(dispatch, "dispatch_once", tick)
++    dispatch.run_daemon(stop_event=stop, interval=0)
++    assert seen == [enabled]
++    assert not runtime.enabled(board="default")
++    if enabled:
++        epochs = list((tmp_path / "capture" / "runtime").iterdir())
++        assert len(epochs) == 1
++        assert load(epochs[0])["records"][0]["payload"]["outcome"] == "missing"
++    else:
++        assert not (tmp_path / "capture").exists()
++
++
++def test_disarm_does_not_require_enabled_config(tmp_path):
++    from hermes_cli import kanban_fairness_activation as activation
++    cfg = config(tmp_path)
++    activation.arm(cfg, home=tmp_path, board="default", source_gateway="gw", board_uid="board")
++    cfg["kanban"]["fairness_capture"]["enabled"] = False
++    activation.disarm(cfg, home=tmp_path)
++    assert not (tmp_path / "capture" / activation.NAME).exists()
+-- 
+2.43.0
+

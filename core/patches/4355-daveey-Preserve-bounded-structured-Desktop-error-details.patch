@@ -1,0 +1,352 @@
+From 7368ccd75adf801fd44483a2c0bc84cc81ce4721 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:17:10 +0000
+Subject: [PATCH] [daveey] Preserve bounded structured Desktop error details
+
+Problem: plain object throws became fallback in both readableError and
+Desktop logging, rendering Prompt failed twice and dropping useful detail.
+Why: each boundary only accepted Error/string. Recognized RPC/HTTP object
+fields had no shared normalization. The earlier be59e3d362 fix handled JSON
+inside strings only, not actual objects.
+Root (happened): missing safe diagnostic-envelope normalization.
+Root (not caught): notification tests exercised string/Error envelopes only.
+Recurrence: adjacent JSON-string regression already fixed; historical Nov14
+screenshot exception remains undetermined, not attributed to object throws.
+
+Normalize own diagnostic data properties only (detail/data/error/message),
+never serialize the thrown object or invoke its accessors/toJSON. Bound the
+walk to six levels, 32 objects and 8192 message characters; retain only known
+classification codes up to 128 characters. Share extraction with logging,
+retain legacy Error stacks/string handling and recovery classifications,
+and omit a redundant fallback title. Preserve specialized refusal handling.
+
+Proof: 10 new object tests RED on unchanged notifications; 37 tests GREEN
+across diagnostic, store, timer and component suites. Ten exact mutants for
+depth, cycles, nodes, text length, code length, allowlist, accessor reads,
+empty text, precedence and code recording all killed by assertions.
+Desktop tsc --noEmit passed with 3072 MiB heap (default 2 GiB exhausted).
+Focused ESLint/Prettier clean. scripts/check --base origin/main: 20 checks OK.
+No live Desktop deployment or historical trigger proof claimed.
+---
+ apps/desktop/src/lib/error-diagnostic.test.ts | 71 ++++++++++++++++++
+ apps/desktop/src/lib/error-diagnostic.ts      | 71 ++++++++++++++++++
+ .../src/store/notifications-objects.test.ts   | 73 +++++++++++++++++++
+ apps/desktop/src/store/notifications.ts       | 22 +++---
+ 4 files changed, 228 insertions(+), 9 deletions(-)
+ create mode 100644 apps/desktop/src/lib/error-diagnostic.test.ts
+ create mode 100644 apps/desktop/src/lib/error-diagnostic.ts
+ create mode 100644 apps/desktop/src/store/notifications-objects.test.ts
+
+diff --git a/apps/desktop/src/lib/error-diagnostic.test.ts b/apps/desktop/src/lib/error-diagnostic.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..cdc0ffcec106fc85be6f51ff9514ba41310b9bc7
+--- /dev/null
++++ b/apps/desktop/src/lib/error-diagnostic.test.ts
+@@ -0,0 +1,71 @@
++import { expect, test, vi } from 'vitest'
++
++import { errorDiagnostic, errorField } from './error-diagnostic'
++
++test('preserves legacy strings and Error messages', () => {
++  expect(errorDiagnostic('text', 'fallback')).toEqual({ text: 'text', codes: '' })
++  expect(errorDiagnostic(new Error('error'), 'fallback')).toEqual({ text: 'error', codes: '' })
++})
++
++test('ignores nonobjects, inherited fields, empty text, and unsafe code payloads', () => {
++  for (const value of [null, undefined, 0, true, () => {}, Object.create({ message: 'inherited' })]) {
++    expect(errorDiagnostic(value, 'fallback')).toEqual({ text: 'fallback', codes: '' })
++    expect(errorField(value, 'message')).toBeUndefined()
++  }
++
++  expect(errorDiagnostic({ detail: ' ', message: ' useful ', code: 'secret' }, 'fallback')).toEqual({
++    text: 'useful',
++    codes: ''
++  })
++  expect(errorDiagnostic({ code: { token: 'secret' } }, 'fallback').codes).toBe('')
++  expect(errorDiagnostic({ code: `storage_${'x'.repeat(1000)}` }, 'fallback').codes).toBe('')
++  expect(errorDiagnostic({ code: 42 }, 'fallback').codes).toBe('')
++})
++
++test('visits a cycle only once', () => {
++  const cycle: { detail?: unknown; code: string } = { code: 'storage_locked' }
++  cycle.detail = cycle
++  expect(errorDiagnostic(cycle, 'fallback').codes).toBe('{"code":"storage_locked"}')
++})
++
++test('does not invoke accessors and tolerates descriptor lookup refusal', () => {
++  const getter = vi.fn(() => {
++    throw new Error('unsafe')
++  })
++
++  const object = Object.defineProperty({}, 'message', { get: getter })
++  expect(errorDiagnostic(object, 'fallback').text).toBe('fallback')
++  expect(getter).not.toHaveBeenCalled()
++
++  const proxy = new Proxy(
++    {},
++    {
++      getOwnPropertyDescriptor() {
++        throw new Error('denied')
++      }
++    }
++  )
++
++  expect(errorDiagnostic(proxy, 'fallback').text).toBe('fallback')
++})
++
++test('bounds breadth independently of depth while retaining earlier codes', () => {
++  let reads = 0
++
++  const tree = (depth: number): object =>
++    new Proxy(
++      {},
++      {
++        getOwnPropertyDescriptor(_target, key) {
++          reads++
++
++          return { configurable: true, value: key === 'code' ? 'storage_locked' : depth ? tree(depth - 1) : undefined }
++        }
++      }
++    )
++
++  const result = errorDiagnostic(tree(5), 'fallback')
++  expect(reads).toBe(32 * 5)
++  expect(result.codes.split(' ')).toHaveLength(32)
++  expect(result.text).toBe('fallback')
++})
+diff --git a/apps/desktop/src/lib/error-diagnostic.ts b/apps/desktop/src/lib/error-diagnostic.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..2049c84fbd98ac65df973613c8d4e45a61f315f5
+--- /dev/null
++++ b/apps/desktop/src/lib/error-diagnostic.ts
+@@ -0,0 +1,71 @@
++// Deliberately never stringify the thrown object: RPC envelopes can carry credentials,
++// request bodies, cycles, accessors and user-defined toJSON implementations.
++const MAX_TEXT = 8192
++const MAX_DEPTH = 6
++const MAX_NODES = 32
++
++export function errorField(value: unknown, key: string): unknown {
++  if (!value || typeof value !== 'object') {
++    return undefined
++  }
++
++  try {
++    return Object.getOwnPropertyDescriptor(value, key)?.value
++  } catch {
++    return undefined
++  }
++}
++
++export function errorDiagnostic(error: unknown, fallback: string): { text: string; codes: string } {
++  if (typeof error === 'string') {
++    return { text: error, codes: '' }
++  }
++
++  if (error instanceof Error) {
++    return { text: error.message, codes: '' }
++  }
++
++  const seen = new Set<object>()
++  const codes: string[] = []
++
++  function visit(value: unknown, depth: number): string | undefined {
++    if (depth > MAX_DEPTH) {
++      return undefined
++    }
++
++    if (typeof value === 'string') {
++      return value.slice(0, MAX_TEXT).trim() || undefined
++    }
++
++    if (!value || typeof value !== 'object' || seen.has(value) || seen.size >= MAX_NODES) {
++      return undefined
++    }
++
++    seen.add(value)
++    const code = errorField(value, 'code')
++
++    // Only classification tokens, not arbitrary fields or code payloads.
++    if (
++      typeof code === 'string' &&
++      code.length <= 128 &&
++      /^(storage_[a-z_]+|disk_full|gateway_auth_failed|invalid_api_key)$/.test(code)
++    ) {
++      codes.push(JSON.stringify({ code }))
++    }
++
++    let text: string | undefined
++
++    // Inner diagnostic detail wins over generic RPC wrapper messages. Continue
++    // the bounded walk to retain classification codes even after finding text.
++    for (const key of ['detail', 'data', 'error', 'message']) {
++      const candidate = visit(errorField(value, key), depth + 1)
++      text ??= candidate
++    }
++
++    return text
++  }
++
++  const text = visit(error, 0) ?? fallback
++
++  return { text, codes: codes.join(' ') }
++}
+diff --git a/apps/desktop/src/store/notifications-objects.test.ts b/apps/desktop/src/store/notifications-objects.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..58e5fbc2c1e9f7b44eb292505c954d0b0daf7e17
+--- /dev/null
++++ b/apps/desktop/src/store/notifications-objects.test.ts
+@@ -0,0 +1,73 @@
++import { afterEach, expect, test, vi } from 'vitest'
++
++import { $notifications, clearNotifications, notifyError, readableError } from './notifications'
++
++const fallback = 'Prompt failed'
++afterEach(() => {
++  clearNotifications()
++  vi.unstubAllGlobals()
++})
++
++test.each([
++  { message: 'Reconnect to the gateway' },
++  { detail: { message: 'Reconnect to the gateway' } },
++  { error: { code: -32000, data: { detail: 'Reconnect to the gateway' } } },
++  { message: 'RPC failed', data: { message: 'Reconnect to the gateway' } }
++])('preserves a structured message in the toast and log: %j', error => {
++  const logLine = vi.fn()
++  vi.stubGlobal('hermesDesktop', { logLine })
++  notifyError(error, fallback)
++  expect($notifications.get()[0]).toMatchObject({ title: fallback, message: 'Reconnect to the gateway' })
++  expect(logLine.mock.calls[0][0]).toContain('Reconnect to the gateway')
++})
++
++test('extracts only diagnostic fields without serializing secrets or invoking getters', () => {
++  const getter = vi.fn(() => {
++    throw new Error('must not run')
++  })
++
++  const error = {
++    detail: { message: 'Reconnect' },
++    token: 'secret-token',
++    request: { password: 'secret-password' },
++    toJSON: getter
++  }
++
++  Object.defineProperty(error, 'message', { get: getter })
++  const logLine = vi.fn()
++  vi.stubGlobal('hermesDesktop', { logLine })
++  notifyError(error, fallback)
++  expect($notifications.get()[0]?.message).toBe('Reconnect')
++  expect(logLine.mock.calls[0][0]).not.toMatch(/secret|password|token/)
++  expect(getter).not.toHaveBeenCalled()
++})
++
++test('handles circular, deep and empty objects with bounded detail and no duplicate heading', () => {
++  const circular: { detail?: unknown; message?: string } = {}
++  circular.detail = circular
++  expect(readableError(circular, fallback).message).toBe(fallback)
++  circular.message = 'Reconnect'
++  expect(readableError(circular, fallback).message).toBe('Reconnect')
++  let deep: unknown = { message: 'too deep' }
++
++  for (let i = 0; i < 30; i++) {
++    deep = { detail: deep }
++  }
++
++  expect(readableError(deep, fallback).message).toBe(fallback)
++  notifyError({}, fallback)
++  expect($notifications.get()[0]?.title).toBeUndefined()
++  notifyError({ message: 'x'.repeat(100_000) }, fallback)
++  expect($notifications.get()[0]?.title).toBeUndefined()
++  expect($notifications.get()[0]?.detail?.length).toBeLessThanOrEqual(8192)
++  expect($notifications.get()[0]?.detail).toContain('xxx')
++})
++
++test.each(['storage_locked', 'disk_full', 'gateway_auth_failed', 'invalid_api_key'])(
++  'retains classification code %s',
++  code => {
++    const result = readableError({ error: { message: 'Request refused', data: { code } } }, fallback)
++    expect(result.action).toBeDefined()
++    expect(result.category).not.toBe('unclassified')
++  }
++)
+diff --git a/apps/desktop/src/store/notifications.ts b/apps/desktop/src/store/notifications.ts
+index 1feac3946a848a04c6360a8692862729bffc4b26..7c960d74707879d6440367098b7bbd2e6bbcef89 100644
+--- a/apps/desktop/src/store/notifications.ts
++++ b/apps/desktop/src/store/notifications.ts
+@@ -1,6 +1,7 @@
+ import { atom } from 'nanostores'
+ 
+ import { translateNow } from '@/i18n'
++import { errorDiagnostic, errorField } from '@/lib/error-diagnostic'
+ import { isOutOfSyncRpcParams } from '@/lib/gateway-rpc'
+ import { servedByHermesCloud } from '@/lib/hermes-cloud-host'
+ import { isTimeoutError } from '@/lib/with-timeout'
+@@ -257,13 +258,15 @@ function summarizeErrorMessage(message: string, fallback: string) {
+ // assistant row or an unknown id is stale for another reason. Every other invalid_params keeps the
+ // generic toast.
+ function staleRewindRefusal(error: unknown): 'compacted' | 'stale' | null {
+-  const data = error && typeof error === 'object' ? (error as { data?: unknown }).data : undefined
++  const data = errorField(error, 'data')
+ 
+   if (!data || typeof data !== 'object') {
+     return null
+   }
+ 
+-  const { detail, field, reason } = data as { detail?: unknown; field?: unknown; reason?: unknown }
++  const detail = errorField(data, 'detail')
++  const field = errorField(data, 'field')
++  const reason = errorField(data, 'reason')
+ 
+   if (reason !== 'invalid_params' || field !== 'target_message_id') {
+     return null
+@@ -276,9 +279,9 @@ function staleRewindRefusal(error: unknown): 'compacted' | 'stale' | null {
+ // (gateway/session_policy_credentials.py): `data.reason` on an RPC error, or the bare code a deferred
+ // pick's refusal event carries.
+ function isLaunchCredentialsRefusal(error: unknown): boolean {
+-  const data = error && typeof error === 'object' ? (error as { data?: { reason?: unknown } }).data : undefined
++  const data = errorField(error, 'data')
+ 
+-  if (data && typeof data === 'object' && data.reason === 'launch_credentials_unavailable') {
++  if (errorField(data, 'reason') === 'launch_credentials_unavailable') {
+     return true
+   }
+ 
+@@ -312,11 +315,13 @@ export function readableError(
+     }
+   }
+ 
+-  const raw = error instanceof Error ? error.message : typeof error === 'string' ? error : fallback
++  const diagnostic = errorDiagnostic(error, fallback)
++  const raw = diagnostic.text
+   const unwrapped = raw.match(/Error invoking remote method '[^']+': Error: (.+)$/)?.[1] ?? raw
+   const cleaned = cleanErrorText(unwrapped)
+   const rawDetail = cleaned.match(/"detail"\s*:\s*"([^"]+)"/)?.[1] ?? cleaned
+-  const classified = summarizeErrorMessage(rawDetail, fallback)
++  const coded = diagnostic.codes ? summarizeErrorMessage(diagnostic.codes, fallback) : undefined
++  const classified = coded && coded.category !== 'unclassified' ? coded : summarizeErrorMessage(rawDetail, fallback)
+   const plain = classified.category === 'unclassified' ? objectDetailMessage(rawDetail) : undefined
+   const detail = plain ?? rawDetail
+   const summary = plain ? summarizeErrorMessage(plain, fallback) : classified
+@@ -381,8 +386,7 @@ function logErrorToDesktopLog(error: unknown, fallback: string): void {
+   try {
+     const label: string = new URLSearchParams(window.location.search).get('win') ?? 'main'
+ 
+-    const raw: string =
+-      error instanceof Error ? (error.stack ?? error.message) : typeof error === 'string' ? error : fallback
++    const raw: string = error instanceof Error ? (error.stack ?? error.message) : errorDiagnostic(error, fallback).text
+ 
+     window.hermesDesktop?.logLine?.(`[renderer error:${label}] ${fallback}: ${raw}`)
+   } catch {
+@@ -407,7 +411,7 @@ export function notifyError(
+       // A caller that can fire again for the same cause names its toast, so the repeat replaces it.
+       id: options.id,
+       kind: 'error',
+-      title: fallback,
++      title: readable.message === fallback ? undefined : fallback,
+       message: readable.message,
+       detail: readable.detail
+     },
+-- 
+2.43.0
+

@@ -1,0 +1,110 @@
+From 4904936ae824f225dd377dbf28e662bb63d7a30c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 13:22:36 +0000
+Subject: [PATCH] [daveey] Observe owner receipt clients in handoff process
+ samples
+
+Dispatch CI passed the release shards and original handoff scenarios, but the new long-drain proof exposed a stale process sampler: current workers carry their task identity in environment, not chat argv. Export only the task identifier in namespace observations and retain legacy argv and duplicate-root detection. Proof: sampler regression failed 0 != 1 before fix; focused canonical suites pass after fix. Full namespace validation remains in dispatch CI.
+---
+ tests/e2e/core/upgrade/handoff/_ns_agent.py   |  2 +-
+ tests/e2e/core/upgrade/handoff/_scenario.py   | 15 ++++---
+ .../upgrade/handoff/test_worker_sampler.py    | 41 +++++++++++++++++++
+ 3 files changed, 52 insertions(+), 6 deletions(-)
+ create mode 100644 tests/e2e/core/upgrade/handoff/test_worker_sampler.py
+
+diff --git a/tests/e2e/core/upgrade/handoff/_ns_agent.py b/tests/e2e/core/upgrade/handoff/_ns_agent.py
+index cc3d5fd56e168325ca85c41a20b106cba4fc47df..ad8ac5aae962083e32a9665bbe3cc8e77734320e 100644
+--- a/tests/e2e/core/upgrade/handoff/_ns_agent.py
++++ b/tests/e2e/core/upgrade/handoff/_ns_agent.py
+@@ -61,7 +61,7 @@ def _procs() -> list[dict]:
+         env = {}
+         for item in _read(f"/proc/{pid}/environ").split(b"\0"):
+             key, sep, value = item.partition(b"=")
+-            if sep and key in (b"HERMES_HOME", b"INVOCATION_ID", b"HERMES_E2E_UNIT"):
++            if sep and key in (b"HERMES_HOME", b"INVOCATION_ID", b"HERMES_E2E_UNIT", b"HERMES_KANBAN_TASK"):
+                 env[key.decode()] = value.decode(errors="replace")
+         rows.append({
+             "pid": pid, "state": fields[0], "ppid": int(fields[1]), "start": int(fields[19]),
+diff --git a/tests/e2e/core/upgrade/handoff/_scenario.py b/tests/e2e/core/upgrade/handoff/_scenario.py
+index d35c5dc4e1be6b990c0abc7487a4469948d85934..1fd30ebb8d084865bbeb2a56dbdd79cc31a0eae7 100644
+--- a/tests/e2e/core/upgrade/handoff/_scenario.py
++++ b/tests/e2e/core/upgrade/handoff/_scenario.py
+@@ -220,8 +220,9 @@ def _overlap(runs: list[dict]) -> list[tuple[int, int]]:
+ 
+ class WorkerSampler:
+     """Samples the sandbox process table once a second while the block runs and records, per card,
+-    the most kanban workers (``hermes ... chat -q "work kanban task <id>"``) alive at the same moment:
+-    two at once is a duplicate spawn, whatever the board says afterwards."""
++    the most Kanban worker clients alive at the same moment. Legacy workers name the card in
++    ``chat -q``; owner receipt clients carry HERMES_KANBAN_TASK in their environment instead.
++    Two roots at once is a duplicate dispatch, whatever the board says afterwards."""
+ 
+     def __init__(self, inst: X.Install, interval: float = 1.0) -> None:
+         self.inst, self.interval = inst, interval
+@@ -233,9 +234,13 @@ class WorkerSampler:
+         live = [p for p in self.inst.host.procs() if p["state"] not in ("Z", "X")]
+         by_card: dict[str, list[dict]] = {}
+         for p in live:
+-            m = _TASK_RE.search(" ".join(p["cmdline"]))
+-            if m:
+-                by_card.setdefault(m.group(1), []).append(p)
++            command = " ".join(p["cmdline"])
++            m = _TASK_RE.search(command)
++            tid = m.group(1) if m else None
++            if "hermes_cli.kanban_worker_client" in command:
++                tid = p.get("env", {}).get("HERMES_KANBAN_TASK")
++            if tid:
++                by_card.setdefault(tid, []).append(p)
+         for tid, procs in by_card.items():
+             pids = {p["pid"] for p in procs}
+             roots = sorted(p["pid"] for p in procs if p["ppid"] not in pids)
+diff --git a/tests/e2e/core/upgrade/handoff/test_worker_sampler.py b/tests/e2e/core/upgrade/handoff/test_worker_sampler.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2f8ccbff16cd7e6990354bd506ac3c268946219a
+--- /dev/null
++++ b/tests/e2e/core/upgrade/handoff/test_worker_sampler.py
+@@ -0,0 +1,41 @@
++"""Process-table coverage for legacy workers and owner receipt clients."""
++from types import SimpleNamespace
++
++from tests.e2e.core.upgrade.handoff import _scenario as S
++
++
++def test_sampler_counts_receipt_clients_and_legacy_workers_without_descendant_duplicates():
++    card = "t_0123abc"
++    def proc(pid, ppid, argv, *, state="S", task=card):
++        return {"pid": pid, "ppid": ppid, "cmdline": argv, "state": state,
++                "env": {"HERMES_KANBAN_TASK": task}}
++
++    client = ["python", "-m", "hermes_cli.kanban_worker_client"]
++    rows = [proc(10, 1, client), proc(11, 10, client),
++            proc(12, 1, ["python", "other"]),
++            proc(13, 1, client, state="Z"), proc(14, 1, client, task="")]
++    sampler = S.WorkerSampler(SimpleNamespace(host=SimpleNamespace(procs=lambda: rows)))
++    sampler._sample()
++    assert sampler.peak[card] == 1
++    rows.append(proc(20, 1, client))
++    sampler._sample()
++    assert sampler.peak[card] == 2
++    assert sampler.evidence[card][1] == [10, 20]
++    rows[:] = [proc(30, 1, ["hermes", "chat", "-q", "work kanban task t_abcdef"])]
++    sampler._sample()
++    assert sampler.peak["t_abcdef"] == 1
++
++
++def test_process_probe_carries_task_identity_but_not_secrets(monkeypatch):
++    from tests.e2e.core.upgrade.handoff import _ns_agent as agent
++
++    monkeypatch.setattr(agent.os, "listdir", lambda path: ["42"])
++    monkeypatch.setattr(agent, "_stat", lambda pid: ["S", "1"] + ["0"] * 18)
++    payloads = {"environ": b"HERMES_KANBAN_TASK=t_0123abc\0API_KEY=secret\0",
++                "cmdline": b"python\0-m\0hermes_cli.kanban_worker_client\0"}
++    monkeypatch.setattr(agent, "_read", lambda path: payloads[path.rsplit("/", 1)[1]])
++    rows = agent._procs()
++    assert rows[0]["env"] == {"HERMES_KANBAN_TASK": "t_0123abc"}
++    sampler = S.WorkerSampler(SimpleNamespace(host=SimpleNamespace(procs=lambda: rows)))
++    sampler._sample()
++    assert sampler.peak["t_0123abc"] == 1
+-- 
+2.43.0
+

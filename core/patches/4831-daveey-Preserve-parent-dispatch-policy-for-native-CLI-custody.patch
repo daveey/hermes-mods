@@ -1,0 +1,318 @@
+From 9d9af9580ad7be83e90015f76f32dfa1e8894446 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 08:34:28 +0000
+Subject: [PATCH] [daveey] Preserve parent dispatch policy for native CLI
+ custody
+
+---
+ model_tools.py                        |   4 +
+ tests/tools/test_origin_cli_bridge.py |  32 +++++++-
+ tests/tools/test_origin_cli_policy.py | 108 ++++++++++++++++++++++++++
+ tools/origin_cli_bridge.py            |   8 +-
+ tools/origin_cli_policy.py            |  65 ++++++++++++++++
+ 5 files changed, 212 insertions(+), 5 deletions(-)
+ create mode 100644 tests/tools/test_origin_cli_policy.py
+ create mode 100644 tools/origin_cli_policy.py
+
+diff --git a/model_tools.py b/model_tools.py
+index 00e46a47b4e047397c38eff6cecc6da1e063b3be..a0cf340fa464cbf8ab7eda8cd2ec15e43530a6bb 100644
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -983,7 +983,11 @@ def _tool_function_scope(function):
+     return _scoped
+ 
+ 
++from tools.origin_cli_policy import capture_dispatch as _capture_cli_dispatch
++
++
+ @_tool_function_scope
++@_capture_cli_dispatch
+ def handle_function_call(
+     function_name: str, function_args: dict[str, Any], task_id: Optional[str] = None,
+     tool_call_id: Optional[str] = None, session_id: Optional[str] = None, turn_id: Optional[str] = None,
+diff --git a/tests/tools/test_origin_cli_bridge.py b/tests/tools/test_origin_cli_bridge.py
+index 80eb3a2538b33c9219ba2485a3980703aa99cbeb..6742bd9cd289348b9ab5b6b9ce4d15ee4c557b01 100644
+--- a/tests/tools/test_origin_cli_bridge.py
++++ b/tests/tools/test_origin_cli_bridge.py
+@@ -131,6 +131,15 @@ from tools import kanban_tools
+ turn = fixtures.turn
+ 
+ 
++def policy_launch(monkeypatch, task_id):
++    import model_tools
++    from tools.origin_cli_bridge import Launch
++    with monkeypatch.context() as scoped:
++        scoped.setattr(model_tools, "_handle_function_call", lambda *a: Launch(task_id))
++        return model_tools.handle_function_call("terminal", {}, task_id=task_id,
++                                               enabled_tools=["kanban_create", "terminal"])
++
++
+ @pytest.mark.parametrize("entrypoint", ["client", "cli"])
+ @pytest.mark.parametrize("revoke", [False, True])
+ def test_real_subprocess_uses_only_parent_custody(turn, monkeypatch, tmp_path, revoke, entrypoint):
+@@ -138,13 +147,14 @@ def test_real_subprocess_uses_only_parent_custody(turn, monkeypatch, tmp_path, r
+     import sys
+     from tools import origin_cli_bridge as bridge
+     from tools.environments.local import build_subprocess_env
++    launch = policy_launch(monkeypatch, "terminal-test")
++    monkeypatch.setattr("model_tools._select_tool_names", lambda *a, **k: {"kanban_create"})
+     monkeypatch.setattr("model_tools.handle_function_call",
+                         lambda name, args, **kw: kanban_tools._handle_create(args))
+     script = tmp_path / "cli_client.py"
+     script.write_text("import json,sys\nfrom tools.origin_cli_bridge import request\n"
+                       "print(json.dumps(request(sys.argv[1], {'title':'subprocess child',"
+                       "'assignee':'default','placement':'local','requires':[]})))\n")
+-    launch = bridge.Launch("subprocess-test")
+     try:
+         if revoke:
+             turn.release()
+@@ -203,11 +213,29 @@ def test_post_admission_exception_reports_unknown(echo_launch, monkeypatch):
+     assert result["task_id"] == "committed-maybe"
+ 
+ 
++def test_transport_without_dispatch_policy_refuses(turn, monkeypatch):
++    from tools import origin_cli_bridge as bridge
++    called = []
++    monkeypatch.setattr("model_tools.handle_function_call", lambda *a, **k: called.append(a))
++    launch = bridge.Launch("not-authority")
++    try:
++        result = bridge.request(launch.locator, {"title": "denied"})
++        assert not result["ok"]
++        assert result["error"] == "CLI launch has no parent dispatch policy"
++        assert called == []
++        with kbc.connect_closing() as conn:
++            assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
++    finally:
++        launch.close()
++        launch._thread.join(2)
++
++
+ def test_transport_creates_with_parent_custody(turn, monkeypatch):
+     from tools import origin_cli_bridge as bridge
++    launch = policy_launch(monkeypatch, "terminal-test")
++    monkeypatch.setattr("model_tools._select_tool_names", lambda *a, **k: {"kanban_create"})
+     monkeypatch.setattr("model_tools.handle_function_call",
+                         lambda name, args, **kw: kanban_tools._handle_create(args))
+-    launch = bridge.Launch("terminal-test")
+     try:
+         result = bridge.request(launch.locator, {"title": "socket child", "assignee": "default",
+                                                  "placement": "local", "requires": []})
+diff --git a/tests/tools/test_origin_cli_policy.py b/tests/tools/test_origin_cli_policy.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0dc72bf9ac109090c6e24ffc2e78afb950c0d0e5
+--- /dev/null
++++ b/tests/tools/test_origin_cli_policy.py
+@@ -0,0 +1,108 @@
++"""Private dispatch capture cannot widen the terminal caller's grant."""
++import json
++
++import pytest
++
++
++def test_no_dispatch_has_no_policy():
++    from tools.origin_cli_policy import current_policy
++    assert current_policy() is None
++
++
++def test_real_dispatch_captures_copies_and_restores(monkeypatch):
++    import model_tools
++    from tools.origin_cli_policy import current_policy
++    enabled = ["terminal", "kanban_create"]
++    toolsets = ["terminal", "kanban"]
++    disabled = ["browser"]
++    seen = []
++    def body(*args):
++        policy = current_policy()
++        seen.append(policy)
++        enabled.clear()
++        toolsets.clear()
++        disabled.clear()
++        assert policy.kwargs()["enabled_tools"] == ["terminal", "kanban_create"]
++        return "{}"
++    monkeypatch.setattr(model_tools, "_handle_function_call", body)
++    model_tools.handle_function_call("terminal", {}, task_id="task", session_id="session",
++                                    conversation_id="conversation", turn_id="turn", user_task="goal",
++                                    enabled_tools=enabled, enabled_toolsets=toolsets, disabled_toolsets=disabled,
++                                    skip_pre_tool_call_hook=True, skip_tool_execution_middleware=True)
++    assert current_policy() is None
++    assert seen[0].kwargs() == dict(task_id="task", session_id="session", conversation_id="conversation",
++                                   turn_id="turn", user_task="goal", enabled_tools=["terminal", "kanban_create"],
++                                   enabled_toolsets=["terminal", "kanban"], disabled_toolsets=["browser"])
++
++
++def test_exception_restores_policy(monkeypatch):
++    import model_tools
++    from tools.origin_cli_policy import current_policy
++    def body(*args):
++        assert current_policy() is not None
++        raise ValueError("failure")
++    monkeypatch.setattr(model_tools, "_handle_function_call", body)
++    with pytest.raises(ValueError):
++        model_tools.handle_function_call("terminal", {})
++    assert current_policy() is None
++
++
++@pytest.mark.parametrize("enabled,selected", [(None, {"kanban_create"}), ([], {"kanban_create"}), (["kanban_create"], set())])
++def test_policy_denies_before_dispatch(monkeypatch, enabled, selected):
++    import model_tools
++    from tools.origin_cli_policy import current_policy
++    calls = []
++    def body(*args):
++        policy = current_policy()
++        monkeypatch.setattr(model_tools, "handle_function_call", lambda *a, **k: calls.append((a, k)))
++        monkeypatch.setattr(model_tools, "_select_tool_names", lambda *a, **k: selected)
++        result = policy.create({"title": "no"})
++        assert not result["ok"]
++        return "{}"
++    monkeypatch.setattr(model_tools, "_handle_function_call", body)
++    model_tools.handle_function_call("terminal", {}, enabled_tools=enabled)
++    assert calls == []
++
++
++def test_nested_dispatch_cannot_replace_outer_grant(monkeypatch):
++    import model_tools
++    from tools.origin_cli_policy import current_policy
++    seen = []
++    def body(name, *args):
++        policy = current_policy()
++        seen.append(policy)
++        if name == "execute_code":
++            return model_tools.handle_function_call("terminal", {}, task_id="inner")
++        assert policy.kwargs()["session_id"] == "outer-session"
++        assert policy.kwargs()["enabled_tools"] == ["terminal", "execute_code"]
++        assert not policy.create({"title": "denied"})["ok"]
++        return "{}"
++    monkeypatch.setattr(model_tools, "_handle_function_call", body)
++    model_tools.handle_function_call("execute_code", {}, session_id="outer-session",
++                                    enabled_tools=["terminal", "execute_code"])
++    assert seen[0] is seen[1]
++    assert current_policy() is None
++
++
++def test_nested_create_retains_identity_and_runs_all_hooks(monkeypatch):
++    import model_tools
++    from tools.origin_cli_policy import current_policy
++    calls = []
++    def body(*args):
++        policy = current_policy()
++        monkeypatch.setattr(model_tools, "_select_tool_names", lambda *a, **k: {"kanban_create"})
++        def dispatch(name, payload, **kwargs):
++            calls.append((name, payload, kwargs))
++            return json.dumps({"ok": True})
++        monkeypatch.setattr(model_tools, "handle_function_call", dispatch)
++        assert policy.create({"title": "yes"})["ok"]
++        return "{}"
++    monkeypatch.setattr(model_tools, "_handle_function_call", body)
++    model_tools.handle_function_call("terminal", {}, session_id="session", enabled_tools=["kanban_create"],
++                                    skip_pre_tool_call_hook=True, skip_tool_request_middleware=True,
++                                    skip_tool_execution_middleware=True)
++    name, payload, kwargs = calls[0]
++    assert name == "kanban_create" and payload == {"title": "yes"}
++    assert kwargs["session_id"] == "session"
++    assert not any(key.startswith("skip_") for key in kwargs)
++    assert "tool_call_id" not in kwargs and "api_request_id" not in kwargs
+diff --git a/tools/origin_cli_bridge.py b/tools/origin_cli_bridge.py
+index 1061e5d2fd4b34bc8288b5148eed126c0ed8583a..f99a9aba23c17b3104efabe63f7db3d62a9bd102 100644
+--- a/tools/origin_cli_bridge.py
++++ b/tools/origin_cli_bridge.py
+@@ -38,7 +38,8 @@ class Launch:
+         from tools.thread_context import _callback_api
+         self._ctx = copy_context()
+         self._callbacks = [(pair, pair[0]()) for pair in _callback_api()]
+-        self._task_id = task_id
++        from tools.origin_cli_policy import current_policy
++        self._policy = current_policy()  # task_id is correlation, never a grant
+         self._gate = LaunchGate()
+         self._nonce = secrets.token_hex(24)
+         self._server, self._child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+@@ -75,13 +76,14 @@ class Launch:
+         # Server owns its fd until its loop exits; never close underneath recvmsg.
+ 
+     def _invoke(self, args, gate):
+-        from model_tools import handle_function_call
++        if self._policy is None:
++            return {"ok": False, "error": "CLI launch has no parent dispatch policy"}
+         previous = [(setter, getter()) for (getter, setter), _ in self._callbacks]
+         try:
+             for (_, setter), value in self._callbacks:
+                 setter(value)
+             with strict_local_creation(gate=gate):
+-                return json.loads(handle_function_call("kanban_create", args, task_id=self._task_id))
++                return self._policy.create(args)
+         finally:
+             for setter, value in previous:
+                 setter(value)
+diff --git a/tools/origin_cli_policy.py b/tools/origin_cli_policy.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..867692e852017b69a4d6de5153464d7f1b23e645
+--- /dev/null
++++ b/tools/origin_cli_policy.py
+@@ -0,0 +1,65 @@
++"""Parent-only dispatch policy capture for native CLI launches.
++
++This is not origin authority: strict admission independently requires live turn
++custody. Neither subprocess environment nor request payload supplies this policy.
++"""
++from contextvars import ContextVar
++from dataclasses import dataclass
++from functools import wraps
++from inspect import signature
++import json
++
++
++_current = ContextVar("origin_cli_dispatch_policy", default=None)
++_IDENTITY = ("task_id", "session_id", "conversation_id", "turn_id", "user_task")
++_GRANTS = ("enabled_tools", "enabled_toolsets", "disabled_toolsets")
++
++
++@dataclass(frozen=True)
++class _Policy:
++    values: tuple
++
++    def kwargs(self):
++        result = dict(self.values)
++        for key in _GRANTS:
++            if result[key] is not None:
++                result[key] = list(result[key])
++        return result
++
++    def create(self, args):
++        from model_tools import _select_tool_names, handle_function_call
++        kwargs = self.kwargs()
++        enabled = kwargs["enabled_tools"]
++        if enabled is None or "kanban_create" not in enabled:
++            return {"ok": False, "error": "kanban_create is not granted to this launch"}
++        selected = _select_tool_names(kwargs["enabled_toolsets"], kwargs["disabled_toolsets"], quiet_mode=True)
++        if "kanban_create" not in selected:
++            return {"ok": False, "error": "kanban_create is not in this session's toolsets"}
++        # New call: never inherit skip-hook flags or the terminal's call/request ID.
++        return json.loads(handle_function_call("kanban_create", args, **kwargs))
++
++
++def current_policy():
++    return _current.get()
++
++
++def capture_dispatch(function):
++    """Install at the trusted dispatcher boundary, not at the terminal tool API."""
++    sig = signature(function)
++
++    @wraps(function)
++    def wrapped(*args, **kwargs):
++        # Sandbox RPC dispatch omits grants and IDs. Never replace its captured
++        # outer policy with those permissive defaults.
++        if _current.get() is not None:
++            return function(*args, **kwargs)
++        bound = sig.bind(*args, **kwargs)
++        bound.apply_defaults()
++        values = [(key, bound.arguments[key]) for key in _IDENTITY]
++        values.extend((key, None if bound.arguments[key] is None else tuple(bound.arguments[key])) for key in _GRANTS)
++        token = _current.set(_Policy(tuple(values)))
++        try:
++            return function(*args, **kwargs)
++        finally:
++            _current.reset(token)
++    return wrapped
+-- 
+2.43.0
+

@@ -1,0 +1,417 @@
+From 0595e934133e4d5b99e7d9a8dd494e9c96455849 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 17:20:50 +0000
+Subject: [PATCH] fix(kanban): authorize runtime tails and fence rejected
+ producers [daveey]
+
+---
+ docs/kanban-fairness-runtime.md               |  73 ++++++++++
+ hermes_cli/kanban_fairness_runtime.py         | 103 ++++++++++++---
+ hermes_cli/kanban_fairness_tail.py            |   3 +-
+ .../test_kanban_fairness_shutdown.py          | 125 ++++++++++++++++++
+ 4 files changed, 288 insertions(+), 16 deletions(-)
+ create mode 100644 docs/kanban-fairness-runtime.md
+ create mode 100644 tests/hermes_cli/test_kanban_fairness_shutdown.py
+
+diff --git a/docs/kanban-fairness-runtime.md b/docs/kanban-fairness-runtime.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..360f0d4c8dd1a1d347a5eaf31bec81ae1ab75146
+--- /dev/null
++++ b/docs/kanban-fairness-runtime.md
+@@ -0,0 +1,73 @@
++# Fairness runtime receipts (Phase A integration)
++
++The runtime observes actual urgency reads; it does not select owners, change scoring,
++or fetch additional policy inputs. The existing observer remains the source of owner
++history. These receipts are not evidence that a numeric fairness gate passed.
++
++## Configuration
++
++`kanban.fairness_capture` defaults to:
++
++```yaml
++enabled: false
++capture_id: null
++directory: null
++max_bytes: 536870912
++```
++
++Parsing is side-effect free. Disabled capture starts no thread and activates no
++journal. Enabled configuration alone is not an activation command. Activation must
++supply the profile home, board, source gateway, board UID and clock uncertainty;
++unknown uncertainty remains null, not zero. An enabled capture ID must be a safe
++1–128 character path component. An explicit directory must be absolute. The default
++is the profile's durable `kanban/evidence/<capture_id>`, never scratch. A byte limit
++must be a positive integer no greater than 536870912; booleans are not integers here.
++
++**Integration status:** the internal `activate()` API exists; production descriptor
++arming, process-startup binding and assembled export are still integration work.
++Do not use this document as an operational activation recipe.
++
++## Actual reads and privacy
++
++The consumer records the actual returned owner IDs, the read outcome and source
++validity. Successful reads, expiry, missing files, invalid requests, malformed JSON,
++oversize reads and IO failures are distinct observations. The production reader's
++existing permissive behavior is retained, even where evidence validation is stricter.
++
++Exact bytes are retained only for source documents passing the frozen allowlist.
++Unknown fields, duplicate keys, nonfinite numbers and arbitrary malformed input are
++not stored verbatim. Those observations retain the digest and observed byte count,
++are redacted, and remain incomplete evidence. A digest of inaccessible bytes does
++not establish the exact-byte acceptance gate. For oversize sources the digest and
++`raw_size` cover the bounded prefix actually read (128 KiB plus one sentinel byte),
++not the unseen whole file. Capture failure never changes the reader's result.
++
++## Queue, storage and shutdown
++
++Submissions do no filesystem/network IO and never wait for the writer. Queue limits
++are 1024 records and 8 MiB of serialized payload; each payload is at most 256 KiB.
++The writer drains at most 128 records / 1 MiB of payload per append call. These are
++payload accounting bounds, not claims about Python RSS. Queue overflow records loss;
++uncountable loss or an in-flight producer/reader at shutdown invalidates the tail.
++Producer custody includes the rejection path, not only successful queue insertion.
++
++All runtime epochs beneath a capture share a locked byte budget, including existing
++files and temporary replacement peaks. Evidence is never deleted to make room.
++Budget failure can prevent even a gap receipt; an absent clean tail remains a gap.
++The lock is advisory and does not prevent unrelated external writes. Unsupported
++locking platforms reject activation. Assembled-export enforcement is separate work.
++
++Process shutdown shares one two-second allowance across all active profile/board
++consumers. The writer first drains and seals data, then waits for a positive in-memory
++publication decision from the closing caller. The caller may authorize only before
++its deadline and with no known lost or in-flight observations. A timeout before this
++decision is irrevocable: a subsequently completed data seal cannot certify the tail.
++
++`Session.close()` returns **publication authorization**, not durable-publication proof.
++After authorization it waits only for the remainder of the same allowance. Slow
++receipt IO can finish later; a process exit may instead leave the receipt absent.
++Only loading the durable `runtime-close.json` bound to the opening identity and final
++seal establishes a clean tail. Missing, malformed, mismatched or late authorization
++receipts remain `runtime_tail` gaps. The `completed_ns` value is the caller's decision
++instant after data sealing, not the time receipt IO completed. No caller-side IO is
++used to try to guarantee both bounded shutdown and durable acknowledgement.
+diff --git a/hermes_cli/kanban_fairness_runtime.py b/hermes_cli/kanban_fairness_runtime.py
+index 5604f1e27b7ab0540dd16feb3b817f77a96823b2..0da82814b0fa37a9b8268ec1774cee8c1e2cfb9f 100644
+--- a/hermes_cli/kanban_fairness_runtime.py
++++ b/hermes_cli/kanban_fairness_runtime.py
+@@ -22,10 +22,25 @@ from hermes_cli.kanban_fairness_schema import make_record
+ MAX_RECORDS = 1024
+ MAX_QUEUE_BYTES = 8 * 1024 * 1024
+ MAX_PAYLOAD_BYTES = 256 * 1024
++MAX_BATCH_RECORDS = 128
++MAX_BATCH_BYTES = 1024 * 1024
+ _SESSIONS = {}
+ _DEFAULT_HOME = None
+ 
+ 
++def close_all(timeout=2.0):
++    """All profile/board consumers share one process shutdown allowance."""
++    deadline = time.monotonic() + min(2.0, max(0.0, timeout))
++    sessions = [session for key, session in tuple(_SESSIONS.items()) if key[0] == os.getpid()]
++    for session in sessions:
++        session.begin_close(timeout=max(0.0, deadline - time.monotonic()))
++    for session in sessions:
++        session.close(timeout=max(0.0, deadline - time.monotonic()))
++
++
++atexit.register(close_all)
++
++
+ def append_records(*args, **kwargs):
+     from hermes_cli.kanban_fairness_store import append_records as append
+ 
+@@ -157,7 +172,12 @@ class Session:
+         self.sealed = False
+         self.seq = 0
+         self.readers = 0
++        self.producers = {}
+         self.deadline_ns = None
++        self.ready = threading.Event()
++        self.decision = threading.Event()
++        self.approved = False
++        self.close_lock = threading.Lock()
+         self.loss_lock = threading.Lock()
+         # Validate supplied identities before starting any thread or making directories.
+         self.record("loss", self.loss_payload("clock_gap", 1), 1)
+@@ -194,6 +214,17 @@ class Session:
+             self.loss_lock.release()
+ 
+     def enqueue(self, kind, payload):
++        # Publish custody BEFORE checking stopping. A producer that passed the
++        # check is visible until both queue admission and rejection accounting
++        # finish. Individual dict operations are atomic; no IO or waiting here.
++        token = object()
++        self.producers[token] = True
++        try:
++            return self._enqueue(kind, payload)
++        finally:
++            self.producers.pop(token)
++
++    def _enqueue(self, kind, payload):
+         if self.stopping.is_set() or self.failed:
+             return False
+         if not self.lock.acquire(blocking=False):
+@@ -233,14 +264,24 @@ class Session:
+                 self.wake.clear()
+                 while True:
+                     with self.lock:
+-                        item = self.queue.popleft() if self.queue else None
+-                        done = item is None and self.stopping.is_set()
+-                        if item is not None:
+-                            self.bytes -= item[2]
+-                    if item is None:
++                        batch, size = [], 0
++                        while self.queue and len(batch) < MAX_BATCH_RECORDS:
++                            if size + self.queue[0][2] > MAX_BATCH_BYTES:
++                                break
++                            item = self.queue.popleft()
++                            batch.append(item)
++                            size += item[2]
++                        self.bytes -= size
++                        done = not batch and self.stopping.is_set()
++                        if done and (self.producers or self.readers):
++                            self.abandoned.set()
++                    if not batch:
+                         break
+-                    kind, payload, _, wall, mono = item
+-                    self.write(kind, json.loads(payload), wall, mono)
++                    records = [self.record(kind, json.loads(payload), self.seq + index,
++                                           wall=wall, mono=mono)
++                               for index, (kind, payload, _, wall, mono) in enumerate(batch, 1)]
++                    append_records(self.out, records, max_bytes=self.maximum)
++                    self.seq += len(records)
+                 if done:
+                     break
+             with self.loss_lock:
+@@ -252,20 +293,39 @@ class Session:
+                                         source_epoch=self.epoch, last_seq=self.seq)])
+                 from hermes_cli.kanban_fairness_tail import close_epoch
+ 
+-                completed = time.monotonic_ns()
+-                if not self.abandoned.is_set() and self.deadline_ns is not None and completed <= self.deadline_ns:
+-                    close_epoch(self.out, self.identity, manifest, self.deadline_ns, completed)
++                self.ready.set()
++                self.decision.wait()
++                if self.approved:
++                    close_epoch(self.out, self.identity, manifest, self.deadline_ns, self.completed_ns)
+                     self.sealed = True
+         except (OSError, ValueError, TypeError, RuntimeError):
+             # Evidence failure cannot change scheduler behavior; unsealed epoch is a gap.
+             self.failed = True
+             self.note_loss("writer_error")
++        finally:
++            self.ready.set()
+ 
+     def close(self, timeout=2.0):
++        """Authorize a sealed data tail within deadline, NOT attest durable publication.
++
++        True may precede receipt IO completion; only load() proves a durable tail.
++        Once authorized, slow receipt publication cannot turn it into a rejection.
++        """
++        if not self.close_lock.acquire(blocking=False):
++            return False
++        try:
++            return self._close(timeout)
++        finally:
++            self.close_lock.release()
++
++    def begin_close(self, timeout=2.0):
++        """Signal every writer before spending the shared allowance waiting."""
+         timeout = min(2.0, max(0.0, timeout))
+         if self.deadline_ns is None:
+             self.deadline_ns = time.monotonic_ns() + int(timeout * 1_000_000_000)
+         self.stopping.set()
++        if self.producers:
++            self.abandoned.set()
+         if self.lock.acquire(blocking=False):
+             try:
+                 if self.readers:
+@@ -275,14 +335,28 @@ class Session:
+         else:
+             self.abandoned.set()
+         self.wake.set()
+-        self.thread.join(timeout)
+-        if self.thread.is_alive():
++
++    def _close(self, timeout):
++        if self.decision.is_set():
++            return self.approved
++        self.begin_close(timeout)
++        assert self.deadline_ns is not None
++        deadline = min(self.deadline_ns, time.monotonic_ns() + int(max(0.0, timeout) * 1_000_000_000))
++
++        def remaining():
++            return max(0.0, (deadline - time.monotonic_ns()) / 1_000_000_000)
++        self.ready.wait(remaining())
++        self.completed_ns = time.monotonic_ns()
++        self.approved = (self.ready.is_set() and self.seq > 0 and not self.failed
++                         and not self.abandoned.is_set() and self.completed_ns <= deadline)
++        if not self.approved:
+             self.abandoned.set()
++        self.decision.set()
++        self.thread.join(remaining())
+         for key, session in tuple(_SESSIONS.items()):
+             if session is self:
+                 del _SESSIONS[key]
+-        atexit.unregister(self.close)
+-        return self.sealed and not self.abandoned.is_set() and not self.thread.is_alive()
++        return self.approved
+ 
+ 
+ def activate(config, *, home: Path, board: str, source_gateway: str, board_uid: str,
+@@ -301,5 +375,4 @@ def activate(config, *, home: Path, board: str, source_gateway: str, board_uid:
+     session = Session(settings, board=board, source_gateway=source_gateway, board_uid=board_uid,
+                       clock_error_ns=clock_error_ns)
+     _SESSIONS[key] = session
+-    atexit.register(session.close)
+     return session
+diff --git a/hermes_cli/kanban_fairness_tail.py b/hermes_cli/kanban_fairness_tail.py
+index 2b896ce7ef36a42f0e084f02f5edfeafdaa5b6c9..febdf5cc2f86543545e746dd5cefe67d87b6dfcb 100644
+--- a/hermes_cli/kanban_fairness_tail.py
++++ b/hermes_cli/kanban_fairness_tail.py
+@@ -1,7 +1,8 @@
+ """Runtime-only closing receipts; a late segment seal is not a clean epoch tail.
+ 
+ These lifecycle files do not change the v1 event envelope. The final timestamp is
+-observed after segment seal IO, in the same process monotonic clock as the deadline.
++the caller's publication authorization after segment seal IO, in the same process
++monotonic clock as the deadline; it is not receipt-publication completion time.
+ Missing or invalid receipts are incomplete evidence, never a zero-loss assertion.
+ """
+ from __future__ import annotations
+diff --git a/tests/hermes_cli/test_kanban_fairness_shutdown.py b/tests/hermes_cli/test_kanban_fairness_shutdown.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..69dc5195fc04dd96731e9f789c1f24f8070235b6
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_fairness_shutdown.py
+@@ -0,0 +1,125 @@
++"""Deterministic shutdown admission and process-budget regressions."""
++import threading
++import os
++
++from hermes_cli import kanban_fairness_runtime as runtime
++
++
++def activate(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    return runtime.activate({"kanban": {"fairness_capture": {"enabled": True, "capture_id": "test"}}},
++                            home=tmp_path, board="default", source_gateway="gateway", board_uid="board",
++                            clock_error_ns=0)
++
++
++def test_rejected_producer_paused_before_loss_cannot_certify(tmp_path, monkeypatch):
++    session = activate(tmp_path, monkeypatch)
++    assert session is not None
++    payload = session.loss_payload("redaction", 1)
++    assert session.enqueue("loss", payload)
++    entered, release = threading.Event(), threading.Event()
++    actual = session.note_loss
++
++    def paused(reason):
++        entered.set()
++        assert release.wait(5)
++        actual(reason)
++
++    monkeypatch.setattr(session, "note_loss", paused)
++    with session.lock:
++        producer = threading.Thread(target=lambda: session.enqueue("loss", payload))
++        producer.start()
++        assert entered.wait(2)
++    try:
++        assert not session.close()
++        assert not session.sealed
++    finally:
++        release.set()
++        producer.join(3)
++        session.thread.join(3)
++
++
++def test_process_shutdown_shares_one_deadline(monkeypatch):
++    now = [10.0]
++    budgets = []
++    begun = []
++
++    class Fake:
++        def begin_close(self, timeout):
++            begun.append(self)
++
++        def close(self, timeout=2):
++            assert len(begun) == 3
++            budgets.append(timeout)
++            now[0] += timeout
++
++    monkeypatch.setattr(runtime.time, "monotonic", lambda: now[0])
++    monkeypatch.setattr(runtime, "_SESSIONS", {(os.getpid(), name): Fake() for name in "abc"})
++    runtime.close_all()
++    assert budgets == [2.0, 0.0, 0.0]
++
++
++def test_shutdown_ignores_fork_inherited_sessions(monkeypatch):
++    monkeypatch.setattr(runtime, "_SESSIONS", {(os.getpid() + 1, "parent"): object()})
++    runtime.close_all()
++
++
++def test_slow_receipt_publication_returns_authorization_not_false_timeout(tmp_path, monkeypatch):
++    from hermes_cli import kanban_fairness_tail as tail
++
++    session = activate(tmp_path, monkeypatch)
++    assert session is not None
++    assert session.enqueue("loss", session.loss_payload("redaction", 1))
++    entered, release = threading.Event(), threading.Event()
++    actual = tail.close_epoch
++    results = []
++
++    def held(*args):
++        entered.set()
++        assert release.wait(5)
++        return actual(*args)
++
++    monkeypatch.setattr(tail, "close_epoch", held)
++    closer = threading.Thread(target=lambda: results.append(session.close(timeout=0.25)))
++    closer.start()
++    try:
++        assert entered.wait(2)
++        closer.join(2)
++        assert not closer.is_alive()
++        # True authorizes publication of data sealed within deadline; only the
++        # durable receipt proves publication. An authorized tail is never revoked.
++        assert results == [True]
++        assert not (session.out / tail.CLOSE).exists()
++    finally:
++        release.set()
++        closer.join(3)
++        session.thread.join(3)
++    assert session.sealed
++
++
++def test_drain_batches_records_with_bounded_writer_calls(tmp_path, monkeypatch):
++    entered, release = threading.Event(), threading.Event()
++    actual = runtime.append_records
++    sizes = []
++
++    def held(out, records, **kwargs):
++        sizes.append(len(records))
++        if len(sizes) == 1:
++            entered.set()
++            assert release.wait(5)
++        return actual(out, records, **kwargs)
++
++    monkeypatch.setattr(runtime, "append_records", held)
++    session = activate(tmp_path, monkeypatch)
++    assert session is not None
++    payload = session.loss_payload("redaction", 1)
++    assert session.enqueue("loss", payload)
++    try:
++        assert entered.wait(2)
++        assert all(session.enqueue("loss", payload) for _ in range(300))
++    finally:
++        release.set()
++        assert session.close()
++    assert sum(sizes) == 301
++    assert max(sizes) <= runtime.MAX_BATCH_RECORDS
++    assert len(sizes) == 4
+-- 
+2.43.0
+

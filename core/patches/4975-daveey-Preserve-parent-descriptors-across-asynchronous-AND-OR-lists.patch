@@ -1,0 +1,116 @@
+From 7997c38f9559c75746d4e47d38f5163e9dfb6003 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 09:05:16 +0000
+Subject: [PATCH] [daveey] Preserve parent descriptors across asynchronous
+ AND/OR lists
+
+An ampersand backgrounds the complete AND/OR list, so an earlier close must not erase parent descriptor provenance. Snapshot list entry state and retain parent alternatives at the asynchronous boundary. Proof: real Bash marker and clean controls; 154 focused tests pass. Prior full cron log: 11040 passed, zero failed, nine skipped. Every If/IfExp mutation in the descriptor helper killed; final-head real-input replay and independent review remain required before landing.
+---
+ cron/lifecycle_guard_fds.py                   |  7 +++
+ .../test_lifecycle_guard_descriptor_async.py  | 62 +++++++++++++++++++
+ 2 files changed, 69 insertions(+)
+ create mode 100644 tests/cron/test_lifecycle_guard_descriptor_async.py
+
+diff --git a/cron/lifecycle_guard_fds.py b/cron/lifecycle_guard_fds.py
+index 040ddc9061b79b716109b415019ba012d5449efc..aedc3bedc4b94093290f5304f3439658c0fe8173 100644
+--- a/cron/lifecycle_guard_fds.py
++++ b/cron/lifecycle_guard_fds.py
+@@ -148,6 +148,7 @@ def carry_exec_descriptors(
+     Each script gets its own table, so heredoc bodies cannot rebind their enclosing script.
+     """
+     table: _Table = {}
++    list_parent: _Table = {}  # Parent state before the current AND/OR list.
+     nesting: list[str] = []  # open compound commands; persists across lines
+     for tokens in lines:
+         pieces: list[tuple[list[str], str, str]] = []  # (segment, control before, control after)
+@@ -161,6 +162,8 @@ def carry_exec_descriptors(
+                 segment.append(token)
+         variants: list[list[list[str]]] = []
+         for segment, before, after in pieces:
++            if not nesting and before in ("", ";", "&"):
++                list_parent = dict(table)
+             start = _command_start(segment, nesting, pattern)
+             redirects = _exec_redirections(segment[start:], pattern)
+             if redirects is not None:
+@@ -184,6 +187,10 @@ def carry_exec_descriptors(
+                 nesting.append("sub")
+             elif after == ")" and nesting and nesting[-1] == "sub":
+                 nesting.pop()
++            if after == "&":
++                # & backgrounds the whole AND/OR list, not only its last command.
++                # Its earlier certain closes/rebinds cannot change the parent's fds.
++                _merge(table, list_parent)
+         for index in range(max((len(v) for v in variants), default=1)):
+             out: list[str] = []
+             for (_, _, after), options in zip(pieces, variants):
+diff --git a/tests/cron/test_lifecycle_guard_descriptor_async.py b/tests/cron/test_lifecycle_guard_descriptor_async.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8f28f2a2dc67e44ea22db1e41f5115eea9cd28b5
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_descriptor_async.py
+@@ -0,0 +1,62 @@
++"""An asynchronous AND/OR list cannot close the parent's descriptors."""
++from __future__ import annotations
++
++import shlex
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++
++
++@pytest.mark.parametrize("tail", [
++    "&& true & wait;", "|| false & wait;", "&& true || false & wait;",
++    "|| false && true & wait;", "&&\n true & wait;", "||\n false & wait;",
++    "&& true | cat & wait;", "&& true |& cat & wait;",
++    "&& { true; true; } & wait;", "|| { false; false; } & wait;",
++    "&& (true; true) & wait;", "&& { true;\n true; } & wait;",
++    "&& if true; then true; fi & wait;",
++    "&& true & wait\n", "&& true & wait; true & wait;",
++])
++@pytest.mark.parametrize("clean", [False, True])
++def test_async_list_preserves_parent(tmp_path, tail, clean):
++    script = tmp_path / "r.sh"
++    script.write_text("printf CLEAN" if clean else "hermes gateway " + "restart")
++    fake = tmp_path / "hermes"
++    fake.write_text("#!/bin/sh\nprintf MARKER")
++    fake.chmod(0o700)
++    command = f"exec 3<{shlex.quote(str(script))}; exec 3<&- {tail} bash <&3"
++    result = subprocess.run(
++        ["bash", "--noprofile", "--norc", "-c", f"PATH={shlex.quote(str(tmp_path))}:$PATH; " + command],
++        capture_output=True, text=True, encoding="utf-8", check=False,
++    )
++    assert result.returncode == 0, result.stderr
++    assert result.stdout == ("CLEAN" if clean else "MARKER")
++    assert scan_gateway_lifecycle(command) == (not clean, None)
++
++
++@pytest.mark.parametrize("tail", ["&& true;", "|| false;", "&& true || false;", "&& true; true & wait;"])
++def test_foreground_close_is_still_certain(tmp_path, tail):
++    script = tmp_path / "r.sh"
++    script.write_text("hermes gateway " + "restart")
++    command = f"exec 3<{shlex.quote(str(script))}; exec 3<&- {tail} bash <&3"
++    assert scan_gateway_lifecycle(command) == (False, None)
++
++
++@pytest.mark.parametrize("redirect", ["", "&>out", "&>>out"])
++def test_stderr_descriptor_combined_output_rebind(tmp_path, monkeypatch, redirect):
++    monkeypatch.chdir(tmp_path)
++    (tmp_path / "r.sh").write_text("hermes gateway " + "restart")
++    command = "exec 2<r.sh; " + (f"exec {redirect}; " if redirect else "") + "bash <&2"
++    assert scan_gateway_lifecycle(command) == (not bool(redirect), None)
++
++
++@pytest.mark.parametrize("prefix", ["function f {", "coproc named {", "coproc {"])
++def test_definition_prefix_consumes_name_before_body(prefix):
++    from cron.lifecycle_guard import _REDIRECTION
++    from cron.lifecycle_guard_fds import _command_start
++
++    nesting = []
++    words = prefix.split() + ["exec", "3<&-"]
++    start = _command_start(words, nesting, _REDIRECTION)
++    assert words[start:] == ["exec", "3<&-"]
+-- 
+2.43.0
+

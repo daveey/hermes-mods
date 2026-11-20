@@ -1,0 +1,202 @@
+From 6e5efc06c1c0bfa1ad41e712ec17e032264197bd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 02:53:29 +0000
+Subject: [PATCH] [daveey] Scope printed startup-shell pipelines with unknown
+ alias names
+
+Printed pipe input was only walked under session alias names, unlike heredocs and -c inputs. Collect printed payloads from connected pipelines into the existing nested-shell walk. Preserve plain-shell and unrelated-pipeline scopes, grouped consumers/producers and pipe-newline continuations; avoid tokenizing no-pipe generators.
+
+Rebased onto main 5eec3bedbb, where the printed-payload iterator moved to cron/lifecycle_guard_output.py (iter_printed_shell_payloads, yielding (payload, raw_quote)). The shell_sink keyword now lives there; cron/lifecycle_guard.py is unchanged by this commit.
+
+Proof: printf/echo x bash -l/zsh/ssh h failed before the fix (6 RED cases). After the rebase, the session-alias suite has 78 passed, and 13 of its tests fail with cron/ reverted to main. tests/cron: 4216 passed, 9 skipped. scripts/check: 20 checks OK. Before the rebase, eight targeted source mutants were killed.
+
+Replay (pre-rebase head): 34579 distinct real terminal commands (command plus explicit workdir), 172895 old/new comparisons across none/ll/stock/zz/unknown. Changed verdict counts: none=0, ll=0, stock=0, zz=0, unknown=0. Corpus SHA256 e12b2f7b5fcde32586aaf33dc43885630e3dad1d8b59e16dcf5e5b3b76c286f0. Stored shell text was scanned, never executed. The baseline disables only the new nested-printed iterator. The replay uses the current filesystem, not historical file contents. The raw command corpus remains private.
+
+Independent exact-head review and required CI remain shipping gates.
+---
+ cron/lifecycle_guard_nested_shells.py         | 61 +++++++++++++++++++
+ cron/lifecycle_guard_output.py                |  5 +-
+ .../test_lifecycle_guard_session_aliases.py   | 54 ++++++++++++++++
+ 3 files changed, 118 insertions(+), 2 deletions(-)
+
+diff --git a/cron/lifecycle_guard_nested_shells.py b/cron/lifecycle_guard_nested_shells.py
+index 321fd100227c4f8230c856aa549125dcc0ca149e..ec99838682c5fa11a78a4392c8014f500c196a6f 100644
+--- a/cron/lifecycle_guard_nested_shells.py
++++ b/cron/lifecycle_guard_nested_shells.py
+@@ -9,6 +9,7 @@ from __future__ import annotations
+ import contextlib
+ import itertools
+ import re
++import shlex
+ from collections.abc import Iterator, Sequence
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Optional
+@@ -90,6 +91,8 @@ def collect_nested_shell_inputs(
+     texts: list[str] = []
+     scripts: set[Path] = set()
+     unknown_names = budget.alias_names is None
++    if not unknown_names:
++        texts.extend(_iter_nested_printed_payloads(walk_command))
+     for text, script in _iter_nested_shell_inputs(command, walk_command, cwd=cwd,
+                                                   heredocs=not unknown_names):
+         if script is not None:
+@@ -276,6 +279,64 @@ def _nested_shell_input(view: list[str]) -> Optional[tuple[str, Optional[str]]]:
+     return None
+ 
+ 
++def _printed_pipeline_units(command: str) -> Iterator[str]:
++    """Keep compound groups and pipe-newline continuations within one printed-text unit."""
++    from cron.lifecycle_guard import _CONTROL_CHARS, _iter_command_token_lists
++
++    words: list[str] = []
++    depth = 0
++    continued = False
++    for tokens in _iter_command_token_lists(command):
++        for token in tokens:
++            controls = re.findall(r"\|&|&&|\|\||[;&|()]", token) if (
++                token and set(token) <= _CONTROL_CHARS) else [token]
++            for word in controls:
++                if word in ("(", "{"):
++                    depth += 1
++                elif word in (")", "}"):
++                    depth = max(0, depth - 1)
++                elif not depth and word in (";", "&", "&&", "||"):
++                    yield " ".join(words)
++                    words = []
++                    continued = False
++                    continue
++                words.append(word if word in ("(", ")", "{", "}", ";", "&", "&&", "||", "|", "|&")
++                             else shlex.quote(word))
++                continued = word in ("|", "|&")
++        if not depth and not continued:
++            yield " ".join(words)
++            words = []
++    if words:
++        yield " ".join(words)
++
++
++def _iter_nested_printed_payloads(command: str) -> Iterator[str]:
++    """Walk printed text with unknown names only within a pipe feeding a startup shell.
++
++    The ordinary printed-text approximation still scans each connected compound pipeline;
++    unrelated top-level pipelines retain their session scope. Keep the ordinary walk too.
++    """
++    from cron.lifecycle_guard import (
++        _command_segment_views, _iter_command_token_lists, _split_segments,
++    )
++    from cron.lifecycle_guard_output import iter_printed_shell_payloads
++
++    if "|" not in command:
++        return  # do not tokenize large no-pipe generators a second time
++    for pipeline in _printed_pipeline_units(command):
++        piped = False
++        for tokens in _iter_command_token_lists(pipeline):
++            for segment in _split_segments(tokens, keep_controls=True):
++                if segment in (["|"], ["|&"]):
++                    piped = True
++                elif piped and any(_nested_shell_input(view) == ("stdin", None)
++                                   for view in _command_segment_views(segment)):
++                    for payload, _raw_quote in iter_printed_shell_payloads(
++                            pipeline, shell_sink=True):
++                        yield payload
++                    break
++
++
+ def _feeds_nested_shell(owner: Optional[str]) -> bool:
+     """Whether a heredoc's *owner* text hands the body to such a nested shell as its script
+     (``None``: unknown owner, fail closed)."""
+diff --git a/cron/lifecycle_guard_output.py b/cron/lifecycle_guard_output.py
+index 5359793cebf614d00a7010e224a1e3454b9cc88a..c101faf2e9c1899633a28ef0265bbb8675514852 100644
+--- a/cron/lifecycle_guard_output.py
++++ b/cron/lifecycle_guard_output.py
+@@ -38,7 +38,7 @@ def iter_recursive_payloads(command, nested_texts, *, cwd, executed, budget, cov
+ 
+ 
+ def iter_printed_shell_payloads(
+-    command: str, *, include_quoted: bool = True,
++    command: str, *, include_quoted: bool = True, shell_sink: bool = False,
+ ) -> Iterator[tuple[str, bool]]:
+     """Yield (payload, raw_quote) when output may execute as shell code.
+ 
+@@ -46,11 +46,12 @@ def iter_printed_shell_payloads(
+     consumer may omit ONLY their enumeration in the same interpretation scope.
+     Keep both quote kinds and overlapping pairs: apostrophes inside the other
+     kind must not hide later literals. Unknown producers remain conservative.
++    *shell_sink*: the caller already knows the output reaches a shell.
+     """
+     from cron import lifecycle_guard as guard
+     from tools.shell_heredoc import output_reaches_shell
+ 
+-    if not output_reaches_shell(command):
++    if not shell_sink and not output_reaches_shell(command):
+         return
+     seen: set[str] = set()
+ 
+diff --git a/tests/cron/test_lifecycle_guard_session_aliases.py b/tests/cron/test_lifecycle_guard_session_aliases.py
+index bb367204486c365cfa07267b6b974b89fe6a79ae..10baaf15f5272c736f557ecb8f8445a661449f9d 100644
+--- a/tests/cron/test_lifecycle_guard_session_aliases.py
++++ b/tests/cron/test_lifecycle_guard_session_aliases.py
+@@ -392,6 +392,60 @@ def test_card_repro_python_body_in_login_shell_stays_allowed(tmp_path, live_kanb
+     assert unsafe is True and refusal is not None and "SQLite" in refusal
+ 
+ 
++@pytest.mark.parametrize("sink,blocked", [
++    ("bash -l", True), ("zsh", True), ("ssh h", True),
++    ("bash", False), ("bash -s", False),
++    ("bash -l -c ':'", False), ("ssh h cat", False),
++])
++@pytest.mark.parametrize("printer", ["printf", "echo"])
++def test_printed_pipe_uses_consuming_shell_scope(tmp_path, live_kanban_db, sink, blocked, printer):
++    text = f"{printer} 't ( bash {live_kanban_db} )' | {sink}"
++    unsafe, refusal = scan_gateway_lifecycle(
++        text, cwd=str(tmp_path), session_aliases=frozenset({"zz"}))
++    assert unsafe is blocked
++    if blocked:
++        assert refusal is not None and "SQLite" in refusal
++
++
++@pytest.mark.parametrize("separator", [";", "&&", "||", "\n"])
++def test_unrelated_login_shell_does_not_change_printed_pipe_scope(
++    tmp_path, live_kanban_db, separator,
++):
++    text = f"printf 't ( bash {live_kanban_db} )' | bash {separator} printf ':' | bash -l"
++    assert scan_gateway_lifecycle(
++        text, cwd=str(tmp_path), session_aliases=frozenset({"zz"})) == (False, None)
++
++
++def test_login_shell_on_producing_side_does_not_receive_printed_text(tmp_path, live_kanban_db):
++    text = f"bash -l | printf 't ( bash {live_kanban_db} )' | bash"
++    assert scan_gateway_lifecycle(
++        text, cwd=str(tmp_path), session_aliases=frozenset({"zz"})) == (False, None)
++
++
++@pytest.mark.parametrize("shape", [
++    "printf 't ( bash {db} )' | ( bash -l )",
++    "( printf 't ( bash {db} )' ) | bash -l",
++    "printf 't ( bash {db} )' | {{ :; bash -l; }}",
++    "printf 't ( bash {db} )' |\nbash -l",
++    "printf 't ( bash {db} )' |& bash -l",
++    "printf 't ( bash {db} )' | cat | bash -l",
++])
++def test_compound_printed_pipe_keeps_nested_scope(tmp_path, live_kanban_db, shape):
++    unsafe, refusal = scan_gateway_lifecycle(
++        shape.format(db=live_kanban_db), cwd=str(tmp_path), session_aliases=frozenset({"zz"}))
++    assert unsafe is True and refusal is not None and "SQLite" in refusal
++
++
++def test_no_pipe_does_not_tokenize_printed_payloads(monkeypatch):
++    from cron.lifecycle_guard_nested_shells import _iter_nested_printed_payloads
++
++    def unexpected(command):
++        pytest.fail("no-pipe command was tokenized")
++
++    monkeypatch.setattr("cron.lifecycle_guard._iter_command_token_lists", unexpected)
++    assert list(_iter_nested_printed_payloads("printf ':'")) == []
++
++
+ def test_nested_shell_input_shapes():
+     """Which nested shells hold aliases of their own, and what of theirs is shell code."""
+     from cron.lifecycle_guard_nested_shells import _feeds_nested_shell, _iter_nested_shell_inputs
+-- 
+2.43.0
+

@@ -1,0 +1,122 @@
+From 6bd03c9dba947bf1792acc83173254a4cf986ebf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 01:24:53 +0000
+Subject: [PATCH] fix(kanban): preserve source creation order for equal ready
+ scores [daveey]
+
+Proof: deterministic source FIFO regressions fail on prior head (3 failures), pass after fix; canonical source, foreign API and hub admission suites pass. Ready-episode precedence and local custody remain intact.
+---
+ hermes_cli/kanban_admission_score.py          | 12 +++---
+ tests/hermes_cli/test_kanban_score_sources.py | 37 +++++++++++++++++++
+ tests/plugins/test_kanban_foreign_card_api.py |  5 +++
+ 3 files changed, 49 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban_admission_score.py b/hermes_cli/kanban_admission_score.py
+index 93867f5d01d8b78b8df988136f4e417e0d22b8ac..57b6100198da480897836a10b6d823e76e695ef4 100644
+--- a/hermes_cli/kanban_admission_score.py
++++ b/hermes_cli/kanban_admission_score.py
+@@ -176,8 +176,8 @@ def _candidate_state(conn, ids):
+     for offset in range(0, len(ids), 400):
+         batch = ids[offset:offset + 400]
+         marks = ",".join("?" for _ in batch)
+-        found = {r[0]: (r[1] or "normal", r[2] or 0) for r in conn.execute(
+-            f"SELECT id, admission_class, consecutive_failures FROM tasks WHERE id IN ({marks})", batch)}
++        found = {r[0]: (r[1] or "normal", r[2] or 0, r[3] or 0) for r in conn.execute(
++            f"SELECT id, admission_class, consecutive_failures, created_at FROM tasks WHERE id IN ({marks})", batch)}
+         metadata.update(found)
+         # Restrict history to extant rows; orphan events do not restore a vanished candidate.
+         since.update(_ready_since(conn, list(found)))
+@@ -230,7 +230,8 @@ def effective_priorities(conn: sqlite3.Connection, task_ids: list[str]) -> dict[
+ def rank(conn: sqlite3.Connection, rows, *, now_ms: Optional[int] = None, weights: Optional[dict] = None):
+     """``rows`` (local task rows with ``id``) in admission order, each with its :class:`ScoreBreakdown`.
+ 
+-    Pure and read-only. Ties break on the earlier ready-interval start, then task id."""
++    Pure and read-only. Ties break on ready-interval start, source creation time,
++    then task id. Creation retains subsecond precision and local custody wins."""
+     import time
+ 
+     rows = list(rows)
+@@ -245,7 +246,7 @@ def rank(conn: sqlite3.Connection, rows, *, now_ms: Optional[int] = None, weight
+         tid = row["id"]
+         below = _descendants(tid, children)
+         priority = max([tasks.get(tid, (0, None))[0], *(tasks[c][0] for c in below)])
+-        klass, failures = metadata.get(tid, ("normal", 0))
++        klass, failures, _created = metadata.get(tid, ("normal", 0, 0))
+         class_rank = CLASS_RANK.get(klass, 0)
+         start = since.get(tid, 0)
+         if start <= 0:
+@@ -257,5 +258,6 @@ def rank(conn: sqlite3.Connection, rows, *, now_ms: Optional[int] = None, weight
+                  + weights["age"] * buckets - weights["failure"] * failures)
+         scored.append((row, ScoreBreakdown(effective, class_rank, descendants, buckets, failures, total, start,
+                                            tuple(sorted(weights.items())))))
+-    scored.sort(key=lambda item: (-item[1].total, item[1].ready_since, item[0]["id"]))
++    scored.sort(key=lambda item: (-item[1].total, item[1].ready_since,
++                                 metadata.get(item[0]["id"], ("normal", 0, 0))[2], item[0]["id"]))
+     return scored
+diff --git a/tests/hermes_cli/test_kanban_score_sources.py b/tests/hermes_cli/test_kanban_score_sources.py
+index 00761db0c42998022d6d0ed4d1801415c4221b40..cef84de5b514d9c33d3a88fcac2ffbf79b333b30 100644
+--- a/tests/hermes_cli/test_kanban_score_sources.py
++++ b/tests/hermes_cli/test_kanban_score_sources.py
+@@ -44,6 +44,43 @@ def add(conn, tid, start, priority=0, klass="normal", failures=0):
+     return conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+ 
+ 
++@pytest.mark.parametrize("replica", [False, True])
++def test_same_second_ready_ties_use_source_creation_before_random_id(sources, replica):
++    local, remote = sources
++    source = remote if replica else local
++    older = add(source, "z-first", 1000.1)
++    newer = add(source, "a-second", 1000.2)
++    for tid in ("z-first", "a-second"):
++        source.execute("INSERT INTO task_events VALUES (?, 'promoted', '{}', 9000)", (tid,))
++    # Minimal candidate projections and reversed input must not erase source FIFO.
++    rows = [{"id": newer["id"]}, {"id": older["id"]}]
++    ranked = score.rank(local, rows, now_ms=9_001_000, weights={})
++    assert [row["id"] for row, _ in ranked] == ["z-first", "a-second"]
++
++
++def test_ready_episode_precedes_creation_tiebreak(sources):
++    local, _ = sources
++    older = add(local, "older-card", 1000)
++    newer = add(local, "newer-card", 2000)
++    local.execute("INSERT INTO task_events VALUES ('older-card', 'promoted', '{}', 9001)")
++    local.execute("INSERT INTO task_events VALUES ('newer-card', 'promoted', '{}', 9000)")
++    ranked = score.rank(local, [older, newer], now_ms=9_002_000, weights={})
++    assert [row["id"] for row, _ in ranked] == ["newer-card", "older-card"]
++
++
++def test_local_creation_tiebreak_overrides_replica(sources):
++    local, remote = sources
++    older = add(remote, "z-first", 2000)
++    newer = add(remote, "a-second", 1000)
++    add(local, "z-first", 1000)
++    add(local, "a-second", 2000)
++    for source in (local, remote):
++        for tid in ("z-first", "a-second"):
++            source.execute("INSERT INTO task_events VALUES (?, 'promoted', '{}', 9000)", (tid,))
++    ranked = score.rank(local, [newer, older], now_ms=9_001_000, weights={})
++    assert [row["id"] for row, _ in ranked] == ["z-first", "a-second"]
++
++
+ def test_replica_candidate_uses_replica_readiness_and_metadata(sources):
+     local, remote = sources
+     row = add(remote, "remote", 1000, 300, "capacity", 2)
+diff --git a/tests/plugins/test_kanban_foreign_card_api.py b/tests/plugins/test_kanban_foreign_card_api.py
+index 173d92e1ae9d1a8367254d796f1e2254dc1a35d5..a563bff2f72b8fabb6956864abc5c48f7469f802 100644
+--- a/tests/plugins/test_kanban_foreign_card_api.py
++++ b/tests/plugins/test_kanban_foreign_card_api.py
+@@ -193,6 +193,11 @@ def test_ready_card_reports_local_queue_position(kanban_home, api, monkeypatch):
+     _set(claimed, claim_lock="host:1", created_at=10)  # being claimed this tick: not ahead in the lane
+     from hermes_cli import kanban_worker_placement as kwp
+     _set(pool, placement_policy=kwp.POLICY, created_at=10)  # waits for the worker pool, not a local slot
++    # Fix the ready episode as well as card creation: real creation events use
++    # whole seconds and can otherwise straddle a clock tick during this fixture.
++    with kbc.connect_closing() as conn:
++        conn.execute("UPDATE task_events SET created_at=1000 WHERE kind='created'")
++        conn.commit()
+     q = api.get(f"/api/plugins/kanban/tasks/{new}").json()["queue"]
+     assert isinstance(q.pop("observed_at"), int)
+     assert q == {"lane": "local", "ahead": 2, "running": 3, "limit": 6, "approximate": True, "board": "default"}
+-- 
+2.43.0
+

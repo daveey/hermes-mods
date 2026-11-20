@@ -1,0 +1,151 @@
+From 737b7f30765822beeaac05eafd6f4721be40b40a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 06:03:31 +0000
+Subject: [PATCH] [daveey] Skip unused placement backlog ranking during
+ dispatch
+
+Why: each labels_mismatch ready card asked placement for a lane verdict but paid for a complete label backlog ranking. Add backlog=True keyword compatibility and opt out only in note_unplaceable. No event or eligibility semantics change.
+
+Proof: real admitted primary-board ticks with 3 and 7 remote cards; parent fails with 3 backlog reads, candidate has zero and constant rank count. Unplaceable event dedup and missing-label changes pass. 21 focused tests pass. Separate-process 4000-task, 7-ready unchanged tick: parent 85.137741 CPU-ms, candidate 46.022652; exact DispatchResult, task_events and default placement dictionaries equal. RED and benchmark artifacts on task t_e05e35b4ba8605a3. No Mac actions.
+---
+ hermes_cli/kanban_db_dispatch_preclaim.py     |  2 +-
+ hermes_cli/kanban_queue_position.py           | 14 ++--
+ .../test_kanban_dispatch_placement_backlog.py | 76 +++++++++++++++++++
+ 3 files changed, 85 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_dispatch_placement_backlog.py
+
+diff --git a/hermes_cli/kanban_db_dispatch_preclaim.py b/hermes_cli/kanban_db_dispatch_preclaim.py
+index 791bcad6abe5808ee72861858719e695830d8e38..4e4635ab8c7b3df0c7ee43c63627685f91cae258 100644
+--- a/hermes_cli/kanban_db_dispatch_preclaim.py
++++ b/hermes_cli/kanban_db_dispatch_preclaim.py
+@@ -52,7 +52,7 @@ def note_unplaceable(conn: sqlite3.Connection, task_id: str) -> None:
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_queue_position as kqp
+     try:
+-        place = kqp.placement(conn, task_id)
++        place = kqp.placement(conn, task_id, backlog=False)
+     except Exception:  # health: allow BLE001 -- the event is advisory; the skip itself already happened
+         kb._log.debug("kanban dispatch: unplaceable check failed for %s", task_id, exc_info=True)
+         return
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index 61312336aeead437d0fbb2304f71de340ae22648..42ce0ebb51eea630a2624b6710e056bbadea74bb 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -89,13 +89,14 @@ def draining(entry: Optional[dict[str, Any]], *, now: Optional[float] = None) ->
+     return {"until_ms": int(until)} if isinstance(until, (int, float)) and until > 0 else {}
+ 
+ 
+-def placement(conn: sqlite3.Connection, task_id: str) -> Optional[dict[str, Any]]:
++def placement(conn: sqlite3.Connection, task_id: str, *, backlog: bool = True) -> Optional[dict[str, Any]]:
+     """For a card whose ``runs_on`` this machine does not satisfy, on a synced board with a readable machine
+     registry: ``{"lane": "unplaceable", runs_on, missing, machines}`` when no known machine satisfies it (``missing``
+     = labels no machine carries; empty when each exists but none carries them all), else ``{"lane": "machine",
+     runs_on, machines}`` naming the machines that can lease it. None otherwise (no labels, sync off, registry
+     unknown, or this machine fits): an unknown registry never reads as unplaceable. [daveey] t_01a1a521638d0a78
+-    (runs_on ["hermes-hub"], no machine carries it) sat ready for days reading as a local slot wait."""
++    (runs_on ["hermes-hub"], no machine carries it) sat ready for days reading as a local slot wait.
++    Set ``backlog=False`` for the same placement verdict without ranking the label queue."""
+     labels = _runs_on(conn, task_id)
+     if not labels:
+         return None
+@@ -129,10 +130,11 @@ def placement(conn: sqlite3.Connection, task_id: str) -> Optional[dict[str, Any]
+             until = [d["until_ms"] for d in drains.values() if "until_ms" in d]
+             if until:
+                 place["drain_until_ms"] = max(until)
+-        from hermes_cli import kanban_label_backlog as klb
+-        backlog = klb.read(conn, task_id, labels, machines=klb.available(labels, machines))
+-        if backlog.get("ahead") or klb.busy(backlog):
+-            place["backlog"] = backlog
++        if backlog:
++            from hermes_cli import kanban_label_backlog as klb
++            queue = klb.read(conn, task_id, labels, machines=klb.available(labels, machines))
++            if queue.get("ahead") or klb.busy(queue):
++                place["backlog"] = queue
+         return place
+     every = set().union(*carried.values())
+     return {"lane": "unplaceable", "runs_on": labels, "missing": [lb for lb in labels if lb not in every],
+diff --git a/tests/hermes_cli/test_kanban_dispatch_placement_backlog.py b/tests/hermes_cli/test_kanban_dispatch_placement_backlog.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..cdeef963cef3405ac1e64e35a904211729303a16
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dispatch_placement_backlog.py
+@@ -0,0 +1,76 @@
++"""Dispatch needs a placement verdict, not a freshly ranked label backlog."""
++from __future__ import annotations
++
++import json
++from unittest.mock import patch
++
++from hermes_cli import kanban_admission_score as score
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_label_backlog as backlog
++from hermes_cli import kanban_queue_position as position
++from tests.hermes_cli import test_kanban_runs_on_dispatch as helpers
++
++svc = helpers.svc
++gws = helpers.gws
++
++
++def _card(hub, index, labels=None):
++    tid = kb.create_task(hub.conn, title=f"remote {index}", assignee="default",
++                         runs_on=["machine:worker-1"])
++    if labels:  # Legacy cards may predate the impossible-placement creation guard.
++        hub.conn.execute("UPDATE tasks SET runs_on=? WHERE id=?", (json.dumps(labels), tid))
++        hub.conn.commit()
++    return tid
++
++
++def test_real_tick_does_not_rank_per_remote_card(gws):
++    hub, _ = gws
++    hub.enter()
++    counts = []
++    ids = []
++    for end in (3, 7):
++        ids.extend(_card(hub, i) for i in range(len(ids), end))
++        with patch.object(score, "rank", wraps=score.rank) as ranked, \
++                patch.object(backlog, "read", wraps=backlog.read) as read:
++            result = hub.tick(dry_run=False)
++        assert result.scheduling_admitted
++        assert not result.spawned
++        assert set(result.skipped_ineligible) == {(tid, "labels_mismatch") for tid in ids}
++        assert read.call_count == 0
++        counts.append(ranked.call_count)
++    assert counts[0] == counts[1]
++
++
++def test_real_ticks_preserve_unplaceable_event_payload_and_dedup(gws):
++    hub, _ = gws
++    hub.enter()
++    tid = _card(hub, 0, ["missing:first"])
++    expected = {"runs_on": ["missing:first"], "missing": ["missing:first"],
++                "machines": ["hub", "macbook", "worker-1"]}
++    for _ in range(2):
++        assert hub.tick(dry_run=False).scheduling_admitted
++        events = [e for e in kb.list_events(hub.conn, tid) if e.kind == "skipped_unplaceable"]
++        assert [e.payload for e in events] == [expected]
++    hub.conn.execute("UPDATE tasks SET runs_on=? WHERE id=?", (json.dumps(["missing:second"]), tid))
++    hub.conn.commit()
++    assert hub.tick(dry_run=False).scheduling_admitted
++    events = [e for e in kb.list_events(hub.conn, tid) if e.kind == "skipped_unplaceable"]
++    assert [e.payload for e in events] == [expected, {**expected, "runs_on": ["missing:second"],
++                                                    "missing": ["missing:second"]}]
++
++
++def test_default_placement_keeps_backlog(gws):
++    hub, _ = gws
++    hub.enter()
++    ids = [_card(hub, i) for i in range(3)]
++    # Establish deterministic queue order independently of generated IDs/timestamps.
++    for i, tid in enumerate(ids):
++        hub.conn.execute("UPDATE tasks SET priority=? WHERE id=?", (100 - i, tid))
++    hub.conn.commit()
++    full = position.placement(hub.conn, ids[-1])
++    assert full["lane"] == "machine"
++    assert full["backlog"]["ahead"] == 2
++    with patch.object(backlog, "read", wraps=backlog.read) as read:
++        verdict = position.placement(hub.conn, ids[-1], backlog=False)
++    assert read.call_count == 0
++    assert verdict == {k: v for k, v in full.items() if k != "backlog"}
+-- 
+2.43.0
+

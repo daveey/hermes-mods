@@ -1,0 +1,154 @@
+From d5ade1e8d12cdf0cd85081b7b63aeaa6b2072fdb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 07:46:06 +0000
+Subject: [PATCH] [daveey] lifecycle guard: allow eval of the core worktree
+ PATH export
+
+`eval "$(hermes-core-wt env)"` is how a core worktree session puts its tools on
+PATH. The computed-shell-input refusal blocked it: 21 of the 27 historical
+commands still newly refused in the scan-only replay were exactly this line.
+
+Why: eval of substitution output is refused because the output is unknown. For
+this one tool the output is a single `export PATH=...` line, and its name is
+already trusted the way the word `python3` is.
+
+Change (cron/lifecycle_guard_substitution_output.py): the computed-input check
+reads `eval "$(hermes-core-wt env)"` as `eval ""` when the tool is bare or
+under ~/.hermes/bin, `env` is its only argument and the quoted substitution is
+the whole operand. The substitution body is still walked as an executed
+command. A command text that defines the name as a function or alias, or
+assigns HOME or PATH, keeps the refusal.
+
+Known limit: the deny check reads the text of the command or file being
+scanned, not its callers; a PATH changed by an earlier, separate command is
+trusted as it is for any other bare tool name.
+
+Proof: tests/cron/test_lifecycle_guard_computed_program.py. Real bash runs the
+fake restart for a shadowing function, a PATH-shadowed tool, a second
+statement in the substitution and a relative tool path, and the scan refuses
+each. The file's fixture also fails any test whose verdict came from the
+walker's failure fallback.
+---
+ cron/lifecycle_guard_substitution_output.py   | 15 +++++
+ .../test_lifecycle_guard_computed_program.py  | 65 +++++++++++++++++++
+ 2 files changed, 80 insertions(+)
+
+diff --git a/cron/lifecycle_guard_substitution_output.py b/cron/lifecycle_guard_substitution_output.py
+index c8780e4c44f2162f2b11afac8b2f53412d3a21a9..0cca6c47068707cbf59a44f3178a48b8f8c137c9 100644
+--- a/cron/lifecycle_guard_substitution_output.py
++++ b/cron/lifecycle_guard_substitution_output.py
+@@ -12,6 +12,17 @@ from cron.lifecycle_guard_substitutions import separate_substitutions
+ from cron.lifecycle_guard_variables import _ASSIGNMENT, _DECLARATIONS
+ 
+ _OUTPUT = '\x00command-output'
++# `eval "$(hermes-core-wt env)"` is the fleet's way to put a core worktree's
++# tools on PATH; the tool prints one `export PATH=...` line. The name is trusted
++# like the word `python3`: bare or under ~/.hermes/bin, sole argument `env`,
++# the whole quoted eval operand. A command that defines the name or assigns
++# HOME/PATH keeps the refusal.
++_PATH_EXPORT = re.compile(
++    r'(?<![\w$\\.-])eval[ \t]+"\$\((?:(?:~|\$HOME|\$\{HOME\}|/home/[\w.-]+|/Users/[\w.-]+)'
++    r'/\.hermes/bin/)?hermes-core-wt env\)"(?=[ \t]*(?:[;&|\n>)]|[0-9]?>|$))')
++_PATH_EXPORT_DENY = re.compile(
++    r'hermes-core-wt\s*\(|function\s+hermes-core-wt|alias\b[^;\n]*hermes-core-wt='
++    r'|(?<![\w])(?:HOME|PATH)\+?=')
+ _VARIABLE_REFERENCE = re.compile(r'\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})')
+ 
+ 
+@@ -491,6 +502,10 @@ def computed_shell_input(command: str, alias_names: frozenset[str], *,
+     from cron.lifecycle_guard_lines import strip_shell_comments
+     from cron.lifecycle_guard_substitutions import normalize_ansi_c_quotes
+ 
++    if not _PATH_EXPORT_DENY.search(command):
++        # Same text the empty-output reading produces; the body is still walked
++        # as an executed command by the substitution scan.
++        command = _PATH_EXPORT.sub('eval ""', command)
+     outer, _ = separate_substitutions(command, output_placeholder=_OUTPUT)
+     if _OUTPUT not in outer:
+         return False, None
+diff --git a/tests/cron/test_lifecycle_guard_computed_program.py b/tests/cron/test_lifecycle_guard_computed_program.py
+index 4a4c6720f78c177ae27fb62e31f963230b1eb0e9..4d999601a1e3f30f7e309e9c9b3279f6ad822f2d 100644
+--- a/tests/cron/test_lifecycle_guard_computed_program.py
++++ b/tests/cron/test_lifecycle_guard_computed_program.py
+@@ -58,13 +58,78 @@ CLEAN = [
+ ]
+ 
+ 
++@pytest.fixture(autouse=True)
++def _private_home_and_complete_walk(tmp_path, monkeypatch, caplog):
++    """Resolve `~` and PATH inside the test tree, and reject a verdict that
++    comes from the walker's failure fallback instead of from the scan."""
++    monkeypatch.setenv('HOME', str(tmp_path))
++    monkeypatch.setenv('PATH', f"{tmp_path / 'bin'}:/usr/bin:/bin")
++    yield
++    assert 'walk failed' not in caplog.text
++
++
+ def _siblings(tmp_path):
+     fixtures._tree(tmp_path)
+     (tmp_path / 'r.sh').chmod(0o755)
+     (tmp_path / 'lib.sh').write_text('FOO=1\n')
++    home_bin = tmp_path / '.hermes' / 'bin'
++    home_bin.mkdir(parents=True)
++    (home_bin / 'hermes-core-wt').write_text('#!/bin/sh\necho "export CORE_WT=1"\n')
++    (home_bin / 'hermes-core-wt').chmod(0o755)
+     (tmp_path / 'sub').mkdir()
+     (tmp_path / 'sub' / 'lib2.sh').write_text('BAR=2\n')
+     (tmp_path / 'sub' / 'calls.sh').write_text(f'bash {tmp_path}/r.sh\n')
++    # Stand-ins for the fleet tool: the honest one prints an export line.
++    for directory, body in (('bin', 'echo "export CORE_WT=1"'), ('evil', f'cat {tmp_path}/r.sh')):
++        (tmp_path / directory).mkdir(exist_ok=True)
++        tool = tmp_path / directory / 'hermes-core-wt'
++        tool.write_text(f'#!/bin/sh\n{body}\n')
++        tool.chmod(0o755)
++
++
++@pytest.mark.parametrize('command', [
++    'eval "$(hermes-core-wt env)"',
++    'cd . && eval "$(hermes-core-wt env)" >/dev/null 2>&1; echo ok | tail -1',
++    'export A="b c" D=e; eval "$(hermes-core-wt env)"; echo ok && echo ok',
++])
++def test_core_worktree_path_export_is_allowed(tmp_path, command):
++    _siblings(tmp_path)
++    assert not fixtures._bash_runs(tmp_path, command)
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
++    home = command.replace('hermes-core-wt env', '~/.hermes/bin/hermes-core-wt env')
++    assert scan_gateway_lifecycle(home, cwd=str(tmp_path)) == (False, None)
++
++
++@pytest.mark.parametrize('command', [
++    'hermes-core-wt() { cat ./r.sh; }; eval "$(hermes-core-wt env)"',
++    'function hermes-core-wt { cat ./r.sh; }; eval "$(hermes-core-wt env)"',
++    'PATH="$PWD/evil:$PATH"; eval "$(hermes-core-wt env)"',
++    'export PATH="$PWD/evil:$PATH"; eval "$(hermes-core-wt env)"',
++    'eval "$(hermes-core-wt env; cat ./r.sh)"',
++    'eval "$(evil/hermes-core-wt env)"',
++    'eval "$(./evil/hermes-core-wt env)"',
++    'eval "$(cat ./r.sh)"',
++])
++def test_path_export_trust_does_not_cover_other_eval_input(tmp_path, command):
++    _siblings(tmp_path)
++    assert fixtures._bash_runs(tmp_path, command), 'bash must run the restart, or the row proves nothing'
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path))[0]
++
++
++@pytest.mark.parametrize('command', [
++    'eval "$(hermes-core-wt env --json)"',
++    'eval "$(hermes-core-wt env)" "$(cat ./r.sh)"',
++    'eval "$(hermes-core-wt env)" > /dev/null "$(cat ./r.sh)"',
++    'eval $(hermes-core-wt env)',
++    'eval "$(hermes-core-wt  env)"',
++    'HOME=/tmp/x; eval "$(~/.hermes/bin/hermes-core-wt env)"',
++    'eval "$(/tmp/.hermes/bin/hermes-core-wt env)"',
++    'noteval "$(hermes-core-wt env)"; bash -c "$(hermes-core-wt env)"',
++])
++def test_path_export_trust_is_exact(tmp_path, command):
++    _siblings(tmp_path)
++    unsafe, reason = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert unsafe and reason and REASON in reason, (unsafe, reason)
+ 
+ 
+ @pytest.mark.parametrize('command', RUN)
+-- 
+2.43.0
+

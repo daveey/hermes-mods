@@ -1,0 +1,453 @@
+From e74c78c3cf25e6579e110be35e2436e105216090 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 06:17:16 +0000
+Subject: [PATCH] perf(picker): resolve the Codex login and provider-profile
+ ids once per model.options pass [daveey]
+
+Why: hub P1 (serve 1757203, c45c7f92) puts model.options at ~105-120 ms/call, .37% of the
+rpc/ row (.51% on the run17 heavy serve). Stage timing on the hub (thread CPU, real home):
+_apply_capabilities 36 ms; inside it daybreak_offered re-resolved the stored Codex login
+(19 x 0.6 ms = 11 ms) and get_model_capabilities/models_dev_id_for re-listed provider profiles
+(~430 list_providers() per pass).
+
+What: agent/pass_memo.PassMemo, a ContextVar memo that lives for one pass only (closed on exit,
+so copy_context() workers cannot read or fill it afterwards; exceptions release it).
+build_models_payload opens it for the models.dev profile-id map; _apply_capabilities opens it
+for the stored-login token. Nothing survives the pass: a login/refresh/disable, registry
+change, plugin install or home switch is visible on the next call. Explicit tokens bypass it.
+A registry-keyed cross-pass memo was built first and rejected in design review: registry
+restores that bypass register_provider and the generation-before-publish window can serve
+stale answers.
+
+Proof: tests/agent/test_picker_pass_costs.py 15 tests, 11 RED on the base (5 stored-login
+reads vs 1). 127 consumer files, 2111 passed. Hub A/B, 4 alternating fresh processes, thread
+CPU: base min 81.5 / p50 83-92 ms -> new min 65.5 / p50 66-69 ms. model.options payload is
+byte-identical (sort_keys JSON diff of back-to-back base vs new dumps = 0 lines).
+---
+ agent/codex_service_tiers.py          |  17 ++
+ agent/models_dev.py                   |  15 +-
+ agent/pass_memo.py                    |  50 ++++++
+ hermes_cli/inventory.py               |  20 +++
+ owned/cache/plugin_hooks.json         |   2 +-
+ tests/agent/test_picker_pass_costs.py | 226 ++++++++++++++++++++++++++
+ 6 files changed, 328 insertions(+), 2 deletions(-)
+ create mode 100644 agent/pass_memo.py
+ create mode 100644 tests/agent/test_picker_pass_costs.py
+
+diff --git a/agent/codex_service_tiers.py b/agent/codex_service_tiers.py
+index 5f40ab9a6e44d2ed11640cf0856d2e35f2ac839c..b4d2dacc7ac4bd4762bc12ff1d40277a98b1c948 100644
+--- a/agent/codex_service_tiers.py
++++ b/agent/codex_service_tiers.py
+@@ -10,6 +10,8 @@ import logging
+ import time
+ from typing import Any
+ 
++from agent.pass_memo import PassMemo
++
+ logger = logging.getLogger(__name__)
+ # Token fingerprints include the origin; token refresh/account changes cannot reuse
+ # an old entitlement. No raw credentials or identities are retained in this cache.
+@@ -87,8 +89,23 @@ def _cyber_programs_for_model(access_token: str, base_url: str, model: str) -> f
+     return None if cached is None else cached[2].get(metadata.strip_codex_context_variant_suffix(model))
+ 
+ 
++# A model-picker pass asks ``daybreak_offered``/``ultrafast_offered`` once per Codex model, and each
++# ask re-read the credential store and JWT for the same answer. Inside ``account_token_scope()`` the
++# stored-login lookup resolves once; the memo is dropped on exit, so the next request reads the
++# store again (a login, refresh, disable or logout shows on the next pass; nothing is kept by clock).
++_ACCOUNT_TOKEN_MEMO = PassMemo("codex_account_token")
++account_token_scope = _ACCOUNT_TOKEN_MEMO.scope
++
++
+ def _account_catalog_token(access_token: Any) -> str | None:
+     """The ChatGPT OAuth JWT that reads this account's Codex catalog, or None."""
++    if access_token is not None:  # an explicit token is never memoized
++        return _resolve_account_catalog_token(access_token)
++    return _ACCOUNT_TOKEN_MEMO.get("stored", lambda: _resolve_account_catalog_token(None))
++
++
++def _resolve_account_catalog_token(access_token: Any) -> str | None:
++    """Uncached form of :func:`_account_catalog_token`."""
+     from hermes_cli.auth_constants import AuthError, _decode_jwt_claims
+     # Only a ChatGPT OAuth JWT reads this catalog; a caller's pre-init key (an OpenAI API key on a
+     # profile that also has one) is not this account's credential, so use the stored Codex login.
+diff --git a/agent/models_dev.py b/agent/models_dev.py
+index eb9f87b94df3fa8d3f4b7b7fe0c2a6bfae9b8732..0b9ba2ea4cb8e2c0202ea3b04d14349d37650747 100644
+--- a/agent/models_dev.py
++++ b/agent/models_dev.py
+@@ -20,6 +20,8 @@ from typing import Any, Dict, List, Optional, Tuple
+ 
+ from utils import atomic_json_write, atomic_write_text
+ 
++from agent.pass_memo import PassMemo
++
+ from hermes_constants import openrouter_variant_base
+ 
+ import requests
+@@ -152,9 +154,20 @@ PROVIDER_TO_MODELS_DEV: dict[str, str] = {
+ _MODELS_DEV_TO_PROVIDER: Optional[dict[str, list[str]]] = None
+ 
+ 
++# A picker pass asks for the profile id map ~430 times (every capability probe). Inside
++# ``profile_ids_scope()`` it is read once; the memo is dropped on exit, so the next pass sees any
++# registration, plugin install or home change (no cross-pass cache to invalidate).
++_PROFILE_IDS_MEMO = PassMemo("models_dev_profile_ids")
++profile_ids_scope = _PROFILE_IDS_MEMO.scope
++
++
+ def _profile_models_dev_ids() -> dict[str, str]:
+     """``{name: models_dev_id}`` declared by registered provider profiles the static map lacks.
+-    Read at lookup time (never merged into ``PROVIDER_TO_MODELS_DEV``)."""
++    Read at lookup time (never merged into ``PROVIDER_TO_MODELS_DEV``). Callers get a fresh dict."""
++    return dict(_PROFILE_IDS_MEMO.get("ids", _read_profile_models_dev_ids))
++
++
++def _read_profile_models_dev_ids() -> dict[str, str]:
+     from providers import list_providers
+     return {p.name: p.models_dev_id for p in list_providers()
+             if p.models_dev_id and p.name not in PROVIDER_TO_MODELS_DEV}
+diff --git a/agent/pass_memo.py b/agent/pass_memo.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..047ee359ee5b81ea64c54f9bde4db2de5cbfeabe
+--- /dev/null
++++ b/agent/pass_memo.py
+@@ -0,0 +1,50 @@
++"""Memos that live for one request/pass only.
++
++A picker pass repeats the same lookup hundreds of times (the stored Codex login per model, the
++provider-profile id map per capability probe). Caching those across passes would need every input
++named (files, env, registry mutations that bypass registration); a memo scoped to one pass needs
++none: the next pass starts empty, so any change is seen on the next call, and no clock is involved.
++"""
++from __future__ import annotations
++
++import contextlib
++import contextvars
++from typing import Any, Callable, Iterator
++
++
++class PassMemo:
++    """``with memo.scope(): ... memo.get(key, compute)`` computes once per key inside the scope.
++
++    Outside a scope, ``get`` just computes. A scope that has exited is closed for good, so a context
++    copied inside it (``copy_context()`` workers outliving the pass) never reads or fills it.
++    """
++
++    def __init__(self, name: str) -> None:
++        self._var: contextvars.ContextVar[dict | None] = contextvars.ContextVar(name, default=None)
++
++    @contextlib.contextmanager
++    def scope(self) -> Iterator[None]:
++        outer = self._var.get()
++        if outer is not None and outer["open"]:  # nested: share the outer pass
++            yield
++            return
++        state: dict[str, Any] = {"open": True, "values": {}}
++        token = self._var.set(state)
++        try:
++            yield
++        finally:
++            state["open"] = False
++            state["values"].clear()
++            self._var.reset(token)
++
++    def get(self, key: Any, compute: Callable[[], Any]) -> Any:
++        state = self._var.get()
++        if state is None or not state["open"]:
++            return compute()
++        values = state["values"]
++        try:
++            return values[key]
++        except KeyError:
++            pass
++        value = values[key] = compute()
++        return value
+diff --git a/hermes_cli/inventory.py b/hermes_cli/inventory.py
+index 34554cf544391d2f3cd4e2dbd41341b780d03538..4c85fd85752bf8a703b9a7e96e9b190cdf8d9952 100644
+--- a/hermes_cli/inventory.py
++++ b/hermes_cli/inventory.py
+@@ -3,6 +3,7 @@
+ 
+ from __future__ import annotations
+ 
++import functools
+ import logging
+ from contextvars import copy_context
+ from dataclasses import dataclass, replace
+@@ -73,6 +74,18 @@ def _without_slug(rows: list[dict], slug: str) -> list[dict]:
+ # ─── Public: payload builder ────────────────────────────────────────────
+ 
+ 
++def _in_profile_ids_pass(fn):
++    """Run *fn* inside one models.dev profile-id pass: the map is read once per payload, not per probe."""
++    @functools.wraps(fn)
++    def wrapper(*args, **kwargs):
++        from agent.models_dev import profile_ids_scope
++
++        with profile_ids_scope():
++            return fn(*args, **kwargs)
++    return wrapper
++
++
++@_in_profile_ids_pass
+ def build_models_payload(
+     ctx: ConfigContext, *, explicit_only: bool = False, include_unconfigured: bool = False,
+     picker_hints: bool = False, canonical_order: bool = False, pricing: bool = False,
+@@ -599,6 +612,13 @@ def _reasoning_catalog_reader(slug: str):
+ 
+ 
+ def _apply_capabilities(rows: list[dict], *, metadata_config: dict | None = None) -> None:
++    from agent.codex_service_tiers import account_token_scope
++
++    with account_token_scope():  # one stored-login read per pass, not one per Codex model
++        _apply_capabilities_rows(rows, metadata_config=metadata_config)
++
++
++def _apply_capabilities_rows(rows: list[dict], *, metadata_config: dict | None = None) -> None:
+     """Attach ``{model: {fast, reasoning, ...}}`` per row. ``reasoning`` defaults True when the catalog is
+     silent (the dial is a no-op on models that ignore it; hiding it from a capable model is worse). A
+     serving aggregator's detail overrides models.dev (adds ``can_disable_reasoning``). ``supported_efforts``
+diff --git a/owned/cache/plugin_hooks.json b/owned/cache/plugin_hooks.json
+index e82ab198ae1b1fd2ff2df276a615cf56da5afde1..9463a3f16985cb9738c2a6ac6d08536cb4c7f85c 100644
+--- a/owned/cache/plugin_hooks.json
++++ b/owned/cache/plugin_hooks.json
+@@ -1 +1 @@
+-{"version": 1, "fingerprint": "e40844399b9022b253155d5996eed6145372cb401554c1860c73856fda98d0e6", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
++{"version": 1, "fingerprint": "996f20bf0ea902783a1c8683b4d731a42caa4b01f5dcb2117b36264e5c201c9e", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
+diff --git a/tests/agent/test_picker_pass_costs.py b/tests/agent/test_picker_pass_costs.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..50323406f1c0f95388f5114d402ac92bf924b94c
+--- /dev/null
++++ b/tests/agent/test_picker_pass_costs.py
+@@ -0,0 +1,226 @@
++"""Model-picker pass costs: repeated lookups inside one ``model.options`` pass resolve once, and
++every input change shows on the next pass (no clock, no cross-pass staleness)."""
++import contextvars
++import threading
++
++import providers
++from agent import codex_service_tiers as tiers
++from agent import models_dev
++from agent.pass_memo import PassMemo
++from providers.base import ProviderProfile
++
++CODEX_ROW = {"slug": "openai-codex", "models": ["gpt-a", "gpt-b", "gpt-c", "gpt-d", "gpt-e"],
++             "api_url": "https://chatgpt.com/backend-api/codex"}
++
++
++def _count_stored_logins(monkeypatch, login):
++    from hermes_cli import auth_codex
++
++    calls = []
++
++    def resolve(**kw):
++        calls.append(kw)
++        return {"api_key": login[0]}
++
++    monkeypatch.setattr(auth_codex, "resolve_codex_runtime_credentials", resolve)
++    monkeypatch.setattr(tiers, "_cyber_programs_for_model", lambda *a, **k: None)
++    monkeypatch.setattr("agent.credential_pool_disabled.token_disabled", lambda *a, **k: False)
++    monkeypatch.setattr("hermes_cli.auth_constants._decode_jwt_claims", lambda t: {"ok": 1})
++    return calls
++
++
++def _capabilities(rows):
++    from hermes_cli.inventory import _apply_capabilities
++
++    _apply_capabilities(rows, metadata_config={})
++
++
++def test_capabilities_pass_reads_the_stored_codex_login_once(monkeypatch):
++    calls = _count_stored_logins(monkeypatch, ["tok-1"])
++    _capabilities([dict(CODEX_ROW, models=list(CODEX_ROW["models"]))])
++    assert len(calls) == 1, f"one stored-login read per pass, got {len(calls)}"
++
++
++def test_next_pass_sees_a_changed_login(monkeypatch):
++    login = ["tok-1"]
++    seen = []
++    calls = _count_stored_logins(monkeypatch, login)
++    monkeypatch.setattr(tiers, "_cyber_programs_for_model",
++                        lambda token, base, model: seen.append(token) or None)
++    _capabilities([dict(CODEX_ROW, models=["gpt-a"])])
++    login[0] = "tok-2"  # refresh / re-login between passes
++    _capabilities([dict(CODEX_ROW, models=["gpt-a"])])
++    assert seen == ["tok-1", "tok-2"] and len(calls) == 2
++
++
++def test_scope_does_not_outlive_the_pass(monkeypatch):
++    login = ["tok-1"]
++    calls = _count_stored_logins(monkeypatch, login)
++    with tiers.account_token_scope():
++        assert tiers._account_catalog_token(None) == "tok-1"
++        login[0] = "tok-2"  # inside the pass the memo answers
++        assert tiers._account_catalog_token(None) == "tok-1"
++    assert tiers._account_catalog_token(None) == "tok-2"
++    assert len(calls) == 2
++
++
++def test_explicit_token_bypasses_the_scope(monkeypatch):
++    _count_stored_logins(monkeypatch, ["stored"])
++    with tiers.account_token_scope():
++        assert tiers._account_catalog_token(None) == "stored"
++        assert tiers._account_catalog_token("passed") == "passed"
++
++
++def test_a_missing_login_is_also_resolved_once_per_pass(monkeypatch):
++    from hermes_cli import auth_codex
++    from hermes_cli.auth_constants import AuthError
++
++    calls = []
++
++    def resolve(**kw):
++        calls.append(1)
++        raise AuthError("no login", provider="openai-codex")
++
++    monkeypatch.setattr(auth_codex, "resolve_codex_runtime_credentials", resolve)
++    with tiers.account_token_scope():
++        assert [tiers._account_catalog_token(None) for _ in range(4)] == [None] * 4
++    assert len(calls) == 1
++
++
++def test_a_concurrent_request_does_not_inherit_this_pass(monkeypatch):
++    login = ["tok-1"]
++    _count_stored_logins(monkeypatch, login)
++    other = []
++    with tiers.account_token_scope():
++        assert tiers._account_catalog_token(None) == "tok-1"
++        login[0] = "tok-2"
++        t = threading.Thread(target=lambda: other.append(tiers._account_catalog_token(None)))
++        t.start()
++        t.join(5)
++    assert other == ["tok-2"]
++
++
++def test_a_copied_context_cannot_use_a_closed_token_pass(monkeypatch):
++    login = ["tok-1"]
++    _count_stored_logins(monkeypatch, login)
++    with tiers.account_token_scope():
++        assert tiers._account_catalog_token(None) == "tok-1"
++        ctx = contextvars.copy_context()
++    login[0] = "tok-2"
++    assert ctx.run(tiers._account_catalog_token, None) == "tok-2"
++
++
++# ── models.dev profile ids ────────────────────────────────────────────────
++
++
++def _isolated_registry(monkeypatch):
++    monkeypatch.setattr(providers, "_REGISTRY", {})
++    monkeypatch.setattr(providers, "_ALIASES", {})
++    monkeypatch.setattr(providers, "_PROVIDER_LIST_CACHE", None)
++    monkeypatch.setattr(providers, "_SOURCES", {})
++    monkeypatch.setattr(providers, "_discovered", True)
++
++
++def test_profile_ids_are_read_once_per_pass(monkeypatch):
++    _isolated_registry(monkeypatch)
++    providers.register_provider(ProviderProfile(name="fx-one", models_dev_id="fx-one-dev"))
++    real = providers.list_providers
++    calls = []
++    monkeypatch.setattr(providers, "list_providers", lambda: calls.append(1) or real())
++    with models_dev.profile_ids_scope():
++        for _ in range(50):
++            assert models_dev.models_dev_id_for("fx-one") == "fx-one-dev"
++    assert len(calls) == 1
++
++
++def test_outside_a_pass_every_lookup_reads_the_registry(monkeypatch):
++    _isolated_registry(monkeypatch)
++    providers.register_provider(ProviderProfile(name="fx-one", models_dev_id="fx-one-dev"))
++    real = providers.list_providers
++    calls = []
++    monkeypatch.setattr(providers, "list_providers", lambda: calls.append(1) or real())
++    for _ in range(3):
++        models_dev.models_dev_id_for("fx-one")
++    assert len(calls) == 3
++
++
++def test_every_registry_change_is_visible_on_the_next_pass(monkeypatch):
++    _isolated_registry(monkeypatch)
++    prof = ProviderProfile(name="fx-one", models_dev_id="fx-one-dev")
++    providers.register_provider(prof)
++
++    def one_pass(name):
++        with models_dev.profile_ids_scope():
++            return models_dev.models_dev_id_for(name)
++
++    assert one_pass("fx-two") is None
++    providers.register_provider(ProviderProfile(name="fx-two", models_dev_id="fx-two-dev"))
++    assert one_pass("fx-two") == "fx-two-dev"
++    providers.register_provider(ProviderProfile(name="fx-two", models_dev_id="fx-two-dev-v2"))
++    assert one_pass("fx-two") == "fx-two-dev-v2"
++    # Changes that bypass register_provider (registry restore + list-cache reset) also show.
++    providers._REGISTRY.pop("fx-two")
++    providers._PROVIDER_LIST_CACHE = None
++    assert one_pass("fx-two") is None
++    object.__setattr__(prof, "models_dev_id", "mutated")
++    assert one_pass("fx-one") == "mutated"
++
++
++def test_callers_cannot_poison_the_pass_memo(monkeypatch):
++    _isolated_registry(monkeypatch)
++    providers.register_provider(ProviderProfile(name="fx-one", models_dev_id="fx-one-dev"))
++    with models_dev.profile_ids_scope():
++        models_dev._profile_models_dev_ids()["fx-one"] = "poison"
++        models_dev.models_dev_provider_map()["fx-one"] = "poison"
++        assert models_dev.models_dev_id_for("fx-one") == "fx-one-dev"
++
++
++def test_a_copied_context_cannot_use_a_closed_profile_pass(monkeypatch):
++    """Warm-up workers started inside a pass run in copy_context() and may outlive it."""
++    _isolated_registry(monkeypatch)
++    providers.register_provider(ProviderProfile(name="fx-one", models_dev_id="fx-one-dev"))
++    with models_dev.profile_ids_scope():
++        assert models_dev.models_dev_id_for("fx-one") == "fx-one-dev"
++        ctx = contextvars.copy_context()
++    providers.register_provider(ProviderProfile(name="fx-one", models_dev_id="fx-one-dev-v2"))
++    assert ctx.run(models_dev.models_dev_id_for, "fx-one") == "fx-one-dev-v2"
++
++
++def test_pass_scope_is_released_when_the_pass_raises():
++    memo = PassMemo("fx")
++    try:
++        with memo.scope():
++            assert memo.get("k", lambda: 1) == 1
++            raise RuntimeError("boom")
++    except RuntimeError:
++        pass
++    assert memo.get("k", lambda: 2) == 2  # nothing leaked past the failed pass
++
++
++def test_nested_scopes_share_the_outer_pass():
++    memo = PassMemo("fx")
++    n = []
++    with memo.scope():
++        memo.get("k", lambda: n.append(1) or 1)
++        with memo.scope():
++            memo.get("k", lambda: n.append(1) or 1)
++        memo.get("k", lambda: n.append(1) or 1)
++    assert n == [1]
++
++
++def test_build_models_payload_is_the_pass_boundary(monkeypatch):
++    import hermes_cli.inventory as inv
++    import hermes_cli.model_switch as ms
++
++    seen = []
++
++    def fake_list(**kw):
++        seen.append(models_dev._PROFILE_IDS_MEMO._var.get() is not None)
++        return []
++
++    monkeypatch.setattr(ms, "list_authenticated_providers", fake_list)
++    monkeypatch.setattr(inv, "_local_runtime_row", lambda ctx: None)
++    monkeypatch.setattr(inv, "_moa_provider_row", lambda p: None)
++    inv.build_models_payload(inv.ConfigContext("", "", "", {}, []))
++    assert seen == [True]
++    assert models_dev._PROFILE_IDS_MEMO._var.get() is None
+-- 
+2.43.0
+

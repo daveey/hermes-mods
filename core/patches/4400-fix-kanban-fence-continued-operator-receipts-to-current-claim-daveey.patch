@@ -1,0 +1,784 @@
+From 04939553da9a3ddb11da4db707ee48a828888c88 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 05:06:34 +0000
+Subject: [PATCH] fix(kanban): fence continued operator receipts to current
+ claim [daveey]
+
+Consolidate the two receipt-continuation implementations on PR3216. Delivery
+belongs to the original authenticated task/request; completion belongs to the
+current admitted claim. Freeze the current run and complete request for the
+transactional recheck. Carried events locate canonical Board evidence, never
+authorize it. Preserve local failed/pending refusal and require proofs for
+carried operator history even when the target exists locally after migration.
+
+Preserve the original 13 historical-run cases alongside 45 completion-tool,
+real pickup/remapped-ID, canonical identity and race controls. A missing ledger
+alone is recoverable on the same host; the missing-request negative now removes
+both carried locators too. No request rewriting, duplicate posts or DB repairs.
+
+Proof: consolidated canonical runner 58 passed, zero failures. Previous full
+Kanban run at identical production source: 877 files, 16046 passed, 24 platform
+skips. Read-only replay of 22 actual databases: 354 old/new receipt evaluations,
+zero as-is acceptance changes; separately labeled in-memory successor scenario
+accepted 315/317 canonical-shaped historical proofs and rejected two originless
+events. Nine stored claim-bearing results had zero history-gate changes. Replay
+is captured-row evidence, not live canonical authentication or deployment.
+---
+ hermes_cli/kanban_completion_receipt.py       |   9 +-
+ hermes_cli/kanban_operator_delivery.py        |  46 ++-
+ .../kanban_operator_delivery_custody.py       |  78 ++++
+ hermes_cli/kanban_operator_delivery_moved.py  |  36 --
+ ...t_kanban_operator_delivery_continuation.py | 376 +++++++++++++++---
+ ...test_kanban_operator_delivery_prior_run.py |  93 +++++
+ 6 files changed, 518 insertions(+), 120 deletions(-)
+ create mode 100644 hermes_cli/kanban_operator_delivery_custody.py
+ delete mode 100644 hermes_cli/kanban_operator_delivery_moved.py
+ create mode 100644 tests/hermes_cli/test_kanban_operator_delivery_prior_run.py
+
+diff --git a/hermes_cli/kanban_completion_receipt.py b/hermes_cli/kanban_completion_receipt.py
+index 24d1aaf50b8fd18f96c29e04b0654a2fc0f4971b..ec1b347c6d5be8fea51b2eb21fe8a84781617107 100644
+--- a/hermes_cli/kanban_completion_receipt.py
++++ b/hermes_cli/kanban_completion_receipt.py
+@@ -113,8 +113,8 @@ def prepare(conn, task_id, metadata, *, summary=None):
+             if proof:
+                 if item["disposition"] != "delivered":
+                     raise ValueError("completion_receipt: operator delivery requires delivered disposition")
+-                verify(conn, task_id, proof)
+-                checks.append((proof, "operator_delivery"))
++                admitted = verify(conn, task_id, proof)
++                checks.append(((proof, admitted), "operator_delivery"))
+                 proved.add(proof["target_task_id"])
+     if claims - proved:
+         raise ValueError(_unproved(claims - proved))
+@@ -190,7 +190,10 @@ def recheck(conn, task_id, owners):
+     for ref, local in owners:
+         if local == "operator_delivery":
+             from hermes_cli.kanban_operator_delivery import verify_local
+-            verify_local(conn, task_id, ref)
++            proof, (run, row, request) = ref
++            checked_row, checked_request = verify_local(conn, task_id, proof, admitted_run=run)
++            if dict(checked_row) != row or checked_request != request:
++                raise ValueError("completion_receipt: operator request changed during admission")
+         elif local:
+             _check_local(conn, task_id, ref)
+         else:
+diff --git a/hermes_cli/kanban_operator_delivery.py b/hermes_cli/kanban_operator_delivery.py
+index bb8413d65d104fae6807a5acaac5ce2778eaa94c..07baee1de9374fea3ac1a1936357ed6bc58d5c06 100644
+--- a/hermes_cli/kanban_operator_delivery.py
++++ b/hermes_cli/kanban_operator_delivery.py
+@@ -112,6 +112,14 @@ def gated_claims(conn, task_id, text):
+             requested.update(op.get("task_id") for op in ops if isinstance(op, dict)
+                              and op.get("op") == "operator" and op.get("action") == "comment")
+     rest = claims - requested
++    if rest:
++        # Migrated callers carry portable request history, not executor-local
++        # ledgers. Such history can require proof but never authenticate it.
++        from hermes_cli.kanban_operator_delivery_custody import requested_targets
++        requested.update(requested_targets(conn, task_id))
++        with calls._replica(conn) as rep:
++            requested.update(requested_targets(rep, task_id))
++    rest = claims - requested
+     if rest:
+         own = calls._own_gateway(conn)
+         with calls._replica(conn) as rep:
+@@ -136,31 +144,32 @@ def _own_synced_comment(rep, target, own, task_id):
+         return False
+ 
+ 
+-def verify_local(conn, task_id, proof):
+-    """Recheck the requesting task/run, which may precede this continuation."""
++def verify_local(conn, task_id, proof, *, admitted_run=None):
++    """Recheck task custody, retaining the original request's caller/run identity."""
+     from hermes_cli import kanban_operator_call as calls
++    from hermes_cli.kanban_operator_delivery_custody import carried_request, current_run
++    run = current_run(conn, task_id)
++    if admitted_run is not None and run != admitted_run:
++        raise ValueError("completion_receipt: operator current run changed during admission")
+     row = (conn.execute("SELECT * FROM operator_calls WHERE request_uid=? AND side='request'",
+                         (proof["request_uid"],)).fetchone() if calls._has_log(conn) else None)
+-    if row is None and calls._own_gateway(conn) not in (None, proof["caller_gateway"]):
+-        from hermes_cli.kanban_operator_delivery_moved import moved_request
+-        return moved_request(conn, task_id, proof)
+-    run = conn.execute("SELECT uid FROM task_runs WHERE task_id=? AND uid=?",
+-                       (task_id, proof["caller_run_uid"])).fetchone()
+-    if row is None or row["outcome"] != "done":
++    if row is not None and row["outcome"] != "done":
+         raise ValueError("completion_receipt: operator request is pending, failed or missing")
+-    if (row["caller_task_id"] != task_id or proof["caller_task_id"] != task_id or run is None
+-            or row["caller_run_uid"] != run[0] or proof["caller_run_uid"] != run[0]):
++    if row is None:
++        row, request = carried_request(conn, task_id, proof)
++    else:
++        event = conn.execute("SELECT payload FROM task_events WHERE uid=? AND task_id=? AND kind=?",
++                             (row["request_event_uid"], task_id, calls.REQUEST_KIND)).fetchone()
++        if event is None:
++            raise ValueError("completion_receipt: request event missing")
++        request = json.loads(event[0])
++    if (row["caller_task_id"] != task_id or proof["caller_task_id"] != task_id
++            or row["caller_run_uid"] != proof["caller_run_uid"]):
+         raise ValueError("completion_receipt: operator caller/run mismatch")
+-    from hermes_cli import kanban_operator_call as calls
+     if (row["action"] != "comment" or row["target_task_id"] != proof["target_task_id"]
+             or row["board"] != proof["board"] or calls._board_slug(conn) != proof["board"]
+             or row["caller_gateway"] != proof["caller_gateway"]):
+         raise ValueError("completion_receipt: operator target/board/actor mismatch")
+-    event = conn.execute("SELECT payload FROM task_events WHERE uid=? AND task_id=? AND kind=?",
+-                         (row["request_event_uid"], task_id, calls.REQUEST_KIND)).fetchone()
+-    if event is None:
+-        raise ValueError("completion_receipt: request event missing")
+-    request = json.loads(event[0])
+     _bind_request(request, row, proof)
+     return row, request
+ 
+@@ -206,7 +215,9 @@ def canonical_payload(evidence, uid, task, kind, gateway):
+ 
+ def verify(conn, task_id, proof):
+     from hermes_cli import kanban_operator_call as calls
+-    row, local_request = verify_local(conn, task_id, proof)
++    from hermes_cli.kanban_operator_delivery_custody import current_run
++    run = current_run(conn, task_id)
++    row, local_request = verify_local(conn, task_id, proof, admitted_run=run)
+     request = _canonical_event(proof["board"], row["request_event_uid"], task_id,
+                                calls.REQUEST_KIND, row["caller_gateway"])
+     if request != local_request:
+@@ -227,6 +238,7 @@ def verify(conn, task_id, proof):
+     expected = {**(result.get("operator_delivery") or {}), "result_event_uid": proof["result_event_uid"]}
+     if expected != proof:
+         raise ValueError("completion_receipt: exact operator result/digest mismatch")
++    return run, dict(row), local_request
+ 
+ 
+ def applied_proof(conn, payload, own):
+diff --git a/hermes_cli/kanban_operator_delivery_custody.py b/hermes_cli/kanban_operator_delivery_custody.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7e0213b705ce1d6374926072cf7886b460fbdbe9
+--- /dev/null
++++ b/hermes_cli/kanban_operator_delivery_custody.py
+@@ -0,0 +1,78 @@
++"""Task-bound discovery for an operator receipt after a worker continuation.
++
++Carried events are locators, not authority. The delivery verifier authenticates
++both complete payloads against the Board before admitting a receipt. No request
++is recreated and the original caller identity is never rewritten.
++"""
++from __future__ import annotations
++
++import json
++
++
++def current_run(conn, task_id):
++    row = conn.execute(
++        "SELECT r.uid FROM task_runs r JOIN tasks t ON t.current_run_id=r.id "
++        "AND r.task_id=t.id WHERE t.id=? AND r.status='running' AND r.ended_at IS NULL",
++        (task_id,)).fetchone()
++    if row is None or not row[0]:
++        raise ValueError("completion_receipt: operator current task/run unavailable")
++    return row[0]
++
++
++def request_events(conn, task_id, request_uid):
++    from hermes_cli import kanban_operator_call as calls
++    found = {}
++    if conn is None:
++        return found
++    for event in conn.execute(
++            "SELECT uid, payload FROM task_events WHERE task_id=? AND kind=?",
++            (task_id, calls.REQUEST_KIND)):
++        try:
++            payload = json.loads(event[1])
++        except (TypeError, ValueError):
++            continue
++        if isinstance(payload, dict) and payload.get("request_uid") == request_uid:
++            found[event[0]] = payload
++    return found
++
++
++def requested_targets(conn, task_id):
++    from hermes_cli import kanban_operator_call as calls
++    targets = set()
++    if conn is None:
++        return targets
++    for (raw,) in conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
++                               (task_id, calls.REQUEST_KIND)):
++        try:
++            payload = json.loads(raw)
++        except (TypeError, ValueError):
++            continue
++        if (isinstance(payload, dict) and payload.get("action") == "comment"
++                and isinstance(payload.get("target_task_id"), str)):
++            targets.add(payload["target_task_id"])
++    return targets
++
++
++def carried_request(conn, task_id, proof):
++    """Locate a unique request by portable UID; replica contents prove nothing."""
++    from hermes_cli import kanban_operator_call as calls
++    found = request_events(conn, task_id, proof["request_uid"])
++    with calls._replica(conn) as rep:
++        for uid, payload in request_events(rep, task_id, proof["request_uid"]).items():
++            if uid in found and found[uid] != payload:
++                raise ValueError("completion_receipt: conflicting carried request")
++            found[uid] = payload
++    if len(found) != 1 or not next(iter(found)):
++        raise ValueError("completion_receipt: unique carried request missing")
++    uid, request = next(iter(found.items()))
++    caller, args = request.get("caller"), request.get("args")
++    if not isinstance(caller, dict) or not isinstance(args, dict):
++        raise ValueError("completion_receipt: malformed carried request")
++    # This is only a verifier input, never an inserted operator_calls row.
++    row = {"request_event_uid": uid, "caller_task_id": caller.get("task_id"),
++           "caller_run_uid": caller.get("run_uid"), "caller_gateway": caller.get("gateway"),
++           "action": request.get("action"), "target_task_id": request.get("target_task_id"),
++           "board": request.get("board"),
++           "args_digest": calls._digest({"action": request.get("action"),
++                                         "task_id": request.get("target_task_id"), **args})}
++    return row, request
+diff --git a/hermes_cli/kanban_operator_delivery_moved.py b/hermes_cli/kanban_operator_delivery_moved.py
+deleted file mode 100644
+index 511362008089a2a57ed82c34e591bde6643c185e..0000000000000000000000000000000000000000
+--- a/hermes_cli/kanban_operator_delivery_moved.py
++++ /dev/null
+@@ -1,36 +0,0 @@
+-"""Locate a moved caller's request; the replica is a locator, never authority."""
+-from __future__ import annotations
+-
+-import json
+-
+-
+-def moved_request(conn, task_id, proof):
+-    """Recover only immutable request identity, without writing a replacement log.
+-
+-    Operator ledgers are gateway-local. A destination can locate the original
+-    request in the Board feed; verify() still authenticates both that exact
+-    event and its applied result against the canonical Board before admission.
+-    This function also runs inside the completion transaction: no network I/O.
+-    """
+-    from hermes_cli import kanban_operator_call as calls
+-    from hermes_cli.kanban_operator_delivery import _bind_request
+-
+-    if proof["caller_task_id"] != task_id or calls._board_slug(conn) != proof["board"]:
+-        raise ValueError("completion_receipt: operator caller/board mismatch")
+-    matches = []
+-    with calls._replica(conn) as rep:
+-        if rep is None:
+-            raise ValueError("completion_receipt: original operator request replica unavailable")
+-        for event in rep.execute("SELECT uid, payload FROM task_events WHERE task_id=? AND kind=?",
+-                                 (task_id, calls.REQUEST_KIND)):
+-            request = json.loads(event["payload"])
+-            if isinstance(request, dict) and request.get("request_uid") == proof["request_uid"]:
+-                matches.append((event["uid"], request))
+-    if len(matches) != 1 or not matches[0][0]:
+-        raise ValueError("completion_receipt: original operator request missing or ambiguous")
+-    uid, request = matches[0]
+-    args = request.get("args") or {}
+-    row = {"request_event_uid": uid, "caller_gateway": proof["caller_gateway"],
+-           "args_digest": calls._digest({"action": "comment", "task_id": proof["target_task_id"], **args})}
+-    _bind_request(request, row, proof)
+-    return row, request
+diff --git a/tests/hermes_cli/test_kanban_operator_delivery_continuation.py b/tests/hermes_cli/test_kanban_operator_delivery_continuation.py
+index 43b90b29080ab5a3af330afa984d1bd87b354900..231984b94c57e52bb4785e41dd92d30b20ef7718 100644
+--- a/tests/hermes_cli/test_kanban_operator_delivery_continuation.py
++++ b/tests/hermes_cli/test_kanban_operator_delivery_continuation.py
+@@ -1,88 +1,336 @@
+-"""Delivery belongs to the requesting task, not only its currently running attempt."""
++"""An applied delivery belongs to its task, not to one executor's ledger."""
+ import json
++from contextlib import contextmanager
+ 
+ import pytest
+ 
+ from hermes_cli import kanban_db as kb
+-from tests.hermes_cli.test_kanban_operator_delivery import _delivered, _receipt
++from hermes_cli import kanban_operator_call as calls
++from hermes_cli import kanban_worker_node as worker
++from hermes_cli.kanban_db_connect import connect
++from hermes_cli.kanban_continuation import continue_task
+ from tests.hermes_cli import test_kanban_operator_call as helpers
++from tests.hermes_cli import test_kanban_operator_delivery as delivery
+ 
+ fleet = helpers.fleet
+ 
+ 
+-def _resume(f):
+-    assert kb.schedule_task(f.w, f.caller, expected_run_id=f.run_id,
+-                            reason="Wait for cooldown", clock_only=True,
+-                            awaiting={"kind": "clock", "why": "cooldown"})
+-    assert kb.unblock_task(f.w, f.caller)
+-    assert kb.claim_task(f.w, f.caller)
+-    f.run_id = kb._current_run_id(f.w, f.caller)
+-    f.run_uid(f.w, f.caller)
++def _resume(f, conn):
++    assert continue_task(conn, f.caller, checkpoint="receipt retained")["ok"]
++    assert kb.claim_task(conn, f.caller)
++    f.run_uid(conn, f.caller)
++    return kb.get_task(conn, f.caller).current_run_id
+ 
+ 
+-@pytest.mark.parametrize("moved", [False, True, "no_ledger_table"])
+-def test_prior_run_delivery_completes_after_resume(fleet, moved):
++def _tool(f, conn, monkeypatch, *, run_id=None, task_id=None):
++    from tools import kanban_tools as kt
++    task = kb.get_task(conn, f.caller)
++    for key, value in {"HERMES_KANBAN_TASK": f.caller,
++                       "HERMES_KANBAN_RUN_ID": str(run_id or task.current_run_id),
++                       "HERMES_KANBAN_CLAIM_LOCK": task.claim_lock}.items():
++        monkeypatch.setenv(key, value)
++
++    @contextmanager
++    def board(_name=None):
++        yield kb, conn
++
++    monkeypatch.setattr(kt, "_board", board)
++    return json.loads(kt._handle_complete({"task_id": task_id or f.caller,
++        "summary": f"Posted the findings to {f.target}.", "metadata": delivery._receipt(f.proof)}))
++
++
++@pytest.mark.parametrize("migrate", [False, True])
++def test_complete_tool_accepts_same_task_successor(fleet, tmp_path, monkeypatch, migrate):
+     f = fleet
+-    proof = _delivered(f)
+-    _resume(f)
+-    if moved:
+-        # Destination has task/run history but no source-local operator ledger.
+-        f.gw[id(f.w)] = "worker-9"
+-        with kb.write_txn(f.w):
+-            f.w.execute("DELETE FROM operator_calls")
+-            if moved == "no_ledger_table":
+-                f.w.execute("DROP TABLE operator_calls")
+-    assert kb.complete_task(f.w, f.caller, expected_run_id=f.run_id,
+-                            summary=f"Posted findings to {f.target}.", metadata=_receipt(proof))
+-    assert kb.get_task(f.w, f.caller).status == "done"
+-
+-
+-@pytest.mark.parametrize("change", ["other_task", "other_run", "missing_request", "canonical_actor"])
+-def test_resumed_receipt_rejects_mismatches(fleet, change):
++    from hermes_cli import kanban_db_sync as sync
++    for source in (f.w, f.h, f.rep):
++        sync.apply_sync_schema_steps(source)
++    f.proof = delivery._delivered(f)
++    original = dict(f.proof)
++    if not migrate:
++        conn = f.w
++        new_run = _resume(f, conn)
++    else:
++        assert continue_task(f.w, f.caller, checkpoint="receipt retained")["ok"]
++        f.board()
++        from tests.hermes_cli import kanban_sync_support as support
++        from hermes_cli import kanban_sync_client as client
++        support.write_sync_config(tmp_path / ".hermes", True)
++        monkeypatch.setattr(sync, "_LEASE_CLIENT", support.FakeLeaseClient())
++        conn = connect(tmp_path / "worker6.db")
++        f.gw[id(conn)] = "worker-6"
++        client.ensure_identity(conn, "default", "worker-6")
++        sync.set_mode(conn, "primary")
++        # Force different local integer identities before real pickup/import.
++        for i in range(3):
++            tid = f.card(conn, f"padding {i}")
++            kb.claim_task(conn, tid)
++        assert worker.import_cards(conn, f.rep, [f.caller]) == [f.caller]
++        assert not calls._has_log(conn)
++        assert kb.claim_task(conn, f.caller)
++        f.run_uid(conn, f.caller)
++        new_run = kb.get_task(conn, f.caller).current_run_id
++        old = conn.execute("SELECT id FROM task_runs WHERE uid=?", (f.proof["caller_run_uid"],)).fetchone()
++        assert old[0] != f.run_id
++    try:
++        assert new_run != f.run_id
++        out = _tool(f, conn, monkeypatch)
++        assert out.get("ok"), out
++        assert kb.get_task(conn, f.caller).status == "done"
++        stored = json.loads(conn.execute("SELECT metadata FROM task_runs WHERE id=?", (new_run,)).fetchone()[0])
++        assert stored["completion_receipt"] == delivery._receipt(original)["completion_receipt"]
++        assert f.h.execute("SELECT count(*) FROM task_comments WHERE task_id=?", (f.target,)).fetchone()[0] == 1
++    finally:
++        if migrate:
++            conn.close()
++
++
++@pytest.mark.parametrize("fault", ["stale_run", "other_task", "foreign_current_run", "ended_run", "nonrunning_run", "missing_uid"])
++def test_complete_tool_rejects_foreign_custody(fleet, monkeypatch, fault):
+     f = fleet
+-    proof = _delivered(f)
+-    _resume(f)
+-    if change == "other_task":
+-        proof["caller_task_id"] = f.target
+-    elif change == "other_run":
+-        proof["caller_run_uid"] = "forged-run"
+-    elif change == "missing_request":
+-        with kb.write_txn(f.w):
+-            f.w.execute("DELETE FROM operator_calls")
++    f.proof = delivery._delivered(f)
++    _resume(f, f.w)
++    other = f.card(f.w, "other task")
++    kb.claim_task(f.w, other)
++    f.run_uid(f.w, other)
++    with kb.write_txn(f.w):
++        if fault == "foreign_current_run":
++            f.w.execute("UPDATE tasks SET current_run_id=? WHERE id=?",
++                        (kb.get_task(f.w, other).current_run_id, f.caller))
++        if fault == "ended_run":
++            f.w.execute("UPDATE task_runs SET ended_at=1 WHERE id=(SELECT current_run_id FROM tasks WHERE id=?)", (f.caller,))
++        if fault == "nonrunning_run":
++            f.w.execute("UPDATE task_runs SET status='continued' WHERE id=(SELECT current_run_id FROM tasks WHERE id=?)", (f.caller,))
++        if fault == "missing_uid":
++            f.w.execute("UPDATE task_runs SET uid=NULL WHERE id=(SELECT current_run_id FROM tasks WHERE id=?)", (f.caller,))
++    out = _tool(f, f.w, monkeypatch, run_id=f.run_id if fault == "stale_run" else None,
++                task_id=other if fault == "other_task" else None)
++    assert not out.get("ok"), out
++    assert kb.get_task(f.w, f.caller).status == "running"
++    assert kb.get_task(f.w, other).status == "running"
++
++
++@pytest.mark.parametrize("fault", ["missing", "ambiguous", "conflict", "canonical", "pending", "failed"])
++def test_carried_request_is_only_discovery(fleet, monkeypatch, fault):
++    f = fleet
++    f.proof = delivery._delivered(f)
++    _resume(f, f.w)
++    uid = f.w.execute("SELECT request_event_uid FROM operator_calls WHERE request_uid=?", (f.proof["request_uid"],)).fetchone()[0]
++    with kb.write_txn(f.w):
++        f.w.execute("DELETE FROM operator_calls WHERE side='request'")
++    if fault == "missing":
++        for conn in (f.w, f.rep):
++            with kb.write_txn(conn):
++                conn.execute("DELETE FROM task_events WHERE uid=?", (uid,))
++    elif fault == "ambiguous":
++        with kb.write_txn(f.rep):
++            f.rep.execute("INSERT INTO task_events(task_id,kind,payload,created_at,uid) SELECT task_id,kind,payload,created_at,'second-uid' FROM task_events WHERE uid=?", (uid,))
++    elif fault in ("conflict", "canonical"):
++        payload = json.loads(f.canonical[uid]["payload"])
++        payload["args"]["text"] = "forged"
++        with kb.write_txn(f.rep):
++            f.rep.execute("UPDATE task_events SET payload=? WHERE uid=?", (json.dumps(payload), uid))
++        if fault == "canonical":
++            with kb.write_txn(f.w):
++                f.w.execute("UPDATE task_events SET payload=? WHERE uid=?", (json.dumps(payload), uid))
++            import hashlib
++            f.proof["content_sha256"] = hashlib.sha256(b"forged").hexdigest()
+     else:
+-        f.gw[id(f.w)] = "worker-9"
+-        with kb.write_txn(f.w):
+-            f.w.execute("DELETE FROM operator_calls")
+-        f.origin[proof["result_event_uid"]] = "impostor"
+-    with pytest.raises(ValueError, match="completion_receipt"):
+-        kb.complete_task(f.w, f.caller, expected_run_id=f.run_id, metadata=_receipt(proof))
++        row = f.canonical[f.proof["result_event_uid"]]
++        result = json.loads(row["payload"])
++        result["outcome"] = fault
++        row["payload"] = json.dumps(result)
++    out = _tool(f, f.w, monkeypatch)
++    assert not out.get("ok"), out
+     assert kb.get_task(f.w, f.caller).status == "running"
+ 
+ 
+-@pytest.mark.parametrize("change", ["content", "run", "task", "board", "event_origin", "unreachable"])
+-def test_moved_receipt_still_requires_canonical_request(fleet, change):
++@pytest.mark.parametrize("event", ["request", "result"])
++@pytest.mark.parametrize("field,value", [("origin_gateway", "foreign"), ("task_id", "unrelated"),
++    ("kind", "unrelated"), ("uid", "forged"), ("deleted_at", 1)])
++def test_ledgerless_canonical_identity(fleet, monkeypatch, event, field, value):
+     f = fleet
+-    proof = _delivered(f)
++    f.proof = delivery._delivered(f)
+     uid = f.w.execute("SELECT request_event_uid FROM operator_calls WHERE request_uid=?",
+-                      (proof["request_uid"],)).fetchone()[0]
+-    _resume(f)
+-    f.gw[id(f.w)] = "worker-9"
++                      (f.proof["request_uid"],)).fetchone()[0]
++    _resume(f, f.w)
+     with kb.write_txn(f.w):
+-        f.w.execute("DELETE FROM operator_calls")
+-    request = json.loads(f.canonical[uid]["payload"])
+-    edits = {
+-        "content": (request["args"], "text", "forged"),
+-        "run": (request["caller"], "run_uid", "forged"),
+-        "task": (request["caller"], "task_id", f.target),
+-        "board": (request, "board", "other"),
+-        "event_origin": (f.origin, uid, "impostor"),
+-    }
+-    if change in edits:
+-        target, key, value = edits[change]
+-        target[key] = value
++        f.w.execute("DROP TABLE operator_calls")
++    if event == "result":
++        uid = f.proof["result_event_uid"]
++    if field == "origin_gateway":
++        f.origin[uid] = value
+     else:
+-        f.evidence_down = True
+-    f.canonical[uid]["payload"] = json.dumps(request)
++        f.canonical[uid][field] = value
++    out = _tool(f, f.w, monkeypatch)
++    assert not out.get("ok"), out
++    assert kb.get_task(f.w, f.caller).status == "running"
++
++
++def test_conflicting_local_request_cannot_be_replaced_by_replica(fleet, monkeypatch):
++    f = fleet
++    f.proof = delivery._delivered(f)
++    _resume(f, f.w)
++    uid = f.w.execute("SELECT request_event_uid FROM operator_calls WHERE request_uid=?",
++                      (f.proof["request_uid"],)).fetchone()[0]
++    # Replica and canonical request remain valid. Ignoring conflict would replace
++    # the altered local snapshot with that valid request and admit completion.
++    payload = json.loads(f.canonical[uid]["payload"])
++    payload["extra_unbound_field"] = "conflicting local copy"
++    with kb.write_txn(f.w):
++        f.w.execute("DROP TABLE operator_calls")
++        f.w.execute("UPDATE task_events SET payload=? WHERE uid=?", (json.dumps(payload), uid))
++    out = _tool(f, f.w, monkeypatch)
++    assert not out.get("ok"), out
++    assert "conflicting carried request" in str(out)
++    assert kb.get_task(f.w, f.caller).status == "running"
++
++
++def test_request_snapshot_frozen_across_canonical_read(fleet, monkeypatch):
++    f = fleet
++    f.proof = delivery._delivered(f)
++    _resume(f, f.w)
++    uid = f.w.execute("SELECT request_event_uid FROM operator_calls WHERE request_uid=?",
++                      (f.proof["request_uid"],)).fetchone()[0]
++    original = calls._evidence
++
++    def evidence(board, event_uid):
++        result = original(board, event_uid)
++        if event_uid == f.proof["result_event_uid"]:
++            payload = json.loads(f.canonical[uid]["payload"])
++            payload["extra_unbound_field"] = "changed after authentication"
++            with kb.write_txn(f.w):
++                f.w.execute("UPDATE task_events SET payload=? WHERE uid=?", (json.dumps(payload), uid))
++        return result
++
++    monkeypatch.setattr(calls, "_evidence", evidence)
++    out = _tool(f, f.w, monkeypatch)
++    assert not out.get("ok"), out
++    assert "request changed" in str(out)
++    assert kb.get_task(f.w, f.caller).status == "running"
++
++
++@pytest.mark.parametrize("outcome", ["pending", "failed"])
++def test_local_ledger_refusal_survives_valid_carried_evidence(fleet, monkeypatch, outcome):
++    f = fleet
++    f.proof = delivery._delivered(f)
++    _resume(f, f.w)
++    with kb.write_txn(f.w):
++        f.w.execute("UPDATE operator_calls SET outcome=? WHERE side='request'", (outcome,))
++    out = _tool(f, f.w, monkeypatch)
++    assert not out.get("ok"), out
++    assert "pending, failed or missing" in str(out)
++    assert kb.get_task(f.w, f.caller).status == "running"
++
++
++@pytest.mark.parametrize("field", ["caller", "args"])
++def test_malformed_carried_envelope_is_controlled_refusal(fleet, monkeypatch, field):
++    f = fleet
++    f.proof = delivery._delivered(f)
++    _resume(f, f.w)
++    uid = f.w.execute("SELECT request_event_uid FROM operator_calls WHERE side='request'").fetchone()[0]
++    payload = json.loads(f.canonical[uid]["payload"])
++    payload[field] = []
++    for conn in (f.w, f.rep):
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_events SET payload=? WHERE uid=?", (json.dumps(payload), uid))
++    with kb.write_txn(f.w):
++        f.w.execute("DROP TABLE operator_calls")
++    out = _tool(f, f.w, monkeypatch)
++    assert not out.get("ok"), out
++    assert "malformed carried request" in str(out)
++
++
++@pytest.mark.parametrize("raw,expected", [
++    ("not json", False), ("[]", False),
++    ('{"request_uid":"wanted","action":"comment","target_task_id":"target"}', True),
++    ('{"request_uid":"other","action":"comment","target_task_id":"target"}', False),
++])
++def test_request_discovery_filters(fleet, raw, expected):
++    from hermes_cli.kanban_operator_delivery_custody import request_events
++    f = fleet
++    with kb.write_txn(f.w):
++        f.w.execute("INSERT INTO task_events(task_id,kind,payload,created_at,uid) VALUES (?,?,?,1,'event')",
++                    (f.caller, calls.REQUEST_KIND, raw))
++    assert bool(request_events(f.w, f.caller, "wanted")) is expected
++    assert request_events(None, f.caller, "wanted") == {}
++
++
++@pytest.mark.parametrize("raw,expected", [
++    ("not json", set()), ("[]", set()),
++    ('{"action":"comment","target_task_id":"target"}', {"target"}),
++    ('{"action":"move","target_task_id":"target"}', set()),
++    ('{"action":"comment","target_task_id":[]}', set()),
++])
++def test_history_gating_filters(fleet, raw, expected):
++    from hermes_cli.kanban_operator_delivery_custody import requested_targets
++    f = fleet
++    with kb.write_txn(f.w):
++        f.w.execute("INSERT INTO task_events(task_id,kind,payload,created_at,uid) VALUES (?,?,?,1,'event')",
++                    (f.caller, calls.REQUEST_KIND, raw))
++    assert requested_targets(f.w, f.caller) == expected
++    assert requested_targets(None, f.caller) == set()
++
++
++def test_carried_request_requires_event_uid(fleet, monkeypatch):
++    from hermes_cli.kanban_operator_delivery_custody import carried_request
++    from hermes_cli import kanban_operator_delivery_custody as custody
++    monkeypatch.setattr(custody, "request_events", lambda *args: {None: {"caller": {}, "args": {}}})
++    with pytest.raises(ValueError, match="unique carried request missing"):
++        carried_request(fleet.w, fleet.caller, {"request_uid": "wanted"})
++
++
++def test_current_run_is_frozen_across_canonical_read(fleet, monkeypatch):
++    f = fleet
++    f.proof = delivery._delivered(f)
++    original = calls._evidence
++    switched = []
++
++    def evidence(board, uid):
++        result = original(board, uid)
++        if not switched:
++            switched.append(_resume(f, f.w))
++        return result
++
++    monkeypatch.setattr(calls, "_evidence", evidence)
++    with pytest.raises(ValueError, match="current run changed"):
++        kb.complete_task(f.w, f.caller, metadata=delivery._receipt(f.proof), summary="Verified delivery")
++    assert kb.get_task(f.w, f.caller).status == "running"
++
++
++@pytest.mark.parametrize("local_event", [False, True])
++def test_unavailable_replica_is_controlled_refusal(fleet, monkeypatch, local_event):
++    f = fleet
++    f.proof = delivery._delivered(f)
++    _resume(f, f.w)
++    with kb.write_txn(f.w):
++        f.w.execute("DELETE FROM operator_calls")
++        if not local_event:
++            f.w.execute("DELETE FROM task_events WHERE kind=?", (calls.REQUEST_KIND,))
++
++    @contextmanager
++    def unavailable(_conn):
++        yield None
++
++    monkeypatch.setattr(calls, "_replica", unavailable)
++    out = _tool(f, f.w, monkeypatch)
++    assert not out.get("ok"), out
++    assert kb.get_task(f.w, f.caller).status == "running"
++
++
++@pytest.mark.parametrize("source", ["local", "replica"])
++def test_carried_request_requires_receipt_even_with_local_target(fleet, source):
++    f = fleet
++    delivery._delivered(f)
++    _resume(f, f.w)
++    with kb.write_txn(f.w):
++        f.w.execute("DELETE FROM operator_calls")
++        f.w.execute("DELETE FROM supervisor_requests")
++        target = f.h.execute("SELECT * FROM tasks WHERE id=?", (f.target,)).fetchone()
++        f.w.execute(f"INSERT INTO tasks ({','.join(target.keys())}) VALUES ({','.join('?' for _ in target)})", tuple(target))
++    absent = f.rep if source == "local" else f.w
++    with kb.write_txn(absent):
++        absent.execute("DELETE FROM task_events WHERE kind=?", (calls.REQUEST_KIND,))
+     with pytest.raises(ValueError, match="completion_receipt"):
+-        kb.complete_task(f.w, f.caller, expected_run_id=f.run_id, metadata=_receipt(proof))
++        kb.complete_task(f.w, f.caller, summary=f"Posted findings to {f.target}.")
+     assert kb.get_task(f.w, f.caller).status == "running"
+diff --git a/tests/hermes_cli/test_kanban_operator_delivery_prior_run.py b/tests/hermes_cli/test_kanban_operator_delivery_prior_run.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..82a47ed016e358d6582b30c919651fd851026747
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_operator_delivery_prior_run.py
+@@ -0,0 +1,93 @@
++"""Delivery belongs to the requesting task, not only its currently running attempt."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from tests.hermes_cli.test_kanban_operator_delivery import _delivered, _receipt
++from tests.hermes_cli import test_kanban_operator_call as helpers
++
++fleet = helpers.fleet
++
++
++def _resume(f):
++    assert kb.schedule_task(f.w, f.caller, expected_run_id=f.run_id,
++                            reason="Wait for cooldown", clock_only=True,
++                            awaiting={"kind": "clock", "why": "cooldown"})
++    assert kb.unblock_task(f.w, f.caller)
++    assert kb.claim_task(f.w, f.caller)
++    f.run_id = kb._current_run_id(f.w, f.caller)
++    f.run_uid(f.w, f.caller)
++
++
++@pytest.mark.parametrize("moved", [False, True, "no_ledger_table"])
++def test_prior_run_delivery_completes_after_resume(fleet, moved):
++    f = fleet
++    proof = _delivered(f)
++    _resume(f)
++    if moved:
++        # Destination has task/run history but no source-local operator ledger.
++        f.gw[id(f.w)] = "worker-9"
++        with kb.write_txn(f.w):
++            f.w.execute("DELETE FROM operator_calls")
++            if moved == "no_ledger_table":
++                f.w.execute("DROP TABLE operator_calls")
++    assert kb.complete_task(f.w, f.caller, expected_run_id=f.run_id,
++                            summary=f"Posted findings to {f.target}.", metadata=_receipt(proof))
++    assert kb.get_task(f.w, f.caller).status == "done"
++
++
++@pytest.mark.parametrize("change", ["other_task", "other_run", "missing_request", "canonical_actor"])
++def test_resumed_receipt_rejects_mismatches(fleet, change):
++    f = fleet
++    proof = _delivered(f)
++    _resume(f)
++    if change == "other_task":
++        proof["caller_task_id"] = f.target
++    elif change == "other_run":
++        proof["caller_run_uid"] = "forged-run"
++    elif change == "missing_request":
++        # Missing ledger alone is recoverable on the same host too. Remove the
++        # carried locators as well to exercise truly missing request evidence.
++        with kb.write_txn(f.w):
++            f.w.execute("DELETE FROM operator_calls")
++            f.w.execute("DELETE FROM task_events WHERE kind='operator_call_requested'")
++        f.rep.execute("DELETE FROM task_events WHERE kind='operator_call_requested'")
++        f.rep.commit()
++    else:
++        f.gw[id(f.w)] = "worker-9"
++        with kb.write_txn(f.w):
++            f.w.execute("DELETE FROM operator_calls")
++        f.origin[proof["result_event_uid"]] = "impostor"
++    with pytest.raises(ValueError, match="completion_receipt"):
++        kb.complete_task(f.w, f.caller, expected_run_id=f.run_id, metadata=_receipt(proof))
++    assert kb.get_task(f.w, f.caller).status == "running"
++
++
++@pytest.mark.parametrize("change", ["content", "run", "task", "board", "event_origin", "unreachable"])
++def test_moved_receipt_still_requires_canonical_request(fleet, change):
++    f = fleet
++    proof = _delivered(f)
++    uid = f.w.execute("SELECT request_event_uid FROM operator_calls WHERE request_uid=?",
++                      (proof["request_uid"],)).fetchone()[0]
++    _resume(f)
++    f.gw[id(f.w)] = "worker-9"
++    with kb.write_txn(f.w):
++        f.w.execute("DELETE FROM operator_calls")
++    request = json.loads(f.canonical[uid]["payload"])
++    edits = {
++        "content": (request["args"], "text", "forged"),
++        "run": (request["caller"], "run_uid", "forged"),
++        "task": (request["caller"], "task_id", f.target),
++        "board": (request, "board", "other"),
++        "event_origin": (f.origin, uid, "impostor"),
++    }
++    if change in edits:
++        target, key, value = edits[change]
++        target[key] = value
++    else:
++        f.evidence_down = True
++    f.canonical[uid]["payload"] = json.dumps(request)
++    with pytest.raises(ValueError, match="completion_receipt"):
++        kb.complete_task(f.w, f.caller, expected_run_id=f.run_id, metadata=_receipt(proof))
++    assert kb.get_task(f.w, f.caller).status == "running"
+-- 
+2.43.0
+

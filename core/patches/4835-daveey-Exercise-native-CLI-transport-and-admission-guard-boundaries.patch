@@ -1,0 +1,206 @@
+From 7f1ac61dfaeb6f227f451b9f651caf5959824d94 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 09:30:14 +0000
+Subject: [PATCH] [daveey] Exercise native CLI transport and admission guard
+ boundaries
+
+---
+ .../test_origin_native_admission.py           |  14 +++
+ tests/tools/test_origin_cli_terminal.py       |  40 +++++++
+ .../tools/test_origin_cli_transport_guards.py | 108 ++++++++++++++++++
+ 3 files changed, 162 insertions(+)
+ create mode 100644 tests/tools/test_origin_cli_transport_guards.py
+
+diff --git a/tests/hermes_cli/test_origin_native_admission.py b/tests/hermes_cli/test_origin_native_admission.py
+index 3af1ccc26b2774f2db91cad196098d3f661b6592..5a9bc6db9550e2224dba2082c88239ebda092d46 100644
+--- a/tests/hermes_cli/test_origin_native_admission.py
++++ b/tests/hermes_cli/test_origin_native_admission.py
+@@ -238,6 +238,20 @@ def test_uncopied_thread_has_no_authority(turn):
+         pool.submit(in_thread).result(timeout=20)
+ 
+ 
++@pytest.mark.parametrize("args,kw", [
++    ({"placement_policy": "worker-first-v1"}, {}),
++    ({"self_work": {}}, {}),
++    ({}, {"origin_intent": {}}),
++    ({}, {"selfwork_intent": {}}),
++])
++def test_unsupported_paths_stop_before_wrapped_body(turn, args, kw):
++    @admission.tool_create
++    def forbidden(args, **kw):
++        pytest.fail("unsupported path reached wrapped create body")
++    with admission.strict_local_creation(), pytest.raises(admission.AdmissionRefused):
++        forbidden({"placement": "local", **args}, **kw)
++
++
+ def test_db_origin_intent_refused(turn):
+     with kbc.connect_closing() as conn:
+         with admission.strict_local_creation(), pytest.raises(admission.AdmissionRefused):
+diff --git a/tests/tools/test_origin_cli_terminal.py b/tests/tools/test_origin_cli_terminal.py
+index 72314d004932eee14e1cdec785e04a111367add5..a08325930868b9f984c216af16068f96cea97c03 100644
+--- a/tests/tools/test_origin_cli_terminal.py
++++ b/tests/tools/test_origin_cli_terminal.py
+@@ -12,6 +12,46 @@ from tests.hermes_cli import test_origin_native_admission as admission_fixtures
+ turn = admission_fixtures.turn
+ 
+ 
++@pytest.mark.parametrize("missing", ["platform", "seqpacket", "cmsg", "poll"])
++def test_supported_requires_each_linux_primitive(monkeypatch, missing):
++    from tools import origin_cli_terminal as boundary
++    monkeypatch.setattr(boundary, "sys", SimpleNamespace(platform="linux"))
++    monkeypatch.setattr(boundary, "socket", SimpleNamespace(SOCK_SEQPACKET=5, MSG_CMSG_CLOEXEC=1))
++    monkeypatch.setattr(boundary, "select", SimpleNamespace(poll=object()))
++    assert boundary.supported()
++    if missing == "platform":
++        boundary.sys.platform = "unsupported"
++    elif missing == "poll":
++        del boundary.select.poll
++    else:
++        delattr(boundary.socket, "SOCK_SEQPACKET" if missing == "seqpacket" else "MSG_CMSG_CLOEXEC")
++    assert not boundary.supported()
++
++
++@pytest.mark.parametrize("missing", ["policy", "delegated"])
++def test_offer_does_not_inherit_absent_or_delegated_policy(turn, monkeypatch, missing):
++    from tools import origin_cli_terminal as boundary
++    from tools.environments.local import LocalEnvironment
++    monkeypatch.setattr(boundary, "supported", lambda: True)
++    monkeypatch.setattr(boundary, "current_policy", lambda: None if missing == "policy" else object())
++    monkeypatch.setattr("agent.delegation_context.is_delegated_child_context", lambda: missing == "delegated")
++    def forbidden(*args):
++        pytest.fail("ineligible caller reached Launch")
++    monkeypatch.setattr(boundary, "Launch", forbidden)
++    assert boundary.offer(object.__new__(LocalEnvironment), "local", None, "x") is None
++
++
++def test_offered_attempt_remains_marked_after_return(monkeypatch):
++    from tools import origin_cli_terminal as boundary
++    launch = SimpleNamespace(retire=list, close=lambda: None)
++    monkeypatch.setattr(boundary, "offer", lambda *a, **kw: launch)
++    attempt = []
++    result = boundary.execute(SimpleNamespace(execute=lambda *a, **kw: {"output": "ok"}), "cmd",
++                              env_type="local", task_id=None, attempt=attempt)
++    assert result == {"output": "ok"}
++    assert attempt == [True]
++
++
+ def test_launch_executes_real_local_shell(turn, monkeypatch, tmp_path):
+     from tools import origin_cli_terminal as boundary
+     from tools.environments.local import LocalEnvironment
+diff --git a/tests/tools/test_origin_cli_transport_guards.py b/tests/tools/test_origin_cli_transport_guards.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..28cab20db3867e71aeccf9b3ae0fc818d205d846
+--- /dev/null
++++ b/tests/tools/test_origin_cli_transport_guards.py
+@@ -0,0 +1,108 @@
++"""Boundary predicates reject malformed frames without consuming admission."""
++import json
++import socket
++
++import pytest
++
++from tools import origin_cli_bridge as bridge
++from tests.tools import test_origin_cli_bridge as helpers
++
++echo_launch = helpers.echo_launch
++
++
++@pytest.mark.parametrize("flag", [socket.MSG_TRUNC, socket.MSG_CTRUNC])
++def test_truncated_request_never_dispatches(echo_launch, flag):
++    reader, writer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
++    with reader, writer:
++        fds = [writer.fileno()]
++        echo_launch._handle(bridge._encode({"nonce": echo_launch._nonce, "args": {"title": "x"}}), flag, fds)
++        assert fds == [writer.fileno()]
++        assert echo_launch.retire() == []
++
++
++@pytest.mark.parametrize("count", [0, 2])
++def test_wrong_descriptor_count_is_rejected(echo_launch, count):
++    readers, writers = [], []
++    try:
++        for _ in range(count):
++            reader, writer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
++            readers.append(reader)
++            writers.append(writer)
++        fds = [writer.fileno() for writer in writers]
++        echo_launch._handle(b'{}', 0, fds)
++        assert fds == [writer.fileno() for writer in writers]
++        assert echo_launch.retire() == []
++    finally:
++        for sock in readers + writers:
++            sock.close()
++
++
++@pytest.mark.parametrize("value", [[], {"args": []}, {"args": "bad"}])
++def test_malformed_payload_is_rejected_before_dispatch(echo_launch, value):
++    if isinstance(value, dict):
++        value["nonce"] = echo_launch._nonce
++    reader, writer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
++    with reader:
++        fds = [writer.detach()]
++        echo_launch._handle(json.dumps(value).encode(), 0, fds)
++        assert fds == []
++        reader.settimeout(1)
++        assert reader.recv(4096) == b''
++        assert echo_launch.retire() == []
++
++
++@pytest.mark.parametrize("family,kind", [(socket.AF_UNIX, socket.SOCK_STREAM), (socket.AF_INET, socket.SOCK_DGRAM)])
++def test_wrong_reply_socket_is_rejected(echo_launch, family, kind):
++    sock = socket.socket(family, kind)
++    fds = [sock.detach()]
++    echo_launch._handle(bridge._encode({"nonce": echo_launch._nonce, "args": {"title": "x"}}), 0, fds)
++    assert fds == []
++    assert echo_launch.retire() == []
++
++
++def test_encode_limit_is_enforced():
++    with pytest.raises(ValueError, match="too large"):
++        bridge._encode("x" * bridge.LIMIT)
++    assert len(bridge._encode("x" * (bridge.LIMIT - 2))) == bridge.LIMIT
++
++
++@pytest.mark.parametrize("fd,nonce", [(True, "x"), (-1, "x"), (3, 42)])
++def test_invalid_locator_never_duplicates(monkeypatch, fd, nonce):
++    def forbidden(*args):
++        pytest.fail("invalid locator reached descriptor duplication")
++    monkeypatch.setattr(bridge.os, "dup", forbidden)
++    assert bridge.request(json.dumps({"fd": fd, "nonce": nonce}), {})["outcome"] == "outcome_unknown"
++
++
++@pytest.mark.parametrize("family,kind", [(socket.AF_UNIX, socket.SOCK_STREAM), (socket.AF_INET, socket.SOCK_DGRAM)])
++def test_wrong_client_socket_never_opens_reply(monkeypatch, family, kind):
++    with socket.socket(family, kind) as sock:
++        def forbidden(*args):
++            pytest.fail("invalid channel reached reply creation")
++        monkeypatch.setattr(bridge.socket, "socketpair", forbidden)
++        assert bridge.request(json.dumps({"fd": sock.fileno(), "nonce": "x"}), {})["outcome"] == "outcome_unknown"
++
++
++@pytest.mark.parametrize("payload,flags", [(b'{}', socket.MSG_TRUNC), (b'[]', 0)])
++def test_invalid_response_is_unknown(monkeypatch, payload, flags):
++    class Socket:
++        family = socket.AF_UNIX
++        type = socket.SOCK_SEQPACKET
++        def __enter__(self):
++            return self
++        def __exit__(self, *args):
++            pass
++        def settimeout(self, timeout):
++            pass
++        def fileno(self):
++            return 42
++        def sendmsg(self, *args):
++            pass
++        def close(self):
++            pass
++        def recvmsg(self, *args):
++            return payload, [], flags, None
++    monkeypatch.setattr(bridge.os, "dup", lambda fd: 42)
++    monkeypatch.setattr(bridge.socket, "socket", lambda **kw: Socket())
++    monkeypatch.setattr(bridge.socket, "socketpair", lambda *args: (Socket(), Socket()))
++    assert bridge.request(json.dumps({"fd": 42, "nonce": "x"}), {})["outcome"] == "outcome_unknown"
+-- 
+2.43.0
+

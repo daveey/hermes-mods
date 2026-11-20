@@ -1,0 +1,157 @@
+From 1d291c40301356437e91c3c65e6845de48d12e44 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 20:02:03 -0800
+Subject: [PATCH] fix(tools): bound the wait hint's card-show flag loop and say
+ "bounded", not "linear" [daveey]
+
+Review follow-up to #3533 (review 5950525933, non-blocking point 1). The module
+called its scan linear, but _CARD_SHOW_RE was quadratic in repeated `kanban`
+words: a flag's value can itself be the word `kanban`, so the unbounded flag
+loop ran to the end of the text from every start. `"kanban --a " * 727`
+(8,000 characters) took about 0.6 s on the reviewer's machine and about 70 ms
+on an M-series Mac.
+
+- _CARD_SHOW_RE reads at most MAX_CARD_SHOW_FLAGS (8) flags per `kanban` word;
+  the same input now takes about 1.5 ms. `kanban [up to 8 flags] show <id>`
+  still matches.
+- Docstring and comments describe the work as bounded and say how.
+- .env.example: TERMINAL_MAX_WAIT defaults to 400 or TERMINAL_TIMEOUT when that
+  is larger, and is held under the per-call deadline only while it is on.
+- website env-var reference: same correction about the deadline.
+- test: the handler-path test scopes its temporary patches with
+  monkeypatch.context() in place of monkeypatch.undo(), which also dropped the
+  suite's hermetic fixtures for the rest of that test.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .env.example                                  |  5 ++--
+ tests/tools/test_terminal_tool_wait_hint.py   | 30 ++++++++++++++++---
+ tools/terminal_tool_wait_hint.py              | 20 +++++++++----
+ .../docs/reference/environment-variables.md   |  2 +-
+ 4 files changed, 44 insertions(+), 13 deletions(-)
+
+diff --git a/.env.example b/.env.example
+index 4e5b5092dafd1998acec1e7528a0d9b8bb89eed8..101e96e5cd393be940191120cfa530cab35a1e58 100644
+--- a/.env.example
++++ b/.env.example
+@@ -246,8 +246,9 @@ TERMINAL_MODAL_IMAGE=nikolaik/python-nodejs:python3.11-nodejs20
+ 
+ # Default command timeout in seconds
+ TERMINAL_TIMEOUT=60
+-# Longest one process_manage(action="wait") call may block (default 400; kept under the
+-# 420 s per-tool-call deadline). The wait returns as soon as the process exits.
++# Longest one process_manage(action="wait") call may block. Default: 400, or TERMINAL_TIMEOUT when
++# that is larger. While the per-tool-call deadline is on (420 s by default) the wait is kept 20 s
++# under it. The wait returns as soon as the process exits.
+ # TERMINAL_MAX_WAIT=400
+ 
+ # Cleanup inactive environments after this many seconds
+diff --git a/tests/tools/test_terminal_tool_wait_hint.py b/tests/tools/test_terminal_tool_wait_hint.py
+index ce44eb21123dac59a465bf70f3e99f38d425b383..6fc81dddcbbe52d80591e4f86c844f70172f5342 100644
+--- a/tests/tools/test_terminal_tool_wait_hint.py
++++ b/tests/tools/test_terminal_tool_wait_hint.py
+@@ -359,6 +359,28 @@ class TestRealResultShapes:
+ class TestScanCost:
+     """The scan runs on the tool thread after the command finished: it must not hold the result."""
+ 
++    @pytest.mark.parametrize("unit", ["kanban --a ", "kanban\t--a\n", "kanban --a kanban ", "kanban --a=b ", "kanban show "])
++    def test_card_show_is_fast_at_the_size_bound(self, unit):
++        """`kanban --a kanban --a ...`: a flag's value can be the word `kanban`, so an unbounded flag
++        loop ran to the end of the text from every start (about 70 ms here, 0.6 s on a slower host).
++        Best of 5 wall-clock samples against a loose bound: about 2 ms idle, 37 ms worst with every
++        core oversubscribed 2.5x. This only guards against a gross regression; the flag bound itself
++        is pinned exactly by the next test, not by timing."""
++        import time
++
++        text = (unit * (wh.MAX_COMMAND_CHARS // len(unit) + 1))[:wh.MAX_COMMAND_CHARS]
++        best = float("inf")
++        for _ in range(5):
++            started = time.perf_counter()
++            wh._CARD_SHOW_RE.findall(text)
++            best = min(best, time.perf_counter() - started)
++        assert best < 0.25, f"{best:.3f}s at the size bound"
++
++    def test_card_show_still_reads_past_several_flags(self):
++        flags = " ".join(f"--f{i} v{i}" for i in range(wh.MAX_CARD_SHOW_FLAGS))
++        assert wh.awaited_card_id(f"sleep 90; hermes kanban {flags} show {CARD}") == CARD
++        assert wh.awaited_card_id(f"sleep 90; hermes kanban {flags} --one-more x show {CARD}") is None
++
+     @pytest.mark.parametrize("command", [
+         "sleep 1; " + "while " * 500 + "do " * 500 + "; a" * 500,
+         "sleep 1\n" + "cat <<EOF\n" * 600,
+@@ -392,10 +414,10 @@ class TestHandlerPath:
+         from tools import terminal_tool as tt
+         from tools.process_registry import process_registry
+ 
+-        monkeypatch.setattr(tt, "terminal_tool", lambda **kw: OK)  # no command ran: nothing was timed
+-        monkeypatch.setattr(wh, "_running_processes", lambda task_id: [_proc()])
+-        assert "wait_hint" not in json.loads(tt._handle_terminal({"command": "sleep 60; tail suite.log"}, task_id="task-handler"))
+-        monkeypatch.undo()
++        with monkeypatch.context() as scoped:  # scoped, so the suite's own hermetic patches stay in place
++            scoped.setattr(tt, "terminal_tool", lambda **kw: OK)  # no command ran: nothing was timed
++            scoped.setattr(wh, "_running_processes", lambda task_id: [_proc()])
++            assert "wait_hint" not in json.loads(tt._handle_terminal({"command": "sleep 60; tail suite.log"}, task_id="task-handler"))
+         monkeypatch.setattr(tt, "terminal_tool", lambda **kw: (wh.note_execute_seconds(600.0), OK)[1])
+         session = process_registry.spawn_local("sleep 30", cwd=str(tmp_path), task_id="task-handler")
+         session.notify_on_complete = False
+diff --git a/tools/terminal_tool_wait_hint.py b/tools/terminal_tool_wait_hint.py
+index 55ddfa7fba959215a2c8f2600342b264b8265236..915d85e9df0b6dd5959d971022210f51f14f195c 100644
+--- a/tools/terminal_tool_wait_hint.py
++++ b/tools/terminal_tool_wait_hint.py
+@@ -6,8 +6,10 @@ process the same session had started (``process_manage(action="wait")`` returns
+ 28% re-read the status of another card (a Kanban worker can park on that card).
+ 
+ This only ADDS a ``wait_hint`` field to the result of a foreground command that ran to an exit
+-status. It never refuses or rewrites a command, and its own work is linear in the command length
+-(longer commands are skipped), so a wrong match costs one sentence, not a lost or late result.
++status. It never refuses or rewrites a command, and its own work is bounded: one pass over the
++command for sleeps, card patterns whose work grows in step with the command's length, and commands
++over 8,000 characters are skipped. So a wrong match costs one sentence, not a lost or late
++result.
+ 
+ A hint is only given for a command whose own execution held the call for half a minute or more
+ (the successful ``env.execute`` attempt, timed in ``_run_foreground``; not the text, and not the
+@@ -30,7 +32,8 @@ import threading
+ 
+ logger = logging.getLogger(__name__)
+ 
+-# Commands longer than this are not examined: the scan below is linear, this bounds it outright.
++# Commands longer than this are not examined. The sleep scan is one pass and the card patterns'
++# work grows in step with the length; this bounds the total outright.
+ MAX_COMMAND_CHARS = 8000
+ # Shortest single sleep worth a note; anything shorter is a settle delay, not a wait.
+ MIN_SLEEP_SECONDS = 60
+@@ -60,9 +63,14 @@ _SERVER_COMMAND_RE = re.compile(
+     r"|\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:dev|start|preview)\b|http\.server|--watch\b")
+ 
+ # `kanban [--flag [value]]... show <id>` as a command word in code (not in a quoted string, not a path
+-# component). Each flag token matches one way only, so the cost is linear; an earlier pattern that
+-# let a flag match two ways backtracked exponentially.
+-_CARD_SHOW_RE = re.compile(r"(?<![\w/.-])kanban\s+(?:--[\w-]+(?:=\S+|\s+[^\s-]\S*)?\s+)*show\s+(t_[0-9a-f]{8,})\b")
++# component). Each flag token matches one way only (an earlier pattern that let a flag match two ways
++# backtracked exponentially), and at most MAX_CARD_SHOW_FLAGS flags are read per `kanban` word: an
++# unbounded flag loop ran to the end of the text from every `kanban`, since a flag's value can itself
++# be the word `kanban`, which made `kanban --a kanban --a ...` quadratic (70 ms to 0.6 s at 8,000 characters, by host).
++MAX_CARD_SHOW_FLAGS = 8
++_CARD_SHOW_RE = re.compile(
++    r"(?<![\w/.-])kanban\s+(?:--[\w-]+(?:=\S+|\s+[^\s-]\S*)?\s+){0," + str(MAX_CARD_SHOW_FLAGS)
++    + r"}show\s+(t_[0-9a-f]{8,})\b")
+ # sqlite3 on a board database with a statement that STARTS with select and filters on id = <card>.
+ _CARD_QUERY_RE = re.compile(
+     r"\bsqlite3\b[^;|&\n]{0,200}?(?:kanban\.db|sync-shadow/[\w.-]{1,80}\.db)(?![\w.])\s+[\"']\s*select\b"
+diff --git a/website/docs/reference/environment-variables.md b/website/docs/reference/environment-variables.md
+index 0c39c2deb74212d4dd2aeb3405c1a4ecf1545e9b..61de8ff37fdeddfe85393bf7236a967712a861e5 100644
+--- a/website/docs/reference/environment-variables.md
++++ b/website/docs/reference/environment-variables.md
+@@ -254,7 +254,7 @@ These variables configure the [Tool Gateway](../user-guide/features/tool-gateway
+ | `TERMINAL_DAYTONA_IMAGE` | Daytona sandbox image |
+ | `TERMINAL_VERCEL_RUNTIME` | Vercel Sandbox runtime (`node24`, `node22`, `python3.13`) |
+ | `TERMINAL_TIMEOUT` | Command timeout in seconds |
+-| `TERMINAL_MAX_WAIT` | Longest one `process_manage` wait may block, in seconds (default: the larger of 400 and `TERMINAL_TIMEOUT`; always kept under the per-tool-call deadline) |
++| `TERMINAL_MAX_WAIT` | Longest one `process_manage` wait may block, in seconds (default: the larger of 400 and `TERMINAL_TIMEOUT`; kept 20 s under the per-tool-call deadline while that deadline is on) |
+ | `TERMINAL_LIFETIME_SECONDS` | Max lifetime for terminal sessions in seconds |
+ | `TERMINAL_CWD` | Deprecated direct override for gateway/cron terminal sessions. Prefer `terminal.cwd` in `config.yaml`; CLI still uses the launch directory. |
+ | `SUDO_PASSWORD` | Enable sudo without interactive prompt. Sent to the backend that runs the command; see [Sudo Support](../user-guide/features/tools.md#sudo-support) |
+-- 
+2.43.0
+

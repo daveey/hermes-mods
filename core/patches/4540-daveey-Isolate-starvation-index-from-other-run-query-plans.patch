@@ -1,0 +1,202 @@
+From 4400dad8a442d0f4acf419bcab60d51d40337d7b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 23:41:08 +0000
+Subject: [PATCH] [daveey] Isolate starvation index from other run query plans
+
+A global started_at index reorders dangling-run selection after ANALYZE. Use a partial arithmetic tautology only the starvation MAX reader spells, preserving all values while keeping the index ineligible for existing readers. Upgrade experimental global indexes and preserve settled-schema no-op.
+
+Proof: 59 tests across six files; seven exact mutants killed. All 18 counterbalanced CPU median cells improve at 1k/5800/20k with checkpointed and pinned >400MiB WAL; 2304 raw pairs retained. Writer-only index maintenance costs reported separately. Policy/refusal selectors are not pursued under owner disposition A.
+---
+ hermes_cli/kanban_board_share.py              |  7 ++-
+ hermes_cli/kanban_db_connect.py               | 20 ++++++-
+ .../test_kanban_starvation_index.py           | 56 ++++++++++++++++++-
+ .../hermes_cli/test_s1_planner_diagnostic.py  | 38 +++++++++++++
+ 4 files changed, 114 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_s1_planner_diagnostic.py
+
+diff --git a/hermes_cli/kanban_board_share.py b/hermes_cli/kanban_board_share.py
+index 56f33d776f8176c97c8d8e1e53bfb34a8308e2f1..819f8f953b2de087f354ce4db14d5bb1cede032d 100644
+--- a/hermes_cli/kanban_board_share.py
++++ b/hermes_cli/kanban_board_share.py
+@@ -110,7 +110,12 @@ def _scored(conn, rows: list, now: float) -> list[Candidate]:
+ 
+ def _served_at(conn) -> int:
+     """The board's latest worker start (0 if none): the floor of its cards' cross-board age."""
+-    row = conn.execute("SELECT MAX(started_at) FROM task_runs").fetchone()
++    # The always-true expression opts only this reader into the partial index.
++    # Without the index this remains a valid scan, including legacy NULL rows.
++    row = conn.execute(
++        "SELECT MAX(started_at) FROM task_runs "
++        "WHERE (started_at+0 IS NULL OR started_at+0 IS NOT NULL)"
++    ).fetchone()
+     return int(row[0] or 0) if row is not None else 0
+ 
+ 
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index c6f342c1588e9abb258ab909bce5b932943b4f37..818dbe4f8bc35ff724b47a15e8bafbfe00641cb4 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -1396,11 +1396,25 @@ _EVENT_BLOCKER_ASSERT_INDEX = (
+ )
+ 
+ 
++_RUN_STARTED_INDEX = (
++    "CREATE INDEX idx_runs_started_at ON task_runs(started_at) "
++    "WHERE (started_at+0 IS NULL OR started_at+0 IS NOT NULL)"
++)
++
++
+ def _ensure_run_started_index(conn: sqlite3.Connection) -> None:
+-    # Board-wide MAX(started_at) must not scan history on every starvation pick.
++    # The tautology admits every storage class, but only the starvation query
++    # spells it: other run readers must not acquire a new implicit scan order.
+     # Legacy TEXT-PK tables may lack this column until the rebuild below.
+     if "started_at" in _column_names(conn, "task_runs"):
+-        conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_started_at ON task_runs(started_at)")
++        existing = conn.execute(
++            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_runs_started_at'"
++        ).fetchone()
++        if existing is not None and existing[0] == _RUN_STARTED_INDEX:
++            return
++        if existing is not None:
++            conn.execute("DROP INDEX idx_runs_started_at")
++        conn.execute(_RUN_STARTED_INDEX)
+ 
+ 
+ def _ensure_run_partial_indexes(conn: sqlite3.Connection) -> None:
+@@ -1444,7 +1458,7 @@ _REBUILD_SPECS = {
+         (
+             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
+             "CREATE INDEX idx_runs_status ON task_runs(status)",
+-            "CREATE INDEX idx_runs_started_at ON task_runs(started_at)",
++            _RUN_STARTED_INDEX,
+             *_RUN_PARTIAL_INDEXES,
+         ),
+     ),
+diff --git a/tests/hermes_cli/test_kanban_starvation_index.py b/tests/hermes_cli/test_kanban_starvation_index.py
+index 12f34a6b15ebb191d937d0d42be1a00d8ec67773..516bcb46819ed46b442572550febe95d55d457fd 100644
+--- a/tests/hermes_cli/test_kanban_starvation_index.py
++++ b/tests/hermes_cli/test_kanban_starvation_index.py
+@@ -10,6 +10,53 @@ from hermes_cli import kanban_db_connect as kbc
+ 
+ 
+ INDEX = "idx_runs_started_at"
++PREDICATE = "(started_at+0 IS NULL OR started_at+0 IS NOT NULL)"
++MAX_SQL = f"SELECT MAX(started_at) FROM task_runs WHERE {PREDICATE}"
++
++
++@pytest.mark.parametrize("analyze", [False, True])
++def test_index_is_only_eligible_for_explicit_starvation_predicate(analyze):
++    with sqlite3.connect(":memory:") as conn:
++        conn.row_factory = sqlite3.Row
++        conn.executescript(kb.SCHEMA_SQL)
++        kbc._migrate_add_optional_columns(conn)
++        conn.executemany("INSERT INTO task_runs(task_id,status,started_at) VALUES (?, 'done', ?)",
++                         [(f"t{i % 10}", 1000-i) for i in range(1000)])
++        if analyze:
++            conn.execute("ANALYZE")
++        forced = f"SELECT started_at FROM task_runs INDEXED BY {INDEX}"
++        for suffix in ("", " WHERE started_at < 5", " WHERE started_at >= 5",
++                       " WHERE started_at IS NULL", " WHERE started_at IS NOT NULL",
++                       " WHERE task_id='t1' AND started_at >= 5", " ORDER BY started_at"):
++            with pytest.raises(sqlite3.OperationalError, match="no query solution"):
++                conn.execute(forced + suffix).fetchall()
++        assert conn.execute(forced + f" WHERE {PREDICATE}").fetchall()
++        plan = str([tuple(r) for r in conn.execute("EXPLAIN QUERY PLAN " + MAX_SQL)])
++        assert f"COVERING INDEX {INDEX}" in plan
++
++
++def test_upgrade_global_experimental_index_and_settled_noop():
++    with sqlite3.connect(":memory:") as conn:
++        conn.row_factory = sqlite3.Row
++        conn.execute("CREATE TABLE task_runs (started_at INTEGER)")
++        conn.execute(f"CREATE INDEX {INDEX} ON task_runs(started_at)")
++        kbc._ensure_run_started_index(conn)
++        assert PREDICATE in _index_sql(conn)
++        cookie = conn.execute("PRAGMA schema_version").fetchone()[0]
++        kbc._ensure_run_started_index(conn)
++        assert conn.execute("PRAGMA schema_version").fetchone()[0] == cookie
++
++
++def test_served_at_missing_index_and_null_fallback():
++    from hermes_cli.kanban_board_share import _served_at
++    with sqlite3.connect(":memory:") as conn:
++        conn.row_factory = sqlite3.Row
++        conn.execute("CREATE TABLE task_runs (started_at INTEGER)")
++        assert _served_at(conn) == 0
++        conn.executemany("INSERT INTO task_runs VALUES (?)", [(None,), (12,), (-5,)])
++        assert _served_at(conn) == 12
++        kbc._ensure_run_started_index(conn)
++        assert _served_at(conn) == 12
+ 
+ 
+ def _index_sql(conn):
+@@ -63,8 +110,10 @@ def test_indexed_max_matches_scan_including_storage_classes(values):
+         for analyze in (False, True):
+             if analyze:
+                 conn.execute("ANALYZE")
+-            assert tuple(conn.execute("SELECT MAX(started_at), typeof(MAX(started_at)) FROM task_runs").fetchone()) == before
+-            plan = str([tuple(r) for r in conn.execute("EXPLAIN QUERY PLAN SELECT MAX(started_at) FROM task_runs")])
++            assert tuple(conn.execute(
++                "SELECT MAX(started_at), typeof(MAX(started_at)) FROM task_runs WHERE " + PREDICATE
++            ).fetchone()) == before
++            plan = str([tuple(r) for r in conn.execute("EXPLAIN QUERY PLAN " + MAX_SQL)])
+             assert f"COVERING INDEX {INDEX}" in plan
+ 
+ 
+@@ -77,6 +126,7 @@ def test_max_vm_work_is_bounded_with_real_history():
+                          [(f"task-{i % 1000}", i % 19999) for i in range(80000)])
+         steps = []
+         conn.set_progress_handler(lambda: steps.append(1) or 0, 1)
+-        assert conn.execute("SELECT MAX(started_at) FROM task_runs").fetchone()[0] == 19998
++        from hermes_cli.kanban_board_share import _served_at
++        assert _served_at(conn) == 19998
+         conn.set_progress_handler(None, 0)
+         assert len(steps) < 100, len(steps)
+diff --git a/tests/hermes_cli/test_s1_planner_diagnostic.py b/tests/hermes_cli/test_s1_planner_diagnostic.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2c2ff549a078f933469b96d5ce0d45e295c33a38
+--- /dev/null
++++ b/tests/hermes_cli/test_s1_planner_diagnostic.py
+@@ -0,0 +1,38 @@
++"""An isolated starvation index must not reorder other run consumers."""
++import sqlite3
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_admission_report as report
++
++
++def test_s1_planner_diagnostic(tmp_path):
++    results = []
++    for analyze in (False, True):
++        for running in (False, True):
++            arms = []
++            for indexed in (False, True):
++                conn = sqlite3.connect(':memory:')
++                conn.row_factory = sqlite3.Row
++                conn.executescript(kb.SCHEMA_SQL)
++                kbc._migrate_add_optional_columns(conn)
++                if not indexed:
++                    conn.execute('DROP INDEX idx_runs_started_at')
++                conn.executemany('INSERT INTO tasks(id,title,status,created_at) VALUES (?,?,?,?)',
++                                 [(f't{i}', 'fixture', 'done', 0) for i in range(1000)])
++                conn.executemany('INSERT INTO task_runs(task_id,status,started_at) VALUES (?,?,?)',
++                                 [(f't{i % 1000}', 'running' if running else 'done', (4000-i)*100) for i in range(4000)])
++                if analyze:
++                    conn.execute('ANALYZE')
++                query = ("SELECT r.id, r.task_id FROM task_runs r JOIN tasks t ON t.id = r.task_id "
++                         "WHERE r.status = 'running' AND r.ended_at IS NULL AND r.started_at < ? "
++                         "AND (t.current_run_id IS NULL OR t.current_run_id != r.id)")
++                rows = [tuple(r) for r in conn.execute(query, (1000,))]
++                plan = [tuple(r) for r in conn.execute('EXPLAIN QUERY PLAN '+query, (1000,))]
++                waits = report._waits(conn, 0, 1000, 'absent')
++                arms.append({'indexed': indexed, 'dangling': rows, 'plan': plan, 'waits': waits})
++                conn.close()
++            results.append({'analyze': analyze, 'running': running, 'arms': arms,
++                            'dangling_equal': arms[0]['dangling'] == arms[1]['dangling'],
++                            'waits_equal': arms[0]['waits'] == arms[1]['waits']})
++    assert all(r['dangling_equal'] for r in results), results
++    assert all(r['waits_equal'] for r in results), results
+-- 
+2.43.0
+

@@ -1,0 +1,295 @@
+From 4b02dddaaca5421eeca388b902678d36621e8c4c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 02:59:54 +0000
+Subject: [PATCH] [daveey] kanban pacing: a lapsed pace offer refuses the
+ launch instead of starting on the held route
+
+Review t_4a9207abeea5da73 (PR #3301 @419ec4f9): the governor released a paced
+card only because its offer would move it to a pool with room, but take()
+treated an expired or mismatched offer like no offer, so a claim whose workspace
+preparation outlived the 120 s TTL started on the held provider.
+
+- take() now distinguishes "no offer" (ordinary admission, None) from an offer
+  that expired or was judged on another route (OfferLost). A resolver failure on
+  a card holding an offer raises OfferLost too (lose()).
+- OfferLost is refused before spawn as a no-penalty admission deferral
+  (admission_refusal infrastructure): the card is requeued and the next tick
+  re-runs the governor, never launching the held route.
+- hold() withdraws the card's previous offer before each fresh judgment, so an
+  offer left by a tick whose claim never ran cannot steer a later admission.
+- TTL raised to 600 s so ordinary slow workspace preparation does not lapse it.
+
+Tests: dispatch-level regressions through the real dispatch_once for an offer
+expiring during launch (refused, requeued with zero failures, then started on
+Grok after the cooldown), a route mismatch, an unresolvable route, and a stale
+earlier-tick offer; unit take()/withdraw() contracts. 8 fail before, pass after.
+---
+ hermes_cli/kanban_llm_pacing_dispatch.py     |  4 +
+ hermes_cli/kanban_model_tier.py              |  5 +-
+ hermes_cli/kanban_pace_reroute.py            | 38 +++++++-
+ hermes_cli/kanban_review_model.py            |  3 +-
+ hermes_cli/kanban_source_launch.py           |  3 +-
+ tests/hermes_cli/test_kanban_pace_reroute.py | 97 +++++++++++++++++++-
+ 6 files changed, 141 insertions(+), 9 deletions(-)
+
+diff --git a/hermes_cli/kanban_llm_pacing_dispatch.py b/hermes_cli/kanban_llm_pacing_dispatch.py
+index 316ecd85ab1902f9ae9a2c8dd2a614f015007cc3..516333e4542665dfae1352e3bec58bfac68f999e 100644
+--- a/hermes_cli/kanban_llm_pacing_dispatch.py
++++ b/hermes_cli/kanban_llm_pacing_dispatch.py
+@@ -449,6 +449,10 @@ def admission_skip(stored: Any) -> Optional[dict[str, Any]]:
+ def hold(conn: sqlite3.Connection, row: Any, lane: str, result: Any, *, dry_run: bool = False) -> bool:
+     """True when the card must wait for its provider's pool to come back to pace (recorded on ``result``)."""
+     try:
++        if not dry_run:
++            # A fresh judgment: an offer from an earlier tick whose claim never happened must not steer this one.
++            from hermes_cli.kanban_pace_reroute import withdraw
++            withdraw(row["id"])
+         cfg = load_config()
+         judged = _governed(conn, row["id"], lane, cfg) if cfg.enabled else None
+         if judged is None:
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index b70d869ae6436726951c6b5dedc82c8ccabde2fd..45b66ff12a41c5284cb2b8115ef36de68df7b50c 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -408,6 +408,8 @@ def _apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Op
+         if is_review:
+             from hermes_cli.kanban_review_model import ReviewModelUnavailable
+             raise ReviewModelUnavailable(f"Review model resolution failed: {exc}") from exc
++        from hermes_cli.kanban_pace_reroute import lose as _lose_pace_offer
++        _lose_pace_offer(getattr(task, "id", ""), f"route resolution failed: {type(exc).__name__}")
+         logger.warning("kanban model tier: resolve failed for %s (%s)", getattr(task, "id", "?"), exc,
+                        exc_info=True)
+         return "error"
+@@ -437,7 +439,8 @@ def _apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Op
+                            model, why, getattr(task, "id", "?"))
+             reason = f"{reason}+unroutable:{model}:{why}"
+             model = provider = None
+-    # Persist the pace choice before the owner reloads its authoritative model_tier receipt.
++    # Persist the pace choice before the owner reloads its authoritative model_tier receipt. An offer that expired or
++    # no longer matches raises OfferLost: the launch is refused and requeued, never started on the held route.
+     from hermes_cli.kanban_pace_reroute import REASON as _PACED, take as _take_pace_move
+     moved = _take_pace_move(getattr(task, "id", ""), (model, provider))
+     if moved:
+diff --git a/hermes_cli/kanban_pace_reroute.py b/hermes_cli/kanban_pace_reroute.py
+index cd85e486a6c052205e89bbac25d8aa2044ef6041..7ea6304e78750d2ab043e197e52d5e69f10ece1f 100644
+--- a/hermes_cli/kanban_pace_reroute.py
++++ b/hermes_cli/kanban_pace_reroute.py
+@@ -8,6 +8,12 @@ governor :func:`offer`\\ s the move here and the applier :func:`take`\\ s it for
+ An offer binds to the route the governor judged: the applier moves the card only when its own resolution lands on
+ that same route (else the card's route changed between the two reads and the move no longer applies). Offers live
+ :data:`TTL_SECONDS` and are taken once. Process-local by design: the hold and the claim run in one dispatcher tick.
++
++An admission that rests on an offer is not an ordinary admission: the governor released the card only because it
++would leave its paced pools. So an offer that expired, or no longer matches the resolved route, fails closed
++(:class:`OfferLost`): the launch is refused before spawn and the card is requeued for a fresh governor judgment,
++never started on the route the governor held. Each judgment first :func:`withdraw`\\ s the card's earlier offer, so
++an offer left by a tick whose claim never happened cannot steer a later, ordinary admission.
+ """
+ from __future__ import annotations
+ 
+@@ -15,7 +21,7 @@ import threading
+ import time
+ from typing import Optional
+ 
+-TTL_SECONDS = 120.0
++TTL_SECONDS = 600.0  # spans claim-time workspace preparation; past it the launch still fails closed (OfferLost)
+ REASON = "paced"  # ``run_route.tier_reason`` suffix: ``<reason>+paced:<paced providers>``
+ _LOCK = threading.Lock()
+ _OFFERS: dict[str, tuple[float, tuple[str, str], tuple[str, str, str]]] = {}
+@@ -35,15 +41,41 @@ def offer(task_id: str, judged: tuple, moved: tuple[str, str, str]) -> None:
+         _OFFERS[task_id] = (now, _norm(judged), moved)
+ 
+ 
++class OfferLost(RuntimeError):
++    """The card was admitted on a pace move that can no longer be applied; it must not start on the held route."""
++
++
++def withdraw(task_id: str) -> None:
++    """Drop ``task_id``'s outstanding offer (the governor is judging the card afresh)."""
++    with _LOCK:
++        _OFFERS.pop(task_id, None)
++
++
+ def take(task_id: str, resolved: tuple) -> Optional[tuple[str, str, str]]:
+-    """The move offered for ``task_id`` when it is fresh and was judged on the ``resolved`` route; consumed either way."""
++    """The move offered for ``task_id``, consumed; None when there is no offer (an ordinary admission).
++
++    Raises :class:`OfferLost` when an offer exists but expired or was judged on another route than ``resolved``."""
+     with _LOCK:
+         found = _OFFERS.pop(task_id, None)
+-    if found is None or time.monotonic() - found[0] >= TTL_SECONDS or found[1] != _norm(resolved):
++    if found is None:
+         return None
++    if time.monotonic() - found[0] >= TTL_SECONDS:
++        raise OfferLost(f"pace reroute offer for {task_id} expired before launch; requeued for a fresh pace judgment")
++    if found[1] != _norm(resolved):
++        raise OfferLost(f"pace reroute offer for {task_id} was judged on {found[1]}, launch resolved "
++                        f"{_norm(resolved)}; requeued for a fresh pace judgment")
+     return found[2]
+ 
+ 
++def lose(task_id: str, why: str) -> None:
++    """Fail closed for a card whose launch route could not be resolved: :class:`OfferLost` if it held an offer."""
++    with _LOCK:
++        found = _OFFERS.pop(task_id, None)
++    if found is not None:
++        raise OfferLost(f"pace reroute offer for {task_id} cannot be applied ({why}); requeued for a fresh pace "
++                        "judgment")
++
++
+ def clear() -> None:
+     with _LOCK:
+         _OFFERS.clear()
+diff --git a/hermes_cli/kanban_review_model.py b/hermes_cli/kanban_review_model.py
+index 8145dea4f930666727445621ea8cde7881613eae..6bcf8e982ec0be91f0d25ad1e850b198936de508 100644
+--- a/hermes_cli/kanban_review_model.py
++++ b/hermes_cli/kanban_review_model.py
+@@ -149,7 +149,8 @@ def admission_refusal(conn, task_id, exc):
+     from tools.process_registry import RestartSafeScopeUnavailable
+     if isinstance(exc, ReviewModelUnavailable) and deferral_exhausted(conn, task_id, str(exc)):
+         return False, True, {"admission_refusal": "review_model_unavailable", "deferrals": DEFERRAL_LIMIT}
+-    return isinstance(exc, (RestartSafeScopeUnavailable, ReviewModelUnavailable)), False, None
++    from hermes_cli.kanban_pace_reroute import OfferLost  # a lapsed pace move: requeue for a fresh judgment
++    return isinstance(exc, (RestartSafeScopeUnavailable, ReviewModelUnavailable, OfferLost)), False, None
+ 
+ 
+ def _distinct_deep(pin, assignee, *, registered=False):
+diff --git a/hermes_cli/kanban_source_launch.py b/hermes_cli/kanban_source_launch.py
+index 21f1e0681b67f85631eaacdb918fc85c8f619c47..31e234703f12cd1d3cb6de9dfc66b797924f2dac 100644
+--- a/hermes_cli/kanban_source_launch.py
++++ b/hermes_cli/kanban_source_launch.py
+@@ -324,8 +324,7 @@ def launch(conn: sqlite3.Connection, claimed: Any, workspace: Any, branch: Optio
+         # Admission failed before any worker ran; preserve its retry budget (a repeated review refusal: visible block).
+         infrastructure, exhausted, extra = admission_refusal(conn, claimed.id, exc)
+         if infrastructure:
+-            dispatch._kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s",
+-                                      claimed.id, exc)
++            dispatch._kb._log.warning("kanban dispatcher: spawn of %s deferred without penalty: %s", claimed.id, exc)
+         if run is not None:
+             not_started = stage == "pre_spawn" or (stage == "spawning" and isinstance(exc, _not_started_types()))
+             abort_attached(conn, claimed, run, not_started=not_started, pid=pid, outcome="spawn_failed",
+diff --git a/tests/hermes_cli/test_kanban_pace_reroute.py b/tests/hermes_cli/test_kanban_pace_reroute.py
+index af9545f4d39ce0f3e18a6cbef8ae080bb0474658..cf9b5c81c1c339f1e8b91a99eea051b6118a4c4c 100644
+--- a/tests/hermes_cli/test_kanban_pace_reroute.py
++++ b/tests/hermes_cli/test_kanban_pace_reroute.py
+@@ -248,22 +248,115 @@ def test_profile_fallback_route_keeps_the_hold(pool, monkeypatch, config):
+ 
+ def test_offer_applies_only_to_the_route_it_judged():
+     reroute.clear()
++    assert reroute.take("t1", ("gpt-6-astra", "openai-codex")) is None  # no offer: an ordinary admission
+     reroute.offer("t1", ("gpt-6-astra", "openai-codex"), ("grok-4.7", "xai-oauth", "openai-codex"))
+-    assert reroute.take("t1", ("claude-opus-5-5", "anthropic")) is None  # the route moved since: no move
++    with pytest.raises(reroute.OfferLost):  # the route moved since: the admission it rested on is gone
++        reroute.take("t1", ("claude-opus-5-5", "anthropic"))
+     assert reroute.take("t1", ("gpt-6-astra", "openai-codex")) is None  # consumed by the first take
+     reroute.offer("t1", ("gpt-6-astra", "OpenAI-Codex"), ("grok-4.7", "xai-oauth", "openai-codex"))
+     assert reroute.take("t1", ("gpt-6-astra", "openai-codex")) == ("grok-4.7", "xai-oauth", "openai-codex")
+ 
+ 
+-def test_stale_offer_is_ignored(monkeypatch):
++def test_stale_offer_fails_closed(monkeypatch):
+     reroute.clear()
+     now = [1000.0]
+     monkeypatch.setattr(reroute.time, "monotonic", lambda: now[0])
+     reroute.offer("t1", ("gpt-6-astra", "openai-codex"), ("grok-4.7", "xai-oauth", "openai-codex"))
+     now[0] += reroute.TTL_SECONDS
++    with pytest.raises(reroute.OfferLost):
++        reroute.take("t1", ("gpt-6-astra", "openai-codex"))
++    reroute.offer("t1", ("gpt-6-astra", "openai-codex"), ("grok-4.7", "xai-oauth", "openai-codex"))
++    reroute.withdraw("t1")
+     assert reroute.take("t1", ("gpt-6-astra", "openai-codex")) is None
+ 
+ 
++def _lapse_during_prepare(monkeypatch, lapse):
++    """Run ``lapse()`` inside the claimed card's workspace preparation (between the governor's offer and the take)."""
++    from hermes_cli import kanban_source_launch as launch
++    prepare = launch._prepare
++
++    def slow_prepare(*args, **kwargs):
++        lapse()
++        return prepare(*args, **kwargs)
++    monkeypatch.setattr(launch, "_prepare", slow_prepare)
++
++
++def _expire(monkeypatch):
++    """A clock that jumps past the offer's TTL during the first launch only."""
++    now, fired = [1000.0], []
++    monkeypatch.setattr(reroute.time, "monotonic", lambda: now[0])
++
++    def lapse():
++        if not fired:
++            fired.append(True)
++            now[0] += reroute.TTL_SECONDS + 1
++    return lapse
++
++
++def _requeued_without_penalty(conn, tid):
++    task = kb.get_task(conn, tid)
++    assert task.status == "ready" and not task.claim_lock
++    assert int(task.consecutive_failures or 0) == 0
++    assert _route_receipt(conn, tid) is None
++
++
++@pytest.mark.parametrize("title", ["routine work", "security work"])
++def test_offer_expiring_during_launch_refuses_spawn(pool, strong_pattern, monkeypatch, title):
++    """Review t_4a9207abeea5da73: a slow claim outlived the offer and the card started on the held Codex route."""
++    _pools(monkeypatch, {"anthropic": 99, "openai-codex": 99})
++    _lapse_during_prepare(monkeypatch, _expire(monkeypatch))
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title=title, assignee="a")
++        seen, _ = _dispatch(conn)
++        assert seen == []
++        _requeued_without_penalty(conn, tid)
++        seen, result = _dispatch(conn)  # requeued like any refused admission: spaced by the infrastructure cooldown
++        assert seen == [] and result.respawn_guarded and "infrastructure_cooldown" in str(result.respawn_guarded)
++        monkeypatch.setattr(kb, "_resolve_rate_limit_cooldown_seconds", lambda: 0)
++        seen, _ = _dispatch(conn)  # the next tick judges it afresh and starts it on Grok
++        assert seen == [(tid, *GROK)]
++
++
++@pytest.mark.parametrize("title", ["routine work", "security work"])
++def test_offer_for_another_route_refuses_spawn(pool, strong_pattern, monkeypatch, title):
++    _pools(monkeypatch, {"anthropic": 99, "openai-codex": 99})
++    resolve = tier.resolve_dispatch_tier
++
++    def moved_route():  # the card's route changed between the governor's read and the launch
++        monkeypatch.setattr(tier, "resolve_dispatch_tier",
++                            lambda *a, **k: ("claude-sonnet-5-5", "anthropic", resolve(*a, **k)[2]))
++    _lapse_during_prepare(monkeypatch, moved_route)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title=title, assignee="a")
++        seen, _ = _dispatch(conn)
++        assert seen == []
++        _requeued_without_penalty(conn, tid)
++
++
++def test_offer_for_an_unresolvable_route_refuses_spawn(pool, monkeypatch):
++    _pools(monkeypatch, {"anthropic": 99, "openai-codex": 99})
++
++    def broken():
++        def fail(*_a, **_k):
++            raise RuntimeError("resolver down")
++        monkeypatch.setattr(tier, "resolve_dispatch_tier", fail)
++    _lapse_during_prepare(monkeypatch, broken)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="routine work", assignee="a")
++        seen, _ = _dispatch(conn)
++        assert seen == []
++        _requeued_without_penalty(conn, tid)
++
++
++def test_an_earlier_ticks_offer_never_steers_an_ordinary_admission(pool, monkeypatch):
++    _pools(monkeypatch, {"anthropic": 5, "openai-codex": 5})
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="routine work", assignee="a")
++        reroute.offer(tid, ("gpt-6-astra", "openai-codex"), (*GROK, "openai-codex"))  # left by a claim that never ran
++        seen, _ = _dispatch(conn)
++        assert seen == [(tid, "gpt-6-astra", "openai-codex")]
++
++
+ @pytest.fixture
+ def resolver_first(pool, monkeypatch):
+     """The shipped default: the resolver's far-hold move (reroute_after_s 3600) runs before the governor's."""
+-- 
+2.43.0
+

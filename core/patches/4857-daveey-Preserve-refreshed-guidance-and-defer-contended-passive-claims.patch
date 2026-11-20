@@ -1,0 +1,105 @@
+From 22a582c52a7f6fce6ae205292b59d84764f2ce7f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 15:19:38 +0000
+Subject: [PATCH] [daveey] Preserve refreshed guidance and defer contended
+ passive claims
+
+---
+ gateway/kanban_wake_fold.py                        |  3 +--
+ tests/gateway/test_kanban_remote_owner_delivery.py | 11 +++++++++--
+ tests/tui_gateway/test_kanban_remote_rehome.py     | 13 +++++++++++++
+ tui_gateway/kanban_remote_notices.py               | 14 +++++++++-----
+ 4 files changed, 32 insertions(+), 9 deletions(-)
+
+diff --git a/gateway/kanban_wake_fold.py b/gateway/kanban_wake_fold.py
+index bbb4ddeb6246d2f7124aaaa4c9503675fe2210ff..d5ab1332856a40960d29db38f854d4d966157f8a 100644
+--- a/gateway/kanban_wake_fold.py
++++ b/gateway/kanban_wake_fold.py
+@@ -290,8 +290,7 @@ def _guidance(text, cards):
+     tail = '\n'.join(rest).rstrip()
+     if tail and text.find(tail, pos) < 0 and f"[kanban] Task {last.get('task_id')} " in text:
+         # A relabel removes the obsolete ask; an ask-only tail becomes a one-line card.
+-        tail = '\n'.join(line for line in rest if not line.startswith(
+-            ('Next action for the user:', 'Why only the user:', 'Scope:', 'Open task:'))).rstrip()
++        tail = '\n'.join(_without_superseded_ask(rest)).rstrip()
+     if tail:
+         end = text.find(tail, pos)
+         if end < 0:
+diff --git a/tests/gateway/test_kanban_remote_owner_delivery.py b/tests/gateway/test_kanban_remote_owner_delivery.py
+index ca283b4777e2608b977b6a9804c7f24009cbf00b..13277fb4d9b650282a48b33824204e591140ca09 100644
+--- a/tests/gateway/test_kanban_remote_owner_delivery.py
++++ b/tests/gateway/test_kanban_remote_owner_delivery.py
+@@ -79,12 +79,19 @@ def test_resolved_real_notice_drops_multiline_ask_presentation(monkeypatch, drop
+     assert 'Next action for the user:' in text
+     item = {'ref': f'worker-6/default/default/{tid}', 'state': 'blocked@1', 'event_key': 'key',
+             'text': text + '\nKeep other context'}
+-    monkeypatch.setattr(kanban_wake_fold, '_live_task', lambda _: ('done', 'Finished'))
+-    result = kanban_wake_fold._compose([kro._metadata(item)['kanban_cards'][0]], GUIDANCE, strict=True)
++    monkeypatch.setattr(kanban_wake_fold, '_live_task', lambda _: ('ready', ''))
++    card = kro._metadata(item)['kanban_cards'][0]
++    result = kanban_wake_fold._compose([card], GUIDANCE, strict=True)
+     for stale in ('Then unblock', 'can grant access', 'and its credentials', 'Your step is still needed',
+                   'NOT resume', 'Use the owner Desktop', 'Next action for the user:'):
+         assert stale not in result
+     assert 'Keep other context' in result and result.endswith(GUIDANCE)
++    payload = {'text': result, 'local_automation_v1': {
++        'identity': json.dumps(['kanban-wake', 'id']), 'kanban_cards': [card]}}
++    monkeypatch.setattr(kanban_wake_fold, '_live_task', lambda _: ('done', 'Finished'))
++    kanban_wake_fold.refresh_claimed(payload)
++    assert 'Result: Finished' in payload['text']
++    assert payload['text'].endswith(GUIDANCE)
+ 
+ 
+ def test_remote_blocked_metadata_preserves_premise_and_board():
+diff --git a/tests/tui_gateway/test_kanban_remote_rehome.py b/tests/tui_gateway/test_kanban_remote_rehome.py
+index baf0ee9b54b509724275377c69a03580ba7000e6..410bd8f5d59b44d79202a3d86eceaf28e29116e8 100644
+--- a/tests/tui_gateway/test_kanban_remote_rehome.py
++++ b/tests/tui_gateway/test_kanban_remote_rehome.py
+@@ -95,6 +95,19 @@ def test_live_holder_keeps_custody_after_home_move(tmp_path):
+     assert krn.collect(once.CHAT, 'default', hub_db=hub, ledger=ledger, now=now + 20) == []
+ 
+ 
++def test_passive_claim_contention_never_falls_back_to_unclaimed_write(tmp_path, monkeypatch):
++    now = time.time()
++    hub = once._hub(tmp_path, now)
++    ledger = tmp_path / 'ledger.db'
++    def busy(*args, **kwargs):
++        raise sqlite3.OperationalError('database is locked')
++    monkeypatch.setattr(krn, '_claim_notice', busy)
++    with once._chat(tmp_path) as (db, opener):
++        assert krn.sweep_remote_notices(replica_path=hub, gateway='macbook', session_db=opener,
++                                        ledger=ledger, now=now, waker=None) == []
++        assert db.get_messages(once.CHAT) == []
++
++
+ def test_passive_failed_write_releases_claim_for_retry(tmp_path, monkeypatch):
+     now = time.time()
+     hub = once._hub(tmp_path, now)
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 3aec22eaa48e68c3d03347f3e2f55d0f87c2fbed..637bffd02b017f10f951035e88f66de337ea98bc 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -1365,11 +1365,15 @@ def _deliver_link(owner, key, task, link, *, me, ref, state, path, live, session
+                 return
+             if waker is None:
+                 # The passive sweep historically works in memory when its ledger is unavailable.
+-                with contextlib.suppress(sqlite3.Error, OSError), contextlib.closing(_ledger(ledger)) as conn:
+-                    verdict = _claim_notice(conn, session=sid, ref=ref, state=state, now=now or time.time(),
+-                                            fresh=True, notice_key=event_key, task_id=str(task['id']),
+-                                            swept_key=memo_key,
+-                                            transcript_has=lambda k, t: notice_in_transcript(db, tip, k, t))
++                conn = None
++                with contextlib.suppress(sqlite3.Error, OSError):
++                    conn = _ledger(ledger)
++                if conn is not None:
++                    with contextlib.closing(conn):
++                        verdict = _claim_notice(conn, session=sid, ref=ref, state=state, now=now or time.time(),
++                                                fresh=True, notice_key=event_key, task_id=str(task['id']),
++                                                swept_key=memo_key,
++                                                transcript_has=lambda k, t: notice_in_transcript(db, tip, k, t))
+                     if verdict not in ('offer', 'acked'):
+                         return
+                 from tui_gateway.kanban_notice_session_store import notice_writer
+-- 
+2.43.0
+

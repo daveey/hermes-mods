@@ -1,0 +1,551 @@
+From 0002f69fbb577e969ab037a7d354e4dfcbe6ab16 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:37:37 +0000
+Subject: [PATCH] [daveey] Make quoted-subscript classification incremental per
+ simple command
+
+Review 5906053691 (t_d2a1c07ed00e87ab): one simple command with N quoted
+subscript-like words re-tokenized its whole prefix per word, O(N x len).
+QuotedNameClassifier now resumes tokenization at the previously classified
+word and reuses a word's verdict for its later brackets, so each source
+character is tokenized O(1) times; command position resolves from at most
+64 leading words (fail closed beyond). Quoted compound-array elements,
+a=("x[...]"), are values, not subscripts. The real-Bash prior-expansion
+cross product is split into 4 wrapper shards under the per-file time cap.
+---
+ .../test_lifecycle_guard_subscript_linear.py  |  66 ++++++++-
+ .../test_lifecycle_guard_subscript_prefix.py  |  15 +-
+ ...lifecycle_guard_subscript_prefix_shard1.py |  21 +++
+ ...lifecycle_guard_subscript_prefix_shard2.py |  21 +++
+ ...lifecycle_guard_subscript_prefix_shard3.py |  21 +++
+ tools/shell_arith_sink.py                     |  20 +--
+ tools/shell_command_position.py               | 136 +++++++++++++-----
+ tools/shell_prefix_expansions.py              |  63 +++++++-
+ 8 files changed, 303 insertions(+), 60 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_subscript_prefix_shard1.py
+ create mode 100644 tests/cron/test_lifecycle_guard_subscript_prefix_shard2.py
+ create mode 100644 tests/cron/test_lifecycle_guard_subscript_prefix_shard3.py
+
+diff --git a/tests/cron/test_lifecycle_guard_subscript_linear.py b/tests/cron/test_lifecycle_guard_subscript_linear.py
+index 8bd04e7143483f7137d747ded63cfb44f067e351..d0f1ab2c257fe7e6d94fe3be3e8dfb94649c5225 100644
+--- a/tests/cron/test_lifecycle_guard_subscript_linear.py
++++ b/tests/cron/test_lifecycle_guard_subscript_linear.py
+@@ -7,6 +7,7 @@ import pytest
+ 
+ import tools.shell_arith_sink as arith_sink
+ from cron.lifecycle_guard import scan_gateway_lifecycle
++from tools.shell_command_position import QuotedNameClassifier, quoted_name_is_arithmetic
+ from tools.shell_heredoc import output_reaches_shell
+ 
+ PRODUCER = "$(echo 'b[$(bash ./big.sh)]')"
+@@ -14,14 +15,15 @@ PRODUCER = "$(echo 'b[$(bash ./big.sh)]')"
+ 
+ @pytest.fixture
+ def prefix_lengths(monkeypatch):
++    """Lengths of the source spans the classifier tokenizes, one per tokenization."""
+     lengths = []
+-    real = arith_sink.quoted_name_is_arithmetic
++    real = QuotedNameClassifier._tokenize
+ 
+-    def counting(prefix):
+-        lengths.append(len(prefix))
+-        return real(prefix)
++    def counting(self, command, start):
++        lengths.append(start - self._resume)
++        return real(self, command, start)
+ 
+-    monkeypatch.setattr(arith_sink, "quoted_name_is_arithmetic", counting)
++    monkeypatch.setattr(QuotedNameClassifier, "_tokenize", counting)
+     return lengths
+ 
+ 
+@@ -52,6 +54,60 @@ def test_python_program_word_is_classified_once(prefix_lengths):
+     assert len(prefix_lengths) <= 1
+ 
+ 
++# One simple command with thousands of quoted subscript-like words (review 5906053691):
++# each tokenization resumes at the previous word, so the total stays linear.
++ONE_COMMAND = [
++    "echo " + " ".join(f'"a[{i}]"' for i in range(2000)),
++    "git add " + " ".join(f'"src/m{i}/f[{i}].py"' for i in range(2000)),
++    "printf %s " + " ".join(f'"a[{i}]" "b"[{i}]' for i in range(1000)),
++    "a=1 " * 100 + "echo " + " ".join(f'"a[{i}]"' for i in range(2000)),
++    'echo "' + "".join(f'a[{i}]"x"' for i in range(2000)) + '"',
++    'echo "' + "".join(f'a[{i}]$(n)' for i in range(2000)) + '"',
++    "a=(" + " ".join(f'"x{i}[{i}]"' for i in range(2000)) + ")",
++]
++
++
++@pytest.mark.parametrize("command", ONE_COMMAND)
++def test_one_command_with_many_quoted_words_tokenizes_linearly(prefix_lengths, command):
++    arith_sink.substitution_in_arithmetic(command, date_exempt=True)
++    assert sum(prefix_lengths) <= 2 * len(command)
++
++
++@pytest.mark.parametrize("command", ONE_COMMAND[:2])
++def test_one_command_with_many_quoted_words_scans_fast(tmp_path, command):
++    import time
++    began = time.perf_counter()
++    scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert time.perf_counter() - began < 5  # ~0.2 s linear; minutes when quadratic
++
++
++@pytest.mark.parametrize("seed", range(40))
++def test_incremental_classification_matches_whole_prefix(seed):
++    import random
++    rng = random.Random(seed)
++    pool = ['unset', 'printf', '-v', 'echo', 'test', 'command', 'a=1', 'if', 'time',
++            '"a[1]"', '"b"[2]', "'q'\"c[3]\"", '2>"e[4]"', '>|', '"f[5]"x"g[6]"',
++            'x\\\n"d[7]"', '$(echo "h[8]")', '"i[9]$(n m)j[0]"', '"k[1]" "l[2]"', '#c']
++    command = " ".join(rng.choice(pool) for _ in range(rng.randint(1, 12)))
++    classifier = QuotedNameClassifier(0)
++    quote = ""
++    for at, ch in enumerate(command):
++        if ch == '"' and command[at - 1:at] != "\\":
++            quote = "" if quote else '"'
++        if ch != "[" or not quote or command[at - 1] in " \"'":
++            continue
++        assert classifier.classify(command, at) == quoted_name_is_arithmetic(command[:at]), (
++            command, at)
++
++
++def test_quoted_compound_array_element_is_data():
++    assert not arith_sink.substitution_in_arithmetic('arr=("x[$(cat f)]")', date_exempt=True)
++    assert not arith_sink.substitution_in_arithmetic(
++        'declare -a arr=("[$(cat f)]=1" "y")', date_exempt=True)
++    assert arith_sink.substitution_in_arithmetic('arr=([$(cat f)]=1)', date_exempt=True)
++    assert arith_sink.substitution_in_arithmetic('declare -a "x=([$(cat f)]=1)"', date_exempt=True)
++
++
+ SINKS = [
+     'echo hi; unset "a[{p}]"',
+     'echo hi && unset "a[{p}]"',
+diff --git a/tests/cron/test_lifecycle_guard_subscript_prefix.py b/tests/cron/test_lifecycle_guard_subscript_prefix.py
+index 2b3dfcc5f69bb86412350e286d08b30e3b647377..be03e9eb361e117123a3ffb6eb229f2f2c3329c9 100644
+--- a/tests/cron/test_lifecycle_guard_subscript_prefix.py
++++ b/tests/cron/test_lifecycle_guard_subscript_prefix.py
+@@ -26,18 +26,27 @@ BUILTINS = [
+ ]
+ 
+ 
+-@pytest.fixture(scope="module")
+-def marker_payload(tmp_path_factory):
++def write_marker_payload(tmp_path_factory):
+     payload = tmp_path_factory.mktemp("prefix-payload") / "big.sh"
+     payload.write_text("#" + "padding" * 200000 + "\nprintf ran > marker\n")
+     return payload
+ 
+ 
++@pytest.fixture(scope="module")
++def marker_payload(tmp_path_factory):
++    return write_marker_payload(tmp_path_factory)
++
++
+ @pytest.mark.parametrize("name", NAMES)
+ @pytest.mark.parametrize("prior", PRIOR)
+ @pytest.mark.parametrize("builtin", BUILTINS)
+-@pytest.mark.parametrize("wrapper", WRAPPERS)
++@pytest.mark.parametrize("wrapper", WRAPPERS[0::4])
+ def test_prior_expansion_cross_product(tmp_path, marker_payload, name, prior, builtin, wrapper):
++    """Wrapper shard 0 of 4; shards 1-3 live in ..._prefix_shard{1,2,3}.py (per-file time cap)."""
++    check_prior_expansion(tmp_path, marker_payload, name, prior, builtin, wrapper)
++
++
++def check_prior_expansion(tmp_path, marker_payload, name, prior, builtin, wrapper):
+     bash = shutil.which("bash")
+     if bash is None:
+         pytest.skip("Bash required for execution evidence")
+diff --git a/tests/cron/test_lifecycle_guard_subscript_prefix_shard1.py b/tests/cron/test_lifecycle_guard_subscript_prefix_shard1.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3d65fdbe40430fd2e61584ef72a29bb1cf841e65
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_subscript_prefix_shard1.py
+@@ -0,0 +1,21 @@
++"""Wrapper shard 1 of 4 of the prior-expansion cross product (per-file time cap)."""
++
++import pytest
++
++from tests.cron.test_lifecycle_guard_subscript_prefix import (
++    BUILTINS, PRIOR, check_prior_expansion, write_marker_payload,
++)
++from tests.cron.test_lifecycle_guard_subscript_quotes import NAMES, WRAPPERS
++
++
++@pytest.fixture(scope="module")
++def marker_payload(tmp_path_factory):
++    return write_marker_payload(tmp_path_factory)
++
++
++@pytest.mark.parametrize("name", NAMES)
++@pytest.mark.parametrize("prior", PRIOR)
++@pytest.mark.parametrize("builtin", BUILTINS)
++@pytest.mark.parametrize("wrapper", WRAPPERS[1::4])
++def test_prior_expansion_cross_product_shard(tmp_path, marker_payload, name, prior, builtin, wrapper):
++    check_prior_expansion(tmp_path, marker_payload, name, prior, builtin, wrapper)
+diff --git a/tests/cron/test_lifecycle_guard_subscript_prefix_shard2.py b/tests/cron/test_lifecycle_guard_subscript_prefix_shard2.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..93571f5232b4ccf628236f49fb8706f13f187733
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_subscript_prefix_shard2.py
+@@ -0,0 +1,21 @@
++"""Wrapper shard 2 of 4 of the prior-expansion cross product (per-file time cap)."""
++
++import pytest
++
++from tests.cron.test_lifecycle_guard_subscript_prefix import (
++    BUILTINS, PRIOR, check_prior_expansion, write_marker_payload,
++)
++from tests.cron.test_lifecycle_guard_subscript_quotes import NAMES, WRAPPERS
++
++
++@pytest.fixture(scope="module")
++def marker_payload(tmp_path_factory):
++    return write_marker_payload(tmp_path_factory)
++
++
++@pytest.mark.parametrize("name", NAMES)
++@pytest.mark.parametrize("prior", PRIOR)
++@pytest.mark.parametrize("builtin", BUILTINS)
++@pytest.mark.parametrize("wrapper", WRAPPERS[2::4])
++def test_prior_expansion_cross_product_shard(tmp_path, marker_payload, name, prior, builtin, wrapper):
++    check_prior_expansion(tmp_path, marker_payload, name, prior, builtin, wrapper)
+diff --git a/tests/cron/test_lifecycle_guard_subscript_prefix_shard3.py b/tests/cron/test_lifecycle_guard_subscript_prefix_shard3.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..73eeafe89a1250f901019dbbc95e3659628a9e58
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_subscript_prefix_shard3.py
+@@ -0,0 +1,21 @@
++"""Wrapper shard 3 of 4 of the prior-expansion cross product (per-file time cap)."""
++
++import pytest
++
++from tests.cron.test_lifecycle_guard_subscript_prefix import (
++    BUILTINS, PRIOR, check_prior_expansion, write_marker_payload,
++)
++from tests.cron.test_lifecycle_guard_subscript_quotes import NAMES, WRAPPERS
++
++
++@pytest.fixture(scope="module")
++def marker_payload(tmp_path_factory):
++    return write_marker_payload(tmp_path_factory)
++
++
++@pytest.mark.parametrize("name", NAMES)
++@pytest.mark.parametrize("prior", PRIOR)
++@pytest.mark.parametrize("builtin", BUILTINS)
++@pytest.mark.parametrize("wrapper", WRAPPERS[3::4])
++def test_prior_expansion_cross_product_shard(tmp_path, marker_payload, name, prior, builtin, wrapper):
++    check_prior_expansion(tmp_path, marker_payload, name, prior, builtin, wrapper)
+diff --git a/tools/shell_arith_sink.py b/tools/shell_arith_sink.py
+index 7c31e7bb037c0717d108eb0a465ee4892ebb2a16..d11f0ab8616655c1a939fa1327ea685f37e966ae 100644
+--- a/tools/shell_arith_sink.py
++++ b/tools/shell_arith_sink.py
+@@ -22,7 +22,7 @@ from __future__ import annotations
+ import bisect
+ import re
+ 
+-from tools.shell_command_position import quoted_name_is_arithmetic
++from tools.shell_command_position import QuotedNameClassifier
+ 
+ # `$(date +%s)` prints only digits: the one producer whose output arithmetic may hold.
+ DATE_PRODUCER_BODY = r"""[ \t]*date[ \t]+(?:\+%s|'\+%s'|"\+%s")[ \t]*\)"""
+@@ -52,7 +52,7 @@ _NOT_NAME_END = frozenset(" \t\n[],:=./+%^~")
+ 
+ # Frames are [kind, closer, depth, in_double_quotes]; command frames also carry the
+ # source start of their current simple command (so outer quotes cannot change nested
+-# command position) and the cached classification of the open double-quoted word.
++# command position) and that command's incremental quoted-word classifier.
+ _CMD, _ARITH, _PARAM = "cmd", "arith", "param"
+ _PARAM_ARITH = "param_arith"  # parameter word feeding an arithmetic evaluator
+ _PARAM_PATTERN = "param_pattern"  # only its replacement feeds the evaluator
+@@ -103,8 +103,6 @@ def substitution_in_arithmetic(command: str, *, date_exempt: bool, _depth: int =
+             if quoted and command[start - 1] == "$" and _subscript_word_before(command, stack, pos):
+                 return True  # `"$"(…)`: the `$` joins a later `(` after quote removal
+             top[3] = not quoted
+-            if kind == _CMD:
+-                top[5] = None  # a new quoted word: classify its subscripts afresh
+             continue
+         skipped = _skip_data(command, token, start, pos, quoted, stack, pending,
+                              date_exempt, _depth)
+@@ -134,18 +132,20 @@ def substitution_in_arithmetic(command: str, *, date_exempt: bool, _depth: int =
+ def _quoted_subscript_sink(command: str, start: int, top: list) -> bool:
+     """Whether the double-quoted ``[`` at *start* opens a builtin's array subscript.
+ 
+-    Linear overall: only a ``[`` that can follow a name is classified, at most once per
+-    quoted word (later brackets in it share the command and word), and only from the
+-    start of its own simple command.
++    Linear overall: only a ``[`` that can follow a name is classified, by one
++    incremental classifier per simple command (see ``QuotedNameClassifier``).
++    A quoted element of a compound array literal, ``a=("x[…]")``, is a plain value.
+     """
++    if top[1] == "array":
++        return False
+     index = start - 1
+     while index >= top[4] and command[index] in "\"'":
+         index -= 1
+     if index < top[4] or command[index] in _NOT_NAME_END:
+         return False
+-    if top[5] is None:
+-        top[5] = quoted_name_is_arithmetic(command[top[4]:start])
+-    return top[5]
++    if top[5] is None or top[5].base != top[4]:
++        top[5] = QuotedNameClassifier(top[4])
++    return top[5].classify(command, start)
+ 
+ 
+ def _compound_assignment_before(command: str, start: int) -> bool:
+diff --git a/tools/shell_command_position.py b/tools/shell_command_position.py
+index db71dd075a4d6d724cb8875b1e28abbed17f61f0..428c1ef82567f6378393b16d20a56393338a051a 100644
+--- a/tools/shell_command_position.py
++++ b/tools/shell_command_position.py
+@@ -5,7 +5,7 @@ from __future__ import annotations
+ import re
+ import shlex
+ 
+-from tools.shell_prefix_expansions import mask_prefix_expansions
++from tools.shell_prefix_expansions import mask_prefix_expansions, same_quoted_word
+ 
+ _RESERVED_PREFIX_WORDS = frozenset({
+     "if", "then", "else", "elif", "do", "while", "until", "!", "time", "coproc", "in", "{",
+@@ -57,49 +57,111 @@ def _builtin_index(words: list[str]) -> int:
+     return index
+ 
+ 
+-def _prefix_words(prefix: str) -> list[str] | None:
+-    words: list[str] = []
+-    redirect_target = False
+-    was_target = False
+-    for match in _PREFIX_TOKEN.finditer(mask_prefix_expansions(prefix.replace("\\\n", "")) + '"'):
+-        raw = match.group()
+-        was_target = redirect_target
+-        redirect_target = False
+-        if was_target:
+-            continue
+-        if _REDIRECTION_RE.fullmatch(raw):
+-            redirect_target = True
+-        elif raw in (";", "\n", "&", "|", "(", ")"):
+-            words.clear()
+-        else:
+-            words.append("".join(shlex.split(raw)))
+-    return None if was_target else words
+-
++# Command position is resolved from at most this many leading words. A command still
++# unresolved after them (all assignments, keywords or wrappers) fails closed, which
++# also keeps every classification of a long command O(1) in its earlier words.
++_RESOLVE_LIMIT = 64
+ 
+-def quoted_name_is_arithmetic(prefix: str) -> bool:
+-    """Whether the open double-quoted name at *prefix* is a builtin's target.
+ 
+-    The caller stops just before its subscript opener, inside double quotes. Close
+-    that quote for tokenization; literal separators remain data, not command starts.
+-    """
+-    try:
+-        words = _prefix_words(prefix)
+-    except (ValueError, RecursionError):
+-        return True  # An unrecognized word must not hide an arithmetic sink.
+-    if words is None:
+-        return False  # The current word is a redirection destination.
+-    index = _builtin_index(words)
++def _words_verdict(words: list[str]) -> bool:
++    """Whether the last of *words* (the open quoted word) is a builtin's target name."""
++    head = words[:_RESOLVE_LIMIT]
++    index = _builtin_index(head)
+     if index < 0:
+         return False  # Proven command introspection, not an unknown command.
+-    if index >= len(words):
++    if index >= len(head):
+         return True
+-    name, arguments = words[index], words[index + 1:]
++    name, count = words[index], len(words) - index - 1
+     if name in _NAME_CONSUMERS:
+-        return bool(arguments)
+-    if name == "printf" and len(arguments) == 1:
+-        return arguments[0].startswith("-v")
++        return count > 0
++    if name == "printf" and count == 1:
++        return words[-1].startswith("-v")
+     if name in ("printf", "test", "[", "[["):
+-        return len(arguments) >= 2 and arguments[-2] == "-v"
++        return count >= 2 and words[-2] == "-v"
+     # Unknown commands may be functions or builtins with arithmetic operands.
+     # Only positively identified data consumers may exempt a quoted subscript.
+     return name not in ("echo", "cat", "grep")
++
++
++class QuotedNameClassifier:
++    """Classify the quoted words of one simple command, in source order, in linear time.
++
++    Tokenization resumes at the start of the previously classified word (the only
++    word whose text could still grow), so each source character is tokenized O(1)
++    times however many quoted words the command has; further brackets in the same
++    word reuse its verdict after a linear walk of the new span.
++    """
++
++    def __init__(self, base: int):
++        self.base = base  # source offset where the simple command starts
++        self.scanned = 0  # source characters tokenized so far (regression tests read it)
++        self._resume = base  # source offset of the last classified word
++        self._words: list[str] = []  # words before _resume (truncated in place on resume)
++        self._kept = 0
++        self._target = False  # whether the word at _resume is a redirection target
++        self._checked: int | None = None  # source offset of the last classified bracket
++        self._verdict = False
++
++    def classify(self, command: str, start: int) -> bool:
++        """Whether the open double-quoted word ending at *start* is a builtin's target."""
++        if self._checked is not None and same_quoted_word(command, self._checked, start):
++            self._checked = start
++            return self._verdict
++        try:
++            self._verdict = self._tokenize(command, start)
++        except (ValueError, RecursionError):
++            self._checked = None
++            return True  # An unrecognized word must not hide an arithmetic sink.
++        return self._verdict
++
++    def _tokenize(self, command: str, start: int) -> bool:
++        segment = command[self._resume:start]
++        self.scanned += len(segment)
++        cleaned_from: list[int] = []
++        cleaned: list[str] = []
++        index = 0
++        while index < len(segment):  # drop line continuations, remembering offsets
++            if segment.startswith("\\\n", index):
++                index += 2
++                continue
++            cleaned.append(segment[index])
++            cleaned_from.append(index)
++            index += 1
++        masked_from: list[int] = []
++        masked = mask_prefix_expansions("".join(cleaned), masked_from,
++                                        comment_at_start=self._resume == self.base)
++        words = self._words
++        del words[self._kept:]
++        redirect_target = self._target
++        last = None
++        for match in _PREFIX_TOKEN.finditer(masked + '"'):
++            raw = match.group()
++            last = (match, words, len(words), redirect_target)
++            was_target, redirect_target = redirect_target, False
++            if was_target:
++                continue
++            if _REDIRECTION_RE.fullmatch(raw):
++                redirect_target = True
++            elif raw in (";", "\n", "&", "|", "(", ")"):
++                words = []
++            else:
++                words.append("".join(shlex.split(raw)))
++        self._checked = None
++        if last is None or last[0].end() != len(masked) + 1 or last[0].start() >= len(masked):
++            raise ValueError("open quoted word not found")
++        match, kept_words, kept, was_target = last
++        self._resume += cleaned_from[masked_from[match.start()]]
++        self._words, self._kept, self._target = kept_words, kept, was_target
++        self._checked = start
++        if was_target:
++            return False  # The current word is a redirection destination.
++        return _words_verdict(words)
++
++
++def quoted_name_is_arithmetic(prefix: str) -> bool:
++    """Whether the open double-quoted name at *prefix* is a builtin's target.
++
++    The caller stops just before its subscript opener, inside double quotes. Close
++    that quote for tokenization; literal separators remain data, not command starts.
++    """
++    return QuotedNameClassifier(0).classify(prefix, len(prefix))
+diff --git a/tools/shell_prefix_expansions.py b/tools/shell_prefix_expansions.py
+index 414e18ab298138fa5fe718c98274a62edb5fd46a..41460539c69a7965e9f31a2b245197b028125ad6 100644
+--- a/tools/shell_prefix_expansions.py
++++ b/tools/shell_prefix_expansions.py
+@@ -64,28 +64,81 @@ def _opener(text: str, pos: int, quote: str) -> tuple[int, str] | None:
+     return (1, "`") if text[pos] == "`" else None
+ 
+ 
+-def mask_prefix_expansions(text: str) -> str:
+-    """Replace expansion bodies with one opaque word fragment, retaining quotes."""
++_MASK = "__expansion__"
++
++
++def mask_prefix_expansions(text: str, sources: list[int] | None = None, *,
++                           comment_at_start: bool = True) -> str:
++    """Replace expansion bodies with one opaque word fragment, retaining quotes.
++
++    When *sources* is given it receives, for each masked character, the index in
++    *text* it came from (a mask maps to its expansion's opener). *comment_at_start*
++    says whether a ``#`` at index 0 starts a comment, i.e. whether *text* begins a
++    command rather than resuming one mid-command at a word start.
++    """
+     pieces: list[str] = []
+     pos, quote = 0, ""
+     while pos < len(text):
+         char = text[pos]
+         if char == "\\" and quote != "'":
+-            pieces.append(text[pos:pos + 2])
++            piece = text[pos:pos + 2]
++            pieces.append(piece)
++            if sources is not None:
++                sources.extend(range(pos, pos + len(piece)))
+             pos += 2
+             continue
+-        comment_end = _comment_end(text, pos, quote)
++        comment_end = None if pos == 0 and not comment_at_start else _comment_end(text, pos, quote)
+         if comment_end is not None:
+             pos = comment_end
+             continue
+         nested = _opener(text, pos, quote) if quote != "'" else None
+         if nested is not None:
+             width, closer = nested
++            if sources is not None:
++                sources.extend([pos] * len(_MASK))
+             pos = _expansion_end(text, pos + width, closer)
+-            pieces.append("__expansion__")
++            pieces.append(_MASK)
+             continue
+         if char in "\"'" and (not quote or char == quote):
+             quote = "" if quote else char
+         pieces.append(char)
++        if sources is not None:
++            sources.append(pos)
+         pos += 1
+     return "".join(pieces)
++
++
++def same_quoted_word(text: str, start: int, end: int) -> bool:
++    """Whether *text[start:end]*, opened and closed inside double quotes, stays one word.
++
++    Expansions are skipped whole, so the walk is linear in the span. Anything this
++    lexical walk cannot vouch for (ANSI quoting, unterminated expansions) is False.
++    """
++    pos, quote = start, '"'
++    while pos < end:
++        char = text[pos]
++        if char == "\\" and quote != "'":
++            pos += 2
++            continue
++        if quote == "'":
++            quote = "" if char == "'" else quote
++            pos += 1
++            continue
++        if not quote and char in " \t\n\r;&|()<>":
++            return False  # an unquoted break: a later word of the command
++        if char == "$" and text[pos + 1:pos + 2] in ("'", '"'):
++            return False
++        nested = _opener(text, pos, quote)
++        if nested is not None:
++            width, closer = nested
++            try:
++                pos = _expansion_end(text, pos + width, closer)
++            except ValueError:
++                return False
++            continue
++        if char == '"':
++            quote = "" if quote else '"'
++        elif char == "'" and not quote:
++            quote = "'"
++        pos += 1
++    return pos == end and quote == '"'
+-- 
+2.43.0
+

@@ -1,0 +1,234 @@
+From 379b71bbb6d57e3f0422a61e9a50b9fb775477ea Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 16:45:09 +0000
+Subject: [PATCH] [daveey] Keep quoted echo parentheses out of substitution
+ command positions
+
+Cause: the flat shell-output regex treated a literal parenthesis in a double-quoted echo argument as a command boundary, cancelling quoted Python heredoc masking under login-shell alias scans.
+
+Reuse the existing heredoc-aware lexical walk to collect root literal-echo argument anchors only. Unknown commands, constructed command words, nested frames, arithmetic and uncertain heredoc framing retain conservative matching. Preserve direct output-sink rules on original text.
+
+Proof: main ab626f4f2cd3f931fb4559c5a3927b150fb06430 has 16 focused regression failures; candidate passes 40 regressions including generated real-Bash marker controls and bash -l oversized-data references. Five in-memory mutants killed (mask removal, direct-sink removal, unterminated heredoc trust, nested-frame trust, unknown-command trust). Historical operational script never executed.
+---
+ .../test_lifecycle_guard_quoted_echo_sink.py  | 96 +++++++++++++++++++
+ tools/shell_arith_sink.py                     | 23 ++++-
+ tools/shell_heredoc.py                        | 19 +++-
+ 3 files changed, 132 insertions(+), 6 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_quoted_echo_sink.py
+
+diff --git a/tests/cron/test_lifecycle_guard_quoted_echo_sink.py b/tests/cron/test_lifecycle_guard_quoted_echo_sink.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bd2a32bb7ada3f91741cd6913ada88d0072e6b7b
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_quoted_echo_sink.py
+@@ -0,0 +1,96 @@
++"""Literal quoted parentheses are not command-position substitution anchors."""
++
++import shlex
++import shutil
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from tools.shell_heredoc import output_reaches_shell, strip_inert_heredoc_bodies
++
++
++@pytest.mark.parametrize("prefix", ["", "revision ", "${v:-revision} "])
++@pytest.mark.parametrize("parens", ["(", "(("])
++@pytest.mark.parametrize("producer", ["$(printf revision)", "`printf revision`"])
++def test_quoted_parentheses_are_data(tmp_path, prefix, parens, producer):
++    suffix = f'echo "{prefix}{parens}{producer})"\n'
++    assert not output_reaches_shell(suffix)
++    big = tmp_path / "large-data"
++    big.write_text("# padding\n" * 150000, encoding="utf-8")
++    body = f'print({str(big)!r})\n'
++    script = "python3 <<'EOF'\n" + body + "EOF\n" + suffix
++    assert body not in strip_inert_heredoc_bodies(script)
++    path = tmp_path / "script.sh"
++    path.write_text(script, encoding="utf-8")
++    unsafe, reason = scan_gateway_lifecycle(f"bash -l {shlex.quote(str(path))}")
++    assert not unsafe, reason
++
++
++@pytest.mark.parametrize("shape", [
++    'echo "revision (SUB)"',
++    'echo "revision ((SUB))"',
++    '( SUB )',
++    '"SUB"',
++    'echo "revision (ok)"; SUB',
++    'echo "$( SUB )"',
++    'echo "revision (ok)"; eval "SUB"',
++])
++@pytest.mark.parametrize("substitution", ["$(printf %s PAYLOAD)", "`printf %s PAYLOAD`"])
++def test_generated_real_bash_output_execution(tmp_path, shape, substitution):
++    marker = tmp_path / "executed"
++    payload = tmp_path / "payload"
++    payload.write_text("#!/bin/bash\n: > " + shlex.quote(str(marker)) + "\n", encoding="utf-8")
++    payload.chmod(0o700)
++    command = shape.replace("SUB", substitution.replace("PAYLOAD", shlex.quote(str(payload))))
++    bash = shutil.which("bash")
++    assert bash is not None
++    result = subprocess.run([bash, "--noprofile", "--norc", "-c", command],
++                            capture_output=True, text=True, encoding="utf-8", timeout=10, check=False)
++    assert result.returncode == 0, result.stderr
++    executes = not shape.startswith('echo "revision (SUB)') and not shape.startswith('echo "revision ((SUB))')
++    assert marker.exists() is executes
++    assert output_reaches_shell(command) is executes
++
++
++@pytest.mark.parametrize("prefix", [
++    "cat <<'E'\n\"\nE\n",
++    "cat <<E\n\"\nE\n",
++    "echo $'escaped\\\'quote'\n",
++])
++def test_quote_like_data_does_not_mask_real_anchor(prefix):
++    assert output_reaches_shell(prefix + '( $(printf payload) )')
++
++
++def test_arithmetic_output_remains_a_sink():
++    assert output_reaches_shell('echo "($(( $(printf payload) )))"')
++
++
++@pytest.mark.parametrize("command", [
++    'bash -c "bash <(printf payload)"',
++    'echo "bash <(printf payload)"',  # preserve the existing broad direct-sink policy
++    'unknown "revision ($(printf revision))"',
++    './"($(printf payload))"',
++    'echo "$(echo \"revision ($(printf revision))\")"',
++    'echo `echo "revision ($(printf revision))"`',
++    'cat <(echo "revision ($(printf revision))")',
++    'cat <<EOF\necho "revision ($(printf revision))"',
++    'cat <<\'EOF\necho "revision ($(printf revision))"',
++])
++def test_uncertain_or_nested_context_keeps_original_sink(command):
++    assert output_reaches_shell(command)
++
++
++def test_quoted_parentheses_in_command_word_execute(tmp_path):
++    marker = tmp_path / "executed"
++    payload = tmp_path / "(payload)"
++    payload.write_text("#!/bin/bash\n: > " + shlex.quote(str(marker)) + "\n", encoding="utf-8")
++    payload.chmod(0o700)
++    command = './"($(printf payload))"'
++    bash = shutil.which("bash")
++    assert bash is not None
++    subprocess.run([bash, "--noprofile", "--norc", "-c", command], cwd=tmp_path,
++                   capture_output=True, timeout=10, check=True)
++    assert marker.exists()
++    assert output_reaches_shell(command)
++
+diff --git a/tools/shell_arith_sink.py b/tools/shell_arith_sink.py
+index 6964193a3afb1f68c76f2e36d17da9eb3f07faf5..3d4444f4aea165f861d35c77915ecf162fdcf3c5 100644
+--- a/tools/shell_arith_sink.py
++++ b/tools/shell_arith_sink.py
+@@ -46,6 +46,7 @@ _INTEGER_DECLARATION_RE = re.compile(
+     r"[ \t]+-[A-Za-z]*i")
+ _PARAM_NAME_RE = re.compile(r"[#!]?(?:[A-Za-z_]\w*|\d+|[@*#?$!-])")
+ _COMMENT_PRECEDERS = frozenset(" \t\n;&|(")
++_LITERAL_ECHO_PREFIX_RE = re.compile(r"[ \t]*echo[ \t]+")
+ 
+ # Characters that cannot end a variable name or an expansion: a quoted `[` after one
+ # (or after a quote concatenation ending in one) never names an array subscript.
+@@ -59,13 +60,16 @@ _PARAM_ARITH = "param_arith"  # parameter word feeding an arithmetic evaluator
+ _PARAM_PATTERN = "param_pattern"  # only its replacement feeds the evaluator
+ 
+ 
+-def substitution_in_arithmetic(command: str, *, date_exempt: bool, _depth: int = 0) -> bool:
++def substitution_in_arithmetic(command: str, *, date_exempt: bool, _depth: int = 0,
++                               _quoted_parens: list[int] | None = None) -> bool:
+     """Whether *command* holds a ``$(`` (not the exempt ``$(date +%s)`` when *date_exempt*)
+     whose nearest enclosing context is arithmetic.
+ 
+     Uncertain quoting and expanding heredoc bodies deliberately fail closed,
+     even for benign producers. Unmasked literal bodies are scanned as programs;
+-    only the caller may mask a proven-inert body.
++    only the caller may mask a proven-inert body. Optional ``_quoted_parens`` records
++    root literal-echo argument anchors (and -1 on uncertain heredoc framing); a
++    caller may use them only when this function returns False.
+     """
+     quick = _quick_result(command, _depth)
+     if quick is not None:
+@@ -102,7 +106,8 @@ def substitution_in_arithmetic(command: str, *, date_exempt: bool, _depth: int =
+         skipped = _word_token(command, token, start, pos, stack)
+         if skipped is None:
+             skipped = _skip_data(command, token, start, pos, quoted, stack, pending,
+-                                 date_exempt, _depth + sum(frame[0] == _CMD for frame in stack) - 1)
++                                 date_exempt, _depth + sum(frame[0] == _CMD for frame in stack) - 1,
++                                 _quoted_parens)
+         if skipped is not None:
+             if skipped < 0:
+                 return True
+@@ -115,6 +120,13 @@ def substitution_in_arithmetic(command: str, *, date_exempt: bool, _depth: int =
+             stack.append([_ARITH, "]", 0, False])
+             continue
+         if quoted:
++            # Certify only literal echo arguments, never an unknown command's
++            # operands or a constructed command word such as "($(producer))".
++            # Nested frames retain their original conservative matching.
++            if (_quoted_parens is not None and len(stack) == 1
++                    and token in ("(", "((")
++                    and _LITERAL_ECHO_PREFIX_RE.match(command, top[4], start)):
++                _quoted_parens.extend(range(start, pos))
+             continue  # inside "…" only expansions (handled above) matter
+         if kind == _CMD:
+             if (start, "case-pattern") in literal_cache:
+@@ -283,7 +295,8 @@ def _word_token(command, token, start, pos, stack) -> int | None:
+     return None
+ 
+ 
+-def _skip_data(command, token, start, pos, quoted, stack, pending, date_exempt, depth) -> int | None:
++def _skip_data(command, token, start, pos, quoted, stack, pending, date_exempt, depth,
++               quoted_parens=None) -> int | None:
+     """Skip literal spans; None means a normal token, -1 means fail closed."""
+     kind = stack[-1][0]
+     if token in ("'", "$'"):
+@@ -329,6 +342,8 @@ def _skip_data(command, token, start, pos, quoted, stack, pending, date_exempt,
+         if close is None:
+             # Opener-only caller views may omit bodies. Scan the remainder rather
+             # than hiding later sinks or unmatched quotes behind an unknown body.
++            if quoted_parens is not None:
++                quoted_parens.append(-1)  # no certified quote provenance for this view
+             break
+         body_end, after = close
+         # Unquoted bodies expand; quoted bodies may be programs for bash/ssh or
+diff --git a/tools/shell_heredoc.py b/tools/shell_heredoc.py
+index 42b8e6d51af1ad95934de476485546a9ebcf59c8..751ba373d2af119f112cbbea3d537cac79198b87 100644
+--- a/tools/shell_heredoc.py
++++ b/tools/shell_heredoc.py
+@@ -495,6 +495,9 @@ _SHELL_SINK_TEMPLATE = (
+     r"|(?:^|[\s;&|({])(?:source|\.)\s+(?:<\s*\(|/dev/(?:stdin|fd/)|/proc/self/fd/)"
+     rf"|{_WORD_START}{_SINK_SHELLS}{_WORD_END}[^|;&\n]*?(?:<\(|<<<)"
+     rf"|{_WORD_START}(?:ba|da|z|k|mk|a)?sh\s+(?:[-+][A-Za-z]+\s+)*-[A-Za-z]*c\s*\"?(?:\$\(|`)"
++)
++_DIRECT_OUTPUT_SINK_RE = re.compile(_SHELL_SINK_TEMPLATE, re.MULTILINE)
++_SHELL_SINK_TEMPLATE += (
+     # [ \t]* not \s*: newline is already an anchor, and \s* made this alternative quadratic on
+     # the all-newline bodies strip_inert_heredoc_bodies leaves (review 5890191993).
+     r"|(?:^|[;&|({\n]|\b(?:then|do|else)\b)[ \t]*\"?(?:\$\((?!\()")
+@@ -531,8 +534,20 @@ def output_reaches_shell(command: str) -> bool:
+     sink = _SHELL_SINK_NUMERIC_RE if date_exempt else _SHELL_SINK_RE
+     # The regex sees a substitution only in command position; inside arithmetic bash also runs
+     # code from its output wherever it sits (`$(( 1 + $(…) ))`, `a[$(…)]`; t_01a1d6ae05c19594).
+-    return (sink.search(command) is not None
+-            or substitution_in_arithmetic(command, date_exempt=date_exempt)
++    if _DIRECT_OUTPUT_SINK_RE.search(command):
++        return True
++    quoted_parens: list[int] = []
++    if substitution_in_arithmetic(command, date_exempt=date_exempt, _quoted_parens=quoted_parens):
++        return True
++    # Literal '(' inside a double-quoted word is not a shell command boundary.
++    # Use the existing heredoc/expansion-aware lexical walk, and only its complete
++    # successful proof; a flat quote pass would misread quotes in heredoc data.
++    if -1 in quoted_parens:
++        quoted_parens.clear()
++    lexical = list(command)
++    for index in quoted_parens:
++        lexical[index] = "x"
++    return (sink.search("".join(lexical)) is not None
+             or _grouped_pipe_reaches_shell(command, sink))
+ 
+ 
+-- 
+2.43.0
+

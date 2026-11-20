@@ -1,0 +1,202 @@
+From da3761138b80c294cc6908e039ac2069a73f6455 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 07:19:25 +0000
+Subject: [PATCH] [daveey] kanban chat waits: rewording does not reset
+ escalation; exempt ask wakes are bounded
+
+Adversarial review of the previous head: the repeat-park premise hashed the
+question (why/reason), so a worker rewording its re-ask after an orchestrator
+"not yet" never escalated, and with asks exempt from the wake budget that
+woke the orchestrator 8 times in 16 minutes.
+
+- premise_hash: a chat wait's premise is kind + gateway (the orchestrator it
+  waits on), declared, reclassified or inferred, so the third chat park in a
+  row escalates at REPARK_LIMIT whatever its wording.
+- kanban_unloaded: the budget exemption is once per chat and card per hour
+  (_ask_exempt_ok); later asks in that hour take the normal budget.
+- A declared chat wait with no probe and no clock_only was refused by the
+  long-park guard before its comment probe existed (tool and CLI): it is now
+  passed as a timed park, and park_probe adds the probe in the txn.
+
+Tests: reworded re-asks escalate on the third park; a declared chat wait parks
+with no probe or clock flag and gets the comment probe; the exemption is once
+per card per hour. 3 of 53 fail on the previous head; 18 neighbouring files
+(468 tests) pass.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_awaiting.py                | 18 +++++++-
+ hermes_cli/kanban_cli_park.py                |  2 +
+ tests/hermes_cli/test_kanban_decision_ask.py | 46 ++++++++++++++++++++
+ tools/kanban_tools.py                        |  2 +
+ tui_gateway/kanban_unloaded.py               | 17 +++++++-
+ 5 files changed, 83 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index 83752c37dcf5c40f1410ff1d5755fce2e1b3479c..e5df0d15fd0b9ef3c79368d1ca9b9897cccc8593 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -226,7 +226,12 @@ def premise_hash(awaiting: dict, reason: Optional[str], wake_check: Optional[str
+     pushed as a new head and a park on that head is new evidence, not the same premise. A PR-URL ref with
+     no per-head ``why`` folded every head into one premise and escalated the third fix round (PR #1806,
+     t_01a1d19e0179a093). The same head re-parked still counts, so a stuck head escalates. [daveey]"""
+-    if awaiting.get("inferred"):
++    if awaiting.get("kind") == CHAT:
++        # The orchestrator waited on, not the question's wording: a worker that rewords its question each park
++        # must still escalate at REPARK_LIMIT (adversarial review of #3647: an orchestrator answering "not yet"
++        # and a reworded re-ask woke it 8 times in 16 min with no escalation).
++        basis = "|".join(awaiting.get(k, "") for k in ("kind", "gateway"))
++    elif awaiting.get("inferred"):
+         basis = " ".join((reason or "").lower().split())[:400]
+     elif awaiting.get("kind") == RESOURCE:
+         # The gate, not its reading: "pool at 87%" and "pool at 88%" are one premise with no new evidence.
+@@ -503,6 +508,17 @@ def orchestrator_wait(text: Optional[str], ref: Optional[str] = None) -> bool:
+     return False
+ 
+ 
++def declared_chat_wait(awaiting: Optional[dict]) -> bool:
++    """A declared ``chat`` wait, or an ``external`` one the gate will record as ``chat``. Before the gate it has no
++    probe yet (:func:`wake_probe` adds it in the park txn), so the long-park guard treats it as timed."""
++    if not awaiting:
++        return False
++    if awaiting.get("kind") == CHAT:
++        return True
++    text = " ".join(str(awaiting.get(k) or "") for k in ("why", "ref"))
++    return awaiting.get("kind") == "external" and orchestrator_wait(text, awaiting.get("ref"))
++
++
+ def park_probe(conn: sqlite3.Connection, task_id: str, record: Optional[dict], wake_check: Optional[str],
+                clock_only: bool) -> tuple[Optional[str], bool]:
+     """``(wake_check, clock_only)`` for a park: the caller's probe, else :func:`wake_probe`'s. A chat wait that
+diff --git a/hermes_cli/kanban_cli_park.py b/hermes_cli/kanban_cli_park.py
+index 7ee78b00a8013436c0db5579bbade2e78f0a23be..ee3d7a89f3f5ef583b9bafe52e072191d482380e 100644
+--- a/hermes_cli/kanban_cli_park.py
++++ b/hermes_cli/kanban_cli_park.py
+@@ -77,6 +77,8 @@ def _cli_awaiting(args: argparse.Namespace, wake):
+     if probe:
+         from hermes_cli import kanban_wake_check as kwc
+         wake = (probe, kwc.normalize_every(None), wake[2])
++    elif not wake[0] and kaw.declared_chat_wait(awaiting):
++        wake = (wake[0], wake[1], True)  # its comment probe is added in the park txn (kanban_awaiting.park_probe)
+     # ssh/https, so before the park's write txn
+     kaw.confirm_remote(awaiting, hint=f"{wake[0] or ''} {getattr(args, 'reason', None) or ''}")
+     return awaiting, wake
+diff --git a/tests/hermes_cli/test_kanban_decision_ask.py b/tests/hermes_cli/test_kanban_decision_ask.py
+index c06fdc47f9f99876aae2377092b2d7050c8e3325..4ba494d6d859e7828d453b39d9809e4ecefc3a96 100644
+--- a/tests/hermes_cli/test_kanban_decision_ask.py
++++ b/tests/hermes_cli/test_kanban_decision_ask.py
+@@ -527,3 +527,49 @@ def test_spent_wake_budget_still_wakes_the_orchestrator_for_an_ask(kanban_home,
+                   spawn=lambda job: job())
+     assert len(wakes) == 1 and "parked until you decide" in wakes[0] and not rows, (wakes, rows)
+     ku._reset_wake_budget_for_tests()
++
++
++def test_reworded_chat_reask_still_escalates(kanban_home, monkeypatch) -> None:
++    """Adversarial review of #3647: the premise hashed the question, so a reworded re-ask never escalated."""
++    monkeypatch.setattr(kaw, "_supervisor_profile", lambda task: None)
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _subscribe(conn, tid)
++        for n in range(2):
++            _as_worker(monkeypatch, conn, tid)
++            out = _tool("schedule", {"reason": f"waiting for the owning orchestrator decision, round {n}",
++                                     "clock_only": True, "awaiting": {"kind": "chat", "ref": "owning orchestrator",
++                                                                      "why": f"premise A or B? (asked {n} times)"}})
++            assert out.get("status") == "scheduled", out
++            assert kb.unblock_task(conn, tid)
++            with kb.write_txn(conn):
++                conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++            assert kb.claim_task(conn, tid, claimer="worker") is not None
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": "still need the orchestrator's answer", "clock_only": True,
++                                 "awaiting": {"kind": "chat", "ref": "owning orchestrator",
++                                              "why": "which premise, A or B, please?"}})
++        assert out.get("code") == "repark_escalated" and out.get("status") == "todo", out
++
++
++def test_declared_chat_wait_needs_no_probe_or_clock_flag(kanban_home, monkeypatch) -> None:
++    """Adversarial review of #3647: the long-park guard refused a chat wait before its comment probe existed."""
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _subscribe(conn, tid)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": "SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting for the release go",
++                                 "awaiting": {"kind": "chat", "ref": "owning orchestrator", "why": "premise A or B?"}})
++        assert out.get("status") == "scheduled", out
++        assert "wait-comment" in kwc.get_state(conn, tid)["cmd"]
++
++
++def test_budget_exemption_is_once_per_card_per_hour() -> None:
++    from tui_gateway import kanban_unloaded as ku
++    ku._reset_wake_budget_for_tests()
++    ident = {"task_id": "t_0000aaaa"}
++    assert ku._ask_exempt_ok("chat-1", ident, 1000.0)
++    assert not ku._ask_exempt_ok("chat-1", ident, 1000.0 + 600)
++    assert ku._ask_exempt_ok("chat-1", {"task_id": "t_0000bbbb"}, 1000.0 + 600)  # another card's question
++    assert ku._ask_exempt_ok("chat-1", ident, 1000.0 + ku.ASK_EXEMPT_S)
++    ku._reset_wake_budget_for_tests()
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 6470aa796ca20d96daf145967fc971a14b8454cf..63e1222e7fc6183a983730dd091a7c068416c5fe 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -986,6 +986,8 @@ def _awaiting_arg(args: dict, wake: tuple) -> tuple[Optional[dict], tuple]:
+     if probe:
+         from hermes_cli import kanban_wake_check as kwc
+         wake = (probe, kwc.normalize_every(None), wake[2])
++    elif not wake[0] and kaw.declared_chat_wait(awaiting):
++        wake = (wake[0], wake[1], True)  # its comment probe is added in the park txn (kanban_awaiting.park_probe)
+     try:
+         kaw.confirm_remote(awaiting, hint=" ".join(str(x) for x in (wake[0], args.get("reason"), args.get("checkpoint")) if x))
+     except kaw.AwaitingError as exc:
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index d173c055eca6065f9d274b1ee05475e919fae6e3..002c7e53bf5983237e08071be571f1265a37d193 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -76,6 +76,8 @@ _sweeper_started = False
+ _sweeper_lock = threading.Lock()
+ _wake_lock = threading.Lock()
+ _wake_times: dict[str, list[float]] = {}  # chat -> recent started wakes (this process)
++_ask_exempt: dict[tuple[str, str], float] = {}  # (chat, card) -> last budget-exempt ask wake (this process)
++ASK_EXEMPT_S = 3600.0
+ _wake_slots = wake_slots.WakeSlots(MAX_PARALLEL_WAKES)
+ _slot_waits: dict[tuple, float] = {}  # remote notice -> when slots first refused it (this process)
+ 
+@@ -91,6 +93,7 @@ _overdue_warned: set[tuple[str, str, str]] = set()
+ def _reset_wake_budget_for_tests() -> None:
+     with _wake_lock:
+         _wake_times.clear()
++        _ask_exempt.clear()
+ 
+ 
+ def _reset_overdue_for_tests() -> None:
+@@ -465,7 +468,7 @@ def _deliver_sub(conn, slug, sub, ident, grace_s, now, session_db, _kb, _kbn, ki
+     # [daveey] A worker's question to its orchestrator is not budgeted: a passive row nobody reads leaves the card
+     # parked until its deadline (adversarial review of #3647). It cannot chain: each ask is a new park, and an
+     # identical re-park escalates at kanban_awaiting.REPARK_LIMIT.
+-    asks = any(getattr(e, "kind", "") == "decision_requested" for e in claimed)
++    asks = any(getattr(e, "kind", "") == "decision_requested" for e in claimed) and _ask_exempt_ok(tip, ident, now)
+     held_by, verdict = _route_notice(holders, ident, tip, slug, task, texts, now, grace_s, exempt_budget=asks)
+     if verdict == "skipped:slots" and _slots_may_wait(claimed, now):
+         # Every wake slot is busy: hand the range back so the next pass wakes the chat, instead of a passive row
+@@ -536,6 +539,18 @@ def _undelivered(db, tip, slug, claimed: list) -> list:
+     return [e for e in claimed if f"{slug}:{int(e.id)}" not in done]
+ 
+ 
++def _ask_exempt_ok(tip: str, ident: dict, now: float) -> bool:
++    """One budget-exempt ask wake per chat and card per ``ASK_EXEMPT_S``: an orchestrator answering "not yet" and a
++    re-park must not wake it without bound (the re-park also escalates at REPARK_LIMIT). Charged here."""
++    key = (tip, str(ident.get("task_id") or ""))
++    with _wake_lock:
++        last = _ask_exempt.get(key)
++        if last is not None and now - last < ASK_EXEMPT_S:
++            return False
++        _ask_exempt[key] = now
++        return True
++
++
+ def _route_notice(holders, ident, tip, slug, task, texts, now, grace_s,
+                   exempt_budget: bool = False) -> tuple[Optional[str], Optional[str]]:
+     """``(held_by, verdict)``: verdict None means a wake slot was taken and the caller must spawn the wake; any other
+-- 
+2.43.0
+

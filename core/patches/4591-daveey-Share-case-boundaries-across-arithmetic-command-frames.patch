@@ -1,0 +1,125 @@
+From 55fc9496d062985c6328fe19ef340e3a6ef8c3a1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 12:03:57 +0000
+Subject: [PATCH] [daveey] Share case boundaries across arithmetic command
+ frames
+
+Compose builtin-name parsing with the newly landed case-sink repair: populate cached whole-expansion boundaries and inspect command frames iteratively, preserving conservative malformed/budget policy without reparsing sliced bodies. Include enclosing frame depth when recursing into executable heredoc bodies.
+
+Proof: post-rebase 12 failures repaired; full lifecycle suite passed before depth follow-up. Advisory review depth regression proved RED then GREEN with existing case/data, numeric-date and malformed controls. Protected DATA lists unchanged.
+---
+ tests/cron/test_lifecycle_guard_case_sink.py | 13 ++++++++---
+ tests/tools/test_shell_builtin_names.py      |  4 +++-
+ tools/shell_arith_sink.py                    | 24 +++++++++-----------
+ 3 files changed, 24 insertions(+), 17 deletions(-)
+
+diff --git a/tests/cron/test_lifecycle_guard_case_sink.py b/tests/cron/test_lifecycle_guard_case_sink.py
+index f1108918f6bc2cc78bc021ced7914b138f19cb0e..de94a42dd9e29021ebb5cc1e853610051af86b64 100644
+--- a/tests/cron/test_lifecycle_guard_case_sink.py
++++ b/tests/cron/test_lifecycle_guard_case_sink.py
+@@ -36,12 +36,12 @@ def test_incomplete_substitution_stays_conservative(command):
+ 
+ 
+ def test_substitution_boundary_budget_stays_conservative(monkeypatch):
+-    from cron import lifecycle_guard_substitutions as substitutions
++    from tools import shell_prefix_expansions as substitutions
+ 
+     def exhausted(*args):
+-        raise substitutions.SubstitutionNestingLimit('test boundary budget')
++        raise RecursionError('test boundary budget')
+ 
+-    monkeypatch.setattr(substitutions, '_paren_end', exhausted)
++    monkeypatch.setattr(substitutions, '_expansion_end', exhausted)
+     assert substitution_in_arithmetic('echo $(echo ok)', date_exempt=True)
+ 
+ 
+@@ -55,6 +55,13 @@ def test_nested_body_charges_recursion_depth():
+     assert substitution_in_arithmetic('echo $(echo ok)', date_exempt=True, _depth=31)
+ 
+ 
++@pytest.mark.parametrize('levels, expected', [(10, False), (20, True)])
++def test_executable_heredoc_keeps_enclosing_substitution_depth(levels, expected):
++    inner = 'echo $(' * levels + 'echo ok' + ')' * levels
++    command = 'echo $(' * levels + "bash <<'EOF'\n" + inner + '\nEOF\n' + ')' * levels
++    assert substitution_in_arithmetic(command, date_exempt=True) is expected
++
++
+ def test_case_body_executed_device_still_fails_closed():
+     command = 'echo "$(echo "$(case x in x) echo " # ";; esac; bash /dev/null)")"'
+     unsafe, reason = scan_gateway_lifecycle(command)
+diff --git a/tests/tools/test_shell_builtin_names.py b/tests/tools/test_shell_builtin_names.py
+index acde6ce2002609b68d8143ef61920d2161ef6380..c1fd19aa555e74b830bf7d65ae3322761e8acccc 100644
+--- a/tests/tools/test_shell_builtin_names.py
++++ b/tests/tools/test_shell_builtin_names.py
+@@ -245,6 +245,8 @@ def test_nested_expansions_share_linear_boundary_scan(monkeypatch):
+         return original(*args)
+ 
+     monkeypatch.setattr(expansions, "_opener", counted)
+-    command = "echo $(" * 200 + "echo 'x'" + ")" * 200
++    command = "echo $(" * 20 + "echo 'x'" + ")" * 20
+     assert not substitution_in_arithmetic(command, date_exempt=True)
+     assert calls < len(command) * 3
++    # Main's conservative nesting budget still applies to the iterative walk.
++    assert substitution_in_arithmetic("echo $(" * 200 + "echo 'x'" + ")" * 200, date_exempt=True)
+diff --git a/tools/shell_arith_sink.py b/tools/shell_arith_sink.py
+index 877c5898986133b433d4ef38ce9c6bba818dafa1..6964193a3afb1f68c76f2e36d17da9eb3f07faf5 100644
+--- a/tools/shell_arith_sink.py
++++ b/tools/shell_arith_sink.py
+@@ -94,7 +94,7 @@ def substitution_in_arithmetic(command: str, *, date_exempt: bool, _depth: int =
+         if kind == _CMD and not quoted and _literal_name_sink(command, start, top, date_exempt, literal_cache):
+             return True
+         if token in ("`", "$(", "$((", "$[", "${"):
+-            pos, sink = _expansion_token(command, token, pos, stack, date_exempt, _depth)
++            pos, sink = _expansion_token(command, token, pos, stack, date_exempt, _depth, literal_cache)
+             if sink:
+                 return True
+             backtick_open ^= token == "`"
+@@ -102,7 +102,7 @@ def substitution_in_arithmetic(command: str, *, date_exempt: bool, _depth: int =
+         skipped = _word_token(command, token, start, pos, stack)
+         if skipped is None:
+             skipped = _skip_data(command, token, start, pos, quoted, stack, pending,
+-                                 date_exempt, _depth)
++                                 date_exempt, _depth + sum(frame[0] == _CMD for frame in stack) - 1)
+         if skipped is not None:
+             if skipped < 0:
+                 return True
+@@ -364,7 +364,7 @@ def _parameter_token(token, start, pos, stack) -> int:
+     return pos
+ 
+ 
+-def _expansion_token(command, token, pos, stack, date_exempt, depth=0) -> tuple[int, bool]:
++def _expansion_token(command, token, pos, stack, date_exempt, depth=0, cache=None) -> tuple[int, bool]:
+     """Open an expansion frame, or flag a producer whose output is arithmetic."""
+     if token == "`":
+         if stack[-1][0] in (_ARITH, _PARAM_ARITH):
+@@ -378,19 +378,17 @@ def _expansion_token(command, token, pos, stack, date_exempt, depth=0) -> tuple[
+         if stack[-1][0] in (_ARITH, _PARAM_ARITH) and not (
+                 date_exempt and _DATE_PRODUCER_RE.match(command, pos)):
+             return pos, True
+-        # A case-pattern ')' is not this substitution's closer. Match the whole
+-        # command frame before inspecting its arithmetic; otherwise its quotes
+-        # can corrupt the parent and promote ordinary redirection output to code.
+-        from cron.lifecycle_guard_substitutions import _paren_end, SubstitutionNestingLimit
++        # Populate shared pattern boundaries before walking the body in its own
++        # frame. Re-parsing sliced bodies loses that cache and is quadratic.
++        from tools.shell_prefix_expansions import _expansion_end
+ 
++        if depth + sum(frame[0] == _CMD for frame in stack) >= 32:
++            return pos, True
+         try:
+-            end = _paren_end(command, pos - 2, depth)
+-        except SubstitutionNestingLimit:
++            _expansion_end(command, pos, ")", cache)
++        except (ValueError, RecursionError):
+             return pos, True
+-        if not command[pos:end].endswith(')'):
+-            return end, True
+-        return end, substitution_in_arithmetic(
+-            command[pos:end - 1], date_exempt=date_exempt, _depth=depth + 1)
++        stack.append([_CMD, ")", 0, False, pos, None])
+     elif token == "${":
+         pos = _open_parameter(command, pos, stack)
+     else:  # $(( or $[
+-- 
+2.43.0
+

@@ -1,0 +1,122 @@
+From e96f2050042de407848d885bdb74ea69e0d45c6f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 23:34:57 +0000
+Subject: [PATCH] [daveey] decode hidden let NUL truncation and long
+ continuations
+
+Address both independent review findings: ANSI-C NUL truncates one piece while escaped quotes still delimit its ignored tail; double-quoted continuations are bounded by decoded length rather than source length. Real Bash marker regressions failed 14 assertions before repair. Green: 150 hidden-let/word-quote tests plus 172 arithmetic consumer tests. Original word-quotes DATA unchanged.
+---
+ .../test_lifecycle_guard_arith_let_word.py    | 20 ++++++++++++++--
+ tools/shell_let_word.py                       | 24 ++++++++++++++-----
+ 2 files changed, 36 insertions(+), 8 deletions(-)
+
+diff --git a/tests/cron/test_lifecycle_guard_arith_let_word.py b/tests/cron/test_lifecycle_guard_arith_let_word.py
+index 761cf9eaf3d5c7946136d7b9c03c078639ae7075..cedb08ac04d2cbae6b6076c5066052b24f4ab084 100644
+--- a/tests/cron/test_lifecycle_guard_arith_let_word.py
++++ b/tests/cron/test_lifecycle_guard_arith_let_word.py
+@@ -16,8 +16,20 @@ from tools.shell_arith_sink import substitution_in_arithmetic
+ from tools.shell_heredoc import output_reaches_shell
+ from tools.shell_let_word import hidden_let_end
+ 
++# NUL truncates only its ANSI-C piece, not subsequent quoted/literal pieces.
++REVIEW_SINKS = [
++    r"$'let\0ignored' 'a[$(SCRIPT)]=1'",
++    r"$'le\x00ignored't 'a[$(SCRIPT)]=1'",
++    r"$'le\u0000ignored't 'a[$(SCRIPT)]=1'",
++    r"$'le\U00000000ignored't 'a[$(SCRIPT)]=1'",
++    r"$'le\c@ignored't 'a[$(SCRIPT)]=1'",
++    r"$'le\000ignored\'still ignored't 'a[$(SCRIPT)]=1'",
++    "$'le\\0" + "ignored" * 40 + "'t 'a[$(SCRIPT)]=1'",
++    '"l' + "\\\n" * 21 + 'et" \'a[$(SCRIPT)]=1\'',
++]
++
+ # SCRIPT is an executable payload that touches a marker and prints 0.
+-SINKS = [
++SINKS = REVIEW_SINKS + [
+     r"\let 'a[$(SCRIPT)]=1'",
+     r"'let' 'a[$(SCRIPT)]=1'",
+     r'"let" "a[$(SCRIPT)]=1"',
+@@ -64,6 +76,10 @@ PRINTED = [
+ # Bash runs none of these: no word is `let` after quote removal, or none of its operands
+ # holds a subscript substitution.
+ DATA = [
++    r"$'let\0ignored'x 'a[$(SCRIPT)]=1' 2>/dev/null",
++    r"$'lex\0let' 'a[$(SCRIPT)]=1' 2>/dev/null",
++    r"$'letx\0' 'a[$(SCRIPT)]=1' 2>/dev/null",
++    r"$'le\0ignored' 'a[$(SCRIPT)]=1' 2>/dev/null",
+     r"\letter 'a[$(SCRIPT)]=1' 2>/dev/null",
+     r"'let'x 'a[$(SCRIPT)]=1' 2>/dev/null",
+     r"'let x' 'a[$(SCRIPT)]=1' 2>/dev/null",
+@@ -118,7 +134,7 @@ def test_double_quoted_let_text_is_printed_not_evaluated(tmp_path, shape):
+ 
+ 
+ @pytest.mark.platforms("posix")
+-@pytest.mark.parametrize("shape", SINKS[:6])
++@pytest.mark.parametrize("shape", SINKS[:len(REVIEW_SINKS) + 6])
+ def test_lifecycle_guard_scans_the_hidden_let_payload(tmp_path, shape):
+     script = tmp_path / "payload.sh"
+     script.write_text("# padding\n" * 150000, encoding="utf-8")  # past the scan cap
+diff --git a/tools/shell_let_word.py b/tools/shell_let_word.py
+index 0fe1e3425b0903dd2d92fee69f599009129e9efa..2a55685953e61dd8d0cba9e8568436cd9489322d 100644
+--- a/tools/shell_let_word.py
++++ b/tools/shell_let_word.py
+@@ -16,7 +16,7 @@ _ANSI_SIMPLE = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n":
+                 "r": "\r", "t": "\t", "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?"}
+ _ANSI_NUMERIC_RE = re.compile(
+     r"x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|([0-7]{1,3})")
+-# A quoted piece of a three-letter word is short; longer spans are never `let`.
++# Plain apostrophe pieces cannot shrink; escaped pieces are bounded after decoding.
+ _SPAN_LIMIT = 40
+ 
+ 
+@@ -75,8 +75,9 @@ def _unquoted_piece(command: str, pos: int) -> tuple[str | None, int]:
+ def _double_quoted_piece(command: str, pos: int) -> tuple[str | None, int]:
+     """Inside ``"…"`` a backslash quotes only ``" \\ $ ` newline``. An expansion stays in
+     the text as ``$``/backtick, which no ``let`` holds."""
+-    text, index, limit = "", pos, min(len(command), pos + _SPAN_LIMIT)
+-    while index < limit:
++    # Bound decoded text, not source: arbitrarily many continuations disappear.
++    text, index = "", pos
++    while index < len(command) and len(text) <= 3:
+         char = command[index]
+         if char == '"':
+             return text, index + 1
+@@ -94,11 +95,16 @@ def _ansi_c_piece(command: str, pos: int) -> tuple[str | None, int]:
+     """Decode a ``$'…'`` body starting at *pos* the way bash does for escapes that can
+     spell a letter. Others (``\\cX``, unknown escapes) keep their backslash here, which no
+     ``let`` holds either."""
+-    out, index, limit = [], pos, min(len(command), pos + _SPAN_LIMIT)
+-    while index < limit:
++    out, index, limit = [], pos, len(command)
++    truncated = False
++    while index < limit and len(out) <= 3:
+         char = command[index]
+         if char == "'":
+             return "".join(out), index + 1
++        if truncated:
++            # NUL drops the rest of this piece, but escaped quotes do not close it.
++            index += 2 if char == "\\" else 1
++            continue
+         if char != "\\" or index + 1 >= limit:
+             out.append(char)
+             index += 1
+@@ -107,9 +113,15 @@ def _ansi_c_piece(command: str, pos: int) -> tuple[str | None, int]:
+         if numeric:
+             hexa = numeric.group(1) or numeric.group(2) or numeric.group(3)
+             value = int(hexa, 16) if hexa else int(numeric.group(4), 8) & 0xFF
+-            out.append(chr(value) if value <= 0x10FFFF else "\ufffd")
++            truncated = value == 0
++            if not truncated:
++                out.append(chr(value) if value <= 0x10FFFF else "\ufffd")
+             index = numeric.end()
+             continue
++        if command.startswith("\\c@", index):
++            truncated = True
++            index += 3
++            continue
+         escaped = command[index + 1]
+         out.append(_ANSI_SIMPLE.get(escaped, "\\" + escaped))
+         index += 2
+-- 
+2.43.0
+

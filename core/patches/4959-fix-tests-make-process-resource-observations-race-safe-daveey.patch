@@ -1,0 +1,145 @@
+From a14b912df1ca22a517c0bb3fa5de7a8b86f91415 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 09:34:41 +0000
+Subject: [PATCH] fix(tests): make process resource observations race-safe
+ [daveey]
+
+The bridge barrier sends its reply before closing its server socket. Global
+/proc/self/fd equality can observe that socket rather than a rejected-file leak.
+Gate the real server send after delivery and inspect only the unique transferred
+file's descriptors; all five rejected copies must already be closed.
+
+Snapshot wrapper child argv once before validating/indexing it. The old two reads
+could see a full argv followed by an empty argv during exec. Tolerate disappeared
+children during readiness, but retain AccessDenied and real gateway membership.
+PR2887 changed test_update_checkpoint_wrapper_pid.py, not this fixture.
+
+Proof with HERMES_TEST_FILE_RETRIES=0:
+- Forced send-before-close schedule: old global assertion fails with extra FD19.
+- Changing argv: old comprehension fails IndexError deterministically.
+- Whole files after fixes: 26 passed; repeated after restoring mutation.
+- Removing production rejected-FD close: new assertion fails on five extra FDs.
+- scripts/hermes-python scripts/check --base origin/main: pass.
+
+Historical jobs 135323748617 / 135190166757 report extra FD20 / FD19;
+135290244463 reports the double-cmdline IndexError. These establish the symptoms;
+the forced schedule demonstrates a cause, not historical socket identity.
+No production behavior, retry policy, or thresholds changed.
+---
+ .../test_gateway_service_child_pids.py        | 38 ++++++++++++++++-
+ tests/tools/test_origin_cli_bridge.py         | 42 +++++++++++++++----
+ 2 files changed, 72 insertions(+), 8 deletions(-)
+
+diff --git a/tests/hermes_cli/test_gateway_service_child_pids.py b/tests/hermes_cli/test_gateway_service_child_pids.py
+index 2384a4afb9beebdb4fddedf0953ed9f9d4c50224..d9e144d31e5c35893718bc81aea47b134d31e7ae 100644
+--- a/tests/hermes_cli/test_gateway_service_child_pids.py
++++ b/tests/hermes_cli/test_gateway_service_child_pids.py
+@@ -25,6 +25,42 @@ pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="sy
+ psutil = pytest.importorskip("psutil")
+ 
+ 
++def _child_scripts(children):
++    names = {}
++    for child in children:
++        try:
++            argv = child.cmdline()
++        except psutil.NoSuchProcess:
++            continue
++        if len(argv) >= 2:
++            names[Path(argv[1]).name] = child.pid
++    return names
++
++
++def test_child_scripts_reads_each_command_line_once():
++    child = MagicMock(pid=123)
++    child.cmdline.side_effect = [["python", "/fixture/main.py", "gateway", "run"], []]
++    assert _child_scripts([child]) == {"main.py": 123}
++    child.cmdline.assert_called_once_with()
++
++
++@pytest.mark.parametrize("argv", [[], ["python"]])
++def test_child_scripts_waits_for_complete_argv(argv):
++    child = MagicMock(pid=123)
++    child.cmdline.return_value = argv
++    assert _child_scripts([child]) == {}
++    child.cmdline.assert_called_once_with()
++
++
++def test_child_scripts_tolerates_exit_but_not_access_denied():
++    child = MagicMock(pid=123)
++    child.cmdline.side_effect = psutil.NoSuchProcess(123)
++    assert _child_scripts([child]) == {}
++    child.cmdline.side_effect = psutil.AccessDenied(123)
++    with pytest.raises(psutil.AccessDenied):
++        _child_scripts([child])
++
++
+ @pytest.fixture()
+ def wrapper_tree(tmp_path):
+     """``wrapper`` (the unit's MainPID) -> [a ``gateway run`` child, a non-gateway card worker child]."""
+@@ -44,7 +80,7 @@ def wrapper_tree(tmp_path):
+     try:
+         def started():
+             children = psutil.Process(wrapper.pid).children()
+-            names = {Path(c.cmdline()[1]).name: c.pid for c in children if len(c.cmdline()) >= 2}
++            names = _child_scripts(children)
+             return names if set(names) == {"main.py", "card_worker.py"} else None
+         by_script = wait_until(started, timeout=10, what="the wrapper's two children")
+         yield wrapper.pid, by_script["main.py"], by_script["card_worker.py"]
+diff --git a/tests/tools/test_origin_cli_bridge.py b/tests/tools/test_origin_cli_bridge.py
+index ef9bba19d305d77f83049cd1c06442035db60439..5fcc0b45cb721253bc1ebb88a5ce2bc2aad694f6 100644
+--- a/tests/tools/test_origin_cli_bridge.py
++++ b/tests/tools/test_origin_cli_bridge.py
+@@ -45,14 +45,42 @@ def test_empty_packet_does_not_poison_launch(echo_launch):
+     assert bridge.request(echo_launch.locator, {"title": "after-empty"}, timeout=1)["ok"]
+ 
+ 
+-def test_non_socket_reply_fd_is_closed(echo_launch):
++def _file_fds(path):
++    matches = set()
++    for fd in os.listdir("/proc/self/fd"):
++        try:
++            if os.readlink(f"/proc/self/fd/{fd}") == str(path):
++                matches.add(fd)
++        except FileNotFoundError:
++            pass  # The enumeration itself and unrelated threads can retire descriptors.
++    return matches
++
++
++def test_non_socket_reply_fd_is_closed(echo_launch, monkeypatch, tmp_path):
+     from tools import origin_cli_bridge as bridge
+-    with open(os.devnull, "rb") as file:
+-        before = set(os.listdir("/proc/self/fd"))
+-        for _ in range(5):
+-            packet(echo_launch, b"{}", [file.fileno()])
+-        assert bridge.request(echo_launch.locator, {"title": "barrier"}, timeout=1)["ok"]
+-        assert set(os.listdir("/proc/self/fd")) == before
++    sent, release = threading.Event(), threading.Event()
++    send = socket.socket.send
++
++    def hold_reply_close(sock, *args, **kwargs):
++        result = send(sock, *args, **kwargs)
++        if threading.current_thread() is echo_launch._thread:
++            sent.set()
++            assert release.wait(5)
++        return result
++
++    monkeypatch.setattr(socket.socket, "send", hold_reply_close)
++    path = tmp_path / "transferred-file"
++    with path.open("w+b") as file:
++        try:
++            for _ in range(5):
++                packet(echo_launch, b"{}", [file.fileno()])
++            assert bridge.request(echo_launch.locator, {"title": "barrier"}, timeout=1)["ok"]
++            assert sent.wait(2)
++            # Serial dispatch has closed the five invalid descriptors, but the
++            # barrier's reply socket deliberately remains open after its send.
++            assert _file_fds(path) == {str(file.fileno())}
++        finally:
++            release.set()
+ 
+ 
+ def test_bad_nonce_closes_reply_without_timeout(echo_launch):
+-- 
+2.43.0
+

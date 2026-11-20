@@ -1,0 +1,431 @@
+From 96d430503ff47682cd4e7c3cabc3b495c7fb162f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 06:55:09 +0000
+Subject: [PATCH] [daveey] lifecycle guard: scan a computed program's literal
+ code and sibling scripts
+
+The computed-shell-input refusal also fired on ordinary agent commands. In a
+scan-only replay of 12,624 historical commands it newly refused 67, among them
+`$PY -c '...'` with `PY=$(command -v python3)`, the `hermes-core-python`
+wrapper, `scripts/run_tests.sh` and `source ./activate`.
+
+Why: any computed program word followed by `-c` was treated as a possible shell
+with unknown input, and any script operand containing a substitution was
+unknown, although only the program or the leading directory was computed.
+
+Change (cron/lifecycle_guard_substitution_output.py):
+- Computed program with literal options and literal `-c` code, no stdin feed,
+  no descriptor other than stdout/stderr, and no `$` or backtick left in the
+  code: the code is scanned as shell text instead of refused.
+- `. "<output>/literal/tail"` and `bash "<output>/literal/tail"`: the tail is
+  resolved against the walk's directory and that file is scanned. A tail with
+  `..`, a glob, an expansion, or naming no file there stays refused.
+- `/abs/dir/<output>` as a program with no argument, pipe or stdin binding is
+  not a shell invocation (`account="/Users/$(id -un)"` inside a certified
+  quote).
+
+Still refused: `eval "$(tool env)"` and every case where the parent can still
+change the code, the options or a descriptor.
+
+Known limit: the computed directory is assumed to be the walk's directory. A
+prefix that evaluates elsewhere is not followed, as before this check existed.
+
+Proof: tests/cron/test_lifecycle_guard_computed_program.py runs real bash
+against a fake hermes marker for 24 refusals and 8 allowed clean commands. The
+allowed rows fail without this change (7 of the first 7 measured); the refusal
+rows pass before and after.
+---
+ cron/lifecycle_guard_substitution_output.py   | 138 +++++++++++++++---
+ .../test_lifecycle_guard_computed_program.py  | 112 ++++++++++++++
+ .../test_lifecycle_guard_quoted_provenance.py |  12 +-
+ 3 files changed, 238 insertions(+), 24 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_computed_program.py
+
+diff --git a/cron/lifecycle_guard_substitution_output.py b/cron/lifecycle_guard_substitution_output.py
+index ba261c07fe14a16babb649013038278d6b71be96..c8780e4c44f2162f2b11afac8b2f53412d3a21a9 100644
+--- a/cron/lifecycle_guard_substitution_output.py
++++ b/cron/lifecycle_guard_substitution_output.py
+@@ -37,9 +37,81 @@ def _unanchored_splice(pattern: str) -> bool:
+     return pattern.replace(".*", "") == ""
+ 
+ 
++def _defer_sibling(deferred: list | None, consumer: str, word: str) -> bool:
++    """Defer ``<output>/literal/tail``: only the leading directory is computed.
++
++    ``. "$HERE/lib.sh"`` is how a script loads its sibling. The caller resolves
++    the literal tail against the walk's directory and scans what it finds; a
++    tail that names no file there stays uncertain."""
++    if deferred is None or not word.startswith(_OUTPUT + '/'):
++        return False
++    tail = word[len(_OUTPUT) + 1:]
++    if (not tail or tail.startswith('/') or _OUTPUT in tail or set('$`*?[]{}~\\\n') & set(tail)
++            or '..' in tail.split('/')):
++        return False
++    if (consumer, tail) not in deferred:
++        deferred.append((consumer, tail))
++    return True
++
++
++def _defer_literal_code(deferred, arguments, operand, bindings, *, plain: bool) -> bool | None:
++    """``$PY -c 'literal'``: scan the code instead of refusing every computed interpreter.
++
++    Applies when the options and the code are literal, the code has no
++    expansion left for the parent to fill, and no descriptor other than
++    stdout/stderr is bound, so the only unknown is the program. *plain* is the
++    caller's "-c without -s or a stdin word". ``None`` means it does not apply."""
++    if (deferred is None or not plain or not set(bindings) <= {'1', '2'}
++            or operand >= len(arguments)
++            or any(_OUTPUT in word for word in arguments[:operand + 1])
++            or set('$`') & set(arguments[operand])):
++        return None
++    if any(_OUTPUT in word for word in bindings.values()):
++        return True
++    if ('code', arguments[operand]) not in deferred:
++        deferred.append(('code', arguments[operand]))
++    return False
++
++
++def _bare_absolute(word: str, quiet: bool) -> bool:
++    """``/Users/<out>`` with no argument, pipe or stdin binding (*quiet*).
++
++    An absolute literal directory whose last component alone is computed has no
++    shell invocation syntax, like a bare ``<out>``. A relative splice or one
++    with computed directories (``s/<out>/<out>/``) keeps the shell match."""
++    return (quiet and word.startswith('/') and word.endswith('/' + _OUTPUT)
++            and word.count(_OUTPUT) == 1)
++
++
++def _sourced_is_computed(name, program, arguments, deferred) -> bool:
++    """``.``/``source`` read their first operand, ``eval`` every argument."""
++    selected = arguments if name == 'eval' else arguments[:1]
++    if _OUTPUT in program:
++        return True
++    if name != 'eval' and selected and _defer_sibling(deferred, '.', selected[0]):
++        return False
++    return any(_OUTPUT in word for word in selected)
++
++
++def _shell_input_words(arguments, operand, stdin, name, deferred, *, code, reads_stdin):
++    """The words a shell reads as options, code, script or stdin.
++
++    Unknown option output may change the option layout or inject a code input.
++    A script operand with only a computed directory is deferred instead."""
++    selected = arguments[:operand]
++    script = (not code and not reads_stdin and operand < len(arguments)
++              and not any(_OUTPUT in word for word in selected)
++              and _defer_sibling(deferred, name, arguments[operand]))
++    if (code or not reads_stdin) and not script:
++        selected += arguments[operand:operand + 1]
++    if not code and (reads_stdin or operand >= len(arguments)):
++        selected += stdin
++    return selected
++
++
+ def _shell_input_is_computed(
+     view: list[str], piped: list[str], *, opened: dict[str, str] | None = None,
+-    depth: int = 0, anchored_only: bool = False,
++    depth: int = 0, anchored_only: bool = False, deferred: list[tuple[str, str]] | None = None,
+ ) -> bool:
+     from cron import lifecycle_guard as guard
+ 
+@@ -59,7 +131,11 @@ def _shell_input_is_computed(
+     while not empty[index] and _OUTPUT in view[index]:
+         # Unknown programs with shell invocation syntax are possible shells.
+         arguments, stdin = _input_words(view[index + 1:], dict(bindings))
+-        _, code, reads_stdin = guard._shell_options_end(arguments, 'bash')
++        operand, code, reads_stdin = guard._shell_options_end(arguments, 'bash')
++        literal = _defer_literal_code(deferred, arguments, operand, bindings,
++                                      plain=code and not reads_stdin and not stdin)
++        if literal is not None:
++            return literal
+         if code or reads_stdin or stdin or piped:
+             return True
+         # Also consider an absent word before a literal shell, without
+@@ -70,8 +146,7 @@ def _shell_input_is_computed(
+     name = guard._executable_name(empty[index])
+     arguments, stdin = _input_words(view[index + 1:], bindings)
+     if name in {'.', 'source', 'eval'}:
+-        selected = arguments if name == 'eval' else arguments[:1]
+-        return _OUTPUT in view[index] or any(_OUTPUT in word for word in selected)
++        return _sourced_is_computed(name, view[index], arguments, deferred)
+     if _OUTPUT in view[index]:
+         # The output may fill a *nonempty* executable splice. Only classify
+         # names compatible with a shell/wrapper, not py$(...)thon or data.
+@@ -82,7 +157,8 @@ def _shell_input_is_computed(
+         # a real command word, and not evidence inside a raw quote the parent
+         # does not feed to a shell. Anchored splices (`b<out>ash`) still match.
+         narrowed = anchored_only and _unanchored_splice(pattern)
+-        if not narrowed and any(re.fullmatch(pattern, candidate) for candidate in shells):
++        bare = _bare_absolute(view[index], not (arguments or stdin or piped or '0' in bindings))
++        if not narrowed and not bare and any(re.fullmatch(pattern, candidate) for candidate in shells):
+             return True
+         # A computed wrapper name is not itself a shell sink. Interpret each
+         # compatible wrapper with the existing option/operand peeling rules.
+@@ -95,17 +171,14 @@ def _shell_input_is_computed(
+                         return True
+                     if _shell_input_is_computed(
+                             candidate, [], opened=bindings, depth=depth,
+-                            anchored_only=anchored_only):
++                            anchored_only=anchored_only, deferred=deferred):
+                         return True
+     if name not in guard._SHELL_EXECUTABLES:
+         return False
+     operand, code, reads_stdin = guard._shell_options_end(arguments, name)
+     # Unknown option output may change the option layout or inject a code input.
+-    selected = arguments[:operand]
+-    if code or not reads_stdin:
+-        selected += arguments[operand:operand + 1]
+-    if not code and (reads_stdin or operand >= len(arguments)):
+-        selected += stdin
++    selected = _shell_input_words(arguments, operand, stdin, name, deferred,
++                                  code=code, reads_stdin=reads_stdin)
+     if any(_OUTPUT in word for word in selected):
+         return True
+     if code and operand < len(arguments) and any(_OUTPUT in word for word in bindings.values()):
+@@ -115,12 +188,12 @@ def _shell_input_is_computed(
+             return True
+         return _contexts_are_computed(
+             arguments[operand], opened=bindings, depth=depth + 1,
+-            anchored_only=anchored_only)
++            anchored_only=anchored_only, deferred=deferred)
+     return False
+ 
+ 
+ def _contexts_are_computed(command, *, opened=None, depth=0, alias_names=frozenset(),
+-                           anchored_only=False) -> bool:
++                           anchored_only=False, deferred=None) -> bool:
+     """Attach descriptor provenance to the existing scope/pipeline feed walk.
+ 
+     Flattened segment contexts cannot carry persistent redirects: a child close
+@@ -258,7 +331,7 @@ def _contexts_are_computed(command, *, opened=None, depth=0, alias_names=frozens
+                     for view in views:
+                         self.computed |= _shell_input_is_computed(
+                             view, piped, opened=self.bindings, depth=depth,
+-                            anchored_only=anchored_only)
++                            anchored_only=anchored_only, deferred=deferred)
+                     candidate = dict(self.bindings)
+                     arguments, _ = _input_words(segment[peel(segment):], candidate)
+                     index = guard._executed_command_index(arguments)
+@@ -406,8 +479,14 @@ def _mark_variables(text: str, uncertain: set[str]) -> str:
+ 
+ 
+ def computed_shell_input(command: str, alias_names: frozenset[str], *,
+-                         anchored_only: bool = False) -> tuple[bool, str | None]:
+-    """Return uncertainty and an additive empty-output scan, only for executed text."""
++                         anchored_only: bool = False,
++                         deferred: list[tuple[str, str]] | None = None) -> tuple[bool, str | None]:
++    """Return uncertainty and an additive empty-output scan, only for executed text.
++
++    *deferred* collects ``('code', text)`` for literal ``-c`` code given to a
++    computed program with no stdin feed, and ``(consumer, tail)`` for a script
++    operand whose leading directory alone is computed. The caller scans each;
++    without the list both stay uncertain."""
+     from cron import lifecycle_guard as guard
+     from cron.lifecycle_guard_lines import strip_shell_comments
+     from cron.lifecycle_guard_substitutions import normalize_ansi_c_quotes
+@@ -443,7 +522,8 @@ def computed_shell_input(command: str, alias_names: frozenset[str], *,
+                     break
+         if previous == uncertain:
+             break
+-    if _contexts_are_computed(marked, alias_names=alias_names, anchored_only=anchored_only):
++    if _contexts_are_computed(marked, alias_names=alias_names, anchored_only=anchored_only,
++                              deferred=deferred):
+         return True, None
+     return False, outer.replace(_OUTPUT, '')
+ 
+@@ -457,11 +537,33 @@ def scan_computed_shell_input(command, *, executed, budget, recurse, cwd, source
+     it for a raw quote the parent does not feed to a shell."""
+     if not executed or not enabled:
+         return False
++    import os
++    import shlex
++
++    from cron import lifecycle_guard as guard
++
++    deferred: list[tuple[str, str]] = []
+     uncertain, empty_output = computed_shell_input(
+-        command, budget.alias_names or frozenset(), anchored_only=anchored_only)
++        command, budget.alias_names or frozenset(), anchored_only=anchored_only, deferred=deferred)
++    texts = []
++    for consumer, value in deferred:
++        if consumer == 'code':
++            # A computed program may be a shell: its literal code is shell evidence.
++            texts.append(value)
++            continue
++        # A sibling path: the tail must name a file in the walk's directory (a
++        # script walk's directory is the script's own). Cloud paths are never
++        # probed; the recursion refuses them.
++        path = os.path.join(str(cwd or os.getcwd()), value)
++        if not (guard._on_cloud_path(guard.Path(path)) or os.path.isfile(path)):
++            uncertain = True
++            break
++        texts.append(f'{consumer} {shlex.quote(path)}')
+     if uncertain:
+         budget.refusal = 'the shell input depends on unresolved command substitution output'
+         return True
++    if any(recurse(text, cwd, executed, source, variable_source=False) for text in texts):
++        return True
+     # This guessed interpretation is executable evidence, not a literal binding
+     # source: HB=$(producer) must not become a shared, invented HB='' fact.
+     return empty_output is not None and recurse(
+diff --git a/tests/cron/test_lifecycle_guard_computed_program.py b/tests/cron/test_lifecycle_guard_computed_program.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4a4c6720f78c177ae27fb62e31f963230b1eb0e9
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_computed_program.py
+@@ -0,0 +1,112 @@
++"""A computed program or directory prefix is scanned, not refused outright.
++
++Refusing every ``$PY -c '...'`` and every ``. "$HERE/lib.sh"`` blocked the fleet's
++own tools (``hermes-core-python``, ``scripts/run_tests.sh``, ``source ./activate``).
++The literal part is still shell evidence: it is scanned, and anything the parent
++could still change keeps the refusal.
++"""
++from __future__ import annotations
++
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from tests.cron import test_lifecycle_guard_fd_redirections as fixtures
++
++REASON = 'substitution output'
++
++# Real bash runs the fake `hermes gateway restart`; the scan must refuse.
++RUN = [
++    "X=$(echo bash); $X -c './r.sh'",
++    "X=$(echo bash); $X -c 'source ./r.sh'",
++    "X=$(echo bash); $X -c 'hermes gateway restart'",
++    "$(echo bash) -c 'hermes gateway restart'",
++    "X=$(echo bash); nohup $X -c 'hermes gateway restart' >/dev/null 2>&1",
++    'X=$(echo bash); S=./r.sh; $X -c "source $S"',
++    "X=$(echo bash); export S=./r.sh; $X -c 'source $S'",
++    "X=$(echo bash); $X -c 'bash' < ./r.sh",
++    "X=$(echo bash); cat ./r.sh | $X -c 'bash'",
++    "X=$(echo bash); exec 3< ./r.sh; $X -c 'bash <&3'",
++    "X=$(echo bash); $X -c 'bash <&3' 3< ./r.sh",
++    "X=$(echo bash); { $X -c 'bash'; } < ./r.sh",
++    'X=$(echo bash); $X -c "$(cat ./r.sh)"',
++    '. "$(pwd)/r.sh"',
++    'H=$(pwd); . "$H/r.sh"',
++    'source "$(echo .)/r.sh"',
++    'bash "$(pwd)/r.sh"',
++    'sh -e "$(pwd)/r.sh"',
++    '. "$(pwd)/sub/../r.sh"',
++    '. "$(pwd)/$(echo r.sh)"',
++    '. "$(pwd)/sub/calls.sh"',
++    '/bin/$(echo bash) < ./r.sh',
++    'cat ./r.sh | /bin/$(echo bash)',
++    '/bin/$(echo bash) ./r.sh',
++]
++
++# Real bash exits 0 without touching the marker; the scan must allow.
++CLEAN = [
++    "PY=$(command -v python3); $PY -c 'print(1)'",
++    "PY=$(command -v python3); \"$PY\" -I -c 'import os\nprint(os.sep)' 2>&1 | tail -1",
++    "PY=$(command -v python3) && timeout 20 $PY -c 'print(1)' > out.log 2>&1; echo rc=$?",
++    'H=$(pwd); . "$H/lib.sh"',
++    'H="$(cd "$(dirname "$BASH_SOURCE")" && pwd)"; source "$H/sub/lib2.sh"',
++    'bash "$(pwd)/lib.sh"',
++    'account="/Users/$(id -un)"; echo "$account"',
++    # An unrelated eval sink certifies every quote as a possible payload.
++    'run() { eval "$1"; }; account="/Users/$(id -un)"; echo "$account"',
++]
++
++
++def _siblings(tmp_path):
++    fixtures._tree(tmp_path)
++    (tmp_path / 'r.sh').chmod(0o755)
++    (tmp_path / 'lib.sh').write_text('FOO=1\n')
++    (tmp_path / 'sub').mkdir()
++    (tmp_path / 'sub' / 'lib2.sh').write_text('BAR=2\n')
++    (tmp_path / 'sub' / 'calls.sh').write_text(f'bash {tmp_path}/r.sh\n')
++
++
++@pytest.mark.parametrize('command', RUN)
++def test_real_shell_runs_and_scan_refuses(tmp_path, command):
++    _siblings(tmp_path)
++    assert fixtures._bash_runs(tmp_path, command), 'bash must run the restart, or the row proves nothing'
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path))[0]
++
++
++@pytest.mark.parametrize('command', CLEAN)
++def test_clean_computed_program_and_sibling_are_allowed(tmp_path, command):
++    _siblings(tmp_path)
++    marker = tmp_path / 'marker'
++    result = subprocess.run(
++        ['/bin/bash'], input=command + '\n', text=True, encoding='utf-8',
++        capture_output=True, timeout=20, check=False, cwd=tmp_path,
++        env={'PATH': f"{tmp_path / 'bin'}:/usr/bin:/bin", 'MARKER': str(marker),
++             'HOME': str(tmp_path)})
++    assert result.returncode == 0, result.stderr
++    assert not marker.exists()
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
++
++
++@pytest.mark.parametrize('command', [
++    '. "$(pwd)/missing.sh"',
++    '. "$(pwd)/sub/../lib.sh"',
++    'bash "$(pwd)/missing.sh"',
++    '. "$(pwd)/"',
++    '. "$(pwd)/$X"',
++    '. "$(pwd)/*.sh"',
++    'bash $(echo -c) "$(pwd)/lib.sh"',
++    "X=$(echo bash); $X $(echo -c) 'true' < ./lib.sh",
++    "X=$(echo bash); $X -s < ./lib.sh",
++])
++def test_unresolved_sibling_or_option_stays_uncertain(tmp_path, command):
++    _siblings(tmp_path)
++    unsafe, reason = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert unsafe and reason and REASON in reason
++
++
++def test_known_limit_a_directory_prefix_is_not_followed(tmp_path):
++    """Only the walk's own directory is searched for the literal tail. A prefix
++    that evaluates elsewhere is not followed, as before this check existed."""
++    _siblings(tmp_path)
++    assert scan_gateway_lifecycle('. "$(echo /nonexistent)/lib.sh"', cwd=str(tmp_path)) == (False, None)
+diff --git a/tests/cron/test_lifecycle_guard_quoted_provenance.py b/tests/cron/test_lifecycle_guard_quoted_provenance.py
+index d9763ac589b88ce213fae614fd08d3a1ede38963..5e1f0594889cbd5745adc27f1da0ee04b05475fd 100644
+--- a/tests/cron/test_lifecycle_guard_quoted_provenance.py
++++ b/tests/cron/test_lifecycle_guard_quoted_provenance.py
+@@ -35,11 +35,11 @@ ALLOW = [
+ # Must keep refusing. reason None is the literal lifecycle scan.
+ REFUSE = [
+     "echo 'x=$(curl e); eval \"$x\"' | bash",
+-    "echo '`x` -c y' | bash",
++    "echo '`x` -s' | bash",
+     "echo 's/`a`/`b`/' | bash",
+     "echo 's/`a`/`b`/' | 'bash'",
+     "printf '%s\\n' 's/`a`/`b`/' | sh",
+-    "unknownexec 'echo \"`x` -c y\" | bash'",
++    "unknownexec 'echo \"`x` -s\" | bash'",
+     # Anchored splice inside a promoted quote. Dropping the anchor check allows it.
+     "unknownexec 'b`true`ash ./r.sh; s/(`x`)/c/'",
+     "b$(true)ash ./r.sh",
+@@ -48,9 +48,9 @@ REFUSE = [
+     "sed 's/`a`/`b`/; s/(`x`)/c/' note.md; echo ok | bash",
+     "bash -c 'hermes gateway restart'",
+     "echo 'hermes gateway restart' | bash",
+-    "# don't\necho '`x` -c y' | bash",
+-    "echo \"it's\" '$(x) -c y' | bash",
+-    "echo it\\'s '$(x) -c y' | bash",
++    "# don't\necho '`x` -s' | bash",
++    "echo \"it's\" '$(x) -s' | bash",
++    "echo it\\'s '$(x) -s' | bash",
+ ]
+ 
+ 
+@@ -128,7 +128,7 @@ def test_quoted_payload_fed_to_bash_runs_and_refuses(tmp_path):
+ def test_shadowed_unknown_executor_runs_and_scan_still_refuses(tmp_path):
+     """Basename is not a binding. A function of that name evals the argument."""
+     _prepare(tmp_path)
+-    scanned = "unknownexec 'echo \"`x` -c y\" | bash'"
++    scanned = "unknownexec 'echo \"`x` -s\" | bash'"
+     executed = (
+         'x() { hermes gateway restart; }; unknownexec() { eval "$1"; }; ' + scanned
+     )
+-- 
+2.43.0
+

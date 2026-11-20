@@ -1,0 +1,126 @@
+From b4aef31e4477114fc83e5f868e89a4782dc98f31 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 20:57:16 +0000
+Subject: [PATCH] [daveey] kanban release: uid write time binds only uids
+ minted at write time
+
+Adversarial review of the previous head found a break: the sync-enable
+backfill mints one instant for every old row and event, so `_same_write`
+let an eventless same-author row (specify/decompose `_insert_comment`)
+stand in for a foreign comment that had not synced, and --seen released.
+
+The uid clock now counts only when the event's uid time agrees with its own
+created_at (minted at the write, not by a backfill), the row stamp precedes
+the event by at most 60 s (a lock wait), and the two uids are within 1 s.
+The live events have uid offsets of 0.057 s and 0.372 s from their stamps.
+
+Regression tests replay the adversary's sequence on promote, unblock and the
+agent tool and bound the drift both ways; they fail on the previous head.
+The lock-drift fixture now mints both uids at the event time, as live.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_release_comments.py         | 21 ++++++---
+ .../test_kanban_release_imported_comments.py  | 44 ++++++++++++++++++-
+ 2 files changed, 59 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_release_comments.py b/hermes_cli/kanban_release_comments.py
+index 79a2376a24e9363df0d39409fffa9a5d5b6a6620..30f60f13e0f08657945bad1881df0543d25324e3 100644
+--- a/hermes_cli/kanban_release_comments.py
++++ b/hermes_cli/kanban_release_comments.py
+@@ -182,17 +182,28 @@ def _uuid7_ms(uid):
+ 
+ 
+ def _same_write(row, event):
+-    """Row and event uids minted within a second: the same tolerance as ``created_at``, on a clock that is right.
++    """Row and event written in one ``add_comment`` transaction, proven by write clocks.
+ 
+     Legacy ``add_comment`` stamped the row's ``created_at`` before waiting for the
+-    write lock and the event's after it, so the two integers drift by seconds
+-    (5 s and 7 s seen live) while their UUIDv7 uids, minted inside the one
+-    transaction, sit milliseconds apart.
++    write lock and the event's after it, so the integers drift by seconds (5 s and
++    7 s seen live) while the UUIDv7 uids, minted inside the transaction, sit
++    milliseconds apart. A uid only records the write when it was minted then: the
++    sync-enable backfill gives every old row and event a uid of the enable instant,
++    so the event's uid time must agree with its own ``created_at`` (a floor, so
++    within [0, 2 s)), the row must be stamped at most ``_LOCK_DRIFT`` before the
++    event, and the two uids within a second.
+     """
+     keys = row.keys()
+     row_ms = _uuid7_ms(row["uid"]) if "uid" in keys else None
+     event_ms = _uuid7_ms(event["uid"]) if "uid" in event.keys() else None
+-    return row_ms is not None and event_ms is not None and abs(row_ms - event_ms) <= 1000
++    if row_ms is None or event_ms is None:
++        return False
++    minted_at_write = 0 <= event_ms - event["created_at"] * 1000 < 2000
++    drift = event["created_at"] - row["created_at"]
++    return minted_at_write and 0 <= drift <= _LOCK_DRIFT and abs(row_ms - event_ms) <= 1000
++
++
++_LOCK_DRIFT = 60  # seconds a legacy row stamp may precede its event (write-lock wait)
+ 
+ 
+ def cli_guard(args, tid, verb):
+diff --git a/tests/hermes_cli/test_kanban_release_imported_comments.py b/tests/hermes_cli/test_kanban_release_imported_comments.py
+index c2a813d0b813c455bd78ff2fcd928dae5c1829d8..58353842c57660f2853760b1b7935405bbc69e67 100644
+--- a/tests/hermes_cli/test_kanban_release_imported_comments.py
++++ b/tests/hermes_cli/test_kanban_release_imported_comments.py
+@@ -228,7 +228,7 @@ def _lock_drift(tid, drift_s, uid_gap_ms):
+     cid = comment(tid, session="peer-session", age=8 * 86400, body="Ladder run note from a subagent")
+     with kbc.connect_closing() as conn:
+         row = conn.execute("SELECT * FROM task_comments WHERE id=?", (cid,)).fetchone()
+-        ms = row["created_at"] * 1000 + 300
++        ms = (row["created_at"] + drift_s) * 1000 + 300  # live shape: both uids minted at the event time
+         with kbc.write_txn(conn):
+             conn.execute("UPDATE task_comments SET uid=? WHERE id=?", (_uid_at(ms), cid))
+             ev = conn.execute("SELECT id, payload FROM task_events WHERE task_id=? AND kind='commented' "
+@@ -280,3 +280,45 @@ def test_comment_row_is_stamped_inside_the_write_lock(board, monkeypatch):
+         ev_at = conn.execute("SELECT created_at FROM task_events WHERE task_id=? AND kind='commented' "
+                              "AND json_extract(payload, '$.comment_id')=?", (board, cid)).fetchone()[0]
+     assert row_at == ev_at == 1794426074
++
++
++def _uid_salted(ms, salt):
++    h = f"{ms:012x}" + f"7{salt:03x}" + "8" + f"{salt:03x}" + f"{salt:012x}"
++    return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
++
++
++@pytest.mark.parametrize("entry", ["promote", "unblock", "tool"])
++@pytest.mark.parametrize("row_age", [8 * 86400, 2 * 86400 + 30])
++def test_backfilled_uids_never_bind_a_spare_row(board, entry, row_age, capsys):
++    """Adversarial review of #3629: sync-enable backfill mints one instant for old rows and events.
++
++    An eventless row (``_insert_comment``: specify, decompose) by the same author must not stand in
++    for a foreign comment that has not synced, however close the backfilled uids are.
++    """
++    enable_sync(board)
++    now = int(time.time())
++    enabled_ms = (now - 3600) * 1000
++    spare = sync.RemoteChange(1, "task_comments", _uid_salted(enabled_ms + 2, 1), "upsert",
++                              {"task_id": board, "author": "default",
++                               "body": "Specified -- updated body and promoted to todo.",
++                               "created_at": now - row_age}, 1, "", "peer")
++    payload = {"author": "default", "len": 40, "comment_id": 77, "writer_kind": "agent",
++               "writer_session": "peer-session"}
++    event = sync.RemoteChange(2, "task_events", _uid_salted(enabled_ms + 5, 2), "upsert",
++                              {"task_id": board, "kind": "commented", "created_at": now - 2 * 86400,
++                               "payload": json.dumps(payload)}, 1, "", "peer")
++    with kbc.connect_closing() as conn:
++        assert sync.apply_remote_changes(conn, [spare, event], new_cursor=2, observers=False).applied == 2
++        spare_id = conn.execute("SELECT id FROM task_comments WHERE uid=?", (spare.uid,)).fetchone()[0]
++    before = snapshot(board)
++    ok, output = release(board, entry, capsys, spare_id)
++    assert not ok and "Comment data unavailable" in output, output
++    assert snapshot(board) == before
++
++
++@pytest.mark.parametrize("drift_s", [-2, 61])
++def test_uid_rule_bounds_row_drift(board, drift_s, capsys):
++    """Co-minted uids alone do not bind a row stamped after its event or more than a lock wait before it."""
++    cid = _lock_drift(board, drift_s, 6)
++    ok, output = release(board, "promote", capsys, cid + 1000)
++    assert not ok and "data unavailable" in output, output
+-- 
+2.43.0
+

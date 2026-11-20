@@ -1,0 +1,247 @@
+From c307478769b45bf8a2bb9fd115085d261ae895f1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 23:53:54 +0000
+Subject: [PATCH] test(update): retain descendant identity across exit races
+ [daveey]
+
+The cancellation test passed its death assertion but could fail in finally:
+a pid_exists check did not guarantee that Process(pid).kill could still
+signal it. Its status poll had the same check/use race, and reconstructing
+a Process after cancellation discarded PID creation-time custody.
+
+Capture the Process at READY, before cancellation, and use its identity
+for polling and cleanup. Treat only NoSuchProcess as gone; preserve
+AccessDenied failures, the three-second death deadline and real tree
+cancellation. Verify failure cleanup also reaches a dead/zombie state.
+
+Proof: real owned children are killed and reaped precisely before status
+and kill. Without the exception handling both fail NoSuchProcess; with it
+they pass. Retained-identity mismatch leaves the real child untouched.
+Disabling production killpg makes the original test fail its cancellation
+assertion; a permanent mutation control verifies that failure and cleanup.
+
+HERMES_TEST_FILE_RETRIES=0 hermes-core-wt test
+ tests/hermes_cli/test_completion_process_helpers.py
+ tests/hermes_cli/test_update_completion_process.py
+=> 37 passed, 3 native-Windows skips, no retries (71.2s).
+scripts/hermes-python scripts/check --base origin/main => exit 0.
+
+Task: t_b86e9ff024032b7f; intake occurrence45 run44163644647.
+---
+ .../hermes_cli/completion_process_helpers.py  | 19 ++++
+ .../test_completion_process_helpers.py        | 97 +++++++++++++++++++
+ .../test_update_completion_process.py         | 48 ++++++---
+ 3 files changed, 150 insertions(+), 14 deletions(-)
+ create mode 100644 tests/hermes_cli/completion_process_helpers.py
+ create mode 100644 tests/hermes_cli/test_completion_process_helpers.py
+
+diff --git a/tests/hermes_cli/completion_process_helpers.py b/tests/hermes_cli/completion_process_helpers.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8401c209e00659a2a2a09ffa6d678ca3a8d9d23a
+--- /dev/null
++++ b/tests/hermes_cli/completion_process_helpers.py
+@@ -0,0 +1,19 @@
++"""Identity-retaining custody for the disposable completion descendant."""
++
++import psutil
++
++
++def descendant_exited(proc):
++    try:
++        return not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE
++    except psutil.NoSuchProcess:
++        return True
++
++
++def reap_descendant(proc):
++    # kill() checks the retained creation time before signalling: never rebuild
++    # a Process from a PID after cancellation, when that PID may be reused.
++    try:
++        proc.kill()
++    except psutil.NoSuchProcess:
++        pass
+diff --git a/tests/hermes_cli/test_completion_process_helpers.py b/tests/hermes_cli/test_completion_process_helpers.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7882edde9f18ce5f40e98bbbf7c810214c3f0821
+--- /dev/null
++++ b/tests/hermes_cli/test_completion_process_helpers.py
+@@ -0,0 +1,97 @@
++"""Real process disappearance between a custody check and status/signal."""
++
++import subprocess
++import sys
++
++import psutil
++import pytest
++
++from tests.hermes_cli.completion_process_helpers import descendant_exited, reap_descendant
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.live_system_guard_bypass
++@pytest.mark.parametrize("operation", ["status", "kill"])
++def test_owned_descendant_disappears_at_checked_seam(monkeypatch, operation):
++    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
++    proc = psutil.Process(child.pid)
++    original = getattr(proc, operation)
++    reached = []
++
++    def disappear():
++        # The helper has already observed this exact process alive. Remove the
++        # real OS process before the subsequent psutil read/signal, not a fake
++        # NoSuchProcess exception or a scheduler-dependent sleep.
++        assert child.poll() is None
++        child.kill()
++        child.wait(timeout=5)
++        assert not psutil.pid_exists(child.pid)
++        reached.append(operation)
++        return original()
++
++    monkeypatch.setattr(proc, operation, disappear)
++    try:
++        if operation == "status":
++            assert descendant_exited(proc)
++        else:
++            reap_descendant(proc)
++        assert reached == [operation]
++    finally:
++        child.kill()
++        child.wait(timeout=5)
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.live_system_guard_bypass
++@pytest.mark.parametrize("operation", ["status", "kill"])
++def test_owned_descendant_does_not_swallow_access_denied(monkeypatch, operation):
++    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
++    proc = psutil.Process(child.pid)
++
++    def refused():
++        raise psutil.AccessDenied(proc.pid)
++
++    monkeypatch.setattr(proc, operation, refused)
++    try:
++        if operation == "kill":
++            assert not descendant_exited(proc)
++        else:
++            assert proc.is_running()
++        with pytest.raises(psutil.AccessDenied):
++            (descendant_exited if operation == "status" else reap_descendant)(proc)
++    finally:
++        child.kill()
++        child.wait(timeout=5)
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.live_system_guard_bypass
++def test_retained_identity_never_signals_replacement(monkeypatch):
++    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
++    proc = psutil.Process(child.pid)
++    try:
++        # Simulate an old retained identity pointing at our live child's PID.
++        # No foreign process is involved and psutil's real reuse guard runs.
++        monkeypatch.setattr(proc, "_ident", (proc.pid, proc.create_time() - 1))
++        assert descendant_exited(proc)
++        reap_descendant(proc)
++        assert child.poll() is None, "cleanup signalled the replacement identity"
++    finally:
++        child.kill()
++        child.wait(timeout=5)
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.live_system_guard_bypass
++def test_owned_descendant_live_and_cleanup():
++    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
++    proc = psutil.Process(child.pid)
++    try:
++        assert not descendant_exited(proc)
++        reap_descendant(proc)
++        child.wait(timeout=5)
++        assert descendant_exited(proc)
++        reap_descendant(proc)  # already gone is idempotent
++    finally:
++        child.kill()
++        child.wait(timeout=5)
+diff --git a/tests/hermes_cli/test_update_completion_process.py b/tests/hermes_cli/test_update_completion_process.py
+index 13addb2ad92ef486932f8e4c71c25edded115bed..5d9c2320d48be2e61c4ff7fc7a44e9423644b525 100644
+--- a/tests/hermes_cli/test_update_completion_process.py
++++ b/tests/hermes_cli/test_update_completion_process.py
+@@ -690,8 +690,9 @@ def test_interactive_configuration_keeps_terminal_input(transition):
+ def test_interrupt_reaps_completion_descendants_before_return(transition, monkeypatch):
+     import io
+     import psutil
+-    import time
+     from hermes_cli import update_completion
++    from tests.hermes_cli.completion_process_helpers import descendant_exited, reap_descendant
++    from tests.waiting import wait_until
+ 
+     root, _git, _old, _new, request = transition
+     (root / "hermes_cli/update_completion.py").write_text(
+@@ -700,12 +701,13 @@ def test_interrupt_reaps_completion_descendants_before_return(transition, monkey
+         "print('READY ' + str(child.pid), flush=True)\n"
+         "time.sleep(600)\n"
+     )
+-    pids = []
++    descendants = []
+ 
+     class Interrupt(io.StringIO):
+         def write(self, value):
+             if 'READY ' in value:
+-                pids.append(int(value.split('READY ')[1].strip()))
++                # Capture PID + creation time before cancellation can retire it.
++                descendants.append(psutil.Process(int(value.split('READY ')[1].strip())))
+                 raise KeyboardInterrupt()
+             return super().write(value)
+ 
+@@ -713,18 +715,36 @@ def test_interrupt_reaps_completion_descendants_before_return(transition, monkey
+     try:
+         with pytest.raises(KeyboardInterrupt):
+             update_completion.run_completion(request)
+-        assert pids
+-        deadline = time.monotonic() + 3
+-        while time.monotonic() < deadline:
+-            if not psutil.pid_exists(pids[0]) or psutil.Process(pids[0]).status() == psutil.STATUS_ZOMBIE:
+-                break
+-            time.sleep(0.02)
+-        else:
+-            pytest.fail("completion descendant survived parent cancellation")
++        assert descendants
++        wait_until(lambda: descendant_exited(descendants[0]), timeout=3, interval=0.02,
++                   what="completion descendant to exit after parent cancellation")
+     finally:
+-        for pid in pids:
+-            if psutil.pid_exists(pid):
+-                psutil.Process(pid).kill()
++        for proc in descendants:
++            reap_descendant(proc)
++            wait_until(lambda: descendant_exited(proc), timeout=3, interval=0.02,
++                       what="owned completion descendant cleanup")
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.live_system_guard_bypass
++def test_surviving_completion_descendant_fails_and_is_cleaned(transition, monkeypatch):
++    from tests.hermes_cli import completion_process_helpers as custody
++
++    owned = []
++    reap = custody.reap_descendant
++
++    def record_and_reap(proc):
++        owned.append(proc)
++        reap(proc)
++
++    # Mutate only tree cancellation: the real completion parent is still killed
++    # and waited, so its real descendant survives until the assertion/finally.
++    monkeypatch.setattr(os, "killpg", lambda pid, sig: None)
++    monkeypatch.setattr(custody, "reap_descendant", record_and_reap)
++    with pytest.raises(AssertionError, match="completion descendant to exit after parent cancellation"):
++        test_interrupt_reaps_completion_descendants_before_return(transition, monkeypatch)
++    assert len(owned) == 1
++    assert custody.descendant_exited(owned[0]), "failure cleanup leaked the descendant"
+ 
+ 
+ @pytest.mark.platforms("windows")
+-- 
+2.43.0
+

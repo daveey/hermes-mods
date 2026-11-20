@@ -1,0 +1,344 @@
+From 74d75852e8b9421a102eeb3078000aef88fa664e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:12:45 -0800
+Subject: [PATCH] state: FTS gate keeps the schema memo, detaches under the
+ lock, remembers only lasting refusals [daveey]
+
+Second review of the free-path gates (2026-11-19):
+- per-thread plan state lives in a module WeakKeyDictionary, not in vars(db): the schema-init memo snapshots
+  vars(db) and had stopped memoizing every open (12 memo tests).
+- the trash verification plans outside self._lock; its schema read and any detach now take the lock instead of
+  writing inside another thread's transaction on the shared connection.
+- a memo hit replayed through an attempt plan logs at debug on runtime paths too.
+- busy/locked/IO plan failures are not remembered across processes; only a corrupt image or an attributed refusal is.
+- optimize_fts returns 0 (no error) when the gate only lost a race (schema moved, no plan); it raises only on a
+  refusal or a named family.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_state_fts_online.py                |  61 ++++++++++---
+ hermes_state_search.py                    |   2 +
+ tests/hermes_state/test_fts_free_gates.py | 105 ++++++++++++++++++++++
+ 3 files changed, 155 insertions(+), 13 deletions(-)
+
+diff --git a/hermes_state_fts_online.py b/hermes_state_fts_online.py
+index 075e7c620c2f43aa3bfee40a5ab2d3a695df0a6f..6b7a573e030b6dd496c9b6d9b844f901c76508f7 100644
+--- a/hermes_state_fts_online.py
++++ b/hermes_state_fts_online.py
+@@ -46,8 +46,10 @@ import os
+ import sqlite3
+ import threading
+ import time
++import weakref
+ from typing import Optional
+ 
++from hermes_state_errors import is_malformed_db_error
+ from hermes_state_common import (FTS_REBUILD_DEFERRAL_KEY, FTS_SQL, FTS_STALE_KEY, FTS_STORAGE_VERSION,
+                                  FTS_TRIGRAM_SQL, _FTS_TRIGGERS, fts_rebuild_admission)
+ 
+@@ -126,7 +128,7 @@ def write_refusal_memo(db_path, reason: Optional[str]) -> None:
+         if reason is None:
+             os.unlink(memo)
+             return
+-        tmp = f"{memo}.{os.getpid()}.tmp"
++        tmp = f"{memo}.{os.getpid()}.{threading.get_ident()}.tmp"
+         with open(tmp, "w") as fh:
+             json.dump({"until": time.time() + ONLINE_REFUSAL_MEMO_S, "reason": reason,
+                        "ino": os.stat(db_path).st_ino}, fh)
+@@ -195,7 +197,7 @@ def plan_online_recovery(db_path) -> dict:
+         conn = connect_tracked(read_only_db_uri(db_path), uri=True, timeout=30.0, isolation_level=None,
+                                tracking_path=db_path)
+     except sqlite3.Error as exc:
+-        raise OnlineRecoveryRefused(f"cannot open state.db read-only: {exc}") from exc
++        raise _transient(OnlineRecoveryRefused(f"cannot open state.db read-only: {exc}")) from exc
+     try:
+         conn.execute("BEGIN")  # one read snapshot for the schema and the check
+         master = [tuple(r) for r in conn.execute("SELECT rootpage, type, name FROM sqlite_master WHERE rootpage > 0")]
+@@ -203,12 +205,19 @@ def plan_online_recovery(db_path) -> dict:
+                  for line in str(r[0]).splitlines()]
+         conn.execute("COMMIT")
+     except sqlite3.DatabaseError as exc:
+-        raise OnlineRecoveryRefused(f"integrity_check could not complete: {exc}") from exc
++        refusal = OnlineRecoveryRefused(f"integrity_check could not complete: {exc}")
++        # Only a corrupt image is a lasting verdict; busy/locked/IO errors are retried by the next attempt.
++        raise (refusal if is_malformed_db_error(exc) else _transient(refusal)) from exc
+     finally:
+         conn.close()
+     return plan_from_check(lines, master)
+ 
+ 
++def _transient(exc: OnlineRecoveryRefused) -> OnlineRecoveryRefused:
++    exc.transient = True  # not remembered across processes (write_refusal_memo is skipped)
++    return exc
++
++
+ def _sql_names(names) -> str:
+     return ", ".join("'" + n.replace("'", "''") + "'" for n in names)
+ 
+@@ -252,14 +261,21 @@ def online_recovery_script(*, unlink_tables, trash, trash_tables, trigram: bool,
+     return "\n".join(p for p in parts if p)
+ 
+ 
++_TLS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
++_TLS_GUARD = threading.Lock()
++
++
+ def _thread_local_attr(name: str):
+     """A per-thread instance attribute (default None): a gateway ``SessionDB`` is shared by many threads, and a plan
+     made for one thread's attempt must never be used, or cleared, by another's."""
+ 
+     def _tls(self):
+-        tls = self.__dict__.get("_fts_plan_tls")
+-        if tls is None:
+-            tls = self.__dict__.setdefault("_fts_plan_tls", threading.local())
++        # Kept outside the instance __dict__: hermes_state_schema_memo snapshots vars(db) around schema init and
++        # declines to memoize an open that added a non-simple attribute.
++        with _TLS_GUARD:
++            tls = _TLS.get(self)
++            if tls is None:
++                tls = _TLS[self] = threading.local()
+         return tls
+ 
+     return property(lambda self: getattr(_tls(self), name, None),
+@@ -277,13 +293,14 @@ class SessionFtsOnlineRecoveryMixin:
+     _fts_tick_plan = _thread_local_attr("tick_plan")
+     _fts_startup_init = _thread_local_attr("startup_init")
+     _fts_in_retry_tick = _thread_local_attr("in_retry_tick")
++    _fts_gate_outcome = _thread_local_attr("gate_outcome")  # why the last gate call on this thread said False
+ 
+     def _fts_plan_outcome(self):
+         """``("ok", plan)`` or ``("refused", reason)`` from a fresh whole-file check, honouring the refusal memo."""
+         try:
+             return ("ok", self._fts_plan())
+         except OnlineRecoveryRefused as exc:
+-            return ("refused", str(exc))
++            return ("refused", str(exc), bool(getattr(exc, "memoized", False)))
+ 
+     def _fts_plan(self, *, force: bool = False) -> dict:
+         """The plan for the current recovery attempt: the retry tick's own (``_fts_tick_plan``, made before it took
+@@ -293,7 +310,9 @@ class SessionFtsOnlineRecoveryMixin:
+         tick = getattr(self, "_fts_tick_plan", None)
+         if tick is not None and not force:
+             if tick[0] == "refused":
+-                raise OnlineRecoveryRefused(tick[1])
++                exc = OnlineRecoveryRefused(tick[1])
++                exc.memoized = len(tick) > 2 and tick[2]
++                raise exc
+             return tick[1]
+         if not force:
+             remembered = read_refusal_memo(self.db_path)
+@@ -304,7 +323,8 @@ class SessionFtsOnlineRecoveryMixin:
+         try:
+             plan = plan_online_recovery(self.db_path)
+         except OnlineRecoveryRefused as exc:
+-            write_refusal_memo(self.db_path, str(exc))
++            if not getattr(exc, "transient", False):
++                write_refusal_memo(self.db_path, str(exc))
+             raise
+         write_refusal_memo(self.db_path, None)
+         return plan
+@@ -327,7 +347,7 @@ class SessionFtsOnlineRecoveryMixin:
+         finally:
+             self._fts_tick_plan = None
+ 
+-    def _fts_wholesale_free_allowed(self, families, *, context: str, cursor=None) -> bool:
++    def _fts_wholesale_free_allowed(self, families, *, context: str, cursor=None, lock_held: bool = True) -> bool:
+         """True when freeing the trees of *families* (FTS index families; empty for trash teardown) is provably safe:
+         a whole-file plan made for this attempt names no damaged tree at all, and the index objects are where it saw
+         them. A named family is not freeable even when it is not one of *families*: integrity_check names a shared
+@@ -342,14 +362,25 @@ class SessionFtsOnlineRecoveryMixin:
+         - the index objects moved since the plan;
+         - the plan names a family: the store goes to the fail-open state with ``_fts_oneshot_failed`` set, so the
+           retry tick's online path unlinks it unread.
+-        *cursor*: where the fail-open state is written (default: the writer connection)."""
++        *cursor*: where the fail-open state is written (default: the writer connection). *lock_held* False: the
++        caller does not hold ``self._lock`` (it planned outside it); the schema read and any detach then take it.
++        Why a call said False is left in ``_fts_gate_outcome`` ("stale", "noplan", "refused", "named", "moved")."""
+         startup = bool(self._fts_startup_init)
++        self._fts_gate_outcome = None
++        if not lock_held and not startup:
++            with self._lock:
++                if self._conn is None:
++                    self._fts_gate_outcome = "noplan"
++                    return False
++                return self._fts_wholesale_free_allowed(families, context=context, cursor=cursor, lock_held=True)
+         if self._fts_stale and not startup:
++            self._fts_gate_outcome = "stale"
+             logger.info("%s skipped: the search index is detached (stale); its recovery recreates it.", context)
+             return False
+         if self._fts_tick_plan is None and not startup:
+             logger.warning("%s skipped: no integrity plan was made for this attempt before the session lock; a later "
+                            "attempt plans first.", context)
++            self._fts_gate_outcome = "noplan"
+             return False
+         try:
+             plan = self._fts_plan()
+@@ -358,6 +389,7 @@ class SessionFtsOnlineRecoveryMixin:
+                 self._fts_tick_plan = ("refused", str(exc))
+             log = logger.debug if getattr(exc, "memoized", False) else logger.error
+             log("%s skipped: %s. `hermes sessions recover` rebuilds the store offline.", context, exc)
++            self._fts_gate_outcome = "refused"
+             return False
+         if startup:
+             self._fts_tick_plan = ("ok", plan)  # one whole-file check per open (cleared when schema init ends)
+@@ -372,10 +404,12 @@ class SessionFtsOnlineRecoveryMixin:
+             logger.error("%s skipped: integrity_check names damaged index tree(s) %s, which freeing any index tree "
+                          "could release twice. Search is detached (LIKE fallback); the retry recovers online (unlinks "
+                          "them unread).", context, ", ".join(plan["unlink"]))
++            self._fts_gate_outcome = "named"
+             return False
+         if roots != {n: r for n, r in plan["roots"].items() if family_of(n) in families}:
+             logger.info("%s skipped: the index objects changed since the integrity plan; a later attempt plans "
+                         "again.", context)
++            self._fts_gate_outcome = "moved"
+             return False
+         return True
+ 
+@@ -384,7 +418,8 @@ class SessionFtsOnlineRecoveryMixin:
+         ``self._lock``, is clean; returns the names recorded. A plan names a trash table only by refusing (it is
+         no index family), so a damaged trash table is never drained."""
+         with self._fts_runtime_plan():
+-            if not self._fts_wholesale_free_allowed((), context=f"Teardown of FTS trash {', '.join(sorted(names))}"):
++            if not self._fts_wholesale_free_allowed((), context=f"Teardown of FTS trash {', '.join(sorted(names))}",
++                                                    lock_held=False):
+                 return set()
+             plan_trash = self._fts_tick_plan[1].get("trash_roots", {})
+ 
+@@ -516,7 +551,7 @@ class SessionFtsOnlineRecoveryMixin:
+                 if self.get_meta("fts_rebuild_high_water") is not None:
+                     self.fts_rebuild_step()
+                 elif not self._fts_teardown_trash_step():
+-                    # Left: trash no clean plan vouches for (logged once; the refusal is remembered). Nothing this
++                    # Left: trash no clean plan vouches for (logged at ERROR when first refused; the refusal is remembered). Nothing this
+                     # tick, or a `repair-search --wait`, can do about it until the memo expires.
+                     more = self.get_meta("fts_rebuild_high_water") is not None
+                     break
+diff --git a/hermes_state_search.py b/hermes_state_search.py
+index b46125a56c7883777261b0e65735e52d0b1a498d..29647eb702171219b6b08f9f4f18661e10776c91 100644
+--- a/hermes_state_search.py
++++ b/hermes_state_search.py
+@@ -1390,6 +1390,8 @@ class SessionSearchMixin:
+                 return 0
+             tables = self._present_fts_tables()
+             if tables and not self._fts_wholesale_free_allowed(tables, context="FTS segment merge ('optimize')"):
++                if self._fts_gate_outcome not in ("refused", "named"):
++                    return 0  # a race (schema moved, no plan): nothing wrong with the store; a later call merges
+                 from hermes_state_fts_online import FtsFreeRefused
+ 
+                 raise FtsFreeRefused("the integrity gate kept the search index from being merged (see the log); "
+diff --git a/tests/hermes_state/test_fts_free_gates.py b/tests/hermes_state/test_fts_free_gates.py
+index 54199b74f0af8c8754a2a6f4869855484d043529..e49d13993e79b38a5c0a7d23b69ab782bbf21336 100644
+--- a/tests/hermes_state/test_fts_free_gates.py
++++ b/tests/hermes_state/test_fts_free_gates.py
+@@ -680,3 +680,108 @@ def test_detach_waits_out_a_short_write_lock_and_commits_atomically(store):
+         holder.close()
+     finally:
+         db.close()
++
++
++# ── 10. second review (2026-11-19) ──
++
++def test_trash_verification_detaches_under_the_session_lock(store, monkeypatch):
++    """The trash check plans outside self._lock; when its plan names a family, the detach must wait for the lock,
++    never write inside another thread's open transaction on the shared connection."""
++    import threading
++
++    path, _before = store
++    _break(path, "messages_fts_trigram_data")
++    db = SessionDB(db_path=path)
++    try:
++        db._fts_stale = False
++        plan = hermes_state_fts_online.plan_online_recovery(path)
++        assert plan["unlink"] == ["messages_fts_trigram"]
++        monkeypatch.setattr(hermes_state_fts_online, "plan_online_recovery", lambda _p: plan)
++        held, release = threading.Event(), threading.Event()
++
++        def writer():
++            with db._lock:
++                db._conn.execute("BEGIN IMMEDIATE")
++                held.set()
++                release.wait(5)
++                db._conn.execute("ROLLBACK")
++
++        t = threading.Thread(target=writer)
++        t.start()
++        held.wait(5)
++        done = []
++        v = threading.Thread(target=lambda: done.append(db._fts_verify_trash(["fts_v22_trash_x"])))
++        v.start()
++        v.join(0.5)
++        assert v.is_alive(), "the detach did not wait for the session lock"
++        release.set()
++        t.join()
++        v.join(15)
++        assert done == [set()]
++        assert _meta(path, FTS_STALE_KEY) == "1"  # committed on its own, not rolled back with the writer
++    finally:
++        db.close()
++
++
++def test_a_remembered_refusal_logs_at_debug_on_runtime_paths(store, monkeypatch, caplog):
++    import logging
++
++    path, _before = store
++    db = SessionDB(db_path=path)
++    try:
++        hermes_state_fts_online.write_refusal_memo(path, "earlier damage")
++        caplog.set_level(logging.DEBUG, logger="hermes_state")
++        with pytest.raises(hermes_state_fts_online.FtsFreeRefused):
++            db.optimize_fts()
++        skipped = [r for r in caplog.records if "skipped" in r.getMessage()]
++        assert skipped and all(r.levelno == logging.DEBUG for r in skipped)
++    finally:
++        hermes_state_fts_online.write_refusal_memo(path, None)
++        db.close()
++
++
++def test_a_transient_plan_failure_is_not_remembered(store, monkeypatch):
++    path, _before = store
++    db = SessionDB(db_path=path)
++    try:
++        import hermes_cli.sqlite_safe_read as safe_read
++
++        real = safe_read.connect_tracked
++
++        def busy(*a, **k):
++            raise sqlite3.OperationalError("database is locked")
++
++        monkeypatch.setattr(safe_read, "connect_tracked", busy)
++        with pytest.raises(hermes_state_fts_online.FtsFreeRefused):
++            db.optimize_fts()
++        assert hermes_state_fts_online.read_refusal_memo(path) is None
++        monkeypatch.setattr(safe_read, "connect_tracked", real)
++        assert db.optimize_fts() == 2
++    finally:
++        db.close()
++
++
++def test_optimize_returns_zero_when_the_schema_moved_since_the_plan(store, monkeypatch):
++    path, _before = store
++    db = SessionDB(db_path=path)
++    try:
++        real = hermes_state_fts_online.plan_online_recovery
++
++        def moved(p):
++            plan = real(p)
++            plan["roots"] = {n: r + 1000 for n, r in plan["roots"].items()}
++            return plan
++
++        monkeypatch.setattr(hermes_state_fts_online, "plan_online_recovery", moved)
++        assert db.optimize_fts() == 0
++        assert db._fts_gate_outcome == "moved"
++    finally:
++        db.close()
++
++
++def test_the_schema_memo_still_records_an_open(tmp_path):
++    path = tmp_path / "state.db"
++    _seed(path, sessions=1, per=4)
++    hermes_state_schema_memo.clear()
++    SessionDB(db_path=path).close()
++    assert hermes_state_schema_memo._memo, "the per-thread plan state disabled the schema-init memo"
+-- 
+2.43.0
+

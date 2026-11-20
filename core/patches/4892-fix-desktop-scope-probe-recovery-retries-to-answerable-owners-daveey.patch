@@ -1,0 +1,168 @@
+From 15382ab9707ab00656fa42917712a01752306275 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 23:17:42 +0000
+Subject: [PATCH] fix(desktop): scope probe recovery retries to answerable
+ owners [daveey]
+
+Address independent review 5966640982 on PR #3636. A probe wildcard for
+an off-window gateway cannot be cleared by refreshSessions, which lists
+the request gateway. Filter wildcard retry eligibility to that gateway;
+subscribe to request-scope changes so switching away cancels and switching
+back arms recovery. A single-profile success ends that profile's retries
+without claiming other profiles are fresh.
+
+RED: both new all/default-profile cases make 61 extra unrelated lists in
+one hour on 0be42b7876. GREEN: no unrelated lists, gateway switches cancel
+and re-arm the 15-second retry, successful lists restore the selected
+owner and stop retries; unlisted profiles stay stale. Existing persistent
+failure/backoff/other-owner-isolation tests remain passing. Targeted
+store/boot-snapshot/hub-sync/hook suite 133 tests passes; all 14 direct
+consumer files pass; Desktop tsc and full scripts/check pass.
+---
+ .../hooks/use-session-list-actions.test.tsx   | 49 ++++++++++++++++++-
+ .../session/hooks/use-session-list-actions.ts | 19 +++++--
+ 2 files changed, 64 insertions(+), 4 deletions(-)
+
+diff --git a/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx b/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx
+index aa9c5478bcb233499e41b26702e6b43d0e3cce81..fe44199f4158d748015d2a1affeca20889626bbd 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx
+@@ -4,7 +4,7 @@ import { Suspense } from 'react'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ import type { DesktopConnectionsRegistry } from '@/global'
+-import { type SessionInfo, setApiRequestConnection, type SidebarSessionsResponse } from '@/hermes'
++import { getApiRequestConnection, type SessionInfo, setApiRequestConnection, type SidebarSessionsResponse } from '@/hermes'
+ import hubSyncPlugin from '@/plugins/hub-sync/plugin'
+ import { $connectionsRegistry } from '@/store/connection-registry-state'
+ import { $cronJobs, setCronJobs } from '@/store/cron'
+@@ -1634,6 +1634,49 @@ describe('re-lists while a failed list leaves owners stale', () => {
+     }
+   })
+ 
++  it.each(['all', 'default'])('does not retry an off-window probe owner; follows scope changes (%s)', async profileScope => {
++    const { recordSessionGatewayUnavailable, sessionOwnerIsFresh } = await import('@/store/offline-sessions')
++    vi.useFakeTimers()
++    const owner = row('remote', { connection_id: 'conn-mini' })
++    listSidebarSessions.mockImplementation(() => Promise.resolve(sidebar({
++      sessions: getApiRequestConnection() === 'conn-mini' ? [owner] : [row('mine', { connection_id: 'local' })]
++    })))
++    const { result, unmount } = renderHook(() => useSessionListActions({ profileScope }))
++
++    try {
++      await act(async () => { await result.current.refreshSessions() })
++      act(() => recordSessionGatewayUnavailable('conn-mini'))
++      const calls = listSidebarSessions.mock.calls.length
++      await act(async () => { await vi.advanceTimersByTimeAsync(3_600_000) })
++      expect(listSidebarSessions.mock.calls.length).toBe(calls)
++      expect(sessionOwnerIsFresh('conn-mini', 'default')).toBe(false)
++      act(() => setApiRequestConnection('conn-mini'))
++      // Switching away cancels the pending recovery; switching back re-arms it.
++      await act(async () => { await vi.advanceTimersByTimeAsync(14_999) })
++      expect(listSidebarSessions.mock.calls.length).toBe(calls)
++      act(() => setApiRequestConnection(null))
++      await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
++      expect(listSidebarSessions.mock.calls.length).toBe(calls)
++      act(() => setApiRequestConnection('conn-mini'))
++      await act(async () => { await vi.advanceTimersByTimeAsync(15_000) })
++      expect(sessionOwnerIsFresh('conn-mini', 'default')).toBe(true)
++
++      if (profileScope === 'default') {
++        expect(sessionOwnerIsFresh('conn-mini', 'work')).toBe(false)
++      }
++
++      const recoveredCalls = listSidebarSessions.mock.calls.length
++      expect(recoveredCalls).toBeGreaterThan(calls)
++      await act(async () => { await vi.advanceTimersByTimeAsync(3_600_000) })
++      expect(listSidebarSessions.mock.calls.length).toBe(recoveredCalls)
++    } finally {
++      unmount()
++      setApiRequestConnection(null)
++      vi.useRealTimers()
++      _resetOfflineSessionsForTests()
++    }
++  })
++
+   it('re-lists after probe failure with bounded backoff, failing closed until the owner answers', async () => {
+     const { recordSessionGatewayUnavailable, sessionOwnerIsFresh, staleSessionOwners } = await import('@/store/offline-sessions')
+     _resetOfflineSessionsForTests()
+@@ -1644,10 +1687,13 @@ describe('re-lists while a failed list leaves owners stale', () => {
+     let failing = false
+     listSidebarSessions.mockImplementation(({ connectionId }: { connectionId?: string }) => {
+       if (connectionId === 'local') { return Promise.resolve(sidebar({ sessions: [local] })) }
++
+       return failing ? Promise.reject(new Error('unreachable')) : Promise.resolve(sidebar({ sessions: [owner] }))
+     })
++
+     const remoteCalls = () => listSidebarSessions.mock.calls.filter((args: unknown[]) =>
+       (args[0] as { connectionId?: string }).connectionId === undefined).length
++
+     const painted = () => mergeOfflineFallback([owner, local], []).find(s => s.id === 'remote')
+     const { result, unmount } = renderHook(() => useSessionListActions({ profileScope: 'all' }))
+ 
+@@ -1671,6 +1717,7 @@ describe('re-lists while a failed list leaves owners stale', () => {
+         expect(sessionOwnerIsFresh('local', 'default')).toBe(true)
+         expect(painted()?.offline_cached).toBe(true)
+       }
++
+       expect(remoteCalls()).toBe(calls + 4)
+       failing = false
+       await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+diff --git a/apps/desktop/src/app/session/hooks/use-session-list-actions.ts b/apps/desktop/src/app/session/hooks/use-session-list-actions.ts
+index b25ff1b2dbd4086d861887a7b9bb410ea00bac34..c87c9521980eeb2223c2861c4106ae5ae17ce464 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-list-actions.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-list-actions.ts
+@@ -1,5 +1,6 @@
+ import { useCallback, useEffect, useLayoutEffect, useRef } from 'react'
+ 
++import { $apiRequestScope } from '@/api/client'
+ import { getApiRequestConnection, getSession, listAllProfileSessions, listSidebarSessions, type SessionInfo } from '@/hermes'
+ import { sameCronSignature } from '@/lib/session-signatures'
+ import {
+@@ -20,7 +21,7 @@ import {
+   SIDEBAR_FILTERED_PAGE_SIZE,
+   SIDEBAR_SESSIONS_PAGE_SIZE
+ } from '@/store/layout'
+-import { $sessionListFreshness, recordSessionListResult, staleSessionOwners } from '@/store/offline-sessions'
++import { $sessionListFreshness, recordSessionListResult, sessionOwnerIsFresh, staleSessionOwners } from '@/store/offline-sessions'
+ import { messagingTotalsKey, normalizeProfileKey, sidebarProfileForScope } from '@/store/profile'
+ import {
+   $messagingSessions,
+@@ -640,7 +641,17 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
+     }
+ 
+     const schedule = (state: Record<string, boolean>) => {
+-      if (!staleSessionOwners(state).length) {
++      // A probe wildcard needs a list of that gateway, not unrelated cached rows.
++      // Scoped success repairs only that profile; keep other profiles fail-closed.
++      const connection = sidebarRequestConnection()
++      const sessionProfile = sidebarProfileForScope(profileScope)
++      const wildcard = `${connection?.trim() || 'local'}/*`
++
++      const eligible = staleSessionOwners(state).some(owner =>
++        !owner.endsWith('/*') || (owner === wildcard &&
++          (sessionProfile === 'all' || !sessionOwnerIsFresh(connection, sessionProfile, state))))
++
++      if (!eligible) {
+         attempt = 0
+         clear()
+ 
+@@ -663,12 +674,14 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
+     }
+ 
+     const unsubscribe = $sessionListFreshness.subscribe(schedule)
++    const unsubscribeScope = $apiRequestScope.subscribe(() => schedule($sessionListFreshness.get()))
+ 
+     return () => {
++      unsubscribeScope()
+       unsubscribe()
+       clear()
+     }
+-  }, [refreshSessions])
++  }, [refreshSessions, profileScope])
+ 
+   return {
+     loadMoreMessagingForPlatform,
+-- 
+2.43.0
+

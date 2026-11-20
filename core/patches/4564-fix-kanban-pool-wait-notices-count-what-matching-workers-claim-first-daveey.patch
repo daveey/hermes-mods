@@ -1,0 +1,266 @@
+From 679ae09532c916284db417553fe44026331db124 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 00:47:34 +0000
+Subject: [PATCH] fix(kanban): pool wait notices count what matching workers
+ claim first [daveey]
+
+Machine-lane wait notices and `kanban show` queue notes printed
+`kanban_label_backlog.words()`, whose `ahead` counts only ready predecessors whose
+`runs_on` EQUALS the card's labels. Predecessors with other label sets that the same
+workers claim first (e.g. `["pool:worker"]`) were not counted, so a card deep in the
+pool queue read "0 card(s) with matching labels ahead of it" and owner chats chased a
+dispatch bug that did not exist (t_d943a79dd2b3889f: notice said 0 ahead; queue
+--explain put it 13/31; 33 pool-eligible ready cards outscored it and the next three
+claims were exactly the top three of those; 47 of 224 matching_pool_busy notices in
+24 h carried the "0 ... ahead" text).
+
+Change:
+- `read()` takes optional `machine_labels` (matching machine -> effective labels).
+  When given, the result carries `pool_ahead`: ready, unclaimed predecessors in
+  `lane_rows` order with a non-empty label set that one of those machines carries.
+  Computed in the existing loop over the ready-row SELECT (no new query). Label-less
+  predecessors are not counted (approximate, documented). Without it, no key.
+- `placement()` passes `machine_labels` for the available matching machines from the
+  `carried` map it already builds. Attach condition unchanged; `backlog=False`
+  dispatch path untouched (737b7f30765).
+- `words()` prepends "N ready card(s) ahead that its matching workers can also run; "
+  only when `pool_ahead` is present; the rest stays byte-identical. `move_refusal()`
+  still calls `read()` without it, so its text is unchanged.
+
+Proof:
+- New tests/hermes_cli/test_kanban_label_backlog_pool_ahead.py: (a)-(d) fail before
+  (TypeError on machine_labels / KeyError pool_ahead), pass after; (e) no-key
+  regression passes before and after.
+- Guards unchanged and green: test_kanban_label_backlog_wait.py (43),
+  test_kanban_dispatch_placement_backlog.py (3), test_kanban_notice_pacing_admission.py
+  (65). 36 test files importing the touched modules: 900 passed.
+- scripts/check --base origin/main: 20 checks ok.
+
+Card: t_3a3e0ec459e18afa
+---
+ hermes_cli/kanban_label_backlog.py            |  27 +++-
+ hermes_cli/kanban_queue_position.py           |   4 +-
+ .../test_kanban_label_backlog_pool_ahead.py   | 121 ++++++++++++++++++
+ 3 files changed, 145 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_label_backlog_pool_ahead.py
+
+diff --git a/hermes_cli/kanban_label_backlog.py b/hermes_cli/kanban_label_backlog.py
+index de4ed109c3809b704d8688aead705ae85edc8d01..3772ab35128360e04c45db1cad91ec10eb09191e 100644
+--- a/hermes_cli/kanban_label_backlog.py
++++ b/hermes_cli/kanban_label_backlog.py
+@@ -9,7 +9,7 @@ import json
+ import logging
+ import sqlite3
+ import time
+-from typing import Any, Iterable, Optional
++from typing import Any, Iterable, Mapping, Optional
+ 
+ _log = logging.getLogger(__name__)
+ WINDOW_SECONDS = 30 * 60
+@@ -48,7 +48,8 @@ def available(labels: Iterable[str], machines: Any) -> set[str]:
+ 
+ 
+ def read(conn: sqlite3.Connection, task_id: str, labels: Iterable[str], *,
+-         machines: Iterable[str] = (), now: Optional[float] = None) -> dict[str, Any]:
++         machines: Iterable[str] = (), now: Optional[float] = None,
++         machine_labels: Optional[Mapping[str, Iterable[str]]] = None) -> dict[str, Any]:
+     """Exact-label ready predecessors and distinct recently claimed cards in this board view.
+ 
+     Use canonical worker dispatch ordering (including donated priority). Counts are approximate: admission may
+@@ -56,8 +57,13 @@ def read(conn: sqlite3.Connection, task_id: str, labels: Iterable[str], *,
+     current ready episode, capped at 30 minutes. Current labels are usable only without a subsequent move/edit;
+     ambiguous history is excluded, not guessed.
+     Unreadable evidence stays unknown and cannot refuse a move.
++
++    With ``machine_labels`` (matching machine -> its effective labels) the result also carries ``pool_ahead``: ready,
++    unclaimed predecessors whose labels one of those machines carries, which it would claim first. Approximate:
++    label-less predecessors are not counted. [daveey] t_d943a79dd2b3889f read "0 ahead" at 13/31 in its pool.
+     """
+     wanted, holders = frozenset(labels), set(machines)
++    pools = None if machine_labels is None else [frozenset(have) for have in machine_labels.values()]
+     out: dict[str, Any] = {"ahead": 0, "claimed_recent": 0, "claimers": [], "window_s": WINDOW_SECONDS,
+                            "approximate": True, "scope": "board_view", "known": False}
+     if not wanted:
+@@ -82,8 +88,12 @@ def read(conn: sqlite3.Connection, task_id: str, labels: Iterable[str], *,
+             if kb._json_dict(event[1]).get("status") == "ready":
+                 since = max(since, event[0])
+         before = set(ordered[:ordered.index(task_id)])
+-        ahead = sum(row[0] in before and _labels(row[1]) == wanted for row in conn.execute(
+-            "SELECT id, runs_on FROM tasks WHERE status = 'ready' AND claim_lock IS NULL"))
++        ahead = pool_ahead = 0
++        for row in conn.execute("SELECT id, runs_on FROM tasks WHERE status = 'ready' AND claim_lock IS NULL"):
++            if row[0] not in before or (have := _labels(row[1])) is None:
++                continue
++            ahead += have == wanted
++            pool_ahead += pools is not None and any(have <= pool for pool in pools)
+         claimed: set[str] = set()
+         claimers: set[str] = set()
+         for row in conn.execute(
+@@ -102,6 +112,8 @@ def read(conn: sqlite3.Connection, task_id: str, labels: Iterable[str], *,
+         _log.debug("label backlog unavailable for %s", task_id, exc_info=True)
+         return out
+     out.update(ahead=ahead, claimed_recent=len(claimed), claimers=sorted(claimers), known=True)
++    if pools is not None:
++        out["pool_ahead"] = pool_ahead
+     return out
+ 
+ 
+@@ -115,8 +127,11 @@ def words(backlog: Any) -> str:
+         return ""
+     ahead, claimed = int(backlog.get("ahead") or 0), int(backlog.get("claimed_recent") or 0)
+     who = ", ".join(backlog.get("claimers") or [])
+-    return (f"{ahead} card(s) with matching labels ahead of it (approximate, this board view); matching workers claimed "
+-            f"{claimed} such card(s) in the last 30 min" + (f" ({who})" if who and claimed else ""))
++    pool = (f"{int(backlog['pool_ahead'] or 0)} ready card(s) ahead that its matching workers can also run; "
++            if "pool_ahead" in backlog else "")
++    return pool + (f"{ahead} card(s) with matching labels ahead of it (approximate, this board view); "
++                   f"matching workers claimed {claimed} such card(s) in the last 30 min"
++                   + (f" ({who})" if who and claimed else ""))
+ 
+ 
+ def move_refusal(conn: sqlite3.Connection, task_id: str, status: Optional[str], previous: Optional[list[str]],
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index 9b1cf08a71223d389b0e0b029f760119a23e9c73..13a7b8f677ff9c98e6653cff091283561273738b 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -132,7 +132,9 @@ def placement(conn: sqlite3.Connection, task_id: str, *, backlog: bool = True) -
+                 place["drain_until_ms"] = max(until)
+         if backlog:
+             from hermes_cli import kanban_label_backlog as klb
+-            queue = klb.read(conn, task_id, labels, machines=klb.available(labels, machines))
++            matching = klb.available(labels, machines)
++            queue = klb.read(conn, task_id, labels, machines=matching,
++                             machine_labels={name: carried[name] for name in matching})
+             if queue.get("ahead") or klb.busy(queue):
+                 place["backlog"] = queue
+         return place
+diff --git a/tests/hermes_cli/test_kanban_label_backlog_pool_ahead.py b/tests/hermes_cli/test_kanban_label_backlog_pool_ahead.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..64df913d1f1851dabe5a780fcbb649032f28f27f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_label_backlog_pool_ahead.py
+@@ -0,0 +1,121 @@
++"""Pool wait notices count what the matching workers would claim first, not only identical labels. [daveey]
++
++t_d943a79dd2b3889f's notice said "0 card(s) with matching labels ahead of it" while 33 pool-eligible ready cards
++outscored it; the next three claims were exactly the top three of those. ``read(..., machine_labels=...)`` now
++also counts ready, unclaimed predecessors (``lane_rows`` order) whose labels a matching worker carries.
++"""
++from __future__ import annotations
++
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_label_backlog as klb
++from hermes_cli import kanban_queue_position as kqp
++from hermes_cli import kanban_worker_node as wn
++from hermes_cli.kanban_db_dispatch_queries import lane_rows
++from tests.hermes_cli._placement_helpers import seen_now
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++from tests.hermes_cli.test_kanban_worker_node import HUB, MACHINES, Gateway
++
++LABELS = ["capability:core-ship", "capability:hub-read", "pool:worker"]
++WORKERS = ("worker-1", "worker-2")
++POOL = {
++    HUB: MACHINES[HUB],
++    **{name: {"name": name, "state": "active", "labels": list(LABELS), "pinned_only": False, "max_card_runs": 4,
++              "hold": False, "pickup": "all"} for name in WORKERS},
++}
++CARRIED = {name: wn.effective_labels(POOL[name], name) for name in WORKERS}
++
++
++@pytest.fixture
++def hub(tmp_path, monkeypatch):
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    sync.consume_dispatcher_wake()
++    gw = Gateway(tmp_path, HUB, FakeService(lease_runs=True, machines=POOL), monkeypatch, pickup=False)
++    gw.enter()
++    wn.set_registry_fetch(lambda: {"me": HUB, "machines": seen_now(POOL.values())})
++    yield gw
++    gw.conn.close()
++    sync.set_lease_client(None)
++    wn.set_registry_fetch(None)
++
++
++def _card(conn, title, created_at, runs_on):
++    tid = kb.create_task(conn, title=title, assignee="default", runs_on=runs_on)
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (created_at, tid))
++        conn.execute("UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = 'created'", (created_at, tid))
++    return tid
++
++
++def _older_pool(conn, now, n):
++    return [_card(conn, f"pool {i}", now - 3600 + i, ["pool:worker"]) for i in range(n)]
++
++
++def test_a_pool_eligible_predecessors_are_counted(hub):
++    now = int(time.time())
++    _older_pool(hub.conn, now, 3)
++    tid = _card(hub.conn, "core fix", now - 1900, LABELS)
++    backlog = klb.read(hub.conn, tid, LABELS, machines=set(WORKERS), machine_labels=CARRIED)
++    assert backlog["known"] and backlog["pool_ahead"] == 3 and backlog["ahead"] == 0, backlog
++    assert ("3 ready card(s) ahead that its matching workers can also run; 0 card(s) with matching labels ahead "
++            "of it") in klb.words(backlog), klb.words(backlog)
++
++
++def test_b_labels_no_matching_worker_carries_and_label_less_cards_are_not_counted(hub):
++    now = int(time.time())
++    _older_pool(hub.conn, now, 1)
++    _card(hub.conn, "hub only", now - 3000, ["machine:hub"])
++    bare = _card(hub.conn, "no labels", now - 2900, ["pool:worker"])
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET runs_on = NULL WHERE id = ?", (bare,))
++    tid = _card(hub.conn, "core fix", now - 1900, LABELS)
++    ordered = [row[0] for row in lane_rows(hub.conn, "ready")]
++    assert ordered.index(bare) < ordered.index(tid)  # the label-less card really is ahead in dispatch order
++    backlog = klb.read(hub.conn, tid, LABELS, machines=set(WORKERS), machine_labels=CARRIED)
++    assert backlog["pool_ahead"] == 1, backlog
++
++
++def test_c_newer_and_claimed_cards_are_not_counted(hub):
++    now = int(time.time())
++    _older_pool(hub.conn, now, 1)
++    running = _card(hub.conn, "running", now - 3000, ["pool:worker"])
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET status = 'running', claim_lock = 'worker-1:1' WHERE id = ?", (running,))
++    tid = _card(hub.conn, "core fix", now - 1900, LABELS)
++    _card(hub.conn, "newer", now - 60, ["pool:worker"])
++    backlog = klb.read(hub.conn, tid, LABELS, machines=set(WORKERS), machine_labels=CARRIED)
++    assert backlog["pool_ahead"] == 1, backlog
++
++
++def test_d_placement_headline_reports_pool_ahead(hub):
++    now = int(time.time())
++    _older_pool(hub.conn, now, 2)
++    claimed = _card(hub.conn, "claimed", now - 4000, LABELS)
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (claimed,))
++        kb._append_event(hub.conn, claimed, "claimed", {"holder": "worker-1", "run_uid": "r0"})
++    tid = _card(hub.conn, "core fix", now - 1900, LABELS)
++    place = kqp.placement(hub.conn, tid)
++    assert place and place["lane"] == "machine", place
++    assert place["backlog"]["pool_ahead"] == 2 and klb.busy(place["backlog"]), place
++    text = kqp.headline(place)
++    assert ("2 ready card(s) ahead that its matching workers can also run; 0 card(s) with matching labels ahead "
++            "of it") in text, text
++
++
++def test_e_without_machine_labels_output_is_unchanged(hub):
++    now = int(time.time())
++    _older_pool(hub.conn, now, 2)
++    _card(hub.conn, "same labels", now - 2500, LABELS)
++    tid = _card(hub.conn, "core fix", now - 1900, LABELS)
++    backlog = klb.read(hub.conn, tid, LABELS, machines=set(WORKERS))
++    assert "pool_ahead" not in backlog, backlog
++    assert klb.words(backlog) == ("1 card(s) with matching labels ahead of it (approximate, this board view); "
++                                  "matching workers claimed 0 such card(s) in the last 30 min"), klb.words(backlog)
++    assert json.dumps(backlog)  # still JSON-serialisable for notice payloads
+-- 
+2.43.0
+

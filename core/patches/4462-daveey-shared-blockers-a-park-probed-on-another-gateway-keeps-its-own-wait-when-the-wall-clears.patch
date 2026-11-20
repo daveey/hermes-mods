@@ -1,0 +1,377 @@
+From 246c26f5ca9cdfedc17fb4c48b9dbb2d8507849e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 03:45:20 -0800
+Subject: [PATCH] [daveey] shared blockers: a park probed on another gateway
+ keeps its own wait when the wall clears
+
+Problem: on the MacBook board (home of the cards), 2026-11-15 PST, the release lane woke two landers out of
+their exact-head CI waits: t_39b8e8a25149df65 parked at 02:40:41 and was woken at 02:40:44; t_4aeee1f1b1fef2a1
+parked at 03:06:43 and was woken at 03:07:10. Both events were `shared_blocker_cleared {"cleared_via": "check",
+"woke": true, "status": "ready"}` for `github-daveey-core-reserve`. Each woken card could only re-park, which
+costs one paced worker run per card per clear.
+
+Why 1: release_cleared_blockers took both for bare clock parks. own_wait was False, because its branch writes
+       no `woke`.
+Why 2: own_wait (c18824850e) needs `kwc.get_state(conn, tid) is not None`. The home had no task_wake_checks row
+       for either card (board read 03:4x PST). The park payloads say `probe_host: worker-7` and `worker-8`.
+Why 3: both parks ran on pool workers. park_fields stamps probe_host as the parking gateway, and set_check
+       registers the probe only there (kanban_timed_park.py `register_here=kwc.probe_here(...)`). That gateway runs
+       the probe and relays the wake home. This is by design.
+Root (happened): the independent-park rule keys "has its own probe" on the local execution row, not on the
+       logical probe the park recorded (wake_check + probe_host). So every park probed elsewhere looks
+       probe-less on its home.
+Branch (c): when such a card's own probe exits 0 while the wall is still open, the guard holds it until the probe
+       interval. A re-park without the id keeps the card in `behind` by design, and nothing tells "ready because
+       its own wait finished" from "ready behind the wall". Before this change test (c) fails with
+       "still held by shared blocker ...: probe interval due at ...".
+Root (not caught): every independent-park test parks on the board that runs the probe. No fixture models a
+       synced board whose park names another gateway as probe_host.
+Recurrence: the 2026-10-28 wake loop (t_7ebc5d5f838cf87c, fixed by _already_saw_clear measuring from the first
+       clear) and c18824850e (2026-11-14, own_wait) each covered a different case. Neither covers a remotely
+       probed park made by a run that started before the clear.
+
+Change (t_416253bd19b22598, replanned):
+- own_wait also counts a park whose wake_check runs on another gateway
+  (kanban_blocker_own_wait.probe_elsewhere: the newest park has a wake_check and probe_here() is False).
+- _shared_blocker_hold does not hold a card whose newest wake is its own probe's condition_met, when the park
+  that set the probe came after the card hit the wall and named neither the wall's id nor awaiting.shared_blocker.
+  One run spends it: a `claimed` event after the wake.
+- blocker_states is unchanged. The card's first plan (a pass run with a wake_check park sets current = None in
+  the walk) would break acceptance 2: test_repark_without_blocker_id_keeps_blocker_open asserts
+  set(st.behind) == {a, b} after exactly that worker re-park. kanban_schedule's description also documents that
+  a park without blocker_id stays behind the blocker.
+
+Tests (tests/hermes_cli/test_kanban_blocker_remote_probe_park.py; the synced board is modelled with own_gateway
+patched, the park made as worker-8, and no home probe row):
+- (a) remote-probe park survives a registered-check clear: RED on c79f377aef (woken), GREEN after.
+- (b) a bare clock re-park from a worker is still woken: GREEN before and after (pin).
+- local-probe own wait unchanged (c18824850e case): GREEN before and after (pin).
+- (c) its own probe fires while the wall is open, so it is not held (park made on the home, and on the worker):
+  RED before, GREEN after.
+- pins, GREEN before and after: one run spends the own-wake exemption; a park whose awaiting names the wall
+  stays held.
+- Every test file importing the shared-blocker modules (33 files, 724 tests) passes on the Mac.
+---
+ hermes_cli/kanban_blocker_own_wait.py         |  63 ++++++
+ hermes_cli/kanban_shared_blockers.py          |   8 +-
+ .../test_kanban_blocker_remote_probe_park.py  | 205 ++++++++++++++++++
+ 3 files changed, 275 insertions(+), 1 deletion(-)
+ create mode 100644 hermes_cli/kanban_blocker_own_wait.py
+ create mode 100644 tests/hermes_cli/test_kanban_blocker_remote_probe_park.py
+
+diff --git a/hermes_cli/kanban_blocker_own_wait.py b/hermes_cli/kanban_blocker_own_wait.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..86ac5b6f800851213745ee6b2783b7fbb820e170
+--- /dev/null
++++ b/hermes_cli/kanban_blocker_own_wait.py
+@@ -0,0 +1,63 @@
++"""Which parks are a card's own wait, independent of the shared blocker it hit earlier. [daveey]
++
++A card behind wall X that re-parks WITHOUT X's id stays in X's ``behind`` (the park says nothing about the
++wall). When that park set a ``wake_check`` of its own (an exact-head CI probe, a deploy), the card waits on that
++probe, not on X: X's clear must not wake it early, and once its own probe fires, X must not hold it.
++
++2026-11-15 PST, MacBook board: two landers parked on their CI probes on pool workers (``probe_host`` = the
++worker, so the home registered no probe row) and the home's registered check for ``github-daveey-core-reserve``
++woke both out of those waits (02:40:44, 03:07:10).
++"""
++from __future__ import annotations
++
++import sqlite3
++from typing import Optional
++
++
++def probe_elsewhere(conn: sqlite3.Connection, task_id: str) -> bool:
++    """The card's current park set a wake_check that another gateway runs (``probe_host``).
++
++    The parking gateway registers and runs that probe and relays its wake home, so this board holds no
++    ``task_wake_checks`` row for it (``kanban_wake_check.set_check(register_here=False)``) although the park
++    has a probe of its own."""
++    from hermes_cli import kanban_wake_check as kwc
++    from hermes_cli.kanban_continuation import park_state
++
++    payload = park_state(conn, task_id)["payload"]
++    host = payload.get("probe_host")
++    return bool(payload.get("wake_check")) and isinstance(host, str) and not kwc.probe_here(conn, host)
++
++
++def woken_by_own_park(conn: sqlite3.Connection, blocker_id: str, task_id: str, asserted_at: int) -> bool:
++    """True when the card's newest wake is its own probe's exit 0 (``condition_met``) and the park that set that
++    probe came after the card hit ``blocker_id`` (``asserted_at``) without naming it: an independent wait that is
++    now satisfied. One run spends it (a ``claimed`` event after the wake), as one run spends a probe release."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_continuation import SCHEDULED_ENTRY_EVENTS
++    from hermes_cli.kanban_shared_blockers import CONDITION_MET_EVENT, normalize_blocker_id
++
++    met = conn.execute(
++        "SELECT id, created_at, payload FROM task_events WHERE kind = ? AND task_id = ? "
++        "ORDER BY id DESC LIMIT 1", (CONDITION_MET_EVENT, task_id)).fetchone()
++    if met is None or (kb._to_epoch(met["created_at"]) or 0) < asserted_at:
++        return False
++    marks = ",".join("?" * len(SCHEDULED_ENTRY_EVENTS))
++    park = conn.execute(
++        f"SELECT created_at, payload FROM task_events WHERE task_id = ? AND kind IN ({marks}) AND id < ? "
++        "ORDER BY id DESC LIMIT 1", (task_id, *SCHEDULED_ENTRY_EVENTS, int(met["id"]))).fetchone()
++    if park is None or (kb._to_epoch(park["created_at"]) or 0) < asserted_at:
++        return False
++    payload = kb._json_dict(park["payload"])
++    awaiting = payload.get("awaiting")
++    if not isinstance(awaiting, dict):
++        awaiting = {}
++    if blocker_id in (normalize_blocker_id(payload.get("blocker_id")),
++                      normalize_blocker_id(awaiting.get("shared_blocker"))):
++        return False
++    probe: Optional[str] = payload.get("wake_check")
++    fired = kb._json_dict(met["payload"]).get("wake_check")
++    if not probe or (fired and fired != probe):
++        return False
++    return conn.execute(
++        "SELECT 1 FROM task_events WHERE kind = 'claimed' AND task_id = ? AND id > ? LIMIT 1",
++        (task_id, int(met["id"]))).fetchone() is None
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+index 33fef460558df50b5f4a7dc30dfe064c792fbaaf..2eb18a21161138c58cc9032290e43de2ae9a99e9 100644
+--- a/hermes_cli/kanban_shared_blockers.py
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -626,6 +626,9 @@ def _shared_blocker_hold(conn, task_id, *, now=None, interval=None) -> Optional[
+     st = blocker_for_task(states, task_id)
+     if st is None or not st.is_open or not task_applies(conn, st, task_id):
+         return None
++    from hermes_cli.kanban_blocker_own_wait import woken_by_own_park
++    if woken_by_own_park(conn, st.blocker_id, task_id, st.behind[task_id]):
++        return None   # its own park's probe woke it, not the wall
+     from hermes_cli.kanban_shared_blocker_checks import registered_checks
+     cfg = _hold_config()
+     if st.blocker_id in registered_checks(cfg) and _operator_released(conn, task_id, st.blocker_id):
+@@ -712,6 +715,7 @@ def release_cleared_blockers(conn: sqlite3.Connection, *, now: Optional[int] = N
+     Returns only task ids whose lane changed (ready/review cards remain queued)."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_wake_check as kwc
++    from hermes_cli.kanban_blocker_own_wait import probe_elsewhere
+     from hermes_cli.kanban_blocker_rows import foreign_among
+ 
+     # Retained executor copies own host-local wake probes, not shared-wall policy writes.
+@@ -735,7 +739,9 @@ def release_cleared_blockers(conn: sqlite3.Connection, *, now: Optional[int] = N
+             from hermes_cli.kanban_continuation import pending_wake
+             park = pending_wake(conn, tid) or {}
+             awaiting = park.get("awaiting") or {}
+-            own_wait = (row["status"] == "scheduled" and kwc.get_state(conn, tid) is not None
++            # A probe another gateway runs (``probe_host``) has no row here but is the park's own wait all the same.
++            own_wait = (row["status"] == "scheduled"
++                        and (kwc.get_state(conn, tid) is not None or probe_elsewhere(conn, tid))
+                         and (awaiting.get("shared_blocker") or park.get("blocker_id")) != st.blocker_id)
+             if row["status"] in ("ready", "review") or own_wait:
+                 # Retire the historical hold, not an independent park's probe/backstop.
+diff --git a/tests/hermes_cli/test_kanban_blocker_remote_probe_park.py b/tests/hermes_cli/test_kanban_blocker_remote_probe_park.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3b371ada6a184bd5ba163879fbb62c34e311f82c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_blocker_remote_probe_park.py
+@@ -0,0 +1,205 @@
++"""A park whose wake_check runs on another gateway is an independent wait: a wall clear must not wake it. [daveey]
++
++Repro of 2026-11-15 PST on the MacBook board (the cards' home), wall ``github-daveey-core-reserve``:
++
++- 02:40:41 t_39b8e8a25149df65 (worker-7) and 03:06:43 t_4aeee1f1b1fef2a1 (worker-8) were behind the wall from an
++  earlier run. Each ran again on a pool worker, published its core PR and re-parked on its own exact-head CI probe
++  (``hermes-core-wt-land --review-ci-probe``) with no ``blocker_id``. The park ran on the worker, so it stamped
++  ``probe_host`` = that worker, and the home registered no ``task_wake_checks`` row
++  (``kanban_wake_check.set_check(register_here=False)``).
++- 02:40:44 and 03:07:10: the home's registered check cleared the wall, and ``release_cleared_blockers`` woke both
++  cards out of their CI waits (``shared_blocker_cleared`` with ``woke: true``). The ready cards could only re-park.
++
++``own_wait`` (c18824850e) keeps an independent park only when ``kwc.get_state`` finds the probe row on this board,
++and a park probed on another gateway never has one here. Not caught because every independent-park test parks on
++the board that runs the probe.
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_shared_blocker_checks as checks
++from hermes_cli import kanban_shared_blockers as ksb
++from hermes_cli import kanban_wake_check as kwc
++from hermes_cli.kanban_continuation import pending_wake
++from tests.hermes_cli import test_kanban_blocker_park_wake as pw
++import tools.kanban_tools as kt
++
++kanban_home = pw.kanban_home
++BID = pw.BID
++HOME, WORKER = "macbook", "worker-8"
++CI_PROBE = ("hermes-core-wt-land --review-ci-probe --repo example-org/hermes --number 3308 "
++            "--sha 099983f370fbb2eb0f96df43596dd5b66755a8bd --check 'All required checks pass (v2)'")
++CI_AWAIT = {"kind": "ci", "ref": "https://github.com/example-org/hermes/pull/3308",
++            "why": "required checks on the exact head are still running"}
++
++
++@pytest.fixture
++def gateway(monkeypatch: pytest.MonkeyPatch) -> list[str]:
++    """This board syncs; ``gateway[0]`` is the gateway the code runs on (the home unless a test moves it)."""
++    host = [HOME]
++    monkeypatch.setattr(kwc, "own_gateway", lambda conn=None: host[0])
++    return host
++
++
++def _two_behind(monkeypatch) -> tuple[str, str]:
++    with kbc.connect_closing() as conn:
++        a = pw._worker_block_behind(monkeypatch, conn, "lander")
++        b = pw._worker_block_behind(monkeypatch, conn, "other card behind the wall")
++        pw._age_all(conn, 600)
++    return a, b
++
++
++def _run_on_worker_then_park(monkeypatch, gateway, tid: str, park: dict) -> None:
++    """``tid`` starts a run (before the clear), and that run parks on a pool worker; the home sees the synced park."""
++    with kbc.connect_closing() as conn:
++        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++        conn.commit()
++        pw._as_worker(monkeypatch, conn, tid)
++    gateway[0] = WORKER
++    try:
++        out = json.loads(kt._handle_schedule(dict(park)))
++    finally:
++        gateway[0] = HOME
++        pw._as_parent(monkeypatch)
++    assert "error" not in out, out
++    with kbc.connect_closing() as conn, kb.write_txn(conn):
++        # The home applies the worker's park without registering its probe (set_check register_here=False).
++        conn.execute("DELETE FROM task_wake_checks WHERE task_id = ?", (tid,))
++
++
++def _clear_by_registered_check(conn) -> None:
++    assert ksb.blocker_states(conn)[BID].is_open
++    assert checks.run_due_checks(conn, cfg={"kanban": {"shared_blocker_checks": {BID: "exit 0"}}}) == [BID]
++    st = ksb.blocker_states(conn)[BID]
++    assert not st.is_open and st.cleared_via == "check"
++
++
++def _woke(conn, tid: str) -> list:
++    return [e for e in pw._cleared_events(conn, tid) if e.payload.get("woke")]
++
++
++def test_remote_probe_park_keeps_its_wait_when_a_registered_check_clears_the_wall(kanban_home, monkeypatch, gateway):
++    """Acceptance (a)."""
++    a, b = _two_behind(monkeypatch)
++    _run_on_worker_then_park(monkeypatch, gateway, a, {
++        "reason": "review deferred: required checks pending on the exact head",
++        "wake_check": CI_PROBE, "check_every": 120, "awaiting": CI_AWAIT})
++    with kbc.connect_closing() as conn:
++        park = pending_wake(conn, a)
++        assert park and park.get("probe_host") == WORKER and park.get("wake_check") == CI_PROBE
++        assert "blocker_id" not in park
++        assert kwc.get_state(conn, a) is None          # no probe row on the home: the worker runs it
++        _clear_by_registered_check(conn)
++        released = ksb.release_cleared_blockers(conn)
++        assert a not in released and b in released
++        assert kb.get_task(conn, a).status == "scheduled"
++        assert pending_wake(conn, a) == park           # its CI wait, backstop and probe custody intact
++        assert not _woke(conn, a)
++        assert ksb.release_cleared_blockers(conn) == []
++
++
++def test_bare_clock_repark_from_a_worker_is_still_woken_by_the_clear(kanban_home, monkeypatch, gateway):
++    """Acceptance (b): a re-park with no wake_check of its own still wakes when the wall clears (pinned)."""
++    a, b = _two_behind(monkeypatch)
++    _run_on_worker_then_park(monkeypatch, gateway, a, {
++        "reason": f"SCHEDULED_UNTIL={pw._tomorrow()} wall still up; re-check tomorrow", "clock_only": True})
++    with kbc.connect_closing() as conn:
++        park = pending_wake(conn, a)
++        assert park and "wake_check" not in park and "probe_host" not in park
++        _clear_by_registered_check(conn)
++        released = ksb.release_cleared_blockers(conn)
++        assert a in released and b in released
++        assert kb.get_task(conn, a).status == "ready"
++        assert len(_woke(conn, a)) == 1
++
++
++def test_local_probe_park_from_the_home_is_unchanged(kanban_home, monkeypatch, gateway):
++    """The c18824850e case on the probing board itself: kept before and after this change."""
++    a, b = _two_behind(monkeypatch)
++    with kbc.connect_closing() as conn:
++        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (a,))
++        conn.commit()
++        pw._as_worker(monkeypatch, conn, a)
++    out = json.loads(kt._handle_schedule({"reason": "review deferred: required checks pending",
++                                          "wake_check": CI_PROBE, "check_every": 120, "awaiting": CI_AWAIT}))
++    pw._as_parent(monkeypatch)
++    assert "error" not in out, out
++    with kbc.connect_closing() as conn:
++        assert kwc.get_state(conn, a)["cmd"] == CI_PROBE
++        _clear_by_registered_check(conn)
++        released = ksb.release_cleared_blockers(conn)
++        assert a not in released and b in released
++        assert kb.get_task(conn, a).status == "scheduled" and not _woke(conn, a)
++
++
++def _own_probe_fires(monkeypatch, gateway, where: str, *, awaits_wall: bool = False) -> tuple[str, str]:
++    """a (behind X) runs, parks on its own CI probe on ``where``, and that probe exits 0 while X is still open."""
++    a, b = _two_behind(monkeypatch)
++    with kbc.connect_closing() as conn:
++        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (a,))
++        conn.commit()
++        pw._as_worker(monkeypatch, conn, a)
++    gateway[0] = where
++    try:
++        out = json.loads(kt._handle_schedule({"reason": "review deferred: required checks pending",
++                                              "wake_check": CI_PROBE, "check_every": 120, "awaiting": CI_AWAIT}))
++        assert "error" not in out, out
++        pw._as_parent(monkeypatch)
++        with kbc.connect_closing() as conn:
++            if awaits_wall:   # the park waits on the wall itself (awaiting.shared_blocker), not on its own work
++                with kb.write_txn(conn):
++                    park = pending_wake(conn, a)
++                    assert park is not None
++                    park["awaiting"]["shared_blocker"] = BID
++                    kb._append_event(conn, a, "scheduled", park)
++            state = kwc.get_state(conn, a)
++            assert kwc.apply_result(conn, a, state["cmd"], 0, "All required checks pass (v2): success",
++                                    generation=state["generation"]) == kwc.CONDITION_MET_EVENT
++    finally:
++        gateway[0] = HOME
++    return a, b
++
++
++def _status(conn, tid: str) -> str:
++    task = kb.get_task(conn, tid)
++    assert task is not None
++    return task.status
++
++
++@pytest.mark.parametrize("where", [HOME, WORKER])
++def test_own_probe_firing_while_the_wall_is_open_is_not_held_on_it(kanban_home, monkeypatch, gateway, where):
++    """Acceptance (c): the card's own wake_check exits 0 while X is still open."""
++    a, b = _own_probe_fires(monkeypatch, gateway, where)
++    with kbc.connect_closing() as conn:
++        assert _status(conn, a) == "ready"
++        st = ksb.blocker_states(conn)[BID]
++        assert st.is_open and b in st.behind
++        verdict = ksb.unblock_verdict(conn, a)
++        assert not verdict.startswith("still held"), verdict
++        assert ksb.shared_blocker_guard(conn, a) is None
++        # The wall still holds every other card behind it.
++        assert _status(conn, b) == "scheduled"
++        assert ksb.release_cleared_blockers(conn) == []
++
++
++def test_own_wake_is_spent_by_one_run(kanban_home, monkeypatch, gateway):
++    """After one run the card is an ordinary card behind X again (e.g. that run was reclaimed)."""
++    a, _b = _own_probe_fires(monkeypatch, gateway, HOME)
++    with kbc.connect_closing() as conn:
++        assert kb.claim_task(conn, a)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status = 'ready', current_run_id = NULL WHERE id = ?", (a,))
++        assert ksb.unblock_verdict(conn, a).startswith("still held"), ksb.unblock_verdict(conn, a)
++
++
++def test_wake_from_a_park_that_awaits_the_wall_is_still_held(kanban_home, monkeypatch, gateway):
++    """A park whose awaiting names the wall waits on the wall: its probe's exit 0 does not lift the hold."""
++    a, _b = _own_probe_fires(monkeypatch, gateway, HOME, awaits_wall=True)
++    with kbc.connect_closing() as conn:
++        assert _status(conn, a) == "ready"
++        assert ksb.unblock_verdict(conn, a).startswith("still held"), ksb.unblock_verdict(conn, a)
+-- 
+2.43.0
+

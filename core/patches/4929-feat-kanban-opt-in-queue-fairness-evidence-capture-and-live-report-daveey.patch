@@ -1,0 +1,1936 @@
+From 1e8cfb36cd141f0eb8516138f1ebb09a4027b5bb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 06:36:16 +0000
+Subject: [PATCH] feat(kanban): opt-in queue-fairness evidence capture and live
+ report [daveey]
+
+Why: t_9791ec808c66123a asks for measured ready-wait numbers from the live board (p0 median <= 30 min, no card past 120 min while claims happen, alarm and land-turn owner cards claimed <= 10 min). Nothing durable records when a card became ready and when it was claimed across gateways, so none of the three can be read back. This is Phase A of the card's implementation brief v2 (the ordering comparison, Phase B, is not built).
+
+What: scripts/kanban_fairness.py arms a bounded SQLite change journal (kanban_fairness_* tables and triggers, with an opening snapshot, in one transaction) on one Kanban database, drains it to hashed JSONL segments, seals it with a manifest, and reports cohorts and the four gates with interval bounds. A gate passes only on its upper bound, fails only on its lower bound, and is INDETERMINATE for an empty cohort, an unbounded episode, a dropped change, a missing seal, a replaced journal or missing owner history. An inventory command lists flat-1000 producers and alarm keys in named trees and refuses an unclassified match.
+
+No scheduler behaviour changes: nothing in the dispatcher reads the journal, and it does nothing until an operator arms it. kanban_admission_score only gains the ALARM_KEY_PREFIXES name for the tuple it already used.
+
+Not in this commit: the owner_authority.jsonl writer (state repository; until it exists the owner gate reads INDETERMINATE), a per-creation explicit/inherited priority receipt, fleet roster capture, and any measurement window. Trigger cost on a busy board is not measured.
+
+Proof: scripts/run_tests.sh on the four new test files plus tests/hermes_cli/test_kanban_urgency_floor.py: 56 passed. The vertical test drives real dispatch_once on a real board database through journal, segments, seal and the CLI report, and checks that the dispatcher's row and event lifecycle is the same with the journal armed and without it. scripts/check: 21 checks ok.
+---
+ docs/kanban-fairness-capture.md               |  98 ++++++
+ hermes_cli/kanban_admission_score.py          |   7 +-
+ hermes_cli/kanban_fairness_inventory.py       |  91 ++++++
+ hermes_cli/kanban_fairness_journal.py         | 181 +++++++++++
+ hermes_cli/kanban_fairness_metrics.py         | 298 ++++++++++++++++++
+ hermes_cli/kanban_fairness_schema.py          | 118 +++++++
+ hermes_cli/kanban_fairness_store.py           | 158 ++++++++++
+ scripts/kanban_fairness.py                    | 220 +++++++++++++
+ .../test_kanban_fairness_inventory.py         |  59 ++++
+ .../test_kanban_fairness_journal.py           | 159 ++++++++++
+ .../test_kanban_fairness_metrics.py           | 269 ++++++++++++++++
+ .../test_kanban_fairness_vertical.py          | 155 +++++++++
+ 12 files changed, 1810 insertions(+), 3 deletions(-)
+ create mode 100644 docs/kanban-fairness-capture.md
+ create mode 100644 hermes_cli/kanban_fairness_inventory.py
+ create mode 100644 hermes_cli/kanban_fairness_journal.py
+ create mode 100644 hermes_cli/kanban_fairness_metrics.py
+ create mode 100644 hermes_cli/kanban_fairness_schema.py
+ create mode 100644 hermes_cli/kanban_fairness_store.py
+ create mode 100644 scripts/kanban_fairness.py
+ create mode 100644 tests/hermes_cli/test_kanban_fairness_inventory.py
+ create mode 100644 tests/hermes_cli/test_kanban_fairness_journal.py
+ create mode 100644 tests/hermes_cli/test_kanban_fairness_metrics.py
+ create mode 100644 tests/hermes_cli/test_kanban_fairness_vertical.py
+
+diff --git a/docs/kanban-fairness-capture.md b/docs/kanban-fairness-capture.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..86be7a46c7a7d6f4cdd0bea925fac6f77b54e833
+--- /dev/null
++++ b/docs/kanban-fairness-capture.md
+@@ -0,0 +1,98 @@
++# Queue-fairness evidence capture
++
++Measures how long cards wait in `ready` on a live board, to check the dispatcher-fairness targets of
++`t_9791ec808c66123a`:
++
++| Gate | Cohort | Threshold |
++|---|---|---|
++| `p0_median_wait` | ready episodes whose stored priority was 0 on entering `ready` | median ≤ 1800 s |
++| `max_wait_while_claims` | every ready episode | none past 7200 s while a claim is witnessed |
++| `alarm_wait` | cards whose idempotency key has an alarm prefix (`kanban_admission_score.ALARM_KEY_PREFIXES`) | each ≤ 600 s |
++| `owner_wait` | cards that held, or were next for, a land turn while ready | each ≤ 600 s |
++
++It is evidence tooling only. It changes no priority, floor or aging rule, nothing in the dispatcher reads it,
++and it does nothing until an operator arms it. This is the first of two phases: comparing the old and the new
++scoring order at each pick is not built here.
++
++## How a capture works
++
++`scripts/kanban_fairness.py capture arm` installs, in one transaction on one Kanban database, two tables
++(`kanban_fairness_journal`, `kanban_fairness_session`), a snapshot of every open card, and four
++`kanban_fairness_*` triggers. From then on each row version of `tasks` that changes status, priority,
++idempotency key, assignee, `ready_since` or lease holder, and each lifecycle event, is appended with the
++database host's clock. Writes made by a sync apply are journaled too. No title, body, comment or payload is
++stored.
++
++- The journal row is part of the writer's transaction: a rollback removes it, and the writer never touches
++  a file.
++- The journal is bounded (100,000 rows or 64 MiB of field text). Past the bound the triggers count each
++  change they did not store. Any dropped change makes the capture incomplete.
++- `capture drain` copies new rows into `segment-NNNNNN.jsonl` files (hashed in `receipts.json`).
++  `capture seal` removes the triggers, drains the tail and writes `manifest.json`. `capture clear` drops the
++  tables.
++
++Which database to arm: a board's own `kanban.db` holds only what that gateway knows. To see every gateway's
++cards from one host, arm the board's replica (`--board default --replica`, the `sync-shadow` copy) and state
++its worst pull lag with `--apply-lag-s`. The reader widens every time by that lag. A replica that is rebuilt
++from a snapshot loses its journal; the next drain records `journal_missing` and the capture is incomplete.
++
++## Reading a capture
++
++`validate --input DIR` lists coverage gaps. `report --mode live --input DIR --output live.json` writes the
++cohorts and gates. Every wait is an interval `[lower, upper]`:
++
++- start: the Board's `ready_since` when the row has one, else the sighting of the ready row (minus the lag);
++- claim: the `claimed` event's second when journaled, else the sighting of the `running` row;
++- a card still ready at the close has no upper bound;
++- a card that left `ready` without a claim (blocked, archived, parked) has no upper bound either, unless the
++  capture was armed with `--unclaimed-exit elapsed_ready`. That choice is fixed at arm time and printed in
++  the report;
++- `--clock-error-s` (default 2) widens both ends.
++
++A gate is PASS only when its upper bound meets the threshold, FAIL only when its lower bound breaks it, and
++INDETERMINATE otherwise: an empty cohort, an unbounded episode that decides the result, no witnessed claim
++(for the max gate), a window shorter than `--min-window-s`, or any coverage gap. A proven FAIL stands on an
++incomplete capture; a PASS does not. No episode is removed from a cohort.
++
++Exit codes: 0 all gates PASS, 1 a gate FAILED, 2 INDETERMINATE or incomplete, 3 tool error.
++
++## Owner history
++
++The owner gate needs `owner_authority.jsonl` in the capture directory: `interval` lines (a card held or was
++next for a land turn from `start_s` to `end_s`) and `coverage` lines (the journal vouches for `core-lane` or
++`state-turn` between two times; `complete: false` marks a chain break). Without the file, or where coverage
++does not span the whole window for both sources, the owner gate is INDETERMINATE. The file is produced by
++the turn-urgency observer's owner journal in the state repository; this repository only reads it.
++
++## Inventories
++
++`inventory scan --tree NAME=PATH ...` lists every line in the named trees that sets a flat top priority
++(`priority=1000`, `"priority": 1000`, `p1000`) or mentions an alarm key prefix (the three floored ones plus
++`worker-resources-unknown:` and `turn-urgency-health:` as candidates), and hashes each tree.
++`inventory check --scan S --classification C` needs one row per match
++(`{"id", "family", "disposition", "note"}` under `producers` / `alarms`); an unclassified match or a row
++whose match is gone exits 2. Skill trees differ per executor: scan on each one, check once per tree hash.
++
++## A measurement window
++
++```bash
++OUT=~/.hermes/kanban/evidence/fairness-150min
++scripts/hermes-python scripts/kanban_fairness.py capture arm --out "$OUT" --capture-id fairness-150min \
++    --board default --replica --apply-lag-s 60
++# ... every 10-15 minutes, and at the end of the window:
++scripts/hermes-python scripts/kanban_fairness.py capture drain --out "$OUT"
++scripts/hermes-python scripts/kanban_fairness.py capture seal --out "$OUT"
++scripts/hermes-python scripts/kanban_fairness.py report --mode live --input "$OUT" --output "$OUT/live.json" \
++    --min-window-s 9000
++scripts/hermes-python scripts/kanban_fairness.py capture clear --out "$OUT"
++```
++
++`--apply-lag-s 60` is an example, not a measured value: use the replica's observed worst pull interval for
++the window.
++
++## Limits
++
++- One database per capture. Which executors served the queue, and at which revisions, is not journaled; put
++  the roster in `plan.json` (`"roster": [...]`) before sealing if the report should carry it.
++- Capacity can make a threshold unreachable in a given window; the report says what happened, not why.
++- Trigger cost on a busy board has not been measured.
+diff --git a/hermes_cli/kanban_admission_score.py b/hermes_cli/kanban_admission_score.py
+index 6efcd4401ef280591393dd1748750403dcc7b383..a30099685f923719bb0d196cfbd5a5160158f6bb 100644
+--- a/hermes_cli/kanban_admission_score.py
++++ b/hermes_cli/kanban_admission_score.py
+@@ -158,11 +158,12 @@ def _apply_turn_floor(conn, tasks, *, now_s=None) -> frozenset:
+     return frozenset(applied)
+ 
+ 
++ALARM_KEY_PREFIXES = ("worker-claim-watch:", "pickup-stall:", "mods-suite-red:")
++
++
+ def _alarm_key(key) -> bool:
+     """Explicit detector keys, not titles or priority bands, identify alarms."""
+-    return isinstance(key, str) and key.startswith((
+-        "worker-claim-watch:", "pickup-stall:", "mods-suite-red:",
+-    ))
++    return isinstance(key, str) and key.startswith(ALARM_KEY_PREFIXES)
+ 
+ 
+ def _source_snapshot(conn, candidate_ids):
+diff --git a/hermes_cli/kanban_fairness_inventory.py b/hermes_cli/kanban_fairness_inventory.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4ef79f81333051029af126af8d00d2ec55d1947e
+--- /dev/null
++++ b/hermes_cli/kanban_fairness_inventory.py
+@@ -0,0 +1,91 @@
++"""Finite producer and alarm inventory for the queue-fairness evidence. [daveey]
++
++``scan`` walks named source trees once and returns every line that sets a flat top priority
++(``priority=1000``, ``"priority": 1000``, ``p1000``) or mentions an alarm key prefix, plus a hash of each tree.
++``check`` compares those matches with a hand-written classification: one row per match saying what the
++producer or detector is and how it is disposed. A match with no row, or a row whose match is gone, makes the
++inventory incomplete; nothing is classified by its title or guessed. Trees differ per executor, so the
++operator runs ``scan`` on each one and ``check`` once per distinct tree hash.
++"""
++from __future__ import annotations
++
++import hashlib
++import re
++from pathlib import Path
++from typing import Iterable
++
++from hermes_cli.kanban_admission_score import ALARM_KEY_PREFIXES
++from hermes_cli.kanban_fairness_schema import VERSION
++
++# Keys that look like alarms but that the scorer does not floor: they must be classified, not assumed.
++ALARM_CANDIDATE_PREFIXES = ("worker-resources-unknown:", "turn-urgency-health:")
++_PRIORITY = re.compile(r"""priority["']?\s*[=:]\s*["']?1000\b|\bp1000\b""", re.IGNORECASE)
++_SUFFIXES = {".py", ".md", ".json", ".yaml", ".yml", ".toml", ".sh", ""}
++_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", ".worktrees", "dist", "build"}
++_MAX_FILE_BYTES = 2 * 1024 * 1024
++DISPOSITIONS = ("inherits_parent", "explicit_user_urgency", "flat_default", "not_a_producer", "floored",
++                "not_floored")
++
++
++def _files(root: Path) -> Iterable[Path]:
++    for path in sorted(root.rglob("*")):
++        if path.is_file() and path.suffix in _SUFFIXES and not _SKIP_DIRS.intersection(path.parts) \
++                and path.stat().st_size <= _MAX_FILE_BYTES:
++            yield path
++
++
++def match_id(tree: str, path: str, text: str) -> str:
++    """Stable across line moves: the tree's name, the file and the matched line's text."""
++    return hashlib.sha256(f"{tree}\0{path}\0{text}".encode()).hexdigest()[:16]
++
++
++def scan(trees: dict[str, Path]) -> dict:
++    """``{"trees": {name: {root, sha256, files}}, "producers": [...], "alarms": [...]}``."""
++    prefixes = ALARM_KEY_PREFIXES + ALARM_CANDIDATE_PREFIXES
++    out: dict = {"version": VERSION, "trees": {}, "producers": [], "alarms": []}
++    for name, root in sorted(trees.items()):
++        digest, count = hashlib.sha256(), 0
++        for path in _files(root):
++            data = path.read_bytes()
++            rel = path.relative_to(root).as_posix()
++            digest.update(f"{rel}\0{hashlib.sha256(data).hexdigest()}\n".encode())
++            count += 1
++            for number, line in enumerate(data.decode("utf-8", "replace").splitlines(), 1):
++                text = line.strip()
++                row = {"tree": name, "path": rel, "line": number, "text": text[:240],
++                       "id": match_id(name, rel, text)}
++                if _PRIORITY.search(line):
++                    out["producers"].append(row)
++                found = [p for p in prefixes if p in line]
++                if found:
++                    out["alarms"].append({**row, "prefixes": found})
++        out["trees"][name] = {"root": str(root), "sha256": digest.hexdigest(), "files": count}
++    return out
++
++
++def check(scanned: dict, classification: dict) -> dict:
++    """Every match needs exactly one valid classification row, and every row a live match."""
++    problems: list[dict] = []
++    result = {"version": VERSION, "trees": scanned["trees"], "problems": problems}
++    for kind in ("producers", "alarms"):
++        rows, seen = {}, set()
++        for row in classification.get(kind) or []:
++            if not isinstance(row, dict) or row.get("disposition") not in DISPOSITIONS \
++                    or not row.get("family") or not row.get("id"):
++                problems.append({"kind": kind, "problem": "invalid_row", "row": row})
++                continue
++            rows[row["id"]] = row
++        classified = []
++        for match in scanned[kind]:
++            row = rows.get(match["id"])
++            if row is None:
++                problems.append({"kind": kind, "problem": "unclassified", "match": match})
++                continue
++            seen.add(match["id"])
++            classified.append({**match, "family": row["family"], "disposition": row["disposition"],
++                               "note": row.get("note")})
++        for missing in sorted(set(rows) - seen):
++            problems.append({"kind": kind, "problem": "stale_row", "row": rows[missing]})
++        result[kind] = classified
++    result["complete"] = not problems
++    return result
+diff --git a/hermes_cli/kanban_fairness_journal.py b/hermes_cli/kanban_fairness_journal.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a1b4f7fcb2bbe635e959bb9ecfbd2b7501317640
+--- /dev/null
++++ b/hermes_cli/kanban_fairness_journal.py
+@@ -0,0 +1,181 @@
++"""Opt-in SQLite change journal for the queue-fairness capture. [daveey]
++
++``arm`` installs, in one write transaction, two feature-owned tables, an opening snapshot of every open card
++and ``kanban_fairness_*`` triggers on ``tasks`` and ``task_events``. From then on every row version that
++changes a queue-relevant field, and every lifecycle event, is appended with the database host's wall clock;
++changes a sync apply writes are recorded too (the sync capture triggers skip those). Nothing here runs unless
++an operator arms it, and no scheduler code reads it.
++
++A journal row is written inside the writer's own transaction, so a rollback removes it and the writer never
++waits on a file. The journal is bounded: past ``max_records`` or ``max_bytes`` the triggers only count what
++they dropped, which the reader treats as a coverage gap. ``seal`` stops the capture and removes the triggers;
++the rows stay until ``clear`` so they can be drained again.
++"""
++from __future__ import annotations
++
++import os
++import sqlite3
++from typing import Iterator, Optional
++
++from hermes_cli.kanban_fairness_schema import EVENT_KINDS, MAX_BYTES, MAX_RECORDS, TASK_FIELDS
++
++JOURNAL, SESSION = "kanban_fairness_journal", "kanban_fairness_session"
++_NOW_MS = "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)"
++_WATCHED = ("status", "priority", "idempotency_key", "assignee", "ready_since", "lease_holder")
++_SCHEMA = (
++    f"CREATE TABLE {JOURNAL} (seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, "
++    "wall_ms INTEGER NOT NULL, task_id TEXT NOT NULL, op TEXT, fields TEXT NOT NULL)",
++    f"CREATE TABLE {SESSION} (id INTEGER PRIMARY KEY CHECK (id = 1), capture_id TEXT NOT NULL, "
++    "armed_ms INTEGER NOT NULL, sealed_ms INTEGER, max_records INTEGER NOT NULL, max_bytes INTEGER NOT NULL, "
++    "stored INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0, dropped INTEGER NOT NULL DEFAULT 0, "
++    "first_drop_ms INTEGER, last_drop_ms INTEGER, admit INTEGER NOT NULL DEFAULT 1)",
++)
++
++
++class JournalError(RuntimeError):
++    """The journal is not in the state the caller needs (already armed, never armed, sealed)."""
++
++
++def _fields_sql(columns: list[str], ref: str) -> str:
++    return "json_object(" + ", ".join(f"'{c}', {ref}.{c}" for c in columns) + ")"
++
++
++def _append(kind: str, task_id: str, op: Optional[str], fields: str) -> str:
++    """Count the change, then store it only while the session is open and under both bounds."""
++    full = "(stored >= max_records OR bytes >= max_bytes)"
++    op_sql = "NULL" if op is None else f"'{op}'"
++    return (
++        f"UPDATE {SESSION} SET admit = NOT {full}, dropped = dropped + {full}, "
++        f"first_drop_ms = CASE WHEN {full} THEN COALESCE(first_drop_ms, {_NOW_MS}) ELSE first_drop_ms END, "
++        f"last_drop_ms = CASE WHEN {full} THEN {_NOW_MS} ELSE last_drop_ms END, "
++        f"bytes = bytes + CASE WHEN {full} THEN 0 ELSE length({fields}) END, stored = stored + NOT {full} "
++        "WHERE id = 1 AND sealed_ms IS NULL; "
++        f"INSERT INTO {JOURNAL} (kind, wall_ms, task_id, op, fields) "
++        f"SELECT '{kind}', {_NOW_MS}, {task_id}, {op_sql}, {fields} FROM {SESSION} "
++        "WHERE id = 1 AND sealed_ms IS NULL AND admit = 1;"
++    )
++
++
++def _triggers(conn: sqlite3.Connection) -> dict[str, str]:
++    present = [r[1] for r in conn.execute("PRAGMA table_info(tasks)")]
++    columns = [c for c in TASK_FIELDS if c in present]
++    changed = " OR ".join(f"OLD.{c} IS NOT NEW.{c}" for c in _WATCHED if c in present)
++    kinds = ", ".join(f"'{k}'" for k in EVENT_KINDS)
++    event = "json_object('kind', NEW.kind, 'created_at', NEW.created_at)"
++    return {
++        "kanban_fairness_tasks_ins": "CREATE TRIGGER kanban_fairness_tasks_ins AFTER INSERT ON tasks BEGIN "
++        + _append("task", "NEW.id", "insert", _fields_sql(columns, "NEW")) + " END",
++        "kanban_fairness_tasks_upd": "CREATE TRIGGER kanban_fairness_tasks_upd AFTER UPDATE ON tasks "
++        f"WHEN {changed} BEGIN " + _append("task", "NEW.id", "update", _fields_sql(columns, "NEW")) + " END",
++        "kanban_fairness_tasks_del": "CREATE TRIGGER kanban_fairness_tasks_del AFTER DELETE ON tasks BEGIN "
++        + _append("task", "OLD.id", "delete", "'{}'") + " END",
++        "kanban_fairness_events_ins": "CREATE TRIGGER kanban_fairness_events_ins AFTER INSERT ON task_events "
++        f"WHEN NEW.kind IN ({kinds}) BEGIN " + _append("event", "NEW.task_id", None, event) + " END",
++    }
++
++
++def _has(conn: sqlite3.Connection, name: str) -> bool:
++    return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
++                        (name,)).fetchone() is not None
++
++
++def _drop_triggers(conn: sqlite3.Connection) -> None:
++    for (name,) in conn.execute(
++            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name GLOB 'kanban_fairness_*'").fetchall():
++        conn.execute(f"DROP TRIGGER IF EXISTS {name}")
++
++
++def identity(conn: sqlite3.Connection) -> dict:
++    """The database file behind ``conn``: a replaced file (a replica rebuild) has another inode."""
++    path = conn.execute("PRAGMA database_list").fetchone()[2]
++    stat = os.stat(path)
++    return {"path": path, "dev": stat.st_dev, "ino": stat.st_ino}
++
++
++def status(conn: sqlite3.Connection) -> Optional[dict]:
++    """The session row plus trigger presence, or None on a database that was never armed."""
++    if not _has(conn, SESSION):
++        return None
++    row = conn.execute(
++        f"SELECT capture_id, armed_ms, sealed_ms, max_records, max_bytes, stored, bytes, dropped, "
++        f"first_drop_ms, last_drop_ms FROM {SESSION} WHERE id = 1").fetchone()
++    if row is None:
++        return None
++    names = ("capture_id", "armed_ms", "sealed_ms", "max_records", "max_bytes", "stored", "bytes", "dropped",
++             "first_drop_ms", "last_drop_ms")
++    installed = {r[0] for r in conn.execute(
++        "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name GLOB 'kanban_fairness_*'")}
++    last = conn.execute(f"SELECT MAX(seq) FROM {JOURNAL}").fetchone()[0]
++    return {**dict(zip(names, row)), "last_seq": last or 0, "db": identity(conn),
++            "triggers": sorted(installed), "triggers_complete": installed == set(_triggers(conn))}
++
++
++def arm(conn: sqlite3.Connection, capture_id: str, *, max_records: int = MAX_RECORDS,
++        max_bytes: int = MAX_BYTES, replace: bool = False) -> dict:
++    """Start a capture on this database: tables, opening snapshot and triggers in one transaction."""
++    from hermes_cli.kanban_db_connect import write_txn
++
++    if not capture_id or not all(c.isalnum() or c in "-_." for c in capture_id):
++        raise JournalError("capture id must be letters, digits, '-', '_' or '.'")
++    with write_txn(conn):
++        if _has(conn, SESSION):
++            if not replace:
++                raise JournalError("a fairness capture already exists on this database; seal and clear it, "
++                                   "or pass replace")
++            _drop_triggers(conn)
++            conn.execute(f"DROP TABLE IF EXISTS {JOURNAL}")
++            conn.execute(f"DROP TABLE IF EXISTS {SESSION}")
++        for ddl in _SCHEMA:
++            conn.execute(ddl)
++        conn.execute(f"INSERT INTO {SESSION} (id, capture_id, armed_ms, max_records, max_bytes) "
++                     f"VALUES (1, ?, {_NOW_MS}, ?, ?)", (capture_id, max_records, max_bytes))
++        present = [r[1] for r in conn.execute("PRAGMA table_info(tasks)")]
++        fields = _fields_sql([c for c in TASK_FIELDS if c in present], "s")
++        # The opening snapshot is not optional evidence: an armed session that could not hold it is a gap.
++        conn.execute(
++            f"INSERT INTO {JOURNAL} (kind, wall_ms, task_id, op, fields) SELECT 'opening', {_NOW_MS}, s.id, NULL, "
++            f"{fields} FROM tasks AS s WHERE s.status NOT IN ('done', 'archived') ORDER BY s.id LIMIT ?",
++            (max_records,))
++        conn.execute(
++            f"UPDATE {SESSION} SET stored = (SELECT COUNT(*) FROM {JOURNAL}), "
++            f"bytes = (SELECT COALESCE(SUM(length(fields)), 0) FROM {JOURNAL}), "
++            "dropped = MAX(0, (SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'archived')) - "
++            f"(SELECT COUNT(*) FROM {JOURNAL})) WHERE id = 1")
++        for ddl in _triggers(conn).values():
++            conn.execute(ddl)
++    return _open_status(conn)
++
++
++def _open_status(conn: sqlite3.Connection) -> dict:
++    state = status(conn)
++    if state is None:
++        raise JournalError("no fairness capture on this database")
++    return state
++
++
++def seal(conn: sqlite3.Connection) -> dict:
++    """Close the capture: stamp the end and remove the triggers. Rows stay for draining."""
++    from hermes_cli.kanban_db_connect import write_txn
++
++    with write_txn(conn):
++        _open_status(conn)
++        conn.execute(f"UPDATE {SESSION} SET sealed_ms = COALESCE(sealed_ms, {_NOW_MS}) WHERE id = 1")
++        _drop_triggers(conn)
++    return _open_status(conn)
++
++
++def clear(conn: sqlite3.Connection) -> None:
++    """Remove every trace of the capture from this database."""
++    from hermes_cli.kanban_db_connect import write_txn
++
++    with write_txn(conn):
++        _drop_triggers(conn)
++        conn.execute(f"DROP TABLE IF EXISTS {JOURNAL}")
++        conn.execute(f"DROP TABLE IF EXISTS {SESSION}")
++
++
++def rows(conn: sqlite3.Connection, after_seq: int = 0, limit: int = 5000) -> Iterator[tuple]:
++    """``(seq, kind, wall_ms, task_id, op, fields_json)`` after ``after_seq``, in commit order."""
++    yield from conn.execute(
++        f"SELECT seq, kind, wall_ms, task_id, op, fields FROM {JOURNAL} WHERE seq > ? ORDER BY seq LIMIT ?",
++        (after_seq, limit))
+diff --git a/hermes_cli/kanban_fairness_metrics.py b/hermes_cli/kanban_fairness_metrics.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8d2d4fbdc71f58946ad4d793e547cf46ba435b20
+--- /dev/null
++++ b/hermes_cli/kanban_fairness_metrics.py
+@@ -0,0 +1,298 @@
++"""Ready-wait cohorts and acceptance gates from one queue-fairness capture. [daveey]
++
++Pure: records in, verdict out. An *episode* is one stay of one card in ``ready``. Every time in it is an
++interval, because the capture sees a change when the database applies it, not when it happened:
++
++* the start is the Board's ``ready_since`` when the row carries a believable one, else the sighting that
++  showed it ready;
++* a claim ends it at the origin's ``claimed`` event second when one was journaled, else at the sighting of the
++  ``running`` row; a card first sighted ``running`` with a new ``ready_since`` was ready and claimed between
++  two sightings, and still counts;
++* a card that leaves ``ready`` any other way (blocked, archived, parked) has only a lower bound, unless the
++  capture was armed with ``unclaimed_exit = "elapsed_ready"`` (it then waited exactly as long as it sat
++  there); one still ready at the close always has only a lower bound.
++
++``clock_error_s`` widens every wait by the assumed disagreement between the clocks involved, and
++``apply_lag_s`` is how long a change may take to reach the captured database (a replica's pull lag; 0 for a
++board's own file): a sighting at ``t`` proves the change happened in ``t - lag .. t``. A gate passes
++only on its upper bound, fails only on its lower bound, and is INDETERMINATE in between, with an empty
++cohort, or when the capture has a coverage gap. Nothing is excluded from a cohort to make a gate pass.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from typing import Iterable, NamedTuple, Optional
++
++from hermes_cli.kanban_fairness_schema import (
++    FAIL,
++    INDETERMINATE,
++    MAX_WAIT_S,
++    OWNER_SOURCES,
++    P0_MEDIAN_S,
++    PASS,
++    URGENT_WAIT_S,
++    VERSION,
++)
++
++
++@dataclass
++class Episode:
++    task_id: str
++    priority: int
++    key: Optional[str]
++    start_lo: float
++    start_hi: float
++    ready_since: Optional[float]
++    last_seen: float
++    opening: bool = False
++    end: str = "open"  # open | claimed | left:<status> | requeued
++    end_lo: float = 0.0  # meaningful once ``end`` is not "open"
++    end_hi: float = 0.0
++    priorities: list = field(default_factory=list)
++
++    def wait(self, clock: Clock) -> tuple[float, Optional[float]]:
++        """``(lower, upper)`` seconds in ready; upper is None while the card is still ready at the close."""
++        if self.end == "open":
++            return max(0.0, clock.close_s - clock.lag - self.start_hi - clock.err), None
++        lo = max(0.0, self.end_lo - self.start_hi - clock.err)
++        if self.end != "claimed" and not clock.unclaimed_elapsed:
++            return lo, None
++        return lo, max(0.0, self.end_hi - self.start_lo + clock.err)
++
++    def elapsed_hi(self, clock: Clock) -> float:
++        """The longest this episode can have been ready inside the window."""
++        return max(0.0, (clock.close_s if self.end == "open" else self.end_hi) - self.start_lo + clock.err)
++
++    def changed_priority(self) -> bool:
++        return len(set(self.priorities)) > 1
++
++
++class Clock(NamedTuple):
++    close_s: float
++    err: float
++    lag: float
++    unclaimed_elapsed: bool = False
++
++
++def episodes(records: Iterable[dict], *, armed_s: float, err: float, lag: float = 0.0) -> list[Episode]:
++    """Every ready episode the records show, oldest first; ``claimed`` events tighten claim times."""
++    seen: dict[str, tuple[str, float]] = {}  # task -> (status, wall of the latest sighting)
++    counted: dict[str, Optional[float]] = {}  # task -> ready_since of its latest episode
++    live: dict[str, Episode] = {}
++    done: list[Episode] = []
++    claims: dict[str, list[int]] = {}
++    for rec in records:
++        tid, wall, fields = rec["task_id"], rec["wall_ms"] / 1000, rec["fields"]
++        if rec["kind"] == "event":
++            if fields["kind"] == "claimed":
++                claims.setdefault(tid, []).append(fields["created_at"])
++            continue
++        status = "deleted" if rec["op"] == "delete" else fields["status"]
++        ep = live.get(tid)
++        since = fields.get("ready_since")
++        since = None if since is None else since / 1000
++        if status != "ready":
++            if ep is not None:
++                ep.end = "claimed" if status == "running" else f"left:{status}"
++                ep.end_lo, ep.end_hi = max(ep.start_lo, wall - lag), wall
++                done.append(live.pop(tid))
++            elif (status == "running" and rec["kind"] != "opening" and since is not None and since <= wall + err
++                  and since != counted.get(tid, since if tid in seen else None)):
++                # Ready and claimed between two sightings (a replica's pull): the row still says since when.
++                done.append(Episode(tid, fields.get("priority") or 0, fields.get("idempotency_key"), since,
++                                    since, since, wall, end="claimed", end_lo=max(since, wall - lag),
++                                    end_hi=wall, priorities=[fields.get("priority") or 0]))
++            counted[tid] = since
++            seen[tid] = (status, wall)
++            continue
++        if ep is not None and since is not None and ep.ready_since is not None and since > ep.ready_since:
++            # The card left ready and came back between two sightings: the first stay ended unseen.
++            ep.end, ep.end_lo, ep.end_hi = "requeued", max(ep.start_lo, ep.last_seen - lag), since
++            done.append(live.pop(tid))
++            ep = None
++        if ep is None:
++            before = seen.get(tid)
++            floor = wall - lag
++            # A ready_since older than a sighting of the card out of ready belongs to an earlier stay.
++            stale = since is None or since > wall + err or (
++                before is not None and since < before[1] - lag - err)
++            if stale and rec["kind"] == "opening":  # ready before the window, since when is not on the row
++                floor = float(fields.get("created_at") or 0)
++            start = (floor, wall) if stale or since is None else (since, since)
++            ep = live[tid] = Episode(tid, fields.get("priority") or 0, fields.get("idempotency_key"), *start,
++                                     None if stale else since, wall, opening=rec["kind"] == "opening")
++        ep.last_seen = wall
++        counted[tid] = ep.ready_since
++        ep.priorities.append(fields.get("priority") or 0)
++        seen[tid] = (status, wall)
++    out = done + list(live.values())
++    for ep in out:
++        if ep.end != "claimed":
++            continue
++        stamps = [c for c in claims.get(ep.task_id, ()) if ep.start_lo - err - 1 <= c <= ep.end_hi + err]
++        if stamps:
++            ep.end_lo = max(ep.start_lo, float(min(stamps)))
++            ep.end_hi = max(ep.end_lo, min(ep.end_hi, min(stamps) + 1.0))
++    return sorted(out, key=lambda e: (e.start_lo, e.task_id))
++
++
++def _median(values: list[float]) -> float:
++    ordered = sorted(values)
++    mid = len(ordered) // 2
++    return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
++
++
++def _counts(cohort: list[Episode]) -> dict:
++    out = {"episodes": len(cohort), "opening_backlog": sum(e.opening for e in cohort), "claimed": 0, "open": 0,
++           "left_unclaimed": 0, "requeued": 0, "priority_changed": sum(e.changed_priority() for e in cohort)}
++    for ep in cohort:
++        name = ep.end if ep.end in ("claimed", "open", "requeued") else "left_unclaimed"
++        out[name] += 1
++    return out
++
++
++def _median_gate(cohort: list[Episode], clock: Clock) -> dict:
++    out = {"threshold_s": P0_MEDIAN_S, **_counts(cohort), "median_lo_s": None, "median_hi_s": None}
++    if not cohort:
++        return {**out, "status": INDETERMINATE, "reason": "no stored-priority-0 ready episode in the window"}
++    waits = [ep.wait(clock) for ep in cohort]
++    lo = _median([w[0] for w in waits])
++    hi = _median([float("inf") if w[1] is None else w[1] for w in waits])
++    out.update(median_lo_s=round(lo, 3), median_hi_s=None if hi == float("inf") else round(hi, 3))
++    if hi <= P0_MEDIAN_S:
++        return {**out, "status": PASS}
++    if lo > P0_MEDIAN_S:
++        return {**out, "status": FAIL}
++    return {**out, "status": INDETERMINATE, "reason": "the median's bounds straddle the threshold"}
++
++
++def _max_gate(eps: list[Episode], clock: Clock) -> dict:
++    """No card waits past ``MAX_WAIT_S`` while claims happen: an overdue card is a breach only when some
++    claim was witnessed during its overtime (its own late claim counts)."""
++    claim_times = sorted(ep.end_hi for ep in eps if ep.end == "claimed")
++    out = {"threshold_s": MAX_WAIT_S, "episodes": len(eps), "claims_witnessed": len(claim_times),
++           "raw_max_lo_s": None, "raw_max_hi_s": None, "breaches": [], "possible": []}
++    if eps:
++        out["raw_max_lo_s"] = round(max(ep.wait(clock)[0] for ep in eps), 3)
++        out["raw_max_hi_s"] = round(max(ep.elapsed_hi(clock) for ep in eps), 3)
++    for ep in eps:
++        lo = ep.wait(clock)[0]
++        until = clock.close_s if ep.end == "open" else ep.end_hi
++        if lo > MAX_WAIT_S and any(ep.start_hi + MAX_WAIT_S + clock.err < t <= until for t in claim_times):
++            out["breaches"].append({"task_id": ep.task_id, "wait_lo_s": round(lo, 3), "end": ep.end})
++        elif ep.elapsed_hi(clock) > MAX_WAIT_S and any(
++                ep.start_lo + MAX_WAIT_S - clock.err < t <= until for t in claim_times):
++            out["possible"].append({"task_id": ep.task_id, "end": ep.end,
++                                    "wait_hi_s": round(ep.elapsed_hi(clock), 3)})
++    if out["breaches"]:
++        return {**out, "status": FAIL}
++    if not claim_times:
++        return {**out, "status": INDETERMINATE, "reason": "no claim was witnessed in the window"}
++    if out["possible"]:
++        return {**out, "status": INDETERMINATE, "reason": "an episode's bounds straddle the threshold"}
++    return {**out, "status": PASS}
++
++
++def _urgent_gate(cohort: list[Episode], clock: Clock, empty: str) -> dict:
++    out = {"threshold_s": URGENT_WAIT_S, **_counts(cohort), "worst_lo_s": None, "worst_hi_s": None, "late": [],
++           "undecided": []}
++    if not cohort:
++        return {**out, "status": INDETERMINATE, "reason": empty}
++    out["worst_lo_s"] = round(max(ep.wait(clock)[0] for ep in cohort), 3)
++    out["worst_hi_s"] = round(max(ep.elapsed_hi(clock) for ep in cohort), 3)
++    for ep in cohort:
++        lo, hi = ep.wait(clock)
++        row = {"task_id": ep.task_id, "end": ep.end, "wait_lo_s": round(lo, 3),
++               "wait_hi_s": None if hi is None else round(hi, 3)}
++        if lo > URGENT_WAIT_S:
++            out["late"].append(row)
++        elif hi is None or hi > URGENT_WAIT_S:
++            out["undecided"].append(row)
++    if out["late"]:
++        return {**out, "status": FAIL}
++    if out["undecided"]:
++        return {**out, "status": INDETERMINATE,
++                "reason": "an episode has no upper bound (still ready, or left unclaimed) or straddles the threshold"}
++    return {**out, "status": PASS}
++
++
++def _owner_coverage(owners: Optional[list[dict]], armed_s: float, close_s: float) -> Optional[str]:
++    """Why the owner journal cannot vouch for the whole window, or None when it does."""
++    if owners is None:
++        return "no owner_authority.jsonl: land-turn owner history was not journaled for this window"
++    for source in OWNER_SOURCES:
++        spans = sorted((o["from_s"], o["to_s"], o["complete"]) for o in owners
++                       if o["kind"] == "coverage" and o["source"] == source
++                       and o["to_s"] > armed_s and o["from_s"] < close_s)
++        reached = armed_s
++        for start, end, complete in spans:
++            if not complete:
++                return f"{source} owner history has a recorded break inside the window"
++            if start > reached:
++                break
++            reached = max(reached, end)
++        if reached < close_s:
++            return f"{source} owner history does not cover the whole window"
++    return None
++
++
++def _owner_episodes(eps: list[Episode], owners: Optional[list[dict]], close_s: float) -> list[Episode]:
++    held: dict[str, list[tuple[float, float]]] = {}
++    for o in owners or ():
++        if o["kind"] == "interval":
++            held.setdefault(o["task_id"], []).append(
++                (o["start_s"], float("inf") if o["end_s"] is None else o["end_s"]))
++    out = []
++    for ep in eps:
++        until = close_s if ep.end == "open" else ep.end_hi
++        if any(start < until and end > ep.start_lo for start, end in held.get(ep.task_id, ())):
++            out.append(ep)
++    return out
++
++
++def verdict(capture: dict, *, alarm_prefixes: tuple, min_window_s: float = 0) -> dict:
++    """The live report for a loaded capture (:func:`kanban_fairness_store.load`)."""
++    manifest = capture["manifest"]
++    gaps = list(capture["gaps"])
++    window = manifest.get("window") or {}
++    records = capture["records"]
++    armed_ms = window.get("armed_ms") or (records[0]["wall_ms"] if records else 0)
++    close_ms = window.get("sealed_ms") or (records[-1]["wall_ms"] if records else armed_ms)
++    armed_s, close_s = armed_ms / 1000, close_ms / 1000
++    assumed = manifest.get("assumptions") or {}
++    err, lag = float(assumed.get("clock_error_s", 2.0)), float(assumed.get("apply_lag_s", 0.0))
++    unclaimed = assumed.get("unclaimed_exit", "unknown")
++    clock = Clock(close_s, err, lag, unclaimed == "elapsed_ready")
++    if close_s - armed_s < min_window_s:
++        gaps.append({"code": "window_short",
++                     "detail": f"window is {close_s - armed_s:.0f} s, the report needs {min_window_s:.0f} s"})
++    eps = episodes(records, armed_s=armed_s, err=err, lag=lag)
++    p0 = [ep for ep in eps if ep.priority == 0]
++    alarms = [ep for ep in eps if isinstance(ep.key, str) and ep.key.startswith(tuple(alarm_prefixes))]
++    owner_gap = _owner_coverage(capture["owners"], armed_s, close_s)
++    gates = {
++        "p0_median_wait": _median_gate(p0, clock),
++        "max_wait_while_claims": _max_gate(eps, clock),
++        "alarm_wait": _urgent_gate(alarms, clock, "no alarm card was ready in the window"),
++        "owner_wait": _urgent_gate(_owner_episodes(eps, capture["owners"], close_s), clock,
++                                   "no land-turn owner card was ready in the window"),
++    }
++    if owner_gap and gates["owner_wait"]["status"] != FAIL:
++        gates["owner_wait"].update(status=INDETERMINATE, reason=owner_gap)
++    if gaps:  # a proven failure stands on incomplete evidence; a pass does not
++        for gate in gates.values():
++            if gate["status"] == PASS:
++                gate.update(status=INDETERMINATE, reason="capture coverage is incomplete")
++    states = {gate["status"] for gate in gates.values()}
++    overall = FAIL if FAIL in states else PASS if states == {PASS} else INDETERMINATE
++    return {
++        "version": VERSION, "mode": "live", "capture_id": manifest.get("capture_id"),
++        "board": manifest.get("board"),
++        "window": {"armed_ms": armed_ms, "close_ms": close_ms, "seconds": round(close_s - armed_s, 3),
++                   "min_seconds": min_window_s},
++        "assumptions": {"clock_error_s": err, "apply_lag_s": lag, "unclaimed_exit": unclaimed,
++                        "alarm_prefixes": list(alarm_prefixes)},
++        "coverage": {"complete": not gaps, "gaps": gaps},
++        "cohorts": {"all": _counts(eps), "p0": _counts(p0), "alarm": _counts(alarms)},
++        "gates": gates, "overall": overall, "policy": manifest.get("policy") or {},
++    }
+diff --git a/hermes_cli/kanban_fairness_schema.py b/hermes_cli/kanban_fairness_schema.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a722aad91db90e97bc4eea32d84f697a28ba45bf
+--- /dev/null
++++ b/hermes_cli/kanban_fairness_schema.py
+@@ -0,0 +1,118 @@
++"""Record shapes, thresholds and exit codes of the queue-fairness evidence capture. [daveey]
++
++One capture is a journal of ``tasks`` row versions and lifecycle events taken from one Kanban database
++(normally a board's full replica, so one host sees every gateway's cards), drained to hashed JSONL segments
++and closed by a sealed ``manifest.json``. The reader (:mod:`kanban_fairness_metrics`) accepts only records
++that decode here; anything else is a coverage gap, never a silently skipped line.
++"""
++from __future__ import annotations
++
++from typing import Any, Mapping
++
++VERSION = 1
++
++# Acceptance gates (seconds), from t_9791ec808c66123a: stored-priority-0 median ready wait, the longest ready
++# wait while claims happen, and the ready wait of alarm and land-turn owner cards.
++P0_MEDIAN_S = 1800
++MAX_WAIT_S = 7200
++URGENT_WAIT_S = 600
++
++PASS, FAIL, INDETERMINATE = "PASS", "FAIL", "INDETERMINATE"
++EXIT = {PASS: 0, FAIL: 1, INDETERMINATE: 2}
++EXIT_ERROR = 3
++
++# Journal bounds: past either, the triggers count the change and store nothing (a recorded gap).
++MAX_RECORDS = 100_000
++MAX_BYTES = 64 * 1024 * 1024
++SEGMENT_BYTES = 8 * 1024 * 1024
++
++# ``tasks`` columns a row-version record may carry; absent columns (an unsynced board has no lease) are omitted.
++TASK_FIELDS = ("status", "priority", "idempotency_key", "assignee", "ready_since", "lease_holder",
++               "created_at", "sync_version")
++# Lifecycle event kinds worth their journal row: who entered or left the queue and when the origin said so.
++EVENT_KINDS = ("created", "promoted", "reclaimed", "unblocked", "claimed", "spawned", "completed", "blocked",
++               "archived", "scheduled", "continued", "continuation_woken", "condition_met")
++
++KINDS = ("opening", "task", "event")
++TASK_OPS = ("insert", "update", "delete")
++OWNER_SOURCES = ("core-lane", "state-turn")
++
++
++class BadRecord(ValueError):
++    """A line that is not a version-1 capture record."""
++
++
++def _int(value: Any, name: str, *, optional: bool = False):
++    if value is None and optional:
++        return None
++    if isinstance(value, bool) or not isinstance(value, int):
++        raise BadRecord(f"{name} must be an integer")
++    return value
++
++
++def decode_record(raw: Any) -> dict:
++    """A journal line as a checked dict: ``seq, kind, wall_ms, task_id, op, fields``."""
++    if not isinstance(raw, Mapping):
++        raise BadRecord("record must be an object")
++    if raw.get("version") != VERSION:
++        raise BadRecord(f"unsupported record version {raw.get('version')!r}")
++    kind = raw.get("kind")
++    if kind not in KINDS:
++        raise BadRecord(f"unknown record kind {kind!r}")
++    task_id = raw.get("task_id")
++    if not isinstance(task_id, str) or not task_id:
++        raise BadRecord("task_id must be a nonempty string")
++    fields = raw.get("fields")
++    if not isinstance(fields, Mapping):
++        raise BadRecord("fields must be an object")
++    op = raw.get("op")
++    if kind == "task" and op not in TASK_OPS:
++        raise BadRecord(f"unknown task op {op!r}")
++    if kind == "event":
++        if not isinstance(fields.get("kind"), str):
++            raise BadRecord("event record needs fields.kind")
++        _int(fields.get("created_at"), "fields.created_at")
++    if kind != "event" and op != "delete":
++        if not isinstance(fields.get("status"), str):
++            raise BadRecord("task record needs fields.status")
++        _int(fields.get("priority"), "fields.priority", optional=True)
++        _int(fields.get("ready_since"), "fields.ready_since", optional=True)
++    return {"seq": _int(raw.get("seq"), "seq"), "kind": kind, "wall_ms": _int(raw.get("wall_ms"), "wall_ms"),
++            "task_id": task_id, "op": op, "fields": dict(fields)}
++
++
++def decode_owner(raw: Any) -> dict:
++    """One ``owner_authority.jsonl`` line (written by the turn-urgency observer's owner journal).
++
++    ``interval``: a card held (``role`` ``holder``) or was next for (``next``) a land turn from ``start_s`` to
++    ``end_s`` (None while still held). ``coverage``: the journal vouches for ``source`` over ``from_s..to_s``;
++    ``complete`` false names a chain break, an overflow or an unreadable release."""
++    if not isinstance(raw, Mapping) or raw.get("version") != VERSION:
++        raise BadRecord("owner record must be a version-1 object")
++    kind = raw.get("kind")
++    source = raw.get("source")
++    if source not in OWNER_SOURCES:
++        raise BadRecord(f"unknown owner source {source!r}")
++    if kind == "coverage":
++        if not isinstance(raw.get("complete"), bool):
++            raise BadRecord("coverage.complete must be a boolean")
++        return {"kind": kind, "source": source, "from_s": _number(raw.get("from_s"), "from_s"),
++                "to_s": _number(raw.get("to_s"), "to_s"), "complete": raw["complete"],
++                "reason": raw.get("reason")}
++    if kind == "interval":
++        task_id = raw.get("task_id")
++        if not isinstance(task_id, str) or not task_id:
++            raise BadRecord("interval.task_id must be a nonempty string")
++        if raw.get("role") not in ("holder", "next"):
++            raise BadRecord(f"unknown owner role {raw.get('role')!r}")
++        end = raw.get("end_s")
++        return {"kind": kind, "source": source, "task_id": task_id, "role": raw["role"],
++                "start_s": _number(raw.get("start_s"), "start_s"),
++                "end_s": None if end is None else _number(end, "end_s")}
++    raise BadRecord(f"unknown owner record kind {kind!r}")
++
++
++def _number(value: Any, name: str) -> float:
++    if isinstance(value, bool) or not isinstance(value, (int, float)):
++        raise BadRecord(f"{name} must be a number")
++    return float(value)
+diff --git a/hermes_cli/kanban_fairness_store.py b/hermes_cli/kanban_fairness_store.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..49aaee680c4836aca44430dbd828176841f86eb0
+--- /dev/null
++++ b/hermes_cli/kanban_fairness_store.py
+@@ -0,0 +1,158 @@
++"""Durable files of one queue-fairness capture: hashed JSONL segments and a sealed manifest. [daveey]
++
++``drain`` copies journal rows the directory does not hold yet into ``segment-<n>.jsonl`` (written whole,
++fsynced, renamed) and records each segment's hash in ``receipts.json``. ``write_manifest`` closes the capture
++with the journal's own counters. ``load`` reads a directory back for the reader and reports, rather than
++repairs, anything that makes the capture incomplete: no seal, a changed or missing segment, a hole in the
++sequence, dropped changes, or a journal that moved to another database file (a replica rebuild).
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import sqlite3
++from pathlib import Path
++from typing import Optional
++
++from hermes_cli import kanban_fairness_journal as journal
++from hermes_cli.kanban_fairness_schema import SEGMENT_BYTES, VERSION, BadRecord, decode_owner, decode_record
++
++RECEIPTS, MANIFEST, OWNERS = "receipts.json", "manifest.json", "owner_authority.jsonl"
++
++
++def _write(path: Path, data: bytes) -> None:
++    tmp = path.with_name(path.name + ".tmp")
++    with tmp.open("wb") as stream:
++        stream.write(data)
++        stream.flush()
++        os.fsync(stream.fileno())
++    os.replace(tmp, path)
++
++
++def _receipts(out: Path) -> dict:
++    path = out / RECEIPTS
++    if not path.exists():
++        return {"version": VERSION, "capture_id": None, "db": None, "armed_ms": None, "segments": [], "gaps": []}
++    return json.loads(path.read_text(encoding="utf-8-sig"))
++
++
++def drain(conn: sqlite3.Connection, out: Path) -> dict:
++    """Append the journal's new rows to ``out``; returns the receipts (with any gap this call found)."""
++    out.mkdir(parents=True, exist_ok=True)
++    receipts = _receipts(out)
++    state = journal.status(conn)
++    if state is None:
++        if receipts["capture_id"] is not None:
++            _gap(receipts, "journal_missing", "the database no longer carries the armed journal")
++            _write(out / RECEIPTS, json.dumps(receipts, indent=1).encode())
++        return receipts
++    if receipts["capture_id"] is None:
++        receipts.update(capture_id=state["capture_id"], db=state["db"], armed_ms=state["armed_ms"])
++    elif (receipts["capture_id"], receipts["armed_ms"], receipts["db"]) != (
++            state["capture_id"], state["armed_ms"], state["db"]):
++        _gap(receipts, "journal_replaced", "the journal on this database is not the one this directory drains")
++        _write(out / RECEIPTS, json.dumps(receipts, indent=1).encode())
++        return receipts
++    last = receipts["segments"][-1]["last_seq"] if receipts["segments"] else 0
++    while True:
++        lines, size, first = [], 0, None
++        for seq, kind, wall_ms, task_id, op, fields in journal.rows(conn, last):
++            line = json.dumps({"version": VERSION, "seq": seq, "kind": kind, "wall_ms": wall_ms,
++                               "task_id": task_id, "op": op, "fields": json.loads(fields)},
++                              separators=(",", ":"), sort_keys=True)
++            lines.append(line)
++            size += len(line) + 1
++            first = seq if first is None else first
++            last = seq
++            if size >= SEGMENT_BYTES:
++                break
++        if not lines:
++            break
++        data = ("\n".join(lines) + "\n").encode()
++        name = f"segment-{len(receipts['segments']) + 1:06d}.jsonl"
++        _write(out / name, data)
++        receipts["segments"].append({"name": name, "first_seq": first, "last_seq": last, "records": len(lines),
++                                     "sha256": hashlib.sha256(data).hexdigest()})
++        _write(out / RECEIPTS, json.dumps(receipts, indent=1).encode())
++    return receipts
++
++
++def _gap(receipts: dict, code: str, detail: str) -> None:
++    if not any(g["code"] == code for g in receipts["gaps"]):
++        receipts["gaps"].append({"code": code, "detail": detail})
++
++
++def write_manifest(conn: sqlite3.Connection, out: Path, *, board: str, assumptions: dict,
++                   policy: dict, roster: Optional[list] = None) -> dict:
++    """Seal the journal, drain its tail and write ``manifest.json``. An unsealed directory is incomplete."""
++    state = journal.seal(conn)
++    receipts = drain(conn, out)
++    manifest = {
++        "version": VERSION, "capture_id": state["capture_id"], "board": board, "db": state["db"],
++        "window": {"armed_ms": state["armed_ms"], "sealed_ms": state["sealed_ms"]},
++        "journal": {k: state[k] for k in ("stored", "bytes", "dropped", "first_drop_ms", "last_drop_ms",
++                                         "max_records", "max_bytes", "last_seq")},
++        "segments": receipts["segments"], "gaps": receipts["gaps"], "assumptions": assumptions,
++        "policy": policy, "roster": roster or [], "sealed": True,
++    }
++    _write(out / MANIFEST, json.dumps(manifest, indent=1, sort_keys=True).encode())
++    return manifest
++
++
++def load(out: Path) -> dict:
++    """``{"manifest", "records", "owners", "gaps"}`` for the reader. ``gaps`` is every reason the capture cannot
++    certify a pass; ``records`` holds what could be decoded, in sequence order."""
++    gaps: list[dict] = []
++    path = out / MANIFEST
++    if not path.exists():
++        receipts = _receipts(out)
++        gaps.append({"code": "unsealed", "detail": "no manifest.json: the capture was never sealed"})
++        manifest = {"version": VERSION, "capture_id": receipts["capture_id"], "window": {
++            "armed_ms": receipts["armed_ms"], "sealed_ms": None}, "journal": None,
++            "segments": receipts["segments"], "gaps": receipts["gaps"], "assumptions": {}, "policy": {},
++            "sealed": False}
++    else:
++        manifest = json.loads(path.read_text(encoding="utf-8-sig"))
++    gaps.extend(manifest.get("gaps") or [])
++    records, expected = [], 1
++    for seg in manifest.get("segments") or []:
++        file = out / seg["name"]
++        data = file.read_bytes() if file.exists() else None
++        if data is None or hashlib.sha256(data).hexdigest() != seg["sha256"]:
++            gaps.append({"code": "segment_mismatch", "detail": f"{seg['name']} is missing or changed"})
++            continue
++        for number, line in enumerate(data.decode().splitlines(), 1):
++            try:
++                record = decode_record(json.loads(line))
++            except (ValueError, BadRecord) as exc:
++                gaps.append({"code": "bad_record", "detail": f"{seg['name']}:{number}: {exc}"})
++                continue
++            if record["seq"] != expected:
++                gaps.append({"code": "sequence_gap", "detail": f"expected seq {expected}, read {record['seq']}"})
++            expected = record["seq"] + 1
++            records.append(record)
++    counters = manifest.get("journal")
++    if counters:
++        if counters["dropped"]:
++            gaps.append({"code": "journal_dropped", "detail": f"{counters['dropped']} change(s) past the "
++                         f"journal bound, first at {counters['first_drop_ms']} ms"})
++        if counters["stored"] != len(records) or counters["last_seq"] != expected - 1:
++            gaps.append({"code": "record_count", "detail": f"journal stored {counters['stored']} (last seq "
++                         f"{counters['last_seq']}), directory holds {len(records)}"})
++    return {"manifest": manifest, "records": records, "owners": _owners(out, gaps), "gaps": gaps}
++
++
++def _owners(out: Path, gaps: list[dict]) -> Optional[list[dict]]:
++    path = out / OWNERS
++    if not path.exists():
++        return None
++    owners = []
++    for number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
++        if not line.strip():
++            continue
++        try:
++            owners.append(decode_owner(json.loads(line)))
++        except (ValueError, BadRecord) as exc:
++            gaps.append({"code": "bad_owner_record", "detail": f"{OWNERS}:{number}: {exc}"})
++    return owners
+diff --git a/scripts/kanban_fairness.py b/scripts/kanban_fairness.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3bf7a96a0f2cd00c6618d4c0f833b750e4acd16e
+--- /dev/null
++++ b/scripts/kanban_fairness.py
+@@ -0,0 +1,220 @@
++#!/usr/bin/env python3
++"""Operator CLI for the queue-fairness evidence capture (design: docs/kanban-fairness-capture.md). [daveey]
++
++usage: scripts/hermes-python scripts/kanban_fairness.py <command> ...
++
++  capture arm --out DIR --capture-id ID (--db PATH | --board SLUG [--replica]) [--clock-error-s S]
++              [--apply-lag-s S] [--unclaimed-exit unknown|elapsed_ready] [--replace]
++                    start journaling one Kanban database; writes DIR/plan.json and the opening segment
++  capture status --out DIR      the journal's counters and trigger state
++  capture drain  --out DIR      copy new journal rows into DIR (run it periodically on long windows)
++  capture seal   --out DIR      stop the capture, drain the tail, write DIR/manifest.json
++  capture clear  --out DIR      remove the journal tables from the database (the files in DIR stay)
++  validate --input DIR          is the capture complete? lists every coverage gap
++  report --mode live --input DIR --output FILE [--min-window-s S]
++                    cohorts and the four gates (p0 median, max wait while claims, alarms, owners)
++  inventory scan --tree NAME=PATH ... --output FILE
++  inventory check --scan FILE --classification FILE --output FILE
++  export --input DIR --output FILE.tar.gz
++
++Exit: 0 pass / completed IO, 1 a proven measured failure, 2 indeterminate or unsupported input, 3 tool error.
++Nothing here is a model tool, and no scheduler code reads what it writes.
++"""
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import subprocess
++import sys
++import tarfile
++from contextlib import closing
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parent.parent
++if str(ROOT) not in sys.path:
++    sys.path.insert(0, str(ROOT))
++
++from hermes_cli import kanban_fairness_inventory as inventory
++from hermes_cli import kanban_fairness_journal as journal
++from hermes_cli import kanban_fairness_metrics as metrics
++from hermes_cli import kanban_fairness_store as store
++from hermes_cli.kanban_fairness_schema import EXIT, EXIT_ERROR, INDETERMINATE, PASS
++
++PLAN = "plan.json"
++
++
++def _connect(db: str):
++    from hermes_cli import kanban_db_connect
++
++    return closing(kanban_db_connect.connect(Path(db)))
++
++
++def _plan(out: Path) -> dict:
++    return json.loads((out / PLAN).read_text(encoding="utf-8-sig"))
++
++
++def _emit(value) -> None:
++    print(json.dumps(value, indent=1, sort_keys=True))
++
++
++def _policy() -> dict:
++    """What scored the queue while the capture ran, as far as this checkout can say."""
++    from hermes_cli import kanban_admission_score as score
++
++    scorer = Path(score.__file__).read_bytes()
++    try:
++        rev = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True, encoding="utf-8",
++                             errors="replace", timeout=10, check=True).stdout.strip()
++    except (OSError, subprocess.SubprocessError):
++        rev = None
++    return {"core_revision": rev, "scorer_sha256": hashlib.sha256(scorer).hexdigest(),
++            "alarm_prefixes": list(score.ALARM_KEY_PREFIXES)}
++
++
++def _arm(args) -> int:
++    out = Path(args.out)
++    if args.db:
++        db = args.db
++    else:
++        from hermes_cli import kanban_db
++        from hermes_cli.kanban_sync_client import shadow_path
++
++        db = str(shadow_path(args.board) if args.replica else kanban_db.kanban_db_path(args.board))
++    if (out / PLAN).exists() and not args.replace:
++        print(f"{out / PLAN} exists: this directory already holds a capture", file=sys.stderr)
++        return EXIT_ERROR
++    out.mkdir(parents=True, exist_ok=True)
++    plan = {"capture_id": args.capture_id, "db": db, "board": args.board, "replica": bool(args.replica),
++            "assumptions": {"clock_error_s": args.clock_error_s, "apply_lag_s": args.apply_lag_s,
++                            "unclaimed_exit": args.unclaimed_exit}}
++    with _connect(db) as conn:
++        state = journal.arm(conn, args.capture_id, replace=args.replace)
++        (out / PLAN).write_text(json.dumps(plan, indent=1, sort_keys=True), encoding="utf-8")
++        store.drain(conn, out)
++    _emit({"armed": state, "plan": plan, "acceptance_ready": False})
++    return 0
++
++
++def _capture(args) -> int:
++    if args.action == "arm":
++        return _arm(args)
++    out = Path(args.out)
++    plan = _plan(out)
++    with _connect(plan["db"]) as conn:
++        if args.action == "status":
++            _emit({"journal": journal.status(conn), "plan": plan})
++        elif args.action == "drain":
++            _emit({"receipts": store.drain(conn, out), "journal": journal.status(conn)})
++        elif args.action == "seal":
++            manifest = store.write_manifest(conn, out, board=plan["board"], assumptions=plan["assumptions"],
++                                            policy=_policy(), roster=plan.get("roster"))
++            _emit({"manifest": manifest, "acceptance_ready": False})
++        else:
++            journal.clear(conn)
++            _emit({"cleared": plan["db"]})
++    return 0
++
++
++def _validate(args) -> int:
++    capture = store.load(Path(args.input))
++    _emit({"capture_id": capture["manifest"].get("capture_id"), "records": len(capture["records"]),
++           "owner_journal": capture["owners"] is not None, "complete": not capture["gaps"],
++           "gaps": capture["gaps"]})
++    return EXIT[PASS] if not capture["gaps"] else EXIT[INDETERMINATE]
++
++
++def _report(args) -> int:
++    capture = store.load(Path(args.input))
++    prefixes = (capture["manifest"].get("policy") or {}).get("alarm_prefixes")
++    if not prefixes:
++        from hermes_cli.kanban_admission_score import ALARM_KEY_PREFIXES as prefixes
++    verdict = metrics.verdict(capture, alarm_prefixes=tuple(prefixes), min_window_s=args.min_window_s)
++    Path(args.output).write_text(json.dumps(verdict, indent=1, sort_keys=True), encoding="utf-8")
++    _emit({"overall": verdict["overall"], "coverage_complete": verdict["coverage"]["complete"],
++           "gates": {name: gate["status"] for name, gate in verdict["gates"].items()}, "output": args.output})
++    return EXIT[verdict["overall"]]
++
++
++def _inventory(args) -> int:
++    if args.action == "scan":
++        trees = dict(item.split("=", 1) for item in args.tree)
++        result = inventory.scan({name: Path(path) for name, path in trees.items()})
++        code = 0
++    else:
++        result = inventory.check(json.loads(Path(args.scan).read_text(encoding="utf-8-sig")),
++                                 json.loads(Path(args.classification).read_text(encoding="utf-8-sig")))
++        code = EXIT[PASS] if result["complete"] else EXIT[INDETERMINATE]
++    Path(args.output).write_text(json.dumps(result, indent=1, sort_keys=True), encoding="utf-8")
++    _emit({"output": args.output, "producers": len(result["producers"]), "alarms": len(result["alarms"]),
++           "problems": len(result.get("problems", [])), "trees": result["trees"]})
++    return code
++
++
++def _export(args) -> int:
++    source = Path(args.input)
++    with tarfile.open(args.output, "w:gz") as bundle:
++        for path in sorted(source.iterdir()):
++            if path.is_file() and not path.name.endswith(".tmp"):
++                bundle.add(path, arcname=f"{source.name}/{path.name}")
++    _emit({"output": args.output, "acceptance_ready": False})
++    return 0
++
++
++def _parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
++    sub = parser.add_subparsers(dest="command", required=True)
++    capture = sub.add_parser("capture")
++    capture.add_argument("action", choices=("arm", "status", "drain", "seal", "clear"))
++    capture.add_argument("--out", required=True)
++    capture.add_argument("--capture-id")
++    capture.add_argument("--db")
++    capture.add_argument("--board", default="default")
++    capture.add_argument("--replica", action="store_true")
++    capture.add_argument("--clock-error-s", type=float, default=2.0)
++    capture.add_argument("--apply-lag-s", type=float, default=None)
++    capture.add_argument("--unclaimed-exit", choices=("unknown", "elapsed_ready"), default="unknown")
++    capture.add_argument("--replace", action="store_true")
++    capture.set_defaults(run=_capture)
++    validate = sub.add_parser("validate")
++    validate.add_argument("--input", required=True)
++    validate.set_defaults(run=_validate)
++    report = sub.add_parser("report")
++    report.add_argument("--mode", choices=("live",), required=True)
++    report.add_argument("--input", required=True)
++    report.add_argument("--output", required=True)
++    report.add_argument("--min-window-s", type=float, default=0)
++    report.set_defaults(run=_report)
++    inv = sub.add_parser("inventory")
++    inv.add_argument("action", choices=("scan", "check"))
++    inv.add_argument("--tree", action="append", default=[])
++    inv.add_argument("--scan")
++    inv.add_argument("--classification")
++    inv.add_argument("--output", required=True)
++    inv.set_defaults(run=_inventory)
++    export = sub.add_parser("export")
++    export.add_argument("--input", required=True)
++    export.add_argument("--output", required=True)
++    export.set_defaults(run=_export)
++    return parser
++
++
++def main(argv=None) -> int:
++    parser = _parser()
++    args = parser.parse_args(argv)
++    if args.command == "capture" and args.action == "arm":
++        if not args.capture_id:
++            parser.error("capture arm needs --capture-id")
++        if args.apply_lag_s is None:
++            if args.replica:
++                parser.error("capture arm --replica needs --apply-lag-s (the replica's worst pull lag)")
++            args.apply_lag_s = 0.0
++    try:
++        return args.run(args)
++    except (journal.JournalError, FileNotFoundError, ValueError, KeyError) as exc:
++        print(f"kanban_fairness: {type(exc).__name__}: {exc}", file=sys.stderr)
++        return EXIT_ERROR
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/hermes_cli/test_kanban_fairness_inventory.py b/tests/hermes_cli/test_kanban_fairness_inventory.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9f33674a7a7570a8661927b370922d23162be751
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_fairness_inventory.py
+@@ -0,0 +1,59 @@
++"""The producer/alarm inventory refuses an unclassified flat-1000 producer or detector key. [daveey]"""
++from __future__ import annotations
++
++from hermes_cli import kanban_fairness_inventory as inventory
++
++
++def _tree(tmp_path):
++    root = tmp_path / "skills"
++    (root / "review").mkdir(parents=True)
++    (root / "review" / "SKILL.md").write_text(
++        "Create the review card with priority=1000 so it runs first.\n"
++        "Titles like `p1000 sweep` are raised by hand.\n", encoding="utf-8")
++    (root / "watch.py").write_text(
++        'KEY = f"worker-claim-watch:{worker}"\n'
++        'OTHER = "worker-resources-unknown:" + host\n'
++        'args = {"priority": 1000}\n'
++        "priority = 10000  # not a flat 1000\n", encoding="utf-8")
++    (root / "node_modules").mkdir()
++    (root / "node_modules" / "x.py").write_text("priority=1000\n", encoding="utf-8")
++    return root
++
++
++def test_scan_finds_every_match_and_hashes_the_tree(tmp_path):
++    root = _tree(tmp_path)
++    scanned = inventory.scan({"state-skills": root})
++    assert [(m["path"], m["line"]) for m in scanned["producers"]] == [
++        ("review/SKILL.md", 1), ("review/SKILL.md", 2), ("watch.py", 3)]
++    assert [(m["path"], m["prefixes"]) for m in scanned["alarms"]] == [
++        ("watch.py", ["worker-claim-watch:"]), ("watch.py", ["worker-resources-unknown:"])]
++    before = scanned["trees"]["state-skills"]
++    assert before["files"] == 2
++    (root / "watch.py").write_text("changed\n", encoding="utf-8")
++    assert inventory.scan({"state-skills": root})["trees"]["state-skills"]["sha256"] != before["sha256"]
++
++
++def test_check_needs_one_valid_row_per_match(tmp_path):
++    scanned = inventory.scan({"state-skills": _tree(tmp_path)})
++
++    def rows(kind, disposition):
++        return [{"id": m["id"], "family": "review", "disposition": disposition} for m in scanned[kind]]
++
++    full = {"producers": rows("producers", "explicit_user_urgency"), "alarms": rows("alarms", "floored")}
++    checked = inventory.check(scanned, full)
++    assert checked["complete"] and checked["producers"][0]["disposition"] == "explicit_user_urgency"
++
++    missing = {**full, "producers": full["producers"][1:]}
++    checked = inventory.check(scanned, missing)
++    assert not checked["complete"]
++    assert [(p["kind"], p["problem"]) for p in checked["problems"]] == [("producers", "unclassified")]
++
++    unknown_key = {**full, "alarms": full["alarms"][:1]}
++    assert [p["match"]["prefixes"] for p in inventory.check(scanned, unknown_key)["problems"]] == [
++        ["worker-resources-unknown:"]]
++
++    stale = {**full, "alarms": full["alarms"] + [{"id": "gone", "family": "x", "disposition": "floored"}]}
++    assert [p["problem"] for p in inventory.check(scanned, stale)["problems"]] == ["stale_row"]
++
++    invalid = {**full, "producers": [{**full["producers"][0], "disposition": "fine"}] + full["producers"][1:]}
++    assert [p["problem"] for p in inventory.check(scanned, invalid)["problems"]] == ["invalid_row", "unclassified"]
+diff --git a/tests/hermes_cli/test_kanban_fairness_journal.py b/tests/hermes_cli/test_kanban_fairness_journal.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9dbd3fc2380fc03fb04da632e90cf169fbcabc1e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_fairness_journal.py
+@@ -0,0 +1,159 @@
++"""The queue-fairness change journal on a real board database: what it records, its bound, and how a
++capture directory reports loss. [daveey]"""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_fairness_journal as journal
++from hermes_cli import kanban_fairness_store as store
++
++
++@pytest.fixture
++def conn(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    with kbc.connect_closing() as handle:
++        yield handle
++
++
++def _rows(conn):
++    return [(kind, task_id, op, json.loads(fields)) for _seq, kind, _ms, task_id, op, fields in journal.rows(conn)]
++
++
++def _codes(out):
++    return [gap["code"] for gap in store.load(out)["gaps"]]
++
++
++def test_opening_snapshot_and_row_versions(conn):
++    old = kb.create_task(conn, title="before", assignee="a")
++    done = kb.create_task(conn, title="finished", assignee="a")
++    kb.archive_task(conn, done)
++    journal.arm(conn, "c1")
++    new = kb.create_task(conn, title="after", assignee="a", priority=7)
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET title = 'renamed' WHERE id = ?", (new,))  # not a queue-relevant field
++        conn.execute("UPDATE tasks SET priority = 9 WHERE id = ?", (new,))
++    rows = _rows(conn)
++    assert [(k, t) for k, t, _op, _f in rows if k == "opening"] == [("opening", old)]
++    versions = [(op, f["status"], f["priority"]) for k, t, op, f in rows if k == "task" and t == new]
++    assert versions[0] == ("insert", "ready", 7) and versions[-1] == ("update", "ready", 9)
++    assert len([v for v in versions if v[0] == "update"]) == 1
++    assert ("event", new, None) in [(k, t, op) for k, t, op, _f in rows]
++    assert "body" not in rows[0][3] and "title" not in rows[0][3]
++
++
++def test_rollback_removes_the_journal_rows_too(conn):
++    tid = kb.create_task(conn, title="x", assignee="a")
++    journal.arm(conn, "c1")
++    before = journal.status(conn)
++    with pytest.raises(RuntimeError):
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET priority = 5 WHERE id = ?", (tid,))
++            raise RuntimeError("abort")
++    after = journal.status(conn)
++    assert (after["stored"], after["last_seq"]) == (before["stored"], before["last_seq"])
++
++
++def test_sync_applied_changes_and_deletes_are_recorded(conn):
++    tid = kb.create_task(conn, title="x", assignee="a")
++    journal.arm(conn, "c1")
++    has_sync = conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'kanban_sync_state'").fetchone()
++    with kb.write_txn(conn):
++        if has_sync:  # the sync capture triggers skip writes made while a feed page is applied
++            conn.execute("UPDATE kanban_sync_state SET applying = 1")
++        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (tid,))
++        if has_sync:
++            conn.execute("UPDATE kanban_sync_state SET applying = 0")
++        conn.execute("DELETE FROM tasks WHERE id = ?", (tid,))
++    ops = [(op, f.get("status")) for k, t, op, f in _rows(conn) if k == "task" and t == tid]
++    assert ops == [("update", "running"), ("delete", None)]
++
++
++def test_bound_stops_storing_and_counts_the_loss(conn, tmp_path):
++    journal.arm(conn, "c1", max_records=3)
++    made = [kb.create_task(conn, title=f"t{i}", assignee="a") for i in range(4)]
++    state = journal.status(conn)
++    assert state["stored"] == 3 and state["dropped"] > 0 and state["first_drop_ms"] is not None
++    assert len(_rows(conn)) == 3
++    # The writer was never refused: every card exists.
++    assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == len(made)
++    out = tmp_path / "evidence"
++    store.write_manifest(conn, out, board="default", assumptions={}, policy={})
++    assert "journal_dropped" in _codes(out)
++
++
++def test_opening_backlog_larger_than_the_bound_is_a_loss(conn, tmp_path):
++    for i in range(3):
++        kb.create_task(conn, title=f"t{i}", assignee="a")
++    state = journal.arm(conn, "c1", max_records=2)
++    assert (state["stored"], state["dropped"]) == (2, 1)
++
++
++def test_seal_stops_capture_and_survives_a_reopen(conn, tmp_path):
++    out = tmp_path / "evidence"
++    journal.arm(conn, "c1")
++    kb.create_task(conn, title="x", assignee="a")
++    store.drain(conn, out)
++    with kbc.connect_closing() as again:  # another connection, as after a process restart
++        kb.create_task(again, title="y", assignee="a")
++        manifest = store.write_manifest(again, out, board="default", assumptions={}, policy={})
++        kb.create_task(again, title="after the seal", assignee="a")
++        assert journal.status(again)["triggers"] == []
++        assert journal.status(again)["stored"] == manifest["journal"]["stored"]
++    capture = store.load(out)
++    assert capture["gaps"] == [] and len(manifest["segments"]) == 2
++    assert [r["seq"] for r in capture["records"]] == list(range(1, len(capture["records"]) + 1))
++
++
++def test_arm_refuses_a_second_capture(conn):
++    journal.arm(conn, "c1")
++    with pytest.raises(journal.JournalError):
++        journal.arm(conn, "c2")
++    assert journal.arm(conn, "c2", replace=True)["capture_id"] == "c2"
++    journal.clear(conn)
++    assert journal.status(conn) is None
++    kb.create_task(conn, title="x", assignee="a")  # no trigger is left pointing at a dropped table
++
++
++def test_changed_segment_and_lost_journal_are_gaps(conn, tmp_path):
++    out = tmp_path / "evidence"
++    journal.arm(conn, "c1")
++    kb.create_task(conn, title="x", assignee="a")
++    store.write_manifest(conn, out, board="default", assumptions={}, policy={})
++    segment = out / "segment-000001.jsonl"
++    segment.write_bytes(segment.read_bytes().replace(b'"ready"', b'"todo"', 1))
++    assert "segment_mismatch" in _codes(out)
++
++    other = tmp_path / "evidence2"
++    journal.arm(conn, "c3", replace=True)
++    store.drain(conn, other)
++    journal.arm(conn, "c4", replace=True)  # the database now carries someone else's journal
++    assert [g["code"] for g in store.drain(conn, other)["gaps"]] == ["journal_replaced"]
++    journal.clear(conn)  # ... or none at all, as after a replica rebuild
++    assert "journal_missing" in [g["code"] for g in store.drain(conn, other)["gaps"]]
++    assert "unsealed" in _codes(other)
++
++
++def test_bad_record_line_is_a_gap_not_a_skip(conn, tmp_path):
++    out = tmp_path / "evidence"
++    journal.arm(conn, "c1")
++    kb.create_task(conn, title="x", assignee="a")
++    manifest = store.write_manifest(conn, out, board="default", assumptions={}, policy={})
++    segment = out / manifest["segments"][0]["name"]
++    lines = segment.read_text().splitlines()
++    lines[0] = json.dumps({**json.loads(lines[0]), "version": 99})
++    data = ("\n".join(lines) + "\n").encode()
++    segment.write_bytes(data)
++    import hashlib
++    manifest["segments"][0]["sha256"] = hashlib.sha256(data).hexdigest()
++    (out / "manifest.json").write_text(json.dumps(manifest))
++    codes = _codes(out)
++    assert "bad_record" in codes and "record_count" in codes
+diff --git a/tests/hermes_cli/test_kanban_fairness_metrics.py b/tests/hermes_cli/test_kanban_fairness_metrics.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bdec456f47d953cb43616f4ffea346b8c5cd8401
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_fairness_metrics.py
+@@ -0,0 +1,269 @@
++"""Ready-wait cohorts and the four gates, from hand-built capture records. [daveey]
++
++Times are seconds after the window opens; ``clock_error_s`` is 0 unless a test is about it, so each threshold
++is checked exactly on and just past its boundary.
++"""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_fairness_metrics as metrics
++from hermes_cli.kanban_fairness_schema import BadRecord, decode_owner, decode_record
++
++T0 = 1_795_000_000
++PREFIXES = ("worker-claim-watch:", "pickup-stall:", "mods-suite-red:")
++
++
++class Log:
++    def __init__(self):
++        self.records = []
++
++    def _add(self, kind, at, tid, op, fields):
++        self.records.append({"seq": len(self.records) + 1, "kind": kind, "wall_ms": (T0 + at) * 1000,
++                             "task_id": tid, "op": op, "fields": fields})
++
++    def row(self, at, tid, status, *, priority=0, since=None, key=None, kind="task", op="update"):
++        since = at if since is None and status == "ready" else since
++        self._add(kind, at, tid, None if kind == "opening" else op, {
++            "status": status, "priority": priority, "idempotency_key": key,
++            "ready_since": None if since is None else (T0 + since) * 1000, "created_at": T0})
++
++    def wait(self, tid, start, end, *, priority=0, key=None, into="running"):
++        """One ready episode from ``start`` to ``end``, claimed unless ``into`` says otherwise."""
++        self.row(start, tid, "ready", priority=priority, key=key, op="insert")
++        if into == "running":
++            self._add("event", end, tid, None, {"kind": "claimed", "created_at": T0 + end})
++        self.row(end, tid, into, priority=priority, key=key, since=start)
++
++    def capture(self, close, *, owners=None, gaps=(), **assumptions):
++        ordered = sorted(self.records, key=lambda r: r["wall_ms"])
++        for seq, record in enumerate(ordered, 1):
++            record["seq"] = seq
++        return {"manifest": {"capture_id": "t", "board": "default", "policy": {},
++                             "window": {"armed_ms": T0 * 1000, "sealed_ms": (T0 + close) * 1000},
++                             "assumptions": {"clock_error_s": 0, **assumptions}},
++                "records": ordered, "owners": owners, "gaps": list(gaps)}
++
++
++def _gates(capture, **kw):
++    return metrics.verdict(capture, alarm_prefixes=PREFIXES, **kw)["gates"]
++
++
++def _owner_cover(close):
++    return [{"kind": "coverage", "source": source, "from_s": T0 - 1.0, "to_s": T0 + close + 1.0,
++             "complete": True, "reason": None} for source in ("core-lane", "state-turn")]
++
++
++@pytest.mark.parametrize("waits, status, median", [
++    ([100, 1800, 5000], "PASS", 1800),          # odd count: the middle one, exactly on the threshold
++    ([100, 1801, 5000], "FAIL", 1801),
++    ([1700, 1900], "PASS", 1800),               # even count: mean of the central two
++    ([1700, 1902], "FAIL", 1801),
++])
++def test_p0_median_boundary(waits, status, median):
++    log = Log()
++    for i, wait in enumerate(waits):
++        log.wait(f"t{i}", 10 * i, 10 * i + wait)
++    log.wait("p1000", 0, 6000, priority=1000)  # not in the p0 cohort
++    gate = _gates(log.capture(9000))["p0_median_wait"]
++    assert (gate["status"], gate["median_lo_s"], gate["median_hi_s"], gate["episodes"]) == (
++        status, median, median, len(waits))
++
++
++def test_p0_median_with_unbounded_episodes():
++    log = Log()
++    log.wait("a", 0, 100)
++    log.wait("b", 0, 200)
++    log.row(8000, "c", "ready", op="insert")  # arrives at the close edge, never claimed
++    gate = _gates(log.capture(8100))["p0_median_wait"]
++    assert (gate["status"], gate["median_hi_s"], gate["open"]) == ("PASS", 200, 1)
++    log.row(8050, "d", "ready", op="insert")  # now the upper median is one of the unbounded ones
++    gate = _gates(log.capture(8100))["p0_median_wait"]
++    assert (gate["status"], gate["median_hi_s"]) == ("INDETERMINATE", None)
++
++
++def test_empty_cohorts_are_indeterminate():
++    log = Log()
++    log.wait("p5", 0, 10, priority=5)
++    gates = _gates(log.capture(100, owners=_owner_cover(100)))
++    assert {gates[name]["status"] for name in ("p0_median_wait", "alarm_wait", "owner_wait")} == {"INDETERMINATE"}
++    assert gates["max_wait_while_claims"]["status"] == "PASS"
++
++
++@pytest.mark.parametrize("wait, status", [(7200, "PASS"), (7201, "FAIL")])
++def test_max_wait_boundary_at_its_own_claim(wait, status):
++    log = Log()
++    log.wait("slow", 0, wait)
++    gate = _gates(log.capture(8000))["max_wait_while_claims"]
++    assert gate["status"] == status and gate["raw_max_hi_s"] == wait
++    assert [b["task_id"] for b in gate["breaches"]] == (["slow"] if status == "FAIL" else [])
++
++
++def test_max_wait_needs_a_claim_during_the_overtime():
++    log = Log()
++    log.row(0, "stuck", "ready", op="insert")
++    log.wait("early", 10, 20)  # a claim, but long before "stuck" was overdue
++    gate = _gates(log.capture(9000))["max_wait_while_claims"]
++    assert gate["status"] == "PASS" and gate["raw_max_lo_s"] == 9000
++    log.wait("late", 8000, 8010)  # someone else was claimed while "stuck" was past 7200 s
++    gate = _gates(log.capture(9000))["max_wait_while_claims"]
++    assert (gate["status"], gate["breaches"][0]["task_id"]) == ("FAIL", "stuck")
++
++
++def test_max_wait_without_any_claim_is_not_a_pass():
++    log = Log()
++    log.row(0, "stuck", "ready", op="insert")
++    gate = _gates(log.capture(9000))["max_wait_while_claims"]
++    assert (gate["status"], gate["claims_witnessed"]) == ("INDETERMINATE", 0)
++
++
++@pytest.mark.parametrize("wait, status", [(600, "PASS"), (601, "FAIL")])
++def test_alarm_boundary(wait, status):
++    log = Log()
++    log.wait("alarm", 0, wait, key="worker-claim-watch:w1")
++    log.wait("other", 0, 5000, key="some-other-key")
++    gate = _gates(log.capture(6000))["alarm_wait"]
++    assert (gate["status"], gate["episodes"], gate["worst_hi_s"]) == (status, 1, wait)
++
++
++def test_unclaimed_exit_has_no_upper_bound_unless_fixed_at_arm():
++    log = Log()
++    log.wait("alarm", 0, 30, key="pickup-stall:x", into="archived")
++    gate = _gates(log.capture(100))["alarm_wait"]
++    assert (gate["status"], gate["left_unclaimed"], gate["undecided"][0]["wait_hi_s"]) == ("INDETERMINATE", 1, None)
++    gate = _gates(log.capture(100, unclaimed_exit="elapsed_ready"))["alarm_wait"]
++    assert (gate["status"], gate["worst_hi_s"]) == ("PASS", 30)
++    late = Log()
++    late.wait("alarm", 0, 700, key="pickup-stall:x", into="blocked")
++    assert _gates(late.capture(800))["alarm_wait"]["status"] == "FAIL"  # the lower bound alone proves it
++
++
++def test_opening_backlog_keeps_its_original_ready_time():
++    log = Log()
++    log.row(0, "old", "ready", since=-5000, kind="opening")
++    log.wait("old2", 0, 0)  # placeholder claim so the max gate has a witness
++    log._add("event", 100, "old", None, {"kind": "claimed", "created_at": T0 + 100})
++    log.row(100, "old", "running", since=-5000)
++    verdict = metrics.verdict(log.capture(200), alarm_prefixes=PREFIXES)
++    assert verdict["cohorts"]["p0"]["opening_backlog"] == 1
++    assert verdict["gates"]["max_wait_while_claims"]["raw_max_hi_s"] == 5100
++    assert verdict["gates"]["p0_median_wait"]["median_hi_s"] == 2550  # (0 + 5100) / 2
++
++
++def test_requeue_between_sightings_is_two_episodes():
++    log = Log()
++    log.row(0, "t", "ready", op="insert")
++    log.row(50, "t", "ready", since=40)  # ready_since moved: it left and came back unseen
++    eps = metrics.episodes(log.capture(100)["records"], armed_s=T0, err=0)
++    assert [(e.end, e.start_lo - T0) for e in eps] == [("requeued", 0), ("open", 40)]
++
++
++def test_priority_cohort_is_fixed_at_ready_entry():
++    log = Log()
++    log.row(0, "t", "ready", op="insert")
++    log.row(5, "t", "ready", priority=1000, since=0)  # raised by hand while waiting
++    log._add("event", 10, "t", None, {"kind": "claimed", "created_at": T0 + 10})
++    log.row(10, "t", "running", priority=1000, since=0)
++    cohorts = metrics.verdict(log.capture(100), alarm_prefixes=PREFIXES)["cohorts"]
++    assert (cohorts["p0"]["episodes"], cohorts["p0"]["priority_changed"]) == (1, 1)
++
++
++def test_clock_error_and_apply_lag_widen_into_indeterminate():
++    log = Log()
++    log.wait("alarm", 0, 599, key="mods-suite-red:x")
++    assert _gates(log.capture(700))["alarm_wait"]["status"] == "PASS"
++    gate = _gates(log.capture(700, clock_error_s=2))["alarm_wait"]
++    assert (gate["status"], gate["undecided"][0]["wait_hi_s"]) == ("INDETERMINATE", 601)
++    # A replica shows the ready row up to 20 s late; with no ready_since the start is only bounded.
++    lagged = Log()
++    lagged.row(0, "seen", "todo", op="insert")
++    lagged.records.append({"seq": 0, "kind": "task", "wall_ms": (T0 + 20) * 1000, "task_id": "seen", "op": "update",
++                           "fields": {"status": "ready", "priority": 0, "idempotency_key": "pickup-stall:y",
++                                      "ready_since": None}})
++    lagged.row(610, "seen", "running")
++    assert _gates(lagged.capture(700))["alarm_wait"]["worst_hi_s"] == 590
++    gate = _gates(lagged.capture(700, apply_lag_s=20))["alarm_wait"]
++    assert gate["status"] == "INDETERMINATE"
++    assert (gate["undecided"][0]["wait_lo_s"], gate["undecided"][0]["wait_hi_s"]) == (570, 610)
++
++
++def test_ready_and_claimed_between_two_sightings_still_counts():
++    log = Log()
++    log.row(0, "t", "todo", op="insert")
++    log._add("event", 700, "t", None, {"kind": "claimed", "created_at": T0 + 700})
++    log.row(720, "t", "running", since=10, key="pickup-stall:z")  # the replica never showed it ready
++    log.row(900, "t", "done", since=10, key="pickup-stall:z")
++    log.row(0, "was-running", "running", since=-50, kind="opening")  # claimed before the window: not an episode
++    log.row(30, "was-running", "done", since=-50)
++    gate = _gates(log.capture(1000, apply_lag_s=30))["alarm_wait"]
++    assert (gate["status"], gate["episodes"], gate["late"][0]["wait_lo_s"]) == ("FAIL", 1, 690)
++
++
++def test_owner_gate_needs_the_owner_journal():
++    log = Log()
++    log.wait("owner", 100, 400)
++    log.wait("bystander", 0, 5000)
++    held = {"kind": "interval", "source": "core-lane", "task_id": "owner", "role": "holder",
++            "start_s": T0 + 50.0, "end_s": T0 + 900.0}
++    gate = _gates(log.capture(6000, owners=_owner_cover(6000) + [held]))["owner_wait"]
++    assert (gate["status"], gate["episodes"], gate["worst_hi_s"]) == ("PASS", 1, 300)
++
++    gate = _gates(log.capture(6000))["owner_wait"]  # no owner_authority.jsonl at all
++    assert gate["status"] == "INDETERMINATE" and "not journaled" in gate["reason"]
++
++    broken = _owner_cover(6000)
++    broken[0] = {**broken[0], "complete": False, "reason": "parentless lane commit"}
++    gate = _gates(log.capture(6000, owners=broken + [held]))["owner_wait"]
++    assert gate["status"] == "INDETERMINATE" and "core-lane" in gate["reason"]
++
++    partial = [{**c, "to_s": T0 + 3000.0} for c in _owner_cover(6000)]
++    assert _gates(log.capture(6000, owners=partial + [held]))["owner_wait"]["status"] == "INDETERMINATE"
++
++    late = Log()
++    late.wait("owner", 100, 800)
++    gate = _gates(late.capture(6000, owners=[held]))["owner_wait"]  # a proven miss stands without coverage
++    assert gate["status"] == "FAIL"
++
++
++def test_coverage_gap_blocks_a_pass_but_not_a_failure():
++    log = Log()
++    log.wait("alarm", 0, 601, key="pickup-stall:x")
++    log.wait("p0", 0, 10)
++    verdict = metrics.verdict(log.capture(700, gaps=[{"code": "journal_dropped", "detail": "x"}]),
++                              alarm_prefixes=PREFIXES)
++    assert verdict["gates"]["alarm_wait"]["status"] == "FAIL"
++    assert verdict["gates"]["p0_median_wait"]["status"] == "INDETERMINATE"
++    assert (verdict["overall"], verdict["coverage"]["complete"]) == ("FAIL", False)
++
++
++def test_all_gates_passing_is_the_only_overall_pass():
++    log = Log()
++    log.wait("p0", 0, 10)
++    log.wait("alarm", 0, 10, key="pickup-stall:x", priority=5)
++    log.wait("owner", 0, 10, priority=5)
++    owners = _owner_cover(100) + [{"kind": "interval", "source": "state-turn", "task_id": "owner",
++                                   "role": "holder", "start_s": T0 - 10.0, "end_s": None}]
++    assert metrics.verdict(log.capture(100, owners=owners), alarm_prefixes=PREFIXES)["overall"] == "PASS"
++    short = metrics.verdict(log.capture(100, owners=owners), alarm_prefixes=PREFIXES, min_window_s=3600)
++    assert short["overall"] == "INDETERMINATE" and short["coverage"]["gaps"][0]["code"] == "window_short"
++
++
++@pytest.mark.parametrize("patch", [
++    {"version": 2}, {"kind": "stage"}, {"task_id": ""}, {"seq": "1"}, {"op": "upsert"},
++    {"fields": {"status": "ready", "priority": "0"}}, {"fields": {"priority": 0}},
++])
++def test_decode_refuses_unknown_shapes(patch):
++    good = {"version": 1, "seq": 1, "kind": "task", "wall_ms": 1, "task_id": "t", "op": "insert",
++            "fields": {"status": "ready", "priority": 0}}
++    assert decode_record(good)["task_id"] == "t"
++    with pytest.raises(BadRecord):
++        decode_record({**good, **patch})
++
++
++def test_decode_owner_refuses_unknown_shapes():
++    good = {"version": 1, "kind": "interval", "source": "core-lane", "task_id": "t", "role": "next",
++            "start_s": 1.0, "end_s": None}
++    assert decode_owner(good)["role"] == "next"
++    for patch in ({"source": "elsewhere"}, {"role": "waiting"}, {"start_s": None}, {"kind": "generation"}):
++        with pytest.raises(BadRecord):
++            decode_owner({**good, **patch})
+diff --git a/tests/hermes_cli/test_kanban_fairness_vertical.py b/tests/hermes_cli/test_kanban_fairness_vertical.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ce3a66e53f05140370dc1767aff3dcbc4af4f3ba
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_fairness_vertical.py
+@@ -0,0 +1,155 @@
++"""Queue-fairness capture, end to end: a real ``dispatch_once`` on a real board database, journaled by the
++SQLite triggers, drained to segments, sealed, and read back by the operator CLI. [daveey]
++
++Worker launch is the only test adapter (``spawn_fn``); selection, claim and every row write are production
++code. The clock is the database host's, so waits here are a few milliseconds: the assertions are about which
++episodes exist, how each ended, and that the capture is complete or says exactly why it is not.
++"""
++from __future__ import annotations
++
++import importlib.util
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_fairness_journal as journal
++from hermes_cli import kanban_fairness_metrics as metrics
++from hermes_cli import kanban_fairness_store as store
++from hermes_cli.kanban_admission_score import ALARM_KEY_PREFIXES
++
++_SPEC = importlib.util.spec_from_file_location(
++    "kanban_fairness_cli", Path(__file__).resolve().parents[2] / "scripts" / "kanban_fairness.py")
++cli = importlib.util.module_from_spec(_SPEC)
++_SPEC.loader.exec_module(cli)
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    (home / "config.yaml").write_text("kanban:\n  dispatch_profiles: [worker-a]\n", encoding="utf-8")
++    kb.init_db()
++    return home
++
++
++def _spawn(task, _workspace):
++    if task.title == "launch fails":
++        raise RuntimeError("no worker")
++    return 4242
++
++
++def _lifecycle(conn):
++    """Everything dispatch-relevant about the board, without the evidence tables."""
++    tasks = conn.execute("SELECT title, status, priority, assignee, claim_lock IS NOT NULL FROM tasks "
++                         "ORDER BY title").fetchall()
++    events = conn.execute("SELECT t.title, e.kind FROM task_events e JOIN tasks t ON t.id = e.task_id "
++                          "ORDER BY e.id").fetchall()
++    per_card: dict = {}  # equal-score cards are visited in task-id order, which is random per run
++    for title, kind in events:
++        per_card.setdefault(title, []).append(kind)
++    return [tuple(r) for r in tasks], per_card
++
++
++def _scenario(conn):
++    """Two priorities, a dependency, an alarm, a failed launch, a card nobody may claim."""
++    ids = {
++        "backlog": kb.create_task(conn, title="backlog p0", assignee="worker-a"),
++        "urgent": kb.create_task(conn, title="urgent p1000", assignee="worker-a", priority=1000),
++        "alarm": kb.create_task(conn, title="alarm", assignee="worker-a",
++                                idempotency_key="worker-claim-watch:w9"),
++        "fails": kb.create_task(conn, title="launch fails", assignee="worker-a"),
++        "foreign": kb.create_task(conn, title="not ours", assignee="worker-b"),
++    }
++    ids["child"] = kb.create_task(conn, title="child", assignee="worker-a", parents=[ids["backlog"]])
++    return ids
++
++
++def test_dispatch_to_report(kanban_home, all_assignees_spawnable, tmp_path, capsys):
++    out = tmp_path / "evidence"
++    db = kanban_home / "kanban.db"
++    with kbc.connect_closing() as conn:
++        early = kb.create_task(conn, title="opening backlog", assignee="worker-b")
++    assert cli.main(["capture", "arm", "--out", str(out), "--capture-id", "t1", "--db", str(db),
++                     "--unclaimed-exit", "elapsed_ready"]) == 0
++    with kbc.connect_closing() as conn:
++        ids = _scenario(conn)
++        res = kbd.dispatch_once(conn, spawn_fn=_spawn)
++        assert {ids["backlog"], ids["urgent"], ids["alarm"]} <= {s[0] for s in res.spawned}
++        assert kb.get_task(conn, ids["child"]).status == "todo"
++        kb.complete_task(conn, ids["backlog"], result="done")
++        kbd.dispatch_once(conn, spawn_fn=_spawn)  # the child is ready now and gets claimed
++        kb.archive_task(conn, ids["foreign"])
++    assert cli.main(["capture", "drain", "--out", str(out)]) == 0
++    assert cli.main(["capture", "seal", "--out", str(out)]) == 0
++    assert cli.main(["validate", "--input", str(out)]) == 0
++    capsys.readouterr()
++
++    capture = store.load(out)
++    assert capture["gaps"] == []
++    eps = metrics.episodes(capture["records"], armed_s=capture["manifest"]["window"]["armed_ms"] / 1000,
++                           err=0)
++    by_task = {}
++    for ep in eps:
++        by_task.setdefault(ep.task_id, []).append(ep)
++    assert [e.end for e in by_task[ids["backlog"]]] == ["claimed"]
++    assert [e.end for e in by_task[ids["urgent"]]] == ["claimed"]
++    assert [e.end for e in by_task[ids["child"]]] == ["claimed"]  # never ready before its parent finished
++    assert by_task[ids["urgent"]][0].priority == 1000
++    assert by_task[ids["alarm"]][0].key == "worker-claim-watch:w9"
++    assert [e.end for e in by_task[ids["foreign"]]] == ["left:archived"]
++    assert [(e.end, e.opening) for e in by_task[early]] == [("open", True)]
++    # A failed launch ends the first wait at the claim; the card's return to ready is a new episode.
++    assert by_task[ids["fails"]][0].end == "claimed"
++    assert len(by_task[ids["fails"]]) >= 2
++
++    report = tmp_path / "live.json"
++    code = cli.main(["report", "--mode", "live", "--input", str(out), "--output", str(report)])
++    verdict = json.loads(report.read_text())
++    assert verdict["coverage"]["complete"] is True
++    assert verdict["cohorts"]["all"]["opening_backlog"] == 1
++    gates = verdict["gates"]
++    assert gates["alarm_wait"]["status"] == "PASS" and gates["alarm_wait"]["episodes"] == 1
++    assert gates["max_wait_while_claims"]["status"] == "PASS"
++    # No owner journal was supplied: that gate cannot pass, so neither can the capture.
++    assert gates["owner_wait"]["status"] == "INDETERMINATE"
++    assert (verdict["overall"], code) == ("INDETERMINATE", 2)
++    assert verdict["policy"]["alarm_prefixes"] == list(ALARM_KEY_PREFIXES)
++
++
++def test_capture_does_not_change_what_the_dispatcher_does(
++        kanban_home, all_assignees_spawnable, tmp_path, monkeypatch):
++    def run(home, armed):
++        monkeypatch.setenv("HERMES_HOME", str(home))
++        (home / "config.yaml").write_text("kanban:\n  dispatch_profiles: [worker-a]\n", encoding="utf-8")
++        kb.init_db()
++        with kbc.connect_closing() as conn:
++            if armed:
++                journal.arm(conn, "identity")
++            ids = _scenario(conn)
++            kbd.dispatch_once(conn, spawn_fn=_spawn)
++            kb.complete_task(conn, ids["backlog"], result="done")
++            kbd.dispatch_once(conn, spawn_fn=_spawn)
++            life = _lifecycle(conn)
++            assert "claimed" in life[1]["backlog p0"] and "claimed" in life[1]["child"]
++            return life
++
++    plain_home = tmp_path / "plain"
++    plain_home.mkdir()
++    assert run(kanban_home, armed=True) == run(plain_home, armed=False)
++
++
++def test_unsealed_capture_is_incomplete(kanban_home, tmp_path, capsys):
++    out = tmp_path / "evidence"
++    assert cli.main(["capture", "arm", "--out", str(out), "--capture-id", "t2",
++                     "--db", str(kanban_home / "kanban.db")]) == 0
++    with kbc.connect_closing() as conn:
++        kb.create_task(conn, title="x", assignee="worker-a")
++    assert cli.main(["capture", "drain", "--out", str(out)]) == 0
++    assert cli.main(["validate", "--input", str(out)]) == 2
++    assert "unsealed" in capsys.readouterr().out
+-- 
+2.43.0
+

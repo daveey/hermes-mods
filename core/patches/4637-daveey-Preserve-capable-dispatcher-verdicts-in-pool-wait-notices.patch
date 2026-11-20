@@ -1,0 +1,217 @@
+From ba4827fd3c70d24c6360479a5c0ce218c8781796 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 10:47:18 +0000
+Subject: [PATCH] [daveey] Preserve capable dispatcher verdicts in pool wait
+ notices
+
+Carry newest capable ready-episode verdict when machine placement omits skip; preserve busy/update precedence. Recorded pacing uses governor pools or recorded providers and renders llm_paced.
+
+Proof: 284 notice/backlog tests pass; nine condition mutants killed. Authorized acceptance correction: only the obsolete capable llm_paced test assertion now expects preserved pacing instead of UNKNOWN.
+---
+ hermes_cli/kanban_llm_pacing_dispatch.py      |  2 +-
+ hermes_cli/kanban_notice_verdict.py           | 33 +++++++
+ hermes_cli/kanban_parent_unclaimed.py         |  7 +-
+ .../test_kanban_notice_pacing_admission.py    |  5 +-
+ .../test_kanban_notice_recorded_verdict.py    | 94 +++++++++++++++++++
+ 5 files changed, 137 insertions(+), 4 deletions(-)
+ create mode 100644 hermes_cli/kanban_notice_verdict.py
+ create mode 100644 tests/hermes_cli/test_kanban_notice_recorded_verdict.py
+
+diff --git a/hermes_cli/kanban_llm_pacing_dispatch.py b/hermes_cli/kanban_llm_pacing_dispatch.py
+index b3c47cb5bebeddbcd64583d966d0997bf5e8385a..797300f2955ed366eaa36f199fd57ac4f42db05e 100644
+--- a/hermes_cli/kanban_llm_pacing_dispatch.py
++++ b/hermes_cli/kanban_llm_pacing_dispatch.py
+@@ -444,7 +444,7 @@ def admission_skip(stored: Any) -> Optional[dict[str, Any]]:
+     """The ``llm_paced`` skip a stored :func:`admission` stands for, so a notice words and advises it as the
+     dispatcher's own hold does (``kanban_dispatch_skip``): every pool, and the earliest ``until``. None for any other
+     admission and for a malformed one."""
+-    if not isinstance(stored, dict) or stored.get("reason") != ADMISSION_REASON:
++    if not isinstance(stored, dict) or stored.get("reason") not in (ADMISSION_REASON, EVENT_KIND):
+         return None
+     listed = stored.get("providers")
+     pools = [p for p in listed if isinstance(p, dict) and p.get("provider") and p.get("state") in (lp.PACED, lp.HELD)
+diff --git a/hermes_cli/kanban_notice_verdict.py b/hermes_cli/kanban_notice_verdict.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..205c8bd55f75d263462b4bc57737a38b14f165f8
+--- /dev/null
++++ b/hermes_cli/kanban_notice_verdict.py
+@@ -0,0 +1,33 @@
++"""Carry capable dispatcher verdicts omitted by machine-lane queue positions. [daveey]"""
++from __future__ import annotations
++
++import logging
++
++from hermes_cli import kanban_dispatch_skip as skips
++from hermes_cli import kanban_llm_pacing_dispatch as pacing
++
++_log = logging.getLogger(__name__)
++
++
++def fields(conn, task_id, place, ready_seconds):
++    """Newest capable verdict in this ready episode, without replacing a queue-provided skip.
++
++    Ordering verdicts remain ordinary capacity advice. Recorder-only eligibility failures are not verdicts on the
++    card's capable workers. A recorded pacing verdict survives even when this emitter cannot read the governor.
++    """
++    if place.get("skip"):
++        return {}
++    verdict = next((skip for skip in skips.episode_skips(conn, task_id) if not skips.recorder_cannot_lease(skip)), None)
++    if not verdict or skips.is_ordering(verdict):
++        return {}
++    carried = skips.notice_fields({"skip": verdict}, ready_seconds)
++    if verdict.get("reason") != skips.LLM_PACED:
++        return carried
++    admission = {"reason": skips.LLM_PACED, "status": "held", "providers": verdict.get("providers", [])}
++    try:
++        paces = pacing.paced_pools(conn, task_id)
++        if paces:
++            admission = {**pacing.admission(paces), "reason": skips.LLM_PACED}
++    except Exception:  # health: allow BLE001 -- keep the recorded verdict if the advisory governor read fails
++        _log.debug("notice: pacing read unavailable for %s", task_id, exc_info=True)
++    return {**carried, "admission": admission}
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index e955b85e3d01ac9c5bbf8bc31385aeab5d35bcf5..377a8eee36b8df507785f4c1a2c37bb2a404fed2 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -290,10 +290,13 @@ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_se
+     place = _place(conn, waiting_on)
+     extra = _host_hold_only_if_local(extra, place)
+     busy = klb.busy(place.get("backlog"))
++    from hermes_cli import kanban_notice_verdict
++    verdict = ({} if busy or (extra or {}).get("core_update_hold") else
++               kanban_notice_verdict.fields(conn, waiting_on, place, ready_seconds))
+     observed = {"board": place.get("board") or khc.board_of(conn), "observed_at": place.get("observed_at") or int(time.time()),
+                 "admission": ({"reason": "core_update_hold", "status": "held"} if (extra or {}).get("core_update_hold")
+                               else {"reason": klb.REASON, "status": "queued"} if busy
+-                              else _pacing_admission(conn, waiting_on, place, extra)
++                              else verdict.get("admission") or _pacing_admission(conn, waiting_on, place, extra)
+                               or {"reason": None, "status": "unknown"})}
+     guard = place.get("reason") if place.get("lane") == "respawn_guard" else None
+     pool_hint = "" if guard else _pool_sentence(place, observed["observed_at"])  # outside the queue clause (#1821)
+@@ -316,6 +319,6 @@ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_se
+             **_backlog(place),
+             "respawn_guard": guard,
+             "priority_evidence": lane_evidence(conn, waiting_on),
+-            **({} if guard else notice_fields(place, ready_seconds)),
++            **({} if guard else {**notice_fields(place, ready_seconds), **verdict}),
+         })
+     return True
+diff --git a/tests/hermes_cli/test_kanban_notice_pacing_admission.py b/tests/hermes_cli/test_kanban_notice_pacing_admission.py
+index 38d5964675042895cac7d904ad23ac406895ecf2..5f5341eb53ccff900fc4f8f56de5ce7e0680de26 100644
+--- a/tests/hermes_cli/test_kanban_notice_pacing_admission.py
++++ b/tests/hermes_cli/test_kanban_notice_pacing_admission.py
+@@ -307,7 +307,10 @@ def test_a_verdict_recorded_by_a_dispatcher_able_to_lease_the_card_keeps_todays_
+     tid = _hub_card(hub.conn)
+     assert skips.record(hub.conn, tid, verdict[0], detail=verdict[1])
+     payload, text = _chat_wait(hub.conn, tid)
+-    assert payload["admission"] == UNKNOWN and "LLM quota pacing" not in text, (payload, text)
++    if verdict[0] == "llm_paced":
++        assert payload["admission"]["reason"] == "llm_paced" and "LLM quota pacing" in text, (payload, text)
++    else:
++        assert payload["admission"] == UNKNOWN and "LLM quota pacing" not in text, (payload, text)
+ 
+ 
+ @pytest.mark.parametrize("cannot_lease", CANNOT_LEASE)
+diff --git a/tests/hermes_cli/test_kanban_notice_recorded_verdict.py b/tests/hermes_cli/test_kanban_notice_recorded_verdict.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..53e2b35e65fdd3adeb7ccdcfd60a85b22920979c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_notice_recorded_verdict.py
+@@ -0,0 +1,94 @@
++"""Preserve a capable dispatcher's verdict in pool-card wait notices."""
++import pytest
++
++from hermes_cli import kanban_dispatch_skip as skips
++from hermes_cli import kanban_parent_unclaimed as pu
++from hermes_cli import kanban_notice_verdict as nv
++from hermes_cli import kanban_llm_pacing_dispatch as pd
++from tests.hermes_cli import test_kanban_notice_pacing_admission as helpers
++
++hub = helpers.hub
++
++
++@pytest.mark.parametrize("path", sorted(helpers.NOTICES))
++@pytest.mark.parametrize("governor", [True, False])
++def test_recorded_pacing_survives_machine_lane(hub, path, governor):
++    tid = helpers._hub_card(hub.conn)
++    providers = [{"provider": "anthropic", "state": "paced", "limit": 1, "running": 1}]
++    assert skips.record(hub.conn, tid, "llm_paced", detail="anthropic paced", extra={"providers": providers})
++    if governor:
++        helpers._store(("anthropic", "held", 1_900_000_000))
++    place = pu._place(hub.conn, tid)
++    assert place["lane"] == "machine" and not place.get("skip")
++    payload, text = helpers.NOTICES[path](hub.conn, tid)
++    assert payload["admission"]["reason"] == "llm_paced"
++    assert payload["admission"]["providers"][0]["state"] == ("held" if governor else "paced")
++    assert "admission reason llm_paced: held: LLM quota pacing" in text
++    assert "it starts on its own once its provider pool is back on pace" in text
++    assert "admission reason unknown" not in text and "re-place" not in text
++
++
++@pytest.mark.parametrize("path", sorted(helpers.NOTICES))
++def test_recorded_quota_wall_survives_machine_lane(hub, path):
++    tid = helpers._hub_card(hub.conn)
++    assert skips.record(hub.conn, tid, "pinned_quota_wall", detail="anthropic", until=1_900_000_000)
++    payload, text = helpers.NOTICES[path](hub.conn, tid)
++    assert payload["dispatch_skip"]["reason"] == "pinned_quota_wall"
++    assert skips.advice(payload["dispatch_skip"], now=payload["observed_at"]) in text
++
++
++def test_newest_capable_verdict_wins_even_with_newer_recorder_only_skip(hub):
++    tid = helpers._hub_card(hub.conn)
++    assert skips.record(hub.conn, tid, "llm_paced", detail="anthropic paced")
++    assert skips.record(hub.conn, tid, "pinned_quota_wall", detail="anthropic")
++    assert skips.record(hub.conn, tid, "claim_deferred", detail="labels_mismatch")
++    helpers._store(("anthropic", "paced"))
++    payload, text = helpers._chat_wait(hub.conn, tid)
++    assert payload["dispatch_skip"]["reason"] == "pinned_quota_wall"
++    assert "LLM quota pacing" not in text
++
++
++@pytest.mark.parametrize("case", ["existing", "ordering", "recorder", "empty"])
++def test_verdict_carriage_boundaries(hub, case):
++    tid = helpers._pool_card(hub.conn)
++    place = {}
++    if case == "existing":
++        place["skip"] = {"reason": "owner_down"}
++        assert skips.record(hub.conn, tid, "pinned_quota_wall", detail="anthropic")
++    elif case == "ordering":
++        assert skips.record(hub.conn, tid, "pinned_quota_wall", detail="anthropic")
++        assert skips.record(hub.conn, tid, "claim_deferred", detail="capacity")
++    elif case == "recorder":
++        assert skips.record(hub.conn, tid, "skipped_ineligible", detail="labels_mismatch")
++    assert nv.fields(hub.conn, tid, place, 2400) == {}
++
++
++@pytest.mark.parametrize("precedence", ["busy", "core_update"])
++def test_recorded_verdict_keeps_admission_precedence(hub, monkeypatch, precedence):
++    tid = helpers._hub_card(hub.conn)
++    assert skips.record(hub.conn, tid, "llm_paced", detail="anthropic paced")
++    helpers._store(("anthropic", "paced"))
++    place = pu._place(hub.conn, tid)
++    if precedence == "busy":
++        from hermes_cli import kanban_label_backlog as klb
++        monkeypatch.setattr(klb, "busy", lambda _backlog: True)
++    else:
++        place["lane"] = "local"
++    monkeypatch.setattr(pu, "_place", lambda *_a: place)
++    payload = helpers._post(hub.conn, tid, core_update_hold=precedence == "core_update")
++    assert payload["admission"]["reason"] == ("matching_pool_busy" if precedence == "busy" else "core_update_hold")
++    assert "dispatch_skip" not in payload
++
++
++def test_failed_governor_read_keeps_recorded_pacing(hub, monkeypatch):
++    tid = helpers._hub_card(hub.conn)
++    assert skips.record(hub.conn, tid, "llm_paced", detail="anthropic paced",
++                        extra={"providers": [{"provider": "anthropic", "state": "paced"}]})
++
++    def fail(*_args):
++        raise RuntimeError("unavailable")
++
++    monkeypatch.setattr(pd, "paced_pools", fail)
++    payload, text = helpers._chat_wait(hub.conn, tid)
++    assert payload["admission"]["reason"] == "llm_paced"
++    assert "it starts on its own once its provider pool is back on pace" in text
+-- 
+2.43.0
+

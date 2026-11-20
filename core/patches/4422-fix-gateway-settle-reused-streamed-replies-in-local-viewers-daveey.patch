@@ -1,0 +1,136 @@
+From aa4be334d9c22b0a4b83a293822642ad930bb448 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 05:34:32 +0000
+Subject: [PATCH] fix(gateway): settle reused streamed replies in local viewers
+ [daveey]
+
+Restore captured reused finals in local completion frames when adapter delivery returns None, and publish interim seals with the actual streaming flag. Leave ordinary streaming and external delivery unchanged. Both regressions failed first in focused tests; 32 focused tests now pass and scripts/check passes. Electron acceptance remains unchanged.
+---
+ gateway/run_turn_runner.py                    | 12 ++++------
+ gateway/session_settlement_recovery.py        |  7 ++++--
+ .../gateway/test_local_viewer_events_turn.py  | 23 +++++++++++++++++++
+ .../test_local_viewer_transformed_final.py    | 19 +++++++++++++--
+ 4 files changed, 50 insertions(+), 11 deletions(-)
+
+diff --git a/gateway/run_turn_runner.py b/gateway/run_turn_runner.py
+index ebd2e45444b216e2c108dc0494e07c03f35298ed..809dd278d87554d507875dbc3465dd3c47c892c1 100644
+--- a/gateway/run_turn_runner.py
++++ b/gateway/run_turn_runner.py
+@@ -425,13 +425,11 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
+             if not ctx._run_still_current():
+                 return
+             unseen = False
+-            if local_viewer_route and not already_streamed and str(text or "").strip():
+-                # LocalSessionAdapter.send publishes nothing, so unstreamed commentary handed to the
+-                # consumer would be recorded as delivered while no viewer saw it. A codex app-server
+-                # final that arrives with no deltas then suppresses the reply (message.complete "").
+-                # Publish the in-process TUI's message.interim contract instead, and count the text
+-                # as delivered only when a viewer or observer actually took it.
+-                payload = {"text": text, "already_streamed": False}
++            if local_viewer_route and str(text or "").strip():
++                # Seal streamed commentary in place; unstreamed commentary needs its text too
++                # because LocalSessionAdapter.send publishes nothing. Preserve the stream flag
++                # so viewers do not paint accepted deltas twice.
++                payload = {"text": text, "already_streamed": already_streamed}
+                 unseen = not self._publish_execution("message.interim", payload)
+             if stts is not None:
+                 # Flush accepted deltas; completed commentary is a separate speech segment.
+diff --git a/gateway/session_settlement_recovery.py b/gateway/session_settlement_recovery.py
+index 066a8d495366bba37700e42917075d0293055f80..b90c429546c84cca3430d78d99494b502e04c948 100644
+--- a/gateway/session_settlement_recovery.py
++++ b/gateway/session_settlement_recovery.py
+@@ -79,10 +79,13 @@ def completion_payload(row, settled, response, captured):
+             complete['response_previewed'] = True
+         if captured_result.get('response_transformed'):
+             complete['response_transformed'] = True
+-            # The stream carried the raw reply and the turn counts as delivered (``response`` is
+-            # None): this frame is the only carrier of the rewrite the session stored.
++        if captured_result.get('response_transformed') or captured_result.get('response_reused'):
++            # Adapter delivery is suppressed after streaming. Local viewers still need the
++            # rewritten/reused final to replace or settle the already painted answer in place.
+             if not response and (final := captured_result.get('final_response')):
+                 complete['text'] = complete['content'] = final
++            if complete['text'] and captured_result.get('response_reused'):
++                complete['response_reused'] = True
+         if isinstance(captured_result.get('warning'), str) and captured_result['warning']:
+             complete['warning'] = captured_result['warning']
+         if isinstance(captured_result.get('billing_block'), dict):
+diff --git a/tests/gateway/test_local_viewer_events_turn.py b/tests/gateway/test_local_viewer_events_turn.py
+index 9e53a4ff2bc4c2d2bf7acef6c55f8613019cf4fc..cbf020f7dd2ea6c92d89fced869efe644f95a168 100644
+--- a/tests/gateway/test_local_viewer_events_turn.py
++++ b/tests/gateway/test_local_viewer_events_turn.py
+@@ -58,6 +58,29 @@ def test_messaging_route_never_publishes_the_boundary():
+     assert published == [('message.delta', {'text': 'hello'})]
+ 
+ 
++@pytest.mark.parametrize('already_streamed', [True, False])
++def test_local_interim_seals_the_reply_with_its_actual_stream_state(already_streamed):
++    published = []
++    turn = _turn(Platform.LOCAL, published)
++    turn._ctx._status_adapter = None
++    _, delta, interim, _ = turn._setup_stream_consumer('cli')
++    if already_streamed:
++        delta('answer')
++    interim('answer', already_streamed=already_streamed)
++    expected = [('message.delta', {'text': 'answer'})] if already_streamed else []
++    assert published == expected + [('message.interim', {'text': 'answer', 'already_streamed': already_streamed})]
++
++
++@pytest.mark.parametrize('already_streamed', [True, False])
++def test_messaging_interim_does_not_publish_a_local_seal(already_streamed):
++    published = []
++    turn = _turn(Platform.TELEGRAM, published)
++    turn._ctx._status_adapter = None
++    _, _, interim, _ = turn._setup_stream_consumer('telegram')
++    interim('answer', already_streamed=already_streamed)
++    assert published == []
++
++
+ def test_turn_sinks_publish_and_restore_on_the_shared_agent():
+     from gateway import local_viewer_events
+     published = []
+diff --git a/tests/gateway/test_local_viewer_transformed_final.py b/tests/gateway/test_local_viewer_transformed_final.py
+index 1823bf178c88cdcc8a11b9dbf4710b0a5dd98c97..95079ad8ae9bb12f7233d5606ad8b802afb8c431 100644
+--- a/tests/gateway/test_local_viewer_transformed_final.py
++++ b/tests/gateway/test_local_viewer_transformed_final.py
+@@ -23,16 +23,18 @@ REWRITE = "Your api key is [REDACTED]."
+ 
+ class _StreamedAgent(_RecordingAgent):
+     transformed = True
++    reused = False
+ 
+     def run_conversation(self, message, **kwargs):
+         if self.transformed:
+             return {"final_response": REWRITE, "messages": [], "response_transformed": True,
+                     "pre_transform_response": RAW}
+-        return {"final_response": RAW, "messages": []}
++        return {"final_response": RAW, "messages": [], "response_reused": self.reused}
+ 
+ 
+-def _settle(platform, transformed):
++def _settle(platform, transformed, *, reused=False):
+     _StreamedAgent.transformed = transformed
++    _StreamedAgent.reused = reused
+     ctx = TurnContext(
+         source=SessionSource(platform=platform, chat_id="sid", user_id="u"),
+         message="show me the config", history=[], session_id="sid", session_key="key", user_config={},
+@@ -63,3 +65,16 @@ def test_a_streamed_local_turn_completes_with_the_transformed_final():
+ def test_the_stream_stays_the_delivery_without_a_local_rewrite(platform, transformed):
+     # An unrewritten streamed reply is already on screen; a messaging turn's chat holds its own copy.
+     assert _settle(platform, transformed)["text"] is None
++
++
++def test_a_streamed_local_reused_reply_completes_with_its_captured_final():
++    complete = _settle(Platform.LOCAL, transformed=False, reused=True)
++    assert complete["text"] == RAW
++    assert complete["content"] == RAW
++    assert complete["response_reused"] is True
++
++
++def test_a_messaging_reused_reply_keeps_adapter_delivery_unchanged():
++    complete = _settle(Platform.TELEGRAM, transformed=False, reused=True)
++    assert complete["text"] is None and complete["content"] is None
++    assert "response_reused" not in complete
+-- 
+2.43.0
+

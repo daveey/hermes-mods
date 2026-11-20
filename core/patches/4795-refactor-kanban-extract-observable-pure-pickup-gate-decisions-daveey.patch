@@ -1,0 +1,402 @@
+From af93f6f59e4b1e339267a4b0a01917b75825fa11 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 07:19:04 +0000
+Subject: [PATCH] refactor(kanban): extract observable pure pickup gate
+ decisions [daveey]
+
+Keep ordered live readers and short-circuit reasons unchanged; retain immutable bounded gate snapshots only in an explicit caller-owned context. Missing facts stay unknown, including after a reader exception. This is a tracing prerequisite, not a full dispatcher trace or fairness acceptance. Proof: canonical pickup tests, all direct worker-node consumers, scripts/check; design and code review by conversation-isolated Opus5.5.
+---
+ hermes_cli/kanban_pickup_gate.py            | 156 +++++++++++++++++
+ hermes_cli/kanban_worker_node.py            |  24 +--
+ tests/hermes_cli/test_kanban_pickup_gate.py | 184 ++++++++++++++++++++
+ 3 files changed, 343 insertions(+), 21 deletions(-)
+ create mode 100644 hermes_cli/kanban_pickup_gate.py
+ create mode 100644 tests/hermes_cli/test_kanban_pickup_gate.py
+
+diff --git a/hermes_cli/kanban_pickup_gate.py b/hermes_cli/kanban_pickup_gate.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2b24be02332d5c0adbfaf4b549ddc6b70456d92d
+--- /dev/null
++++ b/hermes_cli/kanban_pickup_gate.py
+@@ -0,0 +1,156 @@
++"""Pure ordered pickup gate facts; bounded, opt-in partial observations. [daveey]
++
++A complete decision covers _skip_reason ONLY, not quota, pacing, import or
++claim. Missing records/facts are unknown. This module never certifies a trace.
++"""
++from __future__ import annotations
++
++from contextlib import contextmanager
++from contextvars import ContextVar
++from dataclasses import dataclass, field
++import json
++from typing import Mapping
++
++
++STAGES = ('already_local', 'default_placement', 'review_disabled', 'placement_refusal',
++          'missing_profile', 'capability_refusal', 'source_refusal')
++Fact = bool | str | None
++Reason = tuple[str, str | None]
++
++
++@dataclass(frozen=True)
++class Decision:
++    complete: bool
++    next_fact: str | None = None
++    reason: Reason | None = None
++
++
++def evaluate(facts: Mapping[str, Fact]) -> Decision:
++    """Pure, short-circuit evaluator. Absent is never equivalent to null."""
++    for index, name in enumerate(STAGES):
++        if name not in facts:
++            return Decision(False, next_fact=name)
++        value = facts[name]
++        if index < 3:
++            if type(value) is not bool:
++                raise ValueError(f'{name} must be boolean')
++            if value:
++                reason = ('other', 'review dispatch disabled') if index == 2 else ('', None)
++                return Decision(True, reason=reason)
++        else:
++            if value is not None and type(value) is not str:
++                raise ValueError(f'{name} must be string or null')
++            if value is not None:
++                category = 'profile_ineligible' if name == 'missing_profile' else 'capability_missing'
++                if name == 'placement_refusal' and value == 'held':
++                    category = 'hold'
++                return Decision(True, reason=(category, value))
++    return Decision(True)
++
++
++@dataclass(frozen=True)
++class Snapshot:
++    task_id: str
++    facts: tuple[tuple[str, Fact], ...]
++    complete: bool
++    next_fact: str | None
++    reason: Reason | None
++
++
++@dataclass
++class Collector:
++    max_records: int = 1000
++    max_bytes: int = 1_000_000
++    records: list[Snapshot] = field(default_factory=list)
++    bytes_used: int = 0
++    gap: str | None = None
++
++    def add(self, task_id: str, facts: Mapping[str, Fact]) -> None:
++        if self.gap is not None:
++            return
++        if len(self.records) >= self.max_records:
++            self.gap = 'record_limit'
++            return
++        try:
++            if type(task_id) is not str or not task_id:
++                raise ValueError('invalid task id')
++            if any(name not in STAGES for name in facts):
++                raise ValueError('unknown fact')
++            # Check even facts beyond a short-circuit: snapshots retain primitives only.
++            for name, value in facts.items():
++                if (name in STAGES[:3] and type(value) is not bool) or (
++                        name in STAGES[3:] and value is not None and type(value) is not str):
++                    raise ValueError('invalid fact')
++            decision = evaluate(facts)
++            pairs = tuple((name, facts[name]) for name in STAGES if name in facts)
++            size = len(json.dumps([task_id, pairs, decision.complete, decision.next_fact,
++                                   decision.reason], ensure_ascii=False).encode('utf-8'))
++            if self.bytes_used + size > self.max_bytes:
++                self.gap = 'byte_limit'
++                return
++            self.records.append(Snapshot(task_id, pairs, decision.complete, decision.next_fact, decision.reason))
++            self.bytes_used += size
++        except (ValueError, TypeError, UnicodeError):
++            self.gap = 'invalid_facts'
++
++
++_current: ContextVar[Collector | None] = ContextVar('pickup_gate_observer', default=None)
++
++
++@contextmanager
++def collect(*, max_records: int = 1000, max_bytes: int = 1_000_000):
++    """Caller-owned in-memory scope. No file IO, activation or coverage claim."""
++    if type(max_records) is not int or type(max_bytes) is not int or min(max_records, max_bytes) < 0:
++        raise ValueError('collector limits must be nonnegative integers')
++    collector = Collector(max_records, max_bytes)
++    token = _current.set(collector)
++    try:
++        yield collector
++    finally:
++        _current.reset(token)
++
++
++def record(task_id: str, facts: Mapping[str, Fact]) -> None:
++    collector = _current.get()
++    if collector is not None:
++        collector.add(task_id, facts)
++
++
++def decide(card, conn, own, machines, *, mode, review_enabled, profile_exists, placement):
++    """Acquire precisely the facts the pure evaluator requests, once each."""
++    facts: dict[str, Fact] = {}
++    try:
++        while True:
++            decision = evaluate(facts)
++            if decision.complete:
++                return decision.reason
++            name = decision.next_fact
++            facts[name] = _read_fact(name, card, conn, own, machines, mode=mode,
++                                     review_enabled=review_enabled, profile_exists=profile_exists,
++                                     placement=placement)
++    finally:
++        record(card['id'], facts)
++
++
++def _read_fact(name, card, conn, own, machines, *, mode, review_enabled, profile_exists, placement):
++    if name == 'already_local':
++        return bool(conn.execute('SELECT 1 FROM tasks WHERE id = ?', (card['id'],)).fetchone())
++    if name == 'default_placement':
++        return (mode == 'explicit' or card['status'] == 'review') and card['runs_on'] is None
++    if name == 'review_disabled':
++        return card['status'] == 'review' and not review_enabled
++    if name == 'placement_refusal':
++        return placement(dict(card), own, machines)
++    if name == 'missing_profile':
++        if profile_exists is not None and card['assignee'] and not profile_exists(card['assignee']):
++            return f"no profile {card['assignee']!r} here"
++        return None
++    if name == 'capability_refusal':
++        # A profile must satisfy the declared capabilities before pickup, not fail its handoff later.
++        from hermes_cli.kanban_runs_on_capabilities import claim_refusal
++        refusal = claim_refusal(dict(card), me=own)
++        return None if refusal is None else str(refusal)
++    if name == 'source_refusal':
++        from hermes_cli.kanban_workspace_source import pickup_skip
++        return pickup_skip(conn, card, own)
++    raise ValueError(f'unknown fact {name}')
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index 3af9b403ad91b338390e28ae225d574ea8012cae..51d1308005435b1dea407a85291b0d5f5c2f521e 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -789,24 +789,6 @@ def _skip_reason(conn: sqlite3.Connection, card: sqlite3.Row, own: str, machines
+                  mode: str, review_enabled: bool,
+                  profile_exists: Optional[Callable[[str], bool]]) -> Optional[tuple[str, Optional[str]]]:
+     """None when this machine may copy ``card``; else ``(reason, detail)`` (reason ``""``: nothing to record)."""
+-    if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (card["id"],)).fetchone():
+-        return "", None  # already here
+-    if (mode == "explicit" or card["status"] == "review") and card["runs_on"] is None:
+-        return "", None  # a default-placement review stays with its creator
+-    if card["status"] == "review" and not review_enabled:
+-        return "other", "review dispatch disabled"
+-    refused = eligible(dict(card), own, machines)
+-    if refused is not None:
+-        return ("hold" if refused == "held" else "capability_missing"), refused
+-    if profile_exists is not None and card["assignee"] and not profile_exists(card["assignee"]):
+-        return "profile_ineligible", f"no profile {card['assignee']!r} here"
+-    # [daveey] Never claim a card this machine's profile cannot satisfy: it would run, then fail its own
+-    # handoffs here (t_01a184ac93d31979). Left on the Board for a machine that can.
+-    from hermes_cli.kanban_runs_on_capabilities import claim_refusal
+-    refusal = claim_refusal(dict(card), me=own)
+-    if refusal is not None:
+-        return "capability_missing", str(refusal)
+-    from hermes_cli.kanban_workspace_source import pickup_skip  # inert unless kanban.workspace_source is enabled
+-    if (source_skip := pickup_skip(conn, card, own)) is not None:
+-        return "capability_missing", source_skip
+-    return None
++    from hermes_cli.kanban_pickup_gate import decide
++    return decide(card, conn, own, machines, mode=mode, review_enabled=review_enabled,
++                  profile_exists=profile_exists, placement=eligible)
+diff --git a/tests/hermes_cli/test_kanban_pickup_gate.py b/tests/hermes_cli/test_kanban_pickup_gate.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0d677dc832e8e7fc12444d77f24669008db06236
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pickup_gate.py
+@@ -0,0 +1,184 @@
++"""Pure pickup facts and real caller short-circuit/observation parity. [daveey]"""
++from dataclasses import FrozenInstanceError
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import kanban_pickup_gate as gate
++from hermes_cli import kanban_worker_node as node
++
++
++FACTS = dict(already_local=False, default_placement=False, review_disabled=False,
++             placement_refusal=None, missing_profile=None, capability_refusal=None, source_refusal=None)
++
++
++@pytest.mark.parametrize('name,value,reason', [
++    ('already_local', True, ('', None)),
++    ('default_placement', True, ('', None)),
++    ('review_disabled', True, ('other', 'review dispatch disabled')),
++    ('placement_refusal', 'held', ('hold', 'held')),
++    ('placement_refusal', '', ('capability_missing', '')),
++    ('missing_profile', "no profile 'other' here", ('profile_ineligible', "no profile 'other' here")),
++    ('capability_refusal', '', ('capability_missing', '')),
++    ('source_refusal', '', ('capability_missing', '')),
++])
++def test_rejections(name, value, reason):
++    facts = dict(FACTS)
++    facts[name] = value
++    decision = gate.evaluate(facts)
++    assert decision.complete and decision.reason == reason and decision.next_fact is None
++
++
++def test_missing_is_not_null_and_hypothetical_requires_new_facts():
++    facts = {'already_local': True}
++    assert gate.evaluate(facts).complete
++    facts['already_local'] = False
++    decision = gate.evaluate(facts)
++    assert not decision.complete and decision.next_fact == 'default_placement'
++    assert gate.evaluate(FACTS).complete and gate.evaluate(FACTS).reason is None
++    for name in FACTS:
++        shortened = dict(FACTS)
++        del shortened[name]
++        assert gate.evaluate(shortened).next_fact == name
++    with pytest.raises(FrozenInstanceError):
++        decision.complete = True
++
++
++@pytest.mark.parametrize('name,value', [('already_local', 1), ('default_placement', None),
++                                        ('placement_refusal', False), ('source_refusal', [])])
++def test_invalid_facts(name, value):
++    with pytest.raises(ValueError):
++        gate.evaluate(dict(FACTS, **{name: value}))
++
++
++def test_observation_limits_and_nested_scope():
++    with gate.collect(max_records=1, max_bytes=4096) as outer:
++        gate.record('one', FACTS)
++        with gate.collect(max_records=2, max_bytes=4096) as inner:
++            gate.record('two', {'already_local': True})
++        gate.record('three', FACTS)
++        gate.record('four', FACTS)
++    assert len(outer.records) == 1 and outer.gap == 'record_limit'
++    assert inner.records[0].task_id == 'two' and inner.gap is None
++    assert outer.records[0].complete
++    with gate.collect(max_records=5, max_bytes=1) as tiny:
++        gate.record('one', FACTS)
++    assert not tiny.records and tiny.gap == 'byte_limit'
++    gate.record('outside', FACTS)
++    assert len(outer.records) == 1
++
++
++def test_snapshot_copies_facts_and_records_unknown():
++    facts = {'already_local': False}
++    with gate.collect() as capture:
++        gate.record('x', facts)
++        facts['already_local'] = True
++    snapshot = capture.records[0]
++    assert snapshot.facts == (('already_local', False),)
++    assert not snapshot.complete and snapshot.next_fact == 'default_placement'
++    with pytest.raises(FrozenInstanceError):
++        snapshot.task_id = 'other'
++
++
++def test_collector_bad_payload_is_gap_not_exception():
++    with gate.collect() as capture:
++        gate.record('x', {'already_local': object()})
++    assert capture.gap == 'invalid_facts' and not capture.records
++
++
++def caller(monkeypatch, *, local=False, mode='pool', review_enabled=True, card_changes=None):
++    from hermes_cli import kanban_runs_on_capabilities as capabilities
++    from hermes_cli import kanban_workspace_source as source
++    conn = Mock()
++    conn.execute.return_value.fetchone.return_value = (1,) if local else None
++    placement = Mock(return_value=None)
++    capability = Mock(return_value=None)
++    workspace = Mock(return_value=None)
++    profile = Mock(return_value=True)
++    monkeypatch.setattr(node, 'eligible', placement)
++    monkeypatch.setattr(capabilities, 'claim_refusal', capability)
++    monkeypatch.setattr(source, 'pickup_skip', workspace)
++    card = dict(id='task', status='ready', runs_on=[], assignee='default')
++    card.update(card_changes or {})
++    def invoke():
++        return node._skip_reason(conn, card, 'worker', {}, mode=mode,
++                                 review_enabled=review_enabled, profile_exists=profile)
++    return invoke, placement, capability, workspace, profile
++
++
++def test_real_caller_captures_complete_facts(monkeypatch):
++    invoke, placement, capability, workspace, profile = caller(monkeypatch)
++    with gate.collect() as capture:
++        assert invoke() is None
++    assert len(capture.records) == 1
++    assert dict(capture.records[0].facts) == FACTS
++    for reader in (placement, capability, workspace, profile):
++        reader.assert_called_once()
++
++
++def test_real_caller_preserves_short_circuit(monkeypatch):
++    invoke, placement, capability, workspace, profile = caller(monkeypatch, local=True)
++    with gate.collect() as capture:
++        assert invoke() == ('', None)
++    assert capture.records[0].facts == (('already_local', True),)
++    for reader in (placement, capability, workspace, profile):
++        reader.assert_not_called()
++
++
++def test_real_caller_exception_partial_and_overflow(monkeypatch):
++    invoke, placement, capability, workspace, profile = caller(monkeypatch)
++    placement.side_effect = RuntimeError('reader failure')
++    with gate.collect() as capture:
++        with pytest.raises(RuntimeError, match='reader failure'):
++            invoke()
++    assert not capture.records[0].complete
++    assert capture.records[0].next_fact == 'placement_refusal'
++    capability.assert_not_called()
++    workspace.assert_not_called()
++    profile.assert_not_called()
++    with gate.collect(max_records=0) as full:
++        with pytest.raises(RuntimeError, match='reader failure'):
++            invoke()
++    assert full.gap == 'record_limit'
++
++
++@pytest.mark.parametrize('options,reason', [
++    ({'mode': 'explicit', 'card_changes': {'runs_on': None}}, ('', None)),
++    ({'card_changes': {'status': 'review', 'runs_on': None}}, ('', None)),
++    ({'review_enabled': False, 'card_changes': {'status': 'review'}},
++     ('other', 'review dispatch disabled')),
++])
++def test_real_placement_and_review_short_circuits(monkeypatch, options, reason):
++    invoke, placement, capability, workspace, profile = caller(monkeypatch, **options)
++    with gate.collect() as capture:
++        assert invoke() == reason
++    assert capture.records[0].reason == reason
++    for reader in (placement, capability, workspace, profile):
++        reader.assert_not_called()
++
++
++@pytest.mark.parametrize('value', ['held', '', 'labels_mismatch'])
++def test_real_placement_refusal(monkeypatch, value):
++    invoke, placement, capability, workspace, profile = caller(monkeypatch)
++    placement.return_value = value
++    with gate.collect() as capture:
++        assert invoke() == ('hold' if value == 'held' else 'capability_missing', value)
++    assert dict(capture.records[0].facts)['placement_refusal'] == value
++    for reader in (capability, workspace, profile):
++        reader.assert_not_called()
++
++
++def test_real_missing_profile(monkeypatch):
++    invoke, _placement, capability, workspace, profile = caller(monkeypatch)
++    profile.return_value = False
++    assert invoke() == ('profile_ineligible', "no profile 'default' here")
++    capability.assert_not_called()
++    workspace.assert_not_called()
++
++
++def test_actual_surrogate_refusal_remains_refusal(monkeypatch):
++    invoke, _placement, _capability, workspace, _profile = caller(monkeypatch)
++    workspace.return_value = '\ud800'
++    with gate.collect() as capture:
++        assert invoke() == ('capability_missing', '\ud800')
++    assert capture.gap == 'invalid_facts' and not capture.records
+-- 
+2.43.0
+

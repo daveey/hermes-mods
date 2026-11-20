@@ -1,0 +1,118 @@
+From d551cc6caaa90968c48d918894556c239b73abd1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 20:35:57 +0000
+Subject: [PATCH] [daveey] kanban release: prove legacy comment refs whose body
+ the writer redacted
+
+kanban_comment stores redact_sensitive_text(body, force=True), but the
+transcript proof compared the retained call body raw. A legacy comment that
+quoted an E.164 number (stored +141****0134) could never be proven, and every
+--seen release of its card was refused with "Comment data unavailable"
+forever, while the form without --seen passed. That held a churned final
+delivery card (t_5f0d878cd1c10371) in triage and deadlocked its source owner.
+
+Match the stored row against the body as written or after the writer's own
+forced redaction, nothing looser; every other proof condition is unchanged.
+Replay test covers promote, unblock and the agent tool; negative tests keep a
+different number unproven.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_comment_transcript_proof.py | 21 +++++++++--
+ .../test_kanban_release_transcript_proof.py   | 37 +++++++++++++++++++
+ 2 files changed, 54 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_comment_transcript_proof.py b/hermes_cli/kanban_comment_transcript_proof.py
+index 9640190aea091f02a42a7fb1058ab8f57d9c8203..dd0900fe1bc0d86a2a09b83f8e0c8e2b19a76142 100644
+--- a/hermes_cli/kanban_comment_transcript_proof.py
++++ b/hermes_cli/kanban_comment_transcript_proof.py
+@@ -9,9 +9,15 @@ exact body and its paired successful result holds the source integer.
+ 
+ Every step is fail-closed. Coverage is deliberately limited to direct
+ ``kanban_comment`` calls whose result is a top-level JSON object. Wrapped
+-``tool_call`` batches, ``cross_task`` comment actions, shell calls and redacted
+-bodies are not interpreted (no recursive search of arbitrary JSON); a direct
+-receipt of the same source integer under any other tool name refuses.
++``tool_call`` batches, ``cross_task`` comment actions and shell calls are not
++interpreted (no recursive search of arbitrary JSON); a direct receipt of the
++same source integer under any other tool name refuses.
++
++The retained call holds the body *before* the writer stored it, and
++``kanban_comment`` stores ``redact_sensitive_text(body, force=True)``. So a body
++matches as written or after that same forced redaction, nothing looser: a
++legacy comment quoting an E.164 number (stored as ``+141****0134``) is otherwise
++unprovable forever and refuses every ``--seen`` release of its card.
+ """
+ from __future__ import annotations
+ 
+@@ -78,6 +84,12 @@ def _is_receipt(reply, task_id, source_id):
+             and type(result.get('comment_id')) is int and result['comment_id'] == source_id)
+ 
+ 
++def _stored_forms(body):
++    """The body as written and as ``kanban_comment`` stores it (forced redaction, then strip)."""
++    from agent.redact import redact_sensitive_text
++    return {body.strip(), redact_sensitive_text(body, force=True).strip()}
++
++
+ def resolve(rows, event, payload, transcript, *, board=None):
+     """Bridge source integer to exact body, never to a receiver integer.
+ 
+@@ -118,7 +130,8 @@ def resolve(rows, event, payload, transcript, *, board=None):
+         start, end = math.floor(message['timestamp']), math.floor(reply['timestamp'])
+         if not start <= event['created_at'] <= end:
+             return []
+-        candidates = [r for r in rows if r['body'] == args['body'].strip()
++        bodies = _stored_forms(args['body'])
++        candidates = [r for r in rows if r['body'] in bodies
+                       and r['author'] == author.strip()
+                       and start <= r['created_at'] <= event['created_at']]
+     except (_Unprovable, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+diff --git a/tests/hermes_cli/test_kanban_release_transcript_proof.py b/tests/hermes_cli/test_kanban_release_transcript_proof.py
+index 6c4e13e86e3151b2496a63e69012591f94a80ffb..5381102fdb7bbd57592da3ed87a777740d2c422c 100644
+--- a/tests/hermes_cli/test_kanban_release_transcript_proof.py
++++ b/tests/hermes_cli/test_kanban_release_transcript_proof.py
+@@ -64,3 +64,40 @@ def test_unproven_receipt_cannot_be_acknowledged_by_high_watermark(board, shape,
+         retain(receipt(board, start, ('call-1', board, row['body']), ('call-2', board, 'conflicting absent body')))
+     ok, output = release(board, entry, capsys, cid + 1000)
+     assert not ok and 'data unavailable' in output, output
++
++
++def _redacted_delayed(tid, gap):
++    """t_5f0d878cd1c10371 shape: the writer redacted an E.164 number, the event landed `gap` s late, no UID."""
++    from agent.redact import redact_sensitive_text
++    raw = 'Mini operator: Keychain prompt confirmed by +14155550134 at restart.'
++    stored = redact_sensitive_text(raw, force=True)
++    assert stored != raw and len(stored) == len(raw) and '****' in stored
++    cid, row = delayed(tid)
++    with kbc.connect_closing() as conn:
++        conn.execute("UPDATE task_comments SET body=? WHERE id=?", (stored, cid))
++        payload = dict(comment_id=900001, writer_session='peer-session', author='default', len=len(stored))
++        conn.execute("UPDATE task_events SET created_at=?,payload=? WHERE uid='remote-event-one'",
++                     (row['created_at'] + gap, json.dumps(payload)))
++        conn.commit()
++    return cid, row, raw, stored
++
++
++@pytest.mark.parametrize('entry', ['promote', 'unblock', 'tool'])
++def test_writer_redacted_body_is_proven_by_raw_receipt(board, entry, capsys):
++    """Replay: a 2 s late legacy event whose retained call holds the digits the row masks."""
++    cid, row, raw, stored = _redacted_delayed(board, 2)
++    retain(receipt(board, row['created_at'], ('call-1', board, raw)))
++    ok, output = release(board, entry, capsys, cid - 1)
++    assert not ok and stored in output and 'data unavailable' not in output, output
++    ok, output = release(board, entry, capsys, cid)
++    assert ok, output
++
++
++@pytest.mark.parametrize('body', ['other body +14155550199 entirely', 'Mini operator: Keychain prompt confirmed by '
++                                  '+14155559999 at restart.'])
++def test_redaction_does_not_widen_to_other_bodies(board, body, capsys):
++    """Only the writer's exact transform of the retained body matches; a different number stays missing."""
++    cid, row, _raw, _stored = _redacted_delayed(board, 2)
++    retain(receipt(board, row['created_at'], ('call-1', board, body)))
++    ok, output = release(board, 'promote', capsys, cid + 1000)
++    assert not ok and 'data unavailable' in output, output
+-- 
+2.43.0
+

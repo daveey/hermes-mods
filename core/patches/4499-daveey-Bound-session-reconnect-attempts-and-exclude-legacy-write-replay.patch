@@ -1,0 +1,284 @@
+From e071558b2c4456293253531adbb1361245c78c94 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 13:53:57 +0000
+Subject: [PATCH] [daveey] Bound session reconnect attempts and exclude legacy
+ write replay
+
+Pass the remaining reconnect window into every attempt and recompute it after the snapshot before dispatching PATCH/DELETE. Preserve the 30s per-hop cap and never send zero/unlimited after expiry. Mark identity-less legacy failures non-replayable while preserving their cause and message.
+
+Proof: six new regression cases fail on the original code (86s snapshot/reconnect window; repeated identity-less DELETE). GREEN: 66 vitest tests across five session consumer suites; five guard/timeout mutants killed; Desktop tsc and touched-file eslint pass; scripts/check --base origin/main passes. The transport still owns cancellation; JS scheduling is not a hard real-time guarantee.
+---
+ .../src/api/session-write-reconnect.test.ts   | 28 +++++++
+ .../src/api/session-write-reconnect.ts        | 17 ++++-
+ apps/desktop/src/api/sessions.test.ts         | 76 ++++++++++++++++++-
+ apps/desktop/src/api/sessions.ts              | 31 ++++++--
+ 4 files changed, 140 insertions(+), 12 deletions(-)
+
+diff --git a/apps/desktop/src/api/session-write-reconnect.test.ts b/apps/desktop/src/api/session-write-reconnect.test.ts
+index a31694cfe7865e067887156b58e1f035d6a8fc06..95d6c8e18d0ae73854d0888d9038f074a6a8a983 100644
+--- a/apps/desktop/src/api/session-write-reconnect.test.ts
++++ b/apps/desktop/src/api/session-write-reconnect.test.ts
+@@ -49,6 +49,34 @@ describe('isReconnectableSessionWriteError', () => {
+ })
+ 
+ describe('withSessionWriteReconnect', () => {
++  it('passes the remaining window to each attempt, including time spent dialing', async () => {
++    const c = clock()
++    const down = new Error('socket hang up')
++
++    const run = vi.fn(async (remainingMs: number) => {
++      c.advance(Math.min(30_000, remainingMs ?? 30_000))
++      throw down
++    })
++
++    await expect(withSessionWriteReconnect(run, {
++      label: 'PATCH s', now: c.now, sleep: c.sleep, log: vi.fn()
++    })).rejects.toBe(down)
++    expect(run.mock.calls).toEqual([[60_000], [29_000]])
++    expect(c.now()).toBe(60_000)
++  })
++
++  it.each([1_000, 2_000])('does not start an attempt after a sleep exhausts the budget (%i)', async elapsed => {
++    const c = clock()
++    const down = new Error('socket hang up')
++    const run = vi.fn().mockRejectedValue(down)
++
++    await expect(withSessionWriteReconnect(run, {
++      label: 'PATCH s', budgetMs: 1_500, now: c.now,
++      sleep: async () => { c.advance(elapsed + 500) }, log: vi.fn()
++    })).rejects.toBe(down)
++    expect(run).toHaveBeenCalledOnce()
++  })
++
+   it('rides out a hub reconnect and lands the write without a user retry', async () => {
+     const c = clock()
+     const log = vi.fn()
+diff --git a/apps/desktop/src/api/session-write-reconnect.ts b/apps/desktop/src/api/session-write-reconnect.ts
+index 630eadb0b7d8e0f9a73ed4f49eee0b95b11e96ec..818f67a9f3977a3fe74cb767304b7b0a8897c775 100644
+--- a/apps/desktop/src/api/session-write-reconnect.ts
++++ b/apps/desktop/src/api/session-write-reconnect.ts
+@@ -10,7 +10,8 @@ import { isDefinitiveSessionMutationRefusal } from '../../../shared/src/session-
+  * the fail-fast refusal, a dial timeout, `Passive read: no warm backend`), each one a user click
+  * that had to be repeated once the hub was back a few seconds later.
+  *
+- * A session write is safe to replay: the mutation client keeps the same request_id and expected
++ * A fenced session write is safe to replay (identity-less legacy writes are excluded):
++ * the mutation client keeps the same request_id and expected
+  * revision for the same intent until the owner answers definitively, so a write the owner already
+  * committed is answered from its receipt instead of applied twice. So a transport failure (the
+  * renderer never reached the owner, or lost its reply) is retried here with backoff for a bounded
+@@ -23,6 +24,9 @@ export const SESSION_WRITE_RECONNECT_BUDGET_MS = 60_000
+ const FIRST_DELAY_MS = 1_000
+ const MAX_DELAY_MS = 10_000
+ 
++/** A legacy write has no receipt identity: a lost reply cannot safely be replayed. */
++export class NonReplayableSessionWriteError extends Error {}
++
+ const RECONNECTABLE =
+   /socket hang up|\b(?:ECONNRESET|ECONNREFUSED|ECONNABORTED|EPIPE|EHOSTUNREACH|ENETUNREACH|EHOSTDOWN|ETIMEDOUT)\b|Remote backend "[^"]*" is down|Timed out connecting to Hermes backend|Passive read: no warm backend/i
+ 
+@@ -31,6 +35,7 @@ export function isReconnectableSessionWriteError(error: unknown): boolean {
+   const message = error instanceof Error ? error.message : String(error)
+ 
+   return (
++    !(error instanceof NonReplayableSessionWriteError) &&
+     RECONNECTABLE.test(message) &&
+     !isDefinitiveSessionMutationRefusal(message) &&
+     !/client_upgrade_required|mutation_identity_required/.test(message)
+@@ -63,17 +68,22 @@ function desktopLog(line: string): void {
+ }
+ 
+ export async function withSessionWriteReconnect<T>(
+-  run: () => Promise<T>,
++  run: (remainingMs: number) => Promise<T>,
+   options: SessionWriteReconnectOptions
+ ): Promise<T> {
+   const { label, budgetMs = SESSION_WRITE_RECONNECT_BUDGET_MS, now = Date.now, log = desktopLog } = options
+   const sleep = options.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)))
+   const started = now()
+   let delay = FIRST_DELAY_MS
++  let lastError: unknown = new Error('Session write reconnect deadline exceeded')
+ 
+   for (let attempt = 1; ; attempt += 1) {
++    const remainingMs = budgetMs - (now() - started)
++
++    if (remainingMs <= 0) { throw lastError }
++
+     try {
+-      const result = await run()
++      const result = await run(remainingMs)
+ 
+       if (attempt > 1) {
+         log(`[session-write] ${label} landed on attempt ${attempt} after ${now() - started} ms`)
+@@ -81,6 +91,7 @@ export async function withSessionWriteReconnect<T>(
+ 
+       return result
+     } catch (error) {
++      lastError = error
+       const wait = Math.max(delay, gateRetryHintMs(error))
+       const reason = (error instanceof Error ? error.message : String(error)).slice(0, 160)
+ 
+diff --git a/apps/desktop/src/api/sessions.test.ts b/apps/desktop/src/api/sessions.test.ts
+index 248a2a3cc1faade5d1fea504955e5f4f3d1f010b..1ac5c47011420e666638b3f5be60780a2a77a5b4 100644
+--- a/apps/desktop/src/api/sessions.test.ts
++++ b/apps/desktop/src/api/sessions.test.ts
+@@ -2,7 +2,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ import type { SidebarSessionsResponse } from './sessions'
+ 
+-vi.mock('@/lib/gateway-rpc', () => ({ isMissingRestEndpoint: () => false, isUnroutedRestPath: () => false }))
++vi.mock('@/lib/gateway-rpc', () => ({ isMissingRestEndpoint: () => false, isUnroutedRestPath: vi.fn(() => false) }))
++const gatewayRpc = await import('@/lib/gateway-rpc')
+ vi.mock('@/store/transcript-tail', () => ({ pageHonorsLatestOrder: () => true, recordTranscriptTail: vi.fn() }))
+ vi.mock('./client', () => ({
+   ambientOwnerConnectionId: vi.fn(() => 'prometheus'),
+@@ -42,6 +43,79 @@ beforeEach(() => {
+   )
+ })
+ 
++describe('session write reconnect safety', () => {
++  it('does not replay an identity-less legacy DELETE after losing its reply', async () => {
++    vi.useFakeTimers()
++    const missing = new Error('404: Not Found')
++    const lostReply = new Error('socket hang up')
++    vi.mocked(gatewayRpc.isUnroutedRestPath).mockImplementation(error => error === missing)
++    hermesApi.mockImplementation(async request => {
++      if (!request.method) { throw missing }
++      throw lostReply
++    })
++
++    try {
++      const result = deleteSession('legacy-lost-reply').catch(error => error)
++      await vi.runAllTimersAsync()
++      expect(await result).toMatchObject({ message: lostReply.message, cause: lostReply })
++      const writes = hermesApi.mock.calls.filter(([request]) => request.method === 'DELETE')
++      expect(writes).toHaveLength(1)
++      expect(writes[0][0].path).not.toContain('request_id')
++    } finally {
++      vi.mocked(gatewayRpc.isUnroutedRestPath).mockReturnValue(false)
++      vi.useRealTimers()
++    }
++  })
++
++  it.each(['PATCH', 'DELETE'])('subtracts snapshot time and backoff from each %s timeout', async method => {
++    vi.useFakeTimers()
++    let writes = 0
++    hermesApi.mockImplementation(async request => {
++      if (!request.method) {
++        await new Promise(resolve => setTimeout(resolve, 25_000))
++
++        return { exists: true, runtime_revision: 7, runtime_generation: 3 } as never
++      }
++
++      writes += 1
++      await new Promise(resolve => setTimeout(resolve, request.timeoutMs ?? 30_000))
++      throw new Error('socket hang up')
++    })
++
++    try {
++      const write = method === 'PATCH'
++        ? setSessionArchived(`budget-snapshot-${method}`, true)
++        : deleteSession(`budget-snapshot-${method}`)
++
++      const result = write.catch(error => error)
++      await vi.runAllTimersAsync()
++      expect(await result).toBeInstanceOf(Error)
++      expect(writes).toBe(2)
++      expect(hermesApi.mock.calls.map(([request]) => request.timeoutMs)).toEqual([30_000, 30_000, 4_000])
++    } finally {
++      vi.useRealTimers()
++    }
++  })
++
++  it('does not send a write when the snapshot consumes the remaining deadline', async () => {
++    vi.useFakeTimers()
++    hermesApi.mockImplementation(async () => {
++      await new Promise(resolve => setTimeout(resolve, 60_000))
++
++      return { exists: true, runtime_revision: 7, runtime_generation: 3 } as never
++    })
++
++    try {
++      const result = setSessionArchived('snapshot-deadline', true).catch(error => error)
++      await vi.runAllTimersAsync()
++      expect(await result).toBeInstanceOf(Error)
++      expect(hermesApi).toHaveBeenCalledOnce()
++    } finally {
++      vi.useRealTimers()
++    }
++  })
++})
++
+ describe('deleteSession profile scoping', () => {
+   it('scopes the DELETE to the owning profile in the URL (object owner)', async () => {
+     // Regression: the sidebar "All Profiles" delete sent the profile only via
+diff --git a/apps/desktop/src/api/sessions.ts b/apps/desktop/src/api/sessions.ts
+index 5a69c9faa18664e9682e19936250287150c21bf1..b28bb7fd02ab696413729cc6dfbdf12794f26bbb 100644
+--- a/apps/desktop/src/api/sessions.ts
++++ b/apps/desktop/src/api/sessions.ts
+@@ -23,7 +23,7 @@ import {
+   profileScoped,
+   sessionReadOwnerPin
+ } from './client'
+-import { withSessionWriteReconnect } from './session-write-reconnect'
++import { NonReplayableSessionWriteError, withSessionWriteReconnect } from './session-write-reconnect'
+ 
+ const SESSION_LIST_REQUEST_TIMEOUT_MS = 60_000
+ 
+@@ -401,7 +401,9 @@ export function mutateSessionFenced<T>(key: string, read: () => Promise<SessionM
+   }), send).catch(error => {
+     if (!(error instanceof MissingMutationSnapshotRoute)) { throw error }
+ 
+-    return send({})
++    return send({}).catch(cause => {
++      throw new NonReplayableSessionWriteError(cause instanceof Error ? cause.message : String(cause), { cause })
++    })
+   })
+ }
+ 
+@@ -414,23 +416,36 @@ function mutateSessionHttp<T>(id: string, method: 'PATCH' | 'DELETE', payload: R
+   const suffix = query.size ? `?${query}` : ''
+   const key = JSON.stringify([scope, id, method, payload])
+ 
+-  const send = (identity: Partial<SessionMutationIdentity>) => {
++  const send = (identity: Partial<SessionMutationIdentity>, timeoutMs: number) => {
+     if (method === 'DELETE') {
+       const params = new URLSearchParams(query)
+ 
+       for (const [name, value] of Object.entries(identity)) { params.set(name, String(value)) }
+ 
+-      return hermesApi<T>({ ...scope, path: params.size ? `${path}?${params}` : path, method })
++      return hermesApi<T>({ ...scope, path: params.size ? `${path}?${params}` : path, method, timeoutMs })
+     }
+ 
+-    return hermesApi<T>({ ...scope, path, method,
++    return hermesApi<T>({ ...scope, path, method, timeoutMs,
+       body: { ...payload, ...identity, ...(scope.profile ? { profile: scope.profile } : {}) } })
+   }
+ 
+   // A reconnect (hub restart, tunnel reset) replays the same intent with its retained identity.
+-  return withSessionWriteReconnect(() => mutateSessionFenced(key,
+-    () => hermesApi<SessionMutationSnapshot>({ ...scope, path: `${path}/mutation-snapshot${suffix}` }), send),
+-  { label: `${method} ${id}` })
++  return withSessionWriteReconnect(remainingMs => {
++    const deadline = Date.now() + remainingMs
++
++    const timeout = () => {
++      const remaining = deadline - Date.now()
++
++      // Zero means unlimited to the transport. Never dispatch an expired request.
++      if (remaining <= 0) { throw new Error('Session write reconnect deadline exceeded') }
++
++      return Math.min(30_000, remaining)
++    }
++
++    return mutateSessionFenced(key,
++      () => hermesApi<SessionMutationSnapshot>({ ...scope, path: `${path}/mutation-snapshot${suffix}`, timeoutMs: timeout() }),
++      identity => send(identity, timeout()))
++  }, { label: `${method} ${id}` })
+ }
+ 
+ // Mutations take the owning `profile` so Electron can route them to the correct
+-- 
+2.43.0
+

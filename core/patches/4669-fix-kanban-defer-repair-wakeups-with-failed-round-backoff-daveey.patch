@@ -1,0 +1,87 @@
+From 3b075d49b1d51281202a6a8903518042a1b370ef Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 14:12:09 +0000
+Subject: [PATCH] fix(kanban): defer repair wakeups with failed round backoff
+ [daveey]
+
+---
+ hermes_cli/kanban_sync_client.py              | 10 +++---
+ .../test_kanban_sync_host_outage.py           | 36 +++++++++++++++++++
+ 2 files changed, 41 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 5bb49b4110e46a3562cc9182a905d2d62134dde1..54903e7017093a647360d885b382b39df52f7fd6 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1534,16 +1534,16 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+             remaining = 0.0 if any(r.behind for r in results) else max(0.0, work.deadline - time.monotonic())
+             if any(r.skipped for r in results):
+                 remaining = min(remaining, BUSY_RETRY_S)
+-            deferred_due = next_deferred_repair(boards)
++            now = time.monotonic()
++            ready = [(s, p) for s, p in boards if not work.backing_off(s, now)]
++            deferred_due = next_deferred_repair(ready)
+             if deferred_due is not None:
+                 remaining = min(remaining, max(0.0, deferred_due - _repair_clock()))
+-            # A failed board's pending outbox must not end the wait at once: it waits out its backoff.
+-            now = time.monotonic()
++            # Failed boards' outboxes and deferred repairs wait for backoff; neither may force a zero wait.
+             retry_in = work.next_retry(now)
+             if retry_in is not None:
+                 remaining = min(remaining, retry_in)
+-            ready = [p for s, p in boards if not work.backing_off(s, now)]
+-            sync_timing.wait(wait_for_work, wake, ready, remaining, keep_running)
++            sync_timing.wait(wait_for_work, wake, [p for _, p in ready], remaining, keep_running)
+     finally:
+         rounds.close()
+         links.stop()
+diff --git a/tests/hermes_cli/test_kanban_sync_host_outage.py b/tests/hermes_cli/test_kanban_sync_host_outage.py
+index e8469f5e4ee2cbb4de699883db1eb29899b098e0..1e76a00e5f6dd61a0eeefef095cc502402886208 100644
+--- a/tests/hermes_cli/test_kanban_sync_host_outage.py
++++ b/tests/hermes_cli/test_kanban_sync_host_outage.py
+@@ -488,6 +488,42 @@ def test_a_failing_board_never_slows_a_healthy_one(home, monkeypatch):
+     assert len(loop.failed("default")) <= 9
+ 
+ 
++def test_deferred_repair_during_post_pull_failure_does_not_spin(home, monkeypatch):
++    loop = Loop(home, monkeypatch, ["default"])
++    path = loop.boards[0][1]
++    real_send, real_wait = ksc._send, ksc.wait_for_work
++    waits, deferred = [], []
++    failing = [True]
++
++    def send(live, hub, slug, gateway, mode, result, **kwargs):
++        if kwargs["after_pull"] and failing[0]:
++            # A real post-pull transport failure leaves both pending writes and
++            # any repair deferral created earlier in the round intact.
++            _write(path, "post-pull edit")
++            deferred.append(ksc._REPAIR_DEFERRED.get(str(path)))
++            loop.hub.down.add(slug)
++        try:
++            return real_send(live, hub, slug, gateway, mode, result, **kwargs)
++        finally:
++            loop.hub.down.clear()
++
++    def wait(wake, paths, timeout, keep_running):
++        waits.append(timeout)
++        assert len(waits) < 500, "deferred repair hot-spins during round backoff"
++        return real_wait(wake, paths, timeout, keep_running)
++
++    monkeypatch.setattr(ksc, "_send", send)
++    monkeypatch.setattr(ksc, "wait_for_work", wait)
++    start = loop.clock[0]
++    loop.at(180, lambda: failing.__setitem__(0, False))
++    loop.run(260)
++    assert any(due is not None for due in deferred)
++    assert loop.clock[0] >= start + 260
++    assert len(loop.failed("default")) <= 10
++    assert _pending(path) == 0
++    assert any(ok and t >= start + 180 for t, ok in loop.rounds["default"])
++
++
+ def test_sync_work_backoff_keeps_dirty_flags_and_clears_on_success_or_reconnect():
+     from pathlib import Path
+     work = SyncWork(5)
+-- 
+2.43.0
+

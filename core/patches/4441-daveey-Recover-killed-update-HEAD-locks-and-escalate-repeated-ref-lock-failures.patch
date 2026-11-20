@@ -1,0 +1,802 @@
+From 87aa140df4fc326bbfafe14df7a4860d2ac9ae55 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 06:03:34 +0000
+Subject: [PATCH] [daveey] Recover killed update HEAD locks and escalate
+ repeated ref lock failures
+
+Keep receipt ownership and live-holder proofs for HEAD.lock recovery. Classify ref-lock failures separately, record their generation in receipts, and file one idempotent diagnostic card after two distinct failed runs.
+
+Proof: 118 focused tests pass; consumer mutations removing receipt observation or either command identity seam fail. Worker-8 recovered via existing age-floor sweep; producer attribution remains unproven (mtime/reclaim correlation only).
+---
+ hermes_cli/gitlock.py                         |   6 +-
+ .../observability/shared_metrics_contract.py  |  62 +---
+ .../shared_metrics_update_classes.py          |  61 ++++
+ hermes_cli/update_cmd.py                      |   5 +-
+ hermes_cli/update_receipt.py                  |  22 ++
+ hermes_cli/update_ref_lock_alert.py           | 168 ++++++++++
+ .../hermes_cli/test_update_ref_lock_alert.py  | 296 ++++++++++++++++++
+ tests/hermes_cli/test_update_ref_locks.py     |  58 ++++
+ 8 files changed, 617 insertions(+), 61 deletions(-)
+ create mode 100644 hermes_cli/observability/shared_metrics_update_classes.py
+ create mode 100644 hermes_cli/update_ref_lock_alert.py
+ create mode 100644 tests/hermes_cli/test_update_ref_lock_alert.py
+ create mode 100644 tests/hermes_cli/test_update_ref_locks.py
+
+diff --git a/hermes_cli/gitlock.py b/hermes_cli/gitlock.py
+index a258a2be8925264cfa0ab922b57cc8f7f989508b..9b7a247186605b4d8d4cf4aa95174a4d0c8d23dd 100644
+--- a/hermes_cli/gitlock.py
++++ b/hermes_cli/gitlock.py
+@@ -194,8 +194,9 @@ def ref_lock_files(git_dir: Path) -> list[Path]:
+ 
+ 
+ def release_dead_fetch_locks(repo_root: Path) -> list[str]:
+-    """Drop the locks a killed update's fetch left, whatever their age: ``shallow.lock`` and the ref
+-    locks (:func:`ref_lock_files`).
++    """Drop a killed update's shallow/ref locks, including the apply transaction's ``HEAD.lock``.
++
++    Called before fetch and apply; all candidates retain the same killed-owner and holder proofs.
+ 
+     The update's ``git fetch`` dies with its tree (``taskkill /T /F``, the Linux parent-death signal),
+     so a kill inside its ref transaction strands ``refs/remotes/origin/<branch>.lock``. Git (2.51+)
+@@ -208,6 +209,7 @@ def release_dead_fetch_locks(repo_root: Path) -> list[str]:
+     :func:`release_dead_index_lock`; returns the removed paths.
+     """
+     return _release_killed_update_locks(Path(repo_root), lambda git_dir: [git_dir / "shallow.lock",
++                                                                        git_dir / "HEAD.lock",
+                                                                         *ref_lock_files(git_dir)])
+ 
+ 
+diff --git a/hermes_cli/observability/shared_metrics_contract.py b/hermes_cli/observability/shared_metrics_contract.py
+index e7e4e736dfba362f8e01969787b7dc8e9eab2a6b..c950f556fcc0ef989a6e5cb82ed48b31bf843190 100644
+--- a/hermes_cli/observability/shared_metrics_contract.py
++++ b/hermes_cli/observability/shared_metrics_contract.py
+@@ -490,64 +490,10 @@ EXTENSION_REGISTRY_IDS = frozenset({
+     "browse-sh", "clawhub", "github", "hermes-index", "lobehub", "official", "skills-sh", "url", "well-known",
+ })
+ EXTENSION_REGISTRIES = EXTENSION_REGISTRY_IDS | frozenset({"none", "other", "unresolved"})
+-# Why a `hermes update` run failed or was refused, derived from the FINAL receipt only
+-# (shared_metrics_update.update_failure_class); ``none`` unless outcome is failed/refused/partial.
+-UPDATE_FAILURE_CLASSES = frozenset({
+-    "aborted_before_apply",  # fallback: exited before the checkout moved with no reason recorded
+-    "build_failed",          # the build stage reported failure
+-    "deps_failed",           # PM dependency preparation failed (no deps mark, or a PM error type)
+-    "exception",             # the run ended on an uncaught exception (type name dropped)
+-    "fleet_stale",           # post-update verification found a gateway still stale or down
+-    "fleet_unverified",      # verification could not prove the fleet current (no rows, unaccounted runtime)
+-    "git_failed",            # a git/installer subprocess failed before the checkout moved (stash, pull, merge)
+-    "interrupted",           # KeyboardInterrupt / exit 130
+-    "lock_held",             # another updater held the update lock (refused, exit 2)
+-    "managed_install",       # admission refused: image/package-managed or commit-build install (refused)
+-    "none", "other",
+-    "os_error",              # the run ended on an OSError (disk full, permission, file in use)
+-    "restart_failed",        # the gateway restart failed, or a skipped restart left the fleet owing one
+-    "subprocess_failed",     # a subprocess error (CalledProcessError, TimeoutExpired) reached the boundary
+-    "unknown",               # the reporter sent no reason (Desktop packaged updaters)
+-    "disk_full",             # out of disk space (ENOSPC, or no room to stage the ZIP)
+-    "local_changes_parked",  # committed, but the user's stashed changes could not be re-applied (partial)
+-    "permission_denied",     # the run ended on a PermissionError
+-})
+-# The exit that stopped a run before its apply stage mark, recorded at the exit itself as one of
+-# these tokens (update_receipt.record_stop_reason -> the receipt's ``stop_class``).
+-UPDATE_STOP_CLASSES = frozenset({
+-    "branch_missing",         # the target branch exists neither locally nor on origin
+-    "branch_unsupported",     # --branch on the Windows ZIP fallback
+-    "channel_unresolved",     # the update channel could not be resolved
+-    "checkout_move_failed",   # git could not move the checkout (ff refused, reset or switch failed)
+-    "commit_point_refused",   # the commit point could not be armed durably; nothing moved
+-    "detached_head",          # a detached checkout stayed put, or its commits could not be backed up
+-    "disk_full",              # (see above)
+-    "downgrade_refused",      # the target predates the gateway runtime a state.db already uses
+-    "download_failed",        # the ZIP fallback download failed
+-    "fetch_failed",           # git fetch failed
+-    "gateway_pause_failed",   # Windows: the gateways could not be paused safely before the venv moves
+-    "git_in_progress",        # a merge/rebase/cherry-pick/... was already in progress
+-    "git_index_locked",       # git refused: another git process's .git/index.lock exists
+-    "git_timeout",            # a network git call hit the updater's time limit
+-    "head_moved",             # a ref moved during the update; HEAD is not the selected commit
+-    "local_changes_blocked",  # local changes git could not stash, or a dirty tree the ZIP will not overwrite
+-    "lock_held",              # (see above)
+-    "managed_install",        # (see above): HERMES_MANAGED installs refuse before any receipt
+-    "merge_conflict",         # local commits on a custom branch conflict with upstream
+-    "not_git_checkout",       # the install is not a git checkout (non-Windows)
+-    "old_version_handoff",    # an older updater's hand-off to this version could not finish
+-    "parked_branch_blocked",  # the checkout is parked on another branch that is unsafe to switch
+-    "permission_denied",      # (see above): git could not write a file it needs (e.g. index.lock's directory)
+-    "stash_restore_rejected",  # re-applied local changes broke Hermes; the update stopped
+-    "syntax_rollback",        # the pulled code failed the syntax check and was rolled back
+-    "target_syntax_error",    # the target failed the syntax check before anything moved
+-    "target_unresolved",      # the fetched target ref did not resolve to a commit
+-    "unexpected_branch",      # the checkout ended on a branch that is not the target
+-    "up_to_refused",          # --up-to <sha> refused (malformed, not first-parent ahead, or an unsupported combo)
+-    "venv_foreign_owner",     # the venv belongs to another OS user
+-    "zip_failed",             # the ZIP fallback swap failed and was rolled back
+-})
+-UPDATE_FAILURE_CLASSES |= UPDATE_STOP_CLASSES
++from hermes_cli.observability.shared_metrics_update_classes import (
++    UPDATE_FAILURE_CLASSES,
++    UPDATE_STOP_CLASSES,
++)
+ # ---- end iuf c1 ----
+ # ---- iuf c2 ----
+ # One fresh-install run of scripts/install.sh / install.ps1, from the local receipt the installer
+diff --git a/hermes_cli/observability/shared_metrics_update_classes.py b/hermes_cli/observability/shared_metrics_update_classes.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4ed9c92635220bfdc3a288aeb1aff00fdd7d4b8c
+--- /dev/null
++++ b/hermes_cli/observability/shared_metrics_update_classes.py
+@@ -0,0 +1,61 @@
++"""Bounded failure and stop tokens for update receipts and shared metrics."""
++
++# Why a `hermes update` run failed or was refused, derived from the FINAL receipt only
++# (shared_metrics_update.update_failure_class); ``none`` unless outcome is failed/refused/partial.
++UPDATE_FAILURE_CLASSES = frozenset({
++    "aborted_before_apply",  # fallback: exited before the checkout moved with no reason recorded
++    "build_failed",          # the build stage reported failure
++    "deps_failed",           # PM dependency preparation failed (no deps mark, or a PM error type)
++    "exception",             # the run ended on an uncaught exception (type name dropped)
++    "fleet_stale",           # post-update verification found a gateway still stale or down
++    "fleet_unverified",      # verification could not prove the fleet current (no rows, unaccounted runtime)
++    "git_failed",            # a git/installer subprocess failed before the checkout moved (stash, pull, merge)
++    "interrupted",           # KeyboardInterrupt / exit 130
++    "lock_held",             # another updater held the update lock (refused, exit 2)
++    "managed_install",       # admission refused: image/package-managed or commit-build install (refused)
++    "none", "other",
++    "os_error",              # the run ended on an OSError (disk full, permission, file in use)
++    "restart_failed",        # the gateway restart failed, or a skipped restart left the fleet owing one
++    "subprocess_failed",     # a subprocess error (CalledProcessError, TimeoutExpired) reached the boundary
++    "unknown",               # the reporter sent no reason (Desktop packaged updaters)
++    "disk_full",             # out of disk space (ENOSPC, or no room to stage the ZIP)
++    "local_changes_parked",  # committed, but the user's stashed changes could not be re-applied (partial)
++    "permission_denied",     # the run ended on a PermissionError
++})
++# The exit that stopped a run before its apply stage mark, recorded at the exit itself as one of
++# these tokens (update_receipt.record_stop_reason -> the receipt's ``stop_class``).
++UPDATE_STOP_CLASSES = frozenset({
++    "branch_missing",         # the target branch exists neither locally nor on origin
++    "branch_unsupported",     # --branch on the Windows ZIP fallback
++    "channel_unresolved",     # the update channel could not be resolved
++    "checkout_move_failed",   # git could not move the checkout (ff refused, reset or switch failed)
++    "commit_point_refused",   # the commit point could not be armed durably; nothing moved
++    "detached_head",          # a detached checkout stayed put, or its commits could not be backed up
++    "disk_full",              # (see above)
++    "downgrade_refused",      # the target predates the gateway runtime a state.db already uses
++    "download_failed",        # the ZIP fallback download failed
++    "fetch_failed",           # git fetch failed
++    "gateway_pause_failed",   # Windows: the gateways could not be paused safely before the venv moves
++    "git_in_progress",        # a merge/rebase/cherry-pick/... was already in progress
++    "git_index_locked",       # git refused: another git process's .git/index.lock exists
++    "ref_lock_stale",         # ref lock exists; diagnosis is not permission to reclaim it
++    "git_timeout",            # a network git call hit the updater's time limit
++    "head_moved",             # a ref moved during the update; HEAD is not the selected commit
++    "local_changes_blocked",  # local changes git could not stash, or a dirty tree the ZIP will not overwrite
++    "lock_held",              # (see above)
++    "managed_install",        # (see above): HERMES_MANAGED installs refuse before any receipt
++    "merge_conflict",         # local commits on a custom branch conflict with upstream
++    "not_git_checkout",       # the install is not a git checkout (non-Windows)
++    "old_version_handoff",    # an older updater's hand-off to this version could not finish
++    "parked_branch_blocked",  # the checkout is parked on another branch that is unsafe to switch
++    "permission_denied",      # (see above): git could not write a file it needs (e.g. index.lock's directory)
++    "stash_restore_rejected",  # re-applied local changes broke Hermes; the update stopped
++    "syntax_rollback",        # the pulled code failed the syntax check and was rolled back
++    "target_syntax_error",    # the target failed the syntax check before anything moved
++    "target_unresolved",      # the fetched target ref did not resolve to a commit
++    "unexpected_branch",      # the checkout ended on a branch that is not the target
++    "up_to_refused",          # --up-to <sha> refused (malformed, not first-parent ahead, or an unsupported combo)
++    "venv_foreign_owner",     # the venv belongs to another OS user
++    "zip_failed",             # the ZIP fallback swap failed and was rolled back
++})
++UPDATE_FAILURE_CLASSES |= UPDATE_STOP_CLASSES
+diff --git a/hermes_cli/update_cmd.py b/hermes_cli/update_cmd.py
+index 40dcb28aec5625a594b37729bb7bc37cfbd7a976..deaf118e0ee85c8486f90066651d8f3751acae8c 100644
+--- a/hermes_cli/update_cmd.py
++++ b/hermes_cli/update_cmd.py
+@@ -1051,8 +1051,9 @@ def _move_checkout_to(git_cmd, branch, merge_ref, target_sha, pre_pull_sha, *, u
+         if ancestry_detail:
+             print(f"  {ancestry_detail}")
+     print("  Resolve the Git error and re-run `hermes update`; no reset was attempted.")
+-    from hermes_cli.update_receipt import git_output_stop_class
++    from hermes_cli.update_receipt import git_output_stop_class, record_ref_lock_identity
+ 
++    record_ref_lock_identity(detail)
+     # The shared classifier: an index.lock that EXISTS is another git's; "Permission denied" on it is not.
+     _record_stop(git_output_stop_class(detail, ["merge"], merge_result.returncode) or "checkout_move_failed")
+     sys.exit(1)
+@@ -1694,6 +1695,8 @@ def _handle_update_called_process_error(
+             print(f"  Details: {e}")
+             _print_called_process_error_tail(e)
+         if stop := _completion_receipt.git_error_stop_class(e):
++            if stop == "ref_lock_stale":
++                _completion_receipt.record_ref_lock_identity(e)
+             _record_stop(stop)
+         _finalize_receipt("failed", 'Update receipt finalize failed: %s')
+         sys.exit(1)
+diff --git a/hermes_cli/update_receipt.py b/hermes_cli/update_receipt.py
+index 0dcb675f484c3fe52b1cf77d072b62833bbb3c17..07aef8ced07cbb8eb8c6cb2b1a84b6903fe23dcc 100644
+--- a/hermes_cli/update_receipt.py
++++ b/hermes_cli/update_receipt.py
+@@ -534,6 +534,23 @@ def record_stop_reason(reason: str) -> None:
+ _GIT_FILE_PERMISSION = re.compile(r"Permission denied(?! *\()|\bEACCES\b")
+ 
+ 
++def record_ref_lock_identity(output: Any) -> None:
++    """Record WHICH ref lock a ``ref_lock_stale`` failure named (path + stat generation), for the
++    two-run alert (``update_ref_lock_alert``). *output* is git's text or the failed
++    ``CalledProcessError``. Diagnostic only; never raises."""
++    try:
++        from hermes_cli.update_ref_lock_alert import FACT, lock_identity
++
++        if isinstance(output, BaseException):
++            output = getattr(output, "stderr", None) or getattr(output, "output", None) or ""
++        if isinstance(output, bytes):
++            output = output.decode("utf-8", "replace")
++        if (identity := lock_identity(str(output))) is not None:
++            record_fact(FACT, identity)
++    except Exception as exc:  # pragma: no cover - additive
++        logger.debug("ref lock identity not recorded: %s", exc, exc_info=True)
++
++
+ def git_error_stop_class(exc: BaseException) -> Optional[str]:
+     """The closed stop token for a git ``CalledProcessError`` that is about to end the run, or None.
+ 
+@@ -551,6 +568,8 @@ def git_output_stop_class(output: str, argv: list[str], returncode: Optional[int
+     """:func:`git_error_stop_class` for a git call that returned instead of raising (``_git_run``)."""
+     if "index.lock" in output and "File exists" in output:
+         return "git_index_locked"  # another git (or a killed one, #132089) holds the index lock
++    if "File exists" in output and re.search(r"(?:[/\\]HEAD|[/\\]packed-refs|[/\\]refs[/\\][^\n'\"]+)\.lock", output):
++        return "ref_lock_stale"  # diagnostic only; reclamation still requires dead-owner proof
+     if _GIT_FILE_PERMISSION.search(output):
+         return "permission_denied"  # git may not write a file it needs (index.lock's dir, a tracked file)
+     if returncode == 124 and "timed out after" in output:
+@@ -706,6 +725,9 @@ def finalize_update_receipt(outcome: str, fleet: list | None = None, stop_reason
+             _write_latest(payload)
+         _prune_old_receipts(directory)
+         _publish_shared_metrics(receipt.data)
++        from hermes_cli.update_ref_lock_alert import observe as _observe_ref_lock
++
++        _observe_ref_lock(receipt.data, directory=directory)  # best effort, never raises
+         return path
+     except Exception as exc:
+         # Visible, not debug: a run that pulled code and left no receipt is exactly the run
+diff --git a/hermes_cli/update_ref_lock_alert.py b/hermes_cli/update_ref_lock_alert.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..644beaa3ec70b88cf43bec34247efe5e74239677
+--- /dev/null
++++ b/hermes_cli/update_ref_lock_alert.py
+@@ -0,0 +1,168 @@
++"""One Kanban card when the same Git ref lock blocks two distinct ``hermes update`` runs.
++
++A single ``ref_lock_stale`` stop may be a live git; the same lock file (canonical path + inode +
++mtime) still present after a second, different update run is a stranded lock worth a human look.
++This module only DIAGNOSES: it never deletes or authorizes deleting a lock (reclamation stays in
++``gitlock.release_dead_fetch_locks`` behind its dead-owner and holder proofs).
++
++Pieces, kept apart on purpose:
++  * :func:`lock_identity` reads the failing git output + one ``lstat``; the stop-class classifier
++    in ``update_receipt`` stays pure.
++  * a small durable ledger (``<receipt dir>/ref_lock_alerts.json``) remembers which distinct
++    ``update_id`` s saw which lock identity, so the count survives process exits.
++  * publication goes through ``kanban_db.create_task(idempotency_key=...)``, the canonical
++    idempotent creator; a publish failure leaves the entry pending and the next finalize retries.
++"""
++from __future__ import annotations
++
++import contextlib
++import hashlib
++import json
++import logging
++import os
++import re
++import time
++from pathlib import Path
++from typing import Any, Callable, Optional
++
++logger = logging.getLogger(__name__)
++
++STOP_CLASS = "ref_lock_stale"
++FACT = "ref_lock"
++AUTHOR = "update-ref-lock-alert"
++KEY_PREFIX = "update-ref-lock-"
++MIN_RUNS = 2
++_MAX_ENTRIES = 32
++_MAX_RUNS = 8
++_MAX_AGE_S = 30 * 86400
++_LEDGER = "ref_lock_alerts.json"
++
++_PATH = re.compile(r"Unable to create '([^'\n]+\.lock)'")
++_REF_LOCK = re.compile(r"(?:^|[/\\])(?:HEAD|packed-refs|refs[/\\].+)\.lock$")
++
++
++def lock_identity(output: str) -> Optional[dict[str, Any]]:
++    """The ref lock named by git's "Unable to create '<path>.lock': File exists" output, or None.
++
++    Path is canonicalized; ``dev``/``ino``/``mtime_ns`` (lstat) distinguish a lock generation and
++    are None when the lock is already gone.
++    """
++    match = _PATH.search(output or "")
++    if not match or "File exists" not in output or not _REF_LOCK.search(match.group(1)):
++        return None
++    raw = match.group(1)
++    try:
++        path = os.path.realpath(raw)
++    except (OSError, ValueError):
++        path = os.path.normpath(raw)
++    identity: dict[str, Any] = {"path": path, "dev": None, "ino": None, "mtime_ns": None}
++    with contextlib.suppress(OSError):
++        st = os.lstat(path)
++        identity.update(dev=st.st_dev, ino=st.st_ino, mtime_ns=st.st_mtime_ns)
++    return identity
++
++
++def identity_key(identity: dict[str, Any]) -> str:
++    material = json.dumps([identity.get("path"), identity.get("dev"), identity.get("ino"),
++                           identity.get("mtime_ns")])
++    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:20]
++
++
++def _ledger_path(directory: Optional[Path]) -> Path:
++    if directory is None:
++        from hermes_cli.update_receipt import _receipt_dir
++        directory = _receipt_dir()
++    return Path(directory) / _LEDGER
++
++
++@contextlib.contextmanager
++def _locked(path: Path):
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with open(str(path) + ".guard", "ab") as guard:
++        try:
++            import fcntl
++            fcntl.flock(guard, fcntl.LOCK_EX)
++        except ImportError as exc:
++            # Until a native Windows lock is implemented, skip diagnostics there rather than
++            # race read/modify/write or publish from an unprotected ledger.
++            raise RuntimeError("ref-lock alert ledger requires fcntl locking") from exc
++        yield
++
++
++def _load(path: Path) -> dict[str, Any]:
++    try:
++        data = json.loads(path.read_text(encoding="utf-8-sig"))
++        return data if isinstance(data, dict) and isinstance(data.get("entries"), dict) else {"entries": {}}
++    except (OSError, ValueError):
++        return {"entries": {}}
++
++
++def _store(path: Path, ledger: dict[str, Any]) -> None:
++    from hermes_cli.runtime_state import _atomic_bytes
++    _atomic_bytes(path, (json.dumps(ledger, indent=1, sort_keys=True) + "\n").encode("utf-8"))
++
++
++def publish_card(entry: dict[str, Any], key: str) -> str:
++    """Open (or find, by idempotency key) the one card for this lock; returns its task id."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++
++    ident = entry["identity"]
++    runs = ", ".join(f"`{r}`" for r in entry["runs"])
++    body = (
++        f"The same Git ref lock blocked `hermes update` in {len(entry['runs'])} distinct runs: {runs}.\n\n"
++        f"Lock: `{ident['path']}` (inode {ident.get('ino')}, mtime_ns {ident.get('mtime_ns')}).\n\n"
++        "This is a diagnostic only; nothing was deleted. Confirm no git process holds the lock "
++        "(`lsof`/`fuser` on the path) and that the update that created it is dead, then remove it "
++        "by hand, or re-run `hermes update`, whose recovery reclaims it only with dead-owner proof."
++    )
++    with kbc.connect_closing(kb.kanban_home() / "kanban.db") as conn:
++        return kb.create_task(
++            conn, title=f"Stale git ref lock blocks hermes update: {ident['path']}"[:120], body=body,
++            assignee="default", created_by=AUTHOR, priority=50,
++            idempotency_key=KEY_PREFIX + key,
++        )
++
++
++def observe(data: dict[str, Any], *, directory: Optional[Path] = None,
++            publisher: Optional[Callable[[dict[str, Any], str], str]] = None,
++            now: Optional[float] = None) -> list[str]:
++    """Record a finalized receipt's ref-lock stop and publish every lock seen by >=2 distinct runs.
++
++    Also retries earlier unpublished entries. Returns the card ids published now. Never raises.
++    """
++    publisher = publisher or publish_card
++    now = time.time() if now is None else now
++    published: list[str] = []
++    try:
++        path = _ledger_path(directory)
++        with _locked(path):
++            ledger = _load(path)
++            entries = ledger["entries"]
++            for k in [k for k, e in entries.items() if now - e.get("seen_at", 0) > _MAX_AGE_S]:
++                del entries[k]
++            ident, run = data.get(FACT), str(data.get("update_id") or "")
++            if (data.get("outcome") == "failed" and data.get("stop_class") == STOP_CLASS
++                    and run and isinstance(ident, dict)
++                    and ident.get("path")):
++                key = identity_key(ident)
++                entry = entries.setdefault(key, {"identity": ident, "runs": [], "card": None, "attempts": 0})
++                entry["seen_at"] = now
++                if run not in entry["runs"]:
++                    entry["runs"] = (entry["runs"] + [run])[-_MAX_RUNS:]
++            if len(entries) > _MAX_ENTRIES:
++                for k in sorted(entries, key=lambda k: entries[k].get("seen_at", 0))[:len(entries) - _MAX_ENTRIES]:
++                    del entries[k]
++            for key, entry in entries.items():
++                if entry.get("card") or len(entry["runs"]) < MIN_RUNS:
++                    continue
++                try:
++                    entry["card"] = publisher(entry, key)
++                    published.append(entry["card"])
++                except Exception as exc:
++                    entry["attempts"] = entry.get("attempts", 0) + 1
++                    logger.warning("ref-lock alert card not filed (will retry): %s", exc, exc_info=True)
++            _store(path, ledger)
++    except Exception:
++        logger.warning("ref-lock alert bookkeeping failed", exc_info=True)
++    return published
+diff --git a/tests/hermes_cli/test_update_ref_lock_alert.py b/tests/hermes_cli/test_update_ref_lock_alert.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4686e45daa40d4c08e3571bc2189c35edd7921bf
+--- /dev/null
++++ b/tests/hermes_cli/test_update_ref_lock_alert.py
+@@ -0,0 +1,296 @@
++"""The same Git ref lock failing two distinct update runs opens ONE Kanban card (diagnostic only)."""
++from __future__ import annotations
++
++import builtins
++import json
++import logging
++import os
++import subprocess
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import update_receipt, update_ref_lock_alert as alert
++
++
++@pytest.fixture
++def board(_isolate_hermes_home, tmp_path, monkeypatch):
++    home = tmp_path / "kanban_home"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
++    return home
++
++
++def _cards():
++    with kbc.connect_closing(kb.kanban_home() / "kanban.db") as conn:
++        return conn.execute(
++            "SELECT id, idempotency_key, body FROM tasks WHERE created_by = ?", (alert.AUTHOR,)
++        ).fetchall()
++
++
++def _lock(tmp_path, name="HEAD.lock"):
++    path = tmp_path / "repo" / ".git" / name
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text("")
++    return path
++
++
++def _git_output(path):
++    return f"fatal: cannot lock ref 'HEAD': Unable to create '{path}': File exists.\n"
++
++
++def _failed_run(output):
++    """One update run through the real receipt consumer: begin -> record -> finalize."""
++    update_receipt.begin_update_receipt()
++    update_receipt.record_ref_lock_identity(output)
++    update_receipt.record_stop_reason(update_receipt.git_output_stop_class(output, ["git", "merge"]))
++    path = update_receipt.finalize_update_receipt("failed")
++    assert path is not None
++    return path
++
++
++def test_identity_is_canonical_path_plus_generation(tmp_path):
++    lock = _lock(tmp_path)
++    link = tmp_path / "alias"
++    link.symlink_to(lock.parent)
++    a = alert.lock_identity(_git_output(lock))
++    b = alert.lock_identity(_git_output(link / "HEAD.lock"))
++    assert a["path"] == b["path"] == os.path.realpath(lock)
++    assert a["ino"] == lock.stat().st_ino and a["mtime_ns"] == lock.stat().st_mtime_ns
++    assert alert.identity_key(a) == alert.identity_key(b)
++
++
++def test_identity_ignores_non_ref_locks_and_other_errors(tmp_path):
++    index = _lock(tmp_path, "index.lock")
++    assert alert.lock_identity(_git_output(index)) is None
++    assert alert.lock_identity("fatal: Unable to create '/x/.git/HEAD.lock': Permission denied") is None
++
++
++def test_same_lock_two_distinct_runs_opens_exactly_one_card(board, tmp_path):
++    lock = _lock(tmp_path)
++    _failed_run(_git_output(lock))
++    assert _cards() == []  # one run is not yet a pattern
++    _failed_run(_git_output(lock))
++    cards = _cards()
++    assert len(cards) == 1
++    assert cards[0][1].startswith(alert.KEY_PREFIX)
++    assert str(os.path.realpath(lock)) in cards[0][2] and "nothing was deleted" in cards[0][2]
++    assert lock.exists()  # a diagnostic never removes the lock
++    _failed_run(_git_output(lock))  # third run: still one card
++    assert len(_cards()) == 1
++
++
++def test_duplicate_run_id_does_not_count_twice(board, tmp_path):
++    lock = _lock(tmp_path)
++    update_receipt.begin_update_receipt()
++    update_receipt.record_ref_lock_identity(_git_output(lock))
++    update_receipt.record_stop_reason("ref_lock_stale")
++    receipt = update_receipt._current.get()
++    assert receipt is not None
++    data = dict(receipt.data, outcome="failed")
++    for _ in range(3):  # the same run observed repeatedly
++        alert.observe(data)
++    ledger = json.loads((update_receipt._receipt_dir() / alert._LEDGER).read_text(encoding="utf-8"))
++    assert next(iter(ledger["entries"].values()))["runs"] == [data["update_id"]]
++    assert _cards() == []
++
++
++@pytest.mark.parametrize("outcome", ["success", "running", "interrupted", None])
++def test_only_failed_receipts_count_stale_stop_class(board, tmp_path, outcome):
++    lock = _lock(tmp_path)
++    _failed_run(_git_output(lock))
++    update_receipt.begin_update_receipt()
++    update_receipt.record_ref_lock_identity(_git_output(lock))
++    update_receipt.record_stop_reason(alert.STOP_CLASS)
++    receipt = update_receipt._current.get()
++    assert receipt is not None
++    data = dict(receipt.data, outcome=outcome)
++    alert.observe(data)
++    assert _cards() == []
++    _failed_run(_git_output(lock))
++    assert len(_cards()) == 1
++
++
++def test_different_locks_do_not_combine(board, tmp_path):
++    _failed_run(_git_output(_lock(tmp_path, "HEAD.lock")))
++    _failed_run(_git_output(_lock(tmp_path, "packed-refs.lock")))
++    assert _cards() == []
++
++
++def test_new_generation_of_same_path_is_a_different_lock(board, tmp_path):
++    lock = _lock(tmp_path)
++    _failed_run(_git_output(lock))
++    lock.unlink()
++    _lock(tmp_path)
++    os.utime(lock, ns=(1, 1))  # a fresh file at the same path, different mtime/inode
++    _failed_run(_git_output(lock))
++    assert _cards() == []
++
++
++def test_publish_failure_is_retried_and_still_yields_one_card(board, tmp_path, monkeypatch):
++    lock = _lock(tmp_path)
++    calls = []
++
++    def broken(entry, key):
++        calls.append(key)
++        raise RuntimeError("board locked")
++
++    real = alert.publish_card
++    monkeypatch.setattr(alert, "publish_card", broken)
++    _failed_run(_git_output(lock))
++    path = _failed_run(_git_output(lock))  # publication fails; the receipt is still written
++    assert path.exists() and calls and _cards() == []
++    monkeypatch.setattr(alert, "publish_card", real)
++    # any later finalize retries the pending entry, even for an unrelated outcome
++    update_receipt.begin_update_receipt()
++    assert update_receipt.finalize_update_receipt("success") is not None
++    assert len(_cards()) == 1
++    update_receipt.begin_update_receipt()
++    update_receipt.finalize_update_receipt("success")
++    assert len(_cards()) == 1
++
++
++def test_crash_between_card_and_ledger_does_not_duplicate(board, tmp_path):
++    # create_task's idempotency key makes a republish after a lost ledger write return the same card.
++    entry = {"identity": alert.lock_identity(_git_output(_lock(tmp_path))), "runs": ["a", "b"]}
++    key = alert.identity_key(entry["identity"])
++    assert alert.publish_card(entry, key) == alert.publish_card(entry, key)
++    assert len(_cards()) == 1
++
++
++def _data(run, path="/repo/.git/HEAD.lock"):
++    return {"update_id": run, "outcome": "failed", "stop_class": alert.STOP_CLASS,
++            alert.FACT: {"path": path, "dev": 1, "ino": 2, "mtime_ns": 3}}
++
++
++def test_bom_ledger_keeps_prior_run(tmp_path):
++    path = tmp_path / alert._LEDGER
++    ident = _data("first")[alert.FACT]
++    key = alert.identity_key(ident)
++    ledger = {"entries": {key: {"identity": ident, "runs": ["first"], "seen_at": 1,
++                               "card": None, "attempts": 0}}}
++    path.write_text(json.dumps(ledger), encoding="utf-8-sig")
++    published = []
++    alert.observe(_data("second"), directory=tmp_path, now=2,
++                  publisher=lambda entry, key: published.append(list(entry["runs"])) or "card")
++    assert published == [["first", "second"]]
++
++
++def test_unsupported_locking_never_observes_unlocked(tmp_path, monkeypatch, caplog):
++    real_import = builtins.__import__
++
++    def without_fcntl(name, *args, **kwargs):
++        if name == "fcntl":
++            raise ImportError("no fcntl on this platform")
++        return real_import(name, *args, **kwargs)
++
++    monkeypatch.setattr(builtins, "__import__", without_fcntl)
++    with caplog.at_level(logging.WARNING):
++        assert alert.observe(_data("first"), directory=tmp_path) == []
++    assert not (tmp_path / alert._LEDGER).exists()
++    assert any(r.exc_info and "bookkeeping failed" in r.message for r in caplog.records)
++
++
++def test_diagnostic_catchalls_keep_tracebacks(tmp_path, monkeypatch, caplog):
++    def broken(*args):
++        raise RuntimeError("diagnostic failure")
++
++    with caplog.at_level(logging.DEBUG):
++        monkeypatch.setattr(alert, "lock_identity", broken)
++        update_receipt.record_ref_lock_identity("ignored")
++        alert.observe(_data("first"), directory=tmp_path, publisher=broken)
++        alert.observe(_data("second"), directory=tmp_path, publisher=broken)
++    records = [r for r in caplog.records if r.name in {alert.__name__, update_receipt.__name__}
++               and ("identity not recorded" in r.message or "card not filed" in r.message)]
++    assert len(records) == 2
++    assert all(r.exc_info for r in records)
++
++
++@pytest.mark.parametrize("site", ["merge_result", "called_process_error"])
++@pytest.mark.parametrize("stream", ["stderr", "stdout"])
++def test_update_cmd_failures_reach_real_alert_consumer(board, tmp_path, monkeypatch, site, stream):
++    from hermes_cli import update_cmd
++
++    lock = _lock(tmp_path)
++    output = _git_output(lock)
++    monkeypatch.setattr(update_cmd, "_m", lambda: SimpleNamespace(_is_windows=lambda: False))
++    monkeypatch.setattr(update_cmd, "_unrestored_autostash_notice", lambda: None)
++
++    def git_run(cmd, args, **kwargs):
++        assert args in [["merge", "--ff-only", "target"],
++                        ["merge-base", "--is-ancestor", "HEAD", "target"]]
++        return SimpleNamespace(returncode=128 if args[0] == "merge" else 0,
++                               stderr=output if stream == "stderr" else "",
++                               stdout=output if stream == "stdout" else "")
++
++    monkeypatch.setattr(update_cmd, "_git_run", git_run)
++    for run in range(3):
++        update_receipt.begin_update_receipt()
++        with pytest.raises(SystemExit) as error:
++            if site == "merge_result":
++                update_cmd._move_checkout_to(["git"], "main", "origin/main", "target", "old")
++            else:
++                exc = subprocess.CalledProcessError(
++                    128, ["git", "fetch"], stderr=output.encode() if stream == "stderr" else None,
++                    output=output.encode() if stream == "stdout" else None)
++                update_cmd._handle_update_called_process_error(exc, object(), False, False)
++        assert error.value.code == 1
++        if site == "merge_result":
++            path = update_receipt.finalize_pending_update_receipt(1, "sys.exit(1)")
++            assert path is not None
++        receipt = update_receipt.read_latest_receipt()
++        assert receipt is not None
++        assert receipt["outcome"] == "failed" and receipt["stop_class"] == alert.STOP_CLASS
++        assert receipt[alert.FACT] == alert.lock_identity(output)
++        assert len(_cards()) == (0 if run == 0 else 1)
++        assert lock.exists()
++
++
++def test_successful_finalize_with_stale_reason_does_not_count(board, tmp_path):
++    lock = _lock(tmp_path)
++    _failed_run(_git_output(lock))
++    update_receipt.begin_update_receipt()
++    update_receipt.record_ref_lock_identity(_git_output(lock))
++    update_receipt.record_stop_reason(alert.STOP_CLASS)
++    assert update_receipt.finalize_update_receipt("success") is not None
++    assert _cards() == []
++
++
++def test_ledger_is_bounded_by_entries_and_run_history(tmp_path):
++    for run in range(alert._MAX_RUNS + 3):
++        alert.observe(_data(str(run)), directory=tmp_path, now=run, publisher=lambda *_: "card")
++    ledger = json.loads((tmp_path / alert._LEDGER).read_text(encoding="utf-8"))
++    assert next(iter(ledger["entries"].values()))["runs"] == [
++        str(run) for run in range(3, alert._MAX_RUNS + 3)]
++    for run in range(alert._MAX_ENTRIES + 3):
++        alert.observe(_data(str(run), f"/repo/.git/refs/heads/{run}.lock"),
++                      directory=tmp_path, now=100 + run)
++    ledger = json.loads((tmp_path / alert._LEDGER).read_text(encoding="utf-8"))
++    assert len(ledger["entries"]) == alert._MAX_ENTRIES
++    assert {e["identity"]["path"] for e in ledger["entries"].values()} == {
++        f"/repo/.git/refs/heads/{run}.lock" for run in range(3, alert._MAX_ENTRIES + 3)}
++
++
++def test_expired_observation_does_not_combine_with_new_run(tmp_path):
++    alert.observe(_data("first"), directory=tmp_path, now=1)
++    published = []
++    alert.observe(_data("second"), directory=tmp_path, now=alert._MAX_AGE_S + 2,
++                  publisher=lambda *args: published.append(args) or "card")
++    assert published == []
++    ledger = json.loads((tmp_path / alert._LEDGER).read_text(encoding="utf-8"))
++    assert next(iter(ledger["entries"].values()))["runs"] == ["second"]
++
++
++def test_lock_acquisition_failure_does_not_write_or_publish(tmp_path, monkeypatch, caplog):
++    import fcntl
++
++    def fail_lock(*args):
++        raise OSError("cannot acquire guard")
++
++    monkeypatch.setattr(fcntl, "flock", fail_lock)
++    with caplog.at_level(logging.WARNING):
++        assert alert.observe(_data("first"), directory=tmp_path) == []
++    assert not (tmp_path / alert._LEDGER).exists()
++    assert any(r.exc_info and "bookkeeping failed" in r.message for r in caplog.records)
+diff --git a/tests/hermes_cli/test_update_ref_locks.py b/tests/hermes_cli/test_update_ref_locks.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..45abed485e4ae21376720c7299c34b17b823ae9e
+--- /dev/null
++++ b/tests/hermes_cli/test_update_ref_locks.py
+@@ -0,0 +1,58 @@
++"""Ref-transaction recovery retains the killed-owner and live-holder fences."""
++from pathlib import Path
++import subprocess
++import sys
++
++import pytest
++
++from hermes_cli import _early_recovery, gitlock, update_receipt
++
++
++@pytest.mark.parametrize("name", ["HEAD.lock", "refs/heads/main.lock", "packed-refs.lock"])
++@pytest.mark.parametrize("owned,held", [(True, False), (True, True), (True, None), (False, False)])
++def test_ref_recovery_requires_dead_owner(tmp_path, monkeypatch, name, owned, held):
++    root = tmp_path / "repo"
++    lock = root / ".git" / name
++    lock.parent.mkdir(parents=True)
++    lock.touch()
++    monkeypatch.setattr(gitlock, "_killed_update_owns", lambda candidate: owned)
++    monkeypatch.setattr(gitlock, "_windows_git_in_checkout", lambda root: held)
++    monkeypatch.setattr(_early_recovery, "_held_open", lambda *args, **kwargs: held)
++    result = gitlock.release_dead_fetch_locks(root)
++    expected = owned and held is False
++    assert result == ([str(lock)] if expected else [])
++    assert lock.exists() is not expected
++
++
++@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="Linux holder observation")
++def test_real_head_lock_holder_survives_then_dead_owner_is_reclaimed(tmp_path, monkeypatch):
++    root = tmp_path / "repo"
++    lock = root / ".git" / "HEAD.lock"
++    lock.parent.mkdir(parents=True)
++    monkeypatch.setattr(gitlock, "_killed_update_owns", lambda candidate: True)
++    script = "import sys; f=open(sys.argv[1], 'w'); print('ready', flush=True); sys.stdin.read()"
++    proc = subprocess.Popen([sys.executable, "-c", script, str(lock)], stdin=subprocess.PIPE,
++                            stdout=subprocess.PIPE, text=True, encoding="utf-8")
++    try:
++        assert proc.stdout.readline().strip() == "ready"
++        assert gitlock.release_dead_fetch_locks(root) == []
++        assert lock.exists()
++    finally:
++        proc.communicate(timeout=10)
++    assert gitlock.release_dead_fetch_locks(root) == [str(lock)]
++    assert not lock.exists()
++
++
++@pytest.mark.parametrize("name", ["HEAD.lock", "refs/heads/main.lock", "packed-refs.lock"])
++def test_ref_lock_failure_has_specific_class(name):
++    output = f"fatal: cannot lock ref 'HEAD': Unable to create '/repo/.git/{name}': File exists."
++    assert update_receipt.git_output_stop_class(output, ["git", "merge", "--ff-only"]) == "ref_lock_stale"
++
++
++@pytest.mark.parametrize("output,expected", [
++    ("Unable to create '/repo/.git/index.lock': File exists.", "git_index_locked"),
++    ("Unable to create '/repo/.git/HEAD.lock': Permission denied", "permission_denied"),
++    ("cannot lock ref 'HEAD': is at aaa but expected bbb", "checkout_move_failed"),
++])
++def test_non_stale_ref_errors_keep_their_class(output, expected):
++    assert update_receipt.git_output_stop_class(output, ["git", "merge"]) == expected
+-- 
+2.43.0
+

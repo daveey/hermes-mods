@@ -1,0 +1,201 @@
+From 9df5a3ea668eec56d76b8fb91bfc775e8b121f31 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 13:16:02 +0000
+Subject: [PATCH] [daveey] Preserve fairness trigger-loss evidence across
+ sealing
+
+Proof: 10 regressions failed before fix; 55 focused tests pass; four integrity mutants killed. Persist pre-seal integrity atomically and retain observed drain gaps even with no rows. Legacy seals without receipts remain indeterminate.
+---
+ docs/kanban-fairness-capture.md               |  6 ++
+ hermes_cli/kanban_fairness_journal.py         | 23 ++++-
+ .../test_kanban_fairness_journal.py           | 88 ++++++++++++++++++-
+ .../test_kanban_fairness_vertical.py          |  2 +-
+ 4 files changed, 113 insertions(+), 6 deletions(-)
+
+diff --git a/docs/kanban-fairness-capture.md b/docs/kanban-fairness-capture.md
+index 86be7a46c7a7d6f4cdd0bea925fac6f77b54e833..4cc8289ec31de9406e760728e204a5be9f263c9a 100644
+--- a/docs/kanban-fairness-capture.md
++++ b/docs/kanban-fairness-capture.md
+@@ -30,6 +30,12 @@ stored.
+ - `capture drain` copies new rows into `segment-NNNNNN.jsonl` files (hashed in `receipts.json`).
+   `capture seal` removes the triggers, drains the tail and writes `manifest.json`. `capture clear` drops the
+   tables.
++- Drains compare the installed trigger SQL with the expected definitions and persist observed loss even
++  when there are no new rows. Seal checks inside its write transaction before removing triggers and stores
++  that result in the session, so a later drain or repeated seal cannot hide loss. Missing or changed
++  triggers, and legacy seals without an integrity receipt, produce `trigger_loss` coverage gaps.
++  This detects loss observed by drain or seal, not a trigger removed and identically restored entirely
++  between checks; do not repair triggers during a capture or treat such a window as certified.
+ 
+ Which database to arm: a board's own `kanban.db` holds only what that gateway knows. To see every gateway's
+ cards from one host, arm the board's replica (`--board default --replica`, the `sync-shadow` copy) and state
+diff --git a/hermes_cli/kanban_fairness_journal.py b/hermes_cli/kanban_fairness_journal.py
+index 7a42fe63ce91d506c5c4e5b22f175614cbdb44b7..991bdb9529450630fdeb6e87077219f537a6281f 100644
+--- a/hermes_cli/kanban_fairness_journal.py
++++ b/hermes_cli/kanban_fairness_journal.py
+@@ -104,11 +104,20 @@ def status(conn: sqlite3.Connection) -> Optional[dict]:
+         return None
+     names = ("capture_id", "armed_ms", "sealed_ms", "max_records", "max_bytes", "stored", "bytes", "dropped",
+              "first_drop_ms", "last_drop_ms")
+-    installed = {r[0] for r in conn.execute(
+-        "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name GLOB 'kanban_fairness_*'")}
++    installed = dict(conn.execute(
++        "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name GLOB 'kanban_fairness_*'"))
++    complete = installed == _triggers(conn)
++    # A seal intentionally removes triggers. Its pre-removal receipt, not current absence,
++    # proves integrity. Older sealed journals without that receipt are unknown, never clean.
++    seal_complete = None
++    columns = {r[1] for r in conn.execute(f"PRAGMA table_info({SESSION})")}
++    if "seal_triggers_complete" in columns:
++        seal_complete = conn.execute(f"SELECT seal_triggers_complete FROM {SESSION} WHERE id = 1").fetchone()[0]
+     last = conn.execute(f"SELECT MAX(seq) FROM {JOURNAL}").fetchone()[0]
+     return {**dict(zip(names, row)), "last_seq": last or 0, "db": identity(conn),
+-            "triggers": sorted(installed), "triggers_complete": installed == set(_triggers(conn))}
++            "triggers": sorted(installed), "triggers_complete": complete,
++            "trigger_integrity": complete if row[2] is None else (
++                seal_complete == 1 if seal_complete in (0, 1) else None)}
+ 
+ 
+ def arm(conn: sqlite3.Connection, capture_id: str, *, max_records: int = MAX_RECORDS,
+@@ -165,7 +174,13 @@ def seal(conn: sqlite3.Connection) -> dict:
+     from hermes_cli.kanban_db_connect import write_txn
+ 
+     with write_txn(conn):
+-        _open_status(conn)
++        state = _open_status(conn)
++        columns = {r[1] for r in conn.execute(f"PRAGMA table_info({SESSION})")}
++        if "seal_triggers_complete" not in columns:
++            conn.execute(f"ALTER TABLE {SESSION} ADD COLUMN seal_triggers_complete INTEGER")
++        if state["sealed_ms"] is None:
++            conn.execute(f"UPDATE {SESSION} SET seal_triggers_complete = ? WHERE id = 1",
++                         (int(state["triggers_complete"]),))
+         conn.execute(f"UPDATE {SESSION} SET sealed_ms = COALESCE(sealed_ms, {_NOW_MS}) WHERE id = 1")
+         _drop_triggers(conn)
+     return _open_status(conn)
+diff --git a/tests/hermes_cli/test_kanban_fairness_journal.py b/tests/hermes_cli/test_kanban_fairness_journal.py
+index beae3f0b4cbbe6e22a5d06c51d39cd68a9974785..d7f2c567f140ff3de265280bba6b96025a6d56fd 100644
+--- a/tests/hermes_cli/test_kanban_fairness_journal.py
++++ b/tests/hermes_cli/test_kanban_fairness_journal.py
+@@ -109,12 +109,31 @@ def test_seal_stops_capture_and_survives_a_reopen(conn, tmp_path):
+         assert journal.status(again)["triggers"] == []
+         assert journal.status(again)["stored"] == manifest["journal"]["stored"]
+     capture = store.load(out)
+-    expected_gaps = {"source_identity_unknown", "clock_unknown", "source_uid_unknown", "trigger_integrity_unknown"}
++    expected_gaps = {"source_identity_unknown", "clock_unknown", "source_uid_unknown"}
+     assert {g["code"] for g in capture["gaps"]} == expected_gaps
+     assert len(manifest["segments"]) == 2
+     assert [r["seq"] for r in capture["records"]] == list(range(1, len(capture["records"]) + 1))
+ 
+ 
++@pytest.mark.parametrize("integrity,expected", [
++    (True, set()), (False, {"trigger_loss"}),
++    (None, {"trigger_integrity_unknown"}), (1, {"trigger_integrity_unknown"}),
++])
++def test_drain_preserves_three_way_trigger_evidence(conn, tmp_path, monkeypatch, integrity, expected):
++    journal.arm(conn, "c1")
++    state = journal.status(conn)
++    state["trigger_integrity"] = integrity
++    monkeypatch.setattr(journal, "status", lambda _conn: state)
++    out = tmp_path / "evidence"
++    for _ in range(2):  # no rows: new gaps must still be persisted and deduplicated
++        receipts = store.drain(conn, out)
++        codes = [g["code"] for g in receipts["gaps"] if g["code"].startswith("trigger_")]
++        assert set(codes) == expected
++        assert len(codes) == len(expected)
++        stored = json.loads((out / store.RECEIPTS).read_text())
++        assert {g["code"] for g in stored["gaps"] if g["code"].startswith("trigger_")} == expected
++
++
+ def test_arm_refuses_a_second_capture(conn):
+     journal.arm(conn, "c1")
+     with pytest.raises(journal.JournalError):
+@@ -144,6 +163,73 @@ def test_changed_segment_and_lost_journal_are_gaps(conn, tmp_path):
+     assert "unsealed" in _codes(other)
+ 
+ 
++@pytest.mark.parametrize("first_drain", [False, True])
++@pytest.mark.parametrize("trigger", [
++    "kanban_fairness_tasks_ins", "kanban_fairness_tasks_upd",
++    "kanban_fairness_tasks_del", "kanban_fairness_events_ins",
++])
++def test_missing_trigger_survives_seal_and_reopen(conn, tmp_path, trigger, first_drain):
++    out = tmp_path / "evidence"
++    journal.arm(conn, "c1")
++    with kb.write_txn(conn):
++        conn.execute(f"DROP TRIGGER {trigger}")
++    if first_drain:
++        assert "trigger_loss" in [g["code"] for g in store.drain(conn, out)["gaps"]]
++        assert "trigger_loss" in _codes(out)  # persist even without journal rows
++    journal.seal(conn)  # direct seal must not erase loss before the store sees it
++    with kbc.connect_closing() as again:
++        store.write_manifest(again, out, board="default", assumptions={}, policy={})
++    assert "trigger_loss" in _codes(out)
++
++
++def test_observed_trigger_loss_is_sticky_after_repair(conn, tmp_path):
++    out = tmp_path / "evidence"
++    journal.arm(conn, "c1")
++    name = "kanban_fairness_tasks_upd"
++    ddl = conn.execute("SELECT sql FROM sqlite_master WHERE name = ?", (name,)).fetchone()[0]
++    with kb.write_txn(conn):
++        conn.execute(f"DROP TRIGGER {name}")
++    store.drain(conn, out)
++    with kb.write_txn(conn):
++        conn.execute(ddl)
++    store.write_manifest(conn, out, board="default", assumptions={}, policy={})
++    assert "trigger_loss" in _codes(out)
++
++
++def test_same_name_noop_trigger_is_a_gap(conn, tmp_path):
++    out = tmp_path / "evidence"
++    journal.arm(conn, "c1")
++    with kb.write_txn(conn):
++        conn.execute("DROP TRIGGER kanban_fairness_tasks_upd")
++        conn.execute("CREATE TRIGGER kanban_fairness_tasks_upd AFTER UPDATE ON tasks BEGIN SELECT 1; END")
++    store.write_manifest(conn, out, board="default", assumptions={}, policy={})
++    assert "trigger_loss" in _codes(out)
++
++
++@pytest.mark.parametrize("sealed", [False, True])
++def test_legacy_journal_seal_receipt_is_not_invented(conn, tmp_path, sealed):
++    out = tmp_path / "evidence"
++    journal.arm(conn, "legacy")  # the original schema has no seal receipt column
++    if sealed:
++        with kb.write_txn(conn):
++            conn.execute(f"UPDATE {journal.SESSION} SET sealed_ms = armed_ms WHERE id = 1")
++            for name in journal.status(conn)["triggers"]:
++                conn.execute(f"DROP TRIGGER {name}")
++    manifest = store.write_manifest(conn, out, board="default", assumptions={}, policy={})
++    gap_code = "trigger_integrity_unknown" if sealed else None
++    assert (journal.status(conn)["trigger_integrity"] is None) is sealed
++    assert ("trigger_integrity_unknown" in _codes(out)) is sealed
++    assert "trigger_loss" not in _codes(out)
++    # Repeated journal seal preserves its receipt; the newer store refuses resealing.
++    again = journal.seal(conn)
++    assert again["sealed_ms"] == manifest["window"]["sealed_ms"]
++    assert (again["trigger_integrity"] is None) is sealed
++    with pytest.raises(ValueError, match="already sealed"):
++        store.write_manifest(conn, out, board="default", assumptions={}, policy={})
++    if gap_code:
++        assert gap_code in _codes(out)
++
++
+ def test_bad_record_line_is_a_gap_not_a_skip(conn, tmp_path):
+     out = tmp_path / "evidence"
+     journal.arm(conn, "c1")
+diff --git a/tests/hermes_cli/test_kanban_fairness_vertical.py b/tests/hermes_cli/test_kanban_fairness_vertical.py
+index 22eeb3e385f90bcf994f781ab952013347b297b7..fb64f10b90dc8deecd8a56ee471418891f10c070 100644
+--- a/tests/hermes_cli/test_kanban_fairness_vertical.py
++++ b/tests/hermes_cli/test_kanban_fairness_vertical.py
+@@ -91,7 +91,7 @@ def test_dispatch_to_report(kanban_home, all_assignees_spawnable, tmp_path, caps
+     capsys.readouterr()
+ 
+     capture = store.load(out)
+-    expected_gaps = {"source_identity_unknown", "clock_unknown", "source_uid_unknown", "trigger_integrity_unknown"}
++    expected_gaps = {"source_identity_unknown", "clock_unknown", "source_uid_unknown"}
+     assert {g["code"] for g in capture["gaps"]} == expected_gaps
+     eps = metrics.episodes(capture["records"], armed_s=capture["manifest"]["window"]["armed_ms"] / 1000,
+                            err=0)
+-- 
+2.43.0
+

@@ -1,0 +1,281 @@
+From 4b4118d62f8b27194fba1249f423e33dfd7c254d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 08:20:48 +0000
+Subject: [PATCH] [daveey] Route offered native CLI creates through parent
+ custody
+
+---
+ hermes_cli/kanban.py                       |   8 ++
+ hermes_cli/kanban_cli_native.py            |  79 ++++++++++++++
+ tests/hermes_cli/test_origin_cli_create.py | 120 +++++++++++++++++++++
+ tests/tools/test_origin_cli_bridge.py      |  13 ++-
+ 4 files changed, 217 insertions(+), 3 deletions(-)
+ create mode 100644 hermes_cli/kanban_cli_native.py
+ create mode 100644 tests/hermes_cli/test_origin_cli_create.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index e43f3508d22f481c9dd1df55ff5ee810e14739b2..0d083e234c7ce6e8dbc6488c37d82ce1beadbe08 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -171,6 +171,14 @@ def kanban_command(args: argparse.Namespace) -> int:
+             "are fenced from board writes by design; make the change with the agent's kanban_* "
+             "tools, e.g. kanban_comment, kanban_block, kanban_link, kanban_unlink, kanban_create)"))
+ 
++    # Native requests execute only in the owning parent, before any child-side
++    # board initialization or publication scope can write local state.
++    if action == "create":
++        from hermes_cli.kanban_cli_native import offered_create
++        bridged = offered_create(args)
++        if bridged is not None:
++            return bridged
++
+     # Origin obligations are profile-local, not current-board state; do not
+     # auto-initialize a board or route by a worker's inherited board override.
+     if module := _ORIGIN_COMMANDS.get(action):
+diff --git a/hermes_cli/kanban_cli_native.py b/hermes_cli/kanban_cli_native.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9d0d8b96ac5f1191c1f9b78c183165e289557866
+--- /dev/null
++++ b/hermes_cli/kanban_cli_native.py
+@@ -0,0 +1,79 @@
++"""Untrusted CLI request mapping for a parent-owned native creation bridge.
++
++An offered descriptor is a locator, never a grant. Only the parent dispatch can
++admit creation; a failed offer must never fall through to standalone creation.
++"""
++import argparse
++import json
++import os
++from pathlib import Path
++
++from tools.origin_cli_bridge import ENV_KEY
++
++# Deliberately explicit: new CLI options must acquire a mapping or a refusal.
++_DIRECT = frozenset({
++    "title", "assignee", "tenant", "priority", "admission_class", "admission_frees",
++    "triage", "idempotency_key", "distinct_from", "distinct_reason", "skills",
++    "max_retries", "pin_mandatory", "completion_contract", "review_required",
++    "goal_mode", "goal_max_turns", "initial_status", "human_request", "project", "board",
++    "requires",
++})
++_RENAMED = {"parent": "parents", "model_override": "model", "provider_override": "provider"}
++_REFUSED = frozenset({"branch", "reasoning_effort", "origin_session", "hub_reason", "force_hub", "runs_on"})
++_LOCAL = frozenset({"command", "kanban_action", "json", "body", "body_file", "workspace", "max_runtime",
++                    "created_by", "self_work", "_kanban_parser", "no_requires"})
++# Top-level chat/launcher options are not creation fields or authority. In
++# particular a child's --toolsets/--yolo cannot change the parent's dispatch.
++_GLOBAL = frozenset({
++    "accept_hooks", "checkpoints", "cli", "continue_last", "cpu_profile", "func",
++    "ignore_rules", "ignore_user_config", "in_dir", "model", "no_restore_cwd", "oneshot",
++    "pass_session_id", "provider", "reasoning", "resume", "safe_mode", "toolsets", "tui",
++    "tui_dev", "tui_native", "usage_file", "version", "worktree", "yolo",
++})
++
++
++def offered_create(args):
++    """Return None only when no bridge was offered, otherwise a final exit code."""
++    if ENV_KEY not in os.environ:
++        return None
++    from hermes_cli import kanban as cli
++    from hermes_cli.kanban_cli_body import read_body
++    from tools.origin_cli_bridge import request
++
++    def refused(message):
++        return cli._err("kanban: native CLI bridge: " + message, 2)
++
++    values = vars(args)
++    unknown = set(values) - _DIRECT - _RENAMED.keys() - _REFUSED - _LOCAL - _GLOBAL
++    unsupported = [key for key in _REFUSED if values.get(key) is not None and values[key] is not False]
++    if unknown or unsupported:
++        return refused("unsupported options: " + ", ".join(sorted(unknown | set(unsupported))))
++    if values.get("self_work") is not None or values.get("created_by", "user") != "user":
++        return refused("self-work and author overrides are unsupported")
++    if os.environ.get("HERMES_ORIGIN_SESSION"):
++        return refused("explicit foreign origin is unsupported")
++    if values.get("requires"):
++        return refused("gateway capability routing is unsupported")
++    body, error = read_body(args)
++    if error:
++        return refused(error)
++    try:
++        kind, path = cli._parse_workspace_flag(args.workspace)
++        runtime = cli._parse_duration(values.get("max_runtime"))
++    except (ValueError, argparse.ArgumentTypeError) as exc:
++        return refused(str(exc))
++    payload = {key: value for key, value in values.items() if key in _DIRECT and value is not None}
++    payload.update({target: values[source] for source, target in _RENAMED.items() if values.get(source) is not None})
++    # CLI creation is local. Do not silently substitute the tool's automatic
++    # remote placement; that needs a separately authenticated forwarding path.
++    payload.update(placement="local", body=body, workspace_kind=kind,
++                   workspace_path=str(Path(path).expanduser().absolute()) if path else None,
++                   max_runtime_seconds=runtime)
++    result = request(os.environ[ENV_KEY], payload)
++    if values.get("json"):
++        print(json.dumps(result, ensure_ascii=False))
++    elif result.get("ok"):
++        print(result["task_id"])
++    else:
++        cli._err("kanban: native CLI bridge refused or outcome unknown; do not retry automatically", 2)
++    return 0 if result.get("ok") else 2
+diff --git a/tests/hermes_cli/test_origin_cli_create.py b/tests/hermes_cli/test_origin_cli_create.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ce17eb2ddcfe6e0e715777378b27a8f9aa723b06
+--- /dev/null
++++ b/tests/hermes_cli/test_origin_cli_create.py
+@@ -0,0 +1,120 @@
++"""CLI bridge option parity and offered-channel no-fallback contract."""
++import argparse
++import json
++
++import pytest
++
++from hermes_cli import kanban as cli, kanban_parser
++from tools import origin_cli_bridge as bridge
++
++
++def parse(*words):
++    parser = argparse.ArgumentParser()
++    kanban_parser.build_parser(parser.add_subparsers())
++    return parser.parse_args(["kanban", "create", "Native child", *words])
++
++
++@pytest.fixture
++def offered(monkeypatch):
++    monkeypatch.setenv(bridge.ENV_KEY, "offered")
++    monkeypatch.delenv("HERMES_ORIGIN_SESSION", raising=False)
++    calls = []
++    def request(locator, args):
++        calls.append((locator, args))
++        return {"ok": True, "task_id": "t_bridge"}
++    monkeypatch.setattr(bridge, "request", request)
++    def forbidden(*args, **kwargs):
++        pytest.fail("offered bridge fell back to direct database create")
++    monkeypatch.setattr(cli.kbc, "connect_closing", forbidden)
++    return calls
++
++
++def test_cli_dispatches_to_offered_bridge(offered, capsys):
++    assert cli.kanban_command(parse("--json", "--no-requires")) == 0
++    assert json.loads(capsys.readouterr().out)["task_id"] == "t_bridge"
++    assert offered[0][0] == "offered"
++    assert offered[0][1]["placement"] == "local"
++    assert offered[0][1]["requires"] == []
++
++
++def test_cli_maps_options_and_child_body_file(offered, capsys, tmp_path):
++    body = tmp_path / "body.txt"
++    body.write_text("body\n--not-a-flag", encoding="utf-8")
++    args = parse("--json", "--body-file", str(body), "--assignee", "writer", "--parent", "t_parent",
++                 "--model", "model-x", "--provider", "provider-x", "--max-runtime", "2m",
++                 "--workspace", "scratch", "--initial-status", "running", "--review-required",
++                 "--idempotency-key", "cli-key", "--priority", "7", "--skill", "example")
++    assert cli.kanban_command(args) == 0
++    payload = offered[0][1]
++    assert payload["body"] == "body\n--not-a-flag"
++    assert payload["parents"] == ["t_parent"]
++    assert payload["model"] == "model-x" and payload["provider"] == "provider-x"
++    assert payload["max_runtime_seconds"] == 120
++    assert payload["workspace_kind"] == "scratch"
++    assert payload["initial_status"] == "running" and payload["review_required"]
++    assert payload["idempotency_key"] == "cli-key" and payload["priority"] == 7
++    assert payload["skills"] == ["example"]
++    assert "created_by" not in payload and "session_id" not in payload
++
++
++@pytest.mark.parametrize("words", [
++    ["--origin-session", "@session:default@elsewhere/chat"],
++    ["--created-by", "other"], ["--self-work", "{}"],
++    ["--force-hub"], ["--hub-reason", "browser"], ["--requires", "terminal"],
++    ["--runs-on", "linux"], ["--workspace", "worktree", "--branch", "wt/example"],
++    ["--reasoning-effort", "high"],
++])
++def test_unsupported_options_refuse_without_dispatch(offered, words):
++    assert cli.kanban_command(parse(*words)) == 2
++    assert offered == []
++
++
++def test_ambient_origin_refuses_before_dispatch(offered, monkeypatch):
++    monkeypatch.setenv("HERMES_ORIGIN_SESSION", "@session:default@elsewhere/chat")
++    assert cli.kanban_command(parse()) == 2
++    assert offered == []
++
++
++@pytest.mark.parametrize("locator", ["", "{}", "not-json"])
++def test_broken_offer_never_falls_back(offered, monkeypatch, locator):
++    monkeypatch.setenv(bridge.ENV_KEY, locator)
++    monkeypatch.setattr(bridge, "request", lambda *a: {"ok": False, "outcome": "outcome_unknown"})
++    assert cli.kanban_command(parse("--json")) == 2
++
++
++def test_entrypoint_never_initializes_child_board(offered, monkeypatch):
++    def forbidden():
++        pytest.fail("child attempted board initialization")
++    monkeypatch.setattr(cli.kb, "init_db", forbidden)
++    monkeypatch.setattr(cli, "_is_delegated_child_cli_mutation", lambda args: False)
++    assert cli.kanban_command(parse("--json")) == 0
++    assert len(offered) == 1
++
++
++def test_no_offer_keeps_legacy_route(monkeypatch):
++    from hermes_cli.kanban_cli_native import offered_create
++    monkeypatch.delenv(bridge.ENV_KEY, raising=False)
++    assert offered_create(parse()) is None
++
++
++@pytest.mark.parametrize("words", [["--workspace", "invalid"], ["--max-runtime", "invalid"],
++                                   ["--body-file", "/nonexistent/native-cli-body"]])
++def test_invalid_local_inputs_refuse(offered, words):
++    assert cli.kanban_command(parse(*words)) == 2
++    assert offered == []
++
++
++def test_child_launch_policy_is_never_forwarded(offered):
++    args = parse("--json")
++    args.yolo = True
++    args.toolsets = ["all"]
++    args.ignore_rules = True
++    assert cli.kanban_command(args) == 0
++    assert not {"yolo", "toolsets", "ignore_rules"} & offered[0][1].keys()
++
++
++def test_new_unmapped_option_refuses(offered):
++    args = parse()
++    args.future_effect = True
++    assert cli.kanban_command(args) == 2
++    assert offered == []
+diff --git a/tests/tools/test_origin_cli_bridge.py b/tests/tools/test_origin_cli_bridge.py
+index f742e28100a2666ff13d00ab191131c470f177ac..80eb3a2538b33c9219ba2485a3980703aa99cbeb 100644
+--- a/tests/tools/test_origin_cli_bridge.py
++++ b/tests/tools/test_origin_cli_bridge.py
+@@ -131,8 +131,9 @@ from tools import kanban_tools
+ turn = fixtures.turn
+ 
+ 
++@pytest.mark.parametrize("entrypoint", ["client", "cli"])
+ @pytest.mark.parametrize("revoke", [False, True])
+-def test_real_subprocess_uses_only_parent_custody(turn, monkeypatch, tmp_path, revoke):
++def test_real_subprocess_uses_only_parent_custody(turn, monkeypatch, tmp_path, revoke, entrypoint):
+     import subprocess
+     import sys
+     from tools import origin_cli_bridge as bridge
+@@ -149,9 +150,15 @@ def test_real_subprocess_uses_only_parent_custody(turn, monkeypatch, tmp_path, r
+             turn.release()
+         env = build_subprocess_env(scrub_secrets=True)
+         env["PYTHONPATH"] = os.getcwd()
+-        result = subprocess.run([sys.executable, str(script), launch.locator],
++        env[bridge.ENV_KEY] = launch.locator
++        argv = ([sys.executable, "-m", "hermes_cli.main", "kanban", "create", "subprocess child",
++                 "--assignee", "default", "--no-requires", "--json"] if entrypoint == "cli"
++                else [sys.executable, str(script), launch.locator])
++        result = subprocess.run(argv,
+                                 env=env, pass_fds=(launch.child_fd,), capture_output=True,
+-                                text=True, encoding="utf-8", timeout=10, check=True)
++                                text=True, encoding="utf-8", timeout=20, check=False)
++        assert result.returncode == (2 if revoke and entrypoint == "cli" else 0), result.stderr
++        assert result.stdout.strip(), (result.returncode, result.stderr)
+         value = json.loads(result.stdout)
+         assert bool(value.get("ok")) is (not revoke), value
+         with kbc.connect_closing() as conn:
+-- 
+2.43.0
+

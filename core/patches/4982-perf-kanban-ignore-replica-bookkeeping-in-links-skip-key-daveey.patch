@@ -1,0 +1,210 @@
+From 204e60d7721ab8497b687afabe94e82aad1e9758 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 14:26:16 +0000
+Subject: [PATCH] perf(kanban): ignore replica bookkeeping in links skip key
+ [daveey]
+
+Use covered shadow activity revisions and main-file identity/stat instead of transport cursor progress. Missing coverage and legacy subscriptions retain literal reconciliation; live ledger, state TTL and deadlines are unchanged.
+
+Proof: behavioral parent RED; revision/steady-links/binding controls GREEN; five exact-anchor mutants killed. Canonical direct-importer suite: 186 files, 4331 passed, 20 skipped. Full scripts/check: 21 checks pass. Controlled 100-card cursor-only replay preserves outputs and skips 20 repeated plan/backfill calls; not live CPU acceptance. Natural-deploy idle Mac measurement remains required.
+---
+ hermes_cli/kanban_sync_client.py              |  14 +-
+ .../test_kanban_origin_structural_reuse.py    |  15 +++
+ ...test_kanban_sync_links_replica_revision.py | 127 ++++++++++++++++++
+ 3 files changed, 153 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_links_replica_revision.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index f9e5f050b2b8193a749d220cb2e028b4a2bd5614..8cc0e588d06dbef3f72141629c1f424b4c7b5523 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1302,8 +1302,9 @@ def _links_inputs(conn: sqlite3.Connection, path: Path, slug: str, gateway: str,
+     """Everything one board's links pass (``kanban_chat_links.reconcile`` with its creator-chats backfill) reads,
+     besides state.db (``LINKS_MAX_AGE_S``): the live file's identity and transactional activity revision (tasks,
+     events, subscriptions, links; trigger-backed, so dispatcher clocks and sync stamps do not move it), the replica's
+-    identity and feed cursor (its only writer besides the ``pulled_at`` stamp is the pull), this gateway's ledger rows
+-    for the board, the mode and the configuration. Read before the pass, so a commit during it re-arms the next one.
++    main-file identity/stat and covered activity revision (not transport cursor or heartbeat progress), this gateway's
++    ledger rows for the board, the mode and the configuration. Legacy nonempty replica subscriptions are not covered
++    by shadow revision triggers and refuse the skip. Read before the pass, so a commit during it re-arms the next one.
+     None (cannot tell: no counter, unreadable file) always reconciles. [daveey]"""
+     from hermes_cli import kanban_activity_revision as rev
+     if ledger is None or signature is None:
+@@ -1320,7 +1321,14 @@ def _links_inputs(conn: sqlite3.Connection, path: Path, slug: str, gateway: str,
+             # The loop's own pooled replica handle (generation-recovered on borrow), not another connection.
+             with connection(shadow, lambda: open_shadow(slug, gateway)) as replica_conn:
+                 rst = os.stat(shadow)
+-                replica = (rst.st_dev, rst.st_ino, int((sync.sync_state(replica_conn) or {}).get("cursor") or 0))
++                # Creator resolution also reads legacy subscriptions, which shadow activity
++                # triggers do not cover. Nonempty legacy stores must use the literal pass.
++                if replica_conn.execute("SELECT 1 FROM kanban_notify_subs LIMIT 1").fetchone():
++                    return None
++                content = rev.read_key(replica_conn, rev.SHADOW_TABLES)
++                if content is None:
++                    return None
++                replica = (rst.st_dev, rst.st_ino, rst.st_size, rst.st_mtime_ns, content)
+     except (OSError, sqlite3.Error, TypeError, ValueError):
+         return None
+     return (st.st_dev, st.st_ino), revision, replica, ledger.get(slug, frozenset()), mode, signature
+diff --git a/tests/hermes_cli/test_kanban_origin_structural_reuse.py b/tests/hermes_cli/test_kanban_origin_structural_reuse.py
+index ec29c75bbbc3d9de09e8b61c39025d31858423d1..aee41a7129b314e7b19d9e78564e2816a494a6f2 100644
+--- a/tests/hermes_cli/test_kanban_origin_structural_reuse.py
++++ b/tests/hermes_cli/test_kanban_origin_structural_reuse.py
+@@ -132,6 +132,21 @@ def test_exact_binding_text_changes_hash_and_origin_without_reset(world, monkeyp
+     assert structure.digest(raw, original) == first_digest
+ 
+ 
++@pytest.mark.parametrize('change', [{'version': 0}, {'task_record_key': 'mismatched'}])
++def test_invalid_parseable_binding_raises_on_every_read_without_cache_admission(world, change):
++    from hermes_cli import kanban_origin_structure as structure
++
++    _, _, raw = _prepare(world)
++    structure.clear()
++    structure.binding(raw)
++    before = structure._binding.cache_info().currsize
++    text = json.dumps({**json.loads(raw), **change})
++    for _ in range(2):
++        with pytest.raises(ValueError, match='origin_binding_invalid'):
++            structure.binding(text)
++        assert structure._binding.cache_info().currsize == before
++
++
+ def test_warm_binding_does_not_freeze_freshness(world):
+     path, replica, _ = _prepare(world)
+     args = dict(replica=replica, gateway='origin', profile='default')
+diff --git a/tests/hermes_cli/test_kanban_sync_links_replica_revision.py b/tests/hermes_cli/test_kanban_sync_links_replica_revision.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3f52f81e5a27427b1cbf0a2e034812c97d883681
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_links_replica_revision.py
+@@ -0,0 +1,127 @@
++"""Replica transport progress is not a changed chat-link input."""
++import os
++
++import pytest
++
++from hermes_cli import kanban_activity_revision as rev
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_sync_client as ksc
++from tests.hermes_cli import test_kanban_sync_steady_links as f
++
++kanban_home = f.kanban_home
++ledger = f.ledger
++live = f.live
++spies = f.spies
++scope = f.scope
++
++
++def test_replica_bookkeeping_does_not_repeat_plan_or_backfill(live, ledger, kanban_home, spies, scope):
++    replica = ksc.open_shadow(f.BOARD, f.ME)
++    try:
++        settled = f._settled(live, ledger, kanban_home, spies)
++        for i in range(4):
++            with kbc.write_txn(replica):
++                replica.execute('UPDATE kanban_sync_state SET cursor=cursor+1, pulled_at=?', (i,))
++            f._pass(kanban_home)
++        assert spies == {'reconcile': 0, 'backfill': 0}
++        assert f._links(live) == settled
++    finally:
++        replica.close()
++
++
++def test_replica_uncovered_subscriptions_cannot_be_skipped(live, ledger, kanban_home, spies, scope):
++    replica = ksc.open_shadow(f.BOARD, f.ME)
++    try:
++        f._settled(live, ledger, kanban_home, spies)
++        with kbc.write_txn(replica):
++            replica.execute("INSERT INTO kanban_notify_subs (task_id,platform,chat_id,created_at) "
++                            "VALUES ('t_missing','hub','other/default/s_chat',1)")
++        f._pass(kanban_home)
++        assert spies['reconcile'] == 1
++        f._pass(kanban_home)
++        assert spies['reconcile'] == 2
++    finally:
++        replica.close()
++
++
++@pytest.mark.parametrize('change', ['heartbeat', 'lease'])
++def test_replica_bookkeeping_rows_do_not_repeat_plan(live, ledger, kanban_home, spies, scope, change):
++    replica = ksc.open_shadow(f.BOARD, f.ME)
++    try:
++        with kbc.write_txn(replica):
++            replica.execute("INSERT INTO tasks (id,title,status,created_at,created_on) "
++                            "VALUES ('t_foreign','foreign','running',1,?)", (f.OTHER,))
++        settled = f._settled(live, ledger, kanban_home, spies)
++        for i in range(3):
++            before = rev.read_key(replica, rev.SHADOW_TABLES)
++            with kbc.write_txn(replica):
++                if change == 'heartbeat':
++                    replica.execute("INSERT INTO task_events (task_id,kind,payload,created_at) "
++                                    "VALUES ('t_foreign','heartbeat','{}',?)", (i,))
++                else:
++                    replica.execute("UPDATE tasks SET lease_version=?,sync_version=? WHERE id='t_foreign'",
++                                    (i + 1, i + 1))
++                replica.execute('UPDATE kanban_sync_state SET cursor=cursor+1')
++            assert rev.read_key(replica, rev.SHADOW_TABLES) == before
++            f._pass(kanban_home)
++        assert spies == {'reconcile': 0, 'backfill': 0}
++        assert f._links(live) == settled
++    finally:
++        replica.close()
++
++
++@pytest.mark.parametrize('change', ['status', 'link', 'created_event', 'parent'])
++def test_replica_content_without_cursor_change_rearms(live, ledger, kanban_home, spies, scope, change):
++    replica = ksc.open_shadow(f.BOARD, f.ME)
++    try:
++        with kbc.write_txn(replica):
++            replica.execute("INSERT INTO tasks (id,title,status,created_at,created_on) "
++                            "VALUES ('t_foreign','foreign','running',1,?)", (f.OTHER,))
++            replica.execute("INSERT INTO tasks (id,title,status,created_at,created_on) "
++                            "VALUES ('t_parent','parent','running',1,?)", (f.OTHER,))
++        f._settled(live, ledger, kanban_home, spies)
++        with kbc.write_txn(replica):
++            if change == 'status':
++                replica.execute("UPDATE tasks SET status='done' WHERE id='t_foreign'")
++            elif change == 'link':
++                replica.execute("INSERT INTO task_chat_links "
++                                "(uid,task_id,chat_gateway,chat_session,kind,released,created_at) "
++                                "VALUES ('foreign-link','t_foreign',?,'s_foreign','created',0,1)", (f.ME,))
++            elif change == 'created_event':
++                replica.execute("INSERT INTO task_events (task_id,kind,payload,created_at) "
++                                "VALUES ('t_foreign','created','{}',1)")
++            else:
++                replica.execute("INSERT INTO task_links (parent_id,child_id) VALUES ('t_parent','t_foreign')")
++        f._pass(kanban_home)
++        assert spies == {'reconcile': 1, 'backfill': 1}
++    finally:
++        replica.close()
++
++
++def test_replica_main_file_rewrite_signal_rearms(live, ledger, kanban_home, spies, scope):
++    replica = ksc.open_shadow(f.BOARD, f.ME)
++    try:
++        f._settled(live, ledger, kanban_home, spies)
++        path = ksc.shadow_path(f.BOARD)
++        before = rev.read_key(replica, rev.SHADOW_TABLES)
++        stamp = path.stat()
++        os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 1_000_000_000))
++        assert path.stat().st_mtime_ns != stamp.st_mtime_ns
++        assert rev.read_key(replica, rev.SHADOW_TABLES) == before
++        f._pass(kanban_home)
++        assert spies == {'reconcile': 1, 'backfill': 1}
++    finally:
++        replica.close()
++
++
++def test_replica_missing_coverage_retries(live, ledger, kanban_home, spies, scope):
++    replica = ksc.open_shadow(f.BOARD, f.ME)
++    try:
++        f._settled(live, ledger, kanban_home, spies)
++        with kbc.write_txn(replica):
++            rev.drop_triggers(replica)
++        for _ in range(2):
++            f._pass(kanban_home)
++        assert spies == {'reconcile': 2, 'backfill': 2}
++    finally:
++        replica.close()
+-- 
+2.43.0
+

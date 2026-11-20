@@ -1,0 +1,163 @@
+From c4f7a5cc709f494b32a722f48d46bbc42f39760a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 07:52:39 +0000
+Subject: [PATCH] [daveey] Append pickup observations to open incidents
+
+Repeated pickup firings reuse open detector subjects and append evidence, with identical comment replay suppressed. Closed incidents no longer suppress new firings. Preserve decimal alarm identity and source exclusion. WIP for self-work D: state companion and remaining producer audit not finished.
+---
+ hermes_cli/kanban_pickup_stall.py             | 49 +++++++++--------
+ tests/hermes_cli/test_kanban_pickup_stall.py  |  2 +-
+ .../hermes_cli/test_pickup_incident_append.py | 54 +++++++++++++++++++
+ 3 files changed, 79 insertions(+), 26 deletions(-)
+ create mode 100644 tests/hermes_cli/test_pickup_incident_append.py
+
+diff --git a/hermes_cli/kanban_pickup_stall.py b/hermes_cli/kanban_pickup_stall.py
+index 4398906a294862497726c17b1a440b82686fd1e7..78262d97b80a946db74781eecd49cde25e2210a9 100644
+--- a/hermes_cli/kanban_pickup_stall.py
++++ b/hermes_cli/kanban_pickup_stall.py
+@@ -13,7 +13,7 @@ read back: pickup kept no record of why a pass skipped a candidate.
+   replica, pinned ``machine:<this host>``, created elsewhere, with no live lease and not imported here, whose
+   ``ready_since`` and newest move onto this host are older than ``kanban.sync.pickup_stall_seconds`` (default 600)
+   gets ONE agent repair card filed
+-  by this host (an open one, or one closed less than :data:`REPLACE_AFTER_SECONDS` ago, is reused). The repair is
++  by this host. An open incident is reused and repeated evidence is appended; a closed incident is replaced. The repair is
+   never pinned here (:func:`alarm_placement`): this host is the one taking no Board work, so the repair is pinned
+   to another active, unheld machine that can run it now, or the hub operator lane, and an open unclaimed repair
+   whose pin is stranded is re-pinned. Its body carries this host's machine-local evidence (pickup skips, registry
+@@ -220,19 +220,12 @@ def stalled(conn, replica, own: str, *, now: Optional[float] = None) -> list[dic
+ 
+ 
+ def _covering_repair(conn, key: str, now_ms: int) -> Optional[str]:
+-    """The repair already covering ``key``: an open one, or one closed less than :data:`REPLACE_AFTER_SECONDS` ago
+-    (so an agent that finished one is not handed the same card on the next tick)."""
+-    row = conn.execute("SELECT id, status, COALESCE(completed_at, created_at) AS closed FROM tasks "
+-                       "WHERE idempotency_key >= ? AND idempotency_key < ? "
+-                       "ORDER BY created_at DESC, id DESC LIMIT 1", (key, key + "\U0010ffff")).fetchone()
+-    if row is None:
+-        return None
+-    if row["status"] not in ("done", "archived"):
+-        return row["id"]
+-    from hermes_cli import kanban_pickup_stall_resolve as resolve
+-    if resolve.resolved_by_detector(conn, row["id"]):
+-        return None  # this detector closed it once its cards left ready: a later stall is a new incident
+-    return row["id"] if now_ms - int(row["closed"] or 0) * 1000 < REPLACE_AFTER_SECONDS * 1000 else None
++    """The open incident for this exact detector subject; closed cards never cover a new firing."""
++    row = conn.execute("SELECT id FROM tasks WHERE created_by = ? "
++                       "AND idempotency_key >= ? AND idempotency_key < ? "
++                       "AND status NOT IN ('done', 'archived') "
++                       "ORDER BY created_at, id LIMIT 1", (DETECTOR, key, key + "\U0010ffff")).fetchone()
++    return row["id"] if row is not None else None
+ 
+ 
+ def _minutes(since_ms: int, now_ms: int) -> int:
+@@ -371,17 +364,23 @@ def _create(conn, *, key: str, title: str, body: str, tenant: Optional[str], own
+     machines = None if reg is None else (reg.get("machines") or {})
+     assignee = _supervisor_profile()
+     runs_on, why = alarm_placement(own, machines, assignee=assignee, now_ms=now_ms)
+-    existing = _covering_repair(conn, key, now_ms)
+-    if existing:
+-        _replace_stranded(conn, existing, own, machines, runs_on, why)
+-        return existing
+-    # A repair closed long ago is replaced, so the key carries the creation time (create_task returns any
+-    # non-archived task with an equal key, done ones included).
+-    return kb.create_task(conn, title=title, body=body + f"\n\nPlaced with runs_on {runs_on}: {why}."
+-                          + _tail(conn, own, howto), assignee=assignee, created_by=DETECTOR,
+-                          workspace_kind="scratch",
+-                          tenant=tenant, requires=list(_REQUIRES), idempotency_key=f"{key}{_now_ms()}",
+-                          runs_on=runs_on, priority=priority)
++    from hermes_cli.kanban_db_comment_ids import add_comment
++    from uuid import uuid4
++    with kb.write_txn(conn):
++        existing = _covering_repair(conn, key, now_ms)
++        if existing:
++            note = f"Watcher firing:\n\n{body}"
++            if not conn.execute("SELECT 1 FROM task_comments WHERE task_id=? AND author=? AND body=? LIMIT 1",
++                                (existing, DETECTOR, note)).fetchone():
++                add_comment(conn, existing, DETECTOR, note)
++        else:
++            # Positive decimal suffix preserves the authenticated Board alarm identity contract.
++            return kb.create_task(conn, title=title, body=body + f"\n\nPlaced with runs_on {runs_on}: {why}."
++                                  + _tail(conn, own, howto), assignee=assignee, created_by=DETECTOR,
++                                  workspace_kind="scratch", tenant=tenant, requires=list(_REQUIRES),
++                                  idempotency_key=f"{key}{uuid4().int}", runs_on=runs_on, priority=priority)
++    _replace_stranded(conn, existing, own, machines, runs_on, why)
++    return existing
+ 
+ 
+ # Host-wide causes: one card per host, never one per pinned card. ``hold`` is an operator's deliberate state.
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall.py b/tests/hermes_cli/test_kanban_pickup_stall.py
+index d9984a1da3fdefb58a7dc38cc6c776c473bbf3d8..a970b15865f93e769655c422fd2945146464be07 100644
+--- a/tests/hermes_cli/test_kanban_pickup_stall.py
++++ b/tests/hermes_cli/test_kanban_pickup_stall.py
+@@ -93,7 +93,7 @@ def test_the_skip_reason_is_recorded_once_per_reason_and_shown_on_the_target_hos
+ 
+ @pytest.mark.parametrize("closed,closed_ago,want", [
+     (None, 0, 1),             # open: reused
+-    ("done", 60, 1),          # just finished: not handed straight back
++    ("done", 60, 2),          # a closed incident never covers a new firing
+     ("done", 3601, 2),        # finished over an hour ago and still stalled: replaced
+     ("archived", 3601, 2),
+ ])
+diff --git a/tests/hermes_cli/test_pickup_incident_append.py b/tests/hermes_cli/test_pickup_incident_append.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..69d0231ae2ac6227cd995e73cc75bd28624783aa
+--- /dev/null
++++ b/tests/hermes_cli/test_pickup_incident_append.py
+@@ -0,0 +1,54 @@
++"""Pickup watcher firings retain one open subject and append new evidence."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_pickup_stall as pickup
++from tests.hermes_cli import test_kanban_pickup_stall as support
++
++svc = support.svc
++gws = support.gws
++alarm_worker_pool = support.alarm_worker_pool
++
++
++def fire(worker, subject="queue-full"):
++    worker.enter()
++    return pickup._create(
++        worker.conn, key=f"pickup-stall:{support.WORKER}:{subject}:",
++        title=f"Pickup incident {subject}", body="Still stalled: fresh observation",
++        tenant=None, own=support.WORKER, now_ms=pickup._now_ms(),
++    )
++
++
++def test_repeat_appends_one_comment(gws):
++    _, worker = gws
++    first = fire(worker)
++    assert fire(worker) == first
++    assert len(support._repairs(worker.conn)) == 1
++    comments = kb.list_comments(worker.conn, first)
++    assert len(comments) == 1
++    assert "fresh observation" in comments[0].body
++    assert fire(worker) == first
++    assert len(kb.list_comments(worker.conn, first)) == 1
++    from hermes_cli.kanban_pickup_alarm_identity import refusal
++    task = kb.get_task(worker.conn, first)
++    identity = {"idempotency_key": task.idempotency_key, "created_by": task.created_by,
++                "created_on": support.WORKER}
++    assert refusal(identity, support.WORKER) == "pickup_stall_source"
++    assert refusal(identity, "worker-2") is None
++
++
++def test_distinct_subjects_have_distinct_incidents(gws):
++    _, worker = gws
++    assert fire(worker) != fire(worker, "hold")
++    assert len(support._repairs(worker.conn)) == 2
++
++
++@pytest.mark.parametrize("status", ["done", "archived"])
++def test_closed_incident_is_replaced_immediately(gws, status):
++    _, worker = gws
++    first = fire(worker)
++    with kb.write_txn(worker.conn):
++        worker.conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, first))
++    assert fire(worker) != first
++    assert len(support._repairs(worker.conn)) == 2
++    assert not kb.list_comments(worker.conn, first)
+-- 
+2.43.0
+

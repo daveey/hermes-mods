@@ -1,0 +1,168 @@
+From 1ab7523ca8ca22de9a25d795f47c9a6b7b5ede56 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:52:46 +0000
+Subject: [PATCH] [daveey] lifecycle guard: spell a reprinted heredoc word as a
+ synthetic plain delimiter
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Review 5906108098 on PR #3020 (exact head 4c0e4f17c4) found a fail-open:
+
+    {
+    cat <<$(echo E) <<A
+    x
+    $(echo E)
+    }
+    A
+    cat f.py
+    } | python3
+
+Bash reads body 1 up to `$(echo E)`, then body 2 (`}`) up to `A`, so
+`cat f.py` stays in the group and feeds python3. The guard scanned it
+(False, None): each terminator view dropped every `<<` word on the opener,
+the plain `<<A` included, but kept body 2's lines, so its `}` closed the
+outer group early. Same for `<<$(echo  E|cat) <<A` and `<<$(echo E) <<-A`.
+
+Five whys: the view built by `_without_heredoc_words` removed words but
+only the first body's lines; it modelled one heredoc per opener; the
+reprinted-word fix assumed a lone `$(…)` word; no test put a second word on
+the opener; so the later body's lines reached the group walk.
+
+Fix (the reviewer's suggestion): each view now replaces the first
+reprinted word with a synthetic plain delimiter (keeping `<<-`) and the
+candidate `$(` line with the same word, then re-walks the view with the
+normal heredoc_body_walk, which takes every later word on the opener in
+bash's order. Further reprinted words on the opener recurse the same way
+under the existing 16-view cap. An opener whose reprinted word does not
+parse at all keeps the old drop-the-words view.
+
+Tests: tests/cron/test_lifecycle_guard_heredoc_delimiters.py gains six
+two-word opener shapes (each also checked in real bash with a harmless
+marker) and a harmless two-word group that stays allowed. RED at 4c0e4f17c4:
+the three reviewer shapes fail. GREEN: 109/109.
+---
+ cron/lifecycle_guard_groups.py                | 40 ++++++++++++++++---
+ ...test_lifecycle_guard_heredoc_delimiters.py | 36 +++++++++++++++++
+ 2 files changed, 70 insertions(+), 6 deletions(-)
+
+diff --git a/cron/lifecycle_guard_groups.py b/cron/lifecycle_guard_groups.py
+index 8268128ba815916be703cd3a228badf1a825014a..47ac89c86369b2fa5583b9a99cd456bab335ef96 100644
+--- a/cron/lifecycle_guard_groups.py
++++ b/cron/lifecycle_guard_groups.py
+@@ -426,7 +426,7 @@ def heredoc_scripts(command: str) -> Iterator[str]:
+     (``tools.shell_heredoc_words``), which is not predicted here. Such an opener stops the body
+     walk and its body's lines stay in the script, where a ``}`` would close an outer group early.
+     So the script is also yielded once per later line holding ``$(`` (each a line bash could end
+-    the body at), with the opener's heredoc words and the body through that line removed. Past
++    the body at), with the word and that line spelled as one synthetic plain delimiter. Past
+     ``MAX_REPRINTED_TERMINATOR_VIEWS`` such lines, see ``heredoc_views_overflow``."""
+     return (script for script in _heredoc_scripts(command) if script is not None)
+ 
+@@ -474,23 +474,51 @@ def _heredoc_scripts(command: str) -> Iterator[Optional[str]]:
+ 
+ 
+ def _reprinted_terminator_views(text: str, unit_start: int, unit_end: int) -> Iterator[str]:
+-    """*text* without the heredoc words of its stopped command unit and without the lines after
+-    it through a later line holding ``$(``: one view per such line. None unless the unit holds a
+-    ``$(`` after a ``<<`` (only then may bash's terminator be a line the opener parser missed)."""
++    """One view of *text* per later line holding ``$(``, each a line bash may end the stopped
++    unit's first ``$(…)``-delimited body at. The view spells that word and that line as one
++    synthetic plain delimiter, so a re-walk takes the body, and any later heredoc word on the
++    opener, in bash's order. None unless the unit holds a ``$(`` after a ``<<`` (only then may
++    bash's terminator be a line the opener parser missed). A unit with no such word that parses
++    falls back to dropping its heredoc words and the lines through the candidate line."""
+     unit = text[unit_start:unit_end]
+     opener = unit.find("<<")
+     if opener < 0 or "$(" not in unit[opener:]:
+         return
+-    neutral = text[:unit_start] + _without_heredoc_words(unit)
++    word = _first_reprinted_word(unit)
++    synthetic = "HERMES_REPRINTED_DELIMITER"
++    while synthetic in text:
++        synthetic += "_"
+     line_start = unit_end + 1
+     while line_start < len(text):
+         line_end = text.find("\n", line_start)
+         line_end = len(text) if line_end < 0 else line_end
+         if "$(" in text[line_start:line_end]:
+-            yield neutral + text[line_end:]
++            if word is None:
++                yield text[:unit_start] + _without_heredoc_words(unit) + text[line_end:]
++            else:
++                start, end, strip_tabs = word
++                yield (text[:unit_start] + unit[:start] + ("<<-" if strip_tabs else "<<") + synthetic
++                       + unit[end:] + text[unit_end:line_start] + synthetic + text[line_end:])
+         line_start = line_end + 1
+ 
+ 
++def _first_reprinted_word(unit: str) -> Optional[tuple[int, int, bool]]:
++    """``(start, end, strip_tabs)`` of the first ``<<`` word in *unit* only bash's reprint ends
++    (``<<$(echo E)``), past any exact words before it; None when an earlier word does not parse."""
++    from tools.shell_heredoc import _parse_heredoc_operator
++
++    cursor = 0
++    for match in _HEREDOC_OPERATOR.finditer(unit):
++        if match.start() < cursor:
++            continue
++        parsed = _parse_heredoc_operator(unit, match.start())
++        if parsed is None:
++            parsed = _parse_heredoc_operator(unit, match.start(), reprinted_ok=True)
++            return None if parsed is None else (match.start(), parsed[0], parsed[2])
++        cursor = parsed[0]
++    return None
++
++
+ def _without_heredoc_words(unit: str) -> str:
+     """*unit* without its ``<<`` operators and their delimiter words (to its end past a word that
+     does not parse), so ``cat <<$(echo })| python3`` keeps ``cat | python3`` and no ``}``."""
+diff --git a/tests/cron/test_lifecycle_guard_heredoc_delimiters.py b/tests/cron/test_lifecycle_guard_heredoc_delimiters.py
+index fee2c87b64fe971a543309c04a01f824b53e2ef8..5bf85dd276e0288c0bd83f45ebc2e37b6ff32e79 100644
+--- a/tests/cron/test_lifecycle_guard_heredoc_delimiters.py
++++ b/tests/cron/test_lifecycle_guard_heredoc_delimiters.py
+@@ -141,6 +141,42 @@ def test_later_heredoc_in_a_terminator_view_is_split_from_the_group(tmp_path):
+     assert scan_gateway_lifecycle(command) == (True, None)
+ 
+ 
++# (words after the first ``<<``, first body's terminator, second body's terminator): bash reads
++# both bodies in order, so the second body's ``}`` line never closes the group.
++TWO_WORD_OPENERS = [
++    ("$(echo E) <<A", "$(echo E)", "A"),
++    ("$(echo  E|cat) <<A", "$(echo E | cat)", "A"),
++    ("$(echo E) <<-A", "$(echo E)", "\tA"),
++    ("A <<$(echo E)", "A", "$(echo E)"),
++    ("$(echo E) <<$(echo F)", "$(echo E)", "$(echo F)"),
++    ("$(echo E) <<'$(echo  F)'", "$(echo E)", "$(echo  F)"),
++]
++
++
++def _two_body_group(words: str, first: str, second: str, inner: str, sink: str) -> str:
++    return f"{{\ncat <<{words}\nx\n{first}\n}}\n{second}\n{inner}\n}} | {sink}"
++
++
++@pytest.mark.parametrize(("words", "first", "second"), TWO_WORD_OPENERS)
++def test_group_feed_after_two_heredocs_on_one_opener_is_scanned(tmp_path, words, first, second):
++    command = _two_body_group(words, first, second, f"cat {_lifecycle_script(tmp_path)}", "python3")
++    assert scan_gateway_lifecycle(command) == (True, None)
++
++
++@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
++@pytest.mark.parametrize(("words", "first", "second"), TWO_WORD_OPENERS)
++def test_bash_reads_both_bodies_of_one_opener(words, first, second):
++    command = _two_body_group(words, first, second, "echo MARKER_FED", "cat")
++    result = subprocess.run(["bash", "-c", command], capture_output=True, text=True,
++                            timeout=20, check=False)
++    assert "MARKER_FED" in result.stdout.splitlines(), result.stderr
++
++
++def test_two_heredocs_on_one_opener_with_harmless_group_stay_allowed():
++    command = _two_body_group("$(echo  E|cat) <<A", "$(echo E | cat)", "A", "echo fed", "cat")
++    assert scan_gateway_lifecycle(command) == (False, None)
++
++
+ def _candidate_lines(count: int) -> str:
+     lines = [f"echo $(echo {index})" for index in range(count)]
+     return "\n".join(["{", "cat <<$(echo E)", *lines, "} | cat"])
+-- 
+2.43.0
+

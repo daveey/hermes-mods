@@ -1,0 +1,386 @@
+From 9b85c0d05905b4ecd120c5e31d6403b909af35eb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 15:23:42 +0000
+Subject: [PATCH] perf(roster): gate owner reads on input and store generation
+ [daveey]
+
+Roster only needs membership, not complete session payloads or token flushes.
+Repeated polls hydrated system prompts/tool schemas for every live work owner
+and discovered route namespaces even when all owners had authoritative stored
+ids. Gate those reads on their actual inputs and committed connection generation;
+keep registry enumeration, scope and execution-observation clocks fresh.
+
+Memo is per SessionDB object/actual connection, invalidated by total_changes,
+data_version, namespace changes and new owner candidates. Pending transactions
+are uncached so rollback cannot preserve an uncommitted answer. Entries retain
+only current keys. Narrow get_session_list_row avoids the unrelated payload path.
+
+RED: full hydration assertion and 3-vs-1 owner-resolution count both fail on
+original handler. GREEN: 41 focused tests, then 9 invalidation and 51 admission
+consumer tests passed; scripts/check all 20 checks OK. Due-time expiry, activity,
+generation, process exit, ownership, namespace, external commit, replacement DB,
+rollback and write-during-read covered.
+
+Synthetic 467-call nonempty K=2/8/32 replay (distinct live PIDs, real SessionDB,
+210KB prompt per owner): CPU 1.249852->0.430085s, 1.833212->0.314934s,
+3.298628->0.497315s. Component profiles retained separately; no assertion of
+historical K, deployment or combined whole-rpc acceptance. Parent J owns the
+unchanged <=1% whole-row gate; no serve lifecycle/workload changes performed.
+---
+ tests/tui_gateway/test_roster_cost_replay.py  |  61 +++++++++
+ tests/tui_gateway/test_roster_input_gate.py   |  58 ++++++++
+ .../test_roster_owner_invalidation.py         | 129 ++++++++++++++++++
+ tui_gateway/methods_subagents.py              |  10 +-
+ tui_gateway/roster_owner_reads.py             |  39 ++++++
+ 5 files changed, 294 insertions(+), 3 deletions(-)
+ create mode 100644 tests/tui_gateway/test_roster_cost_replay.py
+ create mode 100644 tests/tui_gateway/test_roster_input_gate.py
+ create mode 100644 tests/tui_gateway/test_roster_owner_invalidation.py
+ create mode 100644 tui_gateway/roster_owner_reads.py
+
+diff --git a/tests/tui_gateway/test_roster_cost_replay.py b/tests/tui_gateway/test_roster_cost_replay.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..896cdd1987d743d00327a5881326913a0c558937
+--- /dev/null
++++ b/tests/tui_gateway/test_roster_cost_replay.py
+@@ -0,0 +1,61 @@
++"""Synthetic K-scale replay, not a replacement for the frozen live whole-RPC gate."""
++import cProfile
++import json
++import pstats
++import time
++
++import pytest
++
++from tests.tui_gateway import test_process_subagent_observation_rpc as rpc
++
++runtime = rpc.runtime
++sleeper = rpc.sleeper
++_REAL_SCOPE = rpc.keo.local_scope
++
++
++@pytest.mark.parametrize("k", [2, 8, 32])
++def test_nonempty_roster_replay(runtime, sleeper, monkeypatch, k):
++    from tui_gateway import server
++    from tui_gateway.roster_owner_reads import _memos
++    db = server._get_db()
++    monkeypatch.setattr(rpc.keo, "local_scope", _REAL_SCOPE)
++    for i in range(k):
++        sid = f"replay-{i}"
++        db.create_session(sid, source="desktop", system_prompt="roster replay payload " * 10000)
++        rpc._register(runtime, f"proc_{i}", sleeper().pid, parent_session_id=sid)
++    # Same registry + SQLite + projector, old membership path vs new. Never live traffic.
++    new_resolve = server._stored_owner
++    def old_resolve(db, ids, namespaces):
++        if ids[0]:
++            return ids[0] if db.get_session(ids[0]) else ""
++        return new_resolve(db, ids, namespaces)
++    import tui_gateway.roster_owner_reads as reads
++    gate = reads.resolve_owners
++    def baseline_gate(db, owners, namespaces, resolve):
++        # The original handler unconditionally discovered namespaces, even when
++        # every owner supplied a durable id (this fixture's launch-profile case).
++        namespaces = server._route_namespaces(None)
++        return {ids: old_resolve(db, ids, namespaces) for _, ids, _ in owners}
++    results = []
++    for label in ("before", "after"):
++        _memos.clear()
++        monkeypatch.setattr(reads, "resolve_owners", baseline_gate if label == "before" else gate)
++        runtime.call("subagent.roster")
++        start = time.process_time()
++        for _ in range(467):
++            assert len(runtime.call("subagent.roster")["sessions"]) == k
++        unprofiled_cpu = time.process_time() - start
++        profiler = cProfile.Profile(timer=time.process_time)
++        start = time.process_time()
++        profiler.enable()
++        for _ in range(467):
++            rows = runtime.call("subagent.roster")["sessions"]
++            assert len(rows) == k and all(row["background"] == 1 for row in rows)
++        profiler.disable()
++        cpu = time.process_time() - start
++        stats = pstats.Stats(profiler)
++        components = {name: sum(v[3] for key, v in stats.stats.items() if key[2] == name)
++                      for name in ("get_session", "get_session_list_row", "resolve_owners", "_route_namespaces",
++                                   "_observation_scope", "_roster_observations", "_live_work_owners")}
++        results.append({"mode": label, "k": k, "calls": 467, "cpu_s": unprofiled_cpu, "profiled_cpu_s": cpu, "components": components})
++    print("ROSTER_REPLAY " + json.dumps(results, sort_keys=True))
+diff --git a/tests/tui_gateway/test_roster_input_gate.py b/tests/tui_gateway/test_roster_input_gate.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0177e8967264a6fa2235a1449767ced919145d0d
+--- /dev/null
++++ b/tests/tui_gateway/test_roster_input_gate.py
+@@ -0,0 +1,58 @@
++"""Nonempty roster input-cost replay and invalidation checks."""
++import cProfile
++import pstats
++import time
++
++from tests.tui_gateway import test_process_subagent_observation_rpc as rpc
++
++runtime = rpc.runtime
++_REAL_SCOPE = rpc.keo.local_scope
++
++
++def test_roster_does_not_hydrate_session_payloads(runtime, monkeypatch):
++    from tui_gateway import server
++    db = server._get_db()
++    rpc._child(runtime)
++    calls = []
++    original = db.get_session
++    def read(sid):
++        calls.append(sid)
++        return original(sid)
++    monkeypatch.setattr(db, "get_session", read)
++    assert len(runtime.call("subagent.roster")["sessions"]) == 1
++    assert calls == [], "membership must not flush accounting or hydrate prompts/config"
++
++
++def test_roster_stable_owners_skip_resolution(runtime, monkeypatch):
++    from tui_gateway import server as methods
++    rpc._child(runtime)
++    calls = []
++    original = methods._stored_owner
++    def resolve(*args):
++        calls.append(1)
++        return original(*args)
++    monkeypatch.setattr(methods, "_stored_owner", resolve)
++    for _ in range(3):
++        assert len(runtime.call("subagent.roster")["sessions"]) == 1
++    assert len(calls) == 1
++
++
++def test_roster_component_profile(runtime, monkeypatch):
++    import os
++    monkeypatch.setattr(rpc.keo, "local_scope", _REAL_SCOPE)
++    for i in range(2):
++        rpc._register(runtime, f"proc_{i}", os.getpid(), parent_session_id="parent-a")
++    from tui_gateway import server
++    db = server._get_db()
++    for i in range(8):
++        sid = f"roster-owner-{i}"
++        db.create_session(sid, source="desktop")
++        rpc._child(runtime, f"c{i}", owner=sid, activity=time.time())
++    profiler = cProfile.Profile()
++    start = time.process_time()
++    profiler.enable()
++    for _ in range(100):
++        assert len(runtime.call("subagent.roster")["sessions"]) == 9
++    profiler.disable()
++    print("CPU", time.process_time() - start)
++    pstats.Stats(profiler).sort_stats("cumtime").print_stats(35)
+diff --git a/tests/tui_gateway/test_roster_owner_invalidation.py b/tests/tui_gateway/test_roster_owner_invalidation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fc835a73a74f27764bb167c5ebf67b9162824b7f
+--- /dev/null
++++ b/tests/tui_gateway/test_roster_owner_invalidation.py
+@@ -0,0 +1,129 @@
++"""Invalidation of roster membership never invalidates/fakes activity clocks."""
++import sqlite3
++import time
++
++from tests.tui_gateway import test_process_subagent_observation_rpc as rpc
++
++runtime = rpc.runtime
++sleeper = rpc.sleeper
++
++
++def test_owner_add_remove_and_reassignment(runtime):
++    from tui_gateway import server
++    db = server._get_db()
++    child = rpc._child(runtime, owner="new-owner")
++    assert rpc._roster(runtime) == {}
++    db.create_session("new-owner", source="desktop")
++    assert set(rpc._roster(runtime)) == {"new-owner"}
++    child["owner_agent_session_id"] = "parent-a"
++    assert set(rpc._roster(runtime)) == {"parent-a"}
++    runtime.active.clear()
++    assert rpc._roster(runtime) == {}
++
++
++def test_external_commit_invalidates_membership(runtime):
++    from tui_gateway import server
++    db = server._get_db()
++    rpc._child(runtime)
++    assert set(rpc._roster(runtime)) == {"parent-a"}
++    with sqlite3.connect(db.db_path) as conn:
++        conn.execute("DELETE FROM sessions WHERE id = ?", ("parent-a",))
++    assert rpc._roster(runtime) == {}
++
++
++def test_new_store_same_version_never_inherits_owner(runtime, tmp_path, monkeypatch):
++    from hermes_state import SessionDB
++    from tui_gateway import server
++    rpc._child(runtime)
++    assert set(rpc._roster(runtime)) == {"parent-a"}
++    other = SessionDB(db_path=tmp_path / "other.db")
++    try:
++        other.create_session("foreign", source="desktop")
++        monkeypatch.setattr(server, "_get_db", lambda: other)
++        assert rpc._roster(runtime) == {}
++    finally:
++        other.close()
++
++
++def test_due_time_and_fresh_activity_project_on_cached_membership(runtime, monkeypatch):
++    now = time.time()
++    child = rpc._child(runtime, activity=now, started=now)
++    monkeypatch.setattr(time, "time", lambda: now + 179)
++    before = rpc._roster(runtime)["parent-a"]["execution_observations"][0]
++    assert before["state"] == "running"
++    monkeypatch.setattr(time, "time", lambda: now + 181)
++    expired = rpc._roster(runtime)["parent-a"]["execution_observations"][0]
++    assert expired["state"] == "unknown" and expired["observed_at"] == now
++    child["agent"].activity = now + 181
++    fresh = rpc._roster(runtime)["parent-a"]["execution_observations"][0]
++    assert fresh["state"] == "running" and fresh["observed_at"] == now + 181
++    child["agent"].session_id = "replacement-generation"
++    assert rpc._roster(runtime)["parent-a"]["execution_observations"][0]["identity"]["work_id"] == "replacement-generation"
++
++
++def test_route_namespace_change_invalidates_without_db_write(runtime, monkeypatch):
++    from tui_gateway import server
++    db = server._get_db()
++    route = "agent:main:local:dm:owner"
++    db.create_session("route-owner", source="local", session_key=route)
++    rpc._register(runtime, "proc_route", 0, session_key=route)
++    monkeypatch.setattr(server, "_route_namespaces", lambda _: {"main"})
++    assert set(rpc._roster(runtime)) == {"route-owner"}
++    monkeypatch.setattr(server, "_route_namespaces", lambda _: {"other"})
++    assert rpc._roster(runtime) == {}
++
++
++def test_stored_owners_do_not_discover_route_namespaces(runtime, monkeypatch):
++    from tui_gateway import server
++    rpc._child(runtime)
++    calls = []
++    monkeypatch.setattr(server, "_route_namespaces", lambda _: calls.append(1) or {"main"})
++    assert set(rpc._roster(runtime)) == {"parent-a"}
++    assert calls == []
++    rpc._register(runtime, "proc_route", 0, session_key="agent:main:local:dm:missing")
++    rpc._roster(runtime)
++    assert calls == [1]
++
++
++def test_process_exit_and_new_owner_are_not_memoized(runtime, sleeper):
++    from tui_gateway import server
++    server._get_db().create_session("other-owner", source="desktop")
++    rpc._register(runtime, "proc_live", sleeper().pid, parent_session_id="parent-a")
++    assert rpc._roster(runtime)["parent-a"]["background"] == 1
++    process = runtime.registry._running["proc_live"]
++    process.parent_session_id = "other-owner"
++    assert set(rpc._roster(runtime)) == {"other-owner"}
++    process.exited = True
++    assert rpc._roster(runtime) == {}
++
++
++def test_pending_transaction_result_is_not_reused_after_rollback(runtime):
++    from tui_gateway import server
++    from tui_gateway.roster_owner_reads import resolve_owners
++    db = server._get_db()
++    owners = [("subagents", ("parent-a", ""), {})]
++    def resolve(db, ids, namespaces):
++        return ids[0] if db._conn.execute("SELECT id FROM sessions WHERE id = ?", (ids[0],)).fetchone() else ""
++    assert resolve_owners(db, owners, set(), resolve)[("parent-a", "")] == "parent-a"
++    db._conn.execute("BEGIN")
++    try:
++        db._conn.execute("DELETE FROM sessions WHERE id = ?", ("parent-a",))
++        assert resolve_owners(db, owners, set(), resolve)[("parent-a", "")] == ""
++    finally:
++        db._conn.rollback()
++    assert resolve_owners(db, owners, set(), resolve)[("parent-a", "")] == "parent-a"
++
++
++def test_change_during_resolve_is_not_published(runtime):
++    from tui_gateway import server
++    from tui_gateway.roster_owner_reads import resolve_owners
++    db = server._get_db()
++    calls = []
++    def resolve(db, ids, namespaces):
++        calls.append(ids)
++        db.create_session(f"changed-{len(calls)}", source="desktop")
++        return ids[0]
++    owners = [("subagents", ("parent-a", ""), {})]
++    resolve_owners(db, owners, {"main"}, resolve)
++    resolve_owners(db, owners, {"main"}, resolve)
++    assert len(calls) == 2
+diff --git a/tui_gateway/methods_subagents.py b/tui_gateway/methods_subagents.py
+index 5aa42c0634fff27de9469ef4626235dcf5c344ef..4db31ddd5ce76a720531f948eae4873e4efbff68 100644
+--- a/tui_gateway/methods_subagents.py
++++ b/tui_gateway/methods_subagents.py
+@@ -154,7 +154,7 @@ def _stored_owner(db, owner_ids, namespaces):
+     profile's store."""
+     stored_id, route = owner_ids
+     if stored_id:
+-        return stored_id if db.get_session(stored_id) else ""
++        return stored_id if db.get_session_list_row(stored_id) else ""
+     parts = route.split(":")
+     if len(parts) < 3 or parts[0] != "agent" or parts[1] not in namespaces:
+         return ""
+@@ -181,12 +181,16 @@ def _(rid, params):
+     counts = {}
+     work = {}
+     profile_home = _profile_home(scope.get("profile"))
+-    namespaces = _route_namespaces(profile_home)
++    # Stored owner ids are authoritative; route namespace discovery is irrelevant
++    # unless a live process actually needs the legacy route fallback.
++    namespaces = _route_namespaces(profile_home) if any(not ids[0] for _, ids, _ in owners) else set()
+     with _profile_db(scope) as db:
+         if db is None:
+             return _ok(rid, {"sessions": []})
++        from tui_gateway.roster_owner_reads import resolve_owners
++        resolved = resolve_owners(db, owners, namespaces, _stored_owner)
+         for kind, owner_ids, item in owners:
+-            if sid := _stored_owner(db, owner_ids, namespaces):
++            if sid := resolved[owner_ids]:
+                 counts.setdefault(sid, {"subagents": 0, "background": 0})[kind] += 1
+                 work.setdefault(sid, []).append((kind, item))
+     profile = _profile_label(profile_home)
+diff --git a/tui_gateway/roster_owner_reads.py b/tui_gateway/roster_owner_reads.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1a6487a517779b428d6689bc9e1b4cce65f45f02
+--- /dev/null
++++ b/tui_gateway/roster_owner_reads.py
+@@ -0,0 +1,39 @@
++"""Roster membership memo; never caches live work or execution observations.
++
++One memo per SessionDB object and its actual writer connection generation. Same-
++connection writes and external commits invalidate it; a reopened/replaced handle
++cannot share it. Retain only this request's owner keys, not historical sessions.
++"""
++import threading
++import weakref
++
++_lock = threading.RLock()
++_memos = weakref.WeakKeyDictionary()
++
++
++def resolve_owners(db, owners, namespaces, resolve):
++    """Map owner candidate tuples to stored ids; project activity separately each poll.
++
++    No time-based membership predicates exist in the resolver. Namespace fences
++    are part of the key; fresh live ownership inputs select the keys each time.
++    Stores without a generation protocol retain the uncached behavior.
++    """
++    keys = dict.fromkeys(ids for _kind, ids, _item in owners)
++    generation = getattr(db, "_write_generation", None)
++    if not callable(generation):
++        return {ids: resolve(db, ids, namespaces) for ids in keys}
++    with _lock:
++        before = generation()
++        # A read that can see pending writes must never survive their rollback.
++        if not isinstance(before, tuple) or before[0].in_transaction:
++            _memos.pop(db, None)
++            return {ids: resolve(db, ids, namespaces) for ids in keys}
++        fence = frozenset(namespaces)
++        previous = _memos.get(db)
++        saved = previous[2] if previous and previous[:2] == (before, fence) else {}
++        result = {ids: saved[ids] if ids in saved else resolve(db, ids, namespaces) for ids in keys}
++        if generation() == before:
++            _memos[db] = (before, fence, result)
++        else:
++            _memos.pop(db, None)
++        return result
+-- 
+2.43.0
+

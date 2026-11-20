@@ -1,0 +1,136 @@
+From f3b38437226840cbece360da5601d18144264a8c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 15:29:07 +0000
+Subject: [PATCH] fix(kanban): allow explicit missing-requester priority
+ fallback [daveey]
+
+Problem: review producers can name implementation cards absent from the
+executor board/replica, causing effective-priority CLI exit 1.
+Why 1: snapshot raises when it cannot find a local urgency observation.
+Why 2: the producer interface had no caller-selected recovery policy.
+Root (happened): missing advisory metadata and fatal lookup errors shared
+one undifferentiated error path.
+Root (not caught): prior tests verified strict failure, not recovery for
+a caller which can proceed with a known fallback.
+Recurrence: reported cross-gateway review filing on PR3301; history and
+PR search found no existing fix.
+
+Countermeasure: typed MissingRequester (still ValueError compatible) and
+opt-in --fallback INT. Emit fallback_reason in JSON only for this case;
+strict callers and unreadable/missing databases still exit nonzero.
+The state shipping helper independently tolerates older failing modules.
+Review independence, required CI and landing authority are unchanged.
+
+Proof: five new fallback cases failed on parent f1fb52d592fd (unknown
+--fallback); existing four tests passed. Coverage includes zero, signed
+and positive fallback, existing requester, missing database, strict
+missing requester and actual bootstrapped subprocess/read-only bytes.
+---
+ hermes_cli/kanban_effective_priority.py       | 13 +++++-
+ .../test_kanban_effective_priority.py         | 45 +++++++++++++++++++
+ 2 files changed, 57 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/kanban_effective_priority.py b/hermes_cli/kanban_effective_priority.py
+index 1bde8a7b4083d485df36422f33797e30192f0ab8..5ac5f3f3fa77565e2bb4d7f00f869d8ea6d8ccde 100644
+--- a/hermes_cli/kanban_effective_priority.py
++++ b/hermes_cli/kanban_effective_priority.py
+@@ -6,6 +6,10 @@ import json
+ import sqlite3
+ 
+ 
++class MissingRequester(ValueError):
++    """The board is readable but has no urgency observation for this requester."""
++
++
+ def snapshot(task_id: str, *, board=None) -> dict:
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_admission_score import effective_priorities
+@@ -18,7 +22,7 @@ def snapshot(task_id: str, *, board=None) -> dict:
+         conn.row_factory = sqlite3.Row
+         value = effective_priorities(conn, [task_id]).get(task_id)
+         if value is None:
+-            raise ValueError("requester is absent from the board and replica")
++            raise MissingRequester("requester is absent from the board and replica")
+         return {"task_id": task_id, "board": board_of(conn), "priority": value}
+ 
+ 
+@@ -26,9 +30,16 @@ def main(argv=None):
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("task_id")
+     parser.add_argument("--board")
++    parser.add_argument("--fallback", type=int,
++                        help="use this priority only when the requester is absent (reported in JSON)")
+     args = parser.parse_args(argv)
+     try:
+         result = snapshot(args.task_id, board=args.board)
++    except MissingRequester as exc:
++        if args.fallback is None:
++            parser.exit(1, f"effective priority unavailable: {exc}\n")
++        result = {"task_id": args.task_id, "board": args.board, "priority": args.fallback,
++                  "fallback_reason": str(exc)}
+     except (OSError, sqlite3.Error, ValueError) as exc:
+         parser.exit(1, f"effective priority unavailable: {exc}\n")
+     print(json.dumps(result))
+diff --git a/tests/hermes_cli/test_kanban_effective_priority.py b/tests/hermes_cli/test_kanban_effective_priority.py
+index f6b1e0bb1d3a17768b8571a30437145aeeb0e381..c8ee221293be4832e019ee62a90e6b6d0e68eafd 100644
+--- a/tests/hermes_cli/test_kanban_effective_priority.py
++++ b/tests/hermes_cli/test_kanban_effective_priority.py
+@@ -51,6 +51,14 @@ def test_bootstrapped_producer_cli(tmp_path, monkeypatch):
+                             text=True, encoding='utf-8', timeout=45, check=False)
+     assert result.returncode == 0, result.stderr
+     assert json.loads(result.stdout) == {'task_id': tid, 'board': 'default', 'priority': 37}
++    command = runtime_command(root, ['absent', '--board', 'default', '--fallback', '19'],
++                              module='hermes_cli.kanban_effective_priority')
++    result = subprocess.run(command, env=build_subprocess_env(), capture_output=True,
++                            text=True, encoding='utf-8', timeout=45, check=False)
++    assert result.returncode == 0, result.stderr
++    assert json.loads(result.stdout) == {
++        'task_id': 'absent', 'board': 'default', 'priority': 19,
++        'fallback_reason': 'requester is absent from the board and replica'}
+     assert path.read_bytes() == before
+ 
+ 
+@@ -60,3 +68,40 @@ def test_absent_requester_is_not_zero(tmp_path, monkeypatch):
+     monkeypatch.setattr(kb, 'kanban_db_path', lambda board=None: path)
+     with pytest.raises(ValueError, match='absent'):
+         ep.snapshot('absent')
++    with pytest.raises(SystemExit) as exc:
++        ep.main(['absent'])
++    assert exc.value.code == 1
++
++
++@pytest.mark.parametrize('fallback', [0, -17, 731])
++def test_missing_requester_optional_fallback(tmp_path, monkeypatch, capsys, fallback):
++    path = tmp_path / 'kanban.db'
++    kbc.connect(path).close()
++    monkeypatch.setattr(kb, 'kanban_db_path', lambda board=None: path)
++    before = path.read_bytes()
++    ep.main(['absent', '--fallback', str(fallback)])
++    result = json.loads(capsys.readouterr().out)
++    assert result == {'task_id': 'absent', 'board': None, 'priority': fallback,
++                      'fallback_reason': 'requester is absent from the board and replica'}
++    assert path.read_bytes() == before
++
++
++def test_existing_requester_ignores_fallback(tmp_path, monkeypatch, capsys):
++    path = tmp_path / 'kanban.db'
++    conn = kbc.connect(path)
++    tid = kb.create_task(conn, title='present', priority=37)
++    conn.close()
++    monkeypatch.setattr(kb, 'kanban_db_path', lambda board=None: path)
++    ep.main([tid, '--fallback', '99'])
++    result = json.loads(capsys.readouterr().out)
++    assert result['priority'] == 37
++    assert 'fallback_reason' not in result
++
++
++def test_missing_board_remains_fatal_with_fallback(tmp_path, monkeypatch):
++    path = tmp_path / 'missing.db'
++    monkeypatch.setattr(kb, 'kanban_db_path', lambda board=None: path)
++    with pytest.raises(SystemExit) as exc:
++        ep.main(['absent', '--fallback', '19'])
++    assert exc.value.code == 1
++    assert not path.exists()
+-- 
+2.43.0
+

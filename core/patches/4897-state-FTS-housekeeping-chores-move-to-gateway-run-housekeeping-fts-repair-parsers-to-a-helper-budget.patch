@@ -1,0 +1,205 @@
+From 8ecdb5ad1f0b7e47033f962b6f1f996c5a0291fc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 14:35:11 -0800
+Subject: [PATCH] state: FTS housekeeping chores move to
+ gateway/run_housekeeping_fts; repair parsers to a helper; budget test on a
+ fake clock [daveey]
+
+Code-health caps: gateway/run.py file lines, build_sessions_parser function lines, and no
+wall-clock sleep in tests (HX013).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gateway/run.py                                | 29 +------------
+ gateway/run_housekeeping_fts.py               | 34 +++++++++++++++
+ hermes_cli/subcommands/sessions.py            | 43 +++++++++++--------
+ .../hermes_state/test_fts_online_recovery.py  | 20 ++++++---
+ 4 files changed, 73 insertions(+), 53 deletions(-)
+ create mode 100644 gateway/run_housekeeping_fts.py
+
+diff --git a/gateway/run.py b/gateway/run.py
+index 35f2a98a6f143eecd8e4375e2045f856a25c3d95..0f6869e0fad6292e14aee08576fde1af1c664578 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -49,6 +49,7 @@ from gateway.run_common import _csv_or_list_to_set
+ from hermes_cli.fallback_config import pre_agent_fallback_notice
+ from gateway.turn_executor import _UnboundedThreadExecutor
+ from gateway.run_exit_reason import note_exit_cause, note_start_refused
++from gateway.run_housekeeping_fts import _housekeeping_deferred_fts_retry, _housekeeping_fts_backfill
+ from gateway.run_signal_handlers import _start_gateway_make_restart_signal_handler, repeat_stop_signal
+ from gateway import exit_deadline
+ 
+@@ -4271,34 +4272,6 @@ def _housekeeping_state_db_maintenance(launch: Optional[tuple[Path, Path]] = Non
+         release_or_close(_adb)
+ 
+ 
+-def _housekeeping_deferred_fts_retry() -> None:
+-    """A SessionDB opened while another process held the rebuild lock fails closed onto the LIKE fallback
+-    and the gateway stays up for days. Non-blocking, rate-limited inside SessionDB; no-op when not stale."""
+-    # Retry here, on the existing tick, against the shared instances this process already holds:
+-    # non-blocking admission, no new thread, rate-limited inside SessionDB. No-op when nothing is stale (one
+-    # attribute read per instance). See #100108.
+-    from hermes_state_registry import borrow_live_shared_session_dbs
+-    with borrow_live_shared_session_dbs() as _session_dbs:
+-        for _sdb in _session_dbs:
+-            _retry = getattr(_sdb, "retry_deferred_fts_recovery", None)
+-            if callable(_retry) and _retry():
+-                logger.info(
+-                    "Deferred state.db FTS rebuild completed in-process for %s; full-text search restored.",
+-                    getattr(_sdb, "db_path", "state.db"))
+-
+-
+-def _housekeeping_fts_backfill() -> None:
+-    """Advance a claimed chunked FTS backfill (online recovery, interrupted optimize) a bounded time per tick on
+-    the shared instances; no-op without a claim. Each chunk is one short write transaction
+-    (hermes_state_fts_online)."""
+-    from hermes_state_registry import borrow_live_shared_session_dbs
+-    with borrow_live_shared_session_dbs() as _session_dbs:
+-        for _sdb in _session_dbs:
+-            _advance = getattr(_sdb, "advance_fts_backfill", None)
+-            if callable(_advance):
+-                _advance()
+-
+-
+ def _housekeeping_memory_trim() -> None:
+     """Messaging-gateway counterpart to the TUI idle reaper; timer lane: full GC only once idle (#139763)."""
+     from hermes_cli.mem_trim import trim_memory_when_idle
+diff --git a/gateway/run_housekeeping_fts.py b/gateway/run_housekeeping_fts.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8a2005b8e51ef4b94996bb1c0753a950aba58ec5
+--- /dev/null
++++ b/gateway/run_housekeeping_fts.py
+@@ -0,0 +1,34 @@
++"""Gateway housekeeping chores for the state.db full-text search index (moved out of gateway/run.py). [daveey]"""
++
++import logging
++
++# Same logger identity as gateway/run.py, where these chores lived.
++logger = logging.getLogger("gateway.run")
++
++
++def _housekeeping_deferred_fts_retry() -> None:
++    """A SessionDB opened while another process held the rebuild lock fails closed onto the LIKE fallback
++    and the gateway stays up for days. Non-blocking, rate-limited inside SessionDB; no-op when not stale."""
++    # Retry here, on the existing tick, against the shared instances this process already holds:
++    # non-blocking admission, no new thread, rate-limited inside SessionDB. No-op when nothing is stale (one
++    # attribute read per instance). See #100108.
++    from hermes_state_registry import borrow_live_shared_session_dbs
++    with borrow_live_shared_session_dbs() as _session_dbs:
++        for _sdb in _session_dbs:
++            _retry = getattr(_sdb, "retry_deferred_fts_recovery", None)
++            if callable(_retry) and _retry():
++                logger.info(
++                    "Deferred state.db FTS rebuild completed in-process for %s; full-text search restored.",
++                    getattr(_sdb, "db_path", "state.db"))
++
++
++def _housekeeping_fts_backfill() -> None:
++    """Advance a claimed chunked FTS backfill (online recovery, interrupted optimize) a bounded time per tick on
++    the shared instances; no-op without a claim. Each chunk is one short write transaction
++    (hermes_state_fts_online)."""
++    from hermes_state_registry import borrow_live_shared_session_dbs
++    with borrow_live_shared_session_dbs() as _session_dbs:
++        for _sdb in _session_dbs:
++            _advance = getattr(_sdb, "advance_fts_backfill", None)
++            if callable(_advance):
++                _advance()
+diff --git a/hermes_cli/subcommands/sessions.py b/hermes_cli/subcommands/sessions.py
+index fcbc3fec6bbd7320eba9e26a17fb191376fb4f77..2eca768feff09dad8d552d1477181802e013b56b 100644
+--- a/hermes_cli/subcommands/sessions.py
++++ b/hermes_cli/subcommands/sessions.py
+@@ -218,25 +218,7 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
+     _flag(sessions_optimize_storage, "--force",
+         help="Run even while another Hermes process (gateway, Desktop, dashboard, cron) holds state.db — rewriting the store under a live writer can leave every agent refusing turns until all writers are stopped; the rebuild then paces itself so that process stays responsive (much slower)")
+ 
+-    sessions_repair = sessions_subparsers.add_parser(
+-        "repair", help="Repair a malformed state.db schema so hidden sessions reappear",
+-        description="Recover a state.db whose schema is malformed (e.g. 'table "
+-            "messages_fts already exists'), which makes Desktop/Dashboard show "
+-            "no sessions. A backup is made first; sessions and messages are "
+-            "preserved and the FTS search index is rebuilt if needed.")
+-    _flag(sessions_repair, "--check-only",
+-        help="Only report whether the database opens cleanly; do not modify it")
+-    _flag(sessions_repair, "--no-backup", help="Skip the timestamped backup copy (not recommended)")
+-
+-    sessions_repair_search = sessions_subparsers.add_parser(
+-        "repair-search", help="Rebuild a stale or damaged full-text search index while Hermes keeps running",
+-        description="Unlink and recreate the session search indexes in one short transaction (the old index "
+-            "pages are not read, so a damaged index is no obstacle), then backfill existing messages in short "
+-            "chunks. No other process needs to stop; search falls back to substring matching for messages not yet "
+-            "re-indexed. The old pages stay allocated until a VACUUM or `hermes sessions recover`.")
+-    _flag(sessions_repair_search, "--force", help="Run even when the index is not marked stale")
+-    _flag(sessions_repair_search, "--wait", help="Run the backfill here until it finishes instead of leaving it to "
+-          "the gateway")
++    _add_repair_parsers(sessions_subparsers)
+ 
+     sessions_set_journal_mode = sessions_subparsers.add_parser(
+         "set-journal-mode", help="Convert state.db between journal_mode=WAL and DELETE offline (every holder stopped)",
+@@ -402,3 +384,26 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
+         return cmd_sessions(_args, sessions_parser=sessions_parser)
+ 
+     sessions_parser.set_defaults(func=_dispatch_sessions)
++
++
++def _add_repair_parsers(sessions_subparsers):
++    """`sessions repair` and `sessions repair-search` (kept out of build_sessions_parser's size cap)."""
++    sessions_repair = sessions_subparsers.add_parser(
++        "repair", help="Repair a malformed state.db schema so hidden sessions reappear",
++        description="Recover a state.db whose schema is malformed (e.g. 'table "
++            "messages_fts already exists'), which makes Desktop/Dashboard show "
++            "no sessions. A backup is made first; sessions and messages are "
++            "preserved and the FTS search index is rebuilt if needed.")
++    _flag(sessions_repair, "--check-only",
++        help="Only report whether the database opens cleanly; do not modify it")
++    _flag(sessions_repair, "--no-backup", help="Skip the timestamped backup copy (not recommended)")
++
++    sessions_repair_search = sessions_subparsers.add_parser(
++        "repair-search", help="Rebuild a stale or damaged full-text search index while Hermes keeps running",
++        description="Unlink and recreate the session search indexes in one short transaction (the old index "
++            "pages are not read, so a damaged index is no obstacle), then backfill existing messages in short "
++            "chunks. No other process needs to stop; search falls back to substring matching for messages not yet "
++            "re-indexed. The old pages stay allocated until a VACUUM or `hermes sessions recover`.")
++    _flag(sessions_repair_search, "--force", help="Run even when the index is not marked stale")
++    _flag(sessions_repair_search, "--wait", help="Run the backfill here until it finishes instead of leaving it to "
++          "the gateway")
+diff --git a/tests/hermes_state/test_fts_online_recovery.py b/tests/hermes_state/test_fts_online_recovery.py
+index 78bd8f0ccbf33b8fffd25aaa893731e6212bc494..867c711055063bafd777c0494b69087a4515b75e 100644
+--- a/tests/hermes_state/test_fts_online_recovery.py
++++ b/tests/hermes_state/test_fts_online_recovery.py
+@@ -198,19 +198,27 @@ def test_futile_holder_deferral_goes_online_without_a_failed_rebuild(tmp_path, m
+ 
+ 
+ def test_backfill_tick_respects_its_time_budget(tmp_path, monkeypatch):
++    import hermes_state_fts_online
++
+     path = tmp_path / "state.db"
+     _seed(path, sessions=1, per=4)
+     db = SessionDB(db_path=path)
+     try:
+         db.set_meta("fts_rebuild_high_water", "999999")
+         db.set_meta("fts_rebuild_progress", "0")
++        clock = [100.0]
++        monkeypatch.setattr(hermes_state_fts_online.time, "monotonic", lambda: clock[0])
+         calls = []
+-        monkeypatch.setattr(db, "fts_rebuild_step", lambda: calls.append(1) or time.sleep(0.05) or True)
+-        started = time.monotonic()
+-        assert db.advance_fts_backfill(budget_s=0.2) is True
+-        assert time.monotonic() - started < 0.5
+-        assert 2 <= len(calls) <= 6
+-        assert db.advance_fts_backfill(budget_s=0) is True and len(calls) <= 6
++
++        def step():  # each chunk "costs" 0.25 s of the fake clock (exact in binary floating point)
++            calls.append(1)
++            clock[0] += 0.25
++            return True
++
++        monkeypatch.setattr(db, "fts_rebuild_step", step)
++        assert db.advance_fts_backfill(budget_s=1.0) is True
++        assert len(calls) == 4  # 1.0 s budget / 0.25 s per chunk
++        assert db.advance_fts_backfill(budget_s=0) is True and len(calls) == 4  # no budget, no chunk
+     finally:
+         db.close()
+ 
+-- 
+2.43.0
+

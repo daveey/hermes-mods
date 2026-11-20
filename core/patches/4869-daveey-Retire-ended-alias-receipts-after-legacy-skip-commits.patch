@@ -1,0 +1,92 @@
+From 35e3c12f3a656deb27838a8954e9a44c8268ddfb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 10:33:38 +0000
+Subject: [PATCH] [daveey] Retire ended alias receipts after legacy skip
+ commits
+
+Independent review reproduced mixed ended/live legacy aliases deleting an ended row but skipping postcommit receipt retirement. Returning to that home then reoffered a new live reservation. Keep the skip inside the transaction without bypassing committed receipt cleanup; rollback preserves receipts. Proof: mixed-red-r15-run1 canonical assertion failure; mixed-green-r15-run1 38 passed.
+---
+ .../tui_gateway/test_kanban_remote_rehome.py  | 38 +++++++++++++++++++
+ tui_gateway/kanban_remote_notices.py          | 17 ++++-----
+ 2 files changed, 46 insertions(+), 9 deletions(-)
+
+diff --git a/tests/tui_gateway/test_kanban_remote_rehome.py b/tests/tui_gateway/test_kanban_remote_rehome.py
+index a9a0a5edc7466b8f092b8147e069122337373f10..6c3c1db505798ea41f8afa377e84bb1cd464e0e3 100644
+--- a/tests/tui_gateway/test_kanban_remote_rehome.py
++++ b/tests/tui_gateway/test_kanban_remote_rehome.py
+@@ -9,6 +9,44 @@ from tests.tui_gateway import test_kanban_remote_notice_once as once
+ from tui_gateway import kanban_remote_notices as krn
+ 
+ 
++def test_legacy_mixed_alias_skip_retires_ended_receipt(tmp_path, monkeypatch):
++    now = time.time()
++    hub = tmp_path / 'replica.db'
++    hub.touch()
++    ledger = tmp_path / 'ledger.db'
++    task = {'id': 't_dup', 'status': 'done', 'completed_at': now}
++    state = krn._notice_state(task)
++    old, live, legacy = [f'{h}/default/default/t_dup' for h in ('a', 'b', 'c')]
++    sid = once.CHAT
++    cid = (sid, old, state)
++    home = ['c']
++    monkeypatch.setattr(krn, '_chat_index', lambda *_a, **_kw: (
++        'macbook', {sid: [{'gw': home[0], 'key': 'default/default/t_dup', 'task': task}]}, {}))
++    conn = krn._ledger(ledger)
++    pid, start = krn._my_holder()
++    try:
++        with conn:
++            for ref in (old, live):
++                conn.execute(
++                    'INSERT INTO notices(session,ref,state,at,delivered,holder_pid,holder_start,notice_key) '
++                    'VALUES(?,?,?,?,0,?,?,?)', (sid, ref, state, now, pid, start, 'key-' + ref))
++            conn.execute('INSERT INTO notices(session,ref,state,at,delivered,legacy_seen) VALUES(?,?,?,?,1,0)',
++                         (sid, legacy, state, now))
++        krn._track_woken(cid, {'running': False})
++        args = dict(hub_db=hub, ledger=ledger, now=now, transcript_has=lambda *_: False)
++        assert krn.collect(sid, 'default', **args) == []
++        assert conn.execute('SELECT 1 FROM notices WHERE ref=?', (old,)).fetchone() is None
++        assert krn.release({'session': sid, 'ref': live, 'state': state}, ledger=ledger)
++        home[0] = 'a'
++        first = krn.collect(sid, 'default', **args)
++        second = krn.collect(sid, 'default', **args)
++        assert [item['ref'] for item in first] == [old]
++        assert second == [], 'the first new buffer still owns custody'
++    finally:
++        krn._forget_woken(cid)
++        conn.close()
++
++
+ def _move(path, gateway):
+     with sqlite3.connect(path) as conn:
+         conn.execute('UPDATE replica SET gw=?, seq=seq+1', (gateway,))
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 4358abb596f2d080d4ee008a9b23b569c8e6e2ed..31bf05c8d2df317619139f0cb79dd6aa733bc691 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -534,15 +534,14 @@ def _reconcile_legacy(conn, session_key: str, cards: list, now: float, transcrip
+             moved = moved_claim(conn, session=session_key, ref=row['ref'], state=row['state'],
+                                 now=now, notice_key=key, swept_key=None, transcript_has=transcript_has,
+                                 retired=retired)
+-            if moved is not None:
+-                continue
+-            cur = conn.execute(
+-                "UPDATE notices SET delivered=0, holder_pid=?, holder_start=?, notice_key=?, legacy_seen=1 "
+-                "WHERE session=? AND ref=? AND state=? AND delivered=1 AND IFNULL(legacy_seen,0)=0 "
+-                "AND notice_key IS NULL",
+-                (pid, start, key, session_key, row["ref"], row["state"]))
+-            if cur.rowcount == 1:
+-                out.append(_notice_item(card, session_key, me, profile, now))
++            if moved is None:
++                cur = conn.execute(
++                    "UPDATE notices SET delivered=0, holder_pid=?, holder_start=?, notice_key=?, legacy_seen=1 "
++                    "WHERE session=? AND ref=? AND state=? AND delivered=1 AND IFNULL(legacy_seen,0)=0 "
++                    "AND notice_key IS NULL",
++                    (pid, start, key, session_key, row["ref"], row["state"]))
++                if cur.rowcount == 1:
++                    out.append(_notice_item(card, session_key, me, profile, now))
+         for claim_id in retired:
+             _forget_woken(claim_id)
+     if stale:
+-- 
+2.43.0
+

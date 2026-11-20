@@ -1,0 +1,693 @@
+From ed899d12ffb1b4082184b496a2934b6cd33751c4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 17:19:26 +0000
+Subject: [PATCH] [daveey] kanban: move a route off a far pacing hold to an
+ unheld class peer
+
+2026-11-15 (hub core 992c0cb5e3b): openai-codex was pacing-held (limit 0)
+until 11-20 22:40Z but never walled, so every default-routed card on the
+fleet waited ~5 days while anthropic, the other deep-class provider, was
+paced with free slots. resolve_dispatch_tier moved a route only off a wall,
+and a pacing hold never records one.
+
+Rule (hermes_cli/kanban_paced_reroute.py::paced_route), after the wall
+reroutes: a default route, a review_unpinned reviewer, or a non-mandatory
+concrete pin whose provider is stored `held` in llm_pacing.json with its
+reset more than kanban.llm_pacing.reroute_after_s (default 3600) away, or
+unknown, runs on the first eligible same-class peer (alternate_route /
+independent reviewers / the pin's class peers) that is neither held nor
+walled. tier_reason <reason>+paced:<provider>. A `paced` pool never moves a
+route; mandatory pins, class selectors and require_model cards keep theirs;
+no free peer keeps the base route. Reads only the stored pace (new
+kanban_llm_pacing_dispatch.held_pools), no usage read. Queue notes and the
+stall notice name the move ("next run rerouted: default+paced:openai-codex
+-> anthropic/<model>").
+
+kanban_pin_reroute: factor the class-peer pick into peer_route() so the pin
+rule shares it.
+
+Task: t_4cf6ea0228db1fb9
+---
+ hermes_cli/kanban_llm_pacing_dispatch.py      |  21 ++
+ hermes_cli/kanban_model_tier.py               |   4 +-
+ hermes_cli/kanban_paced_reroute.py            | 151 ++++++++++
+ hermes_cli/kanban_parent_unclaimed.py         |   7 +
+ hermes_cli/kanban_pin_reroute.py              |  19 +-
+ hermes_cli/kanban_queue_position.py           |  22 ++
+ tests/hermes_cli/test_kanban_llm_pacing.py    |   4 +
+ .../test_kanban_model_tier_paced_reroute.py   | 277 ++++++++++++++++++
+ website/docs/user-guide/features/kanban.md    |   3 +
+ 9 files changed, 501 insertions(+), 7 deletions(-)
+ create mode 100644 hermes_cli/kanban_paced_reroute.py
+ create mode 100644 tests/hermes_cli/test_kanban_model_tier_paced_reroute.py
+
+diff --git a/hermes_cli/kanban_llm_pacing_dispatch.py b/hermes_cli/kanban_llm_pacing_dispatch.py
+index 88fb6de4fe47224ceb65ca2c5ee99186c75625a3..ef3bbc0513416ddef8fdba4f7e0e0fcde28cc048 100644
+--- a/hermes_cli/kanban_llm_pacing_dispatch.py
++++ b/hermes_cli/kanban_llm_pacing_dispatch.py
+@@ -18,6 +18,7 @@ from __future__ import annotations
+ 
+ import json
+ import logging
++import math
+ import os
+ import sqlite3
+ import time
+@@ -331,6 +332,26 @@ def paced_pools(conn: sqlite3.Connection, task_id: str) -> Optional[list[lp.Pool
+     return paces
+ 
+ 
++def held_pools(section: Any, now: float) -> dict[str, float]:
++    """``provider -> until`` (``inf`` when no reset is known) for every governed pool this home's dispatchers stored as
++    ``held`` and fresh (:func:`_stored_pace`), under the ``kanban.llm_pacing`` ``section``; pacing off = none.
++
++    The route resolver's read-only view (``kanban_paced_reroute``: a far hold moves a route to an unheld peer). Like
++    :func:`paced_pools` it reads the stored pace only: no usage read, no write, no hold."""
++    cfg = lp.config_from(section)
++    if not cfg.enabled:
++        return {}
++    now_held: dict[str, float] = {}
++    for provider, entry in _load_state(state_path()).items():
++        name = str(provider).strip().lower()
++        pace = _stored_pace(entry, now, cfg) if name in cfg.providers else None
++        if pace is None or pace.state != lp.HELD:
++            continue
++        until = pace.until
++        now_held[name] = float(until) if isinstance(until, (int, float)) and not isinstance(until, bool) else math.inf
++    return now_held
++
++
+ def admission(paces: list[lp.PoolPace]) -> dict[str, Any]:
+     """The ``admission`` a stall notice carries for :func:`paced_pools`: each pool's state, and ``until`` when known."""
+     return {"reason": ADMISSION_REASON, "status": "held", "providers": [
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index 9e3c331953af98973c982ff3f65477d55602c7ae..f9afc20627bc0a18c079d892f7f37b0535786569 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -339,7 +339,9 @@ def resolve_dispatch_tier(conn, task, *, lane, cfg=None):
+         moved = _review_off_wall(conn, task, base, load_tier_config() if cfg is None else cfg)
+         if moved:
+             return moved[0], moved[1], f'{base[2]}+wall:{moved[2]}'
+-    return base
++    # No wall, but the route's pool is pacing-held for longer than reroute_after_s: an unheld class peer runs it.
++    from hermes_cli.kanban_paced_reroute import paced_route
++    return paced_route(conn, task, base, lane=lane, cfg=load_tier_config() if cfg is None else cfg) or base
+ 
+ 
+ def _review_off_wall(conn, task, base, cfg):
+diff --git a/hermes_cli/kanban_paced_reroute.py b/hermes_cli/kanban_paced_reroute.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..147fbcf555be102daa84de19649811d34e419dcb
+--- /dev/null
++++ b/hermes_cli/kanban_paced_reroute.py
+@@ -0,0 +1,151 @@
++"""A pacing-held provider moves a card's route to an unheld peer of the same class. [daveey]
++
++2026-11-15 (hub core 992c0cb5e3b): the openai-codex pool was pacing-``held`` (limit 0) until 11-20 22:40Z but not
++walled, so every default-routed card on the fleet waited ~5 days while anthropic, the other eligible deep-class
++provider, was ``paced`` with free slots. ``resolve_dispatch_tier`` moved a route only off a wall, and a pacing hold
++never produces one: the governor stops exactly the claims whose 429 would record it.
++
++Rule (:func:`paced_route`); anything else keeps the route, as before:
++
++1. the route's concrete provider is stored ``held`` in this home's ``llm_pacing.json`` (the governor's last read;
++   ``kanban_llm_pacing_dispatch.held_pools``, no usage read here) and its ``until`` is more than
++   ``kanban.llm_pacing.reroute_after_s`` (default 3600) away, or unknown. A ``paced`` pool (limit >= 1) never moves a
++   route;
++2. the route is an unpinned ``default`` route, a ``review_unpinned`` reviewer, or a non-mandatory concrete pin (the
++   far-wall rule of ``kanban_pin_reroute``). Mandatory pins, class selectors and ``require_model: true`` cards keep
++   their route;
++3. the peer comes from the same eligibility the wall reroutes use (``alternate_route``, the review resolver's
++   independent routes, the pin's class peers) and its provider is neither held nor walled. With none, the route
++   stays and the governor holds it as before; a moved route is judged by the governor on its new provider.
++
++The move lives on the in-memory claimed task only (as every tier decision does); ``run_route.tier_reason`` names it
++``<reason>+paced:<held provider>``.
++"""
++from __future__ import annotations
++
++import logging
++import math
++import sqlite3
++import time
++from typing import Any, Optional
++
++logger = logging.getLogger(__name__)
++
++REASON = "paced"
++DEFAULT_REROUTE_AFTER_S = 3600.0
++
++
++def _section(cfg: Optional[dict]) -> Any:
++    return (cfg or {}).get("llm_pacing")
++
++
++def reroute_after_seconds(cfg: Optional[dict]) -> float:
++    """``kanban.llm_pacing.reroute_after_s``; an unreadable, negative or non-finite value is the default."""
++    section = _section(cfg)
++    raw = section.get("reroute_after_s", DEFAULT_REROUTE_AFTER_S) if isinstance(section, dict) else DEFAULT_REROUTE_AFTER_S
++    try:
++        value = float(raw)
++    except (TypeError, ValueError):
++        return DEFAULT_REROUTE_AFTER_S
++    return value if math.isfinite(value) and value >= 0 else DEFAULT_REROUTE_AFTER_S
++
++
++def _held(cfg: Optional[dict], now: float) -> dict[str, float]:
++    from hermes_cli.kanban_llm_pacing_dispatch import held_pools
++    return held_pools(_section(cfg), now)
++
++
++def _default_peer(conn, task, base, held, now):
++    """The quota-episode probe (unpinned default routes only) with every held pool as a wall; never live-walled."""
++    from hermes_cli import kanban_provider_walls as pw
++    from hermes_cli.kanban_quota_episode import alternate_route
++    route = alternate_route(conn, task, dict(held), base, now)
++    if not route or pw.live_quota_wall(route[1], route[0]):
++        return None
++    return route[0], route[1]
++
++
++def _review_peer(conn, task, cfg, held, now):
++    """The first independent reviewer (``_review_off_wall``'s candidates) on a provider neither held nor walled."""
++    from hermes_cli import kanban_provider_walls as pw
++    from hermes_cli.kanban_review_model import _implementer_model, independent_routes
++    implementer = _implementer_model(conn, task)
++    if not implementer:
++        return None
++    walled = pw.active_walls(now=now)
++    for alt_model, alt_provider in independent_routes(implementer, cfg, getattr(task, "assignee", None)):
++        alt_provider = pw._norm(alt_provider)
++        if (not alt_provider or alt_provider == "auto" or alt_provider in held or alt_provider in walled
++                or pw.live_quota_wall(alt_provider, alt_model)):
++            continue
++        return alt_model, alt_provider
++    return None
++
++
++def _pinned_peer(task, model, held, now):
++    from hermes_cli.kanban_pin_reroute import is_mandatory_pin, peer_route
++    from hermes_cli.kanban_provider_walls import active_walls
++    if is_mandatory_pin(task):
++        return None
++    return peer_route(task, model, {**active_walls(now=now), **held})
++
++
++def _probe(conn, task, base, cfg, now):
++    """``(model, provider, held provider)`` per the module rule, else None."""
++    from hermes_cli import kanban_provider_walls as pw
++    reason = base[2]
++    if reason == "pinned":
++        from hermes_cli.kanban_pin_reroute import pin
++        pinned = pin(task)
++        if pinned is None:
++            return None
++        model, provider = pinned
++    elif reason in ("default", "review_unpinned"):
++        model, provider = base[0], pw._norm(base[1])
++        if not model or not provider or pw.requires_model(task):
++            return None
++    else:
++        return None
++    held = _held(cfg, now)
++    if held.get(provider, -math.inf) - now <= reroute_after_seconds(cfg):
++        return None  # not held (a class selector's ``auto`` never is), or its reset is near
++    if reason == "pinned":
++        moved = _pinned_peer(task, model, held, now)
++    elif reason == "default":
++        moved = _default_peer(conn, task, base, held, now)
++    else:
++        moved = _review_peer(conn, task, cfg or {}, held, now)
++    return (*moved, provider) if moved else None
++
++
++def paced_route(conn: sqlite3.Connection, task: Any, base: tuple, *, lane: str,
++                cfg: Optional[dict]) -> Optional[tuple[str, str, str]]:
++    """``(model, provider, tier_reason)`` moving *base* off a far pacing hold (module rule), else None. ``lane`` is
++    the caller's: a review run reaches here as ``review_unpinned``, never as ``pinned``.
++
++    Non-allocating and read-only, so preview, the governor and admission decide alike. A fault keeps the route
++    (warned); a SQLite error propagates as the other tier reads do."""
++    try:
++        moved = _probe(conn, task, base, cfg, time.time())
++    except sqlite3.Error:
++        raise
++    except Exception:  # health: allow BLE001 -- a failed probe keeps the route; the governor still judges it
++        logger.warning("kanban paced reroute: probe failed for %s (lane %s); keeping its route",
++                       getattr(task, "id", "?"), lane, exc_info=True)
++        return None
++    if not moved:
++        return None
++    return moved[0], moved[1], f"{base[2]}+{REASON}:{moved[2]}"
++
++
++def route_words(conn: sqlite3.Connection, task: Any) -> Optional[str]:
++    """``"<tier_reason> -> <provider>/<model>"`` when a ready ``task``'s next run is moved off a held pool (queue
++    notes and stall notices name it), else None. Resolves no route while nothing is held (one state-file read)."""
++    from hermes_cli.kanban_model_tier import load_tier_config, resolve_dispatch_tier
++    cfg = load_tier_config()
++    if not _held(cfg, time.time()):
++        return None
++    model, provider, reason = resolve_dispatch_tier(conn, task, lane="ready", cfg=cfg)
++    if f"+{REASON}:" not in str(reason or ""):
++        return None
++    return f"{reason} -> {provider}/{model}"
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index 7a74b3aa99d40c92264c338e817ac2e1cf3e40b0..c9b59fe67c0c9ca8ddb51934560817cabdbf08e4 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -51,6 +51,13 @@ def _place(conn, parent_id: str) -> dict[str, Any]:
+ 
+ 
+ def _queue_words(place: dict[str, Any], now: Optional[float] = None) -> str:
++    from hermes_cli.kanban_queue_position import reroute_prefix
++    if place.get("lane") == "unplaceable":
++        return _lane_words(place, now)  # ``describe`` already names the reroute
++    return reroute_prefix(place) + _lane_words(place, now)
++
++
++def _lane_words(place: dict[str, Any], now: Optional[float] = None) -> str:
+     if place.get("lane") == "worker_pool":
+         return f"waiting for a pool worker ({place.get('reason') or 'no reason recorded'})"
+     if place.get("lane") in ("machine", "unplaceable"):
+diff --git a/hermes_cli/kanban_pin_reroute.py b/hermes_cli/kanban_pin_reroute.py
+index 8c218259897453feb7d25d106350494fc57443d1..80f2196b22bdb8b746fa4fdc4b198d5e02235d30 100644
+--- a/hermes_cli/kanban_pin_reroute.py
++++ b/hermes_cli/kanban_pin_reroute.py
+@@ -155,11 +155,7 @@ def pinned_route(conn: Any, task: Any, *, lane: str, now: float, cfg: Optional[d
+     pin's own provider counts as the card's (rule 1); on any other provider it only rules peers out.
+     Non-allocating: reads config and the credential pool and writes nothing, so preview and admission
+     decide alike."""
+-    from agent.model_routing import ModelRoutingError, eligible_routes, validate_policy
+-    from agent.model_routing_agent import class_requirements
+-    from hermes_cli.config import is_provider_enabled
+-    from hermes_cli.kanban_model_assignment import _assignee_config
+-    from hermes_cli.kanban_provider_walls import active_walls, live_quota_wall
++    from hermes_cli.kanban_provider_walls import active_walls
+     pinned = pin(task)
+     if lane == "review" or pinned is None or is_mandatory_pin(task):
+         return None
+@@ -167,6 +163,18 @@ def pinned_route(conn: Any, task: Any, *, lane: str, now: float, cfg: Optional[d
+     own = _with_known_wall(own_walls(conn, task.id, now, current), pinned, now)
+     if provider not in own or own[provider][0] - now < min_wall_seconds(cfg):
+         return None
++    return peer_route(task, model, {**active_walls(now=now), **{name: wall[0] for name, wall in own.items()}})
++
++
++def peer_route(task: Any, model: str, walled: dict) -> Optional[tuple[str, str]]:
++    """Rule 5: the first eligible ``(model, provider)`` of pinned *model*'s one routing class whose provider is not in
++    *walled*, is enabled, and is not quota-walled in the live pool; None when there is none. Also the peer a
++    pacing-held pin moves to (``kanban_paced_reroute``)."""
++    from agent.model_routing import ModelRoutingError, eligible_routes, validate_policy
++    from agent.model_routing_agent import class_requirements
++    from hermes_cli.config import is_provider_enabled
++    from hermes_cli.kanban_model_assignment import _assignee_config
++    from hermes_cli.kanban_provider_walls import live_quota_wall
+     config = _assignee_config(getattr(task, "assignee", None)) or {}
+     policy = config.get("model_routing") or {}
+     try:
+@@ -179,7 +187,6 @@ def pinned_route(conn: Any, task: Any, *, lane: str, now: float, cfg: Optional[d
+     levels = [key for key, routes in policy.get("routes", {}).items() if any(r["model"] == model for r in routes)]
+     if len(levels) != 1:
+         return None
+-    walled = {**active_walls(now=now), **{name: wall[0] for name, wall in own.items()}}
+     providers = config.get("providers") or {}
+     routes = eligible_routes(policy, levels[0], class_requirements(config), eligible=lambda r: (
+         r["provider"] not in walled and is_provider_enabled(providers.get(r["provider"], {}))))
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index 42ce0ebb51eea630a2624b6710e056bbadea74bb..9b1cf08a71223d389b0e0b029f760119a23e9c73 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -175,9 +175,29 @@ def position(conn: sqlite3.Connection, task, board: Optional[str] = None) -> Opt
+         released = covers_latest(conn, task.id)
+         if released:
+             place["quota_released"] = {k: released.get(k) for k in ("reason", "via", "actor", "until")}
++        rerouted = _paced_reroute(conn, task)
++        if rerouted:
++            place["reroute"] = rerouted
+     return place
+ 
+ 
++def _paced_reroute(conn: sqlite3.Connection, task) -> Optional[str]:
++    """The next run's move off a pacing-held pool (``kanban_paced_reroute.route_words``), else None. Advisory."""
++    try:
++        from hermes_cli.kanban_paced_reroute import route_words
++        return route_words(conn, task)
++    except Exception:  # health: allow BLE001 -- an advisory route note must never fail the read
++        _log.debug("kanban queue position: paced reroute unavailable for %s", task.id, exc_info=True)
++        return None
++
++
++def reroute_prefix(place: Optional[dict[str, Any]]) -> str:
++    """``"next run rerouted: default+paced:openai-codex -> anthropic/<model>; "`` for a place whose card runs off a
++    pacing-held pool, else ``""``: queue notes and stall notices name the move, not only the held pool."""
++    rerouted = (place or {}).get("reroute")
++    return f"next run rerouted: {rerouted}; " if rerouted else ""
++
++
+ def _position(conn: sqlite3.Connection, task, board: Optional[str] = None) -> Optional[dict[str, Any]]:
+     if task is None or task.status != "ready":
+         return None
+@@ -295,6 +315,8 @@ def describe(place: Optional[dict[str, Any]]) -> Optional[str]:
+     for, so "ready, no run" never reads as stuck. [daveey] kanban-7d720d4ab8: a chat saw only a null
+     ``queue_reason`` for a card waiting on a full hub, called it stuck and ran its work in a subagent."""
+     words = _describe_lane(place)
++    if words:
++        words = reroute_prefix(place) + words
+     released = (place or {}).get("quota_released")
+     if words and isinstance(released, dict):
+         words = (f"quota hold released ({released.get('reason') or 'no reason'}, via {released.get('via')}); "
+diff --git a/tests/hermes_cli/test_kanban_llm_pacing.py b/tests/hermes_cli/test_kanban_llm_pacing.py
+index d68868348f24efe9bbc8f2d670aaf0cb5de23872..52239253c88da71a034307fd8a222d08c0250779 100644
+--- a/tests/hermes_cli/test_kanban_llm_pacing.py
++++ b/tests/hermes_cli/test_kanban_llm_pacing.py
+@@ -276,11 +276,13 @@ def test_only_kanban_dispatch_consults_the_governor():
+                    if "kanban_llm_pacing" in p.read_text(encoding="utf-8", errors="ignore"))
+     assert users == ["hermes_cli/kanban_db_dispatch.py", "hermes_cli/kanban_dispatch_maintenance.py",
+                      "hermes_cli/kanban_llm_pacing.py", "hermes_cli/kanban_llm_pacing_dispatch.py",
++                     "hermes_cli/kanban_paced_reroute.py",
+                      "hermes_cli/kanban_parent_unclaimed.py", "hermes_cli/kanban_worker_node.py"]
+     assert _governor_names(root / "hermes_cli/kanban_dispatch_maintenance.py") == {
+         "kanban_llm_pacing_dispatch": {"refresh_pools"}}
+     assert _governor_names(root / "hermes_cli/kanban_parent_unclaimed.py") == NOTICE_VIEW
+     assert _governor_names(root / "hermes_cli/kanban_worker_node.py") == PICKUP_VIEW
++    assert _governor_names(root / "hermes_cli/kanban_paced_reroute.py") == REROUTE_VIEW
+ 
+ 
+ # What the stall notice may take from the governor: no hold(), no usage read, no state write.
+@@ -288,6 +290,8 @@ NOTICE_VIEW = {"kanban_llm_pacing_dispatch": {"admission", "admission_skip", "pa
+ # Worker pickup (t_ce15faa434176d77) predicts the claim-time hold on the replica's copy, so a card dispatch would
+ # hold takes no pickup budget: its one entry point holds nothing, records no card event and fails open.
+ PICKUP_VIEW = {"kanban_llm_pacing_dispatch": {"pickup_hold"}}
++# The route resolver moves a route off a far held pool (t_4cf6ea0228db1fb9): the stored holds only, no usage read.
++REROUTE_VIEW = {"kanban_llm_pacing_dispatch": {"held_pools"}}
+ 
+ 
+ def _governor_names(path: pathlib.Path) -> dict[str, set[str]]:
+diff --git a/tests/hermes_cli/test_kanban_model_tier_paced_reroute.py b/tests/hermes_cli/test_kanban_model_tier_paced_reroute.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3514edff8f1763ace283c9df5fff00ef9ae6d4af
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_model_tier_paced_reroute.py
+@@ -0,0 +1,277 @@
++"""A pacing-held default provider moves a card's route to an unheld peer of its class (``kanban_paced_reroute``).
++
++2026-11-15 (hub core 992c0cb5e3b): openai-codex was pacing-``held`` (limit 0) until 11-20 22:40Z but not walled, so
++every default-routed card waited ~5 days while anthropic, the other deep-class provider, was ``paced`` with free
++slots. ``resolve_dispatch_tier`` moved a route only off a wall; a pacing hold never records one.
++"""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_llm_pacing_dispatch as lpd
++from hermes_cli import kanban_model_tier as tier
++from hermes_cli import kanban_paced_reroute as paced
++from hermes_cli import kanban_parent_unclaimed as kpu
++from hermes_cli import kanban_queue_position as kqp
++from hermes_cli import kanban_provider_walls as walls
++from tests.hermes_cli import test_kanban_pin_reroute as pin_tests
++from tests.hermes_cli.test_kanban_quota_episode import board as board  # noqa: PLC0414 -- the self-alias is load-bearing: it suppresses F811 for the pytest fixture parameter shadowing this import
++
++PIN, PEER, GROK = pin_tests.PIN, pin_tests.PEER, pin_tests.GROK
++HELD_FAR = 5 * 86400  # 11-15 16:52Z -> 11-20 22:40Z
++
++
++@pytest.fixture
++def clock(monkeypatch):
++    clock = pin_tests._clock(monkeypatch)
++    monkeypatch.setattr(paced.time, 'time', lambda: clock[0])
++    monkeypatch.setattr(lpd.time, 'time', lambda: clock[0])
++    monkeypatch.setattr(lpd, '_CACHE', {})
++    return clock
++
++
++def _pools(clock, **states):
++    """Store ``provider=(state, until_offset or None)`` paces in this home's ``llm_pacing.json``, read just now."""
++    data = {}
++    for name, (state, offset) in states.items():
++        provider = name.replace('_', '-')
++        data[provider] = {'read_at': clock[0], 'running': [], 'samples': [], 'pace': {
++            'provider': provider, 'state': state, 'factor': 0.0 if state == 'held' else 0.07,
++            'until': None if offset is None else float(clock[0] + offset), 'detail': ''}}
++    lpd.state_path().write_text(json.dumps(data), encoding='utf-8')
++
++
++def _deep(monkeypatch, cfg=None, grok=False):
++    config, cfg = pin_tests._deep(monkeypatch, cfg)
++    if grok:
++        deep = config['model_routing']['routes']['deep']
++        deep.append(dict(deep[0], model=GROK[0], provider=GROK[1]))
++    return config, cfg
++
++
++def _route(conn, tid, lane='ready'):
++    return tier.resolve_dispatch_tier(conn, kb.get_task(conn, tid), lane=lane)
++
++
++def test_held_far_default_route_moves_to_the_unheld_class_peer(board, clock, monkeypatch, all_assignees_spawnable):
++    _deep(monkeypatch)
++    _pools(clock, openai_codex=('held', HELD_FAR), anthropic=('paced', None))
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='default card', assignee='a')
++        assert _route(conn, tid) == (*PEER, 'default+paced:openai-codex')
++        # The governor judges the moved route on its own provider: anthropic paced with a free slot claims it.
++        assert lpd.candidate_providers(conn, kb.get_task(conn, tid), 'ready') == ['anthropic']
++        assert pin_tests._tick(conn) == [PEER]
++        receipt = pin_tests._events(conn, tid, 'run_route')[-1]
++        assert (receipt['model'], receipt['provider'], receipt['tier_reason']) == (*PEER, 'default+paced:openai-codex')
++        persisted = kb.get_task(conn, tid)
++        assert (persisted.model_override, persisted.provider_override) == (None, None)  # the row never moves
++
++
++@pytest.mark.parametrize('until', [None, HELD_FAR])
++def test_held_pool_with_unknown_or_far_reset_moves_the_route(board, clock, monkeypatch, until):
++    """A held pool with no known reset admits nothing for an unknown time: it is never "near"."""
++    _deep(monkeypatch)
++    _pools(clock, openai_codex=('held', until))
++    with kbc.connect() as conn:
++        assert _route(conn, kb.create_task(conn, title='d', assignee='a')) == (*PEER, 'default+paced:openai-codex')
++
++
++def test_held_near_reset_keeps_the_default_route(board, clock, monkeypatch):
++    _deep(monkeypatch)
++    _pools(clock, openai_codex=('held', 1800))
++    with kbc.connect() as conn:
++        assert _route(conn, kb.create_task(conn, title='d', assignee='a')) == (*PIN, 'default')
++
++
++@pytest.mark.parametrize('after, until, moved', [
++    (0, 1800, True), (1799, 1800, True), (1800, 1800, False), (None, 3599, False), (None, 3601, True),
++    # An unreadable, negative or non-finite value is the 3600 s default, never "never" or "always".
++    ('junk', 1800, False), (-5, 1800, False), ('nan', 1800, False), ('inf', 7200, True), ('junk', 7200, True)])
++def test_reroute_after_s_sets_the_threshold(board, clock, monkeypatch, after, until, moved):
++    """``kanban.llm_pacing.reroute_after_s`` (default 3600): a hold resetting sooner keeps the route."""
++    _deep(monkeypatch, {} if after is None else {'llm_pacing': {'reroute_after_s': after}})
++    _pools(clock, openai_codex=('held', until))
++    with kbc.connect() as conn:
++        route = _route(conn, kb.create_task(conn, title='d', assignee='a'))
++    assert route == ((*PEER, 'default+paced:openai-codex') if moved else (*PIN, 'default'))
++
++
++@pytest.mark.parametrize('state', ['paced', 'open', 'unknown'])
++def test_a_pool_that_is_not_held_never_moves_the_route(board, clock, monkeypatch, state):
++    """A ``paced`` pool keeps limit >= 1 (``admit_limit``): the card waits its turn there, it is not rerouted."""
++    _deep(monkeypatch)
++    _pools(clock, openai_codex=(state, HELD_FAR))
++    with kbc.connect() as conn:
++        assert _route(conn, kb.create_task(conn, title='d', assignee='a')) == (*PIN, 'default')
++
++
++def test_non_mandatory_pin_on_a_held_provider_moves_to_its_class_peer(board, clock, monkeypatch,
++                                                                       all_assignees_spawnable):
++    _deep(monkeypatch)
++    _pools(clock, openai_codex=('held', HELD_FAR))
++    with kbc.connect() as conn:
++        tid = pin_tests._pinned_card(conn)
++        assert _route(conn, tid) == (*PEER, 'pinned+paced:openai-codex')
++        assert pin_tests._tick(conn) == [PEER]
++        assert pin_tests._events(conn, tid, 'run_route')[-1]['tier_reason'] == 'pinned+paced:openai-codex'
++        task = kb.get_task(conn, tid)
++        assert (task.model_override, task.provider_override) == PIN  # the pin itself is unchanged
++        assert tier.owner_model_pin(conn, task) == PEER  # the owner spawns the moved route
++
++
++@pytest.mark.parametrize('why', ['flag', 'marker'])
++def test_mandatory_pin_keeps_its_held_provider(board, clock, monkeypatch, why):
++    _deep(monkeypatch)
++    _pools(clock, openai_codex=('held', HELD_FAR))
++    with kbc.connect() as conn:
++        tid = pin_tests._pinned_card(conn, mandatory=why == 'flag',
++                                     body=walls.REQUIRE_MODEL_MARKER if why == 'marker' else None)
++        assert _route(conn, tid) == (None, None, 'pinned')  # the pin runs as pinned
++
++
++def test_require_model_default_card_keeps_its_held_route(board, clock, monkeypatch):
++    _deep(monkeypatch)
++    _pools(clock, openai_codex=('held', HELD_FAR))
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='needs astra', body=f'astra only\n{walls.REQUIRE_MODEL_MARKER}', assignee='a')
++        assert _route(conn, tid) == (*PIN, 'default')
++        prose = kb.create_task(conn, title='prose', body='a card may say `require_model` in prose', assignee='a')
++        assert _route(conn, prose) == (*PEER, 'default+paced:openai-codex')
++
++
++@pytest.mark.parametrize('peer', ['held', 'walled', 'live_wall'])
++def test_no_unheld_unwalled_peer_keeps_the_base_route(board, clock, monkeypatch, peer):
++    """Never onto another held or walled pool: with no free peer the governor holds the card as before."""
++    _deep(monkeypatch)
++    _pools(clock, openai_codex=('held', HELD_FAR), anthropic=('held', 600) if peer == 'held' else ('paced', None))
++    if peer == 'walled':
++        monkeypatch.setattr(walls, 'active_walls', lambda **_k: {'anthropic': float(clock[0] + 3600)})
++    elif peer == 'live_wall':
++        monkeypatch.setattr(walls, 'live_quota_wall', lambda p, m: float(clock[0] + 3600) if p == 'anthropic' else None)
++    with kbc.connect() as conn:
++        assert _route(conn, kb.create_task(conn, title='d', assignee='a')) == (*PIN, 'default')
++        assert _route(conn, pin_tests._pinned_card(conn)) == (None, None, 'pinned')
++
++
++def test_review_unpinned_on_a_held_provider_moves_to_a_free_independent_reviewer(board, clock, monkeypatch):
++    _deep(monkeypatch, {'llm_pacing': {'providers': ['anthropic', 'openai-codex', 'xai-oauth']}}, grok=True)
++    with kbc.connect() as conn:
++        tid = pin_tests._review_card(conn)
++        assert _route(conn, tid, lane='review') == (*PIN, 'review_unpinned')  # nothing held yet
++        _pools(clock, openai_codex=('held', HELD_FAR))
++        assert _route(conn, tid, lane='review') == (*GROK, 'review_unpinned+paced:openai-codex')
++        task = kb.get_task(conn, tid)
++        assert tier.apply_model_tier(conn, task, lane='review') == 'review_unpinned+paced:openai-codex'
++        assert (task.model_override, task.provider_override) == GROK
++        _pools(clock, openai_codex=('held', HELD_FAR), xai_oauth=('held', HELD_FAR))
++        assert _route(conn, tid, lane='review') == (*PIN, 'review_unpinned')  # every reviewer held: keep
++
++
++def test_review_unpinned_with_require_model_keeps_its_held_route(board, clock, monkeypatch):
++    _deep(monkeypatch, grok=True)
++    _pools(clock, openai_codex=('held', HELD_FAR))
++    with kbc.connect() as conn:
++        tid = pin_tests._review_card(conn, body=walls.REQUIRE_MODEL_MARKER)
++        assert _route(conn, tid, lane='review') == (*PIN, 'review_unpinned')
++
++
++@pytest.mark.parametrize('case', ['stale_read', 'pacing_off', 'ungoverned', 'class_selector'])
++def test_no_trusted_hold_on_a_concrete_route_keeps_it(board, clock, monkeypatch, case):
++    """Only a fresh stored hold on a governed provider of a concrete route moves it."""
++    cfg = {'llm_pacing': {'enabled': False}} if case == 'pacing_off' else {}
++    if case == 'ungoverned':
++        cfg = {'llm_pacing': {'providers': ['anthropic']}}
++    if case == 'class_selector':
++        cfg = {'default_model': 'class:deep', 'default_provider': 'auto'}
++    _deep(monkeypatch, cfg)
++    _pools(clock, openai_codex=('held', HELD_FAR))
++    if case == 'stale_read':
++        clock[0] += lpd.STALE_READ_INTERVALS * 300
++    with kbc.connect() as conn:
++        route = _route(conn, kb.create_task(conn, title='d', assignee='a'))
++    assert '+paced:' not in route[2]
++
++
++def test_queue_note_and_stall_notice_name_the_reroute(board, clock, monkeypatch):
++    _deep(monkeypatch)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='d', assignee='a')
++        assert 'reroute' not in (kqp.position(conn, kb.get_task(conn, tid)) or {})  # nothing held: no note
++        _pools(clock, openai_codex=('held', HELD_FAR))
++        place = kqp.position(conn, kb.get_task(conn, tid))
++    words = 'default+paced:openai-codex -> anthropic/claude-opus-5-5'
++    assert place['reroute'] == words
++    assert kqp.describe(place).startswith(f'next run rerouted: {words}; ')
++    assert kpu._queue_words(place).startswith(f'next run rerouted: {words}; ')
++    unplaceable = {'lane': 'unplaceable', 'runs_on': ['x'], 'missing': ['x'], 'machines': ['hub'], 'reroute': words}
++    assert kpu._queue_words(unplaceable).count('next run rerouted') == 1
++
++
++def test_a_failed_probe_keeps_the_route(board, clock, monkeypatch):
++    _deep(monkeypatch)
++    _pools(clock, openai_codex=('held', HELD_FAR))
++
++    def boom(*_a, **_k):
++        raise RuntimeError('policy unreadable')
++    monkeypatch.setattr('hermes_cli.kanban_quota_episode.alternate_route', boom)
++    with kbc.connect() as conn:
++        assert _route(conn, kb.create_task(conn, title='d', assignee='a')) == (*PIN, 'default')
++
++
++def test_a_sqlite_fault_in_the_probe_propagates(board, clock, monkeypatch):
++    """As the wall reroutes do: admission's own error path decides, never a silent keep on a broken board."""
++    _deep(monkeypatch)
++    _pools(clock, openai_codex=('held', HELD_FAR))
++
++    def locked(*_a, **_k):
++        raise sqlite3.OperationalError('database is locked')
++    monkeypatch.setattr('hermes_cli.kanban_quota_episode.alternate_route', locked)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='d', assignee='a')
++        with pytest.raises(sqlite3.OperationalError):
++            _route(conn, tid)
++
++
++@pytest.mark.parametrize('block', ['walled', 'live_wall'])
++def test_review_unpinned_skips_a_walled_independent_reviewer(board, clock, monkeypatch, block):
++    _deep(monkeypatch, grok=True)
++    _pools(clock, openai_codex=('held', HELD_FAR))
++    if block == 'walled':
++        monkeypatch.setattr(walls, 'active_walls', lambda **_k: {'xai-oauth': float(clock[0] + 3600)})
++    else:
++        monkeypatch.setattr(walls, 'live_quota_wall', lambda p, m: float(clock[0] + 3600) if p == 'xai-oauth' else None)
++    with kbc.connect() as conn:
++        assert _route(conn, pin_tests._review_card(conn), lane='review') == (*PIN, 'review_unpinned')
++
++
++@pytest.mark.parametrize('card', ['class_pin', 'strong_tier_pattern'])
++def test_class_pins_and_other_tier_reasons_keep_their_route(board, clock, monkeypatch, card):
++    """Only default, review_unpinned and concrete pins move: a ``class:*`` pin is the allocator's to place, and a
++    strong-tier keep-pattern card (here on the held provider) keeps the tier its pattern chose."""
++    _deep(monkeypatch, {'strong_model': PIN[0], 'strong_provider': PIN[1], 'default_model_keep_patterns': ['security']})
++    _pools(clock, openai_codex=('held', HELD_FAR))
++    with kbc.connect() as conn:
++        if card == 'class_pin':
++            tid = kb.create_task(conn, title='d', assignee='a', model_override='class:deep', provider_override='auto')
++            assert _route(conn, tid)[2] == 'pinned'
++        else:
++            tid = kb.create_task(conn, title='security audit', assignee='a')
++            assert _route(conn, tid) == (*PIN, 'pattern:security')
++
++
++def test_route_words_resolve_nothing_while_no_pool_is_held(board, clock, monkeypatch):
++    """Card reads stay cheap: with no held pool no route is resolved; a held pool with a near reset adds no note."""
++    _deep(monkeypatch)
++    calls = []
++    real = tier.resolve_dispatch_tier
++    monkeypatch.setattr(tier, 'resolve_dispatch_tier', lambda *a, **k: calls.append(1) or real(*a, **k))
++    with kbc.connect() as conn:
++        task = kb.get_task(conn, kb.create_task(conn, title='d', assignee='a'))
++        assert paced.route_words(conn, task) is None and calls == []
++        _pools(clock, openai_codex=('held', 600))
++        assert paced.route_words(conn, task) is None and calls == [1]
++        assert 'reroute' not in (kqp.position(conn, task) or {})
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 15c56830a7d45e60c224e8d6f2bd474edd3a5a5e..76f1de5f1943cc84020b791a2aa8a9f40b5f5c1b 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -1565,6 +1565,8 @@ Before claiming a ready or review card, the dispatcher checks the OAuth pool of
+ 
+ A held card stays `ready` and unclaimed. The dispatcher records an `llm_paced` event (providers, state, limit, running) and a `dispatch_skipped` row with reason `llm_paced`. Queue position, the chat-wait and parent-unclaimed notices, and `hermes kanban diagnostics` (`held_in_ready`) name the hold instead of "skip reason unrecorded". Raising the card's priority does not lift it. If no account can be read, the governor fails open, and mandatory model pins and ungoverned providers always start. Only Kanban dispatch consults it.
+ 
++A **held** pool whose reset is more than `reroute_after_s` away (or unknown) moves the route instead of holding the card for days: an unpinned default-routed card, a `review_unpinned` reviewer, or a non-mandatory concrete pin runs on another eligible route of the same routing class whose provider is neither held nor walled (the same eligibility as the quota-wall reroutes). The route reason is `default+paced:<provider>`, `review_unpinned+paced:<provider>` or `pinned+paced:<provider>`; the card row never changes, and the governor then judges the new provider as usual. Queue notes and stall notices name the move (`next run rerouted: default+paced:openai-codex -> anthropic/<model>`). A **paced** pool never moves a route, and mandatory pins, `class:*` selectors and `require_model: true` cards keep theirs. The decision reads only the pace stored in `llm_pacing.json`; it makes no usage read.
++
+ | Config key | Default | What it does |
+ |------------|---------|--------------|
+ | `kanban.llm_pacing.enabled` | `true` | `false` restores ungoverned claims. |
+@@ -1576,6 +1578,7 @@ A held card stays `ready` and unclaimed. The dispatcher records an `llm_paced` e
+ | `kanban.llm_pacing.rate_window_seconds` | `3600` | Lookback for burn rates and this host's average concurrency. |
+ | `kanban.llm_pacing.min_rate_span_seconds` | `600` | Shortest sample span a burn slope is measured over. |
+ | `kanban.llm_pacing.deferrable_share` | `0.5` | Share of a paced limit that deferrable cards may use (0-1). |
++| `kanban.llm_pacing.reroute_after_s` | `3600` | A held pool whose reset is further away than this moves default, `review_unpinned` and non-mandatory pinned routes to an unheld same-class peer. |
+ 
+ ### Dependency-review repair continuation
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,855 @@
+From 31c191506b47f917502a59eb5c7c7155128e0e7b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 15:30:43 +0000
+Subject: [PATCH] feat(kanban): stage canonical containment transport and
+ replica markers [daveey]
+
+Bind durable single-request delivery to canonical Board event bytes and admitted worker claims/sessions. Add server-owned episode markers and durable local observations to hold task-before-history page gaps, including a new episode after a valid old release. Upgrade opt-in storage triggers atomically. Keep public entry points and production containment capability disabled pending complete integration.
+
+Proof: canonical combined containment files185 passed; subsequent scope/envelope/replica capture consumers88 passed; marker/actor/schema consumers79 passed. These overlap and are not a distinct grand total. Six selected paging guard mutants killed against a green5-case baseline. Full scripts/check21checks green. Board companion full suite1181 passed1skipped and typecheck green. No PR, deployment or live relay lifecycle application.
+---
+ hermes_cli/kanban_containment_actor.py        |  53 +++++
+ hermes_cli/kanban_containment_canonical.py    | 146 +++++++++++++
+ hermes_cli/kanban_containment_guard.py        |  35 +++-
+ hermes_cli/kanban_containment_lifecycle.py    |   6 +-
+ hermes_cli/kanban_db.py                       |  23 +--
+ hermes_cli/kanban_db_connect.py               |   1 +
+ hermes_cli/kanban_db_sync.py                  |   2 +-
+ hermes_cli/kanban_task_fields.py              |  18 ++
+ .../test_kanban_containment_actor.py          | 100 +++++++++
+ .../test_kanban_containment_canonical.py      | 195 ++++++++++++++++++
+ .../test_kanban_containment_paging.py         | 108 ++++++++++
+ 11 files changed, 665 insertions(+), 22 deletions(-)
+ create mode 100644 hermes_cli/kanban_containment_actor.py
+ create mode 100644 hermes_cli/kanban_containment_canonical.py
+ create mode 100644 hermes_cli/kanban_task_fields.py
+ create mode 100644 tests/hermes_cli/test_kanban_containment_actor.py
+ create mode 100644 tests/hermes_cli/test_kanban_containment_canonical.py
+ create mode 100644 tests/hermes_cli/test_kanban_containment_paging.py
+
+diff --git a/hermes_cli/kanban_containment_actor.py b/hermes_cli/kanban_containment_actor.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0bf80bd930e13ce74c1ec195748afd4810b0122b
+--- /dev/null
++++ b/hermes_cli/kanban_containment_actor.py
+@@ -0,0 +1,53 @@
++"""Admitted worker identity shared by CLI and agent containment adapters.
++
++Identity comes from dispatcher pins plus durable claim/session adoption, never
++from containment arguments or the informational WORKER_TASK shell variable.
++"""
++from __future__ import annotations
++
++import json
++import os
++import sqlite3
++from dataclasses import dataclass
++from pathlib import Path
++
++from hermes_cli.kanban_containment_lifecycle import ContainmentRefused, _actor
++
++
++@dataclass(frozen=True)
++class Actor:
++    task: str
++    run_uid: str
++
++
++def current_actor(conn: sqlite3.Connection) -> Actor:
++    from agent.delegation_context import owned_kanban_task
++    from gateway.session_context import get_session_env
++    task = owned_kanban_task()
++    pinned_db = os.environ.get("HERMES_KANBAN_DB")
++    lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
++    run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
++    session = get_session_env("HERMES_SESSION_ID")
++    path = conn.execute("PRAGMA database_list").fetchone()[2]
++    if (not task or not pinned_db or not path or Path(path).resolve() != Path(pinned_db).resolve()
++            or not lock or not run_id or not run_id.isascii() or not run_id.isdecimal() or not session):
++        raise ContainmentRefused("containment requires the dispatcher-admitted task, board, run, lock and session")
++    row = conn.execute("SELECT uid,claim_lock FROM task_runs WHERE task_id=? AND id=?", (task, int(run_id))).fetchone()
++    if row is None or row[1] != lock:
++        raise ContainmentRefused("containment caller does not own the pinned run claim")
++    _actor(conn, task, row[0])
++    # Session adoption is recorded by the owner before agent execution. A leaked
++    # environment from another conversation cannot borrow the current claim.
++    adopted = False
++    for (raw,) in conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
++                               "AND kind='owner_admitted'", (task, int(run_id))):
++        try:
++            payload = json.loads(raw)
++        except (TypeError, ValueError):
++            continue
++        if isinstance(payload, dict) and payload.get("session_id") == session:
++            adopted = True
++            break
++    if not adopted:
++        raise ContainmentRefused("containment caller lacks the owning session adoption receipt")
++    return Actor(task, row[0])
+diff --git a/hermes_cli/kanban_containment_canonical.py b/hermes_cli/kanban_containment_canonical.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..daa45ec7c7b37ef82c16486f0cd27243ee5b1685
+--- /dev/null
++++ b/hermes_cli/kanban_containment_canonical.py
+@@ -0,0 +1,146 @@
++"""Canonical Board containment receipts and replay-safe single-operation delivery.
++
++No replica row, gateway label or request-supplied digest grants release authority.
++The Board attests the exact event bytes after checking its private episode ledger.
++This adapter is staged; it does not install local fences or advertise capability.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++from collections.abc import Mapping
++from typing import Any
++
++from hermes_cli.kanban_containment_lifecycle import ContainmentRefused
++from hermes_cli.kanban_containment_policy import identity
++from hermes_cli.kanban_containment_state import _payload, _release, _stop, _uid, fingerprint
++
++
++class DeliveryUnknown(RuntimeError):
++    """The original request must be recovered, never replaced with another UID."""
++
++    code = "containment_delivery_unknown"
++
++
++def canonical_event(evidence: Any, *, board: str, uid: str, task: str, kind: str) -> dict:
++    """Validate the authenticated /evidence response, not a shape-only replica.
++
++    The caller obtains this value directly from its enrolled Hub connection.
++    This function is deliberately not an authentication boundary against code
++    possessing that connection/key. A gateway key holder is trusted ingress.
++    """
++    if (not isinstance(evidence, Mapping) or evidence.get("board") != board
++            or evidence.get("table") != "task_events" or evidence.get("uid") != uid
++            or evidence.get("state") != "live" or not _uid(uid)):
++        raise ContainmentRefused("canonical containment event identity is unproven")
++    row, proof = evidence.get("row"), evidence.get("containment_v1")
++    if (not isinstance(row, Mapping) or row.get("uid") != uid or row.get("task_id") != task
++            or row.get("kind") != kind or row.get("deleted_at") is not None
++            or not isinstance(row.get("payload"), str) or not isinstance(proof, Mapping)
++            or type(proof.get("version")) is not int or proof.get("version") != 1
++            or not _uid(proof.get("episode")) or not _uid(proof.get("request"))
++            or not isinstance(proof.get("gateway"), str) or not proof["gateway"]
++            or row.get("origin_gateway") != proof["gateway"]):
++        raise ContainmentRefused("canonical containment attestation is missing or inconsistent")
++    return dict(row)
++
++
++def certified_stop(evidence: Any, *, board: str, task: str, uid: str) -> dict:
++    row = canonical_event(evidence, board=board, task=task, uid=uid, kind="contained")
++    stop = _stop(row)
++    proof = evidence["containment_v1"]
++    if (stop is None or stop["target"]["board"] != board or proof["episode"] != uid
++            or proof.get("containment_sha256") != fingerprint(stop)):
++        raise ContainmentRefused("canonical frozen containment predicate is inconsistent")
++    return row
++
++
++def certified_release(stop_evidence: Any, release_evidence: Any, *, board: str, task: str,
++                      episode: str, receipt: str) -> tuple[dict, dict]:
++    stop = certified_stop(stop_evidence, board=board, task=task, uid=episode)
++    release = canonical_event(release_evidence, board=board, task=task, uid=receipt,
++                              kind="containment_released")
++    proof = release_evidence["containment_v1"]
++    if (proof["episode"] != episode or proof.get("containment_sha256") != fingerprint(_stop(stop))
++            or not _release(release, stop)):
++        raise ContainmentRefused("canonical release is not bound to this exact containment episode")
++    return stop, release
++
++
++def _schema(conn: sqlite3.Connection) -> None:
++    # Host-local request custody, deliberately not in SYNCED_COLUMNS. No token or
++    # free-text handoff is stored in this transport ledger.
++    conn.execute("CREATE TABLE IF NOT EXISTS containment_delivery ("
++                 "request_uid TEXT PRIMARY KEY, board TEXT NOT NULL, gateway TEXT NOT NULL, "
++                 "op_json TEXT NOT NULL, confirmed INTEGER NOT NULL DEFAULT 0)")
++
++
++def stage(conn: sqlite3.Connection, *, board: str, gateway: str, op: dict) -> str:
++    """Commit the exact operation BEFORE network I/O. Retrying cannot change it."""
++    from hermes_cli import kanban_db as kb
++    request = op.get("client_op_id")
++    if (not _uid(request) or not _uid(op.get("event_uid"))
++            or op.get("op") not in ("contain", "resume_contained") or not gateway):
++        raise ContainmentRefused("containment delivery requires portable request/event identities")
++    target = identity({"board": board, "gateway": gateway, "task_id": op.get("task")})
++    if not _uid(op.get("actor_run_uid")) or not isinstance(op.get("payload"), dict):
++        raise ContainmentRefused("containment delivery lacks actor or predicate")
++    identity({**target, "task_id": op.get("actor_task")})
++    raw = json.dumps(op, sort_keys=True, separators=(",", ":"), allow_nan=False)
++    _schema(conn)
++    with kb.write_txn(conn):
++        prior = conn.execute("SELECT board,gateway,op_json FROM containment_delivery WHERE request_uid=?",
++                             (request,)).fetchone()
++        if prior and tuple(prior) != (board, gateway, raw):
++            raise ContainmentRefused("request identity already binds different containment bytes")
++        if not prior:
++            conn.execute("INSERT INTO containment_delivery(request_uid,board,gateway,op_json) VALUES (?,?,?,?)",
++                         (request, board, gateway, raw))
++    return request
++
++
++def deliver(conn: sqlite3.Connection, hub: Any, *, request: str) -> dict:
++    """Send/recover one durable request; success requires exact canonical readback.
++
++    A timeout, malformed response or missing attestation is UNKNOWN, never a
++    license to create a replacement request. Board replay uses the same client
++    operation identity. No local task/history/edge mutation occurs here.
++    """
++    if conn.in_transaction:
++        raise ContainmentRefused("containment network delivery cannot run inside a writer transaction")
++    _schema(conn)
++    row = conn.execute("SELECT board,gateway,op_json,confirmed FROM containment_delivery WHERE request_uid=?",
++                       (request,)).fetchone()
++    if row is None:
++        raise ContainmentRefused("unknown durable containment request")
++    board, gateway, raw, confirmed = row
++    if hub.ident.gateway != gateway:
++        raise ContainmentRefused("containment request belongs to a different enrolled gateway")
++    op = json.loads(raw)
++    if not confirmed:
++        response = hub.ops(board, [op])
++        results = response.get("results") if isinstance(response, dict) else None
++        if (not isinstance(results, list) or len(results) != 1 or not isinstance(results[0], dict)
++                or results[0].get("client_op_id") != request):
++            raise DeliveryUnknown("Board reply did not identify the exact containment request; recover it")
++        verdict = results[0]
++        if verdict.get("status") == "rejected":
++            raise ContainmentRefused("Board refused containment: " + str(verdict.get("reason") or "unknown"))
++        if verdict.get("status") not in ("applied", "merged"):
++            raise DeliveryUnknown("Board containment disposition is unknown; recover the same request")
++    event = hub.row_evidence(board, "task_events", op["event_uid"])
++    if op["op"] == "contain":
++        receipt = certified_stop(event, board=board, task=op["task"], uid=op["event_uid"])
++    else:
++        episode = op["payload"].get("episode")
++        stop = hub.row_evidence(board, "task_events", episode)
++        _, receipt = certified_release(stop, event, board=board, task=op["task"], episode=episode,
++                                       receipt=op["event_uid"])
++    if _payload(receipt) != op["payload"] or event["containment_v1"]["request"] != request:
++        raise DeliveryUnknown("canonical receipt does not match the staged request bytes")
++    from hermes_cli import kanban_db as kb
++    with kb.write_txn(conn):
++        conn.execute("UPDATE containment_delivery SET confirmed=1 WHERE request_uid=? AND op_json=?",
++                     (request, raw))
++    return {"task_id": op["task"], "request_uid": request, "event_uid": op["event_uid"],
++            "canonical_confirmed": True}
+diff --git a/hermes_cli/kanban_containment_guard.py b/hermes_cli/kanban_containment_guard.py
+index 182e298deff95f5a5b53b2a8393f4b127a2a5f0e..5539249c136d8328e55bcd4b967cfc11db102b5d 100644
+--- a/hermes_cli/kanban_containment_guard.py
++++ b/hermes_cli/kanban_containment_guard.py
+@@ -42,6 +42,18 @@ def pending(conn: sqlite3.Connection, task_id: str, *, verify_release: Callable
+                           "AND kind IN ('contained','containment_released')", (task_id,))
+     names = [column[0] for column in cursor.description]
+     events = [dict(zip(names, row)) for row in cursor]
++    # A canonical task page may precede its event page. Seeing a marker grants
++    # only a hold; clearing it later cannot substitute for the missing receipt.
++    observed = set()
++    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='containment_observations'").fetchone():
++        observed.update(r[0] for r in conn.execute("SELECT episode FROM containment_observations WHERE task_id=?", (task_id,)))
++    if "containment_episode" in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}:
++        marker = conn.execute("SELECT containment_episode FROM tasks WHERE id=?", (task_id,)).fetchone()
++        if marker and marker[0] is not None:
++            observed.add(marker[0])
++    known = {event["uid"] for event in events if event["kind"] == "contained"}
++    if observed - known:
++        return True
+     return reduce_events(events, verify_release=verify_release) is not None
+ 
+ 
+@@ -57,6 +69,22 @@ def install(conn: sqlite3.Connection, *, verify_release: Callable[
+                          lambda task: int(pending(conn, task, verify_release=verify_release)))
+     conn.create_function("kanban_containment_write", 1,
+                          lambda task: int(conn.in_transaction and _WRITE.get() == (id(conn), task)))
++    from hermes_cli import kanban_db as kb
++    with kb.write_txn(conn, allow_nested=True):
++        _install_schema(conn)
++
++
++def _install_schema(conn: sqlite3.Connection) -> None:
++    # Upgrade all triggers atomically: failure must retain the previous fence.
++    conn.execute("CREATE TABLE IF NOT EXISTS containment_observations (task_id TEXT NOT NULL,episode TEXT NOT NULL,"
++                 "PRIMARY KEY(task_id,episode))")
++    conn.execute("INSERT OR IGNORE INTO containment_observations SELECT id,containment_episode FROM tasks "
++                 "WHERE containment_episode IS NOT NULL")
++    for operation in ("INSERT", "UPDATE OF containment_episode"):
++        name = operation.split()[0].lower()
++        conn.execute(f"CREATE TRIGGER IF NOT EXISTS containment_observe_{name} AFTER {operation} ON tasks "
++                     "WHEN NEW.containment_episode IS NOT NULL BEGIN INSERT OR IGNORE INTO containment_observations "
++                     "VALUES (NEW.id,NEW.containment_episode); END")
+     _triggers(conn)
+ 
+ 
+@@ -66,9 +94,9 @@ def _triggers(conn: sqlite3.Connection) -> None:
+     fail = "SELECT RAISE(ABORT,'containment_pending');"
+     protected = "('contained','containment_released')"
+     statements = {
+-        "task_update": ("BEFORE UPDATE OF status,current_run_id,completed_at ON tasks",
++        "task_update": ("BEFORE UPDATE OF status,current_run_id,completed_at,containment_episode ON tasks",
+                         f"{held}(OLD.id) AND (OLD.status IS NOT NEW.status OR OLD.current_run_id IS NOT NEW.current_run_id "
+-                        "OR OLD.completed_at IS NOT NEW.completed_at) AND ("
++                        "OR OLD.completed_at IS NOT NEW.completed_at OR OLD.containment_episode IS NOT NEW.containment_episode) AND ("
+                         f"NOT {permit}(OLD.id) OR NEW.status != 'triage' "
+                         "OR NEW.current_run_id IS NOT NULL OR NEW.completed_at IS NOT NULL)"),
+         "task_delete": ("BEFORE DELETE ON tasks", f"{held}(OLD.id)"),
+@@ -85,4 +113,5 @@ def _triggers(conn: sqlite3.Connection) -> None:
+         condition = " OR ".join(f"{held}({ref}.{end}_id)" for ref in refs for end in ("parent", "child"))
+         statements[f"edge_{op}"] = (f"BEFORE {op.upper()} ON task_links", condition)
+     for name, (operation, condition) in statements.items():
+-        conn.execute(f"CREATE TRIGGER IF NOT EXISTS containment_{name} {operation} WHEN {condition} BEGIN {fail} END")
++        conn.execute(f"DROP TRIGGER IF EXISTS containment_{name}")
++        conn.execute(f"CREATE TRIGGER containment_{name} {operation} WHEN {condition} BEGIN {fail} END")
+diff --git a/hermes_cli/kanban_containment_lifecycle.py b/hermes_cli/kanban_containment_lifecycle.py
+index 6b4e11171d653f327c8618463f341b34a69c3d5d..614c1c96c7d7d785b02a5f48fb11b2e8ae0d8a85 100644
+--- a/hermes_cli/kanban_containment_lifecycle.py
++++ b/hermes_cli/kanban_containment_lifecycle.py
+@@ -174,7 +174,7 @@ def contain_local(conn: sqlite3.Connection, *, target: dict, resume_policy: dict
+                 raise ContainmentRefused("own containment requires the current running task")
+         elif row[0] not in ("todo", "ready", "triage") or row[1] is not None or not _reachable(conn, actor_task, tid):
+             raise ContainmentRefused("foreign containment requires an unclaimed descendant")
+-        if reduce_events(_events(conn, tid), verify_release=lambda r, s: verified_release(conn, r, s)) is not None:
++        if guard.pending(conn, tid, verify_release=lambda r, s: verified_release(conn, r, s)):
+             raise ContainmentRefused("task is already contained; resume its exact episode")
+         _nominees(conn, target, spec)
+         baseline = _baseline(conn, spec)
+@@ -185,6 +185,7 @@ def contain_local(conn: sqlite3.Connection, *, target: dict, resume_policy: dict
+             conn.execute("UPDATE tasks SET status='triage',current_run_id=NULL,completed_at=NULL,"
+                          "claim_lock=NULL,claim_expires=NULL,worker_pid=NULL,worker_started_at=NULL WHERE id=?", (tid,))
+             episode = _append(conn, tid, "contained", payload)
++            conn.execute("UPDATE tasks SET containment_episode=? WHERE id=?", (episode, tid))
+     return {"task_id": tid, "status": "triage", "episode": episode, "resume_policy": spec}
+ 
+ 
+@@ -240,5 +241,6 @@ def resume_local(conn: sqlite3.Connection, *, target: dict, episode: str, actor_
+             remaining = reduce_events(_events(conn, tid), verify_release=lambda r, s: verified_release(conn, r, s))
+             from hermes_cli.kanban_spend_decision import pending as spend_pending
+             landing = "triage" if remaining is not None or spend_pending(conn, tid) else kb._landing_status_after_parents(conn, tid)
+-            conn.execute("UPDATE tasks SET status=? WHERE id=?", (landing, tid))
++            conn.execute("UPDATE tasks SET status=?,containment_episode=CASE WHEN ? THEN containment_episode ELSE NULL END "
++                         "WHERE id=?", (landing, remaining is not None, tid))
+     return {"task_id": tid, "status": landing, "episode": episode, "release": receipt_uid}
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index b810f858a9bcaecd055c543d170df22721c5a723..8c9ecffeebe8bcc663e811cd7cd4f1fe37d5db7b 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -658,6 +658,7 @@ class Task:
+     # VALID_BLOCK_KINDS or None (legacy); kept across unblock so a same-kind re-block reads as a loop.
+     block_kind: Optional[str] = None
+     human_request: Optional[dict] = None
++    containment_episode: Optional[str] = None  # Portable hold marker; never release authority.
+     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
+     completion_contract: Optional[str] = None
+     placement_policy: Optional[str] = None
+@@ -689,22 +690,11 @@ class Task:
+         )
+ 
+ 
+-# Columns every schema version has (KeyError if the SELECT omitted them).
+-_TASK_REQUIRED_COLUMNS = (
+-    "id", "title", "body", "assignee", "status", "priority", "created_by",
+-    "workspace_kind", "workspace_path", "claim_lock",
+-)
+-_TASK_EPOCH_COLUMNS = ("created_at", "started_at", "completed_at", "claim_expires", "last_heartbeat_at")
+-# Later-added columns read as NULL when absent from the row.
+-_TASK_OPTIONAL_COLUMNS = (
+-    "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
+-    "max_runtime_seconds", "current_run_id", "workflow_template_id",
+-    "current_step_key", "max_retries", "session_id", "completion_contract", "placement_policy", "model_pin_mandatory",
+-)
+-# Text columns where "" is stored/read as "not set".
+-_TASK_EMPTY_IS_NULL_COLUMNS = (
+-    "model_override", "provider_override", "reasoning_effort", "goal_max_turns", "block_kind",
+-)
++# Private aliases remain available to direct callers of the compatibility facade.
++from hermes_cli.kanban_task_fields import EMPTY_IS_NULL as _TASK_EMPTY_IS_NULL_COLUMNS
++from hermes_cli.kanban_task_fields import EPOCH as _TASK_EPOCH_COLUMNS
++from hermes_cli.kanban_task_fields import OPTIONAL as _TASK_OPTIONAL_COLUMNS
++from hermes_cli.kanban_task_fields import REQUIRED as _TASK_REQUIRED_COLUMNS
+ 
+ 
+ @dataclass
+@@ -879,6 +869,7 @@ CREATE TABLE IF NOT EXISTS tasks (
+     -- the SAME kind can be recognised as a loop.
+     block_kind           TEXT,
+     human_request        TEXT,
++    containment_episode  TEXT,
+     -- Unblock-loop counter. Incremented each time a task is re-blocked for the
+     -- same truly-blocked reason after having been unblocked. When it reaches
+     -- BLOCK_RECURRENCE_LIMIT the task is routed to ``triage`` instead of
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 818dbe4f8bc35ff724b47a15e8bafbfe00641cb4..f457e0379a7bc0589c7e53602503162fbdf4f47e 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -1121,6 +1121,7 @@ _LATER_TASK_COLUMNS = (
+     # Typed operational reason; neither NULL nor capability implies a human ask.
+     ("block_kind", "block_kind TEXT"),
+     ("human_request", "human_request TEXT"),
++    ("containment_episode", "containment_episode TEXT"),
+     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
+     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
+     ("worker_started_at", "worker_started_at INTEGER"),
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index de7555c7020eb4bc35ac42bbc2823d5d15d30aec..11674c3ed4373e7e3df9f6667b5873d219c361ff 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -99,7 +99,7 @@ LOCAL_COLUMNS: dict[str, frozenset[str]] = {
+ # ``ready_since``: when the card last became ready (ms), for the Board's ``home_grace`` placement rule.
+ # ``workspace_source``/``workspace_custody``: Board-written only (``publish_source``, custody hooks); a push is refused.
+ SERVER_COLUMNS: dict[str, frozenset[str]] = {
+-    "tasks": frozenset({"created_on", "ready_since", "workspace_source", "workspace_custody"})}
++    "tasks": frozenset({"created_on", "ready_since", "workspace_source", "workspace_custody", "containment_episode"})}
+ JSON_SERVER_COLUMNS: dict[str, frozenset[str]] = {"tasks": frozenset({"workspace_source", "workspace_custody"})}
+ # Old columns an ADD-first rename migration keeps (``kanban_db_connect._RENAMED_TASK_COLUMNS``: the new column is
+ # added and filled from the old one, which stays). Every board older than the rename holds them; only
+diff --git a/hermes_cli/kanban_task_fields.py b/hermes_cli/kanban_task_fields.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b1558b16d1febfcec0792ee4786fc75378e092bd
+--- /dev/null
++++ b/hermes_cli/kanban_task_fields.py
+@@ -0,0 +1,18 @@
++"""Task row decoding groups, shared by the kanban_db compatibility facade."""
++
++# Columns every schema version has (KeyError if the SELECT omitted them).
++REQUIRED = (
++    "id", "title", "body", "assignee", "status", "priority", "created_by",
++    "workspace_kind", "workspace_path", "claim_lock",
++)
++EPOCH = ("created_at", "started_at", "completed_at", "claim_expires", "last_heartbeat_at")
++# Later-added columns read as NULL when absent from the row.
++OPTIONAL = (
++    "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
++    "max_runtime_seconds", "current_run_id", "workflow_template_id", "containment_episode",
++    "current_step_key", "max_retries", "session_id", "completion_contract", "placement_policy", "model_pin_mandatory",
++)
++# Text columns where "" is stored/read as "not set".
++EMPTY_IS_NULL = (
++    "model_override", "provider_override", "reasoning_effort", "goal_max_turns", "block_kind",
++)
+diff --git a/tests/hermes_cli/test_kanban_containment_actor.py b/tests/hermes_cli/test_kanban_containment_actor.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..70778775c3285f876af02c89115affa31f365e05
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_containment_actor.py
+@@ -0,0 +1,100 @@
++"""Runtime admission for CLI/tool containment, never caller-supplied identity."""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_containment_actor as actors
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_containment_lifecycle import ContainmentRefused
++from tests.hermes_cli import test_kanban_containment_lifecycle as fixtures
++
++board = fixtures.board
++
++
++def bind(conn, monkeypatch):
++    relay, _, _, _, _ = fixtures.setup(conn)
++    task = kb.get_task(conn, relay)
++    assert task is not None
++    path = conn.execute("PRAGMA database_list").fetchone()[2]
++    session = "fixture-contained-owner"
++    for key, value in {"HERMES_KANBAN_DB": path, "HERMES_KANBAN_TASK": relay,
++                       "HERMES_KANBAN_RUN_ID": str(task.current_run_id),
++                       "HERMES_KANBAN_CLAIM_LOCK": task.claim_lock, "HERMES_SESSION_ID": session}.items():
++        monkeypatch.setenv(key, value)
++    from gateway.session_context import scoped_current_session_id
++    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
++    with scoped_current_session_id(session):
++        kb._append_event(conn, relay, "owner_admitted", {"session_id": session}, run_id=task.current_run_id)
++    return relay, task.current_run_id, session
++
++
++def test_exact_runtime_claim_and_owner_session_are_required(board, monkeypatch):
++    relay, _, session = bind(board, monkeypatch)
++    from gateway.session_context import scoped_current_session_id
++    with scoped_current_session_id(session):
++        actor = actors.current_actor(board)
++    assert actor.task == relay
++    assert actor.run_uid == fixtures.run_uid(board, relay)
++
++
++@pytest.mark.parametrize("key,value", [
++    ("HERMES_KANBAN_TASK", ""), ("HERMES_KANBAN_TASK", "t_da066fc02a25c3b2"),
++    ("HERMES_KANBAN_DB", ""), ("HERMES_KANBAN_DB", "/does-not-exist/fixture.db"),
++    ("HERMES_KANBAN_RUN_ID", ""), ("HERMES_KANBAN_RUN_ID", "bad"),
++    ("HERMES_KANBAN_RUN_ID", "١"), ("HERMES_KANBAN_RUN_ID", "9999999"),
++    ("HERMES_KANBAN_CLAIM_LOCK", ""), ("HERMES_KANBAN_CLAIM_LOCK", "other"),
++])
++def test_missing_or_changed_runtime_pins_refuse(board, monkeypatch, key, value):
++    _, _, session = bind(board, monkeypatch)
++    monkeypatch.setenv(key, value)
++    from gateway.session_context import scoped_current_session_id
++    with scoped_current_session_id(session), pytest.raises(ContainmentRefused):
++        actors.current_actor(board)
++
++
++@pytest.mark.parametrize("scope", ["delegate", "cron"])
++def test_inprocess_child_cannot_borrow_workers_claim(board, monkeypatch, scope):
++    _, _, session = bind(board, monkeypatch)
++    from agent.delegation_context import delegated_child_context, non_dispatcher_owned_context
++    from gateway.session_context import scoped_current_session_id
++    context = delegated_child_context() if scope == "delegate" else non_dispatcher_owned_context()
++    with context, scoped_current_session_id(session), pytest.raises(ContainmentRefused):
++        actors.current_actor(board)
++
++
++def test_informational_worker_task_never_grants_admission(board, monkeypatch):
++    relay, _, session = bind(board, monkeypatch)
++    monkeypatch.delenv("HERMES_KANBAN_TASK")
++    monkeypatch.setenv("HERMES_KANBAN_WORKER_TASK", relay)
++    from gateway.session_context import scoped_current_session_id
++    with scoped_current_session_id(session), pytest.raises(ContainmentRefused):
++        actors.current_actor(board)
++
++
++@pytest.mark.parametrize("case", ["missing", "unrelated_run", "wrong_session", "malformed", "nonobject", "empty_context"])
++def test_owner_adoption_must_bind_exact_session_and_current_run(board, monkeypatch, case):
++    relay, rid, session = bind(board, monkeypatch)
++    if case in ("missing", "unrelated_run"):
++        board.execute("UPDATE task_events SET run_id=? WHERE task_id=? AND kind='owner_admitted'",
++                      (None if case == "missing" else rid + 1, relay))
++    elif case in ("malformed", "nonobject"):
++        board.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='owner_admitted'",
++                      ("{bad" if case == "malformed" else json.dumps([session]), relay))
++    elif case == "wrong_session":
++        session = "different-runtime-session"
++    else:
++        session = ""  # Context-local empty must NOT fall back to an ambient owner session.
++    from gateway.session_context import scoped_current_session_id
++    with scoped_current_session_id(session), pytest.raises(ContainmentRefused):
++        actors.current_actor(board)
++
++
++def test_ended_owner_cannot_start_new_containment(board, monkeypatch):
++    relay, rid, session = bind(board, monkeypatch)
++    board.execute("UPDATE task_runs SET ended_at=1 WHERE id=?", (rid,))
++    from gateway.session_context import scoped_current_session_id
++    with scoped_current_session_id(session), pytest.raises(ContainmentRefused):
++        actors.current_actor(board)
++    assert kb.get_task(board, relay).status == "running"
+diff --git a/tests/hermes_cli/test_kanban_containment_canonical.py b/tests/hermes_cli/test_kanban_containment_canonical.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..31ff2a86fb7feaf309c23b326f0514af2742cacb
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_containment_canonical.py
+@@ -0,0 +1,195 @@
++"""Canonical adapter: exact custody, unknown outcomes and durable replay.
++
++The Hub double models the documented wire contract, not a live Board or replica
++proof. Board's authenticated ingress tests exercise the producer of these bytes.
++"""
++from __future__ import annotations
++
++import copy
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_containment_canonical as canonical
++from hermes_cli.kanban_containment_lifecycle import ContainmentRefused
++from hermes_cli.kanban_containment_state import fingerprint
++from hermes_cli.kanban_db_sync import uuid7
++from tests.hermes_cli import test_kanban_containment_legacy_paths as legacy
++
++board = legacy.board
++TASK = "t_da066fc02a25c3b2"
++AUTH = "t_1123456789abcdef"
++
++
++def operation(kind="contain"):
++    target = {"gateway": "home", "board": "fixture", "task_id": TASK}
++    stop = {"version": 1, "target": target, "policy": {"version": 1, "authority": {**target, "task_id": AUTH}},
++            "producer_baseline": None}
++    episode = uuid7()
++    payload = stop if kind == "contain" else {
++        "version": 1, "episode": episode, "containment_sha256": fingerprint(stop), "resume_status": "ready",
++        "evidence": {"kind": "authority", "authority": stop["policy"]["authority"], "run_uid": uuid7()}}
++    op = {"client_op_id": uuid7(), "op": kind, "task": TASK, "actor_task": AUTH,
++          "actor_run_uid": uuid7(), "event_uid": episode if kind == "contain" else uuid7(), "payload": payload}
++    return op, stop, episode
++
++
++def evidence(op, stop, episode):
++    return {"board": "fixture", "table": "task_events", "uid": op["event_uid"], "state": "live",
++            "row": {"uid": op["event_uid"], "task_id": TASK,
++                    "kind": "contained" if op["op"] == "contain" else "containment_released",
++                    "payload": json.dumps(op["payload"], separators=(",", ":")), "origin_gateway": "worker"},
++            "containment_v1": {"version": 1, "episode": episode, "containment_sha256": fingerprint(stop),
++                               "gateway": "worker", "request": op["client_op_id"]}}
++
++
++class Hub:
++    def __init__(self, op, stop, episode):
++        self.ident = SimpleNamespace(gateway="worker")
++        self.posts = []
++        self.op = op
++        self.reply = {"results": [{"client_op_id": op["client_op_id"], "status": "applied"}]}
++        self.events = {op["event_uid"]: evidence(op, stop, episode)}
++        if op["op"] != "contain":
++            original = {**op, "op": "contain", "event_uid": episode, "payload": stop, "client_op_id": uuid7()}
++            self.events[episode] = evidence(original, stop, episode)
++        self.fail = False
++
++    def ops(self, slug, ops):
++        assert slug == "fixture"
++        self.posts.append(copy.deepcopy(ops))
++        if self.fail:
++            raise TimeoutError("fixture accepted request but reply was lost")
++        return self.reply
++
++    def row_evidence(self, slug, table, uid):
++        assert (slug, table) == ("fixture", "task_events")
++        return copy.deepcopy(self.events[uid])
++
++
++def staged(board, kind="contain"):
++    op, stop, episode = operation(kind)
++    request = canonical.stage(board, board="fixture", gateway="worker", op=op)
++    return request, op, Hub(op, stop, episode)
++
++
++@pytest.mark.parametrize("kind", ["contain", "resume_contained"])
++def test_canonical_success_never_writes_task_or_dependencies(board, kind):
++    relay, consumer = legacy._relay(board)
++    before = legacy._edges(board)
++    request, op, hub = staged(board, kind)
++    result = canonical.deliver(board, hub, request=request)
++    assert result == {"task_id": TASK, "request_uid": request, "event_uid": op["event_uid"],
++                      "canonical_confirmed": True}
++    assert legacy._edges(board) == before
++    assert legacy.kb.get_task(board, relay).status == "running"
++    assert legacy.kb.get_task(board, consumer).status == "todo"
++    assert board.execute("SELECT confirmed FROM containment_delivery").fetchone()[0] == 1
++    # Confirmed recovery still reads canonical evidence; it does not re-submit.
++    assert canonical.deliver(board, hub, request=request) == result
++    assert hub.posts == [[op]]
++
++
++def test_uncertain_delivery_recovers_identical_bytes_after_real_connection_restart(board):
++    import sqlite3
++    request, op, hub = staged(board)
++    hub.fail = True
++    with pytest.raises(TimeoutError):
++        canonical.deliver(board, hub, request=request)
++    path = board.execute("PRAGMA database_list").fetchone()[2]
++    hub.fail = False
++    with sqlite3.connect(path, isolation_level=None) as fresh:
++        fresh.row_factory = sqlite3.Row
++        canonical.deliver(fresh, hub, request=request)
++    assert hub.posts == [[op], [op]]
++    assert board.execute("SELECT COUNT(*) FROM containment_delivery").fetchone()[0] == 1
++
++
++@pytest.mark.parametrize("field", ["payload", "actor_run_uid", "task", "gateway", "board"])
++def test_request_cannot_change_on_retry(board, field):
++    request, op, _ = staged(board)
++    kwargs = {"board": "fixture", "gateway": "worker", "op": copy.deepcopy(op)}
++    if field in ("gateway", "board"):
++        kwargs[field] = "other"
++    elif field == "payload":
++        kwargs["op"][field]["producer_baseline"] = {"run_uid": uuid7(), "event_uid": None}
++    elif field == "actor_run_uid":
++        kwargs["op"][field] = uuid7()
++    else:
++        kwargs["op"][field] = AUTH
++    with pytest.raises(ContainmentRefused, match="different containment bytes"):
++        canonical.stage(board, **kwargs)
++    assert board.execute("SELECT request_uid FROM containment_delivery").fetchone()[0] == request
++
++
++@pytest.mark.parametrize("case", ["missing", "many", "nonobject", "other_request", "pending", "rejected"])
++def test_malformed_or_rejected_disposition_is_not_success(board, case):
++    request, _, hub = staged(board)
++    valid = hub.reply["results"][0]
++    hub.reply = {
++        "missing": {}, "many": {"results": [valid, valid]}, "nonobject": {"results": [None]},
++        "other_request": {"results": [{**valid, "client_op_id": uuid7()}]},
++        "pending": {"results": [{**valid, "status": "pending"}]},
++        "rejected": {"results": [{**valid, "status": "rejected"}]},
++    }[case]
++    with pytest.raises((canonical.DeliveryUnknown, ContainmentRefused)):
++        canonical.deliver(board, hub, request=request)
++    assert board.execute("SELECT confirmed FROM containment_delivery").fetchone()[0] == 0
++
++
++@pytest.mark.parametrize("path,value", [
++    (("board",), "other"), (("table",), "task_comments"), (("uid",), "bad"), (("state",), "deleted"),
++    (("row",), None), (("row", "uid"), "bad"), (("row", "task_id"), AUTH),
++    (("row", "kind"), "completed"), (("row", "deleted_at"), 1), (("row", "payload"), {}),
++    (("containment_v1",), None), (("containment_v1", "version"), True),
++    (("containment_v1", "episode"), "bad"), (("containment_v1", "request"), "bad"),
++    (("containment_v1", "gateway"), ""), (("row", "origin_gateway"), "foreign"),
++    (("containment_v1", "containment_sha256"), "0" * 64),
++])
++def test_attestation_guards_fail_closed(board, path, value):
++    request, op, hub = staged(board)
++    item = hub.events[op["event_uid"]]
++    for part in path[:-1]:
++        item = item[part]
++    item[path[-1]] = value
++    with pytest.raises(ContainmentRefused):
++        canonical.deliver(board, hub, request=request)
++    assert board.execute("SELECT confirmed FROM containment_delivery").fetchone()[0] == 0
++
++
++def test_certified_receipt_for_different_request_or_payload_is_not_delivery(board):
++    request, op, hub = staged(board)
++    hub.events[op["event_uid"]]["containment_v1"]["request"] = uuid7()
++    with pytest.raises(canonical.DeliveryUnknown):
++        canonical.deliver(board, hub, request=request)
++    # A different, internally certified policy still is not OUR staged policy.
++    item = hub.events[op["event_uid"]]
++    item["containment_v1"]["request"] = request
++    payload = json.loads(item["row"]["payload"])
++    payload["policy"]["authority"]["gateway"] = "new-home"
++    item["row"]["payload"] = json.dumps(payload)
++    item["containment_v1"]["containment_sha256"] = fingerprint(payload)
++    with pytest.raises(canonical.DeliveryUnknown):
++        canonical.deliver(board, hub, request=request)
++
++
++def test_confirmed_recovery_rechecks_canonical_evidence(board):
++    request, op, hub = staged(board)
++    canonical.deliver(board, hub, request=request)
++    hub.events[op["event_uid"]]["containment_v1"] = None
++    with pytest.raises(ContainmentRefused):
++        canonical.deliver(board, hub, request=request)
++    assert len(hub.posts) == 1
++
++
++def test_network_is_outside_writer_and_other_gateway_cannot_replay(board):
++    request, _, hub = staged(board)
++    hub.ident.gateway = "other"
++    with pytest.raises(ContainmentRefused, match="different enrolled gateway"):
++        canonical.deliver(board, hub, request=request)
++    hub.ident.gateway = "worker"
++    from hermes_cli import kanban_db as kb
++    with kb.write_txn(board), pytest.raises(ContainmentRefused, match="writer transaction"):
++        canonical.deliver(board, hub, request=request)
++    assert hub.posts == []
+diff --git a/tests/hermes_cli/test_kanban_containment_paging.py b/tests/hermes_cli/test_kanban_containment_paging.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ac502f40c5f73edb4879a4c4c54b09e15183ac04
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_containment_paging.py
+@@ -0,0 +1,108 @@
++"""A canonical task marker must hold before its history page arrives."""
++from __future__ import annotations
++
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_containment_guard as guard
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_db_sync import uuid7
++from tests.hermes_cli import test_kanban_containment_lifecycle as fixtures
++from tests.hermes_cli import test_kanban_sync_capture as capture
++
++board = fixtures.board
++kanban_home = capture.kanban_home
++synced_conn = capture.synced_conn
++
++
++def test_marker_before_history_holds_generic_lifecycle_and_survives_restart(board):
++    relay, _, _, _, _ = fixtures.setup(board)
++    episode = uuid7()
++    # Simulate the canonical task page before containment guards are installed.
++    board.execute("UPDATE tasks SET status='triage',current_run_id=NULL,containment_episode=? WHERE id=?", (episode, relay))
++    guard.install(board)
++    assert guard.pending(board, relay)
++    assert kb.get_task(board, relay).containment_episode == episode
++    with pytest.raises(sqlite3.IntegrityError, match="containment_pending"):
++        board.execute("UPDATE tasks SET status='ready' WHERE id=?", (relay,))
++    with pytest.raises(sqlite3.IntegrityError, match="containment_pending"):
++        board.execute("UPDATE tasks SET containment_episode=NULL WHERE id=?", (relay,))
++    with kb.write_txn(board), guard.authorized_write(board, relay):
++        board.execute("UPDATE tasks SET containment_episode=NULL WHERE id=?", (relay,))
++    assert guard.pending(board, relay)  # Bootstrapped observation survives a later task page.
++    path = board.execute("PRAGMA database_list").fetchone()[2]
++    again = sqlite3.connect(path)
++    try:
++        guard.install(again)
++        assert guard.pending(again, relay)
++    finally:
++        again.close()
++
++
++def test_later_task_page_cannot_erase_an_unresolved_observed_episode(board):
++    relay, _, _, _, _ = fixtures.setup(board)
++    guard.install(board)
++    episode = uuid7()
++    board.execute("UPDATE tasks SET status='triage',current_run_id=NULL,containment_episode=? WHERE id=?", (episode, relay))
++    # Importing an authoritative task page will use a scoped sync seam. Even a
++    # later cleared marker must not authorize before the missing history arrives.
++    with kb.write_txn(board), guard.authorized_write(board, relay):
++        board.execute("UPDATE tasks SET containment_episode=NULL WHERE id=?", (relay,))
++    assert guard.pending(board, relay)
++    assert board.execute("SELECT COUNT(*) FROM containment_observations WHERE task_id=?", (relay,)).fetchone()[0] == 1
++
++
++def test_new_marker_is_not_satisfied_by_an_older_valid_release(board):
++    relay, consumer, actor, target, spec = fixtures.setup(board)
++    stop = fixtures.contain(board, relay, target, spec)
++    from hermes_cli import kanban_containment_lifecycle as lifecycle
++    released = lifecycle.resume_local(board, target=target, episode=stop["episode"], actor_task=actor,
++                                     actor_run_uid=fixtures.run_uid(board, actor), kind="authority")
++    assert released["status"] == "ready"
++    assert not guard.pending(board, relay, verify_release=lambda r, s: lifecycle.verified_release(board, r, s))
++    assert kb.get_task(board, relay).containment_episode is None
++    assert kb.get_task(board, consumer).status == "todo"
++    # The second episode's task page arrives before its stop event. The previous
++    # authenticated release is valid, but is not authority for this new episode.
++    board.execute("UPDATE tasks SET status='triage',containment_episode=? WHERE id=?", (uuid7(), relay))
++    assert guard.pending(board, relay, verify_release=lambda r, s: lifecycle.verified_release(board, r, s))
++
++
++def test_failed_trigger_upgrade_retains_prior_fence(board, monkeypatch):
++    relay, _, _, _, _ = fixtures.setup(board)
++    guard.install(board)
++    board.execute("UPDATE tasks SET status='triage',current_run_id=NULL,containment_episode=? WHERE id=?", (uuid7(), relay))
++
++    def interrupted(conn):
++        conn.execute("DROP TRIGGER containment_task_update")
++        raise sqlite3.OperationalError("fixture interrupted migration")
++
++    monkeypatch.setattr(guard, "_triggers", interrupted)
++    with pytest.raises(sqlite3.OperationalError, match="interrupted migration"):
++        guard.install(board)
++    assert not board.in_transaction
++    with pytest.raises(sqlite3.IntegrityError, match="containment_pending"):
++        board.execute("UPDATE tasks SET status='ready' WHERE id=?", (relay,))
++
++
++def test_real_replica_apply_imports_hold_marker_but_outbox_never_authors_it(synced_conn):
++    from hermes_cli import kanban_db_sync as sync
++    conn = synced_conn
++    tid = kb.create_task(conn, title="fixture metadata", assignee="default")
++    episode = uuid7()
++    capture._clear_outbox(conn)
++    guard.install(conn)
++    remote = sync.RemoteChange(1, "tasks", tid, "upsert",
++                               {"id": tid, "status": "triage", "containment_episode": episode},
++                               100, "", "fixture-home")
++    sync.apply_remote_changes(conn, [remote], new_cursor=1, board="default")
++    assert kb.get_task(conn, tid).containment_episode == episode
++    assert guard.pending(conn, tid)
++    assert sync.outbox(conn) == []
++    # An annotation may still travel. Its full task row must omit the server
++    # marker so a gateway cannot manufacture/clear canonical containment.
++    conn.execute("UPDATE tasks SET priority=priority+1 WHERE id=?", (tid,))
++    task_ops = [op for op in sync.outbox(conn) if op["table_name"] == "tasks"]
++    assert task_ops
++    assert all("containment_episode" not in op["fields"] for op in task_ops)
+-- 
+2.43.0
+

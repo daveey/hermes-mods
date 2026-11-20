@@ -1,0 +1,152 @@
+From 69463b0c2a2276f5aa9432ce99415390fd825e75 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 07:11:29 +0000
+Subject: [PATCH] [daveey] kanban unloaded sweep: an orchestrator ask is not
+ wake-budgeted
+
+Adversarial review of the previous head: once a chat spent its hourly wake
+budget (4, often on its other cards' notices), the sweeper wrote a
+decision_requested as a passive transcript row and acked it. No turn read
+it, the card's comment probe never fired, and the card stayed parked.
+
+A batch carrying decision_requested is exempt from the per-chat budget (the
+wake slots and every other kind are unchanged). It cannot chain: each ask is
+a new park, and an identical re-park escalates at REPARK_LIMIT.
+
+Also (review Low): the post-commit decision-ask fallback catches any error
+per card with a traceback, so one card never skips the rest of _after_commit.
+
+Test: budget spent by four earlier wakes, real sweep_once: the ask starts a
+turn and writes no passive row; fails on the previous head. Sweeper and
+notification suites (12 files, 241 tests) pass.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_db_sync.py                 |  2 +-
+ tests/hermes_cli/test_kanban_decision_ask.py | 55 ++++++++++++++++++++
+ tui_gateway/kanban_unloaded.py               | 12 +++--
+ 3 files changed, 65 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 07b75e34d05fc1ed59b8e96a53987b3731f34e62..fda0eba0f7a4070aeba0ecfe5151e66c57741b54 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -1628,7 +1628,7 @@ def _after_commit(conn: sqlite3.Connection, result: ApplyResult, board: Optional
+         for task_id in sorted(result.decision_asks):
+             try:
+                 kanban_decision_ask.owner_fallback(conn, task_id)
+-            except (sqlite3.Error, ValueError) as exc:  # one card's fallback never stops the rest of the apply
++            except Exception as exc:  # health: allow BLE001 -- post-commit hook: one card's fallback never skips the rest of _after_commit (logged with traceback)
+                 _log.warning("kanban sync: decision ask fallback for %s failed: %s", task_id, exc, exc_info=True)
+     if result.wake_dispatcher:
+         wake_dispatcher()
+diff --git a/tests/hermes_cli/test_kanban_decision_ask.py b/tests/hermes_cli/test_kanban_decision_ask.py
+index b5be0ac278abeb07a1a15de5d02791c41a86de70..c06fdc47f9f99876aae2377092b2d7050c8e3325 100644
+--- a/tests/hermes_cli/test_kanban_decision_ask.py
++++ b/tests/hermes_cli/test_kanban_decision_ask.py
+@@ -9,6 +9,7 @@ gateway and a notify kind for ``tui`` chats (which the unloaded sweeper turns in
+ from __future__ import annotations
+ 
+ import argparse
++import contextlib
+ import json
+ import time
+ 
+@@ -472,3 +473,57 @@ def test_owner_with_a_wakeable_chat_leaves_the_card_parked(kanban_home) -> None:
+     _imported_ask(tid)
+     with kbc.connect_closing() as conn:
+         assert kb.get_task(conn, tid).status == "scheduled"
++
++
++class _ChatStore:
++    """The session store the sweeper opens for a reachable, live (not archived) orchestrator chat."""
++
++    def get_compression_tip(self, chat_id):
++        return chat_id
++
++    def _read_all(self, sql, params=()):
++        return [{"archived": 0, "end_reason": None}] if "archived" in sql and "end_reason" in sql else []
++
++    def kanban_notice_keys_delivered(self, tip, keys):
++        return set()
++
++    def __getattr__(self, name):
++        return lambda *a, **k: None
++
++
++def test_spent_wake_budget_still_wakes_the_orchestrator_for_an_ask(kanban_home, monkeypatch) -> None:
++    """Adversarial review of #3647: with the chat's hourly wake budget spent by other cards, the sweeper wrote the
++    ask as a passive row and acked it, so no turn ever read it and the card stayed parked."""
++    from tui_gateway import kanban_unloaded as ku
++    chat = _session()
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _subscribe(conn, tid, chat)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": LIVE_REASON, "clock_only": True, "awaiting": LIVE_AWAITING})
++        assert kb.get_task(conn, tid).status == "scheduled", out
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
++    now = time.time() + 10
++    ku._reset_wake_budget_for_tests()
++    for i in range(ku.WAKES_PER_HOUR):  # the orchestrator's other cards woke it this hour
++        ku._charge_wake(chat, now - 60 * (i + 1))
++    assert not ku._has_wake_budget(chat, now)
++    wakes, rows = [], []
++
++    class Store(_ChatStore):
++        def append_kanban_notice(self, tip, text, metadata):
++            rows.append(text)
++
++    @contextlib.contextmanager
++    def session_db(chat_id):
++        yield Store(), chat_id
++
++    def wake(tip, text, meta):
++        wakes.append(text)
++        return "started"
++
++    ku.sweep_once(set(), grace_s=0, now=now, session_db=session_db, wake=wake, holders=list,
++                  spawn=lambda job: job())
++    assert len(wakes) == 1 and "parked until you decide" in wakes[0] and not rows, (wakes, rows)
++    ku._reset_wake_budget_for_tests()
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index f9fcdc2cf4f13fa1894176a53c9e6e6ef7b9292f..d173c055eca6065f9d274b1ee05475e919fae6e3 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -462,7 +462,11 @@ def _deliver_sub(conn, slug, sub, ident, grace_s, now, session_db, _kb, _kbn, ki
+                 "task_id": ident["task_id"], "event_ids": [int(e.id) for e in claimed],
+                 # event-id identity shared with the live poller: a notice it already wrote is not written twice
+                 "kanban_event_keys": [f"{slug}:{int(e.id)}" for e in claimed if fmt(sub, task, e, slug)]}
+-    held_by, verdict = _route_notice(holders, ident, tip, slug, task, texts, now, grace_s)
++    # [daveey] A worker's question to its orchestrator is not budgeted: a passive row nobody reads leaves the card
++    # parked until its deadline (adversarial review of #3647). It cannot chain: each ask is a new park, and an
++    # identical re-park escalates at kanban_awaiting.REPARK_LIMIT.
++    asks = any(getattr(e, "kind", "") == "decision_requested" for e in claimed)
++    held_by, verdict = _route_notice(holders, ident, tip, slug, task, texts, now, grace_s, exempt_budget=asks)
+     if verdict == "skipped:slots" and _slots_may_wait(claimed, now):
+         # Every wake slot is busy: hand the range back so the next pass wakes the chat, instead of a passive row
+         # that no turn reads (design t_01a1d45d75851804 R4). An OVERDUE_S-old notice gets its row as before.
+@@ -532,7 +536,8 @@ def _undelivered(db, tip, slug, claimed: list) -> list:
+     return [e for e in claimed if f"{slug}:{int(e.id)}" not in done]
+ 
+ 
+-def _route_notice(holders, ident, tip, slug, task, texts, now, grace_s) -> tuple[Optional[str], Optional[str]]:
++def _route_notice(holders, ident, tip, slug, task, texts, now, grace_s,
++                  exempt_budget: bool = False) -> tuple[Optional[str], Optional[str]]:
+     """``(held_by, verdict)``: verdict None means a wake slot was taken and the caller must spawn the wake; any other
+     verdict says why the row is written now. Never raises: the events are already claimed."""
+     held_by = None
+@@ -541,7 +546,8 @@ def _route_notice(holders, ident, tip, slug, task, texts, now, grace_s) -> tuple
+         if held_by:
+             logger.warning("kanban poller miss: chat %s is held by %s but its poller did not claim %s/%s within "
+                            "%.0fs; the sweeper is delivering it", tip, held_by, slug, ident["task_id"], grace_s)
+-        skip = _wake_skip_reason(task, texts) or (None if _has_wake_budget(tip, now) else "skipped:budget")
++        skip = _wake_skip_reason(task, texts) or (
++            None if exempt_budget or _has_wake_budget(tip, now) else "skipped:budget")
+     except Exception:
+         logger.warning("kanban sweep routing for %s failed; writing the notice row", tip, exc_info=True)
+         return held_by, "error"
+-- 
+2.43.0
+

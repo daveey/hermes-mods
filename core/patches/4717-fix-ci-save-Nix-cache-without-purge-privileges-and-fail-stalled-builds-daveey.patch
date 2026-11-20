@@ -1,0 +1,133 @@
+From 28ad10b8b70affb8bba95d4097faceb478a4c8be Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 04:14:39 +0000
+Subject: [PATCH] fix(ci): save Nix cache without purge privileges and fail
+ stalled builds [daveey]
+
+cache-nix v7 awaits purge before save and catches the 403 as a warning, leaving every main runner cold. Disable purge rather than granting write permissions to PR/reusable builds; retain the 5G store GC and use GitHub LRU. Export Docker final layers only to reduce pressure on the shared cache quota. Bound the flake command to 40m with a 30s kill grace inside the 60m job so stalls fail instead of being reported as supersession cancellations. Regression proof: 3 RED, then 69 GREEN across four CI suites; scripts/check 21 checks pass. Live save/restore and cache survival remain post-merge acceptance.
+---
+ .github/workflows/docker.yml      |  9 +++---
+ .github/workflows/nix.yml         | 16 +++++------
+ tests/ci/test_nix_cache_budget.py | 47 +++++++++++++++++++++++++++++++
+ 3 files changed, 60 insertions(+), 12 deletions(-)
+ create mode 100644 tests/ci/test_nix_cache_budget.py
+
+diff --git a/.github/workflows/docker.yml b/.github/workflows/docker.yml
+index ddf7561c1fa156a2f9b3cd7f48de101c4a954ba2..d1b94e02130bea7fd16c99967c4dcf966c014f37 100644
+--- a/.github/workflows/docker.yml
++++ b/.github/workflows/docker.yml
+@@ -232,11 +232,12 @@ jobs:
+           tags: ${{ env.IMAGE_NAME }}:test
+           build-args: |
+             HERMES_BOT_DESKTOP=${{ matrix.variant == 'desktop' && '1' || '0' }}
+-          # Slim owns the scope; desktop adds the gated apt layer, so it reads
+-          # and writes nothing — a mode=max scope could exceed the cache cap.
++          # Slim owns the scope; desktop reads it but never exports. Export
++          # only final layers: mode=max's intermediate stages consumed the
++          # repository cache quota, leaving no room for the Nix store.
+           # Cache export is optional; backend outages must not discard a tested image.
+           cache-from: type=gha,scope=docker-${{ matrix.arch }}
+-          cache-to: ${{ (github.event_name != 'pull_request' && matrix.variant == 'slim') && format('type=gha,mode=max,ignore-error=true,scope=docker-{0}', matrix.arch) || '' }}
++          cache-to: ${{ (github.event_name != 'pull_request' && matrix.variant == 'slim') && format('type=gha,mode=min,ignore-error=true,scope=docker-{0}', matrix.arch) || '' }}
+ 
+ 
+       # Run the docker-integration test suite against the freshly-built image
+@@ -414,7 +415,7 @@ jobs:
+             org.opencontainers.image.revision=${{ env.CANDIDATE_COMMIT }}
+           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+           cache-from: type=gha,scope=docker-${{ matrix.arch }}
+-          cache-to: ${{ matrix.variant == 'slim' && format('type=gha,mode=max,ignore-error=true,scope=docker-{0}', matrix.arch) || '' }}
++          cache-to: ${{ matrix.variant == 'slim' && format('type=gha,mode=min,ignore-error=true,scope=docker-{0}', matrix.arch) || '' }}
+ 
+       - name: Export digest
+         run: |
+diff --git a/.github/workflows/nix.yml b/.github/workflows/nix.yml
+index 6a067ae0e4c04dba66e7a07e474e2db148b2f642..fcfce1d192ba78c6d5dc005a28094764c838f803 100644
+--- a/.github/workflows/nix.yml
++++ b/.github/workflows/nix.yml
+@@ -176,13 +176,10 @@ jobs:
+           # size of the compressed archive.
+           gc-max-store-size-linux: 5G
+ 
+-          # Delete the caches that this key replaces. GitHub removes caches by
+-          # least recent use across the whole repository, so a Nix store that
+-          # is never purged pushes out the caches of the other workflows.
+-          purge: true
+-          purge-prefixes: nix-${{ runner.os }}-
+-          purge-created: 0
+-          purge-primary-key: never
++          # v7 purges before saving, and a purge API 403 aborts the upload
++          # with only a warning. Keep the token read-only (also for PRs and
++          # reusable callers); let GitHub's LRU evict obsolete keys instead.
++          purge: false
+ 
+       - name: Prepare isolated release source
+         if: inputs.release == true
+@@ -200,7 +197,10 @@ jobs:
+         # A path: flake has no git metadata, so the release source names its
+         # commit with ?rev=: without it self.rev is null, the install stamp
+         # carries no commit, and the packaged CLI reports "unknown".
+-        run: nix flake check "${{ inputs.release == true && format('path:{0}/release-source?rev={1}', runner.temp, env.CANDIDATE_COMMIT) || '.' }}" --print-build-logs
++        # Fail before the job deadline: runner deadlines report cancelled,
++        # hiding red main from failure watchers. Reserve time for setup and
++        # cache post steps; GNU timeout exits 124 (or 137 after forced kill).
++        run: timeout --kill-after=30s 40m nix flake check "${{ inputs.release == true && format('path:{0}/release-source?rev={1}', runner.temp, env.CANDIDATE_COMMIT) || '.' }}" --print-build-logs
+ 
+       - name: Verify release package runtime identity
+         if: inputs.release == true
+diff --git a/tests/ci/test_nix_cache_budget.py b/tests/ci/test_nix_cache_budget.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..55297d85291ac1efaee8ec5fc4deff94907ab82e
+--- /dev/null
++++ b/tests/ci/test_nix_cache_budget.py
+@@ -0,0 +1,47 @@
++"""Nix caching must not require cache-delete privileges or hide build timeouts."""
++
++from pathlib import Path
++import subprocess
++
++from ruamel.yaml import YAML
++
++ROOT = Path(__file__).resolve().parents[2]
++
++
++def workflow(name):
++    return YAML(typ='safe').load((ROOT / '.github/workflows' / name).read_text())
++
++
++def test_cache_save_does_not_purge_with_read_only_token():
++    doc = workflow('nix.yml')
++    job = doc['jobs']['flake-check']
++    cache = next(s for s in job['steps'] if 'cache-nix-action@' in s.get('uses', ''))
++    assert cache['with'].get('purge', False) is False
++    assert doc['permissions'] == {'contents': 'read'}
++    assert 'permissions' not in job
++    assert cache['with']['gc-max-store-size-linux'] == '5G'
++
++
++def test_nix_timeout_is_a_command_failure(tmp_path):
++    job = workflow('nix.yml')['jobs']['flake-check']
++    step = next(s for s in job['steps'] if s.get('name') == 'nix flake check')
++    command = step['run']
++    assert 'timeout --kill-after=30s 40m nix flake check' in command
++    assert job['timeout-minutes'] == 60
++    assert not step.get('continue-on-error', False)
++    # Execute the same timeout prefix with a deliberately stalled child. GNU
++    # timeout's 124 is a failing step, unlike the runner's cancelled job deadline.
++    prefix = command.split('nix flake check')[0].replace('40m', '0.1s')
++    result = subprocess.run(
++        ['bash', '-e', '-c', prefix + ' bash -c "read -r -t 10 < <(tail -f /dev/null)"'],
++        capture_output=True, timeout=5, check=False,
++    )
++    assert result.returncode == 124
++
++
++def test_docker_exports_final_layers_only():
++    doc = workflow('docker.yml')
++    exports = [s['with']['cache-to'] for job in doc['jobs'].values()
++               for s in job.get('steps', []) if 'cache-to' in s.get('with', {})]
++    assert len(exports) == 2
++    assert all('mode=min,' in export and 'mode=max' not in export for export in exports)
+-- 
+2.43.0
+

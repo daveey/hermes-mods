@@ -1,0 +1,508 @@
+From b128abcfe20dd1573a78ae41a644fa142601492b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 16:56:25 +0000
+Subject: [PATCH] =?UTF-8?q?[daveey]=20lifecycle=20guard:=20walk=20every=20?=
+ =?UTF-8?q?line=20bash=20may=20end=20a=20$(=E2=80=A6)=20heredoc=20delimite?=
+ =?UTF-8?q?r=20at?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Review 5905862108 on PR #3020 (request changes): bash ends a heredoc whose
+delimiter holds $(…) at its own reprint of the parsed command, not at the
+literal text. `<<$(echo  E|cat)` ends at `$(echo E | cat)`, `<<$([[ a ]])`
+at `$([[ -n a ]])`, and `<<"$(echo  E)"` (double quotes too) at `$(echo E)`.
+Reading the word verbatim predicted the wrong end line, so the body's `}`
+still closed an outer group early and `cat f.py` escaped the `} | python3`.
+
+Fix (fail closed rather than model bash's printer):
+- tools/shell_heredoc_words.py: reprinted_by_bash() flags a word holding
+  $( (or a $(( that is not plain arithmetic). _balanced_end skips a nested
+  $(…)/${…} whole, so ${x:-$(echo })} reads as one word.
+- tools/shell_heredoc.py: _parse_heredoc_operator returns None for such a
+  word (also inside double quotes), so no masker or span walk trusts a guessed
+  terminator. heredoc_body_walk() also reports where the span walk stopped.
+- cron/lifecycle_guard_groups.py: heredoc_scripts() additionally yields one
+  view per later line holding $( (bash's reprint always does), with the
+  opener's heredoc words and the body through that line removed. Views are
+  capped at 16 per command; heredoc_views_overflow() reports a cut-off.
+- cron/lifecycle_guard.py (+8 lines, _walk_refusal): past the cap, executed text fails
+  closed with a named refusal telling the model to use a plain word.
+
+Backticks, $((…)), ${…} without $(, $'…' and $"…" keep exact parsing;
+each terminator in the test file is checked against real bash 5.2.
+
+Tests: tests/cron/test_lifecycle_guard_heredoc_delimiters.py (96 cases).
+---
+ cron/lifecycle_guard.py                       |  14 ++-
+ cron/lifecycle_guard_groups.py                |  82 ++++++++++++-
+ ...test_lifecycle_guard_heredoc_delimiters.py | 114 +++++++++++++++---
+ tools/shell_heredoc.py                        |  26 ++--
+ tools/shell_heredoc_words.py                  |  37 ++++--
+ 5 files changed, 229 insertions(+), 44 deletions(-)
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index 1ac46d43d90922754ab4cfa822e27bfed56c26e4..4d0d0bf81170aa4f344c24a3d43fd59c6673e599 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -22,7 +22,7 @@ from typing import Callable, Iterator, Optional
+ from cron.lifecycle_guard_aliases import _may_define_alias, _session_aliases_shadow_consumers
+ from cron.lifecycle_guard_groups import CONTROL_CHARS as _CONTROL_CHARS
+ from cron.lifecycle_guard_groups import (
+-    heredoc_scripts, iter_script_segment_contexts, join_continued_lines)
++    heredoc_scripts, heredoc_views_overflow, iter_script_segment_contexts, join_continued_lines)
+ from cron.lifecycle_guard_words import REDIRECTION as _REDIRECTION
+ from cron.lifecycle_guard_words import redirection_parts, tokenize_redirections
+ from cron.lifecycle_guard_lines import join_line_continuations
+@@ -705,6 +705,14 @@ def _depth_limit_reached(budget: _LifecycleScanBudget, depth: int, *, executed:
+     return executed
+ 
+ 
++def _walk_refusal(budget: _LifecycleScanBudget, command: str, depth: int, executed: bool) -> Optional[bool]:
++    """Verdict before a walk: depth cap, or ``$(…)`` heredoc terminator views past their cap."""
++    if executed and heredoc_views_overflow(command):
++        budget.refusal = "a `<<$(…)` heredoc delimiter has too many possible end lines; use a plain word"
++        return True
++    return _depth_limit_reached(budget, depth, executed=executed) if depth >= _MAX_REFERENCED_SCRIPT_DEPTH else None
++
++
+ def _unreadable_reason(path: Path) -> str:
+     """Name why an *executed* script failed closed without being scanned (live SQLite, device,
+     oversized). Message-only: the fail-closed verdict itself came from the bounded reader."""
+@@ -1672,8 +1680,8 @@ def _contains_unsafe_gateway_action(
+     if _direct_lifecycle_scan(command, mask_heredocs=budget.mask_heredocs):
+         return True
+     budget.note_aliases(command)
+-    if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
+-        return _depth_limit_reached(budget, depth, executed=executed)
++    if (refused := _walk_refusal(budget, command, depth, executed)) is not None:
++        return refused
+ 
+     def recurse(
+         text: str, cwd: Optional[str], executed: bool, source: Optional[str], python_source: bool = False,
+diff --git a/cron/lifecycle_guard_groups.py b/cron/lifecycle_guard_groups.py
+index 2f445ed98b16e65ed5ba41f95ae269ff91f0f8c8..8268128ba815916be703cd3a228badf1a825014a 100644
+--- a/cron/lifecycle_guard_groups.py
++++ b/cron/lifecycle_guard_groups.py
+@@ -420,19 +420,93 @@ class _LineWalk:
+ def heredoc_scripts(command: str) -> Iterator[str]:
+     """*command* without its heredoc bodies, then each body (a shell's body is a script of its
+     own; any other body walked as one only fails closed), so a ``{``/``}`` line in a body never
+-    opens or closes a group of the command around it."""
+-    from tools.shell_heredoc import heredoc_body_spans
++    opens or closes a group of the command around it.
++
++    Bash ends a body whose delimiter holds ``$(…)`` at its own reprint of that substitution
++    (``tools.shell_heredoc_words``), which is not predicted here. Such an opener stops the body
++    walk and its body's lines stay in the script, where a ``}`` would close an outer group early.
++    So the script is also yielded once per later line holding ``$(`` (each a line bash could end
++    the body at), with the opener's heredoc words and the body through that line removed. Past
++    ``MAX_REPRINTED_TERMINATOR_VIEWS`` such lines, see ``heredoc_views_overflow``."""
++    return (script for script in _heredoc_scripts(command) if script is not None)
++
++
++def heredoc_views_overflow(command: str) -> bool:
++    """Whether ``heredoc_scripts`` left out some line bash may end a ``$(…)``-delimited body at
++    (more than ``MAX_REPRINTED_TERMINATOR_VIEWS``): its walk is incomplete, so fail closed."""
++    return any(script is None for script in _heredoc_scripts(command)) if "<<" in command else False
++
++
++# Bound on the extra script walks ``heredoc_scripts`` makes for one command.
++MAX_REPRINTED_TERMINATOR_VIEWS = 16
++_HEREDOC_OPERATOR = re.compile(r"(?<!<)<<(?!<)")
++
++
++def _heredoc_scripts(command: str) -> Iterator[Optional[str]]:
++    """``heredoc_scripts``, then one None if some terminator view was left out."""
++    from tools.shell_heredoc import heredoc_body_walk
+ 
+     pending = [command]
++    views = MAX_REPRINTED_TERMINATOR_VIEWS
++    overflow = False
+     while pending:
+         script = pending.pop()
+         outside: list[str] = []
+         previous = 0
+-        for start, terminator, end in heredoc_body_spans(script) if "<<" in script else []:
++        spans, stop = heredoc_body_walk(script) if "<<" in script else ([], None)
++        for start, terminator, end in spans:
+             outside.append(script[previous:start])
+             pending.append(script[start:terminator])
+             previous = end
+-        yield "".join(outside) + script[previous:]
++        head = "".join(outside)
++        yield head + script[previous:]
++        if stop is None or overflow:
++            continue
++        for view in _reprinted_terminator_views(
++                script[previous:], stop[0] - previous, stop[1] - previous):
++            if views <= 0:
++                overflow = True
++                break
++            views -= 1
++            pending.append(head + view)
++    if overflow:
++        yield None
++
++
++def _reprinted_terminator_views(text: str, unit_start: int, unit_end: int) -> Iterator[str]:
++    """*text* without the heredoc words of its stopped command unit and without the lines after
++    it through a later line holding ``$(``: one view per such line. None unless the unit holds a
++    ``$(`` after a ``<<`` (only then may bash's terminator be a line the opener parser missed)."""
++    unit = text[unit_start:unit_end]
++    opener = unit.find("<<")
++    if opener < 0 or "$(" not in unit[opener:]:
++        return
++    neutral = text[:unit_start] + _without_heredoc_words(unit)
++    line_start = unit_end + 1
++    while line_start < len(text):
++        line_end = text.find("\n", line_start)
++        line_end = len(text) if line_end < 0 else line_end
++        if "$(" in text[line_start:line_end]:
++            yield neutral + text[line_end:]
++        line_start = line_end + 1
++
++
++def _without_heredoc_words(unit: str) -> str:
++    """*unit* without its ``<<`` operators and their delimiter words (to its end past a word that
++    does not parse), so ``cat <<$(echo })| python3`` keeps ``cat | python3`` and no ``}``."""
++    from tools.shell_heredoc import _parse_heredoc_operator
++
++    kept: list[str] = []
++    cursor = 0
++    for match in _HEREDOC_OPERATOR.finditer(unit):
++        if match.start() < cursor:
++            continue
++        kept.append(unit[cursor:match.start()])
++        parsed = _parse_heredoc_operator(unit, match.start(), reprinted_ok=True)
++        if parsed is None:
++            return "".join(kept)
++        cursor = parsed[0]
++    return "".join(kept) + unit[cursor:]
+ 
+ 
+ def iter_script_segment_contexts(
+diff --git a/tests/cron/test_lifecycle_guard_heredoc_delimiters.py b/tests/cron/test_lifecycle_guard_heredoc_delimiters.py
+index 765c416f0d0da2213809bee53c5c9471a030b0f7..fee2c87b64fe971a543309c04a01f824b53e2ef8 100644
+--- a/tests/cron/test_lifecycle_guard_heredoc_delimiters.py
++++ b/tests/cron/test_lifecycle_guard_heredoc_delimiters.py
+@@ -1,11 +1,14 @@
+ """Heredoc delimiters spelled with expansions or ``$'…'``/``$"…"`` quoting (PR #2942 review).
+ 
+-Bash reads a delimiter word through its expansions without performing them: ``cat <<$(echo E)``
+-ends at a line reading ``$(echo E)``, while ``<<$'\\x45'`` ends at ``E``. The opener parser
+-used to stop such a word at its first ``(`` or space (or keep the ``$`` of ``$'E'``), so the
+-body had no terminator; its lines were walked as commands of the script around it and a ``}``
+-there closed the outer group early, hiding ``cat f.py`` from the ``} | python3`` it feeds.
+-Each shape is checked against real bash too, with a harmless marker in place of the program.
++Bash reads most of a delimiter word through its expansions without performing them: backticks,
++``$((…))`` and ``${…}`` end the body at a line spelled exactly like them, and ``<<$'\\x45'`` at
++``E``. A ``$(…)`` is different: bash ends the body at its own reprint of the parsed command
++(``<<$(echo  E|cat)`` at ``$(echo E | cat)``), even inside double quotes. The opener parser
++used to stop such a word at its first ``(`` or space, so the body had no terminator; its lines
++were walked as commands of the script around it, and a ``}`` there closed the outer group early,
++hiding ``cat f.py`` from the ``} | python3`` it feeds. Now exact words parse whole, and a
++``$(…)`` word is unparsable: the guard also walks the script once per later line holding ``$(``.
++Every terminator below is the one bash itself uses, checked with a harmless marker.
+ """
+ 
+ from __future__ import annotations
+@@ -16,23 +19,44 @@ import subprocess
+ 
+ import pytest
+ 
++from cron import lifecycle_guard_groups
+ from cron.lifecycle_guard import scan_gateway_lifecycle
+ from tools.shell_heredoc import _parse_heredoc_operator
+ 
+ # Assembled so this file's own text never carries the literal command.
+ LIFECYCLE = " ".join(["hermes", "gateway", "re" + "start"])
+ 
+-# (delimiter word as written, the body line bash ends the heredoc at)
+-DELIMITERS = [
+-    ("$(echo E)", "$(echo E)"),
++# (delimiter word as written, the body line bash ends the heredoc at): the parser predicts these.
++EXACT = [
+     ("`echo E`", "`echo E`"),
++    ("`echo  E`", "`echo  E`"),
+     ("$((1+2))", "$((1+2))"),
++    ("$((1 + 2))", "$((1 + 2))"),
+     ("${x:-a b}", "${x:-a b}"),
+-    ("$(echo ')')", "$(echo ')')"),
+-    ("a$(echo E)b", "a$(echo E)b"),
++    ("${x:-`echo }`}", "${x:-`echo }`}"),
+     ("$'E'", "E"),
+     ("$'\\x45'", "E"),
+     ('$"E"', "E"),
++    ("'$(echo  E)'", "$(echo  E)"),
++    ('"\\$(x  y)"', "$(x  y)"),
++]
++# Bash ends these at its reprint of the `$(…)`, which the parser does not model.
++REPRINTED = [
++    ("$(echo E)", "$(echo E)"),
++    ("$(echo  E)", "$(echo E)"),
++    ("$(  echo E )", "$(echo E)"),
++    ("$(echo E|cat)", "$(echo E | cat)"),
++    ("$(echo E;)", "$(echo E)"),
++    ("$(echo E>/dev/null)", "$(echo E > /dev/null)"),
++    ("$(<f)", "$(< f)"),
++    ("$(echo E&)", "$(echo E &)"),
++    ("$([[ a ]])", "$([[ -n a ]])"),
++    ("$(echo ')')", "$(echo ')')"),
++    ("a$(echo  E)b", "a$(echo E)b"),
++    ('"$(echo  E)"', "$(echo E)"),
++    ("${x:-$(echo })}", "${x:-$(echo })}"),
++    ("${x:-$(echo  E)}", "${x:-$(echo E)}"),
++    ("$((1+$(echo  1)))", "$((1+$(echo 1)))"),
+ ]
+ 
+ 
+@@ -40,38 +64,51 @@ def _group(delimiter: str, terminator: str, inner: str, sink: str) -> str:
+     return f"{{\ncat <<{delimiter}\n}}\n{terminator}\n{inner}\n}} | {sink}"
+ 
+ 
+-@pytest.mark.parametrize(("delimiter", "terminator"), DELIMITERS)
+-def test_group_feed_after_expansion_delimiter_is_scanned(tmp_path, delimiter, terminator):
++def _lifecycle_script(tmp_path) -> str:
+     script = tmp_path / "f.py"
+     script.write_text(f"import os\nos.system({LIFECYCLE!r})\n", encoding="utf-8")
+-    command = _group(delimiter, terminator, f"cat {shlex.quote(str(script))}", "python3")
++    return shlex.quote(str(script))
++
++
++@pytest.mark.parametrize(("delimiter", "terminator"), EXACT + REPRINTED)
++def test_group_feed_after_expansion_delimiter_is_scanned(tmp_path, delimiter, terminator):
++    command = _group(delimiter, terminator, f"cat {_lifecycle_script(tmp_path)}", "python3")
+     assert scan_gateway_lifecycle(command) == (True, None)
+ 
+ 
+ @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+-@pytest.mark.parametrize(("delimiter", "terminator"), DELIMITERS)
+-def test_bash_ends_the_body_where_the_parser_does(delimiter, terminator):
++@pytest.mark.parametrize(("delimiter", "terminator"), EXACT + REPRINTED)
++def test_bash_ends_the_body_at_the_terminator(delimiter, terminator):
+     """Bash itself ends the body at ``terminator``: the group's later command reaches the pipe."""
+     command = _group(delimiter, terminator, "echo MARKER_FED", "cat")
+     result = subprocess.run(["bash", "-c", command], capture_output=True, text=True,
+                             timeout=20, check=False)
+     assert "MARKER_FED" in result.stdout.splitlines(), result.stderr
++
++
++@pytest.mark.parametrize(("delimiter", "terminator"), EXACT)
++def test_parser_ends_an_exact_word_where_bash_does(delimiter, terminator):
+     parsed = _parse_heredoc_operator(f"<<{delimiter}", 0)
+     assert parsed is not None and parsed[1] == terminator
+ 
+ 
++@pytest.mark.parametrize(("delimiter", "_terminator"), REPRINTED)
++def test_parser_refuses_a_word_bash_reprints(delimiter, _terminator):
++    assert _parse_heredoc_operator(f"<<{delimiter}", 0) is None
++    assert _parse_heredoc_operator(f"<<-{delimiter}", 0) is None
++
++
+ @pytest.mark.parametrize(
+     ("opener", "delimiter", "quoted"),
+     [
+-        ("<<$(echo E)", "$(echo E)", False),
+-        ("<<-$(echo E)", "$(echo E)", False),
+         ("<<`echo E`", "`echo E`", False),
+-        ("<<$(echo \"(\" ')')", "$(echo \"(\" ')')", False),
++        ("<<-`echo E`", "`echo E`", False),
+         ("<<${x:-a b}", "${x:-a b}", False),
++        ("<<${x:-$((1))}", "${x:-$((1))}", False),
+         ("<<$'a\\'b'", "a'b", True),
+         ("<<$'\\t'", "\t", True),
+         ('<<$"E"', "E", True),
+-        ("<<E$(x)'q'", "E$(x)q", True),
++        ("<<E`x`'q'", "E`x`q", True),
+     ],
+ )
+ def test_opener_takes_expansion_parts_whole(opener, delimiter, quoted):
+@@ -84,3 +121,40 @@ def test_opener_takes_expansion_parts_whole(opener, delimiter, quoted):
+ @pytest.mark.parametrize("opener", ["<<$(echo E", "<<`echo E", "<<${x", "<<$'E", "<<$(echo\nE)"])
+ def test_opener_with_unclosed_expansion_stays_unparsed(opener):
+     assert _parse_heredoc_operator(opener, 0) is None
++
++
++def test_double_quoted_substitution_body_is_not_masked_past_bash_terminator():
++    """``<<"$(echo  E)"`` ends at ``$(echo E)``; masking to the literal word hid what follows."""
++    command = f'cat <<"$(echo  E)"\ndata\n$(echo E)\n{LIFECYCLE}\n$(echo  E)'
++    assert scan_gateway_lifecycle(command) == (True, None)
++
++
++def test_reprinted_delimiter_with_harmless_group_stays_allowed():
++    command = _group("$(echo  E|cat)", "$(echo E | cat)", "echo fed", "cat")
++    assert scan_gateway_lifecycle(command) == (False, None)
++
++
++def test_later_heredoc_in_a_terminator_view_is_split_from_the_group(tmp_path):
++    """The view after a reprinted body still separates a later heredoc's ``}`` line."""
++    command = (f"{{\ncat <<$(echo E)\n}}\n$(echo E)\ncat <<X\n}}\nX\n"
++               f"cat {_lifecycle_script(tmp_path)}\n}} | python3")
++    assert scan_gateway_lifecycle(command) == (True, None)
++
++
++def _candidate_lines(count: int) -> str:
++    lines = [f"echo $(echo {index})" for index in range(count)]
++    return "\n".join(["{", "cat <<$(echo E)", *lines, "} | cat"])
++
++
++def test_terminator_views_up_to_the_cap_are_walked():
++    cap = lifecycle_guard_groups.MAX_REPRINTED_TERMINATOR_VIEWS
++    assert not lifecycle_guard_groups.heredoc_views_overflow(_candidate_lines(cap))
++    assert scan_gateway_lifecycle(_candidate_lines(cap)) == (False, None)
++
++
++def test_terminator_views_past_the_cap_fail_closed():
++    cap = lifecycle_guard_groups.MAX_REPRINTED_TERMINATOR_VIEWS
++    command = _candidate_lines(cap + 1)
++    assert lifecycle_guard_groups.heredoc_views_overflow(command)
++    unsafe, refusal = scan_gateway_lifecycle(command)
++    assert unsafe and refusal and "plain word" in refusal
+diff --git a/tools/shell_heredoc.py b/tools/shell_heredoc.py
+index b6c2ea717918075bb9534989650c6639d74c0b7d..c5e704ef425687fe21e6e0d23b6fde2785d43cb6 100644
+--- a/tools/shell_heredoc.py
++++ b/tools/shell_heredoc.py
+@@ -18,7 +18,7 @@ import shlex
+ from collections.abc import Iterator
+ 
+ from tools.shell_arith_sink import DATE_PRODUCER_BODY, substitution_in_arithmetic
+-from tools.shell_heredoc_words import delimiter_expansion
++from tools.shell_heredoc_words import delimiter_expansion, reprinted_by_bash
+ 
+ # Non-shell interpreters whose quoted heredoc bodies are data for THAT interpreter, judged on the
+ # command the owner actually runs: VAR=... assignments and stdin-passing wrappers (``timeout 20``,
+@@ -340,8 +340,9 @@ def _mask_simple_quotes(command: str) -> str:
+     return "".join(result)
+ 
+ 
+-def _parse_heredoc_operator(command: str, index: int):
+-    """Parse one ``<<`` opener -> ``(end_index, delimiter, strip_tabs, quoted)`` or None."""
++def _parse_heredoc_operator(command: str, index: int, *, reprinted_ok: bool = False):
++    """Parse one ``<<`` opener -> ``(end_index, delimiter, strip_tabs, quoted)`` or None. A word
++    bash reprints (``$(…)``) is None unless *reprinted_ok*; then its delimiter is only a guess."""
+     if not command.startswith("<<", index) or command.startswith("<<<", index):
+         return None
+     strip_tabs = command.startswith("-", index + 2)
+@@ -364,7 +365,7 @@ def _parse_heredoc_operator(command: str, index: int):
+             cursor += 1
+         elif char == "`" or command.startswith(("$(", "${", "$'"), cursor):
+             part = delimiter_expansion(command, cursor)  # taken unexpanded, spaces and all
+-            if part is None:
++            if part is None or (reprinted_by_bash(part[1]) and not reprinted_ok):
+                 return None
+             cursor, text, part_quoted = part
+             delimiter.append(text)
+@@ -374,8 +375,9 @@ def _parse_heredoc_operator(command: str, index: int):
+             cursor += 1
+             while cursor < len(command) and command[cursor] != char:
+                 current = command[cursor]
+-                if current in "\r\n":
+-                    return None
++                if current in "\r\n" or (
++                        char == '"' and not reprinted_ok and command.startswith("$(", cursor)):
++                    return None  # bash reprints a quoted `$(…)` too: "$(echo  E)" ends at $(echo E)
+                 if char == '"' and current == "\\":
+                     if cursor + 1 >= len(command):
+                         return None
+@@ -694,19 +696,25 @@ def heredoc_body_spans(command: str) -> list[tuple[int, int, int]]:
+     (bodies nested in a body are part of it). Stops at the first opener it cannot parse or whose
+     body has no terminator line, leaving the rest of *command* outside every span.
+     """
++    return heredoc_body_walk(command)[0]
++
++
++def heredoc_body_walk(command: str) -> tuple[list[tuple[int, int, int]], tuple[int, int] | None]:
++    """``heredoc_body_spans`` plus ``(start, end)`` of the command unit (its line) the walk
++    stopped at, or None when no opener stopped it."""
+     spans: list[tuple[int, int, int]] = []
+     last_opener_index = command.rfind("<<")
+     command_start = 0
+     while command_start <= last_opener_index:
+         command_end, specs, unknown_operator, _, _ = _scan_heredoc_command_unit(command, command_start)
+         if unknown_operator or (specs and command_end >= len(command)):
+-            break
++            return spans, (command_start, command_end)
+         bodies = _heredoc_bodies(command, command_end + 1, specs) if specs else []
+         if bodies is None:
+-            break
++            return spans, (command_start, command_end)
+         spans += bodies
+         command_start = bodies[-1][2] if bodies else command_end + 1
+-    return spans
++    return spans, None
+ 
+ 
+ def _numeric_filter_suffix(line: str) -> bool:
+diff --git a/tools/shell_heredoc_words.py b/tools/shell_heredoc_words.py
+index 9d7fad9b63f3d73b498b8732d559a777eefaf039..3c8e396cfe28ea821b3ee564278d91907681b8aa 100644
+--- a/tools/shell_heredoc_words.py
++++ b/tools/shell_heredoc_words.py
+@@ -1,13 +1,17 @@
+ """Expansion parts of a heredoc delimiter word, read the way bash reads them.
+ 
+-Bash takes a delimiter word through its expansions without performing them: ``<<$(echo E)``
+-ends at a line reading ``$(echo E)``, and ``` <<`echo E` ```, ``<<$((1+2))`` and ``<<${x:-a b}``
+-likewise, spaces and all. ``$'…'`` and ``$"…"`` are quoting: ``<<$'\\x45'`` ends at ``E``.
+-Stopping such a word at its first space or ``(`` left the body unterminated, so its lines
+-(a ``}`` among them) read as commands of the script around it.
++Bash takes a delimiter word through its expansions without performing them. Backticks,
++``$((…))`` and ``${…}`` stay as written: ``` <<`echo  E` ``` ends at a line reading
++``` `echo  E` ``` and ``<<${x:-a  b}`` at ``${x:-a  b}``, spaces and all. ``$'…'`` and ``$"…"``
++are quoting: ``<<$'\\x45'`` ends at ``E``. Stopping such a word at its first space or ``(`` left
++the body unterminated, so its lines (a ``}`` among them) read as commands of the script around it.
+ 
+-Bash reprints a ``$(…)`` delimiter from its parse, so one holding a newline, a comment or a
+-``case`` is not matched here; such an opener stays unparsed or unterminated.
++A ``$(…)`` command substitution is different: bash parses it, and the delimiter is bash's own
++reprint of that parse. ``$(echo  E|cat)`` ends at ``$(echo E | cat)``, ``$([[ a ]])`` at
++``$([[ -n a ]])``, and a ``case`` or a comment reprints across lines, so it never ends. That
++reprint is not modelled here. A word holding ``$(`` outside single quotes is *reprinted*, and the
++opener parser treats it as unparsable. The lifecycle guard then tries every later line holding
++``$(`` as the terminator (``cron.lifecycle_guard_groups.heredoc_scripts``).
+ """
+ 
+ from __future__ import annotations
+@@ -21,6 +25,15 @@ _ANSI_C_SIMPLE = {
+ _ANSI_C_ESCAPE_RE = re.compile(
+     r"\\(?:(?P<simple>[abeEfnrtv\\'\"?])|(?P<octal>[0-7]{1,3})|x(?P<hex>[0-9A-Fa-f]{1,2})"
+     r"|u(?P<u4>[0-9A-Fa-f]{1,4})|U(?P<u8>[0-9A-Fa-f]{1,8})|c(?P<control>.))", re.DOTALL)
++# A command substitution: ``$(`` that does not open arithmetic ``$((``.
++_COMMAND_SUBSTITUTION_RE = re.compile(r"\$\((?!\()")
++
++
++def reprinted_by_bash(text: str) -> bool:
++    """Whether bash ends a heredoc whose delimiter holds expansion *text* at its own reprint of a
++    parse instead of at *text*: any ``$(…)`` in it, or a ``$((`` that is not plain arithmetic."""
++    return bool(_COMMAND_SUBSTITUTION_RE.search(text)) or (
++        text.startswith("$((") and not text.endswith("))"))
+ 
+ 
+ def _decode_ansi_c(text: str) -> str:
+@@ -54,7 +67,8 @@ def _quoted_end(command: str, index: int, quote: str, escapes: bool | None = Non
+ 
+ 
+ def _balanced_end(command: str, index: int, opener: str, closer: str) -> int | None:
+-    """Index just past the ``closer`` matching ``command[index]`` (one line only)."""
++    """Index just past the ``closer`` matching ``command[index]`` (one line only). A nested
++    ``$(…)`` or ``${…}`` is skipped whole, so ``${x:-$(echo })}`` closes at its last ``}``."""
+     depth = 0
+     cursor = index
+     while cursor < len(command):
+@@ -70,6 +84,13 @@ def _balanced_end(command: str, index: int, opener: str, closer: str) -> int | N
+                 return None
+             cursor = end
+             continue
++        nested = {"(": ")", "{": "}"}.get(command[cursor + 1:cursor + 2])
++        if char == "$" and nested is not None:
++            end = _balanced_end(command, cursor + 1, command[cursor + 1], nested)
++            if end is None:
++                return None
++            cursor = end
++            continue
+         if char == opener:
+             depth += 1
+         elif char == closer:
+-- 
+2.43.0
+

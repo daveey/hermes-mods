@@ -1,0 +1,93 @@
+From b960cc1ad6f4d8411c098487a4ad997f8cdb76c1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 23:27:18 -0800
+Subject: [PATCH] state: optimize_fts() 'optimize' asks the whole-file plan
+ first [daveey]
+
+'optimize' rewrites every segment and frees the old segment pages, so on the
+hub's damage shape it frees a shared page twice like 'rebuild' does. It now
+plans before self._lock and goes through _fts_wholesale_free_allowed: a named
+family detaches search (fail-open, _fts_oneshot_failed) for the online
+retry, a refused plan skips. vacuum() reaches it the same way. The bounded
+'merge' (_merge_fts_incrementally) stays ungated.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_state_search.py                    |  9 +++--
+ tests/hermes_state/test_fts_free_gates.py | 40 +++++++++++++++++++++++
+ 2 files changed, 47 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_state_search.py b/hermes_state_search.py
+index 038cc045166a215ecdd2cdf87bcf90d3b6b6ea40..d92d44224fb9722e949827da3ecd152fd99e9b69 100644
+--- a/hermes_state_search.py
++++ b/hermes_state_search.py
+@@ -1379,11 +1379,16 @@ class SessionSearchMixin:
+         structural damage (or a split WAL generation) instead of leaving it diagnosable."""
+         self._raise_if_db_corrupt()
+         optimized = 0
+-        with self._lock:
++        # 'optimize' frees every old segment page: the whole-file plan runs here, before the lock
++        # (hermes_state_fts_online).
++        with self._fts_runtime_plan(), self._lock:
+             self._raise_if_db_replaced()
+             if self._conn is None:
+                 self._reopen_after_close_locked(context="write")
+-            for tbl in self._present_fts_tables():
++            tables = self._present_fts_tables()
++            if tables and not self._fts_wholesale_free_allowed(tables, context="FTS segment merge ('optimize')"):
++                return 0
++            for tbl in tables:
+                 try:
+                     self._conn.execute(f"INSERT INTO {tbl}({tbl}) VALUES('optimize')")
+                     optimized += 1
+diff --git a/tests/hermes_state/test_fts_free_gates.py b/tests/hermes_state/test_fts_free_gates.py
+index 5ef01940d881028baccd0664da131c8c366ccea4..a3e993f91d3fa8110de1bd36465aebfb9ded5e80 100644
+--- a/tests/hermes_state/test_fts_free_gates.py
++++ b/tests/hermes_state/test_fts_free_gates.py
+@@ -460,3 +460,43 @@ def test_verified_list_merges_with_trash_already_recorded(tmp_path):
+         recorded = hermes_state_fts_online.verified_trash(conn)
+     assert "fts_v22_trash_older" in recorded and len(recorded) > 1
+ 
++
++
++# ── 8. optimize_fts() ('optimize' segment merge, reached through vacuum()) ──
++
++def test_optimize_keeps_a_damaged_index_and_plans_outside_the_lock(store, plans):
++    path, before = store
++    _break(path, "messages_fts_trigram_data")
++    root = _root(path, "messages_fts_trigram_data")
++    db = SessionDB(db_path=path)
++    plans[0]["db"] = db
++    assert db.optimize_fts() == 0
++    assert plans[1] == [False]
++    assert db._fts_tick_plan is None
++    _assert_gate_fired(db, path, "messages_fts_trigram_data", root)
++    _recover(db, path, before)
++
++
++def test_optimize_on_a_healthy_store_runs_as_before(store, plans):
++    path, _before = store
++    db = SessionDB(db_path=path)
++    plans[0]["db"] = db
++    try:
++        assert db.optimize_fts() == 2
++        assert db.vacuum() == 2  # vacuum() merges first, through the same gate
++        assert plans[1] == [False, False]
++        assert db._fts_stale is False
++        assert db.search_messages("bravoword")
++    finally:
++        db.close()
++    assert _integrity_lines(path)[0] == ["ok"]
++
++
++def test_merge_is_not_gated(store, plans):
++    path, _before = store
++    db = SessionDB(db_path=path)
++    try:
++        db._merge_fts_incrementally(max_pages=8, max_commands=2)
++        assert plans[1] == []
++    finally:
++        db.close()
+-- 
+2.43.0
+

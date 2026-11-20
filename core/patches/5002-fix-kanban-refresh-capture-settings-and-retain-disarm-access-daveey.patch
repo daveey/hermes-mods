@@ -1,0 +1,230 @@
+From e78875acff59d93947dcfdc51ff691380d8edf55 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 17:45:44 +0000
+Subject: [PATCH] fix(kanban): refresh capture settings and retain disarm
+ access [daveey]
+
+---
+ docs/kanban-fairness-runtime.md               | 11 +++--
+ gateway/session_managed_worker.py             |  3 +-
+ hermes_cli/kanban_fairness_activation.py      | 49 ++++++++++++++++---
+ scripts/kanban_fairness.py                    |  3 +-
+ .../test_kanban_fairness_activation.py        | 39 +++++++++++++++
+ .../hermes_cli/test_kanban_fairness_worker.py | 24 +++++++++
+ 6 files changed, 115 insertions(+), 14 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_fairness_worker.py
+
+diff --git a/docs/kanban-fairness-runtime.md b/docs/kanban-fairness-runtime.md
+index ea37474b78a737780821723d3ed03138bb02f414..a4b42b1cb891f6b3e76ca4f6bbba6d5e749d8803 100644
+--- a/docs/kanban-fairness-runtime.md
++++ b/docs/kanban-fairness-runtime.md
+@@ -35,12 +35,15 @@ small descriptor and retains it and all evidence. A passive monitor outside sche
+ locks notices the change on a 0.5-second poll and closes its consumer; filesystem
+ stalls may delay noticing it, so no synchronous remote-stop guarantee is made.
+ Turning config off prevents new consumers but does not replace explicit disarm for
+-already-running consumers. The draft disarm command still needs the original capture
+-ID/directory settings even when enabled is false.
++already-running consumers. After a config reset, `runtime disarm --directory /absolute/capture`
++reads and validates the existing descriptor for the exact current profile home; it
++never reconstructs or rearms capture. Repeated disarm retains the original bytes.
+ 
+ Bindings currently enter before standalone dispatch, before the daemon loop, during
+-gateway dispatcher lease tenure, and around a managed tool-worker turn using live
+-profile config (not the frozen session policy). No lazy IO is added to readers,
++gateway dispatcher lease tenure, and around a managed tool-worker turn. Ordinary
++worker admission refreshes only capture observation settings from live profile config
++before freezing the child snapshot; scheduler settings stay frozen. Safe/config-bypass
++workers never read the live profile. No lazy IO is added to readers,
+ submission, enabled checks or config loading. Profile-specific descriptors must be
+ armed for their exact home; a root descriptor is not authority for another profile.
+ Managed-worker/profile and multiplexed gateway scope still need end-to-end proof.
+diff --git a/gateway/session_managed_worker.py b/gateway/session_managed_worker.py
+index 1473754e9f469706072fd05a5f7aab3ef8176590..d788910134b709335c19d626b063abeb55cc6930 100644
+--- a/gateway/session_managed_worker.py
++++ b/gateway/session_managed_worker.py
+@@ -111,7 +111,8 @@ def _worker_config(authority, policy, *, config=None):
+     config.pop('command_allowlist', None)
+     if live.get('command_allowlist') is not None:
+         config['command_allowlist'] = live['command_allowlist']
+-    return config
++    from hermes_cli.kanban_fairness_activation import hydrate_worker_config
++    return hydrate_worker_config(config, live)
+ 
+ 
+ def _session_yolo(authority, route, policy):
+diff --git a/hermes_cli/kanban_fairness_activation.py b/hermes_cli/kanban_fairness_activation.py
+index 180a0a288acfd9217daa7f9d20a1a484d558af31..e046ecacdc84d34b6a28e13db9bc3a3d29683e81 100644
+--- a/hermes_cli/kanban_fairness_activation.py
++++ b/hermes_cli/kanban_fairness_activation.py
+@@ -76,15 +76,31 @@ def arm(config, *, home, board, source_gateway, board_uid, clock_error_ns=None):
+     return value
+ 
+ 
+-def disarm(config, *, home):
+-    """Retain the descriptor/evidence; revoke new boots and monitored consumers."""
+-    raw = dict(config.get("kanban", {}).get("fairness_capture", {}))
+-    raw["enabled"] = True  # permit rollback after the config was disabled
+-    settings = resolve({"kanban": {"fairness_capture": raw}}, home=Path(home))
+-    root = settings.directory
++def disarm(config, *, home, directory=None):
++    """Revoke an existing descriptor, even after config reset; never create one."""
++    home = Path(home)
++    if directory is None:
++        raw = dict(config.get("kanban", {}).get("fairness_capture", {}))
++        raw["enabled"] = True  # permit rollback after the config was disabled
++        settings = resolve({"kanban": {"fairness_capture": raw}}, home=home)
++        root = settings.directory
++    else:
++        root = Path(directory)
++        if not root.is_absolute():
++            raise ValueError("disarm directory must be absolute")
++    if not root.is_dir() or root.is_symlink():
++        raise ValueError("disarm requires an existing capture directory")
+     with budget._locked(root):
+-        if (root / NAME).exists():
+-            os.replace(root / NAME, root / DISARMED)
++        path = root / NAME if (root / NAME).exists() else root / DISARMED
++        value = json.loads(_read(path))
++        if type(value) is not dict:
++            raise ValueError("invalid runtime arm descriptor")
++        options = {"enabled": True, "capture_id": value.get("capture_id"),
++                   "directory": str(root), "max_bytes": value.get("max_bytes")}
++        settings = resolve({"kanban": {"fairness_capture": options}}, home=home)
++        _validate(value, settings, home)
++        if path.name == NAME:
++            os.replace(path, root / DISARMED)
+ 
+ 
+ def _monitor(session, path, expected):
+@@ -128,6 +144,23 @@ def start(config, *, home):
+         return session
+ 
+ 
++def hydrate_worker_config(config, live):
++    """Owner admission refreshes observations only, never frozen scheduler policy."""
++    from copy import deepcopy
++
++    block = live.get("kanban", {})
++    prior = config.get("kanban", {})
++    if (isinstance(prior, dict) and "fairness_capture" not in prior
++            and (not isinstance(block, dict) or "fairness_capture" not in block)):
++        return config
++    result = deepcopy(config)
++    capture = block.get("fairness_capture", {}) if isinstance(block, dict) else {}
++    if not isinstance(result.get("kanban"), dict):
++        result["kanban"] = {}
++    result["kanban"]["fairness_capture"] = deepcopy(capture)
++    return result
++
++
+ def boot(config=None, *, home=None):
+     """Production startup: evidence failure cannot refuse normal queue service."""
+     try:
+diff --git a/scripts/kanban_fairness.py b/scripts/kanban_fairness.py
+index a8e4338fd5364fcc0ee5c965c8b7ccc2f9db0cf4..08b8e48d049540ba6a0fc2f6ac01c1432b223b0f 100644
+--- a/scripts/kanban_fairness.py
++++ b/scripts/kanban_fairness.py
+@@ -180,7 +180,7 @@ def _runtime(args) -> int:
+         activation.arm(config, home=home, board=args.board, source_gateway=args.source_gateway,
+                        board_uid=args.board_uid, clock_error_ns=args.clock_error_ns)
+     else:
+-        activation.disarm(config, home=home)
++        activation.disarm(config, home=home, directory=args.directory)
+     _emit({"runtime": args.action, "acceptance_ready": False})
+     return 0
+ 
+@@ -193,6 +193,7 @@ def _parser() -> argparse.ArgumentParser:
+     runtime.add_argument("--board", default="default")
+     runtime.add_argument("--source-gateway")
+     runtime.add_argument("--board-uid")
++    runtime.add_argument("--directory", help="existing capture directory for disarm after config reset")
+     runtime.add_argument("--clock-error-ns", type=int, default=None)
+     runtime.set_defaults(run=_runtime)
+     capture = sub.add_parser("capture")
+diff --git a/tests/hermes_cli/test_kanban_fairness_activation.py b/tests/hermes_cli/test_kanban_fairness_activation.py
+index 0fac7a200e97da30bd58474fe3d33af924c1762b..77f165e799273f7306f88f5ee8760d4fb7f52dc2 100644
+--- a/tests/hermes_cli/test_kanban_fairness_activation.py
++++ b/tests/hermes_cli/test_kanban_fairness_activation.py
+@@ -101,6 +101,26 @@ def test_real_daemon_binds_before_dispatch_and_closes(tmp_path, monkeypatch, ena
+         assert not (tmp_path / "capture").exists()
+ 
+ 
++def test_disarm_after_config_reset_uses_existing_directory(tmp_path):
++    from hermes_cli import kanban_fairness_activation as activation
++    cfg = config(tmp_path)
++    activation.arm(cfg, home=tmp_path, board="default", source_gateway="gw", board_uid="board")
++    root = tmp_path / "capture"
++    original = (root / activation.NAME).read_bytes()
++    activation.disarm({}, home=tmp_path, directory=root)
++    assert not (root / activation.NAME).exists()
++    assert (root / activation.DISARMED).read_bytes() == original
++    activation.disarm({}, home=tmp_path, directory=root)
++
++
++def test_explicit_disarm_refuses_other_profile(tmp_path):
++    from hermes_cli import kanban_fairness_activation as activation
++    activation.arm(config(tmp_path), home=tmp_path, board="default", source_gateway="gw", board_uid="board")
++    with pytest.raises(ValueError):
++        activation.disarm({}, home=tmp_path / "other", directory=tmp_path / "capture")
++    assert (tmp_path / "capture" / activation.NAME).exists()
++
++
+ def test_disarm_does_not_require_enabled_config(tmp_path):
+     from hermes_cli import kanban_fairness_activation as activation
+     cfg = config(tmp_path)
+@@ -108,3 +128,22 @@ def test_disarm_does_not_require_enabled_config(tmp_path):
+     cfg["kanban"]["fairness_capture"]["enabled"] = False
+     activation.disarm(cfg, home=tmp_path)
+     assert not (tmp_path / "capture" / activation.NAME).exists()
++
++
++def test_real_cli_disarm_after_reset(tmp_path, monkeypatch):
++    import os
++    from pathlib import Path
++    import subprocess
++    import sys
++    from hermes_cli import kanban_fairness_activation as activation
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    activation.arm(config(tmp_path), home=tmp_path, board="default", source_gateway="gw", board_uid="board")
++    repo = Path(__file__).resolve().parents[2]
++    result = subprocess.run(
++        [sys.executable, str(repo / "scripts" / "kanban_fairness.py"), "runtime", "disarm",
++         "--directory", str(tmp_path / "capture")],
++        cwd=repo, env=dict(os.environ), capture_output=True, text=True, timeout=30, check=False)
++    assert result.returncode == 0, result.stderr
++    assert json.loads(result.stdout)["runtime"] == "disarm"
++    assert (tmp_path / "capture" / activation.DISARMED).is_file()
++    assert not (tmp_path / "capture" / activation.NAME).exists()
+diff --git a/tests/hermes_cli/test_kanban_fairness_worker.py b/tests/hermes_cli/test_kanban_fairness_worker.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3409a52857e916b0a567a58865b667b9ebfe3018
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_fairness_worker.py
+@@ -0,0 +1,24 @@
++"""Only capture observation settings refresh at ordinary worker turn admission."""
++from types import SimpleNamespace
++
++import pytest
++
++
++@pytest.mark.parametrize("live", [{}, {"enabled": False}, {"enabled": True, "capture_id": "new"}])
++def test_owner_hydrates_capture_without_changing_scheduler(tmp_path, monkeypatch, live):
++    from gateway.session_managed_worker import _worker_config
++    from gateway import run
++    frozen = {"kanban": {"fairness_capture": {"enabled": True, "capture_id": "old"}, "max_running": 2}}
++    policy = SimpleNamespace(ignore_user_config=False, config=lambda authority: frozen)
++    monkeypatch.setattr(run, "_load_gateway_config", lambda path: {"kanban": {"fairness_capture": live, "max_running": 99}})
++    result = _worker_config(SimpleNamespace(profile_id=str(tmp_path)), policy)
++    assert result["kanban"]["fairness_capture"] == live
++    assert result["kanban"]["max_running"] == 2
++
++
++def test_bypass_worker_never_loads_live_capture(tmp_path, monkeypatch):
++    from gateway.session_managed_worker import _worker_config
++    from gateway import run
++    policy = SimpleNamespace(ignore_user_config=True, config=lambda authority: {})
++    monkeypatch.setattr(run, "_load_gateway_config", lambda path: pytest.fail("bypass profile read"))
++    assert _worker_config(SimpleNamespace(profile_id=str(tmp_path)), policy) == {}
+-- 
+2.43.0
+

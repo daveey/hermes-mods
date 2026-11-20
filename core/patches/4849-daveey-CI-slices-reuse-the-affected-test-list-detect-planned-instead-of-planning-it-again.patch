@@ -1,0 +1,340 @@
+From d00590e6d57c417313190d9187654de12ac155f7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 09:14:34 -0800
+Subject: [PATCH] [daveey] CI: slices reuse the affected test list detect
+ planned instead of planning it again
+
+The plan was to make the slice split duration-aware. The data said no: in run 44280644770 the five
+affected slices were already balanced by estimate (1780-2049 s) while their test steps took
+156-254 s, so the spread is not the split. What the timeline showed instead (7.0 min wall):
+
+  detect 0:51, slice start + setup 0:22, planning the selection again in every slice 0:36,
+  bytecode precompile 0:20, tests 2:36-4:14, final gate 0:26.
+
+Each slice ran scripts/ci/affected_tests.py on the same commit and changed list detect had just
+planned (same answer: "1183 affected + 276 smoke" in both logs). Now detect writes its list with
+--files-out and saves it to the Actions cache under the exact key
+affected-tests-<run_id>-<run_attempt>; the slices restore that key (no restore-keys) and pass the
+file as --reuse. The cache, not an artifact: required jobs never read artifact storage
+(tests/ci/test_artifact_quota_advisory.py). A usable list (sorted, unique, every entry an existing tests/**.py in this checkout)
+is copied to --files-out and nothing is planned. Both cache steps are continue-on-error with a
+2 min bound, and a missing, empty or malformed list (another caller of tests.yml, a rerun of failed
+jobs only, a cache miss) falls back to planning in the slice as before, so the selection is never narrower
+than today.
+
+Detect plans with the runner's python3 and the slices with the pinned interpreter, and the list is
+now detect's. A tracked .py file one of them cannot parse would have its import edges dropped by that
+one only, so an unparseable tracked file now makes the plan "full" (no list is saved, and no narrower
+run is claimed on a graph with missing edges). All tracked files parse today.
+
+Expected: about 30 s off every affected slice, wall and runner time. Not measured in this pull
+request: it changes affected_tests.py, which makes its own CI run the full suite, so the reuse path
+first runs on pull requests after it merges.
+
+Proof: tests/ci/test_affected_tests.py 56 passed (reuse without planning; ten unusable lists fall
+back to planning, each rejected by the one rule it names; an unparseable file runs the full suite), tests/ci/test_fast_runner_routing.py 19 passed (both cache steps best effort,
+same exact per-attempt key, slice still passes --changed), hermes-core-wt test --local on macOS; ruff
+clean.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .github/workflows/ci.yaml            | 22 ++++++++++--
+ .github/workflows/tests.yml          | 21 +++++++++--
+ scripts/ci/affected_tests.py         | 54 +++++++++++++++++++++++++---
+ tests/ci/test_affected_tests.py      | 47 ++++++++++++++++++++++++
+ tests/ci/test_fast_runner_routing.py | 18 ++++++++++
+ 5 files changed, 151 insertions(+), 11 deletions(-)
+
+diff --git a/.github/workflows/ci.yaml b/.github/workflows/ci.yaml
+index d725068c610d691a8df4b8d6cbc46c9e6fdf8bb0..27a8f6ee529ae2010bf614ffa0e0ab4b5ace6e1a 100644
+--- a/.github/workflows/ci.yaml
++++ b/.github/workflows/ci.yaml
+@@ -205,8 +205,9 @@ jobs:
+         # Pull requests run the test files their change can reach plus a smoke set
+         # (scripts/ci/affected_tests.py); every other event, the label ci:full-tests, a failed
+         # compare (empty list) or a list at the compare API's 300-file cap runs the full suite.
+-        # Main pushes still run everything, so a miss surfaces there. Each tests.yml slice
+-        # recomputes the same file list from `changed` and its own checkout.
++        # Main pushes still run everything, so a miss surfaces there. The affected file list
++        # goes to the tests.yml slices through the Actions cache (next step); a slice that cannot get it
++        # recomputes the same list from `changed` and its own checkout.
+         id: python-plan
+         env:
+           EVENT_NAME: ${{ github.event_name }}
+@@ -225,13 +226,15 @@ jobs:
+           if [ -n "$full" ]; then
+             python3 scripts/ci/affected_tests.py --full "$full" --github-output "$plan_out" > /dev/null
+           else
+-            python3 scripts/ci/affected_tests.py --changed "${changed[@]}" --github-output "$plan_out" > /dev/null
++            python3 scripts/ci/affected_tests.py --changed "${changed[@]}" --github-output "$plan_out" \
++              --files-out "$RUNNER_TEMP/affected-tests.txt" > /dev/null
+           fi
+           cat "$plan_out"
+           mode=$(sed -n 's/^mode=//p' "$plan_out")
+           reason=$(sed -n 's/^reason=//p' "$plan_out")
+           slices=$(sed -n 's/^slices=//p' "$plan_out")
+           echo "slices=$slices" >> "$GITHUB_OUTPUT"
++          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+           {
+             echo "changed<<CHANGED_EOF"
+             if [ "$mode" = "affected" ]; then printf '%s\n' "${changed[@]}"; fi
+@@ -239,6 +242,19 @@ jobs:
+           } >> "$GITHUB_OUTPUT"
+           echo "### Python tests: $mode ($reason)" >> "$GITHUB_STEP_SUMMARY"
+ 
++      - name: Save the affected test list for the slices
++        # Planning takes ~35 s; without this every slice repeats it before its first test.
++        # The Actions cache, not an artifact: required jobs never read artifact storage
++        # (tests/ci/test_artifact_quota_advisory.py). Best effort and bounded like the other
++        # cache saves: a slice that finds no entry plans the same list itself.
++        if: steps.python-plan.outputs.mode == 'affected'
++        continue-on-error: true
++        timeout-minutes: 2
++        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
++        with:
++          path: ${{ runner.temp }}/affected-tests.txt
++          key: affected-tests-${{ github.run_id }}-${{ github.run_attempt }}
++
+   # ─────────────────────────────────────────────────────────────────────
+   # Lane-gated sub-workflows. Each runs in parallel after detect finishes.
+   # Skipped workflows (if condition is false) don't spin up runners.
+diff --git a/.github/workflows/tests.yml b/.github/workflows/tests.yml
+index 3a4d521568422ca268bd7db8bf9622645246d011..4b1ee806a0fd7be7b95c52a9f166fd6f99229a0a 100644
+--- a/.github/workflows/tests.yml
++++ b/.github/workflows/tests.yml
+@@ -140,6 +140,19 @@ jobs:
+           restore-keys: |
+             test-durations-
+ 
++      - name: Restore the affected test list planned by detect
++        # ci.yaml detect saves the list it planned for this run attempt (exact key, no
++        # restore-keys: another run's list is never taken); reusing it saves the ~35 s each
++        # slice spent planning the same list. Best effort: without it (another caller, a rerun
++        # of failed jobs only, a cache miss) the Run tests step plans it here.
++        if: inputs.python_changed != ''
++        continue-on-error: true
++        timeout-minutes: 2
++        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
++        with:
++          path: ${{ runner.temp }}/affected-tests.txt
++          key: affected-tests-${{ github.run_id }}-${{ github.run_attempt }}
++
+       - name: Run tests
+         # Per-file isolation via scripts/run_tests.sh: each test file runs
+         # in its own freshly-spawned `python -m pytest <file>` subprocess
+@@ -162,15 +175,17 @@ jobs:
+         # the job.
+         #
+         # Pull requests pass python_changed: the slice runs only the affected files
+-        # (scripts/ci/affected_tests.py, the same selection ci.yaml detect sized).
++        # (scripts/ci/affected_tests.py, the same selection ci.yaml detect sized): detect's own
++        # list when the step above restored it (--reuse), else planned here from python_changed.
+         run: |
+           HERMES_TEST_WORKERS="$(python3 scripts/ci/test_workers.py)"
+           export HERMES_TEST_WORKERS
+           echo "HERMES_TEST_WORKERS=$HERMES_TEST_WORKERS (nproc=$(nproc))"
+           if [ -n "$PYTHON_CHANGED" ]; then
+             mapfile -t changed < <(printf '%s\n' "$PYTHON_CHANGED" | grep -v '^$')
+-            selection="$RUNNER_TEMP/affected-tests.txt"
+-            "$HERMES_PYTHON" scripts/ci/affected_tests.py --changed "${changed[@]}" --files-out "$selection" > /dev/null
++            selection="$RUNNER_TEMP/affected-selection.txt"
++            "$HERMES_PYTHON" scripts/ci/affected_tests.py --changed "${changed[@]}" --files-out "$selection" \
++              --reuse "$RUNNER_TEMP/affected-tests.txt" > /dev/null
+             echo "Affected selection: $(wc -l < "$selection") files"
+             scripts/run_tests.sh --files-from "$selection"
+           else
+diff --git a/scripts/ci/affected_tests.py b/scripts/ci/affected_tests.py
+index 43f84e0a81cf8ce194d324649d2b6b25046de65f..35b196c9c12bcea0dd3a7603ada330b2fc8bfaa3 100755
+--- a/scripts/ci/affected_tests.py
++++ b/scripts/ci/affected_tests.py
+@@ -2,7 +2,11 @@
+ """Pick the Python test files a pull request can affect (tests.yml `plan` job).
+ 
+     affected_tests.py [--repo DIR] [--base REV] [--head REV] [--changed PATH ...] [--full REASON]
+-                      [--files-out FILE] [--github-output FILE]
++                      [--files-out FILE] [--github-output FILE] [--reuse FILE]
++
++--reuse FILE (tests.yml slices): FILE is the --files-out list ci.yaml detect made for this run from the
++same commit and changed list. A usable one is copied to --files-out and nothing is planned (the plan
++takes ~35 s a slice); a missing, empty or malformed one is ignored and the selection is planned here.
+ 
+ Prints a JSON plan on stdout: {"mode": "full" | "affected" | "none", "reason", "files", "slices"}.
+ "full" runs the whole suite (the runner's own discovery); "affected" runs `files` with --files-from;
+@@ -21,8 +25,8 @@ Selection, unioned:
+   5. the smoke set: tests/ci plus every test that scans the source tree (rglob/os.walk/git ls-files).
+      They break on changes no import graph reaches: docs drift, prompt surface, code health
+      (replay of 83 red PR slice jobs, 2026-10-29: 16 failures were tree scans the PR never imported).
+-The suite falls back to "full" when a changed file shapes every test (WIDE) or the selection is over
+-FULL_FRACTION of the suite. Main pushes, release-check branches, dispatch and release runs never call this:
++The suite falls back to "full" when a changed file shapes every test (WIDE), a tracked .py file does not
++parse (its imports are unknown) or the selection is over FULL_FRACTION of the suite. Main pushes, release-check branches, dispatch and release runs never call this:
+ tests.yml runs the full suite for any event that is not a pull request.
+ """
+ from __future__ import annotations
+@@ -109,10 +113,19 @@ def _import_nodes(tree: ast.AST, lazy: bool):
+             stack.extend(ast.iter_child_nodes(node))
+ 
+ 
++#: Files the last `importers` call could read but not parse: their imports are unknown to this interpreter.
++UNPARSED: list[str] = []
++
++
+ def _parse(repo: Path, rel: str) -> ast.AST | None:
+     try:
+-        return ast.parse((repo / rel).read_text(encoding="utf-8-sig", errors="replace"))
+-    except (OSError, SyntaxError, ValueError):
++        text = (repo / rel).read_text(encoding="utf-8-sig", errors="replace")
++    except OSError:
++        return None
++    try:
++        return ast.parse(text)
++    except (SyntaxError, ValueError):
++        UNPARSED.append(rel)
+         return None
+ 
+ 
+@@ -161,6 +174,7 @@ def importers(repo: Path, changed_modules: set[str]) -> set[str]:
+     modules = set(by_module)
+     reverse: dict[str, set[str]] = {}
+     lazy_reverse: dict[str, set[str]] = {}
++    UNPARSED.clear()
+     for f in files:
+         is_test = f.startswith("tests/")
+         tree = _parse(repo, f)  # one parse serves both walks
+@@ -232,6 +246,13 @@ def plan(repo: Path, changed: list[str], full_reason: str | None = None) -> dict
+     if any(re.fullmatch(r"scripts/ci/upstream_sync[^/]*\.py", c) for c in changed):
+         changed_modules.add("tests.hermes_cli.upstream_gate_fake")
+     selected |= importers(repo, changed_modules) & in_suite
++    if UNPARSED:
++        # Its import edges are missing from the graph, so a narrower run has no basis. This also keeps
++        # detect (the runner's system python3) and the slices (the pinned interpreter) from planning
++        # different lists when a file uses syntax only one of them accepts: detect then saves no list.
++        return {"mode": "full", "reason": f"cannot parse {', '.join(sorted(UNPARSED)[:5])} with Python "
++                                          f"{sys.version_info.major}.{sys.version_info.minor}",
++                "files": [], "slices": MAX_SLICES}
+     string_refs = [re.compile(rf"[\"']{re.escape(m)}([\"']|\.)") for m in changed_modules]
+     path_refs = [re.escape(c) for c in changed if "/" in c and Path(c).name not in GENERIC]
+     path_refs += [rf"(?<![\w.-]){re.escape(Path(c).name)}(?![\w-])" for c in changed
+@@ -263,6 +284,20 @@ def changed_files(repo: Path, base: str, head: str) -> list[str]:
+     return [line for line in out.splitlines() if line]
+ 
+ 
++def reusable(repo: Path, listing: Path) -> list[str] | None:
++    """The files in a detect-made --files-out list, or None when it cannot stand in for planning here."""
++    try:
++        files = listing.read_text(encoding="utf-8-sig").split("\n")
++    except (OSError, UnicodeDecodeError):
++        return None
++    if files and files[-1] == "":
++        files.pop()
++    ok = files and files == sorted(set(files)) and all(
++        f.startswith("tests/") and f.endswith(".py") and ".." not in f.split("/") and (repo / f).is_file()
++        for f in files)
++    return files if ok else None
++
++
+ def main(argv: list[str] | None = None) -> int:
+     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+     ap.add_argument("--repo", default=str(ROOT))
+@@ -272,8 +307,17 @@ def main(argv: list[str] | None = None) -> int:
+     ap.add_argument("--full", metavar="REASON", help="skip selection: run the full suite for REASON")
+     ap.add_argument("--files-out", help="write the selected files here, one per line")
+     ap.add_argument("--github-output", help="append mode/reason/slices outputs (GITHUB_OUTPUT)")
++    ap.add_argument("--reuse", metavar="FILE", help="a --files-out list detect made for this run: use it "
++                                                    "instead of planning when it is usable (needs --files-out)")
+     args = ap.parse_args(argv)
+     repo = Path(args.repo).resolve()
++    if args.reuse and args.files_out:
++        files = reusable(repo, Path(args.reuse))
++        if files is not None:
++            Path(args.files_out).write_text("".join(f"{f}\n" for f in files), encoding="utf-8")
++            print(f"affected-tests: reused {len(files)} files planned by detect", file=sys.stderr)
++            return 0
++        print(f"affected-tests: no usable list at {args.reuse}; planning here", file=sys.stderr)
+     if args.full:
+         changed = []
+     elif args.changed is not None:
+diff --git a/tests/ci/test_affected_tests.py b/tests/ci/test_affected_tests.py
+index 1f8e6dfcad43e81146c790edfc81e7c993a91878..df8899fa82355add9b82b0e9641417420d488762 100644
+--- a/tests/ci/test_affected_tests.py
++++ b/tests/ci/test_affected_tests.py
+@@ -291,3 +291,50 @@ def test_cli_without_a_diff_runs_the_full_suite(repo, tmp_path):
+     outputs = dict(line.split("=", 1) for line in gh_out.read_text().splitlines())
+     assert outputs["mode"] == "full" and "git diff" in outputs["reason"]
+     assert json.loads(outputs["slices"]) == list(range(1, at.MAX_SLICES + 1))
++
++
++def _reuse(repo, tmp_path, listing_text):
++    listing, out = tmp_path / "plan" / "affected-tests.txt", tmp_path / "selection.txt"
++    if listing_text is not None:
++        listing.parent.mkdir()
++        listing.write_text(listing_text, encoding="utf-8")
++    assert at.main(["--repo", str(repo), "--changed", "pkg/other.py", "--files-out", str(out),
++                    "--reuse", str(listing)]) == 0
++    return out.read_text(encoding="utf-8").split()
++
++
++def test_reuse_takes_detects_list_without_planning(repo, tmp_path, monkeypatch, capsys):
++    monkeypatch.setattr(at, "plan", lambda *a, **k: pytest.fail("planned despite a usable list"))
++    # Not what pkg/other.py would select here: the list is detect's answer, taken as given.
++    assert _reuse(repo, tmp_path, "tests/pkg/test_lazy.py\ntests/pkg/test_top.py\n") == [
++        "tests/pkg/test_lazy.py", "tests/pkg/test_top.py"]
++    assert "reused 2 files planned by detect" in capsys.readouterr().err
++
++
++@pytest.mark.parametrize("listing", [
++    None,                                              # no cache entry
++    "",                                                # empty file
++    # Each of the next four is sorted and unique, so only the rule it names can reject it.
++    "tests/pkg/test_gone.py\ntests/pkg/test_top.py\n",  # a file this checkout does not have
++    "pkg/core.py\ntests/pkg/test_top.py\n",            # not under tests/
++    "tests/../pkg/core.py\ntests/pkg/test_top.py\n",   # escapes tests/
++    "tests/pkg/data.txt\ntests/pkg/test_top.py\n",     # not a .py file (it exists)
++    "tests/pkg/test_top.py\ntests/pkg/test_lazy.py\n",  # not the planner's sorted output
++    "tests/pkg/test_top.py\ntests/pkg/test_top.py\n",   # duplicate
++    "tests/pkg/test_top.py\n\n",                        # blank line
++    "<html>artifact service error</html>",
++])
++def test_reuse_plans_here_when_the_list_is_unusable(repo, tmp_path, capsys, listing):
++    _write(repo, {"tests/pkg/data.txt": "x\n"})
++    assert set(_reuse(repo, tmp_path, listing)) == {"tests/pkg/test_other.py"} | SMOKE
++    assert "planning here" in capsys.readouterr().err
++
++
++def test_an_unparseable_tracked_file_runs_the_full_suite(repo):
++    # Its imports are unknown, and detect's python3 may not be the slices' interpreter: no narrow list.
++    _write(repo, {"pkg/broken.py": "def f(:\n"})
++    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
++    result = at.plan(repo, ["pkg/other.py"])
++    assert result["mode"] == "full" and "cannot parse pkg/broken.py" in result["reason"]
++    (repo / "pkg" / "broken.py").write_text("X = 1\n")
++    assert at.plan(repo, ["pkg/other.py"])["mode"] == "affected"
+diff --git a/tests/ci/test_fast_runner_routing.py b/tests/ci/test_fast_runner_routing.py
+index 1f6d13ae17326b6a0629715a6d51344a93a2d75b..f4e50e13ccd6ac454ccabba679bf9e0d30777ce2 100644
+--- a/tests/ci/test_fast_runner_routing.py
++++ b/tests/ci/test_fast_runner_routing.py
+@@ -371,3 +371,21 @@ def test_pull_requests_pass_their_affected_plan_to_the_slices():
+     run = next(step for step in _workflows()["tests.yml"]["jobs"]["test"]["steps"] if step.get("name") == "Run tests")
+     assert run["env"]["PYTHON_CHANGED"] == "${{ inputs.python_changed }}"
+     assert "affected_tests.py --changed" in run["run"] and "--files-from" in run["run"]
++    # Detect hands its planned list to the slices through the Actions cache (required jobs never read
++    # artifacts). Both ends are best effort and bounded, use one exact per-attempt key with no
++    # restore-keys, and the slice still passes --changed so a missing list is planned there.
++    steps = ci["detect"]["steps"]
++    save = steps[steps.index(plan) + 1]
++    assert '--files-out "$RUNNER_TEMP/affected-tests.txt"' in script and 'echo "mode=$mode" >> "$GITHUB_OUTPUT"' in script
++    assert save["uses"].startswith("actions/cache/save@")
++    assert save["if"] == "steps.python-plan.outputs.mode == 'affected'"
++    test_steps = _workflows()["tests.yml"]["jobs"]["test"]["steps"]
++    restore = test_steps[test_steps.index(run) - 1]
++    assert restore["uses"].startswith("actions/cache/restore@")
++    assert restore["if"] == "inputs.python_changed != ''"
++    for step in (save, restore):
++        assert step["continue-on-error"] is True and 0 < step["timeout-minutes"] <= 2
++        assert step["with"] == {"path": "${{ runner.temp }}/affected-tests.txt",
++                                "key": "affected-tests-${{ github.run_id }}-${{ github.run_attempt }}"}
++    assert '--reuse "$RUNNER_TEMP/affected-tests.txt"' in run["run"]
++    assert '--files-out "$selection"' in run["run"] and 'selection="$RUNNER_TEMP/affected-selection.txt"' in run["run"]
+-- 
+2.43.0
+

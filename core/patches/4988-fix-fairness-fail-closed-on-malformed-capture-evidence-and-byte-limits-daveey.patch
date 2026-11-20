@@ -1,0 +1,1223 @@
+From 73ef6401d8b925f44b4f2e40dee4f203a19c6eee Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 15:02:26 +0000
+Subject: [PATCH] fix(fairness): fail closed on malformed capture evidence and
+ byte limits [daveey]
+
+---
+ hermes_cli/kanban_fairness_journal.py         |  19 +-
+ hermes_cli/kanban_fairness_payloads.py        | 106 ++++++++-
+ hermes_cli/kanban_fairness_schema.py          |   6 +
+ hermes_cli/kanban_fairness_segments.py        | 134 ++++++++++--
+ hermes_cli/kanban_fairness_store.py           |  41 +++-
+ .../test_kanban_fairness_envelope.py          |  40 +++-
+ .../test_kanban_fairness_journal.py           |   6 +-
+ .../test_kanban_fairness_payloads.py          | 156 ++++++++++++--
+ .../test_kanban_fairness_resource_bounds.py   | 132 ++++++++++++
+ .../test_kanban_fairness_segments.py          |   4 +-
+ .../test_kanban_fairness_store_hardening.py   | 202 ++++++++++++++++++
+ .../test_kanban_fairness_vertical.py          |   9 +-
+ 12 files changed, 796 insertions(+), 59 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_fairness_resource_bounds.py
+ create mode 100644 tests/hermes_cli/test_kanban_fairness_store_hardening.py
+
+diff --git a/hermes_cli/kanban_fairness_journal.py b/hermes_cli/kanban_fairness_journal.py
+index a1b4f7fcb2bbe635e959bb9ecfbd2b7501317640..7a42fe63ce91d506c5c4e5b22f175614cbdb44b7 100644
+--- a/hermes_cli/kanban_fairness_journal.py
++++ b/hermes_cli/kanban_fairness_journal.py
+@@ -42,13 +42,14 @@ def _fields_sql(columns: list[str], ref: str) -> str:
+ 
+ def _append(kind: str, task_id: str, op: Optional[str], fields: str) -> str:
+     """Count the change, then store it only while the session is open and under both bounds."""
+-    full = "(stored >= max_records OR bytes >= max_bytes)"
++    # The bound is on the UTF-8 bytes the row would add (not SQLite's character length), checked before admission.
++    full = f"(stored >= max_records OR bytes + length(CAST({fields} AS BLOB)) > max_bytes)"
+     op_sql = "NULL" if op is None else f"'{op}'"
+     return (
+         f"UPDATE {SESSION} SET admit = NOT {full}, dropped = dropped + {full}, "
+         f"first_drop_ms = CASE WHEN {full} THEN COALESCE(first_drop_ms, {_NOW_MS}) ELSE first_drop_ms END, "
+         f"last_drop_ms = CASE WHEN {full} THEN {_NOW_MS} ELSE last_drop_ms END, "
+-        f"bytes = bytes + CASE WHEN {full} THEN 0 ELSE length({fields}) END, stored = stored + NOT {full} "
++        f"bytes = bytes + CASE WHEN {full} THEN 0 ELSE length(CAST({fields} AS BLOB)) END, stored = stored + NOT {full} "
+         "WHERE id = 1 AND sealed_ms IS NULL; "
+         f"INSERT INTO {JOURNAL} (kind, wall_ms, task_id, op, fields) "
+         f"SELECT '{kind}', {_NOW_MS}, {task_id}, {op_sql}, {fields} FROM {SESSION} "
+@@ -132,15 +133,21 @@ def arm(conn: sqlite3.Connection, capture_id: str, *, max_records: int = MAX_REC
+         present = [r[1] for r in conn.execute("PRAGMA table_info(tasks)")]
+         fields = _fields_sql([c for c in TASK_FIELDS if c in present], "s")
+         # The opening snapshot is not optional evidence: an armed session that could not hold it is a gap.
++        # Rows over the byte bound on their own are gaps; the rest are admitted in id order while the running
++        # UTF-8 byte total and the record count stay within bounds.
+         conn.execute(
+-            f"INSERT INTO {JOURNAL} (kind, wall_ms, task_id, op, fields) SELECT 'opening', {_NOW_MS}, s.id, NULL, "
+-            f"{fields} FROM tasks AS s WHERE s.status NOT IN ('done', 'archived') ORDER BY s.id LIMIT ?",
+-            (max_records,))
++            f"INSERT INTO {JOURNAL} (kind, wall_ms, task_id, op, fields) SELECT 'opening', {_NOW_MS}, id, NULL, f "
++            f"FROM (SELECT id, f, SUM(n) OVER (ORDER BY id) AS run, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM ("
++            f"SELECT s.id AS id, {fields} AS f, length(CAST({fields} AS BLOB)) AS n FROM tasks AS s "
++            "WHERE s.status NOT IN ('done', 'archived')) WHERE n <= ?) WHERE run <= ? AND rn <= ? ORDER BY id",
++            (max_bytes, max_bytes, max_records))
+         conn.execute(
+             f"UPDATE {SESSION} SET stored = (SELECT COUNT(*) FROM {JOURNAL}), "
+-            f"bytes = (SELECT COALESCE(SUM(length(fields)), 0) FROM {JOURNAL}), "
++            f"bytes = (SELECT COALESCE(SUM(length(CAST(fields AS BLOB))), 0) FROM {JOURNAL}), "
+             "dropped = MAX(0, (SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'archived')) - "
+             f"(SELECT COUNT(*) FROM {JOURNAL})) WHERE id = 1")
++        conn.execute(f"UPDATE {SESSION} SET first_drop_ms = armed_ms, last_drop_ms = armed_ms "
++                     "WHERE id = 1 AND dropped > 0")
+         for ddl in _triggers(conn).values():
+             conn.execute(ddl)
+     return _open_status(conn)
+diff --git a/hermes_cli/kanban_fairness_payloads.py b/hermes_cli/kanban_fairness_payloads.py
+index 0a6b15053729bdfa678636be1a8dd1d0b93467fa..03d233ed02cea897bcd096ad5fa3aae1b2374fa5 100644
+--- a/hermes_cli/kanban_fairness_payloads.py
++++ b/hermes_cli/kanban_fairness_payloads.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ import base64
+ import binascii
+ import hashlib
++import json
+ import math
+ import re
+ from typing import Mapping, NoReturn
+@@ -36,11 +37,23 @@ def _string(value, name, *, optional=False, bounded=False):
+         _bad(f"{name} exceeds the string limit")
+ 
+ 
+-def _integer(value, name, *, optional=False, nonnegative=False):
++def _integer(value, name, *, optional=False, nonnegative=False, positive=False):
+     if value is None and optional:
+         return
+-    if type(value) is not int or (nonnegative and value < 0):
+-        _bad(f"{name} must be {'a nonnegative' if nonnegative else 'an'} integer")
++    if type(value) is not int or (positive and value < 1) or (nonnegative and value < 0):
++        kind = "a positive" if positive else "a nonnegative" if nonnegative else "an"
++        _bad(f"{name} must be {kind} integer")
++
++
++def _pair(lo, hi, lo_name, hi_name, *, positive=False):
++    if (lo is None) is not (hi is None):
++        _bad(f"{lo_name} and {hi_name} must both be null or both known")
++    if lo is None:
++        return
++    _integer(lo, lo_name, positive=positive, nonnegative=not positive)
++    _integer(hi, hi_name, positive=positive, nonnegative=not positive)
++    if hi < lo:
++        _bad(f"{lo_name} and {hi_name} must be ordered")
+ 
+ 
+ def creation_payload(payload):
+@@ -48,8 +61,11 @@ def creation_payload(payload):
+     _string(payload["task_uid"], "task_uid")
+     for name in ("creator_task_uid", "creator_episode_uid"):
+         _string(payload[name], name, optional=True)
+-    if payload["priority_intent"] not in ("explicit", "omitted", "unknown"):
++    intent = payload["priority_intent"]
++    if intent not in ("explicit", "omitted", "unknown"):
+         _bad("priority_intent must be explicit, omitted or unknown")
++    if intent == "omitted" and payload["priority_argument"] is not None:
++        _bad("omitted priority_argument must be null")
+     if isinstance(payload["priority_argument"], (Mapping, list, tuple)):
+         _bad("priority_argument must be a JSON scalar or null")
+     for name in ("effective_parent_priority", "inheritance_cap"):
+@@ -68,7 +84,10 @@ def creation_payload(payload):
+     if (not isinstance(unknown, list) or any(not isinstance(name, str) for name in unknown)
+             or len(unknown) != len(set(unknown)) or not set(unknown) <= CREATION_KEYS):
+         _bad("unknown_fields must be a unique list of known creation field names")
+-    if any(value is None and name != "priority_argument" and name not in unknown
++    if intent == "unknown" and "priority_intent" not in unknown:
++        _bad("unknown priority_intent must appear in unknown_fields")
++    known_null = intent in ("explicit", "omitted")
++    if any(value is None and not (name == "priority_argument" and known_null) and name not in unknown
+            for name, value in payload.items()):
+         _bad("null creation provenance must appear in unknown_fields")
+     return dict(payload)
+@@ -94,6 +113,63 @@ def _finite(value, name):
+         _bad(f"{name} must be a finite number or null")
+ 
+ 
++SOURCE_KEYS = frozenset(("version", "board", "source_revision", "observed_at", "valid_until", "owners"))
++SOURCE_OWNER_KEYS = frozenset(("task_id", "source", "ref", "head", "expires_at"))
++SOURCE_OWNER_SOURCES = ("core-lane", "state-turn")
++MAX_SOURCE_BYTES = 128 * 1024
++MAX_SOURCE_OWNERS = 4096
++
++
++def _source_pairs(pairs):
++    keys = [key for key, _ in pairs]
++    if len(keys) != len(set(keys)):
++        raise ValueError("duplicate key")
++    return dict(pairs)
++
++
++def _source_constant(_name):
++    raise ValueError("nonfinite number")
++
++
++def _source_identity(value):
++    return isinstance(value, str) and bool(value.strip()) and len(value) <= MAX_METADATA_STRING
++
++
++def _source_time(value):
++    if isinstance(value, bool) or not isinstance(value, (int, float)):
++        return False
++    return math.isfinite(value)
++
++
++def _validate_source_document(raw):
++    """Schema-only allowlist of the kanban_turn_urgency source document; nothing else is storable."""
++    try:
++        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_source_pairs,
++                           parse_constant=_source_constant)
++    except (ValueError, UnicodeError, RecursionError):
++        _bad("raw_b64 must be a strict owner source JSON document")
++    if not isinstance(value, dict) or set(value) != SOURCE_KEYS:
++        _bad("raw_b64 source document keys must be exactly the owner source keys")
++    if type(value["version"]) is not int or value["version"] != 1:
++        _bad("raw_b64 source document version must be 1")
++    if not _source_identity(value["board"]) or not _source_identity(value["source_revision"]):
++        _bad("raw_b64 source document board/source_revision must be bounded nonempty strings")
++    if not _source_time(value["observed_at"]) or not _source_time(value["valid_until"]):
++        _bad("raw_b64 source document times must be finite numbers")
++    owners = value["owners"]
++    if not isinstance(owners, list) or len(owners) > MAX_SOURCE_OWNERS:
++        _bad("raw_b64 source document owners must be a bounded list")
++    for owner in owners:
++        if not isinstance(owner, dict) or set(owner) != SOURCE_OWNER_KEYS:
++            _bad("raw_b64 source owner keys must be exactly the owner source keys")
++        if not all(_source_identity(owner[key]) for key in ("task_id", "ref", "head")):
++            _bad("raw_b64 source owner identities must be bounded nonempty strings")
++        if not isinstance(owner["source"], str) or owner["source"] not in SOURCE_OWNER_SOURCES:
++            _bad("raw_b64 source owner source is not allowed")
++        if not _source_time(owner["expires_at"]):
++            _bad("raw_b64 source owner expires_at must be finite")
++
++
+ def _raw_receipt(payload):
+     encoded, digest, size = (payload[name] for name in ("raw_b64", "raw_sha256", "raw_size"))
+     _integer(size, "raw_size", optional=True, nonnegative=True)
+@@ -105,6 +181,8 @@ def _raw_receipt(payload):
+         return
+     if not isinstance(encoded, str):
+         _bad("raw_b64 must be base64 or null")
++    if len(encoded) > 4 * ((MAX_SOURCE_BYTES + 2) // 3):
++        _bad("raw_b64 exceeds the source document size bound")
+     try:
+         raw = base64.b64decode(encoded, validate=True)
+     except (ValueError, binascii.Error):
+@@ -113,6 +191,9 @@ def _raw_receipt(payload):
+         _bad("raw_sha256 does not match raw_b64")
+     if len(raw) != size:
+         _bad("raw_size does not match raw_b64")
++    if len(raw) > MAX_SOURCE_BYTES:
++        _bad("raw_b64 exceeds the source document size bound")
++    _validate_source_document(raw)
+ 
+ 
+ def urgency_payload(payload):
+@@ -146,3 +227,18 @@ def urgency_payload(payload):
+     if payload["outcome"] == "invalid" and not payload["redacted"]:
+         _bad("invalid urgency bytes must be redacted")
+     return dict(payload)
++
++
++LOSS_KEYS = frozenset(("reason", "count", "first_seq", "last_seq", "start_wall_ns", "end_wall_ns"))
++LOSS_REASONS = ("dropped", "oversize", "writer_error", "unsupported", "redaction", "truncation",
++                "clock_gap", "membership_gap")
++
++
++def loss_payload(payload):
++    _keys(payload, LOSS_KEYS, "loss")
++    if payload["reason"] not in LOSS_REASONS:
++        _bad("unknown loss reason")
++    _integer(payload["count"], "count", positive=True)
++    _pair(payload["first_seq"], payload["last_seq"], "first_seq", "last_seq", positive=True)
++    _pair(payload["start_wall_ns"], payload["end_wall_ns"], "start_wall_ns", "end_wall_ns")
++    return dict(payload)
+diff --git a/hermes_cli/kanban_fairness_schema.py b/hermes_cli/kanban_fairness_schema.py
+index a3900285d504a9be78304b519a375d6e23ea3d7d..e9db3473f4d219e19ed741d6eb15ad10d19159d0 100644
+--- a/hermes_cli/kanban_fairness_schema.py
++++ b/hermes_cli/kanban_fairness_schema.py
+@@ -186,6 +186,12 @@ def decode_record(raw: Any) -> dict:
+         from hermes_cli.kanban_fairness_payloads import urgency_payload
+ 
+         payload = urgency_payload(payload)
++    elif kind == "membership":
++        raise BadRecord("membership records are unsupported")
++    elif kind == "loss":
++        from hermes_cli.kanban_fairness_payloads import loss_payload
++
++        payload = loss_payload(payload)
+     out["payload"] = payload
+     return out
+ 
+diff --git a/hermes_cli/kanban_fairness_segments.py b/hermes_cli/kanban_fairness_segments.py
+index 3c1d65da0046f025b2ba6f40a266716d9a85aa45..bd3a8c407732aa008ec426909ebc64e79d0980f6 100644
+--- a/hermes_cli/kanban_fairness_segments.py
++++ b/hermes_cli/kanban_fairness_segments.py
+@@ -26,10 +26,87 @@ def write(path: Path, data: bytes) -> None:
+     os.replace(tmp, path)
+ 
+ 
++MAX_METADATA_BYTES = 8 * 1024 * 1024
++
++
++def read_bounded(path, limit):
++    """Bound the allocation even if the file grows after stat."""
++    with path.open("rb") as stream:
++        if os.fstat(stream.fileno()).st_size > limit:
++            raise BadRecord("file exceeds storage bound")
++        data = stream.read(limit + 1)
++    if len(data) > limit:
++        raise BadRecord("file exceeds storage bound")
++    return data
++
++
++def dedupe_gaps(gaps):
++    return list({encoded(g): g for g in gaps}.values())
++
++
++def checked_gaps(gaps):
++    if not isinstance(gaps, list) or any(
++            not isinstance(g, dict) or not isinstance(g.get("code"), str) or not g["code"]
++            or ("detail" in g and not isinstance(g["detail"], str)) for g in gaps):
++        raise BadRecord("invalid coverage gaps")
++    return dedupe_gaps(gaps)
++
++
++def validate_state(state, *, check_totals=True):
++    required = {"version", "capture_id", "board_uid", "segments", "sources", "gaps", "bytes"}
++    if not isinstance(state, dict) or not required <= state.keys():
++        raise BadRecord("invalid capture metadata")
++    if type(state["version"]) is not int or state["version"] != VERSION:
++        raise BadRecord("invalid capture version")
++    for key in ("capture_id", "board_uid"):
++        if state[key] is not None and (not isinstance(state[key], str) or not state[key]):
++            raise BadRecord("invalid capture identity")
++    if (state["capture_id"] is None) != (state["board_uid"] is None):
++        raise BadRecord("partial capture identity")
++    if type(state["bytes"]) is not int or not 0 <= state["bytes"] <= MAX_CAPTURE_BYTES:
++        raise BadRecord("invalid capture byte count")
++    if not isinstance(state["segments"], list):
++        raise BadRecord("invalid segment list")
++    total = 0
++    for item in state["segments"]:
++        if (not isinstance(item, dict) or set(item) != {"name", "bytes", "records", "sha256"}
++                or not isinstance(item["name"], str)
++                or not re.fullmatch(r"segment-\d{6}\.jsonl", item["name"])
++                or type(item["bytes"]) is not int or not 0 < item["bytes"] <= SEGMENT_BYTES
++                or type(item["records"]) is not int or not 0 < item["records"] <= item["bytes"]
++                or not isinstance(item["sha256"], str)
++                or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"])):
++            raise BadRecord("invalid segment receipt")
++        total += item["bytes"]
++    cuts = source_map(state["sources"])
++    if total > MAX_CAPTURE_BYTES or (check_totals and total != state["bytes"]) or bool(cuts) != bool(total):
++        raise BadRecord("inconsistent capture totals or empty source cuts")
++    if total and state["capture_id"] is None:
++        raise BadRecord("missing capture identity")
++    checked_gaps(state["gaps"])
++    if "journal_seq" in state and (type(state["journal_seq"]) is not int or state["journal_seq"] < 0):
++        raise BadRecord("invalid journal cursor")
++    if "journal_seq" in state:
++        for name in ("source_gateway", "database_uid"):
++            if not isinstance(state.get(name), str) or not state[name]:
++                raise BadRecord("invalid database export identity")
++        db = state.get("db")
++        if (not isinstance(db, dict) or set(db) != {"path", "dev", "ino"}
++                or not isinstance(db["path"], str) or not db["path"]
++                or any(type(db[k]) is not int or db[k] < 0 for k in ("dev", "ino"))):
++            raise BadRecord("invalid database file identity")
++        if type(state.get("armed_ms")) is not int or state["armed_ms"] < 0:
++            raise BadRecord("invalid database export opening cut")
++    return state
++
++
+ def receipts(out: Path) -> dict:
+     path = out / RECEIPTS
+     if path.exists():
+-        return json.loads(path.read_text(encoding="utf-8-sig"))
++        try:
++            return validate_state(json.loads(read_bounded(path, MAX_METADATA_BYTES).decode("utf-8-sig")))
++        except (ValueError, TypeError, RecursionError) as exc:
++            raise BadRecord("invalid receipts") from exc
+     return {"version": VERSION, "capture_id": None, "board_uid": None, "segments": [],
+             "sources": [], "gaps": [], "bytes": 0}
+ 
+@@ -40,14 +117,16 @@ def source_key(record):
+ 
+ def source_map(sources):
+     result = {}
++    if not isinstance(sources, list):
++        raise BadRecord("source cuts must be a list")
+     for item in sources:
+-        if set(item) != {"source_gateway", "source_epoch", "last_seq"}:
++        if not isinstance(item, dict) or set(item) != {"source_gateway", "source_epoch", "last_seq"}:
+             raise BadRecord("invalid source closing cut")
+         key = source_key(item)
+         if any(not isinstance(x, str) or not x for x in key) or key in result:
+             raise BadRecord("invalid or duplicate source identity")
+         seq = item["last_seq"]
+-        if type(seq) is not int or seq < 0:
++        if type(seq) is not int or seq <= 0:
+             raise BadRecord("invalid source closing sequence")
+         result[key] = seq
+     return result
+@@ -57,7 +136,7 @@ def source_rows(cuts):
+     return [{"source_gateway": g, "source_epoch": e, "last_seq": n} for (g, e), n in sorted(cuts.items())]
+ 
+ 
+-def append_records(out: Path, records, *, max_bytes: int = MAX_CAPTURE_BYTES) -> dict:
++def append_records(out: Path, records, *, max_bytes: int = MAX_CAPTURE_BYTES, _metadata=None) -> dict:
+     """Append one bounded batch. Caller counts rejection as loss; one consumer owns the directory."""
+     if type(max_bytes) is not int or not 0 < max_bytes <= MAX_CAPTURE_BYTES:
+         raise ValueError("max_bytes outside capture bound")
+@@ -65,6 +144,15 @@ def append_records(out: Path, records, *, max_bytes: int = MAX_CAPTURE_BYTES) ->
+         raise ValueError("capture is already sealed")
+     state = receipts(out)
+     cuts = source_map(state["sources"])
++    if _metadata is not None:
++        if not isinstance(_metadata, dict) or set(_metadata) != {"journal_seq"}:
++            raise BadRecord("internal metadata may only advance journal_seq")
++        cursor = _metadata["journal_seq"]
++        if type(cursor) is not int or cursor < state.get("journal_seq", 0):
++            raise BadRecord("invalid journal cursor advance")
++    for index, item in enumerate(state["segments"], 1):
++        if item["name"] != f"segment-{index:06d}.jsonl":
++            raise BadRecord("invalid segment order")
+     batches, lines, size, total = [], [], 0, state["bytes"]
+     for raw in records:
+         rec = decode_record(raw)
+@@ -91,13 +179,23 @@ def append_records(out: Path, records, *, max_bytes: int = MAX_CAPTURE_BYTES) ->
+     if any((out / name).exists() for name in names):
+         raise ValueError("unacknowledged segment exists; capture incomplete")
+     out.mkdir(parents=True, exist_ok=True)
++    data_batches = []
+     for name, batch in zip(names, batches):
+         data = b"".join(batch)
+-        write(out / name, data)
++        data_batches.append(data)
+         state["segments"].append({"name": name, "records": len(batch), "bytes": len(data),
+                                   "sha256": hashlib.sha256(data).hexdigest()})
+     state.update(sources=source_rows(cuts), bytes=total)
+-    write(out / RECEIPTS, encoded(state))
++    if _metadata is not None:
++        state.update(_metadata)
++    state["gaps"] = checked_gaps(state["gaps"])
++    validate_state(state)
++    receipt_data = encoded(state)
++    if len(receipt_data) > MAX_METADATA_BYTES:
++        raise BadRecord("receipt metadata bound exceeded")
++    for name, data in zip(names, data_batches):
++        write(out / name, data)
++    write(out / RECEIPTS, receipt_data)
+     return state
+ 
+ 
+@@ -113,7 +211,7 @@ def seal_records(out: Path, *, expected_sources: list[dict], gaps=None) -> dict:
+         raise BadRecord("source closing cuts do not cover exactly the recorded epochs")
+     if (out / MANIFEST).exists():
+         raise ValueError("capture already sealed")
+-    manifest = {**state, "sealed": True, "gaps": state["gaps"] + (gaps or [])}
++    manifest = {**state, "sealed": True, "gaps": checked_gaps(state["gaps"] + checked_gaps([] if gaps is None else gaps))}
+     manifest["final_seal"] = final_seal(manifest)
+     write(out / MANIFEST, encoded(manifest))
+     return manifest
+@@ -125,7 +223,7 @@ def _read_segment(out, seg, gaps):
+         gaps.append({"code": "bad_segment_name"})
+         return []
+     try:
+-        data = (out / name).read_bytes()
++        data = read_bounded(out / name, SEGMENT_BYTES)
+         if (len(data) > SEGMENT_BYTES or len(data) != seg.get("bytes")
+                 or hashlib.sha256(data).hexdigest() != seg.get("sha256")):
+             raise ValueError("segment size/hash mismatch")
+@@ -142,14 +240,20 @@ def load_records(out: Path) -> dict:
+     gaps = []
+     try:
+         path = out / MANIFEST
+-        manifest = json.loads(path.read_text(encoding="utf-8-sig")) if path.exists() else receipts(out)
+-    except (OSError, ValueError, TypeError):
++        manifest = validate_state(json.loads(read_bounded(path, MAX_METADATA_BYTES).decode("utf-8-sig")), check_totals=False) if path.exists() else receipts(out)
++    except (OSError, ValueError, TypeError, RecursionError):
+         return {"manifest": {}, "records": [], "gaps": [{"code": "bad_manifest"}]}
+     if manifest.get("sealed") is not True or not manifest.get("final_seal"):
+         gaps.append({"code": "unsealed"})
+-    elif manifest["final_seal"] != final_seal(manifest):
+-        gaps.append({"code": "seal_mismatch"})
++    else:
++        try:
++            if manifest["final_seal"] != final_seal(manifest):
++                gaps.append({"code": "seal_mismatch"})
++        except (ValueError, TypeError, RecursionError):
++            return {"manifest": {}, "records": [], "gaps": [{"code": "bad_manifest"}]}
+     gaps.extend(manifest.get("gaps") or [])
++    if sum(s["bytes"] for s in manifest["segments"]) != manifest["bytes"]:
++        gaps.append({"code": "capture_bytes"})
+     records, cuts, names = [], {}, []
+     for index, seg in enumerate(manifest.get("segments") or [], 1):
+         names.append(seg.get("name"))
+@@ -167,7 +271,7 @@ def load_records(out: Path) -> dict:
+             if rec["seq"] != cuts.get(key, 0) + 1:
+                 gaps.append({"code": "sequence_gap"})
+             cuts[key] = rec["seq"]
+-            if rec["clock_error_ns"] is None:
++            if rec["clock_error_ns"] is None or rec["mono_ns"] is None:
+                 gaps.append({"code": "clock_unknown"})
+             payload = rec["payload"]
+             if rec["kind"] == "loss" or payload.get("unknown_fields") or payload.get("redacted"):
+@@ -180,4 +284,6 @@ def load_records(out: Path) -> dict:
+             gaps.append({"code": "source_tail"})
+     except (ValueError, TypeError, KeyError):
+         gaps.append({"code": "bad_source_cuts"})
+-    return {"manifest": manifest, "records": records, "gaps": gaps}
++    if not cuts:
++        gaps.append({"code": "source_tail"})
++    return {"manifest": manifest, "records": records, "gaps": dedupe_gaps(gaps)}
+diff --git a/hermes_cli/kanban_fairness_store.py b/hermes_cli/kanban_fairness_store.py
+index 64b9d3b80f3d1b254a32c84ea3b73e7b902c338d..43a4154aa5dd5b65e67ab1ff1e865e0913345c29 100644
+--- a/hermes_cli/kanban_fairness_store.py
++++ b/hermes_cli/kanban_fairness_store.py
+@@ -16,7 +16,7 @@ from typing import Optional
+ 
+ from hermes_cli import kanban_fairness_journal as journal
+ from hermes_cli import kanban_fairness_segments as segments
+-from hermes_cli.kanban_fairness_schema import VERSION, BadRecord, decode_owner, make_record
++from hermes_cli.kanban_fairness_schema import VERSION, decode_owner, make_record
+ from hermes_cli.kanban_fairness_segments import append_records, seal_records
+ 
+ __all__ = ["append_records", "drain", "load", "seal_records", "write_manifest"]
+@@ -78,6 +78,10 @@ def drain(conn: sqlite3.Connection, out: Path) -> dict:
+         return receipts
+     if (out / MANIFEST).exists():
+         return receipts
++    if state.get("trigger_integrity") is not True and not any(g["code"] == "trigger_loss" for g in receipts["gaps"]):
++        _gap(receipts, "trigger_loss", "capture triggers are missing or changed, or seal integrity is unknown")
++        # Preserve newly observed gaps even when no new rows arrive.
++        _write(out / RECEIPTS, segments.encoded(receipts))
+     while True:
+         rows = list(journal.rows(conn, receipts["journal_seq"], limit=128))
+         if not rows:
+@@ -96,17 +100,18 @@ def drain(conn: sqlite3.Connection, out: Path) -> dict:
+                     payload={"task_id": task_id, "op": op, "fields": json.loads(fields),
+                              "journal_seq": db_seq, "journal_kind": kind,
+                              "database_uid": receipts["database_uid"], "source_uid": None}))
+-            receipts = append_records(out, records)
++            receipts = append_records(out, records, _metadata={"journal_seq": rows[-1][0]})
+         except (ValueError, OSError) as exc:
+             _gap(receipts, "export_failed", type(exc).__name__)
+             _write(out / RECEIPTS, segments.encoded(receipts))
+             return receipts
+-        receipts["journal_seq"] = rows[-1][0]
+-        _write(out / RECEIPTS, segments.encoded(receipts))
++
+ 
+ 
+ def write_manifest(conn: sqlite3.Connection, out: Path, *, board: str, assumptions: dict,
+                    policy: dict, roster: Optional[list] = None) -> dict:
++    if (out / MANIFEST).exists():
++        raise ValueError("capture already sealed")
+     state = journal.seal(conn)
+     receipts = drain(conn, out)
+     manifest = {
+@@ -141,25 +146,47 @@ def load(out: Path) -> dict:
+         if payload["source_uid"] is None:
+             gaps.append({"code": "source_uid_unknown"})
+     counters = manifest.get("journal")
+-    if counters:
++    if "journal" in manifest and not _valid_counters(counters):
++        gaps.append({"code": "bad_journal_counters"})
++    elif counters is not None:
+         if counters["dropped"]:
+             gaps.append({"code": "journal_dropped", "detail": "journal bound dropped changes"})
+         if counters["stored"] != len(records) or counters["last_seq"] != expected - 1:
+             gaps.append({"code": "record_count"})
+     capture["owners"] = _owners(out, gaps)
++    capture["gaps"] = segments.dedupe_gaps(gaps)
+     return capture
+ 
+ 
++def _valid_counters(counters):
++    required = {"stored", "bytes", "dropped", "first_drop_ms", "last_drop_ms", "max_records", "max_bytes", "last_seq"}
++    if not isinstance(counters, dict) or set(counters) != required:
++        return False
++    for name, value in counters.items():
++        if value is None and name in ("first_drop_ms", "last_drop_ms"):
++            continue
++        if type(value) is not int or value < 0:
++            return False
++    return (counters["stored"] <= counters["max_records"] and counters["bytes"] <= counters["max_bytes"]
++            and counters["max_records"] > 0 and counters["max_bytes"] > 0)
++
++
+ def _owners(out: Path, gaps: list[dict]) -> Optional[list[dict]]:
+     path = out / OWNERS
+     if not path.exists():
+         return None
+     owners = []
+-    for number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
++    try:
++        data = segments.read_bounded(path, min(segments.MAX_CAPTURE_BYTES, segments.MAX_METADATA_BYTES))
++        lines = data.decode("utf-8-sig").splitlines()
++    except (OSError, ValueError):
++        gaps.append({"code": "bad_owner_record", "detail": "owner file unreadable or over bound"})
++        return owners
++    for number, line in enumerate(lines, 1):
+         if not line.strip():
+             continue
+         try:
+             owners.append(decode_owner(json.loads(line)))
+-        except (ValueError, BadRecord) as exc:
++        except (ValueError, TypeError, RecursionError) as exc:
+             gaps.append({"code": "bad_owner_record", "detail": f"{OWNERS}:{number}: {exc}"})
+     return owners
+diff --git a/tests/hermes_cli/test_kanban_fairness_envelope.py b/tests/hermes_cli/test_kanban_fairness_envelope.py
+index 5f2a3012de8e1fb54e4b4cc79890c7331e70af96..216774e3767c4f849e611cc7c7af5e5ae5f898e1 100644
+--- a/tests/hermes_cli/test_kanban_fairness_envelope.py
++++ b/tests/hermes_cli/test_kanban_fairness_envelope.py
+@@ -77,16 +77,42 @@ def test_make_record_rejects_phase_b_kinds():
+             _rec(kind=kind, payload={})
+ 
+ 
+-@pytest.mark.parametrize("kind", ["membership", "loss"])
+-def test_other_kinds_take_bounded_json_mapping(kind):
+-    raw = _rec(kind=kind, payload={"a": [1, {"b": None}], "c": "x"})
+-    assert decode_record(raw)["payload"] == {"a": [1, {"b": None}], "c": "x"}
++def _loss(**over):
++    payload = {"reason": "dropped", "count": 1, "first_seq": None, "last_seq": None,
++               "start_wall_ns": None, "end_wall_ns": None}
++    payload.update(over)
++    return payload
++
++
++def test_membership_records_are_unsupported():
++    with pytest.raises(BadRecord, match="unsupported"):
++        _rec(kind="membership", payload={})
++    with pytest.raises(BadRecord, match="unsupported"):
++        decode_record({**_rec(), "kind": "membership", "payload": {"a": [1, {"b": None}], "c": "x"}})
++
++
++def test_loss_payload_is_exact():
++    raw = _rec(kind="loss", payload=_loss())
++    assert decode_record(raw)["payload"] == _loss()
++    with pytest.raises(BadRecord):
++        decode_record({**raw, "payload": {**_loss(), "extra": 1}})
++    with pytest.raises(BadRecord):
++        decode_record({**raw, "payload": {**_loss(), "membership": []}})
++
++
++@pytest.mark.parametrize("kind,payload", [
++    ("membership", {}),
++    ("loss", {"reason": "dropped", "count": 1, "first_seq": None, "last_seq": None,
++              "start_wall_ns": None, "end_wall_ns": None}),
++])
++def test_membership_and_loss_still_reject_non_json_and_oversize(kind, payload):
++    raw = {**_rec(), "kind": kind, "payload": payload}
+     with pytest.raises(BadRecord):
+-        decode_record({**raw, "payload": {"a": object()}})
++        decode_record({**raw, "payload": {**payload, "a": object()}})
+     with pytest.raises(BadRecord):
+-        decode_record({**raw, "payload": {"a": float("nan")}})
++        decode_record({**raw, "payload": {**payload, "a": float("nan")}})
+     with pytest.raises(BadRecord):
+-        decode_record({**raw, "payload": {"a": "x" * (300 * 1024)}})
++        decode_record({**raw, "payload": {**payload, "a": "x" * (300 * 1024)}})
+     with pytest.raises(BadRecord):
+         decode_record({**raw, "payload": {1: 2}})
+ 
+diff --git a/tests/hermes_cli/test_kanban_fairness_journal.py b/tests/hermes_cli/test_kanban_fairness_journal.py
+index 90dd055d9830d6c9eec62b3ca92b08c327aab9e8..d9db9a2885a697e2101258792c36b705f463d45c 100644
+--- a/tests/hermes_cli/test_kanban_fairness_journal.py
++++ b/tests/hermes_cli/test_kanban_fairness_journal.py
+@@ -109,8 +109,10 @@ def test_seal_stops_capture_and_survives_a_reopen(conn, tmp_path):
+         assert journal.status(again)["triggers"] == []
+         assert journal.status(again)["stored"] == manifest["journal"]["stored"]
+     capture = store.load(out)
+-    assert {g["code"] for g in capture["gaps"]} == {
+-        "source_identity_unknown", "clock_unknown", "source_uid_unknown"}
++    expected_gaps = {"source_identity_unknown", "clock_unknown", "source_uid_unknown"}
++    if journal.status(conn).get("trigger_integrity") is not True:
++        expected_gaps.add("trigger_loss")
++    assert {g["code"] for g in capture["gaps"]} == expected_gaps
+     assert len(manifest["segments"]) == 2
+     assert [r["seq"] for r in capture["records"]] == list(range(1, len(capture["records"]) + 1))
+ 
+diff --git a/tests/hermes_cli/test_kanban_fairness_payloads.py b/tests/hermes_cli/test_kanban_fairness_payloads.py
+index 611804f253a4c66c6bd3398ef148a556c28af92f..30284e9316fa3411fce867071b0004c21940cde4 100644
+--- a/tests/hermes_cli/test_kanban_fairness_payloads.py
++++ b/tests/hermes_cli/test_kanban_fairness_payloads.py
+@@ -1,6 +1,7 @@
+ """Strict, privacy-bounded Phase A payload contracts."""
+ import base64
+ import hashlib
++import json
+ 
+ import pytest
+ 
+@@ -12,9 +13,9 @@ def creation():
+                 priority_intent="unknown", priority_argument=None, effective_parent_priority=None,
+                 parent_snapshot_cut=None, inheritance_cap=None, stored_child_priority=2,
+                 producer_source_hash=None,
+-                unknown_fields=["creator_task_uid", "creator_episode_uid", "priority_argument",
+-                                "effective_parent_priority", "parent_snapshot_cut", "inheritance_cap",
+-                                "producer_source_hash"])
++                unknown_fields=["creator_task_uid", "creator_episode_uid", "priority_intent",
++                                "priority_argument", "effective_parent_priority", "parent_snapshot_cut",
++                                "inheritance_cap", "producer_source_hash"])
+ 
+ 
+ def record(kind, payload, **kwargs):
+@@ -51,28 +52,101 @@ def test_creation_requires_all_exact_keys():
+             record("creation", payload)
+ 
+ 
+-def test_creation_accepts_known_cut_and_scalar_priority():
+-    payload = creation()
+-    payload.update(creator_task_uid="parent", creator_episode_uid="run", priority_intent="explicit",
+-                   priority_argument="3", effective_parent_priority=0, inheritance_cap=2,
++def known_creation(**over):
++    payload = dict(task_uid="child", creator_task_uid="parent", creator_episode_uid="run",
++                   priority_intent="omitted", priority_argument=None, effective_parent_priority=0,
+                    parent_snapshot_cut=dict(source_gateway="gw", source_epoch="ep", seq=1),
+-                   producer_source_hash="revision", unknown_fields=[])
++                   inheritance_cap=2, stored_child_priority=2, producer_source_hash="revision",
++                   unknown_fields=[])
++    payload.update(over)
++    return payload
++
++
++def test_creation_accepts_known_cut_and_scalar_priority():
++    payload = known_creation(priority_intent="explicit", priority_argument="3")
+     assert record("creation", payload)["payload"] == payload
+ 
+ 
++def test_creation_known_omitted_and_explicit_null():
++    omitted = known_creation()
++    assert record("creation", omitted)["payload"] == omitted
++    explicit_null = known_creation(priority_intent="explicit", priority_argument=None)
++    assert record("creation", explicit_null)["payload"] == explicit_null
++
++
++def test_creation_unknown_intent_requires_marker():
++    missing = known_creation(priority_intent="unknown", priority_argument=3)
++    with pytest.raises(schema.BadRecord):
++        record("creation", missing)
++    marked = known_creation(priority_intent="unknown", priority_argument=3,
++                            unknown_fields=["priority_intent"])
++    assert record("creation", marked)["payload"] == marked
++
++
++def test_creation_rejects_omitted_scalar():
++    with pytest.raises(schema.BadRecord):
++        record("creation", known_creation(priority_argument=3))
++
++
++def loss(**over):
++    payload = dict(reason="dropped", count=1, first_seq=None, last_seq=None,
++                   start_wall_ns=None, end_wall_ns=None)
++    payload.update(over)
++    return payload
++
++
++def test_loss_roundtrip_and_known_ranges():
++    assert record("loss", loss())["payload"] == loss()
++    payload = loss(first_seq=2, last_seq=4, start_wall_ns=0, end_wall_ns=5, reason="oversize", count=3)
++    assert record("loss", payload)["payload"] == payload
++
++
++@pytest.mark.parametrize("change", [
++    {"extra": 1}, {"reason": "other"}, {"count": 0}, {"count": True}, {"count": -1},
++    {"first_seq": 1}, {"last_seq": 1}, {"first_seq": 0, "last_seq": 1},
++    {"first_seq": 3, "last_seq": 2}, {"first_seq": True, "last_seq": 1},
++    {"start_wall_ns": 1}, {"end_wall_ns": 1}, {"start_wall_ns": -1, "end_wall_ns": 0},
++    {"start_wall_ns": 5, "end_wall_ns": 4}, {"reason": None}, {"membership": []},
++])
++def test_loss_rejects_malformed_and_banned_keys(change):
++    payload = loss()
++    payload.update(change)
++    with pytest.raises(schema.BadRecord):
++        record("loss", payload)
++
++
++def test_membership_records_are_unsupported():
++    with pytest.raises(schema.BadRecord, match="unsupported"):
++        record("membership", {})
++    with pytest.raises(schema.BadRecord, match="unsupported"):
++        record("membership", {"roster": [], "extra": 1})
++    with pytest.raises(schema.BadRecord, match="unsupported"):
++        record("membership", loss())
++
++
+ def test_make_record_stage_index_is_explicit_but_phase_a_rejects_nonnull():
+     assert record("creation", creation(), stage_index=None)["stage_index"] is None
+     with pytest.raises(schema.BadRecord):
+         record("creation", creation(), stage_index=0)
+ 
+ 
+-def urgency():
+-    raw = b'{"version":1,"board":"board","owners":[]}'
+-    return dict(receipt_type="urgency_read", board="board", read_at_s=10, outcome="valid",
+-                raw_b64=base64.b64encode(raw).decode("ascii"),
+-                raw_sha256=hashlib.sha256(raw).hexdigest(), raw_complete=True,
+-                observed_at=9, valid_until=20, source_revision="rev", owner_ids=[], reason=None,
+-                raw_size=len(raw), redacted=False)
++def source_doc(**changes):
++    doc = dict(version=1, board="board", source_revision="rev", observed_at=9, valid_until=20,
++               owners=[dict(task_id="t1", source="core-lane", ref="r", head="h", expires_at=30)])
++    doc.update(changes)
++    return doc
++
++
++def urgency(raw=None, **changes):
++    if raw is None:
++        raw = json.dumps(source_doc()).encode()
++    payload = dict(receipt_type="urgency_read", board="board", read_at_s=10, outcome="valid",
++                   raw_b64=base64.b64encode(raw).decode("ascii"),
++                   raw_sha256=hashlib.sha256(raw).hexdigest(), raw_complete=True,
++                   observed_at=9, valid_until=20, source_revision="rev", owner_ids=["t1"], reason=None,
++                   raw_size=len(raw), redacted=False)
++    payload.update(changes)
++    return payload
+ 
+ 
+ def test_owner_generation_valid_roundtrip():
+@@ -156,3 +230,55 @@ def test_lifecycle_field_values_cannot_hide_nested_content(value):
+     payload["fields"]["assignee"] = value
+     with pytest.raises(schema.BadRecord):
+         record("row_change", payload)
++
++
++def _owner(**changes):
++    owner = dict(task_id="t1", source="core-lane", ref="r", head="h", expires_at=30)
++    owner.update(changes)
++    return owner
++
++
++def _j(**changes):
++    return json.dumps(source_doc(**changes)).encode()
++
++
++BAD_RAW = [
++    b"secret-token-abc123", b"[]", b"", b"\xff\xfe", b"null",
++    json.dumps(dict(source_doc(), extra=1)).encode(),
++    json.dumps({k: v for k, v in source_doc().items() if k != "board"}).encode(),
++    _j(version=2), _j(version=True), _j(version=1.0),
++    _j(board=""), _j(board=" "), _j(board=1), _j(board="b" * 1025), _j(source_revision=None),
++    _j(observed_at="9"), _j(valid_until=True), _j(owners={}), _j(owners=["x"]),
++    _j(owners=[_owner(extra="secret")]),
++    _j(owners=[{k: v for k, v in _owner().items() if k != "ref"}]),
++    _j(owners=[_owner(source="other")]), _j(owners=[_owner(source=["core-lane"])]),
++    _j(owners=[_owner(task_id="")]), _j(owners=[_owner(head=3)]), _j(owners=[_owner(expires_at=None)]),
++    _j(owners=[_owner()] * 4097),
++    b'{"version":1,"version":1,"board":"b","source_revision":"r","observed_at":1,"valid_until":2,"owners":[]}',
++    b'{"version":1,"board":"b","source_revision":"r","observed_at":NaN,"valid_until":2,"owners":[]}',
++    b'{"version":1,"board":"b","source_revision":"r","observed_at":1,"valid_until":1e999,"owners":[]}',
++    b'{"version":1,"board":"b","source_revision":"r","observed_at":1,"valid_until":2,"owners":[],"x":Infinity}',
++    b'{"version":1,"board":"b","source_revision":"r","observed_at":1,"valid_until":2,"owners":['
++    b'{"task_id":"a","task_id":"b","source":"core-lane","ref":"r","head":"h","expires_at":3}]}',
++    b" " * (128 * 1024 + 1),
++]
++
++
++@pytest.mark.parametrize("raw", BAD_RAW, ids=[f"bad{i}" for i in range(len(BAD_RAW))])
++def test_owner_generation_rejects_non_source_raw_bytes(raw):
++    with pytest.raises(schema.BadRecord):
++        record("owner_generation", urgency(raw))
++
++
++def test_owner_generation_accepts_empty_and_many_owners():
++    for owners in ([], [_owner(task_id=f"t{i}") for i in range(1000)]):
++        raw = json.dumps(source_doc(owners=owners), separators=(",", ":")).encode()
++        payload = urgency(raw, owner_ids=sorted(o["task_id"] for o in owners))
++        assert record("owner_generation", payload)["payload"] == payload
++
++
++def test_owner_generation_redacted_receipt_keeps_digest_without_bytes():
++    raw = b"secret-token-abc123"
++    payload = urgency(raw, outcome="invalid", raw_b64=None, raw_complete=False, redacted=True,
++                      owner_ids=[], reason="invalid_source")
++    assert record("owner_generation", payload)["payload"] == payload
+diff --git a/tests/hermes_cli/test_kanban_fairness_resource_bounds.py b/tests/hermes_cli/test_kanban_fairness_resource_bounds.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6edf9be70bec2fdc7d3b0d6f549c8f4da530d433
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_fairness_resource_bounds.py
+@@ -0,0 +1,132 @@
++"""The fairness journal bounds UTF-8 bytes of the stored fields before admitting a row, in the opening snapshot
++and in the triggers, and keeps the record bound. [daveey]"""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_fairness_journal as journal
++
++
++@pytest.fixture
++def conn(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    with kbc.connect_closing() as handle:
++        yield handle
++
++
++def _utf8_total(conn) -> int:
++    return sum(len(r[5].encode("utf-8")) for r in journal.rows(conn, limit=10**9))
++
++
++def _count(conn, kind=None) -> int:
++    sql = f"SELECT COUNT(*) FROM {journal.JOURNAL}" + (" WHERE kind = ?" if kind else "")
++    return conn.execute(sql, (kind,) if kind else ()).fetchone()[0]
++
++
++def _seed(conn, keys):
++    return [kb.create_task(conn, title=f"t{i}", assignee="a", idempotency_key=key) for i, key in enumerate(keys)]
++
++
++@pytest.mark.parametrize("key", ["a" * 70_000, "界" * 30_000], ids=["70k-ascii", "30k-unicode"])
++def test_opening_1000_rows_ascii_and_unicode_keys_stay_in_byte_bound(conn, key):
++    _seed(conn, [str(i) + key for i in range(1000)])
++    bound = 64 * 1024 * 1024
++    state = journal.arm(conn, "c1", max_bytes=bound)
++    assert state["bytes"] == _utf8_total(conn)
++    assert state["bytes"] <= bound
++    assert state["stored"] == _count(conn, "opening") < 1000
++    assert state["dropped"] == 1000 - state["stored"] > 0
++    assert state["first_drop_ms"] == state["last_drop_ms"] == state["armed_ms"]
++
++
++def test_segment_ceiling_checks_before_append(tmp_path):
++    from hermes_cli import kanban_fairness_segments as segments
++    from hermes_cli.kanban_fairness_schema import make_record, SEGMENT_BYTES
++
++    def records():
++        for seq in range(1, 131):
++            yield make_record(capture_id="cap", source_gateway="gw", board_uid="board",
++                              source_epoch="epoch", seq=seq, kind="opening", wall_ns=1,
++                              mono_ns=1, clock_error_ns=0,
++                              payload={"task_id": str(seq), "op": None,
++                                       "fields": {"status": "ready", "idempotency_key": "a" * 70_000},
++                                       "journal_seq": seq, "journal_kind": "opening",
++                                       "database_uid": "db", "source_uid": "uid" + str(seq)})
++    receipt = segments.append_records(tmp_path, records())
++    assert len(receipt["segments"]) == 2
++    assert all((tmp_path / item["name"]).stat().st_size <= SEGMENT_BYTES for item in receipt["segments"])
++    segments.seal_records(tmp_path, expected_sources=receipt["sources"])
++    loaded = segments.load_records(tmp_path)
++    assert len(loaded["records"]) == 130 and loaded["gaps"] == []
++
++
++def test_opening_unicode_counts_bytes_not_characters(conn):
++    _seed(conn, ["é" * 2000 + str(i) for i in range(10)])  # ~4k bytes each, ~2k characters
++    journal.arm(conn, "probe")
++    first = next(journal.rows(conn))[5]
++    one, chars = len(first.encode("utf-8")), len(first)
++    assert one > chars
++    bound = one * 4 + 100
++    state = journal.arm(conn, "c2", max_bytes=bound, replace=True)
++    assert state["stored"] == 4 and state["dropped"] == 6
++    assert state["bytes"] == _utf8_total(conn) <= bound
++
++
++def test_streaming_trigger_never_overshoots_64mib(conn):
++    bound = 64 * 1024 * 1024
++    journal.arm(conn, "c3")
++    big = "é" * 400_000  # 800k bytes, 400k characters
++    created = 0
++    while created < 100:  # 100 * ~0.8 MiB > 64 MiB
++        kb.create_task(conn, title="t", assignee="a", idempotency_key=big + str(created))
++        created += 1
++    state = journal.status(conn)
++    assert state["bytes"] == _utf8_total(conn) <= bound
++    assert _count(conn, "task") < created and state["dropped"] > 0
++    assert state["first_drop_ms"] is not None and state["last_drop_ms"] >= state["first_drop_ms"]
++
++
++def test_trigger_counts_utf8_bytes_with_small_bound(conn):
++    journal.arm(conn, "c4", max_bytes=3000)
++    for i in range(6):
++        kb.create_task(conn, title="t", assignee="a", idempotency_key="é" * 600 + str(i))  # >1200 bytes
++    state = journal.status(conn)
++    assert state["bytes"] == _utf8_total(conn) <= 3000
++    assert _count(conn, "task") < 6 and state["dropped"] > 0
++
++
++def test_oversized_individual_rows_are_gaps_and_later_small_rows_admit(conn):
++    journal.arm(conn, "c5", max_bytes=4000)
++    kb.create_task(conn, title="huge", assignee="a", idempotency_key="x" * 10_000)
++    assert _count(conn, "task") == 0 and journal.status(conn)["dropped"] >= 1
++    kb.create_task(conn, title="small", assignee="a")
++    state = journal.status(conn)
++    assert _count(conn, "task") == 1 and state["bytes"] == _utf8_total(conn) <= 4000
++
++
++def test_opening_skips_oversized_row_and_keeps_the_rest(conn):
++    _seed(conn, ["x" * 10_000, None, None])
++    state = journal.arm(conn, "c6", max_bytes=4000)
++    assert state["stored"] == 2 and state["dropped"] == 1
++    assert state["bytes"] == _utf8_total(conn) <= 4000
++    assert all(json.loads(r[5])["idempotency_key"] is None for r in journal.rows(conn))
++
++
++def test_record_bound_preserved_at_100k(conn):
++    state = journal.arm(conn, "c7")
++    assert state["max_records"] == 100_000 and state["max_bytes"] == 64 * 1024 * 1024
++    journal.arm(conn, "c8", max_records=3, replace=True)
++    for _ in range(5):
++        kb.create_task(conn, title="t", assignee="a")
++    state = journal.status(conn)
++    assert state["stored"] == 3 and state["dropped"] >= 2  # task rows plus their created events
++    assert state["bytes"] == _utf8_total(conn)
+diff --git a/tests/hermes_cli/test_kanban_fairness_segments.py b/tests/hermes_cli/test_kanban_fairness_segments.py
+index 0bcc826075c7083e2e137a6334422f4293408e4c..fae5857d26eadfb1d89a5f4dd570e05aec0c7b44 100644
+--- a/tests/hermes_cli/test_kanban_fairness_segments.py
++++ b/tests/hermes_cli/test_kanban_fairness_segments.py
+@@ -10,7 +10,9 @@ from hermes_cli.kanban_fairness_schema import BadRecord, make_record
+ def record(seq=1, epoch="e1", **kw):
+     return make_record(capture_id="capture", board_uid="board", source_gateway="gw",
+                        source_epoch=epoch, seq=seq, kind="loss", wall_ns=100,
+-                       mono_ns=10, clock_error_ns=0, payload={"count": 0}, **kw)
++                       mono_ns=10, clock_error_ns=0,
++                       payload={"reason": "dropped", "count": 1, "first_seq": None, "last_seq": None,
++                                "start_wall_ns": None, "end_wall_ns": None}, **kw)
+ 
+ 
+ def seal(out, *sources):
+diff --git a/tests/hermes_cli/test_kanban_fairness_store_hardening.py b/tests/hermes_cli/test_kanban_fairness_store_hardening.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e4fe13515eb2125d4f1c60170b6620b9d467673b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_fairness_store_hardening.py
+@@ -0,0 +1,202 @@
++"""Adversarial storage boundaries use real envelopes and recomputed integrity hashes."""
++import hashlib
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_fairness_segments as seg
++from hermes_cli import kanban_fairness_store as store
++from hermes_cli.kanban_fairness_schema import make_record
++
++
++def record(seq=1, epoch="e1"):
++    return make_record(capture_id="capture", board_uid="board", source_gateway="gw",
++                       source_epoch=epoch, seq=seq, kind="row_change", wall_ns=100,
++                       mono_ns=10, clock_error_ns=0,
++                       payload={"task_id": "task", "op": "update", "fields": {"status": "ready"},
++                                "journal_seq": seq, "journal_kind": "task", "database_uid": "db",
++                                "source_uid": "source"})
++
++
++def save(out, manifest):
++    manifest["final_seal"] = seg.final_seal(manifest)
++    (out / seg.MANIFEST).write_bytes(seg.encoded(manifest))
++
++
++def sealed(out, records=None):
++    seg.append_records(out, records or [record()])
++    return seg.seal_records(out, expected_sources=seg.receipts(out)["sources"])
++
++
++def codes(out):
++    return {g["code"] for g in store.load(out)["gaps"]}
++
++
++def test_real_no_gap_roundtrip(tmp_path):
++    records = [record(), record(2), record(1, "e2")]
++    sealed(tmp_path, records)
++    loaded = store.load(tmp_path)
++    assert loaded["records"] == records
++    # Journal sequence is global, not exporter-epoch local.
++    assert {g["code"] for g in loaded["gaps"]} == {"journal_sequence_gap"}
++    other = tmp_path / "other"
++    sealed(other, [record(), record(2)])
++    assert store.load(other)["gaps"] == []
++
++
++@pytest.mark.parametrize("value", [None, [], 3, "bad", {"segments": []}])
++def test_malformed_manifest_and_receipts_fail_closed(tmp_path, value):
++    (tmp_path / seg.MANIFEST).write_text(json.dumps(value))
++    assert codes(tmp_path)
++    (tmp_path / seg.MANIFEST).unlink()
++    (tmp_path / seg.RECEIPTS).write_text(json.dumps(value))
++    assert codes(tmp_path)
++    with pytest.raises(ValueError):
++        seg.append_records(tmp_path, [record()])
++
++
++@pytest.mark.parametrize("field,value", [("segments", [None]), ("segments", {}), ("sources", [None]),
++    ("sources", {}), ("gaps", [None]), ("gaps", "bad"), ("bytes", True), ("bytes", 0),
++    ("version", True), ("journal", []), ("journal", {"stored": "bad"})])
++def test_malformed_fields_fail_closed(tmp_path, field, value):
++    manifest = sealed(tmp_path)
++    manifest[field] = value
++    save(tmp_path, manifest)
++    assert codes(tmp_path)
++
++
++@pytest.mark.parametrize("seqs", [[1, 1], [2, 1], [1, 3]])
++def test_reader_rechecks_sequence_after_rehash(tmp_path, seqs):
++    manifest = sealed(tmp_path, [record(), record(2)])
++    data = b"".join(seg.encoded(record(n)) + b"\n" for n in seqs)
++    entry = manifest["segments"][0]
++    (tmp_path / entry["name"]).write_bytes(data)
++    entry.update(bytes=len(data), sha256=hashlib.sha256(data).hexdigest())
++    manifest["bytes"] = len(data)
++    save(tmp_path, manifest)
++    assert "sequence_gap" in codes(tmp_path)
++
++
++def test_epoch_tail_order_and_absent_seal(tmp_path):
++    seg.append_records(tmp_path, [record()])
++    seg.append_records(tmp_path, [record(1, "e2")])
++    manifest = seg.seal_records(tmp_path, expected_sources=seg.receipts(tmp_path)["sources"])
++    manifest["sources"].pop()
++    manifest["segments"].reverse()
++    save(tmp_path, manifest)
++    assert {"source_tail", "segment_order"} <= codes(tmp_path)
++    manifest.pop("final_seal")
++    (tmp_path / seg.MANIFEST).write_bytes(seg.encoded(manifest))
++    assert "unsealed" in codes(tmp_path)
++
++
++def test_unknown_mono_and_gap_dedup(tmp_path):
++    records = [record(), record(2)]
++    for item in records:
++        item["mono_ns"] = None
++    sealed(tmp_path, records)
++    gaps = store.load(tmp_path)["gaps"]
++    assert {g["code"] for g in gaps} == {"clock_unknown"}
++    assert len(gaps) == 1
++
++
++def test_segment_ceiling_before_read(tmp_path, monkeypatch):
++    manifest = sealed(tmp_path)
++    monkeypatch.setattr(seg, "SEGMENT_BYTES", 10)
++    assert codes(tmp_path)
++    # Declared segment ceiling is checked even with a recomputed final seal.
++    manifest["segments"][0]["bytes"] = seg.MAX_CAPTURE_BYTES
++    save(tmp_path, manifest)
++    assert codes(tmp_path)
++
++
++def test_empty_source_cuts_and_metadata_identity_refused(tmp_path):
++    seg.append_records(tmp_path, [])
++    with pytest.raises(ValueError):
++        seg.seal_records(tmp_path, expected_sources=[
++            {"source_gateway": "gw", "source_epoch": "e1", "last_seq": 0}])
++    with pytest.raises(ValueError):
++        seg.append_records(tmp_path, [record()], _metadata={"board_uid": "other"})
++
++
++def test_owner_bound_and_malformed_owner(tmp_path, monkeypatch):
++    sealed(tmp_path)
++    (tmp_path / store.OWNERS).write_text("[1]\n")
++    assert "bad_owner_record" in codes(tmp_path)
++    monkeypatch.setattr(seg, "MAX_CAPTURE_BYTES", 10)
++    assert codes(tmp_path)
++
++
++def test_write_manifest_refuses_reseal_before_db_access(tmp_path):
++    sealed(tmp_path)
++    with pytest.raises(ValueError):
++        store.write_manifest(None, tmp_path, board="board", assumptions={}, policy={})
++
++
++def test_database_cursor_published_with_segment_receipt(tmp_path, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_fairness_journal as journal
++
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    out = tmp_path / "capture"
++    publications = []
++    real_write = seg.write
++
++    def observe(path, data):
++        real_write(path, data)
++        if path.name == seg.RECEIPTS:
++            receipt = json.loads(path.read_bytes())
++            if receipt["segments"]:
++                publications.append(receipt)
++                assert receipt["journal_seq"] == sum(s["records"] for s in receipt["segments"])
++
++    monkeypatch.setattr(seg, "write", observe)
++    with kbc.connect_closing() as conn:
++        kb.create_task(conn, title="fixture", assignee="a")
++        journal.arm(conn, "capture")
++        result = store.drain(conn, out)
++        assert len(publications) == 1
++        assert result["journal_seq"] == 1
++        store.drain(conn, out)
++        assert len(publications) == 1
++
++
++@pytest.mark.parametrize("field,value", [("records", True), ("records", -1), ("bytes", "2"),
++    ("name", []), ("sha256", {}), ("sha256", "bad")])
++def test_bad_segment_receipt_shape(tmp_path, field, value):
++    manifest = sealed(tmp_path)
++    manifest["segments"][0][field] = value
++    save(tmp_path, manifest)
++    assert codes(tmp_path)
++
++
++def test_read_limits_precede_allocation(tmp_path, monkeypatch):
++    sealed(tmp_path)
++    original = Path.open
++
++    def guarded(path, *args, **kwargs):
++        assert not path.name.startswith("segment-")
++        return original(path, *args, **kwargs)
++
++    monkeypatch.setattr(seg, "MAX_METADATA_BYTES", 1)
++    monkeypatch.setattr(Path, "open", guarded)
++    assert "bad_manifest" in codes(tmp_path)
++
++
++def test_owner_file_over_bound(tmp_path, monkeypatch):
++    sealed(tmp_path)
++    (tmp_path / store.OWNERS).write_bytes(b" " * 100)
++    # Manifest remains within bound; owner ceiling is independently enforced.
++    real_read = seg.read_bounded
++
++    def small_owner(path, limit):
++        return real_read(path, 10 if path.name == store.OWNERS else limit)
++
++    monkeypatch.setattr(seg, "read_bounded", small_owner)
++    assert "bad_owner_record" in codes(tmp_path)
+diff --git a/tests/hermes_cli/test_kanban_fairness_vertical.py b/tests/hermes_cli/test_kanban_fairness_vertical.py
+index f94620023de318fb6d07e77647c8cfe5dbd865a1..5d62b4f6b7c0a53770593ff9ce284478d8da471c 100644
+--- a/tests/hermes_cli/test_kanban_fairness_vertical.py
++++ b/tests/hermes_cli/test_kanban_fairness_vertical.py
+@@ -91,8 +91,13 @@ def test_dispatch_to_report(kanban_home, all_assignees_spawnable, tmp_path, caps
+     capsys.readouterr()
+ 
+     capture = store.load(out)
+-    assert {g["code"] for g in capture["gaps"]} == {
+-        "source_identity_unknown", "clock_unknown", "source_uid_unknown"}
++    expected_gaps = {"source_identity_unknown", "clock_unknown", "source_uid_unknown"}
++    with kbc.connect_closing() as again:
++        state = journal.status(again)
++        assert state is not None
++        if state.get("trigger_integrity") is not True:
++            expected_gaps.add("trigger_loss")
++    assert {g["code"] for g in capture["gaps"]} == expected_gaps
+     eps = metrics.episodes(capture["records"], armed_s=capture["manifest"]["window"]["armed_ms"] / 1000,
+                            err=0)
+     by_task = {}
+-- 
+2.43.0
+

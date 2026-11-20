@@ -1,0 +1,372 @@
+From 40ff9edddd97057fb304281297cade5c41e1b41e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 23:59:11 +0000
+Subject: [PATCH] fix(lifecycle): preserve reaching stdin provenance [daveey]
+
+Replace command-wide assignment/fd unions with a deliberately narrow flat-sequence
+proof. Future, conditional, function-local and subshell definitions cannot erase
+inherited or unknown stdin. Freeze expansions at assignment/redirection time;
+resolve descriptors left-to-right and persist only standalone exec definitions.
+Unknown mutations invalidate subsequent variable proofs, including nameref and
+readonly attributes; quoted assignment words are not proven assignments. Export
+arguments expand against their pre-command snapshot, unlike assignment-only words.
+
+PR3099 rework: variable scope/order and descriptor scope/order were lost when
+segment-view unions replaced the inherited source without a reaching definition.
+This patch preserves uncertainty instead of claiming that any syntactic definition
+is necessarily in force. Unsupported compound flow may refuse earlier with a
+cannot-resolve reason; nine existing cases now assert that exact reason rather
+than SQLite after guessing a file. No piped-file behavior is changed.
+
+TDD: variable RED 10 cases, fd RED 9 cases incl closed-fd control, nameref RED 2,
+quoted/declaration RED 4 plus duplicate assignment RED 1. Focused GREEN 391 tests
+including harmless real-Bash marker oracles. Scoped scripts/check:20 checks OK.
+Full --base origin/main gate is not green: stale stacked base has unrelated
+agent_runtime_helpers FILE_LINES and process_registry NESTING failures. Must rebase
+only after parent PR3039/2911 land, rerun full gates, independent exact-head review
+and required CI before canonical hermes-core-wt ship. No merge authorization here.
+---
+ cron/lifecycle_guard_nested_shells.py         |  36 +++---
+ cron/lifecycle_guard_stdin_provenance.py      | 102 ++++++++++++++++
+ .../test_lifecycle_guard_session_aliases.py   |  16 ++-
+ .../test_lifecycle_guard_stdin_provenance.py  | 111 ++++++++++++++++++
+ 4 files changed, 243 insertions(+), 22 deletions(-)
+ create mode 100644 cron/lifecycle_guard_stdin_provenance.py
+ create mode 100644 tests/cron/test_lifecycle_guard_stdin_provenance.py
+
+diff --git a/cron/lifecycle_guard_nested_shells.py b/cron/lifecycle_guard_nested_shells.py
+index 4219fd40dcb22431377b96d21e917c714df0dfd9..7c6bceaf07940f876dcbe792b8ddfc6ceae113a5 100644
+--- a/cron/lifecycle_guard_nested_shells.py
++++ b/cron/lifecycle_guard_nested_shells.py
+@@ -814,9 +814,6 @@ def _iter_nested_shell_inputs(
+     # redirection overrides it: with a stdin-reading one anywhere, every compound command's
+     # redirections count, failing closed.
+     grouped = any(found == ("stdin", None) for _view, found in classified)
+-    sources = _StdinSources(
+-        _descriptor_sources(view for view, _found in classified),
+-        _assigned_variables(view for view, _found in classified)) if grouped else None
+     # So does a function body's (`f() { su -l bob; }; f < f`): a call to any function the
+     # command defines counts, whichever body holds the shell (`g() { f; }; g < f`).
+     functions = _defined_functions(walk_command) if grouped else frozenset()
+@@ -825,9 +822,12 @@ def _iter_nested_shell_inputs(
+             yield body, None
+     if grouped:
+         yield from _fed_shell_inputs(walk_command, cwd=cwd)
+-    for view, found in classified:
++    from cron.lifecycle_guard_stdin_provenance import source_contexts
++
++    contexts = source_contexts(walk_command, [view for view, _found in classified])
++    for (view, found), local_sources in zip(classified, contexts):
+         if grouped and (_compound_redirections(view) or _calls_function(view, functions)):
+-            yield from _redirected_shell_inputs(view, cwd=cwd, sources=sources)
++            yield from _redirected_shell_inputs(view, cwd=cwd, sources=local_sources)
+         if found is None:
+             continue
+         kind, value = found
+@@ -837,12 +837,14 @@ def _iter_nested_shell_inputs(
+             for path in _resolved_or_nothing(value, cwd):
+                 yield None, path
+         elif kind == "stdin":
+-            yield from _redirected_shell_inputs(view, cwd=cwd, sources=sources)
++            yield from _redirected_shell_inputs(view, cwd=cwd, sources=local_sources)
+ 
+ 
+ class _StdinSources(NamedTuple):
+-    """What the command itself says about its stdin targets: each descriptor's input
+-    redirections (``_descriptor_sources``) and each variable's values (``_assigned_variables``)."""
++    """Proven reaching descriptor sources and variable values before one command.
++
++    Unknown values carry an unresolvable ``$`` sentinel, not an empty safe union.
++    """
+ 
+     fds: dict[str, list[tuple[str, str]]]
+     variables: dict[str, list[str]]
+@@ -875,18 +877,6 @@ def _redirections(view: list[str]) -> Iterator[tuple[str, str, str]]:
+             yield fd, operator, target or next(words, "")
+ 
+ 
+-def _descriptor_sources(views: Iterator[list[str]]) -> dict[str, list[tuple[str, str]]]:
+-    """``{fd: [(operator, target), …]}`` for every input redirection of a descriptor above 2
+-    anywhere in the command (``3< f``, ``exec 3<> f``, ``3<<< T``): which one a later ``0<&3``
+-    duplicates depends on order and scope the walk does not track, so each counts."""
+-    sources: dict[str, list[tuple[str, str]]] = {}
+-    for view in views:
+-        for fd, operator, target in _redirections(view):
+-            if fd.isdigit() and int(fd) > 2 and operator.startswith("<"):
+-                sources.setdefault(fd, []).append((operator, target))
+-    return sources
+-
+-
+ _ASSIGNMENT_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", re.DOTALL)
+ _DECLARATION_WORDS = frozenset({"export", "readonly", "declare", "typeset", "local"})
+ 
+@@ -945,9 +935,13 @@ def _redirected_shell_inputs(
+     feeds the shell nothing (and is no regular file to walk). A stdin duplicated from another
+     descriptor (``0<&3``, ``< /dev/fd/3``) reads that descriptor's sources; a ``$NAME`` target
+     expands from the command's assignments or the environment (*sources*)."""
+-    fds, variables = sources or _StdinSources({}, {})
++    from cron.lifecycle_guard_stdin_provenance import descriptor_definition
++
++    inherited, variables = sources or _StdinSources({}, {})
++    fds = dict(inherited)
+     for fd, operator, target in _redirections(view):
+         if fd not in ("", "0"):
++            fds[fd] = descriptor_definition(operator, target, fds, variables)
+             continue
+         duplicated = _FD_PATH_RE.fullmatch(target) if operator in ("<", "<>") else None
+         if operator == "<&" and target in ("-", "0"):
+diff --git a/cron/lifecycle_guard_stdin_provenance.py b/cron/lifecycle_guard_stdin_provenance.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ed9b744263bba36ebca9cd6cc537eb7f4ec17eed
+--- /dev/null
++++ b/cron/lifecycle_guard_stdin_provenance.py
+@@ -0,0 +1,102 @@
++"""Small reaching-definition proof for nested-shell stdin, conservative otherwise.
++
++Segment views intentionally discard shell control flow. Never infer a reaching
++assignment from their union: only a flat, unconditional sequence is a proof.
++"""
++
++from __future__ import annotations
++
++import re
++from collections.abc import Iterator
++
++
++def source_contexts(command: str, views: list[list[str]]) -> Iterator:
++    """Variable and descriptor snapshots immediately before each command view."""
++    from cron.lifecycle_guard_nested_shells import (
++        _StdinSources, _assigned_variables, _redirections, _split_redirections,
++    )
++
++    fds: dict[str, list[tuple[str, str]]] = {}
++    flat = _flat_sequence(command, views)
++    for view, variables in zip(views, variable_contexts(command, views)):
++        yield _StdinSources(dict(fds), variables)
++        if flat and _split_redirections(view)[0] == ["exec"]:
++            for fd, operator, target in _redirections(view):
++                if fd.isdigit():
++                    fds[fd] = descriptor_definition(operator, target, fds, variables)
++        elif not (flat and _assigned_variables(iter([view]))):
++            # A command can call a function or builtin which replaces descriptors.
++            fds = {}
++
++
++def descriptor_definition(operator, target, fds, variables) -> list[tuple[str, str]]:
++    """Freeze a descriptor at its redirection, including duplication order."""
++    from cron.lifecycle_guard_nested_shells import _expanded_targets
++
++    if operator == "<&":
++        return [("<", "/dev/null")] if target == "-" else list(fds.get(target, [("?", "")]))
++    if operator in ("<", "<>"):
++        paths = _expanded_targets(target, variables)
++        return [(operator, path) for path in paths] if paths else [("?", target)]
++    return [(operator, target)]
++
++
++def variable_contexts(command: str, views: list[list[str]]) -> Iterator[dict[str, list[str]]]:
++    """Snapshot variables before each view; unsupported scope or mutation is unknown.
++
++    This is deliberately not a shell evaluator. Only standalone assignments in
++    a flat list can replace inherited values, and expansions are frozen when
++    assigned rather than re-expanded against a later variable definition.
++    """
++    from cron.lifecycle_guard_nested_shells import (
++        _VARIABLE_RE, _assigned_variables, _expanded_targets,
++    )
++
++    unknown = {match.group(1) or match.group(2): ["$"]
++               for match in _VARIABLE_RE.finditer(command)}
++    flat = _flat_sequence(command, views)
++    state: dict[str, list[str]] = {} if flat else unknown
++    for view in views:
++        yield dict(state)
++        if not flat:
++            continue
++        assignments = _assigned_variables(iter([view]))
++        if view and (view[0] in {"declare", "typeset", "local", "readonly"}
++                     or any(word.startswith("-") for word in view)):
++            assignments = {}
++        if not assignments:
++            # read, unset, eval, source, function calls, namerefs, arithmetic,
++            # etc. can mutate values, including persistent reference semantics.
++            state = dict(unknown)
++            flat = False
++            continue
++        before = dict(state)
++        words = view[1:] if view[0] == "export" else view
++        for word in words:
++            name, _, value = word.partition("=")
++            expansion = before if view[0] == "export" else state
++            state[name] = _expanded_targets(value, expansion) or ["$"]
++
++
++def _flat_sequence(command: str, views: list[list[str]]) -> bool:
++    """Accept only simple sequential commands, never flattened compound views."""
++    from cron.lifecycle_guard import _iter_command_segment_views
++    from cron.lifecycle_guard_nested_shells import _VARIABLE_RE, _assigned_variables
++
++    syntax = _VARIABLE_RE.sub("VARIABLE", command).replace("<&", "<")
++    if re.search(r"[(){}|&`\\]", syntax) or any(
++            "$" in quoted for quoted in re.findall(r"'[^']*'", command)):
++        return False
++    chunks = [chunk.strip() for chunk in re.split(r"[;\n]", command) if chunk.strip()]
++    parts = [list(_iter_command_segment_views(chunk)) for chunk in chunks]
++    if any(len(part) != 1 for part in parts) or [part[0] for part in parts] != views:
++        return False
++    # Quoting any part of NAME= makes it a command word, not an assignment.
++    # Only prove the deliberately small unquoted assignment grammar here.
++    assignment = r"(?:export\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=[^\s'\";]*\s*)+"
++    if any(_assigned_variables(iter([view])) and not re.fullmatch(assignment, chunk)
++           for chunk, view in zip(chunks, views)):
++        return False
++    reserved = {"if", "then", "else", "elif", "fi", "for", "while", "until", "do",
++                "done", "case", "esac", "select", "function", "!", "time", "coproc"}
++    return all(view and view[0] not in reserved for view in views)
+diff --git a/tests/cron/test_lifecycle_guard_session_aliases.py b/tests/cron/test_lifecycle_guard_session_aliases.py
+index 1eea25fd7caa0a1736ed625dd0cff503e3996c90..23dfe0936b292cb53b58902080aa6bff486e2eb1 100644
+--- a/tests/cron/test_lifecycle_guard_session_aliases.py
++++ b/tests/cron/test_lifecycle_guard_session_aliases.py
+@@ -476,7 +476,21 @@ def test_nested_login_shell_body_treats_names_as_unknown(tmp_path, live_kanban_d
+     text = shape.format(db=live_kanban_db, script=script, tmp=tmp_path)
+     for names in (frozenset({"zz"}), frozenset(), None):
+         unsafe, refusal = scan_gateway_lifecycle(text, cwd=str(tmp_path), session_aliases=names)
+-        assert unsafe is True and refusal is not None and "SQLite" in refusal, (shape, names)
++        # A source formerly inferred from a future fd definition or flattened
++        # compound scope now fails closed before any file can be named.
++        unresolved_source = shape in {
++            "su -l bob 0<&3 3< {script}",
++            "{{ su -l bob; }} 0<&3 3< {script}",
++            "{{ su -l bob; }} <&3 3< {script}",
++            "exec 3< {script}; {{ su -l bob; }} 0<&3",
++            "su -l bob < /dev/fd/3 3< {script}",
++            "su -l bob < /proc/self/fd/3 3<> {script}",
++            "su -l bob 0<&3 3<<< 't ( bash {db} )'",
++            "f() {{ su -l bob; }}; f 0<&3 3< {script}",
++            "S={script}\nfor h in a b; do ssh $h sh -s < $S; done",
++        }
++        reason = "cannot resolve" if unresolved_source else "SQLite"
++        assert unsafe is True and refusal is not None and reason in refusal, (shape, names)
+ 
+ 
+ @pytest.mark.parametrize("shape", [
+diff --git a/tests/cron/test_lifecycle_guard_stdin_provenance.py b/tests/cron/test_lifecycle_guard_stdin_provenance.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..79c0b74af556fc9e3fbb022fe17bf287b0ec6580
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_stdin_provenance.py
+@@ -0,0 +1,111 @@
++"""Reaching definitions must not erase inherited or unknown shell stdin."""
++
++import os
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++
++
++@pytest.mark.parametrize("command", [
++    "bash --noprofile -l < $S; S=/dev/null",
++    "(S=/dev/null); bash --noprofile -l < $S",
++    "false && S=/dev/null; bash --noprofile -l < $S",
++    "if false; then S=/dev/null; fi; bash --noprofile -l < $S",
++    "f() { S=/dev/null; }; bash --noprofile -l < $S",
++    "S=/dev/null; read S; bash --noprofile -l < $S",
++    "S=/dev/null; unset S; bash --noprofile -l < $S",
++    "S=/dev/null; S+=suffix; bash --noprofile -l < $S",
++    "S=/dev/null; eval 'S=$OTHER'; bash --noprofile -l < $S",
++    "S=/dev/null; . update.sh; bash --noprofile -l < $S",
++    "declare -n S=T; T=/dev/null; S=input.sh; bash --noprofile -l < $T",
++    "S=/dev/null; declare -n R=S; R=input.sh; bash --noprofile -l < $S",
++    "D=/dev/null; S=$D; D=input.sh; bash --noprofile -l < $D",
++])
++def test_uncertain_variable_definition_cannot_clear_stdin(tmp_path, monkeypatch, command):
++    (tmp_path / "huge.sh").write_text("# padding\n" * 130000)
++    (tmp_path / "input.sh").write_text("t ( bash huge.sh )\n")
++    monkeypatch.setenv("S", "input.sh")
++    unsafe, refusal = scan_gateway_lifecycle(
++        command, cwd=str(tmp_path), session_aliases=frozenset({"zz"}))
++    assert unsafe and refusal is not None
++
++
++@pytest.mark.parametrize("command", [
++    "S=/dev/null; bash --noprofile -l < $S",
++    "export S=/dev/null; bash --noprofile -l < ${S}",
++    "D=/dev/null; S=$D; D=input.sh; bash --noprofile -l < $S",
++    "su -l bob < /dev/null",
++    "bash --noprofile -l <&-",
++    "cat < $S; S=/dev/null",
++])
++def test_proven_variable_and_inert_controls(tmp_path, monkeypatch, command):
++    monkeypatch.setenv("S", "input.sh")
++    assert scan_gateway_lifecycle(
++        command, cwd=str(tmp_path), session_aliases=frozenset({"zz"})) == (False, None)
++
++
++@pytest.mark.parametrize("command", [
++    "bash --noprofile -l <&3; cat 3</dev/null",
++    "cat 3</dev/null; bash --noprofile -l <&3",
++    "(exec 3</dev/null); bash --noprofile -l <&3",
++    "false && exec 3</dev/null; bash --noprofile -l <&3",
++    "f() { exec 3</dev/null; }; bash --noprofile -l <&3",
++    "bash --noprofile -l <&3 3</dev/null",
++    "exec 3</dev/null; eval 'exec 3<other'; bash --noprofile -l <&3",
++    "bash --noprofile -l < /dev/fd/3; cat 3</dev/null",
++])
++def test_unproven_descriptor_definition_retains_unknown(tmp_path, command):
++    unsafe, refusal = scan_gateway_lifecycle(
++        command, cwd=str(tmp_path), session_aliases=frozenset({"zz"}))
++    assert unsafe and refusal is not None and "cannot resolve" in refusal
++
++
++@pytest.mark.parametrize("command", [
++    "exec 3</dev/null; su -l bob <&3",
++    "su -l bob 3</dev/null <&3",
++    "exec 3</dev/null; su -l bob < /dev/fd/3",
++    "S=/dev/null; exec 3<$S; S=input.sh; su -l bob <&3",
++    "exec 3<&-; su -l bob <&3",
++])
++def test_proven_descriptor_controls(tmp_path, command):
++    assert scan_gateway_lifecycle(
++        command, cwd=str(tmp_path), session_aliases=frozenset({"zz"})) == (False, None)
++
++
++@pytest.mark.parametrize("command", [
++    "bash --noprofile -l < $S",
++    "'S=/dev/null'; bash --noprofile -l < $S",
++    '"S=/dev/null"; bash --noprofile -l < $S',
++    "A=$S; export A=/dev/null S=$A; bash --noprofile -l < $S",
++    "A=$S T=$A A=/dev/null; bash --noprofile -l < $T",
++    "readonly S; export S=/dev/null; bash --noprofile -l < $S",
++    "readonly S=$S; export S=/dev/null; bash --noprofile -l < $S",
++    "bash --noprofile -l < $S; S=/dev/null",
++    "(S=/dev/null); bash --noprofile -l < $S",
++    "false && S=/dev/null; bash --noprofile -l < $S",
++    "f() { S=/dev/null; }; bash --noprofile -l < $S",
++    "bash --noprofile -l <&3",
++    "bash --noprofile -l <&3; cat 3</dev/null",
++    "cat 3</dev/null; bash --noprofile -l <&3",
++    "(exec 3</dev/null); bash --noprofile -l <&3",
++])
++def test_real_bash_inherited_source_oracle(tmp_path, monkeypatch, command):
++    """Known-executing anchors prevent a vacuous conservative scanner matrix."""
++    marker = tmp_path / "marker.sh"
++    marker.write_text("printf 'REVIEW_STDIN_EXECUTED\\n'\n")
++    env = dict(os.environ, S=str(marker), HOME=str(tmp_path))
++    # Only harmless marker bytes are executed. The oversize scanner fixture is
++    # separate and is never supplied to Bash.
++    result = subprocess.run(
++        ["/bin/bash", "--noprofile", "--norc", "-c", 'exec 3<"$S"; ' + command],
++        env=env, cwd=tmp_path, input="", capture_output=True, text=True, timeout=10, check=False)
++    assert result.returncode == 0, result.stderr
++    assert result.stdout == "REVIEW_STDIN_EXECUTED\n"
++    (tmp_path / "huge.sh").write_text("# padding\n" * 130000)
++    (tmp_path / "input.sh").write_text("t ( bash huge.sh )\n")
++    monkeypatch.setenv("S", "input.sh")
++    unsafe, refusal = scan_gateway_lifecycle(
++        command, cwd=str(tmp_path), session_aliases=frozenset({"zz"}))
++    assert unsafe and refusal is not None
+-- 
+2.43.0
+

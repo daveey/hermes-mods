@@ -1,0 +1,171 @@
+From c770147e0dc0d568fb1c7ec6038cd640ae3c1ead Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 04:44:19 +0000
+Subject: [PATCH] fix(cron): retain uncertainty in computed command defaults
+ [daveey]
+
+Address independent review: retain dynamic bindings behind parameter defaults; reuse continuation-aware substitution openers without rewriting inert quote/comment text; revoke colon producer trust on shadowing, including sourced definitions. Six real-Bash RUN regressions fail on prior head and pass here. All 70 lifecycle consumer files pass 10613 tests; scripts/check passes. Conservative tightening: dynamic self-reference x=$(${x:-echo} hi) is unresolved in the additive graph; result=$(${x:-echo} hi) remains allowed.
+---
+ cron/lifecycle_guard_computed.py              | 19 ++++++++++------
+ cron/lifecycle_guard_variables.py             | 10 ++++++++-
+ .../test_lifecycle_guard_computed_commands.py | 22 +++++++++++++++++--
+ 3 files changed, 41 insertions(+), 10 deletions(-)
+
+diff --git a/cron/lifecycle_guard_computed.py b/cron/lifecycle_guard_computed.py
+index 8f21d330634b05a2515712df9de0a1263b3f5ab9..5f74f1adb3c6986961bae56765da0ffae8964ca9 100644
+--- a/cron/lifecycle_guard_computed.py
++++ b/cron/lifecycle_guard_computed.py
+@@ -11,7 +11,11 @@ import re
+ import shlex
+ from dataclasses import dataclass
+ 
+-from cron.lifecycle_guard_substitutions import _backtick_end, _paren_end
++from cron.lifecycle_guard_substitutions import (
++    _arithmetic_start, _backtick_end, _opener_end, _paren_end,
++)
++
++_PRODUCERS = frozenset({'echo', 'printf', 'true', ':'})
+ 
+ _MARKER = '\x00computed'
+ _DEFAULT = re.compile(r'([A-Za-z_][A-Za-z0-9_]*):?[-=](.*)', re.DOTALL)
+@@ -95,9 +99,9 @@ def _expansion(text, index, quoted, bindings):
+         if identity:
+             variable = identity[1]
+             values = tuple(bindings.get(variable, ())) or None
+-    elif text.startswith('$(', index) and not text.startswith('$((', index):
++    elif (opener := _opener_end(text, index)) and not _arithmetic_start(text, index):
+         end = _paren_end(text, index)
+-        values = _printed(text[index + 2:end - 1]) if text[end - 1:end] == ')' else None
++        values = _printed(text[opener:end - 1]) if text[end - 1:end] == ')' else None
+     elif text[index] == '`':
+         end = _backtick_end(text, index)
+         values = _printed(text[index + 1:end - 1]) if text[end - 1:end] == '`' else None
+@@ -115,7 +119,7 @@ def _opaque_expansions(text, bindings):
+             out.append(text[index:index + 2])
+             index += 2
+             continue
+-        if quote != "'" and text.startswith('$((', index):
++        if quote != "'" and _arithmetic_start(text, index):
+             end = _paren_end(text, index)
+             if text[index:end].endswith('))'):
+                 out.append('0')  # Arithmetic output cannot name a lifecycle executable.
+@@ -167,9 +171,9 @@ def scan_computed_commands(command, *, cwd, executed, variable_source, budget, r
+     if not executed or not variable_source:
+         return False
+     normalized = re.sub(r"[\"'\\\\]", '', command.replace('\\\n', ''))
+-    if re.search(r'\b(?:function\s+(?:echo|printf|true)\b|(?:echo|printf|true)\s*\(\s*\))', normalized):
++    if re.search(r'(?:function\s+(?:echo|printf|true|:)(?=\s|\()|(?<![\w])(?:echo|printf|true|:)\s*\(\s*\))', normalized):
+         budget.variable_candidates.computed_producer_shadow = True
+-    if not any(s in command for s in ('${', '$(', '`')):
++    if '$' not in command and '`' not in command:
+         return False
+     from cron.lifecycle_guard_substitutions import separate_substitutions
+ 
+@@ -191,13 +195,14 @@ def scan_computed_commands(command, *, cwd, executed, variable_source, budget, r
+                 continue
+             producer_unknown = (command[span.start:span.start + 2] != '${' and (
+                 budget.variable_candidates.computed_producer_shadow or budget.alias_names is None
+-                or bool({'echo', 'printf', 'true'} & budget.alias_names)))
++                or bool(_PRODUCERS & budget.alias_names)))
+             if command[span.start:span.start + 2] != '${':
+                 budget.variable_candidates.computed_producer_used = True
+             if span.values is None or producer_unknown:
+                 budget.variable_candidates.unresolved_computed = True
+                 continue
+             if span.variable:
++                budget.variable_candidates.computed_variables.add(span.variable)
+                 # Register the set-variable reading with the existing sink graph:
+                 # a later sourced file may supply its literal binding.
+                 payload = command[:span.start] + '${' + span.variable + '}' + command[span.end:]
+diff --git a/cron/lifecycle_guard_variables.py b/cron/lifecycle_guard_variables.py
+index 565953f73a2b8e1d371297523394cfa4c552a3c8..fb83f54558d995b0d82a1b642a8189e2074a499e 100644
+--- a/cron/lifecycle_guard_variables.py
++++ b/cron/lifecycle_guard_variables.py
+@@ -47,14 +47,20 @@ class VariableCandidates:
+         self.computed_producer_shadow = False
+         self.computed_producer_used = False
+         self.values: dict[str, set[str]] = {}
++        self.unknown_values: set[str] = set()
++        self.computed_variables: set[str] = set()
+         self.sinks: set[tuple[str, tuple[str, ...], int, str | None]] = set()
+         self.emitted: set[tuple[str, str | None]] = set()
+ 
+     def computed_unknown(self, aliases):
++        from cron.lifecycle_guard_computed import _PRODUCERS
++
++        if self.unknown_values & self.computed_variables:
++            return True
+         # Later sourced definitions revoke earlier builtin-output assumptions.
+         return self.unresolved_computed or (self.computed_producer_used and (
+             self.computed_producer_shadow or aliases is None
+-            or bool({'echo', 'printf', 'true'} & aliases)))
++            or bool(_PRODUCERS & aliases)))
+ 
+     def payloads(self, command, cwd):
+         from cron import lifecycle_guard as guard
+@@ -73,6 +79,8 @@ class VariableCandidates:
+                     # traversed by the ordinary walk, never reinterpreted here.
+                     if not any(char in match[2] for char in '$`\x00'):
+                         self.values.setdefault(match[1], set()).add(match[2])
++                    else:
++                        self.unknown_values.add(match[1])
+                 elif not word.startswith('-'):
+                     break
+             index = guard._executed_command_index(words)
+diff --git a/tests/cron/test_lifecycle_guard_computed_commands.py b/tests/cron/test_lifecycle_guard_computed_commands.py
+index 9f6f465db777e1c30f185d22714b34576aa8dad7..13a543e26c896cc0b1241b0d7129f2d172aa18c6 100644
+--- a/tests/cron/test_lifecycle_guard_computed_commands.py
++++ b/tests/cron/test_lifecycle_guard_computed_commands.py
+@@ -8,6 +8,12 @@ from cron.lifecycle_guard import scan_gateway_lifecycle
+ 
+ 
+ RUN = [
++    'x=$(cat command-name); ${x:-echo} gateway restart',
++    'x=$(printf %s hermes); ${x:-echo} gateway restart',
++    '$\\\n(echo hermes) gateway restart',
++    ':() { printf hermes; }; $(:) gateway restart',
++    '. ./colon.sh; $(:) gateway restart',
++    '. ./dynamic.sh; ${x:-echo} gateway restart',
+     'x=$(${x:-hermes} gateway restart)',
+     'echo `${x:-hermes} gateway restart`',
+     'echo "$(echo "$(${x:-bash} ./r.sh)")"',
+@@ -33,7 +39,12 @@ RUN = [
+     '. ./producer.sh; $(echo echo) gateway restart',
+ ]
+ CLEAN = [
+-    'x=$(${x:-echo} hi)',
++    '$\\\n(echo echo) hi',
++    "echo '$\\\n(echo hermes) gateway restart'",
++    'echo hi # $\\\n(echo hi)',
++    '$(:) echo hi',
++    'x=$(cat command-name); echo ${x:-echo} gateway restart',
++    'result=$(${x:-echo} hi)',
+     'echo `${x:-echo} hi`',
+     'echo "$(echo "$(${x:-bash} ./clean.sh)")"',
+     '((${x:-echo} hi); true)',
+@@ -65,6 +76,8 @@ def test_computed_executable_bash_differential(tmp_path, command, run):
+     (tmp_path / 'values.sh').write_text('x=hermes\n')
+     (tmp_path / 'producer.sh').write_text('echo() { printf hermes; }\n')
+     (tmp_path / 'command-name').write_text('hermes\n')
++    (tmp_path / 'colon.sh').write_text(':() { printf hermes; }\n')
++    (tmp_path / 'dynamic.sh').write_text('x=$(cat command-name)\n')
+     marker = tmp_path / 'marker'
+     env = {'PATH': str(tmp_path) + os.pathsep + '/usr/bin:/bin', 'MARKER': str(marker)}
+     proof = subprocess.run(['/bin/bash', '--noprofile', '--norc', '-c', command],
+@@ -77,7 +90,12 @@ def test_computed_executable_bash_differential(tmp_path, command, run):
+     assert unsafe == run
+ 
+ 
+-@pytest.mark.parametrize('command', ['$(cat command-name) gateway restart', '${x#prefix} gateway restart'])
++@pytest.mark.parametrize('command', [
++    '$(cat command-name) gateway restart', '${x#prefix} gateway restart',
++    # The additive binding graph is not ordered shell state: a dynamic
++    # self-assignment cannot prove its own default's set-value reading safe.
++    'x=$(${x:-echo} hi)',
++])
+ def test_unresolved_computed_executable_fails_closed(command, tmp_path):
+     unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
+     assert unsafe
+-- 
+2.43.0
+

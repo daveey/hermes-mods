@@ -1,0 +1,339 @@
+From b6f19b5dbcdba242196cb4435fc00b0b41879523 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 19:34:45 +0000
+Subject: [PATCH] [daveey] Govern xai-oauth (Grok subscription) in the Kanban
+ LLM pacing governor
+
+Five whys: Grok (xai-oauth, X Ultra) was added to the pool-worker deep/standard model_routing classes
+(state PR #3367, core PR #3301), but the pacing governor only judged anthropic and openai-codex. There
+was no xai-oauth usage reader, so listing it would read `unknown` (fail open), and because `_governed`
+skips any card with an ungoverned candidate provider, every class card whose routes include Grok, and
+every Grok-pinned card, started ungoverned. Grok could absorb unbounded parallel runs until a 429 wall,
+and this account has auto top-up on a saved payment method, so a drained pool spills into metered
+Extra Usage.
+
+Research (t_19ff0ce8c9b33e6a): api.x.ai response headers carry only per-minute RPS/TPM limits, but the
+Grok subscription has one weekly usage pool, read by the official Grok Build CLI from
+`GET https://cli-chat-proxy.grok.com/v1/billing?format=credits` with the OAuth bearer
+(xai-org/grok-build xai-grok-shell/src/extensions/billing.rs). Live read from the hub's X Ultra row
+2026-11-15: HTTP 200, currentPeriod USAGE_PERIOD_TYPE_WEEKLY (7 days), creditUsagePercent 2.0.
+
+Change:
+- agent/account_usage_xai.py: the reader. A weekly period maps to one account-scope `Current week`
+  window (the governor's seven_day). Any other period type, or a missing percent, is unavailable
+  (never headroom), so the pool stays `unknown` rather than being mis-paced. Only an OAuth token is
+  sent, redirects are not followed, and the read-only variant never resolves or refreshes a login.
+- agent/account_usage.py: register xai-oauth in the usage fetchers (normal and read-only).
+- kanban.llm_pacing.providers default (+ PacingConfig): add xai-oauth.
+
+Proof: tests/hermes_cli/test_kanban_llm_pacing_xai.py, 12 tests. RED on origin/main 3f13528930 with
+only the test file and the new reader module copied in: 4 fail (fetch_account_usage does not dispatch
+xai-oauth, the redirect test, xai-oauth not in the default providers, and a Grok card at 90% weekly
+starts instead of being held). GREEN on this branch: 12/12, plus the 38 test files that import
+account_usage / kanban_llm_pacing (723 passed); scripts/check --base origin/main ok.
+---
+ agent/account_usage.py                        |  14 +-
+ agent/account_usage_xai.py                    |  77 ++++++++++
+ hermes_cli/kanban_llm_pacing.py               |   5 +-
+ hermes_cli/kanban_pacing_defaults.py          |   2 +-
+ .../hermes_cli/test_kanban_llm_pacing_xai.py  | 136 ++++++++++++++++++
+ 5 files changed, 229 insertions(+), 5 deletions(-)
+ create mode 100644 agent/account_usage_xai.py
+ create mode 100644 tests/hermes_cli/test_kanban_llm_pacing_xai.py
+
+diff --git a/agent/account_usage.py b/agent/account_usage.py
+index 6f648870d71551ee0355a1f90d34443e75a056d2..f1a8cfd5b6d9596f8603c3481fd383c51393e8c8 100644
+--- a/agent/account_usage.py
++++ b/agent/account_usage.py
+@@ -908,15 +908,25 @@ def _fetch_openrouter_account_usage(base_url: Optional[str], api_key: Optional[s
+     return _snapshot("openrouter", "credits_api", windows, details)
+ 
+ 
++def _fetch_xai_oauth_account_usage(_base_url: Optional[str], api_key: Optional[str]) -> Optional[AccountUsageSnapshot]:
++    from agent.account_usage_xai import fetch
++    return fetch(api_key)
++
++
++def _fetch_xai_oauth_account_usage_read_only(_base_url: Optional[str], api_key: Optional[str]) -> Optional[AccountUsageSnapshot]:
++    from agent.account_usage_xai import fetch
++    return fetch(api_key, read_only=True)
++
++
+ _USAGE_FETCHERS: dict[str, Callable[[Optional[str], Optional[str]], Optional[AccountUsageSnapshot]]] = {
+     "openai-codex": _fetch_codex_account_usage, "anthropic": _fetch_anthropic_account_usage,
+-    "openrouter": _fetch_openrouter_account_usage,
++    "openrouter": _fetch_openrouter_account_usage, "xai-oauth": _fetch_xai_oauth_account_usage,
+ }
+ 
+ # Picker per-credential variants: same parsers/fetch shape, but a failure is never repaired by
+ # rotating/refreshing a credential (see ``fetch_account_usage(read_only=True)``).
+ _READ_ONLY_USAGE_FETCHERS: dict[str, Callable[[Optional[str], Optional[str]], Optional[AccountUsageSnapshot]]] = {
+-    "openai-codex": _fetch_codex_account_usage_read_only,
++    "openai-codex": _fetch_codex_account_usage_read_only, "xai-oauth": _fetch_xai_oauth_account_usage_read_only,
+ }
+ 
+ 
+diff --git a/agent/account_usage_xai.py b/agent/account_usage_xai.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e4aedba5884caf8f9d9ea386ab26f87eba3cef5c
+--- /dev/null
++++ b/agent/account_usage_xai.py
+@@ -0,0 +1,77 @@
++"""xAI (Grok) subscription usage for ``xai-oauth`` logins. [daveey]
++
++The Grok subscription (SuperGrok / X Premium / X Ultra) has one shared weekly usage pool across Chat, Build and the
++API. It has no public REST doc, and ``api.x.ai`` response headers carry only per-minute RPS/TPM limits. The official
++Grok Build CLI reads the pool from ``GET https://cli-chat-proxy.grok.com/v1/billing?format=credits`` with the OAuth
++bearer (xai-org/grok-build ``xai-grok-shell/src/extensions/billing.rs``):
++
++    {"config": {"currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY", "start": "...", "end": "..."},
++                "creditUsagePercent": 2.0, "productUsage": [{"product": "Api", "usagePercent": 2.0}], ...}}
++
++Live read 2026-11-15 (hub X Ultra row): HTTP 200, weekly period, 2%. The weekly pool maps to one account-scope
++``Current week`` window, so the Kanban pacing governor judges ``xai-oauth`` like the Claude/Codex pools (t_01a1e076).
++Any other period type yields no window (``unavailable_reason``): the governor's 5h/7d math cannot place it, and an
++unknown pool fails open rather than being mis-paced.
++
++Only an xAI OAuth token is ever sent to this host (never an ``XAI_API_KEY``), redirects are not followed, and a read
++never refreshes or rotates a pool credential when called with an explicit token.
++"""
++from __future__ import annotations
++
++from typing import Any, Optional
++
++import httpx
++
++BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
++WEEKLY = "USAGE_PERIOD_TYPE_WEEKLY"
++SOURCE = "grok_cli_billing"
++TIMEOUT_SECONDS = 15.0
++
++
++def _headers(token: str) -> dict[str, str]:
++    return {"Authorization": f"Bearer {token}", "Accept": "application/json", "X-XAI-Token-Auth": "xai-grok-cli",
++            "User-Agent": "hermes-agent"}
++
++
++def _percent(value: Any) -> Optional[float]:
++    from agent.account_usage import _is_finite_num
++    return max(0.0, min(100.0, float(value))) if _is_finite_num(value) and not isinstance(value, bool) else None
++
++
++def snapshot_from_payload(payload: Any):
++    """``/v1/billing?format=credits`` body -> :class:`~agent.account_usage.AccountUsageSnapshot`."""
++    from agent.account_usage import AccountUsageWindow, _parse_dt, _snapshot
++    config = payload.get("config") if isinstance(payload, dict) else None
++    config = config if isinstance(config, dict) else {}
++    found = config.get("currentPeriod")
++    period: dict = found if isinstance(found, dict) else {}
++    kind = str(period.get("type") or "")
++    used = _percent(config.get("creditUsagePercent"))
++    details = []
++    for row in config.get("productUsage") or []:
++        share = _percent(row.get("usagePercent")) if isinstance(row, dict) else None
++        if share is not None and row.get("product"):
++            details.append(f"{row['product']}: {share:.0f}% of the weekly pool")
++    raw = payload if isinstance(payload, dict) else None
++    if kind != WEEKLY or used is None:
++        reason = (f"xAI usage period {kind or 'missing'} is not a weekly window" if kind != WEEKLY
++                  else "xAI usage response carries no creditUsagePercent")
++        return _snapshot("xai-oauth", SOURCE, [], details, unavailable_reason=reason, raw=raw)
++    reset = _parse_dt(period.get("end")) or _parse_dt(config.get("billingPeriodEnd"))
++    window = AccountUsageWindow(label="Current week", used_percent=used, reset_at=reset, scope="account")
++    return _snapshot("xai-oauth", SOURCE, [window], details, title="Grok subscription", raw=raw)
++
++
++def fetch(api_key: Optional[str], *, read_only: bool = False):
++    """Usage of the xAI OAuth login ``api_key`` (else the resolved runtime login unless ``read_only``)."""
++    token = str(api_key or "").strip()
++    if not token and not read_only:
++        from hermes_cli.auth_xai import resolve_xai_oauth_runtime_credentials
++        creds = resolve_xai_oauth_runtime_credentials() or {}
++        token = str(creds.get("api_key") or creds.get("access_token") or "").strip()
++    if not token:
++        return None
++    with httpx.Client(timeout=TIMEOUT_SECONDS, follow_redirects=False) as client:
++        response = client.get(BILLING_URL, headers=_headers(token))
++        response.raise_for_status()
++    return snapshot_from_payload(response.json() or {})
+diff --git a/hermes_cli/kanban_llm_pacing.py b/hermes_cli/kanban_llm_pacing.py
+index 13bd2972be5595c148004863e82ecc8905fbbe89..f4e022507ffe0003e895305b2dd78eda21021ea7 100644
+--- a/hermes_cli/kanban_llm_pacing.py
++++ b/hermes_cli/kanban_llm_pacing.py
+@@ -5,7 +5,8 @@ weekly rate. One account-week went in under 21 h, 6 of 7 accounts sat at ``seven
+ for a week, and nothing finished for hours (301 refused starts). Admission was gated on slots and walls only.
+ 
+ The governor judges each governed provider's OAuth pool from its per-account usage windows (``five_hour`` and
+-``seven_day``, the account-wide buckets of ``/api/oauth/usage``; Codex ``Session``/``Weekly``):
++``seven_day``, the account-wide buckets of ``/api/oauth/usage``; Codex ``Session``/``Weekly``; xAI Grok's single
++weekly pool, ``agent.account_usage_xai``):
+ 
+ * **Projection, not elapsed pace.** Each window's burn rate is measured from this host's own samples of that
+   window over the last ``rate_window`` (fallback: the window's average so far). A used-vs-elapsed rule read
+@@ -39,7 +40,7 @@ class PacingConfig:
+     enabled: bool = True
+     target: float = 95.0
+     reserve: dict = field(default_factory=lambda: {FIVE_HOUR: 80.0, SEVEN_DAY: 85.0})
+-    providers: tuple = ("anthropic", "openai-codex")
++    providers: tuple = ("anthropic", "openai-codex", "xai-oauth")
+     read_interval: int = 300
+     rate_window: int = 3600
+     min_rate_span: int = 600
+diff --git a/hermes_cli/kanban_pacing_defaults.py b/hermes_cli/kanban_pacing_defaults.py
+index 75dd8afcbc6b54be3f59e348e2e0fcd6f7b770df..b2b4ca780ceab110fe580a2d527a10e7ad8d2372 100644
+--- a/hermes_cli/kanban_pacing_defaults.py
++++ b/hermes_cli/kanban_pacing_defaults.py
+@@ -17,7 +17,7 @@ DEFAULTS = {
+     "target_percent": 95,
+     "reserve_five_hour_percent": 80,
+     "reserve_seven_day_percent": 85,
+-    "providers": ["anthropic", "openai-codex"],
++    "providers": ["anthropic", "openai-codex", "xai-oauth"],
+     "read_interval_seconds": 300,
+     "rate_window_seconds": 3600,
+     "min_rate_span_seconds": 600,
+diff --git a/tests/hermes_cli/test_kanban_llm_pacing_xai.py b/tests/hermes_cli/test_kanban_llm_pacing_xai.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2aae887d1eb8bbcde3dfc1f2165bdbc09189a827
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_llm_pacing_xai.py
+@@ -0,0 +1,136 @@
++"""xai-oauth (Grok subscription) in the Kanban LLM pacing governor (t_19ff0ce8c9b33e6a). [daveey]
++
++Before: no usage reader existed for ``xai-oauth`` and it was not a governed provider, so Grok cards (and every
++``class:`` card whose routes include Grok) started ungoverned. The Grok subscription has one weekly usage pool, read
++by the Grok Build CLI from ``cli-chat-proxy.grok.com/v1/billing?format=credits``; it now maps to a ``seven_day``
++account window and ``xai-oauth`` is governed by default.
++"""
++from __future__ import annotations
++
++import json
++from datetime import UTC, datetime
++
++import httpx
++import pytest
++
++from agent import account_usage as au
++from agent import account_usage_xai as ax
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_llm_pacing as lp
++from hermes_cli import kanban_llm_pacing_dispatch as pd
++from tests.hermes_cli.test_kanban_llm_pacing_followups import CFG, DAY, _config, _tick, paced_board
++from tests.hermes_cli.test_kanban_model_tier import board as _board_fixture
++
++board = _board_fixture
++__all__ = ["paced_board"]
++
++END = "2026-11-16T22:52:31.914+00:00"
++
++
++def _payload(used: float | None = 2.0, kind: str = ax.WEEKLY, end: str = END) -> dict:
++    """Shape of the live hub read, 2026-11-15 (X Ultra)."""
++    return {"config": {"currentPeriod": {"type": kind, "start": "2026-11-09T22:52:31.914+00:00", "end": end},
++                       "creditUsagePercent": used, "productUsage": [{"product": "Api", "usagePercent": used},
++                                                                    {"product": "GrokChat"}],
++                       "isUnifiedBillingUser": True, "prepaidBalance": {"val": 0},
++                       "billingPeriodStart": "2026-11-09T22:52:31.914+00:00", "billingPeriodEnd": end}}
++
++
++# --- the reader -------------------------------------------------------------------------------------------------
++
++def test_weekly_credit_pool_maps_to_one_account_week_window():
++    snap = ax.snapshot_from_payload(_payload(2.0))
++    assert snap.available and snap.provider == "xai-oauth"
++    (window,) = snap.windows
++    assert (window.label, window.used_percent, window.scope) == ("Current week", 2.0, "account")
++    assert window.reset_at == datetime(2026, 11, 16, 22, 52, 31, 914000, tzinfo=UTC)
++    assert lp.window_kind(window.label) == lp.SEVEN_DAY
++    assert snap.details == ("Api: 2% of the weekly pool",)  # a product row without a percent is skipped
++
++
++@pytest.mark.parametrize("payload", [_payload(kind="USAGE_PERIOD_TYPE_MONTHLY"), _payload(used=None), {}, {"config": []},
++                                     # the legacy shape (no ``format=credits``): monthlyLimit/used, no period
++                                     {"config": {"monthlyLimit": {"val": 0}, "used": {"val": 0}}}])
++def test_anything_but_a_weekly_percent_is_unavailable_never_headroom(payload):
++    snap = ax.snapshot_from_payload(payload)
++    assert not snap.available and snap.windows == () and snap.unavailable_reason
++
++
++def _client_spy(monkeypatch, status=200, body=None):
++    seen = []
++
++    def handler(request):
++        seen.append(request)
++        return httpx.Response(status, json=_payload() if body is None else body,
++                              headers={"location": "https://evil.example/"} if 300 <= status < 400 else {})
++    real = httpx.Client
++    monkeypatch.setattr(ax.httpx, "Client", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
++    return seen
++
++
++def test_fetch_account_usage_dispatches_xai_oauth_to_the_grok_billing_read(monkeypatch):
++    seen = _client_spy(monkeypatch)
++    snap = au.fetch_account_usage("xai-oauth", api_key="oauth-token", read_only=True, identity_id="acct")
++    assert snap is not None and snap.windows[0].used_percent == 2.0
++    (request,) = seen
++    assert str(request.url) == "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
++    assert request.headers["authorization"] == "Bearer oauth-token"
++    assert request.headers["x-xai-token-auth"] == "xai-grok-cli"
++
++
++def test_a_redirect_is_not_followed_with_the_bearer(monkeypatch):
++    seen = _client_spy(monkeypatch, status=302)
++    assert au.fetch_account_usage("xai-oauth", api_key="oauth-token", read_only=True) is None
++    assert len(seen) == 1
++
++
++def test_read_only_without_an_explicit_token_never_resolves_a_credential(monkeypatch):
++    from hermes_cli import auth_xai
++    monkeypatch.setattr(auth_xai, "resolve_xai_oauth_runtime_credentials",
++                        lambda *a, **k: pytest.fail("read-only usage read must not refresh/resolve a login"))
++    seen = _client_spy(monkeypatch)
++    assert au.fetch_account_usage("xai-oauth", read_only=True) is None and seen == []
++
++
++# --- the governor ----------------------------------------------------------------------------------------------
++
++def test_xai_oauth_is_governed_by_default():
++    from hermes_cli.config_defaults import DEFAULT_CONFIG
++    assert "xai-oauth" in lp.PacingConfig().providers
++    assert "xai-oauth" in lp.config_from(DEFAULT_CONFIG["kanban"]["llm_pacing"]).providers
++
++
++def _xai_pool(monkeypatch, used, end_epoch):
++    end = datetime.fromtimestamp(end_epoch, tz=UTC).isoformat()
++    monkeypatch.setattr(pd, "_snapshots", lambda provider: [("X Ultra (@daveey)", ax.snapshot_from_payload(
++        _payload(used, end=end)))] if provider == "xai-oauth" else [])
++
++
++def test_read_pool_judges_the_xai_pool_instead_of_unknown(monkeypatch):
++    now = 1_800_000_000.0
++    _xai_pool(monkeypatch, 2.0, now + 1.5 * DAY)
++    current = pd.read_pool("xai-oauth", now)
++    assert [(r.account, r.kind, r.used, r.reset_at) for r in current] == [
++        ("X Ultra (@daveey)", lp.SEVEN_DAY, 2.0, pytest.approx(now + 1.5 * DAY))]
++    assert lp.pool_pace("xai-oauth", current, [], CFG).state == lp.OPEN
++
++    _xai_pool(monkeypatch, 90.0, now + 1.5 * DAY)  # past the 85% weekly reserve: held until the reset
++    pace = lp.pool_pace("xai-oauth", pd.read_pool("xai-oauth", now), [], CFG)
++    assert (pace.state, pace.until) == (lp.HELD, pytest.approx(now + 1.5 * DAY))
++
++
++def test_a_grok_card_is_held_when_the_grok_pool_is_past_its_reserve(paced_board, monkeypatch):
++    import time
++    _config(paced_board)  # no llm_pacing override: the defaults must govern xai-oauth
++    _xai_pool(monkeypatch, 90.0, time.time() + DAY)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="grok work", assignee="default", model_override="grok-4.6",
++                             provider_override="xai-oauth")
++        seen, _ = _tick(conn)
++        assert tid not in seen
++        events = [e.payload for e in kb.list_events(conn, tid) if e.kind == pd.EVENT_KIND]
++    assert events and events[-1] and [(p["provider"], p["state"], p["limit"]) for p in events[-1]["providers"]] == [
++        ("xai-oauth", lp.HELD, 0)]
++    stored = json.loads(pd.state_path().read_text(encoding="utf-8"))
++    assert stored["xai-oauth"]["pace"]["state"] == lp.HELD
+-- 
+2.43.0
+

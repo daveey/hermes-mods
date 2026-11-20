@@ -1,0 +1,354 @@
+From 88f214cc34c1d021eb92102cee8faef0b3d7f3b0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 14:51:59 +0000
+Subject: [PATCH] [daveey] Preserve builtin name scanning past case
+ substitutions
+
+Recognize lexical case pattern parentheses, quoted and heredoc regions, and line continuations without confusing them with substitution boundaries. Share pattern positions with the arithmetic scanner and memoize failed literal words to avoid repeated boundary walks. Preserve date exemptions and non-subscript data controls.
+---
+ tests/tools/test_shell_builtin_names.py |  88 ++++++++++++++++++
+ tools/shell_arith_sink.py               |   4 +
+ tools/shell_builtin_names.py            |  12 +++
+ tools/shell_case_words.py               | 114 ++++++++++++++++++++++++
+ tools/shell_prefix_expansions.py        |  32 +++++--
+ 5 files changed, 243 insertions(+), 7 deletions(-)
+ create mode 100644 tools/shell_case_words.py
+
+diff --git a/tests/tools/test_shell_builtin_names.py b/tests/tools/test_shell_builtin_names.py
+index 45fb0b6587f83b02aec8d8f4448d28eb03b12632..c24967df66b2932ab75cd111d42abfde7aa42760 100644
+--- a/tests/tools/test_shell_builtin_names.py
++++ b/tests/tools/test_shell_builtin_names.py
+@@ -126,6 +126,94 @@ def test_uncertain_prefix_has_bounded_scan_work(monkeypatch, opener, closer):
+     substitution_in_arithmetic(command, date_exempt=True)
+ 
+ 
++CASE_BODIES = [
++    "ca\\\nse x in x) :;; esac",
++    "case x i\\\nn x) :;; esac",
++    "case x in x) :;; e\\\nsac",
++    "case \\\nx in x) :;; esac",
++    "case x in x) printf x;; esac",
++    "case x in (x) printf x;; esac",
++    "case x in x|esac) printf x;; esac",
++    "case esac in (esac) printf x;; esac",
++    "case x in x) case y in (y) printf x;; esac;; esac",
++    "case x in x) printf '%s' case esac;; esac",
++    "case x in x) printf '%s' 'case ) esac';; esac",
++    "case x in 'a)'|x) printf x;; esac",
++    "case x in a\\)|x) printf x;; esac",
++    "case x in x) printf x;& y) :;; esac",
++    "case x in x) printf x;;& y) :;; esac",
++    "case x in x) # ) case esac\n printf x;; esac",
++    "printf '%s' case esac",
++    "time case x in x) :;; esac",
++    "time -p case x in x) :;; esac",
++    "time { case x in x) :;; esac; }",
++    "coproc case x in x) :;; esac; wait",
++    "case x in $'\\')') :;; esac",
++    "case x in x) echo $'\\'';; esac",
++    "echo $'\\''",
++    "cat <<E\ncase\nE\n:",
++    "case x in x) cat <<E\nesac ) case\nE\n;; esac",
++]
++
++
++@pytest.mark.platforms("linux")
++@pytest.mark.parametrize("body", CASE_BODIES)
++@pytest.mark.parametrize("wrapped", [False, True])
++def test_case_boundary_preserves_suffix_marker(tmp_path, body, wrapped):
++    prefix = '"$(' + body + ')"' if wrapped else '$(' + body + ')'
++    test_literal_builtin_name_marker(tmp_path, "a=(1); unset " + prefix + " 'a[$(P)]'", True)
++
++
++@pytest.mark.parametrize("body", CASE_BODIES)
++@pytest.mark.parametrize("suffix", ["'a[$(date +%s)]'", "'plain'", "'a[0]=literal[$(P)]'"])
++def test_case_boundary_retains_date_and_non_subscript_data(body, suffix):
++    assert not substitution_in_arithmetic('unset "$(' + body + ')" ' + suffix, date_exempt=True)
++
++
++@pytest.mark.platforms("linux")
++@pytest.mark.parametrize("body", [
++    "case x in x) :;; esac",
++    "case x i\\\nn x) :;; esac",
++    "case x in x) :;; e\\\nsac",
++])
++@pytest.mark.parametrize("suffix,expected", [
++    ("'a[$(P)]'", True), ("'plain'", False),
++    ("'a[0]=literal[`P`]'", False), ("'plain`P`'", False),
++    ("'a[$(date +%s)]'", False),
++])
++def test_backtick_case_prefix_controls(tmp_path, body, suffix, expected):
++    test_literal_builtin_name_marker(tmp_path, 'a=(1); unset "`' + body + '`" ' + suffix, expected)
++
++
++@pytest.mark.parametrize("body", CASE_BODIES + [
++    "case x in @(x|y)) :;; esac",
++    "case x in (@(x|+(y|z))) :;; esac",
++])
++def test_case_boundary_masks_whole_substitution(body):
++    from tools.shell_prefix_expansions import mask_prefix_expansions
++
++    assert mask_prefix_expansions('$(' + body + ') after') == '__expansion__ after'
++
++
++def test_failed_word_boundary_is_not_retried(monkeypatch):
++    from tools import shell_builtin_names as names
++
++    original = names._read_word
++    calls = 0
++
++    def counted(*args):
++        nonlocal calls
++        calls += 1
++        return original(*args)
++
++    monkeypatch.setattr(names, "_read_word", counted)
++    cache = {}
++    for _ in range(100):
++        with pytest.raises(ValueError):
++            names._word('"$(case x nope ' + 'x' * 1000, 0, False, cache)
++    assert calls == 1
++
++
+ def test_nested_expansions_share_linear_boundary_scan(monkeypatch):
+     from tools import shell_prefix_expansions as expansions
+ 
+diff --git a/tools/shell_arith_sink.py b/tools/shell_arith_sink.py
+index 82c2c5ed5e8c089f8720c270ca47a470da019784..877c5898986133b433d4ef38ce9c6bba818dafa1 100644
+--- a/tools/shell_arith_sink.py
++++ b/tools/shell_arith_sink.py
+@@ -117,6 +117,10 @@ def substitution_in_arithmetic(command: str, *, date_exempt: bool, _depth: int =
+         if quoted:
+             continue  # inside "…" only expansions (handled above) matter
+         if kind == _CMD:
++            if (start, "case-pattern") in literal_cache:
++                if token == ")":
++                    top[4] = pos
++                continue
+             pos = _cmd_token(command, token, start, pos, stack, closes, operators)
+         elif kind == _ARITH:
+             pos = _arith_token(command, token, pos, stack)
+diff --git a/tools/shell_builtin_names.py b/tools/shell_builtin_names.py
+index e4c17f8c283295b46a07de74dc9f3c261f14f4af..a7a7c2fcf0216f54e381ccfdc834b99b7310a592 100644
+--- a/tools/shell_builtin_names.py
++++ b/tools/shell_builtin_names.py
+@@ -24,6 +24,18 @@ def _ansi_escape(match: re.Match) -> str:
+ 
+ 
+ def _word(text: str, pos: int, conditional: bool, cache: dict) -> tuple[str, int]:
++    # Cache failures too: outer tokens can revisit an unfinished operand. Never
++    # repeat a whole failed boundary walk for every later quote in the command.
++    key = (pos, conditional, "literal-word")
++    if key not in cache:
++        cache[key] = None
++        cache[key] = _read_word(text, pos, conditional, cache)
++    if cache[key] is None:
++        raise ValueError("unclassified literal word")
++    return cache[key]
++
++
++def _read_word(text: str, pos: int, conditional: bool, cache: dict) -> tuple[str, int]:
+     """Remove lexical quotes, leaving real expansions opaque to name classification."""
+     pieces = []
+     while pos < len(text) and text[pos] not in _BREAKS:
+diff --git a/tools/shell_case_words.py b/tools/shell_case_words.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..be53fe9b87e93798671c0e752617e34c0ee6ae43
+--- /dev/null
++++ b/tools/shell_case_words.py
+@@ -0,0 +1,114 @@
++"""Reserved-word state for command-substitution boundary scanning.
++
++Only lexical, unquoted words are reserved words. Nested expansions are opaque
++word fragments; their own boundary walk has its own state.
++"""
++from __future__ import annotations
++
++import re
++
++_ASSIGNMENT = re.compile(r"[A-Za-z_]\w*(?:\+)?=")
++
++
++class CaseWords:
++    def __init__(self):
++        self.cases: list[str] = []
++        self.command = True
++        self.prefix = ""
++        self.word: list[str] = []
++        self.pattern_depth = 0
++
++    def fragment(self, value: str) -> None:
++        self.word.append(value)
++
++    def flush(self) -> None:
++        if not self.word:
++            return
++        word = "".join(self.word)
++        self.word.clear()
++        phase = self.cases[-1] if self.cases else ""
++        if phase == "subject":
++            self.cases[-1] = "in"
++        elif phase == "in":
++            if word != "in":
++                raise ValueError("case missing in")
++            self.cases[-1] = "pattern-start"
++        elif phase in ("pattern-start", "pattern"):
++            if word == "esac" and phase == "pattern-start":
++                self.cases.pop()
++                self.command = False
++            else:
++                self.cases[-1] = "pattern"
++        elif self.command and word == "case":
++            self.prefix = ""
++            self.cases.append("subject")
++        elif self.command and word == "esac" and self.cases:
++            self.cases.pop()
++            self.command = False
++        elif self.command:
++            if word in ("time", "coproc", "function"):
++                self.prefix = word
++            elif self.prefix == "time" and word in ("-p", "--"):
++                return
++            elif self.prefix in ("coproc", "function"):
++                self.prefix = ""
++            else:
++                self.prefix = ""
++                self.command = bool(_ASSIGNMENT.match(word)) or word in {
++                    "if", "then", "elif", "else", "while", "until", "do", "!", "{",
++                }
++
++    def punctuation(self, token: str) -> bool:
++        """Consume case syntax; return whether a parenthesis is a pattern token."""
++        phase = self.cases[-1] if self.cases else ""
++        extended = token == "(" and self.word and self.word[-1] in "@!?+*"
++        if phase in ("pattern-start", "pattern") and (extended or self.pattern_depth):
++            self.pattern_depth += (token == "(") - (token == ")")
++            self.fragment(token)
++            return token in ("(", ")")
++        self.flush()
++        phase = self.cases[-1] if self.cases else ""
++        if phase in ("pattern-start", "pattern"):
++            if token == ")":
++                self.cases[-1] = "body"
++                self.command = True
++            elif token in ("(", "|"):
++                self.cases[-1] = "pattern"
++            return token in ("(", ")")
++        if token in (";;", ";&", ";;&") and phase == "body":
++            self.cases[-1] = "pattern-start"
++            self.command = True
++        elif token in (";", "&", "|", "\n", "("):
++            self.command = True
++        return False
++
++
++def opaque_end(text: str, pos: int, words: CaseWords, pending: list) -> int | None:
++    """Skip ANSI literals and heredoc bodies without interpreting reserved words."""
++    from tools.shell_heredoc import _find_heredoc_close, _parse_heredoc_operator
++
++    if text.startswith("$'", pos):
++        words.fragment("__quoted__")
++        pos += 2
++        while pos < len(text) and text[pos] != "'":
++            pos += 2 if text[pos] == "\\" else 1
++        if pos >= len(text):
++            raise ValueError("unterminated ANSI quote")
++        return pos + 1
++    if text.startswith("<<", pos) and not text.startswith("<<<", pos):
++        spec = _parse_heredoc_operator(text, pos)
++        if spec is not None:
++            words.flush()
++            pending.append(spec)
++            return spec[0]
++    if text[pos] == "\n" and pending:
++        words.punctuation("\n")
++        pos += 1
++        for _, delimiter, strip_tabs, _ in pending:
++            close = _find_heredoc_close(text, pos, delimiter, strip_tabs)
++            if close is None:
++                raise ValueError("unterminated heredoc")
++            pos = close[1]
++        pending.clear()
++        return pos
++    return None
+diff --git a/tools/shell_prefix_expansions.py b/tools/shell_prefix_expansions.py
+index fc893ab63c6c966e8de15b95218eaef4ee5b68ab..b301fb078dbd94809b9050cb2da588658fedcffa 100644
+--- a/tools/shell_prefix_expansions.py
++++ b/tools/shell_prefix_expansions.py
+@@ -8,9 +8,7 @@ can conservatively classify the target as arithmetic.
+ 
+ from __future__ import annotations
+ 
+-import re
+-
+-_CASE_WORD = re.compile(r"(?<![\w])case(?![\w])")
++from tools.shell_case_words import CaseWords, opaque_end
+ 
+ 
+ def _comment_end(text: str, pos: int, quoted: str) -> int | None:
+@@ -26,9 +24,17 @@ def _expansion_end(text: str, start: int, closer: str, cache: dict | None = None
+     if cache is not None and key in cache:
+         return cache[key]
+     pos, quote = start, ""
++    words = CaseWords()
++    pending = []
+     while pos < len(text):
+         char = text[pos]
++        opaque = opaque_end(text, pos, words, pending) if not quote else None
++        if opaque is not None:
++            pos = opaque
++            continue
+         if char == "\\" and quote != "'":
++            if text[pos + 1:pos + 2] != "\n":
++                words.fragment("__quoted__")
+             pos += 2
+             continue
+         if quote == "'":
+@@ -36,14 +42,22 @@ def _expansion_end(text: str, start: int, closer: str, cache: dict | None = None
+                 quote = ""
+             pos += 1
+             continue
++        if not quote and char.isspace():
++            words.flush()
++        if not quote and char in ";&|()\n":
++            operator = next((op for op in (";;&", ";;", ";&") if text.startswith(op, pos)), char)
++            if words.punctuation(operator):
++                if cache is not None:
++                    cache[(pos, "case-pattern")] = pos + 1
++                pos += 1
++                continue
++            if len(operator) > 1:
++                pos += len(operator)
++                continue
+         if char == closer and not quote:
+             if cache is not None:
+                 cache[key] = pos + 1
+             return pos + 1
+-        if not quote and _CASE_WORD.match(text, pos):
+-            # A case-pattern ')' is not a frame closer; fail closed on grammar
+-            # this lexical masker cannot classify rather than lose the builtin.
+-            raise ValueError("case grammar in expansion")
+         comment_end = _comment_end(text, pos, quote)
+         if comment_end is not None:
+             pos = comment_end
+@@ -51,13 +65,17 @@ def _expansion_end(text: str, start: int, closer: str, cache: dict | None = None
+         nested = _opener(text, pos, quote)
+         if nested is not None:
+             width, end = nested
++            words.fragment("__expansion__")
+             pos = _expansion_end(text, pos + width, end, cache)
+             continue
+         if char in "\"'" and (not quote or char == quote):
++            words.fragment("__quoted__")
+             quote = "" if quote else char
+         elif not quote and char == "(" and closer == ")":
+             pos = _expansion_end(text, pos + 1, ")", cache)
+             continue
++        elif not quote and not char.isspace() and char not in ";&|()":
++            words.fragment(char)
+         pos += 1
+     raise ValueError("unterminated expansion")
+ 
+-- 
+2.43.0
+

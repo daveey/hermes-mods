@@ -1,0 +1,171 @@
+From 9f48267d3578fb152d30a67960397b37019f2a0d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 06:00:45 +0000
+Subject: [PATCH] [daveey] fix(kanban): a class card with one paced pool moves
+ off it, now that Grok is governed
+
+Five whys: required CI on #3301 @14fd4211ff went red in 6 tests of test_kanban_pace_reroute.py (class:deep
+"security work" cards spawned as class:deep/auto instead of moving to grok-4.7). Main b6f19b5dbc put xai-oauth
+under kanban.llm_pacing, so Grok became a governed candidate of every class card. `_verdicts` returned None as
+soon as ONE candidate pool admitted the card, so a Grok pool with room (or with no reading: unknown) let the class
+card start unmoved, and the weighted round-robin class allocator (not pace-aware) could then hand it to the paced
+Claude/Codex pool. That reopened exactly the gap this PR closed while Grok was ungoverned.
+
+Change: `_verdicts` returns the verdicts of every candidate pool at its pace limit (None when none is). One pool at
+its limit is enough for a class card: `hold` then moves it via `_pace_alternate` (the limited pools as walls, a
+governed target judged before the move, live serving required) to a pool of its class with room, or holds it.
+pickup_hold follows the same judgment. Single-provider routes behave as before.
+
+Tests: the pool fixture gives Grok an on-pace reading (governed, like production). New/changed:
+test_strong_class_card_with_one_paced_pool_moves_off_it (was "...starts_unmoved": with Codex paced and Claude open
+the card now moves to claude-opus-5-5, reason pattern:security+paced:openai-codex),
+test_strong_class_card_with_every_pool_open_starts_unmoved, test_strong_class_card_waits_when_grok_is_paced_too,
+test_default_card_holds_when_grok_is_paced_too. With the production change reverted, 7 tests fail; with it, all 30
+in the file pass.
+---
+ hermes_cli/kanban_llm_pacing_dispatch.py     | 26 ++++++-----
+ tests/hermes_cli/test_kanban_pace_reroute.py | 47 +++++++++++++++++---
+ 2 files changed, 58 insertions(+), 15 deletions(-)
+
+diff --git a/hermes_cli/kanban_llm_pacing_dispatch.py b/hermes_cli/kanban_llm_pacing_dispatch.py
+index 516333e4542665dfae1352e3bec58bfac68f999e..a9c0a61a812f531bbc2906b8b0bc9ea79f1f16a2 100644
+--- a/hermes_cli/kanban_llm_pacing_dispatch.py
++++ b/hermes_cli/kanban_llm_pacing_dispatch.py
+@@ -254,9 +254,15 @@ def is_deferrable(conn: sqlite3.Connection, task: Any, lane: str) -> bool:
+ 
+ 
+ def _verdicts(conn, task, providers, lane, cfg, host=None) -> Optional[list[dict]]:
+-    """One verdict per governed candidate provider, or None as soon as one provider admits the card.
++    """One verdict per governed candidate pool at its pace limit; None when none is (the card starts as routed).
+     ``host``: the connection whose running cards count (default ``conn``): pickup judges a replica card against
+-    this machine's own board."""
++    this machine's own board.
++
++    A class route (several candidate pools) is judged pool by pool: ONE pool at its limit is enough, because the class
++    allocator is weighted round-robin, not pace-aware, and would hand the card to that pool on its turn. The caller
++    then moves the card to a pool of its class with room (:func:`_pace_alternate`, the limited pools as walls) or
++    holds it. Since xai-oauth is governed too (b6f19b5dbc), a Grok pool with room no longer exempts a class card whose
++    Claude/Codex pools are paced: it is the move's target instead. [daveey] (t_d943a79dd2b3889f)"""
+     host = conn if host is None else host
+     now = time.time()
+     deferrable = is_deferrable(conn, task, lane)
+@@ -266,9 +272,9 @@ def _verdicts(conn, task, providers, lane, cfg, host=None) -> Optional[list[dict
+         limit = lp.admit_limit(pace, avg_running(provider, now, cfg), deferrable=deferrable, cfg=cfg)
+         running = local_running(host, provider)
+         if limit is None or running < limit:
+-            return None
++            continue
+         verdicts.append({**pace.as_dict(), "limit": limit, "running": running, "deferrable": deferrable})
+-    return verdicts
++    return verdicts or None
+ 
+ 
+ def _record(conn: sqlite3.Connection, task_id: str, verdicts: list[dict], result: Any, *, dry_run: bool,
+@@ -299,10 +305,10 @@ def _governed(conn: sqlite3.Connection, task_id: str, lane: str, cfg: lp.PacingC
+     """``(task, providers)`` for a card the governor judges on ``lane``; None when it starts regardless: no such card,
+     a mandatory pin, an unknown route or no provider the governor governs.
+ 
+-    A class route judges only its governed pools: an ungoverned pool in the same class (xai-oauth: Grok on the X Ultra
+-    subscription) no longer exempts the card, which would start it ungoverned and let the class allocator hand it to
+-    a paced Claude/Codex pool. When every governed pool holds it, :func:`_pace_alternate` moves it to the ungoverned
+-    pool if that one serves here. [daveey] (t_d943a79dd2b3889f)"""
++    A class route judges only its governed pools: an ungoverned pool in the same class no longer exempts the card,
++    which would start it ungoverned and let the class allocator hand it to a paced pool. When any governed pool holds
++    it (:func:`_verdicts`), :func:`_pace_alternate` moves it to a pool of its class with room that serves here, or it
++    holds. [daveey] (t_d943a79dd2b3889f)"""
+     from hermes_cli import kanban_db as kb
+     task = kb.get_task(conn, task_id)
+     if task is None or int(getattr(task, "model_pin_mandatory", 0) or 0):
+@@ -316,8 +322,8 @@ def _governed(conn: sqlite3.Connection, task_id: str, lane: str, cfg: lp.PacingC
+ def _pace_alternate(conn: sqlite3.Connection, task: Any, lane: str, cfg: lp.PacingConfig,
+                     host: sqlite3.Connection, verdicts: list[dict]) -> Optional[tuple[str, str, str, tuple]]:
+     """``(model, provider, paced, judged)``: a route of the card's own class on a pool that is NOT ahead of pace, for a
+-    card whose every candidate pool holds it (``verdicts``); ``judged`` is the ``(model, provider)`` route it moves
+-    from. None keeps the hold. [daveey]
++    card a candidate pool holds (``verdicts``: the pools at their limit); ``judged`` is the ``(model, provider)`` route
++    it moves from. None keeps the hold. [daveey]
+ 
+     The move uses the quota-episode probe (``alternate_route``: unpinned default or strong-class routes only, the
+     worker's own billing/capability eligibility, never a mandatory or ``require_model`` card, never a walled provider)
+diff --git a/tests/hermes_cli/test_kanban_pace_reroute.py b/tests/hermes_cli/test_kanban_pace_reroute.py
+index cf9b5c81c1c339f1e8b91a99eea051b6118a4c4c..e1ff1f96571d81e01eedf5305479405289a78749 100644
+--- a/tests/hermes_cli/test_kanban_pace_reroute.py
++++ b/tests/hermes_cli/test_kanban_pace_reroute.py
+@@ -53,7 +53,10 @@ def pool(board, monkeypatch, all_assignees_spawnable):
+ 
+ 
+ def _pools(monkeypatch, used):
+-    """``used``: provider -> seven-day percent; 99 holds the pool (past reserve), 5 leaves it open."""
++    """``used``: provider -> seven-day percent; 99 holds the pool (past reserve), 5 leaves it open. Grok (xai-oauth) is
++    a governed pool (b6f19b5dbc) and reads open unless ``used`` names it."""
++    used = {"xai-oauth": 5, **used}
++
+     def read(provider, now):
+         return [lp.Reading(now, f"{provider}-1", lp.SEVEN_DAY, used[provider], now + 9 * HOUR)]
+     monkeypatch.setattr(pd, "read_pool", read)
+@@ -137,8 +140,8 @@ def strong_pattern(pool, monkeypatch):
+ 
+ 
+ def test_strong_class_card_moves_to_grok_not_a_paced_pool(pool, strong_pattern, monkeypatch):
+-    """A class card whose class also holds an ungoverned subscription pool (xai-oauth) is still judged on its governed
+-    pools: otherwise it starts ungoverned and the class allocator may hand it to a paced Claude/Codex pool."""
++    """A class card whose class also holds a Grok pool with room (xai-oauth) is still judged pool by pool: otherwise it
++    starts unmoved and the class allocator may hand it to a paced Claude/Codex pool."""
+     _pools(monkeypatch, {"anthropic": 99, "openai-codex": 99})
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title="security work", assignee="a")
+@@ -150,8 +153,8 @@ def test_strong_class_card_moves_to_grok_not_a_paced_pool(pool, strong_pattern,
+     assert receipt["tier_reason"] == "pattern:security+paced:anthropic,openai-codex"
+ 
+ 
+-def test_strong_class_card_with_an_open_governed_pool_starts_unmoved(pool, strong_pattern, monkeypatch):
+-    _pools(monkeypatch, {"anthropic": 5, "openai-codex": 99})
++def test_strong_class_card_with_every_pool_open_starts_unmoved(pool, strong_pattern, monkeypatch):
++    _pools(monkeypatch, {"anthropic": 5, "openai-codex": 5})
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title="security work", assignee="a")
+         seen, result = _dispatch(conn)
+@@ -159,6 +162,40 @@ def test_strong_class_card_with_an_open_governed_pool_starts_unmoved(pool, stron
+     assert seen == [(tid, "class:deep", "auto")] and tid not in result.clock_held
+ 
+ 
++def test_strong_class_card_with_one_paced_pool_moves_off_it(pool, strong_pattern, monkeypatch):
++    """One paced pool is enough to move a class card: the round-robin class allocator is not pace-aware and would
++    hand it to Codex on its turn. It moves to the first open pool of its class (class order: Claude)."""
++    _pools(monkeypatch, {"anthropic": 5, "openai-codex": 99})
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="security work", assignee="a")
++        seen, result = _dispatch(conn)
++        receipt = _route_receipt(conn, tid)
++        assert _paced_events(conn, tid) == []
++    assert seen == [(tid, "claude-opus-5-5", "anthropic")] and tid not in result.clock_held
++    assert receipt["tier_reason"] == "pattern:security+paced:openai-codex"
++
++
++def test_strong_class_card_waits_when_grok_is_paced_too(pool, strong_pattern, monkeypatch):
++    """Grok is a governed pool: a class card whose every pool is at its limit holds, Grok named in the hold."""
++    _pools(monkeypatch, {"anthropic": 99, "openai-codex": 99, "xai-oauth": 99})
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="security work", assignee="a")
++        seen, result = _dispatch(conn)
++        events = _paced_events(conn, tid)
++    assert seen == [] and result.clock_held[tid][0] == lp.GUARD_REASON
++    assert sorted(p["provider"] for p in events[-1].payload["providers"]) == ["anthropic", "openai-codex", "xai-oauth"]
++
++
++def test_default_card_holds_when_grok_is_paced_too(pool, monkeypatch):
++    """A governed move target is judged before the move: with Claude and Grok both at their limit, the default Codex
++    card has no pool with room and holds."""
++    _pools(monkeypatch, {"anthropic": 99, "openai-codex": 99, "xai-oauth": 99})
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="routine work", assignee="a")
++        seen, result = _dispatch(conn)
++    assert seen == [] and result.clock_held[tid][0] == lp.GUARD_REASON
++
++
+ def test_strong_class_card_without_grok_credential_waits(pool, strong_pattern, monkeypatch):
+     _, serving = pool
+     serving.discard("xai-oauth")
+-- 
+2.43.0
+

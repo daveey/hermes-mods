@@ -1,0 +1,223 @@
+From d5e7156bca61442b221a0d57429e4a4c71b38154 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 18:06:40 +0000
+Subject: [PATCH] [daveey] lifecycle guard: peel command wrappers before
+ classifying a nested login shell
+
+`_nested_shell_input(view)` checked su/runuser/doas/sudo only in the first
+command word, then peeled every transparent wrapper at once (su and sudo
+included). So `env su -l bob < f`, `nice su -l bob`, `timeout 5 su -l bob`,
+`exec su -l bob`, `command su -l bob` and `sudo su - bob` landed on `bob` or
+nothing and were never classified as a login shell: the stdin file, here-string,
+heredoc or piped file that shell parses was not walked in nested scope (where
+alias names are unknown). The lifecycle guard allowed `t ( bash <live
+kanban.db> )` fed that way under every session alias set, None included
+(fail-open; t_d57454ce9f63e6f0, found reviewing PR #3081).
+
+Five whys:
+1. Why allowed? The nested-scope walk never saw f: `_nested_shell_input`
+   returned None for `env su -l bob`.
+2. Why None? The su/runuser/doas/sudo launcher checks ran only at the first
+   command word (`env`).
+3. Why not after peeling? Peeling was all-at-once via
+   `_peel_transparent_prefixes`, which also peels su/sudo themselves, so the
+   launcher was skipped, never inspected.
+4. Why all-at-once? The function predates the launcher cases; they were added
+   in front of it rather than inside the wrapper walk.
+5. Why not caught? Tests only covered bare launchers.
+
+Fix: walk the wrapper chain one wrapper at a time
+(`_peel_transparent_prefixes(..., limit=1)`, a new optional bound), classifying
+each position as a launcher (su/runuser/doas/sudo shell modes) before peeling
+it. `exec -l` anywhere in the chain stays sticky (fails closed). The final
+command keeps the old ssh / shell / BASH_ENV logic. Every caller (stdin
+redirect, heredoc owner, compound-command redirections, piped/fed files) goes
+through `_nested_shell_input`, so all shapes are covered.
+
+Proof: tests/cron/test_lifecycle_guard_session_aliases.py
+- RED on the parent: 21 new `test_nested_login_shell_body_treats_names_as_unknown`
+  shapes (env/exec/command/nice/timeout su -l bob < f, sudo su -l bob < f,
+  env sudo -i < f, nice doas -s < f, command runuser -l bob < f,
+  { env su -l bob; } < f, cat f | env/exec/command/nice/timeout 5 su -l bob,
+  heredoc/here-string/-c variants) plus `test_nested_shell_input_shapes`
+  failed; GREEN after the fix (353 passed).
+- Controls stay allowed under {zz}: `env cat < f`, `nice cat < f`,
+  `timeout 5 cat < f`, `cat f | env cat`, `env su -l bob -c true < f`,
+  `nice su -l bob -c true <<< T`, `sudo cat < f`,
+  `env runuser -u bob -- cat < f`.
+- All 37 test files referencing the lifecycle guard: 2827 passed.
+---
+ cron/lifecycle_guard.py                       |  8 ++--
+ cron/lifecycle_guard_nested_shells.py         | 47 ++++++++++++++-----
+ .../test_lifecycle_guard_session_aliases.py   | 39 ++++++++++++++-
+ 3 files changed, 76 insertions(+), 18 deletions(-)
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index f098cf1b71d70958451b74aa4bb0d269ff2679f8..72d56784c3d486f06d7c0bae91e4a1eb124092ed 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -803,10 +803,10 @@ def _executable_name(token: str) -> str:
+     return Path(token).name or token
+ 
+ 
+-def _peel_transparent_prefixes(segment: list[str], index: int) -> int:
+-    """Index of the command a wrapper chain actually executes. Unchanged if not a wrapper; may be
+-    ``len(segment)`` when a wrapper has no operand — callers must bounds-check."""
+-    for _ in range(_MAX_PREFIX_PEELS):
++def _peel_transparent_prefixes(segment: list[str], index: int, limit: int = _MAX_PREFIX_PEELS) -> int:
++    """Index of the command a chain of at most *limit* wrappers executes. Unchanged if not a
++    wrapper; may be ``len(segment)`` when a wrapper has no operand — callers must bounds-check."""
++    for _ in range(limit):
+         if index >= len(segment):
+             return index
+         name = _executable_name(segment[index])
+diff --git a/cron/lifecycle_guard_nested_shells.py b/cron/lifecycle_guard_nested_shells.py
+index 18fb18eaeafe468019b083137a0c9de27d65c0b8..6655d9d3703a537af44eb5d91108db4ebde0375e 100644
+--- a/cron/lifecycle_guard_nested_shells.py
++++ b/cron/lifecycle_guard_nested_shells.py
+@@ -15,6 +15,7 @@ from pathlib import Path
+ from typing import TYPE_CHECKING, Optional
+ 
+ from cron.lifecycle_guard import (
++    _MAX_PREFIX_PEELS,
+     _REDIRECTION,
+     _SHELL_EXECUTABLES,
+     _command_token_index,
+@@ -233,11 +234,32 @@ def _remote_reads_stdin(remote: list[str]) -> bool:
+ def _nested_shell_input(view: list[str]) -> Optional[tuple[str, Optional[str]]]:
+     """``_shell_inputs`` of the nested shell *view* starts when that shell holds aliases of its
+     own (see above), else ``None``. For ssh only stdin counts: a remote ``-c`` or script names
+-    remote text and paths."""
++    remote text and paths. Command wrappers are peeled one at a time (``env su -l bob``,
++    ``nice sudo -i``, ``sudo su - bob``): each may itself be the shell launcher."""
+     index = _command_token_index(view)
+-    if index is None:
+-        return None
+-    name = _executable_name(view[index])
++    login_exec = False
++    for _ in range(_MAX_PREFIX_PEELS):
++        if index is None or index >= len(view):
++            return None
++        name = _executable_name(view[index])
++        found = _launcher_shell_input(view, index, name)
++        if found is not None:
++            return found
++        # `exec -l` anywhere in the chain fails closed: its `-` reaches the next argv[0].
++        login_exec = login_exec or (name == "exec" and "-l" in itertools.takewhile(
++            lambda word: word.startswith("-"), view[index + 1:]))
++        peeled = _peel_transparent_prefixes(view, index, limit=1)
++        if peeled == index:
++            return _shell_input(view, index, name, login_exec)
++        index = peeled
++    return None
++
++
++def _launcher_shell_input(
++    view: list[str], index: int, name: str,
++) -> Optional[tuple[str, Optional[str]]]:
++    """What a su/runuser/doas/sudo at *index* hands its own shell, or ``None`` when it runs the
++    command after its options instead (direct-user runuser, plain ``sudo``/``doas``)."""
+     if name in ("su", "runuser"):
+         options = [_su_long_option(word) for word in view[index + 1:]]
+         direct_user = name == "runuser" and any(
+@@ -263,13 +285,14 @@ def _nested_shell_input(view: list[str]) -> Optional[tuple[str, Optional[str]]]:
+         if any(_SUDO_SHELL_OPTION_RE.fullmatch(word) for word in options):
+             rest = _split_redirections(view[index + 1 + operand:])[0]
+             return ("payload", " ".join(rest)) if rest else ("stdin", None)
+-    login_exec = name == "exec" and "-l" in itertools.takewhile(
+-        lambda word: word.startswith("-"), view[index + 1:])
+-    peeled = _peel_transparent_prefixes(view, index)
+-    if peeled >= len(view):
+-        return None
+-    name = _executable_name(view[peeled])
+-    arguments = _split_redirections(view[peeled + 1:])[0]
++    return None
++
++
++def _shell_input(
++    view: list[str], index: int, name: str, login_exec: bool,
++) -> Optional[tuple[str, Optional[str]]]:
++    """``_nested_shell_input`` for the unwrapped command *name* at *index*: ssh or a shell."""
++    arguments = _split_redirections(view[index + 1:])[0]
+     if name == "ssh":
+         from tools.shell_heredoc import _SSH_VALUE_OPTIONS
+ 
+@@ -280,7 +303,7 @@ def _nested_shell_input(view: list[str]) -> Optional[tuple[str, Optional[str]]]:
+     options_end = _shell_options_end(arguments, name)[0]
+     # ENV is read by interactive POSIX shells (already covered by -i); BASH_ENV
+     # additionally lets a plain non-interactive bash define and enable aliases.
+-    startup_env = name == "bash" and any(word.startswith("BASH_ENV=") for word in view[:peeled])
++    startup_env = name == "bash" and any(word.startswith("BASH_ENV=") for word in view[:index])
+     if name == "zsh" or login_exec or startup_env or any(
+             _LOGIN_SHELL_OPTION_RE.fullmatch(word) for word in arguments[:options_end]):
+         return _shell_inputs(arguments, name)
+diff --git a/tests/cron/test_lifecycle_guard_session_aliases.py b/tests/cron/test_lifecycle_guard_session_aliases.py
+index 5eb907f4c30c466961deff9d692e87898c165264..6864178cd44ccb6e99ae1dc17904e15ddd158986 100644
+--- a/tests/cron/test_lifecycle_guard_session_aliases.py
++++ b/tests/cron/test_lifecycle_guard_session_aliases.py
+@@ -353,6 +353,29 @@ _NESTED_FOREIGN_SHELLS = [
+     "( bash -l ) < <(printf '%s\\n' 't ( bash {db} )')",
+     "while read l; do su -l bob; done < <(echo 't ( bash {db} )')",
+     "su -l bob < <(python3 - <<'PY'\nprint('t ( bash {db} )')\nPY\n)",
++    # The login shell behind a command wrapper (t_d57454ce9f63e6f0): base read only the first
++    # word, so `env`/`exec`/`command`/`nice`/`timeout` hid `su` and its stdin was never walked.
++    "env su -l bob < {script}",
++    "exec su -l bob < {script}",
++    "command su -l bob < {script}",
++    "nice su -l bob < {script}",
++    "timeout 5 su -l bob < {script}",
++    "env -i HOME=/x nohup nice -n 5 su -l bob < {script}",
++    "sudo su -l bob < {script}",
++    "sudo -u root su - bob < {script}",
++    "env sudo -i < {script}",
++    "nice doas -s < {script}",
++    "command runuser -l bob < {script}",
++    "{{ env su -l bob; }} < {script}",
++    "cat {script} | env su -l bob",
++    "cat {script} | exec su -l bob",
++    "cat {script} | command su -l bob",
++    "cat {script} | nice su -l bob",
++    "cat {script} | timeout 5 su -l bob",
++    "env su -l bob <<'EOF'\nt ( bash {db} )\nEOF",
++    "nice su - bob <<< 't ( bash {db} )'",
++    "timeout 5 su -c 't ( bash {db} )' bob",
++    "env sudo -s <<'EOF'\nt ( bash {db} )\nEOF",
+ ]
+ 
+ 
+@@ -477,6 +500,15 @@ def test_nested_login_shell_body_treats_names_as_unknown(tmp_path, live_kanban_d
+     "su -l bob; cat < <(echo 't ( bash {db} )')",
+     "{{ su -l bob; cat < <(echo 't ( bash {db} )'); }}",
+     "su -l bob < <(echo ':'); echo 't ( bash {db} )'",
++    # A wrapper around a non-shell command, or a login shell given its own `-c`.
++    "env cat < {script}",
++    "nice cat < {script}",
++    "timeout 5 cat < {script}",
++    "cat {script} | env cat",
++    "env su -l bob -c true < {script}",
++    "nice su -l bob -c true <<< 't ( bash {db} )'",
++    "sudo cat < {script}",
++    "env runuser -u bob -- cat < {script}",
+ ])
+ def test_plain_child_shell_keeps_session_names(tmp_path, live_kanban_db, shape):
+     """Controls: no login/interactive shell, so the session's names still decide (#2358)."""
+@@ -708,11 +740,14 @@ def test_nested_shell_input_shapes():
+     for owner in ("bash -l <<'E'", "sh -i <<'E'", "zsh <<'E'", "ssh h <<'E'",
+                   "ssh -p 22 -o X=1 h 'bash -s' <<'E'", "ssh h 'cd /x; bash' <<'E'",
+                   "sudo -i <<'E'", "sudo -u root -s <<'E'", "su - bob <<'E'",
+-                  "timeout 9 bash --login <<'E'", "exec -l bash <<'E'", None):
++                  "timeout 9 bash --login <<'E'", "exec -l bash <<'E'",
++                  "env su -l bob <<'E'", "nice -n 5 sudo -i <<'E'", "command doas -s <<'E'",
++                  "sudo su - bob <<'E'", "exec runuser -l bob <<'E'", None):
+         assert _feeds_nested_shell(owner), owner
+     for owner in ("bash <<'E'", "bash -s <<'E'", "sh -e <<'E'", "python3 - <<'E'",
+                   "ssh h python3 - <<'E'", "ssh h 'cat > f' <<'E'", "bash -l x.sh <<'E'",
+-                  "sudo -u bob python3 - <<'E'", "cat <<'E'"):
++                  "sudo -u bob python3 - <<'E'", "cat <<'E'", "env cat <<'E'",
++                  "nice su -l bob -c true <<'E'", "env runuser -u bob -- cat <<'E'"):
+         assert not _feeds_nested_shell(owner), owner
+     found = list(_iter_nested_shell_inputs("bash -l -c 'x ( y )'; zsh s.sh; bash -c 'z'", "", cwd="/"))
+     assert found == []  # *walk_command* holds the segments; *command* only its heredocs
+-- 
+2.43.0
+

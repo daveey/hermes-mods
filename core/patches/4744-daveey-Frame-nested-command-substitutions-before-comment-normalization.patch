@@ -1,0 +1,142 @@
+From 7b9aa3609d26412c008591a385949bfaf8e9f997 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 04:33:22 +0000
+Subject: [PATCH] [daveey] Frame nested command substitutions before comment
+ normalization
+
+---
+ cron/lifecycle_guard_lines.py                 | 66 ++++++++++++++++++-
+ .../test_lifecycle_guard_nested_comments.py   | 10 +++
+ 2 files changed, 74 insertions(+), 2 deletions(-)
+
+diff --git a/cron/lifecycle_guard_lines.py b/cron/lifecycle_guard_lines.py
+index 9c174854261e926777d03ba0b6c8e399639b1c9e..da724825bdd170226dd25ead4624da2c869bd4ad 100644
+--- a/cron/lifecycle_guard_lines.py
++++ b/cron/lifecycle_guard_lines.py
+@@ -41,6 +41,8 @@ def _double_span(text: str, start: int, *, shlex_quotes: bool) -> tuple[int, str
+         if char in "$`":
+             end, span = _expansion(text, pos, in_double=True, shlex_quotes=shlex_quotes)
+             if span:
++                if shlex_quotes:
++                    span = span.replace("\\", "\\\\").replace('"', '\\"')
+                 parts.extend((text[copied:pos], span))
+                 pos = copied = end
+                 continue
+@@ -49,6 +51,55 @@ def _double_span(text: str, start: int, *, shlex_quotes: bool) -> tuple[int, str
+     return pos, "".join(parts)
+ 
+ 
++def _command_span(text: str, start: int, *, shlex_quotes: bool) -> tuple[int, str]:
++    """Find a substitution's closing parenthesis in its own shell comment frame."""
++    pos = copied = start
++    depth = 1
++    word_start = True
++    parts = ["$("]
++    while pos < len(text):
++        char = text[pos]
++        if char == "#" and word_start:
++            end = text.find("\n", pos)
++            end = len(text) if end < 0 else end
++            if shlex_quotes:
++                parts.append(text[copied:pos])
++                copied = end
++            pos = end
++            continue
++        if char == "\\":
++            if text[pos + 1:pos + 2] != "\n":
++                word_start = False
++            pos += 2
++            continue
++        if char == "'":
++            pos = _quoted_end(text, pos + 1, char, escapes=False)
++            word_start = False
++            continue
++        if char == '"':
++            end, span = _double_span(text, pos + 1, shlex_quotes=shlex_quotes)
++        elif char in "$`":
++            end, span = _expansion(text, pos, in_double=False, shlex_quotes=shlex_quotes)
++        else:
++            end, span = pos, ""
++        if span:
++            parts.extend((text[copied:pos], span))
++            pos = copied = end
++            word_start = False
++            continue
++        if char == "(":
++            depth += 1
++        elif char == ")":
++            depth -= 1
++            if not depth:
++                pos += 1
++                break
++        word_start = char in _WORD_BREAKS
++        pos += 1
++    parts.append(text[copied:pos])
++    return pos, "".join(parts)
++
++
+ def _parameter_span(text: str, start: int, *, shlex_quotes: bool) -> tuple[int, str]:
+     """Keep parameter words opaque to the OUTER comment/line scanner.
+ 
+@@ -60,7 +111,9 @@ def _parameter_span(text: str, start: int, *, shlex_quotes: bool) -> tuple[int,
+     parts = [text[start - 2:start]]
+     while pos < len(text) and stack:
+         char = text[pos]
+-        if char == "`" or text.startswith("$'", pos):
++        if char == "`" or text.startswith("$'", pos) or (
++            text.startswith("$(", pos) and not text.startswith("$((", pos)
++        ):
+             # Nested backticks need the same inner-comment normalization as root
+             # substitutions; otherwise a comment's quote leaks into outer shlex.
+             end, span = _expansion(text, pos, in_double=False, shlex_quotes=shlex_quotes)
+@@ -95,6 +148,8 @@ def _expansion(text: str, pos: int, *, in_double: bool, shlex_quotes: bool) -> t
+     """Return an opaque span, or an empty span when ordinary scanning should proceed."""
+     if text.startswith("${", pos):
+         return _parameter_span(text, pos + 2, shlex_quotes=shlex_quotes)
++    elif text.startswith("$(", pos) and not text.startswith("$((", pos):
++        return _command_span(text, pos + 2, shlex_quotes=shlex_quotes)
+     elif text[pos] == "`":
+         end = _quoted_end(text, pos + 1, "`")
+         if shlex_quotes and text[end - 1:end] == "`":
+@@ -131,9 +186,16 @@ def _scan(text: str, *, split: bool, keep_comments: bool, shlex_quotes: bool = F
+     for pos, ch in enumerate(text):
+         if pos < end:
+             continue
+-        if ch in "$`" and not in_comment and not in_single and not escape:
++        if (ch in "$`" and not in_comment and not in_single and not escape
++                and not text.startswith("$(", pos)):
++            # Root $() traversal stays visible to logical-line consumers; only
++            # nested opaque words need the substitution framed as a whole.
+             end, span = _expansion(text, pos, in_double=in_double, shlex_quotes=shlex_quotes)
+             if span:
++                if shlex_quotes and in_double:
++                    # shlex has no nested shell frames: keep the normalized
++                    # substitution's quotes inside the enclosing quoted word.
++                    span = span.replace("\\", "\\\\").replace('"', '\\"')
+                 current.append(span)
+                 word_start = False
+                 continue
+diff --git a/tests/cron/test_lifecycle_guard_nested_comments.py b/tests/cron/test_lifecycle_guard_nested_comments.py
+index f533c15cfccac5c4c444048f203c99941b3a9ad3..25f0e5da404375adaf64534b0848e936afc17aab 100644
+--- a/tests/cron/test_lifecycle_guard_nested_comments.py
++++ b/tests/cron/test_lifecycle_guard_nested_comments.py
+@@ -6,6 +6,16 @@ from cron.lifecycle_guard import scan_gateway_lifecycle
+ from tests.cron import test_lifecycle_guard_comment_words as helpers
+ 
+ PREFIXES = [
++    'echo ${x:-"$(echo $\'it\\\'s\' #say "x\n)"}',
++    'echo "${x:-$(echo $\'it\\\'s\' #say "x\n)}"',
++    'echo ${x:-"$(echo #say "x\n)"}',
++    'echo "${x:-$(echo #say "x\n)}"',
++    'echo ${x:-"$(echo #} "\n)"}',
++    'echo ${x:-$(echo #say "x\n)}',
++    "echo ${x:-$(echo #it's\n)}",
++    'echo ${x:-$(echo #} "\n)}',
++    'echo ${x:-"$(echo "$(echo #say "x\n)")"}',
++    'echo ${x:-"$(echo ${y:-$(echo #say "x\n)})"}',
+     "x='a b'; echo ${x// #/y}",
+     "echo ${x:-a #b}",
+     "echo `echo #x`",
+-- 
+2.43.0
+

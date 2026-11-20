@@ -1,0 +1,165 @@
+From 6245b1d3c936e0fd7f06a63d171d953c64e1ed98 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 15:25:45 -0800
+Subject: [PATCH] [daveey] desktop: an ended turn's store re-read never stamps
+ a newer turn
+
+Review of the previous commit found two gaps:
+- recoverEndedLiveTurn was keyed by runtime, so a prompt sent during a re-read
+  delay could get the older turn's "no reply" stamp while waiting on an approval.
+  The recovery now remembers its turn's prompt and stops when the tail prompt changes.
+- disproveNoReplyNotice fired on closing frames; a late or replayed
+  message.complete / tool.complete removed a correct notice. Only frames that
+  carry new output disprove it now.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .../hooks/no-reply-notice-disproved.test.tsx  | 10 +----
+ .../use-message-stream/gateway-event/index.ts |  6 +--
+ apps/desktop/src/store/session-states.ts      | 16 +++++++-
+ .../src/store/session-watchdog.test.ts        | 39 +++++++++++++++++++
+ 4 files changed, 58 insertions(+), 13 deletions(-)
+
+diff --git a/apps/desktop/src/app/session/hooks/no-reply-notice-disproved.test.tsx b/apps/desktop/src/app/session/hooks/no-reply-notice-disproved.test.tsx
+index fe2a22e370ba636b5bdff9832a98a238bd6d9f5c..ccbb03aad37b3627f747726f01004973f4fc8ad6 100644
+--- a/apps/desktop/src/app/session/hooks/no-reply-notice-disproved.test.tsx
++++ b/apps/desktop/src/app/session/hooks/no-reply-notice-disproved.test.tsx
+@@ -93,18 +93,12 @@ describe('a no-reply notice on a turn that is still producing', () => {
+     expect(notice()).toBeUndefined()
+   })
+ 
+-  it('stays for a frame that is not turn output', () => {
++  it.each(['session.info'] as const)('stays for a %s frame, which is not new output', type => {
+     const { result } = mount()
+ 
+     stamp()
+ 
+-    act(() =>
+-      result.current.handleGatewayEvent({
+-        session_id: runtimeId,
+-        type: 'session.info',
+-        payload: {}
+-      } as GatewayEvent)
+-    )
++    act(() => result.current.handleGatewayEvent({ session_id: runtimeId, type, payload: {} } as GatewayEvent))
+ 
+     expect(notice()?.error).toBe(NO_REPLY_ERROR)
+   })
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/index.ts b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/index.ts
+index cd03e0d4d695108877eb97fa4d160853b71738ef..fd955563d1e5680b6441922511a03c800abcd348 100644
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/index.ts
+@@ -54,16 +54,16 @@ const DRAFT_SUPERSEDING_EVENT_TYPES = new Set([
+   'tool.start'
+ ])
+ 
+-// The turn's own stream output: any of these after a "turn ended without a
++// The turn producing NEW output: any of these after a "turn ended without a
+ // reply" stamp proves that stamp wrong (store/session-states disproveNoReplyNotice).
++// Closing frames (message.complete, tool.complete) are left out: a late or
++// replayed one says nothing about a turn that really ended without a reply.
+ const TURN_OUTPUT_EVENT_TYPES = new Set([
+-  'message.complete',
+   'message.delta',
+   'message.interim',
+   'message.start',
+   'reasoning.delta',
+   'thinking.delta',
+-  'tool.complete',
+   'tool.generating',
+   'tool.start'
+ ])
+diff --git a/apps/desktop/src/store/session-states.ts b/apps/desktop/src/store/session-states.ts
+index 6e5a6bf97167d9916d9cbfdf113e3f5223501d12..060087aa05e6968151dd89f45d2aca0945255584 100644
+--- a/apps/desktop/src/store/session-states.ts
++++ b/apps/desktop/src/store/session-states.ts
+@@ -555,6 +555,13 @@ async function recoverEndedLiveTurn(runtimeId: string) {
+   const recovery = {}
+   endedTurnRecoveries.set(runtimeId, recovery)
+ 
++  // The turn this recovery is for: a prompt sent during a re-read delay starts
++  // another turn, which this one must not stamp.
++  const tailPrompt = () =>
++    $sessionStates.get()[runtimeId]?.messages.findLast(message => message.role === 'user' && !message.hidden)?.id
++
++  const prompt = tailPrompt()
++
+   try {
+     for (let attempt = 0; ; attempt += 1) {
+       const storedSessionId = $sessionStates.get()[runtimeId]?.storedSessionId ?? null
+@@ -574,7 +581,7 @@ async function recoverEndedLiveTurn(runtimeId: string) {
+         // No answer from the store: read again below.
+       }
+ 
+-      if (endedTurnRecoveries.get(runtimeId) !== recovery) {
++      if (endedTurnRecoveries.get(runtimeId) !== recovery || tailPrompt() !== prompt) {
+         return
+       }
+ 
+@@ -594,7 +601,12 @@ async function recoverEndedLiveTurn(runtimeId: string) {
+ 
+       const state = $sessionStates.get()[runtimeId]
+ 
+-      if (endedTurnRecoveries.get(runtimeId) !== recovery || !state || isLiveTurnAwaitingEvents(state)) {
++      if (
++        endedTurnRecoveries.get(runtimeId) !== recovery ||
++        !state ||
++        isLiveTurnAwaitingEvents(state) ||
++        tailPrompt() !== prompt
++      ) {
+         return
+       }
+     }
+diff --git a/apps/desktop/src/store/session-watchdog.test.ts b/apps/desktop/src/store/session-watchdog.test.ts
+index d0c234d351ab47febc80f758b1ec3492ad000306..d5a26239235095e164bb6ecbae484e1d062d8514 100644
+--- a/apps/desktop/src/store/session-watchdog.test.ts
++++ b/apps/desktop/src/store/session-watchdog.test.ts
+@@ -498,6 +498,45 @@ describe('live turn event silence', () => {
+     expect(card('rt-revived')).toBeUndefined()
+   })
+ 
++  it('does not stamp a newer turn that began while the store was being re-read', async () => {
++    $activeSessionId.set('rt-next')
++    publishSessionState(
++      'rt-next',
++      state({
++        awaitingResponse: true,
++        busy: true,
++        messages: [{ id: 'u1', parts: [textPart('first')], role: 'user' }],
++        storedSessionId: 's-next',
++        turnLive: true
++      })
++    )
++    backend(
++      async () => ({ sessions: [] }),
++      vi.fn(async () => false)
++    )
++    noteSessionEvent('rt-next')
++
++    await vi.advanceTimersByTimeAsync(SILENCE_MS)
++
++    // The user sends again; that turn stops at an approval prompt with a tool-only bubble.
++    publishSessionState('rt-next', {
++      ...$sessionStates.get()['rt-next']!,
++      awaitingResponse: false,
++      busy: true,
++      messages: [
++        { id: 'u1', parts: [textPart('first')], role: 'user' },
++        { id: 'u2', parts: [textPart('second')], role: 'user' },
++        { id: 'a2', parts: [], role: 'assistant' }
++      ],
++      needsInput: true,
++      turnLive: true
++    })
++
++    await vi.advanceTimersByTimeAsync(ENDED_TURN_STORE_RETRY_MS.reduce((sum, ms) => sum + ms, 0))
++
++    expect(card('rt-next')).toBeUndefined()
++  })
++
+   it('leaves a background session to read its history when opened', async () => {
+     publishSessionState('rt-bg', state({ awaitingResponse: true, busy: true, storedSessionId: 's-bg', turnLive: true }))
+     const refreshTranscript = vi.fn()
+-- 
+2.43.0
+

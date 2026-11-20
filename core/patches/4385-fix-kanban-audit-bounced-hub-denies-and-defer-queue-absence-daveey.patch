@@ -1,0 +1,291 @@
+From bd6e06086c91e993cd32e5368679af6ee1f5d497 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 01:10:27 +0000
+Subject: [PATCH] fix(kanban): audit bounced hub denies and defer queue absence
+ [daveey]
+
+---
+ hermes_cli/doctor_state.py                    | 10 +--
+ hermes_cli/kanban_hub_admission_claim.py      | 47 ++++++++---
+ .../test_kanban_denied_claim_disposition.py   | 77 +++++++++++++++++++
+ .../test_kanban_hub_admission_claim.py        | 12 +--
+ 4 files changed, 124 insertions(+), 22 deletions(-)
+
+diff --git a/hermes_cli/doctor_state.py b/hermes_cli/doctor_state.py
+index aceed47311c055204123a0b5688768f5156cd39c..a8c67755a07ed84e3142d7e044d1219fe30cab70 100644
+--- a/hermes_cli/doctor_state.py
++++ b/hermes_cli/doctor_state.py
+@@ -729,7 +729,7 @@ def _check_host_loop_leases(should_fix: bool, f: Finding) -> None:
+ 
+ @doctor_check("")  # best-effort: a busy or missing board must never break doctor
+ def _check_hub_admission_claims(should_fix: bool, f: Finding) -> None:
+-    """On the hub: its claims of cards with no hub-admission verdict in the last week (should be 0). [daveey]"""
++    """On the hub: claims lacking an admission or explicit keep in the last week (should be 0). [daveey]"""
+     import sqlite3
+     from contextlib import closing
+     from hermes_cli import kanban_placement as kp
+@@ -746,11 +746,11 @@ def _check_hub_admission_claims(should_fix: bool, f: Finding) -> None:
+         found = unjudged_claims(conn, row[0])
+     days = WINDOW_SECONDS // 86400
+     if not found:
+-        return check_ok(f"Kanban: 0 hub claims of unjudged cards in the last {days} days")
++        return check_ok(f"Kanban: 0 hub claims without an admission disposition in the last {days} days")
+     ids = ", ".join(tid for tid, _at in found[:10])
+-    check_warn(f"Kanban: {len(found)} hub claim(s) of unjudged cards in the last {days} days", f"({ids})")
+-    f.manual_issues.append(f"The hub claimed {len(found)} card(s) with no hub_admission verdict (the claim screen "
+-                           f"failed open on a judge outage, or it is not deployed): {ids}")
++    check_warn(f"Kanban: {len(found)} hub claim(s) without an admission disposition in the last {days} days", f"({ids})")
++    f.manual_issues.append(f"The hub claimed {len(found)} card(s) with no hub_admission verdict or a deny without "
++                           f"an explicit keep (inspect the latest pre-claim disposition): {ids}")
+ 
+ 
+ @doctor_check("")  # best-effort: profile enumeration must never break doctor
+diff --git a/hermes_cli/kanban_hub_admission_claim.py b/hermes_cli/kanban_hub_admission_claim.py
+index 25214d83cba8c8d219c15db8b15d0a570e2cd719..02f9d9993686f77d214cd59087735d67278ad967 100644
+--- a/hermes_cli/kanban_hub_admission_claim.py
++++ b/hermes_cli/kanban_hub_admission_claim.py
+@@ -18,8 +18,9 @@ The screen covers ready and review because a scheduled continuation can resume e
+   hub-local wake_check, or no worker queue fits): the verdict carries ``kept: <reason>``. A probe registered on
+   this gateway stays here independently of the ready card's execution; unknown legacy probe custody stays local.
+   A fleet probe in :data:`PORTABLE_WAKE_PROBES` (or ``kanban.placement.portable_wake_probes``) is also portable;
+-* an earlier deny that left the card here (a ``kept`` that no longer holds, or none) is re-placed on the worker
+-  queue once it has waited ready 5 min (``kanban_worker_first_selfcheck.denied_target``), with no new judge call;
++* an earlier deny is resolved immediately, including a card bounced back to this hub's machine pin: re-evaluate
++  the structural/pickup constraints, record a current keep or move before claiming, without a new judge call;
++  unchanged keep dispositions do not append duplicate events on each screen;
+ * judge unavailable: claimed as before, warning logged, nothing recorded (judged at its next ready). Failing open
+   here keeps a judge outage from freezing the hub; only pre-gate cards reach this path.
+ * deferred (``Counts.deferred_ids``, left out of this tick's claims and judged next tick): a card edited while the
+@@ -29,8 +30,8 @@ The screen covers ready and review because a scheduled continuation can resume e
+   result (``DispatchResult.admission_deferred``) name them, so a ready card that keeps not starting is traceable.
+ 
+ A card with any verdict (forced or skipped included) makes no model call. :func:`unjudged_claims` is the
+-detector: this gateway's claims of a card that had no verdict yet (``hermes doctor`` reports it on the hub). Its
+-gate (the board's first verdict) counts audits riding a ``created`` payload as well as ``hub_admission`` events.
++detector: this gateway's claims without a prior verdict or with a prior deny lacking an explicit keep/force.
++Its gate counts audits riding a ``created`` payload as well as ``hub_admission`` events.
+ """
+ from __future__ import annotations
+ 
+@@ -78,8 +79,20 @@ class Counts:
+                 ).format(**asdict(self)) + ids
+ 
+ 
+-_SCREENABLE = ("status IN ('ready', 'review') AND claim_lock IS NULL AND (runs_on IS NULL OR runs_on IN ('', '[]')) "
+-               "AND placement_policy IS NULL")
++_SCREENABLE = "status IN ('ready', 'review') AND claim_lock IS NULL AND placement_policy IS NULL"
++
++
++def _eligible(conn: sqlite3.Connection, card: sqlite3.Row) -> bool:
++    """Unlabelled legacy cards, plus denied cards bounced back to this hub's machine pin."""
++    from hermes_cli import kanban_hub_admission_pickup as pickup
++    from hermes_cli import kanban_worker_node as wn
++    labels = wn._parse(card["runs_on"])
++    if not labels:
++        return True
++    if labels != [f"machine:{wn._own(conn)}"]:
++        return False
++    prior = pickup.verdict(conn, card["id"])
++    return bool(prior and prior.get("admit") is False and not prior.get("forced"))
+ 
+ 
+ def _candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+@@ -88,7 +101,7 @@ def _candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+     from hermes_cli.kanban_admission_pools import lane_rows
+     rows = {row["id"]: row for row in conn.execute(f"SELECT * FROM tasks WHERE {_SCREENABLE}").fetchall()}
+     lanes = lane_rows(conn, "ready") + lane_rows(conn, "review")
+-    return [rows[row["id"]] for row in lanes if row["id"] in rows]
++    return [rows[row["id"]] for row in lanes if row["id"] in rows and _eligible(conn, rows[row["id"]])]
+ 
+ 
+ def _current(conn: sqlite3.Connection, tid: str) -> tuple[Optional[sqlite3.Row], int]:
+@@ -97,7 +110,8 @@ def _current(conn: sqlite3.Connection, tid: str) -> tuple[Optional[sqlite3.Row],
+     start of the tick would make :func:`_apply` defer it for any write in between and waste its judge call.
+     The row is ``None`` when the card stopped being screenable meanwhile (claimed, labelled, no longer ready)."""
+     event_head = _event_head(conn, tid)
+-    return conn.execute(f"SELECT * FROM tasks WHERE id = ? AND {_SCREENABLE}", (tid,)).fetchone(), event_head
++    card = conn.execute(f"SELECT * FROM tasks WHERE id = ? AND {_SCREENABLE}", (tid,)).fetchone()
++    return (card if card is not None and _eligible(conn, card) else None), event_head
+ 
+ 
+ def _latest_wake_check(conn: sqlite3.Connection, task_id: str) -> str:
+@@ -201,7 +215,11 @@ def screen(conn: sqlite3.Connection, *, cfg: Optional[dict] = None, budget: int
+             target = None if kept else pickup._target(fields, own, cfg, audit)
+             if kept is None and target is None:
+                 # A deny pool_route keeps home (the claim gate refuses the text on every worker) names that reason.
+-                kept = audit.get("home") or NO_QUEUE
++                kept = audit.get("home")
++                if not kept:
++                    _apply(conn, own, tid, audit, None, expected=card, event_head=event_head)
++                    counts.defer(tid)
++                    continue  # no attested queue is not permission to run a portable deny on the hub
+             if kept:
+                 audit["kept"] = kept
+         applied = _apply(conn, own, tid, audit, target, expected=card, event_head=event_head)
+@@ -227,7 +245,9 @@ def _apply(conn: sqlite3.Connection, own: str, tid: str, audit: dict, target: Op
+         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
+         if row is None or dict(row) != dict(expected) or _event_head(conn, tid) != event_head:
+             return None  # the verdict and route belong only to the snapshot the judge saw
+-        kb._append_event(conn, tid, "hub_admission", audit)
++        from hermes_cli.kanban_hub_admission_pickup import verdict
++        if verdict(conn, tid) != audit:
++            kb._append_event(conn, tid, "hub_admission", audit)
+         if target is None:
+             return False
+         previous = wn._parse(row["runs_on"])  # None (NULL or '') or [] ('[]'): what the card carried
+@@ -264,7 +284,10 @@ def _self_check(conn: sqlite3.Connection, card: sqlite3.Row, own: str, cfg: dict
+             log_repin(card["id"], target, reason)
+             counts.repinned += 1
+             return
+-        audit["kept"] = kept or audit.get("home") or NO_QUEUE
++        if not kept and not audit.get("home"):
++            counts.defer(card["id"])
++            return  # queue unavailability is not a structural permission to execute on the hub
++        audit["kept"] = kept or audit["home"]
+         applied = _apply(conn, own, card["id"], audit, None, expected=card, event_head=event_head)
+         if applied is None:
+             counts.defer(card["id"])
+@@ -327,7 +350,7 @@ def safe_screen(conn: sqlite3.Connection) -> frozenset:
+ def unjudged_claims(conn: sqlite3.Connection, own: str, *, now: Optional[float] = None,
+                     window: int = WINDOW_SECONDS) -> list[tuple[str, int]]:
+     """``[(task_id, claimed_at)]``: claims by ``own`` in the last ``window`` seconds, after the board's first
+-    verdict (the gate's rollout), of a card with no verdict before that claim."""
++    verdict (the gate's rollout), without a verdict or with a deny lacking an explicit keep/force."""
+     now = time.time() if now is None else now
+     gate = conn.execute(  # a verdict is a hub_admission event or an audit riding a created payload
+         "SELECT MIN(t) FROM (SELECT MIN(created_at) AS t FROM task_events WHERE kind = 'hub_admission' "
+diff --git a/tests/hermes_cli/test_kanban_denied_claim_disposition.py b/tests/hermes_cli/test_kanban_denied_claim_disposition.py
+index c4a10cccd2b6639668e75285146126bbc448b820..b49de13e60999aa8393c297456038ad79055c662 100644
+--- a/tests/hermes_cli/test_kanban_denied_claim_disposition.py
++++ b/tests/hermes_cli/test_kanban_denied_claim_disposition.py
+@@ -49,6 +49,83 @@ def test_detector_counts_denied_claim_without_keep(gws):
+     assert tid in [t for t, _at in hac.unjudged_claims(hub.conn, support.HUB)]
+ 
+ 
++@pytest.mark.parametrize("body,kept", [
++    ("Run hermes-hub outcomes --id original", "needs home coordination action"),
++    ("Portable repo work: edit, test, PR.", None),
++])
++def test_bounced_hub_pin_with_deny_is_resolved(gws, hub_judge, body, kept):
++    from hermes_cli import kanban_worker_node as wn
++    hub, _worker, svc = gws
++    tid = support._hub_card(hub, body=body)
++    deny(hub, tid)
++    with kb.write_txn(hub.conn):
++        wn.set_runs_on(hub.conn, tid, [f"machine:{support.HUB}"])
++    support._tick(hub)
++    if kept:
++        assert support._holder(svc, tid) == support.HUB
++        assert support._events(hub.conn, tid, "hub_admission")[-1].get("kept") == kept
++    else:
++        assert support._holder(svc, tid) != support.HUB
++        assert support._events(hub.conn, tid, "moved")
++    assert hub_judge.calls == []
++
++
++def test_unchanged_keep_does_not_append_each_screen(gws, hub_judge):
++    hub, _worker, _svc = gws
++    tid = support._hub_card(hub, body="Run hermes-hub outcomes --id original")
++    deny(hub, tid)
++    hac.screen(hub.conn)
++    first = support._events(hub.conn, tid, "hub_admission")
++    hac.screen(hub.conn)
++    assert support._events(hub.conn, tid, "hub_admission") == first
++    assert first[-1]["kept"] == "needs home coordination action"
++
++
++@pytest.mark.parametrize("first,last,flagged", [
++    ({"admit": False, "kept": "host workspace"}, {"admit": False}, True),
++    ({"admit": False}, {"admit": True}, False),
++    ({"admit": True}, {"admit": False}, True),
++    ({"admit": False}, {"admit": False, "kept": "host workspace"}, False),
++    ({"admit": False}, {"admit": False, "forced": True}, False),
++])
++def test_detector_uses_latest_preclaim_disposition(gws, first, last, flagged):
++    hub, _worker, _svc = gws
++    tid = support._hub_card(hub)
++    with kb.write_txn(hub.conn):
++        kb._append_event(hub.conn, tid, "hub_admission", first)
++        kb._append_event(hub.conn, tid, "hub_admission", last)
++        kb._append_event(hub.conn, tid, "claimed", {"holder": support.HUB})
++        # A later correction must not repair the historical census.
++        kb._append_event(hub.conn, tid, "hub_admission", {"admit": True})
++    found = [t for t, _at in hac.unjudged_claims(hub.conn, support.HUB)]
++    assert (tid in found) is flagged
++
++
++@pytest.mark.parametrize("kept", [None, "needs home coordination action"])
++def test_detector_creation_fallback(gws, kept):
++    hub, _worker, _svc = gws
++    tid = support._hub_card(hub)
++    with kb.write_txn(hub.conn):
++        kb._append_event(hub.conn, tid, "created", {"hub_admission": {"admit": False, "kept": kept}})
++        kb._append_event(hub.conn, tid, "claimed", {"holder": support.HUB})
++    found = [t for t, _at in hac.unjudged_claims(hub.conn, support.HUB)]
++    assert (tid in found) is (kept is None)
++
++
++@pytest.mark.parametrize("prior", [True, False])
++def test_denied_without_queue_or_structural_keep_is_deferred(gws, hub_judge, monkeypatch, prior):
++    from hermes_cli import kanban_hub_admission_pickup as pickup
++    hub, _worker, svc = gws
++    tid = support._hub_card(hub)
++    if prior:
++        deny(hub, tid)
++    hub_judge.admit_next = False
++    monkeypatch.setattr(pickup, "_target", lambda *_args: None)
++    support._tick(hub)
++    assert support._holder(svc, tid) != support.HUB
++    assert not any(event.get("kept") for event in support._events(hub.conn, tid, "hub_admission"))
++
++
+ def test_create_home_override_is_explicit_keep():
+     from hermes_cli import kanban_hub_admission_placement as placement
+     result = placement.pool_route(
+diff --git a/tests/hermes_cli/test_kanban_hub_admission_claim.py b/tests/hermes_cli/test_kanban_hub_admission_claim.py
+index 6115d2ab63578357aff33f16ff10f0bc4ffc5c95..e828d058e8e31f4a6f51031c1b32fe2e9ea1c586 100644
+--- a/tests/hermes_cli/test_kanban_hub_admission_claim.py
++++ b/tests/hermes_cli/test_kanban_hub_admission_claim.py
+@@ -189,16 +189,18 @@ def test_the_newest_wake_check_decides(gws, hub_judge):
+     assert _holder(svc, tid) != HUB and len(_events(hub.conn, tid, "moved")) == 1
+ 
+ 
+-def test_a_deny_with_no_worker_queue_is_kept_and_claimed(gws, hub_judge, monkeypatch):
++def test_a_deny_with_no_worker_queue_is_deferred(gws, hub_judge, monkeypatch):
+     from hermes_cli import kanban_placement as kp
+     hub, _worker, svc = gws
+     monkeypatch.setattr(kp, "config", lambda: {"worker_pools": {HUB: [WORKER]}})  # no worker_queue label
+     hub_judge.admit_next = False
+     tid = _hub_card(hub)
+     _tick(hub)
+-    assert _holder(svc, tid) == HUB  # never stranded
++    assert _holder(svc, tid) != HUB  # queue absence is not structural permission
+     [verdict] = _events(hub.conn, tid, "hub_admission")
+-    assert verdict["kept"] == hac.NO_QUEUE and _events(hub.conn, tid, "moved") == []
++    assert "kept" not in verdict and _events(hub.conn, tid, "moved") == []
++    _tick(hub)
++    assert len(hub_judge.calls) == 1 and _holder(svc, tid) != HUB
+ 
+ 
+ def test_a_deny_no_worker_can_claim_is_kept_home_with_the_action_reason(gws, hub_judge, caplog):
+@@ -577,7 +579,7 @@ def test_doctor_flags_unjudged_hub_claims(gws, monkeypatch, capsys):
+     _tick(hub)
+     hub.enter()
+     assert doctor_state._check_hub_admission_claims(False).manual_issues == []
+-    assert "0 hub claims of unjudged cards" in capsys.readouterr().out
++    assert "0 hub claims without an admission disposition" in capsys.readouterr().out
+     monkeypatch.setattr(judge, "admit", lambda card, hub_reason=None: judge.Verdict())
+     tid = _hub_card(hub, title="claimed unjudged")
+     _tick(hub)
+@@ -585,7 +587,7 @@ def test_doctor_flags_unjudged_hub_claims(gws, monkeypatch, capsys):
+     hub.enter()
+     found = doctor_state._check_hub_admission_claims(False)
+     assert len(found.manual_issues) == 1 and tid in found.manual_issues[0], found.manual_issues
+-    assert "1 hub claim(s) of unjudged cards" in capsys.readouterr().out
++    assert "1 hub claim(s) without an admission disposition" in capsys.readouterr().out
+ 
+ 
+ def test_doctor_hub_claim_check_is_silent_off_the_hub(gws, monkeypatch, capsys):
+-- 
+2.43.0
+

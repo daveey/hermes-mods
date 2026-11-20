@@ -1,0 +1,342 @@
+From 2dffbaddee3e7283c30e3fabe9ceee0d4aa3f0fd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 15:01:40 -0800
+Subject: [PATCH] state: online FTS plan refuses what it cannot attribute;
+ one-shot rebuild never drops a shared tree [daveey]
+
+Review round 2 of the online FTS recovery:
+- plan_from_check: a Tree line whose root this snapshot cannot name (including Tree 1, the schema)
+  refuses; a check at its error limit refuses (walk incomplete); schema and check come from one
+  read snapshot; FTS5 xIntegrity blob lines no longer unlink (page structure sound: drained, file
+  ends clean); family_of full-matches the FTS5 shadow suffixes.
+- recover_stale_fts_online re-checks a peer's recovery and the index root pages under the rebuild
+  authority (the plan ran without it); a refused plan is not repeated by the automatic retry for
+  6 h (a whole-file check of a large store).
+- _recover_stale_fts_locked (existing one-shot) now asks the same plan first. On the hub's damage
+  shape its DROP succeeded and freed the shared page twice; the reviewer showed the page then
+  reaches canonical data after ordinary inserts. A named family skips the DROP and the retry
+  recovers online; a refused plan skips it and points at `hermes sessions recover`.
+
+Tests: plan attribution table (Tree 1, unmapped root, canonical tree, freelist, limit); FTS5-only
+lines drain; full-match names; a page shared with `messages` is never drained; the one-shot at
+open steps aside on the hub shape and the retry recovers with no double reference left.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_state_fts_online.py                    |  92 ++++++++++-----
+ hermes_state_schema.py                        |  25 ++++-
+ .../hermes_state/test_fts_online_recovery.py  | 106 +++++++++++++++++-
+ 3 files changed, 193 insertions(+), 30 deletions(-)
+
+diff --git a/hermes_state_fts_online.py b/hermes_state_fts_online.py
+index e2c7030332afcc9994df528f1f3f9d39c30a3aea..bf5ae2ae0229e756afbde332cdd86b9bee384c4e 100644
+--- a/hermes_state_fts_online.py
++++ b/hermes_state_fts_online.py
+@@ -52,55 +52,82 @@ logger = logging.getLogger("hermes_state")
+ 
+ # Wall time one housekeeping tick may spend on backfill / teardown chunks (each chunk its own short transaction).
+ FTS_BACKFILL_TICK_BUDGET_S = 5.0
++# A refused plan (damage outside the index) is not re-checked by the automatic retry for this long.
++ONLINE_REFUSAL_MEMO_S = 6 * 3600.0
+ FAMILIES = ("messages_fts", "messages_fts_trigram")
+ TRASH_PREFIX = "fts_v22_trash_"  # the optimize-storage teardown drains every table with this prefix
+-_FTS5_TABLE_RE = re.compile(r'from table "([^"]+)"')
++
++
++_FAMILY_OBJECT_RE = re.compile(r"(messages_fts(?:_trigram)?)(?:_data|_idx|_content|_docsize|_config)?")
+ 
+ 
+ def family_of(name: str) -> Optional[str]:
+-    """The FTS index family an object name belongs to (``messages_fts_trigram*`` before ``messages_fts*``)."""
+-    if name == "messages_fts_trigram" or name.startswith("messages_fts_trigram_"):
+-        return "messages_fts_trigram"
+-    if name == "messages_fts" or name.startswith("messages_fts_"):
+-        return "messages_fts"
+-    return None
++    """The FTS index family a vtable or shadow-table name belongs to; None for anything else (full match on the
++    FTS5 shadow suffixes, so a lookalike table is never swept in)."""
++    m = _FAMILY_OBJECT_RE.fullmatch(name or "")
++    return m.group(1) if m else None
+ 
+ 
+ class OnlineRecoveryRefused(Exception):
+     """The plan step found a reason not to touch the store."""
+ 
+ 
++_CHECK_LIMIT = 100_000
++
++
++def plan_from_check(lines, master) -> dict:
++    """The decision of :func:`plan_online_recovery` from integrity_check output and the ``(rootpage, type, name)``
++    rows of the same snapshot. Raises :class:`OnlineRecoveryRefused` unless every problem line is attributable.
++
++    Safety rests on how SQLite reports a shared page: the free-page list is walked first and every page is named
++    against the SECOND structure that reaches it. So a family not named by any line shares no page with anything
++    reached after it, and anything reached before it was named itself: a canonical tree (refused here), the other
++    family (unlinked, never read again) or nothing. Draining an unnamed family therefore frees only its own pages.
++    That argument needs every line mapped and the walk complete, hence the refusals below."""
++    from hermes_state_repair import _INTEGRITY_TREE_RE, integrity_damage_is_structural
++
++    problems = [line for line in lines if line not in ("ok", "*** in database main ***")]
++    if len(problems) >= _CHECK_LIMIT - 1:
++        raise OnlineRecoveryRefused(f"integrity_check stopped at its {_CHECK_LIMIT}-error limit; later trees unchecked")
++    if integrity_damage_is_structural(problems, master):
++        raise OnlineRecoveryRefused("integrity_check reports damage outside the search indexes: "
++                                    + "; ".join(problems[:3]))
++    by_root = {int(rp): name for rp, _type, name in master}
++    damaged = set()
++    for line in problems:
++        tree = _INTEGRITY_TREE_RE.search(line)
++        if not tree:
++            continue  # "Page N: never used", FTS5 xIntegrity blob lines: no page is shared
++        name = by_root.get(int(tree.group(1)))
++        family = family_of(name or "")
++        if family is None:  # Tree 1 (sqlite_schema) or a root this snapshot cannot name
++            raise OnlineRecoveryRefused(f"integrity_check names a tree outside the search indexes: {line}")
++        damaged.add(family)
++    return {"unlink": sorted(damaged), "trash": [f for f in FAMILIES if f not in damaged], "problems": len(problems),
++            "roots": {name: int(rp) for rp, _type, name in master if family_of(name)}}
++
++
+ def plan_online_recovery(db_path) -> dict:
+-    """Step 1: ``{"unlink": [...families], "trash": [...families], "problems": n}`` from one read-only whole-file
+-    integrity_check. Raises :class:`OnlineRecoveryRefused` on damage outside the FTS families (or a check that
+-    cannot complete), which an index rebuild cannot fix."""
++    """Step 1: ``{"unlink": [...], "trash": [...], "problems": n, "roots": {...}}`` from one read-only whole-file
++    integrity_check and the schema of the same read snapshot (see :func:`plan_from_check`). Raises
++    :class:`OnlineRecoveryRefused` when it cannot prove the plan safe."""
+     from hermes_state_holders import read_only_db_uri
+-    from hermes_state_repair import _INTEGRITY_TREE_RE, integrity_damage_is_structural
+ 
+     try:
+-        conn = sqlite3.connect(read_only_db_uri(db_path), uri=True, timeout=30.0)
++        conn = sqlite3.connect(read_only_db_uri(db_path), uri=True, timeout=30.0, isolation_level=None)
+     except sqlite3.Error as exc:
+         raise OnlineRecoveryRefused(f"cannot open state.db read-only: {exc}") from exc
+     try:
++        conn.execute("BEGIN")  # one read snapshot for the schema and the check
+         master = [tuple(r) for r in conn.execute("SELECT rootpage, type, name FROM sqlite_master WHERE rootpage > 0")]
+-        lines = [line for r in conn.execute("PRAGMA integrity_check(100000)") for line in str(r[0]).splitlines()]
++        lines = [line for r in conn.execute(f"PRAGMA integrity_check({_CHECK_LIMIT})")
++                 for line in str(r[0]).splitlines()]
++        conn.execute("COMMIT")
+     except sqlite3.DatabaseError as exc:
+         raise OnlineRecoveryRefused(f"integrity_check could not complete: {exc}") from exc
+     finally:
+         conn.close()
+-    problems = [line for line in lines if line not in ("ok", "*** in database main ***")]
+-    if integrity_damage_is_structural(problems, master):
+-        raise OnlineRecoveryRefused("integrity_check reports damage outside the search indexes: "
+-                                    + "; ".join(problems[:3]))
+-    by_root = {int(rp): name for rp, _type, name in master}
+-    damaged = set()
+-    for line in problems:
+-        tree = _INTEGRITY_TREE_RE.search(line)
+-        named = _FTS5_TABLE_RE.search(line)  # FTS5's own xIntegrity lines name the vtable
+-        family = family_of(by_root.get(int(tree.group(1)), "")) if tree else family_of(named.group(1)) if named else None
+-        if family:
+-            damaged.add(family)
+-    return {"unlink": sorted(damaged), "trash": [f for f in FAMILIES if f not in damaged], "problems": len(problems)}
++    return plan_from_check(lines, master)
+ 
+ 
+ def _sql_names(names) -> str:
+@@ -159,9 +186,12 @@ class SessionFtsOnlineRecoveryMixin:
+                     logger.warning("Online FTS recovery skipped: legacy inline FTS layout (run "
+                                    "`hermes sessions optimize-storage`).")
+                     return False
++            if not force and time.monotonic() < getattr(self, "_fts_online_refused_until", 0.0):
++                return False  # a whole-file check of a large store is not repeated every retry
+             try:
+                 plan = plan_online_recovery(self.db_path)
+             except OnlineRecoveryRefused as exc:
++                self._fts_online_refused_until = time.monotonic() + ONLINE_REFUSAL_MEMO_S
+                 logger.error("Online FTS recovery refused (%s): %s. `hermes sessions recover` rebuilds the store "
+                              "offline.", reason, exc)
+                 return False
+@@ -172,6 +202,16 @@ class SessionFtsOnlineRecoveryMixin:
+                     if self._conn is None:
+                         return False
+                     cursor = self._conn.cursor()
++                    # The plan ran without the lock: a peer may have recovered meanwhile (its new tables must not get
++                    # this plan), or the index objects may have moved. Re-check both under the authority.
++                    if not force and self._adopt_peer_fts_state_locked(cursor):
++                        return True
++                    roots = {r[0]: int(r[1]) for r in cursor.execute(
++                        "SELECT name, rootpage FROM sqlite_master WHERE rootpage > 0").fetchall() if family_of(r[0])}
++                    if roots != plan["roots"]:
++                        logger.info("Online FTS recovery: the index objects changed since the plan; the next retry "
++                                    "plans again.")
++                        return False
+                     trigram = self._trigram_tokenizer_available(cursor)
+                     tables = [(r[0], (r[1] or "").startswith("CREATE VIRTUAL")) for r in cursor.execute(
+                         "SELECT name, sql FROM sqlite_master WHERE type = 'table' ORDER BY name").fetchall()]
+diff --git a/hermes_state_schema.py b/hermes_state_schema.py
+index d24f53ea25d0eb54d7aa5fe9107e68c15b8f5fd4..e6e76776588b779c9aa18c5cd5dbfbd1a6e2ad19 100644
+--- a/hermes_state_schema.py
++++ b/hermes_state_schema.py
+@@ -574,6 +574,23 @@ class SessionSchemaMixin:
+         )
+         return True
+ 
++    def _oneshot_drop_is_safe(self) -> bool:
++        """False when the whole-file plan names a damaged index tree (the retry then takes the online path, which
++        unlinks it unread) or cannot attribute the damage (nothing may be freed; ``hermes sessions recover``)."""
++        from hermes_state_fts_online import OnlineRecoveryRefused, plan_online_recovery
++
++        try:
++            plan = plan_online_recovery(self.db_path)
++        except OnlineRecoveryRefused as exc:
++            logger.error("Stale FTS rebuild skipped: %s. `hermes sessions recover` rebuilds the store offline.", exc)
++            return False
++        if plan["unlink"]:
++            self._fts_oneshot_failed = True
++            logger.error("Stale FTS rebuild skipped: integrity_check names damaged index tree(s) %s, which a DROP could "
++                         "free twice; the next retry recovers online (unlinks them unread).", ", ".join(plan["unlink"]))
++            return False
++        return True
++
+     @staticmethod
+     def _fts_deferral_futile(cursor: sqlite3.Cursor) -> bool:
+         """The stored holder-deferral record says waiting is futile (``_defer_stale_fts_for_holders``)."""
+@@ -681,7 +698,13 @@ class SessionSchemaMixin:
+ 
+     def _recover_stale_fts_locked(self, cursor: sqlite3.Cursor, *, legacy: bool) -> bool:
+         """Body of :meth:`_recover_stale_fts`; caller holds rebuild authority. One write
+-        transaction, so no canonical writer slips between rebuild and trigger restoration."""
++        transaction, so no canonical writer slips between rebuild and trigger restoration.
++
++        Guarded by the online recovery's whole-file plan (hermes_state_fts_online): when an index tree shares a
++        page with another structure (the hub's 2026-11-18 damage), DROP can succeed and free that page twice, and
++        the doubly freed page is later handed to canonical data. A named family or a refused plan skips the DROP."""
++        if not legacy and not self._oneshot_drop_is_safe():
++            return False
+         try:
+             trigram_present = self._fts_table_probe(cursor, "messages_fts_trigram") is True
+         except (sqlite3.DatabaseError, UnicodeDecodeError):
+diff --git a/tests/hermes_state/test_fts_online_recovery.py b/tests/hermes_state/test_fts_online_recovery.py
+index 57d73c29a9d0f06bdae8f0f96f7553d3cb2d2477..e742b84ca836fc422e3e338a29582581fbf02b85 100644
+--- a/tests/hermes_state/test_fts_online_recovery.py
++++ b/tests/hermes_state/test_fts_online_recovery.py
+@@ -366,11 +366,9 @@ def test_damage_outside_the_search_index_is_refused(tmp_path):
+     with open(path, "r+b") as fh:
+         fh.seek((root - 1) * page)
+         fh.write(b"\x0f" * 64)
+-    db = SessionDB.__new__(SessionDB)  # a full open would quarantine on the damaged canonical table first
+     from hermes_state_fts_online import OnlineRecoveryRefused, plan_online_recovery
+-    with pytest.raises(OnlineRecoveryRefused):
++    with pytest.raises(OnlineRecoveryRefused):  # a full open would quarantine on the damaged canonical table first
+         plan_online_recovery(path)
+-    del db
+     with _raw(path) as conn:
+         assert conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name = 'messages_fts_trigram_data'").fetchone()[0] == 1
+ 
+@@ -428,3 +426,105 @@ def test_an_index_damaged_so_badly_that_integrity_check_fails_is_refused(tmp_pat
+                                 ).fetchone()[0] == 1
+     finally:
+         db.close()
++
++
++_MASTER = [(2, "table", "sessions"), (3, "table", "messages"), (80, "table", "messages_fts_trigram_data"),
++           (81, "table", "messages_fts_trigram_idx"), (90, "table", "messages_fts_data")]
++
++
++@pytest.mark.parametrize("lines,unlink", [
++    (["Tree 80 page 2 cell 3: 2nd reference to page 7", "Page 9: never used"], ["messages_fts_trigram"]),
++    (['fts5: corruption found reading blob 12 from table "messages_fts"'], []),  # page structure sound: drain
++    (["Tree 80 page 2: x", "Tree 90 page 4: y"], ["messages_fts", "messages_fts_trigram"]),
++    (["ok"], []),
++])
++def test_plan_unlinks_exactly_the_named_families(lines, unlink):
++    from hermes_state_fts_online import plan_from_check
++    plan = plan_from_check(lines, _MASTER)
++    assert plan["unlink"] == unlink
++    assert sorted(plan["unlink"] + plan["trash"]) == ["messages_fts", "messages_fts_trigram"]
++
++
++@pytest.mark.parametrize("lines", [
++    ["Tree 1 page 1 cell 3: 2nd reference to page 41"],          # the schema table itself
++    ["Tree 99 page 5: 2nd reference to page 6"],                 # a root this snapshot cannot name
++    ["Tree 3 page 7 cell 0: 2nd reference to page 80"],          # a canonical table
++    ["Freelist: 2nd reference to page 5"],
++    ["Tree 80 page 2: x"] * 100_000,                              # the check stopped at its limit
++])
++def test_plan_refuses_what_it_cannot_attribute(lines):
++    from hermes_state_fts_online import OnlineRecoveryRefused, plan_from_check
++    with pytest.raises(OnlineRecoveryRefused):
++        plan_from_check(lines, _MASTER)
++
++
++def test_family_of_full_matches_shadow_names():
++    assert family_of("messages_fts_trigram_docsize") == "messages_fts_trigram"
++    assert family_of("messages_fts_config") == "messages_fts"
++    assert family_of("messages_fts_notes") is None and family_of("messages_ftsnot") is None
++    assert family_of("fts_v22_trash_messages_fts_data_1") is None
++
++
++def test_a_page_shared_with_a_canonical_table_is_never_freed(tmp_path, monkeypatch):
++    """The trigram index points at a page of `messages`. Whichever structure SQLite names, the recovery either
++    refuses or unlinks the trigram family; it never drains it, and `messages` keeps every row."""
++    import struct
++
++    path = tmp_path / "state.db"
++    _seed(path)
++    before = _canonical(path)
++    conn = _raw(path)
++    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
++    root = conn.execute("SELECT rootpage FROM sqlite_master WHERE name = 'messages_fts_trigram_data'").fetchone()[0]
++    victim = conn.execute("SELECT pageno FROM dbstat WHERE name = 'messages' AND pagetype = 'leaf' ORDER BY pageno "
++                          "LIMIT 1").fetchone()[0]
++    page_size = conn.execute("PRAGMA page_size").fetchone()[0]
++    _mark_fail_open(conn)
++    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
++    conn.close()
++    with open(path, "r+b") as fh:
++        fh.seek((root - 1) * page_size)
++        page = bytearray(fh.read(page_size))
++        assert page[0] == 5
++        page[8:12] = struct.pack(">I", victim)
++        fh.seek((root - 1) * page_size)
++        fh.write(page)
++    monkeypatch.setattr(SessionDB, "_foreign_state_db_holders", lambda self: [(424242, str(path))])
++    db = _open_stale(path)
++    try:
++        recovered = db.retry_deferred_fts_recovery()
++        if recovered:
++            _drain(db)
++    finally:
++        db.close()
++    assert _canonical(path)[:len(before)] == before
++    with _raw(path) as conn:
++        assert conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'fts_v22_trash_messages_fts_trigram%'"
++                            ).fetchone()[0] == 0
++    if recovered:
++        lines, _master = _integrity_lines(path)
++        assert not [l for l in lines if "2nd reference" in l]
++
++
++def test_one_shot_rebuild_never_drops_a_tree_that_shares_a_page(tmp_path):
++    """No other holder, so the one-shot rebuild runs at open. On the hub's damage shape its DROP would succeed and free
++    the shared page twice; it must step aside, and the retry recovers online instead."""
++    path = tmp_path / "state.db"
++    _seed(path)
++    before = _canonical(path)
++    _break_trigram_btree(path)
++    db = SessionDB(db_path=path)
++    try:
++        assert db._fts_stale is True and db._fts_oneshot_failed is True
++        with _raw(path) as conn:
++            assert conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name = 'messages_fts_trigram_data'"
++                                ).fetchone()[0] == 1  # not dropped
++        db._fts_stale_retry_after = 0.0
++        assert db.retry_deferred_fts_recovery() is True
++        _drain(db)
++        assert db.search_messages("alphaword")
++    finally:
++        db.close()
++    assert _canonical(path)[:len(before)] == before
++    lines, _master = _integrity_lines(path)
++    assert not [l for l in lines if "2nd reference" in l or l.startswith("Freelist")]
+-- 
+2.43.0
+

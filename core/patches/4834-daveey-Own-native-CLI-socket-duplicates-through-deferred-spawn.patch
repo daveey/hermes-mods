@@ -1,0 +1,328 @@
+From 7768669625c01295d377d7722af50d8023f5c85f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 09:13:48 +0000
+Subject: [PATCH] [daveey] Own native CLI socket duplicates through deferred
+ spawn
+
+Serialize endpoint duplication with retirement; retain per-spawn ownership through Popen without holding retirement hostage. Preserve cancellation reports and scrub stale locators at common child-environment creation.
+
+Proof: six regression failures before fix; final 1584 focused/scanner tests pass; nine exact lifetime mutants killed; scripts/check passes. Bounded independent delta review found no blockers. Full native guard proof and canonical landing still pending.
+---
+ tests/tools/test_origin_cli_spawn_lifetime.py | 149 ++++++++++++++++++
+ tools/environments/local.py                   |  29 ++--
+ tools/origin_cli_bridge.py                    |  33 +++-
+ tools/origin_cli_terminal.py                  |   3 +
+ 4 files changed, 198 insertions(+), 16 deletions(-)
+ create mode 100644 tests/tools/test_origin_cli_spawn_lifetime.py
+
+diff --git a/tests/tools/test_origin_cli_spawn_lifetime.py b/tests/tools/test_origin_cli_spawn_lifetime.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..76611dfe481c64ce0d428ce795b966bd0d200e68
+--- /dev/null
++++ b/tests/tools/test_origin_cli_spawn_lifetime.py
+@@ -0,0 +1,149 @@
++"""Deterministic retirement at the spawn boundary, not timing sleeps."""
++import json
++import os
++import socket
++from types import SimpleNamespace
++
++import pytest
++
++from tools.origin_cli_bridge import ENV_KEY, Launch
++
++
++def test_spawn_lease_owns_duplicate_across_retirement():
++    launch = Launch(None)
++    try:
++        with launch.spawn_endpoint() as (fd, locator):
++            assert fd != launch.child_fd
++            identity = os.fstat(fd)
++            assert json.loads(locator)["fd"] == fd
++            launch.close()
++            # Retiring the offer must not close a descriptor already handed to
++            # a delayed Popen, even if unrelated descriptors are allocated now.
++            with socket.socket() as unrelated:
++                assert unrelated.fileno() != fd
++                assert os.fstat(fd) == identity
++        with pytest.raises(OSError):
++            os.fstat(fd)
++        with pytest.raises(RuntimeError, match="retired"):
++            with launch.spawn_endpoint():
++                pytest.fail("retired launch acquired a spawn endpoint")
++    finally:
++        launch.close()
++
++
++def test_duplicate_and_retirement_share_lock(monkeypatch):
++    from threading import Event, Lock, Thread, current_thread
++    launch = Launch(None)
++    duplicating, release, retire_waiting, retired = Event(), Event(), Event(), Event()
++    lock = Lock()
++    class ObservedLock:
++        def __enter__(self):
++            if current_thread().name == "retire-probe":
++                retire_waiting.set()
++            lock.acquire()
++        def __exit__(self, *args):
++            lock.release()
++    launch._spawn_lock = ObservedLock()
++    original = socket.socket.dup
++    def slow_dup(sock):
++        if sock is launch._child:
++            duplicating.set()
++            assert release.wait(5)
++        return original(sock)
++    monkeypatch.setattr(socket.socket, "dup", slow_dup)
++    errors = []
++    def spawn():
++        try:
++            with launch.spawn_endpoint():
++                pass
++        except BaseException as exc:
++            errors.append(exc)
++    def retire():
++        launch.close()
++        retired.set()
++    spawner = Thread(target=spawn)
++    closer = Thread(target=retire, name="retire-probe")
++    try:
++        spawner.start()
++        assert duplicating.wait(5)
++        closer.start()
++        assert retire_waiting.wait(5)
++        assert not retired.is_set()
++    finally:
++        release.set()
++        spawner.join(5)
++        if closer.ident is not None:
++            closer.join(5)
++        launch.close()
++    assert not errors
++    assert not spawner.is_alive() and not closer.is_alive()
++
++
++def test_delayed_local_spawn_refuses_after_retire(monkeypatch, tmp_path):
++    from tools.environments import local
++    env = object.__new__(local.LocalEnvironment)
++    env.env, env.cwd = {}, str(tmp_path)
++    launch = Launch(None)
++    monkeypatch.setattr(env, "_recover_cwd", launch.close)
++    monkeypatch.setattr(local.subprocess, "Popen", lambda *a, **kw: pytest.fail("spawned retired offer"))
++    try:
++        with pytest.raises(RuntimeError, match="retired"):
++            env._run_bash("true", origin_cli_launch=launch)
++    finally:
++        launch.close()
++
++
++def test_real_popen_after_retirement_keeps_exact_socket(monkeypatch, tmp_path):
++    import shlex
++    import sys
++    from tools.environments import local
++    env = object.__new__(local.LocalEnvironment)
++    env.env, env.cwd = {}, str(tmp_path)
++    launch = Launch(None)
++    original = local.subprocess.Popen
++    captured = []
++    def delayed(*args, **kwargs):
++        fd, = kwargs["pass_fds"]
++        assert json.loads(kwargs["env"][ENV_KEY])["fd"] == fd
++        inode = os.fstat(fd).st_ino
++        launch.close()  # between endpoint acquisition and actual Popen
++        with socket.socket() as unrelated:
++            assert unrelated.fileno() != fd
++            proc = original(*args, **kwargs)
++        captured.append((fd, inode))
++        return proc
++    monkeypatch.setattr(local.subprocess, "Popen", delayed)
++    code = "import os,json; v=json.loads(os.environ['HERMES_ORIGIN_CLI_BRIDGE']); print(os.fstat(v['fd']).st_ino)"
++    try:
++        proc = env._run_bash(shlex.join([sys.executable, "-c", code]), origin_cli_launch=launch)
++        output, _ = proc.communicate(timeout=5)
++        assert proc.returncode == 0
++        assert int(output.strip()) == captured[0][1]
++        with pytest.raises(OSError):
++            os.fstat(captured[0][0])
++    finally:
++        launch.close()
++
++
++@pytest.mark.parametrize("error", [KeyboardInterrupt, SystemExit])
++def test_cancellation_retains_admission_report(monkeypatch, error):
++    from tools import origin_cli_terminal as boundary
++    closed = []
++    report = [{"outcome": "outcome_unknown", "task_id": "fixture"}]
++    launch = SimpleNamespace(retire=lambda: report, close=lambda: closed.append(True))
++    monkeypatch.setattr(boundary, "offer", lambda *a, **kw: launch)
++    def fail(*a, **kw):
++        raise error("cancel")
++    with pytest.raises(error) as caught:
++        boundary.execute(SimpleNamespace(execute=fail), "true", env_type="local", task_id=None)
++    assert closed == [True]
++    assert "outcome_unknown" in " ".join(caught.value.__notes__)
++    assert "do not retry" in " ".join(caught.value.__notes__)
++
++
++@pytest.mark.parametrize("scrub", [False, True])
++def test_common_subprocess_factory_drops_stale_locator(scrub):
++    from tools.environments.local import build_subprocess_env
++    env = build_subprocess_env({ENV_KEY: "stale", "PATH": "/usr/bin"},
++                               scrub_secrets=scrub, extra={ENV_KEY: "also stale"})
++    assert ENV_KEY not in env
+diff --git a/tools/environments/local.py b/tools/environments/local.py
+index cc23e02059574cb8c046ebb010559a7b43a004fa..f33497ea02809f70c35b0caef392393289f6f2c1 100644
+--- a/tools/environments/local.py
++++ b/tools/environments/local.py
+@@ -434,13 +434,16 @@ def build_subprocess_env(
+             # exactly as they do in the launch process (``_apply_managed_env`` applies them last).
+             restore_managed_env(env)
+     if scrub_secrets:
+-        return _sanitize_subprocess_env(env, dict(extra) if extra else None)
++        clean = _sanitize_subprocess_env(env, dict(extra) if extra else None)
++        clean.pop("HERMES_ORIGIN_CLI_BRIDGE", None)
++        return clean
+     if inherit_profile_home:
+         _apply_profile_home(env)
+     if extra:
+         env.update(extra)
+     strip_supervised_process_identity(env)
+     from agent.delegation_context import delegated_child_subprocess_env
++    env.pop("HERMES_ORIGIN_CLI_BRIDGE", None)
+     return delegated_child_subprocess_env(env)
+ 
+ 
+@@ -1240,8 +1243,7 @@ class LocalEnvironment(BaseEnvironment):
+         bash = _find_bash()
+         run_env = _make_run_env(self.env)
+         run_env.pop(ENV_KEY, None)
+-        if origin_cli_launch is not None:
+-            run_env[ENV_KEY] = origin_cli_launch.locator
++
+         # Login invocations (init_session's env snapshot) source the user's rc /
+         # custom init files so nvm/asdf/pyenv land on PATH in the snapshot; then the
+         # spawn env's dirs a resetting profile dropped are re-appended (#56634).
+@@ -1259,14 +1261,19 @@ class LocalEnvironment(BaseEnvironment):
+             return proc
+         # Not spawn_owned: an awaited command needs no spawn-ledger entry; own_process_groups below hands
+         # its group to the owner-death supervisor and _wait_for_process releases it.
+-        proc = subprocess.Popen(
+-            args, text=True, env=run_env, encoding="utf-8", errors="replace",
+-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+-            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+-            # detached-spawn: ok — owned via own_process_groups right below
+-            start_new_session=True, cwd=self.cwd,
+-            **({"pass_fds": (origin_cli_launch.child_fd,)} if origin_cli_launch is not None else {}),
+-            **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
++        from contextlib import nullcontext
++        endpoint = origin_cli_launch.spawn_endpoint() if origin_cli_launch is not None else nullcontext()
++        with endpoint as offered:
++            if offered is not None:
++                run_env[ENV_KEY] = offered[1]
++            proc = subprocess.Popen(
++                args, text=True, env=run_env, encoding="utf-8", errors="replace",
++                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
++                stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
++                # detached-spawn: ok — owned via own_process_groups right below
++                start_new_session=True, cwd=self.cwd,
++                **({"pass_fds": (offered[0],)} if offered is not None else {}),
++                **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
+         if not _IS_WINDOWS:
+             # The command dies with this process however it dies: a SIGKILLed / OOM-killed host left a
+             # running `npm run dev` or `sleep` on init. Released once the wait returns (see below).
+diff --git a/tools/origin_cli_bridge.py b/tools/origin_cli_bridge.py
+index 47c12dbab7e38f34cc2303434398cfa91b06a666..237e89fa26aa4d488dbcc062491969aa6f9380f8 100644
+--- a/tools/origin_cli_bridge.py
++++ b/tools/origin_cli_bridge.py
+@@ -5,13 +5,14 @@ transaction. A private reply socket per packet prevents sibling clients stealing
+ responses. Retirement fences admission without waiting for slow tool execution.
+ """
+ from array import array
++from contextlib import contextmanager
+ from contextvars import copy_context
+ import json
+ import os
+ import secrets
+ import select
+ import socket
+-from threading import Thread
++from threading import Lock, Thread
+ 
+ from hermes_cli.kanban_origin_admission import strict_local_creation
+ from hermes_cli.kanban_origin_cli_gate import LaunchGate
+@@ -34,7 +35,12 @@ def _unknown():
+ 
+ 
+ class Launch:
+-    """Construct on the terminal caller thread; pass only child_fd to Popen."""
++    """Capture on the caller thread; use spawn_endpoint ownership for Popen.
++
++    This is not a sandbox: a shell can unset the locator and use legacy local
++    creation, but that path receives no trusted origin receipt. Environment
++    strings select a channel; they never establish origin custody.
++    """
+     def __init__(self, task_id):
+         from tools.thread_context import _callback_api
+         self._ctx = copy_context()
+@@ -46,6 +52,7 @@ class Launch:
+         self._server, self._child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+         self._server.settimeout(0.1)
+         self._closed = False
++        self._spawn_lock = Lock()
+         self._requests = 0
+         self._thread = Thread(target=self._serve, name="origin-cli-bridge", daemon=True)
+         try:
+@@ -63,9 +70,26 @@ class Launch:
+     def locator(self):
+         return json.dumps({"fd": self.child_fd, "nonce": self._nonce})
+ 
++    @contextmanager
++    def spawn_endpoint(self):
++        """Own a duplicate until Popen returns, never a borrowed fd number.
++
++        Retirement can finish while Popen stalls. Already acquired endpoints
++        stay valid, but the retired admission gate refuses their requests.
++        """
++        with self._spawn_lock:
++            if self._closed:
++                raise RuntimeError("CLI launch retired before spawn")
++            endpoint = self._child.dup()
++        with endpoint:
++            fd = endpoint.fileno()
++            yield fd, json.dumps({"fd": fd, "nonce": self._nonce})
++
+     def retire(self):
+-        reports = self._gate.retire()
+-        self._closed = True
++        with self._spawn_lock:
++            reports = self._gate.retire()
++            self._closed = True
++            self._child.close()
+         try:
+             self._server.shutdown(socket.SHUT_RD)
+         except OSError:
+@@ -74,7 +98,6 @@ class Launch:
+ 
+     def close(self):
+         self.retire()
+-        self._child.close()
+         # Server owns its fd until its loop exits; never close underneath recvmsg.
+ 
+     def _invoke(self, args, gate):
+diff --git a/tools/origin_cli_terminal.py b/tools/origin_cli_terminal.py
+index aa75c34a2f029e5221f0d47c1ae4af5a944efa4c..f3f57359ed557794fdc134272e91ba097a4cac41 100644
+--- a/tools/origin_cli_terminal.py
++++ b/tools/origin_cli_terminal.py
+@@ -47,6 +47,9 @@ def execute(env, command, *, env_type, task_id, attempt=None, **kwargs):
+     except Exception as exc:  # health: allow BLE001 -- convert every backend failure to a non-retryable outcome
+         raise NoRetry("CLI custody launch failed; do not retry automatically. "
+                       + json.dumps(reports)) from exc
++    except BaseException as exc:
++        exc.add_note("Native CLI admission; do not retry automatically: " + json.dumps(reports))
++        raise
+     finally:
+         launch.close()
+     if reports:
+-- 
+2.43.0
+

@@ -1,0 +1,454 @@
+From 5b041f64fbf188aca027c9a38707ddf5f39eaf49 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 14:17:00 +0000
+Subject: [PATCH] feat(fairness): validate complete fleet roster evidence
+ [daveey]
+
+Inventory tree scans only describe respondents, not complete fleet coverage.
+Add a read-only roster manifest validator and inventory roster CLI that keeps
+expected/opening/closing/coverage source identities separate, retains unknowns,
+and refuses duplicates, offline sources, gaps and changing membership.
+
+Identity is gateway/profile/board UID/database UID; serving process, source and
+config pins must agree with capture receipts. Membership continuity requires
+its own receipt rather than inference from equal endpoint lists. Version 1
+explicitly refuses changing membership rather than inventing join coverage.
+
+No scheduler/capture activation, replay, policy changes or fairness claims.
+The full report coverage consumer is owned by the sibling Phase A gate task;
+this standalone validator does not silently mutate an existing capture.
+
+Tests cover complete, omitted, duplicate, offline, changing and malformed
+rosters plus the real operator CLI. Read-only current discovery intentionally
+validates INDETERMINATE because no authorized capture window or process/cut
+attestations exist. Registry eligibility is not proof of actual serving.
+---
+ docs/kanban-fairness-roster.md                |  81 ++++++++++
+ hermes_cli/kanban_fairness_roster.py          | 140 ++++++++++++++++++
+ scripts/kanban_fairness.py                    |  14 +-
+ .../hermes_cli/test_kanban_fairness_roster.py | 132 +++++++++++++++++
+ 4 files changed, 366 insertions(+), 1 deletion(-)
+ create mode 100644 docs/kanban-fairness-roster.md
+ create mode 100644 hermes_cli/kanban_fairness_roster.py
+ create mode 100644 tests/hermes_cli/test_kanban_fairness_roster.py
+
+diff --git a/docs/kanban-fairness-roster.md b/docs/kanban-fairness-roster.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..68bac3b90a5808977f2db4fbdaf11c8f8069c51c
+--- /dev/null
++++ b/docs/kanban-fairness-roster.md
+@@ -0,0 +1,81 @@
++# Fairness Phase A fleet roster
++
++`inventory scan` describes named trees, not the fleet. A successful scan of the
++responding hosts does not establish that all queue-serving sources responded.
++Validate the independent fleet roster before using those inventories:
++
++```sh
++scripts/hermes-python scripts/kanban_fairness.py inventory roster \
++  --manifest plan.json --output roster-validation.json
++```
++
++This command only reads the plan and writes the requested validation file. It
++never activates capture, polls a gateway, changes placement, or claims work.
++Exit 0 means structurally complete roster evidence; exit 2 means incomplete or
++unsupported evidence, not an empty successful inventory. It is not a fairness
++verdict. The capture-validation owner must also gate the full report on this
++result; running the standalone command does not alter an existing capture.
++
++## Discovery contract
++
++Retain a read-only registry listing including inactive/offline entries, declared
++worker pools, and each relevant gateway's board and profile inventories. Record
++provenance and observation times. Reconcile those lists against actual serving
++process receipts. A registry's `pickup=true` or a recent heartbeat alone does
++not prove that a process serves a board/profile. Held or inactive entries need
++an explicit disposition supported by evidence, not removal from the discovery
++record. A gateway that cannot answer remains unknown. Do not wake retired hosts.
++
++Names/slugs are lookup labels, not proof of database identity. Bind the registry
++gateway identity and profile to authoritative `board_uid` and `database_uid`
++from source receipts. Never substitute a local task/run/event integer, invent a
++UID for an unanswered source, or identify a database by its path alone. Retain
++unknown discoveries separately in the source evidence and set discovery
++`complete:false` until they are resolved. Enumerate *every* relevant board and
++profile on each serving gateway, rather than a Cartesian product of guesses.
++
++## Manifest schema
++
++`manifest.roster` is a version 1 object with:
++
++- `window: {start_ms, end_ms}`: nonnegative integer cuts, end strictly after start.
++- `expected_sources`: independently enumerated source identity rows, including
++  unavailable sources. Identity is the tuple
++  `(source_gateway, profile, board_uid, database_uid)`, all nonempty strings.
++- `opening` and `closing`: `{complete, provenance, observed_ms, sources, unknown_sources}`.
++  `unknown_sources` must be an explicit empty list for complete evidence; retain
++  unresolved registry entries here with their original labels and reasons.
++  `observed_ms` equals the corresponding window cut. Each source row carries
++  identity plus `process_epoch`, `core_revision`, `config_sha256`. These pins
++  describe the loaded serving process/configuration, not just checkout HEAD.
++- `membership`: `{complete, provenance, start_ms, end_ms, events}`. This is a
++  continuous membership-journal receipt spanning the window, not a conclusion
++  inferred from equal opening and closing lists. Without such evidence use
++  `complete:false`; unobserved between-poll joins remain unknown.
++- `coverage`: source identity and pins plus `status`, `provenance`, `start_ms`,
++  `end_ms`, `opening_cut`, `closing_cut`. Status is `ok` only with actual source
++  receipts covering the whole served interval. Use `offline` or `unknown` and
++  null cuts for unavailable evidence. Cuts are source-epoch-qualified journal
++  positions, not bare local sequence integers.
++
++All provenance strings refer to retained evidence artifacts. The checker checks
++structure and agreement, not authenticity of operator assertions or existence
++of arbitrary provenance references. Discovery must independently establish
++scope completeness: omitting a source from *all* declarations cannot be detected
++by comparing those declarations alone. An assertion copied from the capture
++receipts is not independent discovery.
++
++The checker returns the union of expected, opening, closing and coverage sources,
++with each contributing row and nulls for missing sections. It rejects duplicates,
++empty rosters, missing identities/pins/provenance, unavailable sources, cut gaps,
++and process/revision/configuration changes. Version 1 intentionally rejects any
++membership event or opening/closing membership difference as
++`membership_changed`; it does not claim to reconcile joined/departed intervals.
++Even a transient join that left before closing must appear in membership events.
++Changed membership requires reconciliation by the capture owner, never a rerun
++that quietly deletes the source. Missing continuity makes the window incomplete.
++
++A read-only discovery collected outside an authorized capture will normally be
++INDETERMINATE: no opening/closing capture cuts or continuous membership evidence
++exist. Preserve that output and the labeled unknowns; do not manufacture seals,
++activation, timestamps, process pins or successful empty captures to make it pass.
+diff --git a/hermes_cli/kanban_fairness_roster.py b/hermes_cli/kanban_fairness_roster.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..726a7028c4b30ba859433c5b599b920212e679ad
+--- /dev/null
++++ b/hermes_cli/kanban_fairness_roster.py
+@@ -0,0 +1,140 @@
++"""Read-only fleet roster evidence validation; never discover by successful replies alone.
++
++A source is a gateway/profile/board/database tuple, not a local integer or a host alias.
++Discovery and membership receipts are separate from capture receipts. Version 1 refuses
++changing membership rather than guessing coverage for a joined or departed executor.
++"""
++from __future__ import annotations
++
++IDENTITY = ("source_gateway", "profile", "board_uid", "database_uid")
++PINS = ("process_epoch", "core_revision", "config_sha256")
++
++
++def _text(value) -> bool:
++    return isinstance(value, str) and bool(value.strip())
++
++
++def _time(value) -> bool:
++    return type(value) is int and value >= 0
++
++
++def _problem(problems: list, code: str, detail: str) -> None:
++    problems.append({"code": code, "detail": detail})
++
++
++def _rows(value, section: str, problems: list) -> dict:
++    result = {}
++    if not isinstance(value, list):
++        _problem(problems, "invalid_sources", section)
++        return result
++    for index, row in enumerate(value):
++        if not isinstance(row, dict) or not all(_text(row.get(k)) for k in IDENTITY):
++            _problem(problems, "invalid_identity", f"{section}[{index}]")
++            continue
++        identity = tuple(row[k] for k in IDENTITY)
++        if identity in result:
++            _problem(problems, "duplicate_identity", f"{section}: {identity!r}")
++        else:
++            result[identity] = row
++    return result
++
++
++def _snapshot(value, section: str, at_ms, problems: list) -> dict:
++    if not isinstance(value, dict):
++        _problem(problems, "discovery_incomplete", section)
++        return {}
++    if value.get("complete") is not True:
++        _problem(problems, "discovery_incomplete", section)
++    if value.get("unknown_sources") != []:
++        _problem(problems, "discovery_incomplete", f"{section}: unresolved or absent unknown-source inventory")
++    if not _text(value.get("provenance")):
++        _problem(problems, "missing_provenance", section)
++    if not _time(value.get("observed_ms")) or value["observed_ms"] != at_ms:
++        _problem(problems, "discovery_cut_mismatch", section)
++    rows = _rows(value.get("sources"), section, problems)
++    for identity, row in rows.items():
++        if not all(_text(row.get(k)) for k in PINS):
++            _problem(problems, "missing_source_pin", f"{section}: {identity!r}")
++    return rows
++
++
++def _membership(value, start, end, problems: list) -> None:
++    if not isinstance(value, dict):
++        _problem(problems, "membership_incomplete", "missing membership journal receipt")
++        return
++    if value.get("complete") is not True:
++        _problem(problems, "membership_incomplete", "membership journal is incomplete")
++    if not _text(value.get("provenance")):
++        _problem(problems, "missing_provenance", "membership")
++    if not _time(value.get("start_ms")) or not _time(value.get("end_ms")) \
++            or value["start_ms"] != start or value["end_ms"] != end:
++        _problem(problems, "membership_incomplete", "membership does not cover the window")
++    events = value.get("events")
++    if not isinstance(events, list):
++        _problem(problems, "membership_incomplete", "missing membership events")
++    elif events:
++        _problem(problems, "membership_changed", "membership events require interval reconciliation")
++
++
++def _coverage(row: dict, identity: tuple, start, end, problems: list) -> None:
++    detail = repr(identity)
++    if row.get("status") != "ok":
++        _problem(problems, "source_unavailable", detail)
++    if not _text(row.get("provenance")):
++        _problem(problems, "missing_provenance", f"coverage: {detail}")
++    if not _time(row.get("start_ms")) or not _time(row.get("end_ms")) \
++            or row["start_ms"] != start or row["end_ms"] != end:
++        _problem(problems, "coverage_gap", detail)
++    if not all(_text(row.get(k)) for k in ("opening_cut", "closing_cut")):
++        _problem(problems, "missing_cut", detail)
++
++
++def validate(value) -> dict:
++    """Return explicit incomplete evidence for missing, malformed or unsupported rosters.
++
++    Expected sources come from the independently declared fleet inventory, including offline
++    sources. Discovery snapshots must enumerate the entire scope, not just responding hosts.
++    Provenance refers to retained read-only source evidence; this checks its structure and
++    consistency, not the authenticity of an operator's assertion of discovery completeness.
++    """
++    problems: list[dict] = []
++    result = {"version": 1, "complete": False, "problems": problems, "sources": []}
++    if not isinstance(value, dict) or value.get("version") != 1:
++        _problem(problems, "invalid_roster", "expected a version 1 roster object")
++        return result
++    result["unknown_sources"] = {
++        section: value.get(section, {}).get("unknown_sources")
++        for section in ("opening", "closing") if isinstance(value.get(section), dict)
++    }
++    window = value.get("window")
++    window = window if isinstance(window, dict) else {}
++    start, end = window.get("start_ms"), window.get("end_ms")
++    if not _time(start) or not _time(end) or end <= start:
++        _problem(problems, "invalid_window", "a nonempty bounded window is required")
++    expected = _rows(value.get("expected_sources"), "expected_sources", problems)
++    opening = _snapshot(value.get("opening"), "opening", start, problems)
++    closing = _snapshot(value.get("closing"), "closing", end, problems)
++    coverage = _rows(value.get("coverage"), "coverage", problems)
++    _membership(value.get("membership"), start, end, problems)
++    identities = set(expected) | set(opening) | set(closing) | set(coverage)
++    if not identities:
++        _problem(problems, "empty_roster", "no known sources; not empty success")
++    if set(opening) != set(closing):
++        _problem(problems, "membership_changed", "opening and closing source identities differ")
++    for identity in sorted(identities):
++        result["sources"].append({"identity": list(identity), "expected": expected.get(identity),
++                                  "opening": opening.get(identity), "closing": closing.get(identity),
++                                  "coverage": coverage.get(identity)})
++        for section, rows in (("expected_sources", expected), ("opening", opening),
++                              ("closing", closing), ("coverage", coverage)):
++            if identity not in rows:
++                _problem(problems, "source_missing", f"{section}: {identity!r}")
++        if identity in opening and identity in closing:
++            if any(opening[identity].get(k) != closing[identity].get(k) for k in PINS):
++                _problem(problems, "source_changed", repr(identity))
++        if identity in coverage:
++            _coverage(coverage[identity], identity, start, end, problems)
++            if identity in opening and any(coverage[identity].get(k) != opening[identity].get(k) for k in PINS):
++                _problem(problems, "source_changed", f"coverage: {identity!r}")
++    result["complete"] = not problems
++    return result
+diff --git a/scripts/kanban_fairness.py b/scripts/kanban_fairness.py
+index 3bf7a96a0f2cd00c6618d4c0f833b750e4acd16e..1eda3bb80ce2334e57f9b8a3561ed8d2e735d117 100644
+--- a/scripts/kanban_fairness.py
++++ b/scripts/kanban_fairness.py
+@@ -15,6 +15,7 @@ usage: scripts/hermes-python scripts/kanban_fairness.py <command> ...
+                     cohorts and the four gates (p0 median, max wait while claims, alarms, owners)
+   inventory scan --tree NAME=PATH ... --output FILE
+   inventory check --scan FILE --classification FILE --output FILE
++  inventory roster --manifest FILE --output FILE  validate fleet identity/coverage evidence
+   export --input DIR --output FILE.tar.gz
+ 
+ Exit: 0 pass / completed IO, 1 a proven measured failure, 2 indeterminate or unsupported input, 3 tool error.
+@@ -137,6 +138,14 @@ def _report(args) -> int:
+ 
+ 
+ def _inventory(args) -> int:
++    if args.action == "roster":
++        from hermes_cli.kanban_fairness_roster import validate
++
++        manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8-sig"))
++        result = validate(manifest.get("roster") if isinstance(manifest, dict) else None)
++        Path(args.output).write_text(json.dumps(result, indent=1, sort_keys=True), encoding="utf-8")
++        _emit(result)
++        return EXIT[PASS] if result["complete"] else EXIT[INDETERMINATE]
+     if args.action == "scan":
+         trees = dict(item.split("=", 1) for item in args.tree)
+         result = inventory.scan({name: Path(path) for name, path in trees.items()})
+@@ -186,7 +195,8 @@ def _parser() -> argparse.ArgumentParser:
+     report.add_argument("--min-window-s", type=float, default=0)
+     report.set_defaults(run=_report)
+     inv = sub.add_parser("inventory")
+-    inv.add_argument("action", choices=("scan", "check"))
++    inv.add_argument("action", choices=("scan", "check", "roster"))
++    inv.add_argument("--manifest")
+     inv.add_argument("--tree", action="append", default=[])
+     inv.add_argument("--scan")
+     inv.add_argument("--classification")
+@@ -209,6 +219,8 @@ def main(argv=None) -> int:
+             if args.replica:
+                 parser.error("capture arm --replica needs --apply-lag-s (the replica's worst pull lag)")
+             args.apply_lag_s = 0.0
++    if args.command == "inventory" and args.action == "roster" and not args.manifest:
++        parser.error("inventory roster needs --manifest")
+     try:
+         return args.run(args)
+     except (journal.JournalError, FileNotFoundError, ValueError, KeyError) as exc:
+diff --git a/tests/hermes_cli/test_kanban_fairness_roster.py b/tests/hermes_cli/test_kanban_fairness_roster.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d935e9e009f85f6b69e24fca91af1dd01dcd343a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_fairness_roster.py
+@@ -0,0 +1,132 @@
++"""Fleet coverage cannot be inferred from the sources that happened to answer."""
++from copy import deepcopy
++
++import pytest
++
++from hermes_cli import kanban_fairness_roster as roster
++
++
++def source(gateway="worker-a"):
++    return {"source_gateway": gateway, "profile": "default", "board_uid": "board-uid",
++            "database_uid": "db-" + gateway, "process_epoch": "boot-1:pid-2:start-3",
++            "core_revision": "a" * 40, "config_sha256": "b" * 64}
++
++
++def evidence():
++    row = source()
++    snapshot = {"complete": True, "provenance": "registry-and-executor-receipt",
++                "observed_ms": 100, "sources": [row], "unknown_sources": []}
++    return {"version": 1, "window": {"start_ms": 100, "end_ms": 200},
++            "expected_sources": [row], "opening": snapshot,
++            "closing": {**deepcopy(snapshot), "observed_ms": 200},
++            "membership": {"complete": True, "start_ms": 100, "end_ms": 200,
++                           "provenance": "continuous-membership-journal", "events": []},
++            "coverage": [{**row, "status": "ok", "provenance": "executor-receipt",
++                          "start_ms": 100, "end_ms": 200,
++                          "opening_cut": "epoch:0", "closing_cut": "epoch:9"}]}
++
++
++def codes(value):
++    return {p["code"] for p in roster.validate(value)["problems"]}
++
++
++def test_complete_roster_keeps_stable_identity_and_provenance():
++    result = roster.validate(evidence())
++    assert result["complete"]
++    assert result["sources"][0]["identity"] == ["worker-a", "default", "board-uid", "db-worker-a"]
++    assert result["sources"][0]["coverage"]["provenance"] == "executor-receipt"
++
++
++@pytest.mark.parametrize("section", ["opening", "closing"])
++def test_omitted_source_never_becomes_empty_success(section):
++    value = evidence()
++    value[section]["sources"] = []
++    assert "source_missing" in codes(value)
++
++
++@pytest.mark.parametrize("section", ["expected_sources", "coverage", "opening", "closing"])
++def test_duplicate_identity_is_rejected(section):
++    value = evidence()
++    rows = value[section] if isinstance(value[section], list) else value[section]["sources"]
++    rows.append(deepcopy(rows[0]))
++    assert "duplicate_identity" in codes(value)
++
++
++def test_offline_source_remains_visible():
++    value = evidence()
++    value["coverage"][0]["status"] = "offline"
++    result = roster.validate(value)
++    assert not result["complete"]
++    assert result["sources"][0]["coverage"]["status"] == "offline"
++    assert "source_unavailable" in codes(value)
++
++
++def test_changing_membership_and_transient_join_are_not_silently_ignored():
++    value = evidence()
++    value["closing"]["sources"].append(source("new-worker"))
++    assert "membership_changed" in codes(value)
++    assert "source_missing" in codes(value)
++    value = evidence()
++    value["membership"]["events"] = [{"kind": "join", "source": source("transient"), "at_ms": 150}]
++    assert "membership_changed" in codes(value)
++
++
++@pytest.mark.parametrize("mutation,code", [
++    (lambda v: v["coverage"].clear(), "source_missing"),
++    (lambda v: v["coverage"][0].update(start_ms=101), "coverage_gap"),
++    (lambda v: v["coverage"][0].update(closing_cut=None), "missing_cut"),
++    (lambda v: v["closing"]["sources"][0].update(core_revision="c" * 40), "source_changed"),
++    (lambda v: v["opening"].update(complete=False), "discovery_incomplete"),
++    (lambda v: v["membership"].update(complete=False), "membership_incomplete"),
++    (lambda v: v["expected_sources"][0].update(database_uid=None), "invalid_identity"),
++    (lambda v: v["coverage"][0].update(provenance=None), "missing_provenance"),
++])
++def test_unknown_coverage_fails_closed(mutation, code):
++    value = evidence()
++    mutation(value)
++    assert code in codes(value)
++
++
++@pytest.mark.parametrize("value", [None, [], {}, {"version": 1}, {"version": 1, "coverage": None}])
++def test_incomplete_documents_return_evidence_not_tool_errors(value):
++    assert not roster.validate(value)["complete"]
++
++
++def test_same_gateway_different_board_profile_and_database_are_distinct():
++    value = evidence()
++    for key in ("board_uid", "profile", "database_uid"):
++        row = {**source(), key: "another"}
++        value["expected_sources"].append(row)
++        value["opening"]["sources"].append(row)
++        value["closing"]["sources"].append(row)
++        value["coverage"].append({**value["coverage"][0], **row})
++    assert roster.validate(value)["complete"]
++    value["coverage"][0]["process_epoch"] = "different-process"
++    assert "source_changed" in codes(value)
++
++
++def test_unknown_discovery_is_retained_even_when_complete_was_claimed():
++    value = evidence()
++    unknown = {"source_gateway": "unreachable", "reason": "offline; profile/board unknown"}
++    value["opening"]["unknown_sources"] = [unknown]
++    result = roster.validate(value)
++    assert not result["complete"]
++    assert result["unknown_sources"]["opening"] == [unknown]
++
++
++def test_cli_roster_reads_manifest_without_arming_capture(tmp_path, capsys):
++    import json
++    from scripts.kanban_fairness import main
++
++    manifest, output = tmp_path / "manifest.json", tmp_path / "validation.json"
++    manifest.write_text(json.dumps({"roster": evidence()}))
++    args = ["inventory", "roster", "--manifest", str(manifest), "--output", str(output)]
++    assert main(args) == 0
++    assert json.loads(output.read_text())["complete"]
++    value = evidence()
++    value["coverage"] = []
++    manifest.write_text(json.dumps({"roster": value}))
++    assert main(args) == 2
++    assert not json.loads(output.read_text())["complete"]
++    assert sorted(p.name for p in tmp_path.iterdir()) == ["manifest.json", "validation.json"]
++
+-- 
+2.43.0
+

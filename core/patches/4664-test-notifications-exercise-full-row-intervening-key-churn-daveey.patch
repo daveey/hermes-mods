@@ -1,0 +1,101 @@
+From a6c9df307974a3815ea4935e8931a1fbb334e296 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 10:53:23 +0000
+Subject: [PATCH] test(notifications): exercise full-row intervening key churn
+ [daveey]
+
+---
+ tests/tui_gateway/test_j_nonrpc_rows.py | 45 ++++++++++++++++++++++---
+ 1 file changed, 40 insertions(+), 5 deletions(-)
+
+diff --git a/tests/tui_gateway/test_j_nonrpc_rows.py b/tests/tui_gateway/test_j_nonrpc_rows.py
+index e32d5779e49611459ece7bc7105d710c8d42545c..e47697a29dc28665942a5e22b45736565c0d51a0 100644
+--- a/tests/tui_gateway/test_j_nonrpc_rows.py
++++ b/tests/tui_gateway/test_j_nonrpc_rows.py
+@@ -362,7 +362,8 @@ def _holder_pass(cx, now, measure):
+     from tui_gateway import kanban_remote_index as kri
+ 
+     _lease_beat(cx.seed.lease)
+-    if cx.stale_since is not None and now - cx.stale_since >= 1.0:
++    delay = 2.0 if now < getattr(cx, "churn_until", 0) else 1.0
++    if cx.stale_since is not None and now - cx.stale_since >= delay:
+         started = time.thread_time()
+         assert kri.refresh(cx.seed.replica, cx.seed.ledger)
+         if measure:
+@@ -420,8 +421,8 @@ def _measured_tick(cx, tick, start, replicas):
+     now = start + (tick + 1) * TICK
+     if tick % 4 == 0 and _state_stream(cx.swriter, tick // 4):
+         cx.counts["state"] += 1
+-    if tick % 4 == 1 and tick // 4 in cx.plan:  # replica commit inside the 2 s window
+-        _replica_commit(cx, tick // 4, now, replicas)
++    if tick in cx.replica_due:  # replica commit inside the scheduled window
++        _replica_commit(cx, cx.replica_due[tick], now, replicas)
+     if tick in cx.local_due:
+         n = cx.local_due[tick]
+         cx.commits[_complete_local(CHATS[n % POLLERS], f"local {n}", f"local done {n}")] = now
+@@ -446,7 +447,7 @@ def _span_delta(before, after):
+     return spans
+ 
+ 
+-def _run_cell(home, peers, monkeypatch, cell, reader_defers=True):
++def _run_cell(home, peers, monkeypatch, cell, reader_defers=True, *, churn=False, retry=True):
+     from hermes_cli import loop_accounting
+     from tests.tui_gateway.j_nonrpc_scheduler import PollerScheduler
+     from tools import process_registry, process_registry_awaiting
+@@ -492,6 +493,21 @@ def _run_cell(home, peers, monkeypatch, cell, reader_defers=True):
+             for peer in peers:
+                 peer.frames.clear()
+             start = clock[0]
++            cx.replica_due = {4 * w + 1: w for w in cx.plan}
++            if churn:
++                # Preserve all 80 windows/568 rows. Move only the first two filler-only
++                # windows: misses at +5/+10, publications at +6/+11. The +6 retry
++                # consumes the first publication before +9 changes its key again.
++                first, second = sorted(cx.replica_due)[:2]
++                first_window = cx.replica_due.pop(first)
++                second_window = cx.replica_due.pop(second)
++                assert cx.plan[first_window][1] == cx.plan[second_window][1] == 0
++                cx.replica_due.update({7: first_window, 17: second_window})
++                cx.churn_until = start + 12.0
++            if not retry:
++                from tui_gateway import notification_remote_retry
++                # Counterfactual retains the actual index's four-second deferral.
++                monkeypatch.setattr(notification_remote_retry, "deadline", lambda *a: None)
+             unguarded.enter_context(_production_io())  # the measured window only
+             spans_before, load_before = loop_accounting.counters(), os.getloadavg()
+             for tick in range(int(SECONDS / TICK)):
+@@ -513,7 +529,8 @@ def _run_cell(home, peers, monkeypatch, cell, reader_defers=True):
+             if tid in text:
+                 latency.setdefault(tid, at - committed)
+     spans = _span_delta(spans_before, spans_after)
+-    evidence = {"cell": cell, "reader_defers": reader_defers, "seconds": SECONDS, "pollers": POLLERS,
++    evidence = {"cell": cell, "reader_defers": reader_defers, "churn": churn, "retry": retry,
++                "seconds": SECONDS, "pollers": POLLERS,
+                 "spans": spans, "loadavg_1m": [load_before[0], load_after[0]],
+                 "counts": dict(cx.counts), "calls": dict(ins.calls), "cpu_by_name_s": dict(ins.cpu_by_name),
+                 "computes": dict(ins.computes),
+@@ -602,3 +619,21 @@ def test_red_control_pre_fix_reader_rebuilds_on_misses(row_home, monkeypatch, re
+     assert evidence["computes"].get("reader", 0) > 0, evidence
+     if "base" in _RESULTS:
+         assert evidence["poller_cpu_s"] > _RESULTS["base"]["poller_cpu_s"], (evidence, _RESULTS["base"])
++
++
++@pytest.mark.parametrize("retry", [True, False], ids=["retry", "no-retry"])
++def test_h4_intervening_key_churn(row_home, monkeypatch, record_property, retry):
++    """A healthy holder publishes between ordinary polls; a new key hides that hit."""
++    home, peers = row_home
++    evidence = _run_cell(home, peers, monkeypatch, BASE, churn=True, retry=retry)
++    record_property("h4_row", json.dumps(evidence, sort_keys=True))
++    assert evidence["deferred"] > 0, evidence
++    assert evidence["calls"]["notifications.poll_kanban"] == 240, evidence
++    assert evidence["max_latency_s"] <= 12.0, evidence
++    if retry:
++        assert evidence["computes"].get("reader", 0) == 0, evidence
++        assert evidence["calls"].get("notifications.poll_kanban_retry", 0) > 0, evidence
++        assert evidence["row_core"] <= 0.007, evidence
++    else:
++        assert evidence["computes"].get("reader", 0) > 0, evidence
++        assert evidence["calls"].get("notifications.poll_kanban_retry", 0) == 0, evidence
+-- 
+2.43.0
+

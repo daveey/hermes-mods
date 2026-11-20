@@ -1,0 +1,193 @@
+From 0bd2abac8b5bf1f9aa5507415145c90f3202a823 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 16:15:34 +0000
+Subject: [PATCH] [daveey] lifecycle guard: a bare or exec redirection and a
+ cp/mv of a generated script fail closed
+
+Review of PR #3001 (t_dc12cf0c543108d4) found two fail-opens in the generated-script walk:
+`(echo P) > F; bash F` and `exec > F` / `exec 3>F` then `bash F`. The segment view for those is
+`['>', 'F']` (or `exec` peeled to its `>`), so `_executed_command_index` pointed at the
+redirection itself and `_writes` read F as an operand: nothing was recorded.
+
+Fix: `_writes` now reads every redirection of the view, before the command word too, and
+`_command_word` skips redirections at the command position. A view with no command word (subshell
+redirect, `exec` redirection) is an unknown writer, so executing F fails closed.
+
+Nit 1 of the same review (a generated file copied before it runs, `cp G F; bash F`) is fixed too:
+the destinations of cp/mv/ln/install (last operand, `<dest>/<basename>`, `-t DIR`) are unknown
+writes. Nit 2 (variable write/run paths, `cat > $N`, `bash $PWD/F`) is pre-existing and filed as
+follow-up t_e2d5885ccb81d847.
+
+RED on 6d00d95576: 8/49 fail in tests/cron/test_lifecycle_guard_generated_scripts.py (real-Bash
+differential: the marker ran each time). GREEN 49/49. 288-file cron/guard/heredoc/corpus suite:
+5333 passed, 0 failed.
+---
+ cron/lifecycle_guard_generated.py             | 70 ++++++++++++++++---
+ .../test_lifecycle_guard_generated_scripts.py | 17 +++++
+ 2 files changed, 77 insertions(+), 10 deletions(-)
+
+diff --git a/cron/lifecycle_guard_generated.py b/cron/lifecycle_guard_generated.py
+index 1217721a5919c9321c0e60b71814770232f28f58..30e7dacc14af04c9138348606b9e5c67967aabc1 100644
+--- a/cron/lifecycle_guard_generated.py
++++ b/cron/lifecycle_guard_generated.py
+@@ -8,8 +8,10 @@ recorded here with what it writes, and the walk scans that text wherever it runs
+ - ``cat``/``tee`` fed by a heredoc or here-string: the body (a quoted heredoc verbatim; an
+   unquoted one whose body holds a substitution writes output nobody can predict, so unknown);
+ - ``echo``/``printf`` with literal arguments: the lines they may print (escapes decoded);
+-- any other writer (``curl … > F``, ``python3 gen.py > F``, ``cat a b > F``, stderr, ``3<> F``):
+-  unknown (``<> F`` on stdin is input, as in ``bash <> F``). Executing a path with an unknown
++- any other writer (``curl … > F``, ``python3 gen.py > F``, ``cat a b > F``, stderr, ``3<> F``,
++  a redirection with no command word such as ``(echo P) > F`` or ``exec > F`` / ``exec 3>F``,
++  and the destination of ``cp``/``mv``/``ln``/``install``): unknown (``<> F`` on stdin is input,
++  as in ``bash <> F``). Executing a path with an unknown
+   write fails closed; mentioning it does not, and a Python interpreter's file never fails closed
+   (as everywhere in the walk).
+ 
+@@ -21,6 +23,7 @@ lexical model the rest of the walk uses.
+ from __future__ import annotations
+ 
+ import hashlib
++import re
+ from collections.abc import Callable, Iterator
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Optional
+@@ -48,6 +51,34 @@ UNKNOWN: None = None
+ _DYNAMIC_MARKS = ("$(", "`", "<(", ">(")
+ _STDIN_COPIERS = frozenset({"cat", "tee"})
+ _PRINTERS = frozenset({"echo", "printf"})
++# File copiers: what lands at the destination is another file's content, so it is unknown here.
++_COPIERS = frozenset({"cp", "mv", "ln", "install"})
++_COPIER_MENTION = re.compile(r"\b(?:cp|mv|ln|install)\b")
++
++
++def _copier_targets(operands: list[str]) -> list[str]:
++    """Paths a ``cp``/``mv``/``ln``/``install`` may create: ``DIR/<basename>`` of each source with
++    ``-t DIR``/``--target-directory=DIR``, else the last operand and ``<last>/<basename>`` of each
++    other operand (``cp G sub/``). An option value read as an operand only adds paths."""
++    paths: list[str] = []
++    directory: Optional[str] = None
++    words = iter(operands)
++    for word in words:
++        if word in ("-t", "--target-directory"):
++            directory = next(words, None)
++        elif word.startswith("--target-directory="):
++            directory = word.split("=", 1)[1]
++        elif not word.startswith("-"):
++            paths.append(word)
++    if directory is None:
++        if not paths:
++            return []
++        directory = paths.pop()
++        targets = [directory]
++    else:
++        targets = []
++    base = directory.rstrip("/") or directory
++    return targets + [f"{base}/{Path(source).name}" for source in paths if Path(source).name]
+ 
+ 
+ def _owner_has_unquoted_heredoc(owner: str) -> bool:
+@@ -84,19 +115,35 @@ def _opens_heredoc(word: str) -> bool:
+     return match is not None and match.group(2) in ("<<", "<<-")
+ 
+ 
+-def _writes(view: list[str], index: int) -> tuple[list[str], list[str], dict]:
+-    """``(stdout targets, other written targets, inputs)`` of the command at *index*."""
++def _command_word(view: list[str], index: int) -> Optional[int]:
++    """Index of the command word at or after *index*, skipping redirections there; ``None`` when
++    only redirections follow. ``(echo P) > F`` leaves the view ``['>', 'F']`` and ``exec > F``
++    (peeled to the ``>``) has no command at all: their writer is unknown (``exec`` sends all
++    later output of the shell to F)."""
++    while index < len(view):
++        match = _REDIRECTION.match(view[index])
++        if match is None:
++            return index
++        index += 1 if match.group(3) else 2
++    return None
++
++
++def _writes(view: list[str], index: Optional[int]) -> tuple[list[str], list[str], dict]:
++    """``(stdout targets, other written targets, inputs)`` of the command at *index* (``None``:
++    a bare redirection). Every redirection of the view counts, before the command word too
++    (``> F echo``, ``exec 3>F``); only words after the command are its operands."""
+     stdout: list[str] = []
+     other: list[str] = []
+     inputs = {"heredoc": False, "herestrings": [], "stdin_file": False, "operands": []}
+-    words = iter(view[index + 1:])
+-    for word in words:
++    words = iter(enumerate(view))
++    for position, word in words:
+         match = _REDIRECTION.match(word)
+         if match is None:
+-            inputs["operands"].append(word)
++            if index is not None and position > index:
++                inputs["operands"].append(word)
+             continue
+         fd, operator, target = match.groups()
+-        target = target or next(words, "")
++        target = target or next(words, (None, ""))[1]
+         if operator in ("<<", "<<-"):
+             inputs["heredoc"] = True
+         elif operator == "<<<":
+@@ -119,11 +166,14 @@ def _view_writes(
+     index = _executed_command_index(view)
+     if index is None:
+         return
+-    name = _executable_name(view[index])
++    index = _command_word(view, index)
++    name = _executable_name(view[index]) if index is not None else ""
+     stdout, other, inputs = _writes(view, index)
+     targets = list(stdout)
+     if name == "tee":
+         targets += [word for word in inputs["operands"] if not word.startswith("-")]
++    if name in _COPIERS:
++        other += _copier_targets(inputs["operands"])
+     if not targets and not other:
+         return
+     contents: list[Optional[str]] = [UNKNOWN]
+@@ -152,7 +202,7 @@ def note_generated_scripts(budget: _LifecycleScanBudget, command: str, cwd: Opti
+     """Record in *budget* every file *command* writes and what it writes (see module docstring).
+     Shared across the whole walk, so a generated script that runs another one the root command
+     generated is followed too."""
+-    if ">" not in command and "tee" not in command:
++    if ">" not in command and "tee" not in command and not _COPIER_MENTION.search(command):
+         return  # nothing written: skip a second tokenization
+     bodies = _bodies_by_view(command) if "<<" in command else {}
+     for view in _iter_command_segment_views(command):
+diff --git a/tests/cron/test_lifecycle_guard_generated_scripts.py b/tests/cron/test_lifecycle_guard_generated_scripts.py
+index ce52d78a553beaca6c12cce4eedf8455c32ddf9f..86962d14a1704602a216d04ec978fa57ecb65810 100644
+--- a/tests/cron/test_lifecycle_guard_generated_scripts.py
++++ b/tests/cron/test_lifecycle_guard_generated_scripts.py
+@@ -80,6 +80,18 @@ def test_printed_and_herestring_writes_are_scanned(tmp_path, big, template):
+     "rev > F <<'R'\nREVERSED\nR\nbash F\n",
+     "cat > F <<R\n$(printf '%s' 'BODY')\nR\nbash F\n",
+     "base64 -d > F <<< B64; bash F\n",
++    # A redirection with no command word, or a persistent `exec` redirection (review of #3001).
++    "(echo 'BODY') > F; bash F\n",
++    "{ echo 'BODY'; } > F; bash F\n",
++    "exec > F; echo 'BODY'; exec > /dev/null; bash F\n",
++    "exec 3>F; echo 'BODY' >&3; exec 3>&-; bash F\n",
++    "if true; then echo 'BODY'; fi > F; bash F\n",
++    # A generated file copied or moved before it runs.
++    "cat > G <<'R'\nBODY\nR\ncp G F; bash F\n",
++    "cat > G <<'R'\nBODY\nR\nmv G F && bash F\n",
++    "cat > G <<'R'\nBODY\nR\ncp G sub/; bash sub/G\n",
++    "cat > G <<'R'\nBODY\nR\ncp -t sub G; bash sub/G\n",
++    "cat > G <<'R'\nBODY\nR\nln -s G F; bash F\n",
+ ])
+ def test_unpredictable_writer_then_execute_fails_closed(tmp_path, big, template):
+     command = (template.replace("REVERSED", big[::-1]).replace("BODY", big)
+@@ -107,6 +119,11 @@ def test_generated_lifecycle_command_is_refused(tmp_path, transport):
+     "python3 -c 'print(1)' > gen.py; python3 gen.py\n",
+     # `bash <> F` reads F as its program; it is not a write.
+     "printf 'echo hi\\n' > F; bash <> F\n",
++    # A redirection or copy whose target is never executed.
++    "(echo hi) > out.log; exec 2> err.log; cat out.log\n",
++    "cp a.txt b.txt; bash run.sh\n",
++    # Known content after a prefix redirection is still read as written.
++    "> F echo 'echo hi'; bash F\n",
+ ])
+ def test_inert_or_benign_generated_files_are_allowed(tmp_path, command):
+     unsafe, reason = scan_gateway_lifecycle(command, cwd=str(tmp_path))
+-- 
+2.43.0
+

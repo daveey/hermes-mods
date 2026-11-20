@@ -1,0 +1,831 @@
+From 6d34d48562b7299c5d8b3c0605272669657e9b67 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 09:37:17 +0000
+Subject: [PATCH] [daveey] Gate remote notice and outcome passes on semantic
+ inputs
+
+Replica task liveness writes were invalidating both settled notice and card-change proofs every host pass. Retain quiet notice inputs across irrelevant row deltas and distinguish stale seeded observations from deliverable late notices. Use per-task content cursors plus status/owner/chat-link fingerprints for outcome fanout, not rebuilt ledger object identities.
+
+Proof: real-cursor heartbeat/rebuilt-ledger regression fails on parent da4e09cf72 (5 reads versus 2), passes after the change. Status, owner, link, deletion, missing-row and raced-projection controls pass. Removing the post-projection cursor fence fails the race control. Host-gate tests cover first-seen terminal/withdrawal states, replica restore identity, concurrent writes and backward clocks. Required CI, independent exact-head review, and deployed 600-second CPU acceptance remain mandatory.
+---
+ tests/tui_gateway/test_h2_gate_mutations.py   |   4 +
+ .../tui_gateway/test_kanban_unloaded_gates.py | 163 +++++++++++++++--
+ .../test_remote_change_semantic_gate.py       | 135 ++++++++++++++
+ tui_gateway/kanban_unloaded_gates.py          | 155 ++++++++++++++--
+ tui_gateway/notice_fanout.py                  | 165 ++++++++++++++----
+ 5 files changed, 566 insertions(+), 56 deletions(-)
+ create mode 100644 tests/tui_gateway/test_remote_change_semantic_gate.py
+
+diff --git a/tests/tui_gateway/test_h2_gate_mutations.py b/tests/tui_gateway/test_h2_gate_mutations.py
+index 8b10cc2545a47794bf318049be3dbd0945d9f586..6c0f62edb16a0a3d36b87f714e0d104af7e0f67d 100644
+--- a/tests/tui_gateway/test_h2_gate_mutations.py
++++ b/tests/tui_gateway/test_h2_gate_mutations.py
+@@ -346,8 +346,10 @@ def test_remote_pending_inputs_stay_hot(monkeypatch, tmp_path):
+     base = gates.probe('remote_notices')
+     assert not base.pending and base.key[1] == 'me' and isinstance(base.key[2], str)  # a content digest, not the replica counter
+     monkeypatch.setattr(remote, '_sweep_snapshot', lambda p, me: ([{'key': 'a'}], {}))
++    gates._remote_memo.clear()  # the swept cards follow the replica's rows: this mock stands for a write
+     assert gates.probe('remote_notices').pending  # even delivered terminal cards are hot
+     monkeypatch.setattr(remote, '_sweep_snapshot', lambda p, me: ([], {}))
++    gates._remote_memo.clear()
+     remote._woken[('x',)] = {}
+     try:
+         assert gates.probe('remote_notices').pending  # a woken running flag is not a DB commit
+@@ -388,8 +390,10 @@ def test_remote_each_key_component_moves_the_key_independently(monkeypatch, tmp_
+     state['fp'] = ('fp', 2)  # the replica's commit counter churns on every sync: it is NOT a key component
+     assert gates.probe('remote_notices').key == base.key
+     monkeypatch.setattr(remote, '_sweep_snapshot', lambda p, me: ([('gw', 'k', {'status': 'done'}, [])], {}))
++    gates._remote_memo.clear()  # the swept cards follow the replica's rows: this mock stands for a write
+     assert gates.probe('remote_notices').key != base.key  # a swept card's content moves it
+     monkeypatch.setattr(remote, '_sweep_snapshot', lambda p, me: ([], {}))
++    gates._remote_memo.clear()
+     state['fp'] = ('fp', 1)
+     state['me'] = 'you'
+     assert gates.probe('remote_notices').key != base.key
+diff --git a/tests/tui_gateway/test_kanban_unloaded_gates.py b/tests/tui_gateway/test_kanban_unloaded_gates.py
+index 901cc6366e4765a207cdabbbca76b313abad5311..ff224614ea1f38881cb813d31b2e315d8f111fa5 100644
+--- a/tests/tui_gateway/test_kanban_unloaded_gates.py
++++ b/tests/tui_gateway/test_kanban_unloaded_gates.py
+@@ -1,5 +1,6 @@
+ """H2/C11: exercise the production host boundary, not delivery return values."""
+ import contextlib
++import time
+ 
+ import pytest
+ 
+@@ -391,6 +392,9 @@ def remote_host(monkeypatch, tmp_path):
+     tasks = [(1, 1, 1)]
+     monkeypatch.setattr(gates, '_replica_tasks_signature', lambda path: tasks[0])
+     stamp.append(tasks)
++    rows = []  # task rows "written" since the last signature: (gw, key, task)
++    monkeypatch.setattr(gates, '_replica_rows_after', lambda path, seq: list(rows))
++    stamp.append(rows)
+     gates.reset_for_tests()
+     remote._ledger(ledger).close()
+ 
+@@ -419,15 +423,90 @@ def test_remote_probe_key_ignores_unrelated_replica_commits(remote_host):
+ 
+ 
+ def test_remote_probe_key_changes_with_the_card_state_and_the_ledger(remote_host):
+-    gates, cards, _, settle = remote_host
++    gates, cards, stamp, settle = remote_host
+     settle()
+     first = gates._remote()
+     settle(session='chat-b')
+     assert gates._remote().key != first.key
+     cards[0] = (*cards[0][:2], {'id': 't_1', 'status': 'blocked', 'blocked_at': 200.0}, cards[0][3])
++    stamp[1][0] = (1, 2, 2)  # the owner's write of that state
++    stamp[2][:] = [('macbook', 'default/t_1', cards[0][2])]
+     assert gates._remote().pending  # the new state has no settled row: it runs
+ 
+ 
++def test_remote_probe_runs_when_an_unlinked_terminal_card_arrives(remote_host):
++    """``observe`` records the first sighting of every terminal state, linked or not; skipping the pass that would
++    record it lets a later link resurrect an expired notice (review of PR #3349)."""
++    gates, _, stamp, settle = remote_host
++    settle()
++    first = gates._remote()
++    assert not first.pending
++    stamp[1][0] = (2, 2, 3)  # a task row arrived; no card the sweep owes a notice for changed
++    stamp[2][:] = [('worker-1', 'default/t_9', {'status': 'done', 'completed_at': 5.0})]
++    assert gates._remote().key != first.key
++    stamp[1][0] = (2, 3, 4)  # ... and a blocked one
++    stamp[2][:] = [('worker-1', 'default/t_8', {'status': 'blocked'})]
++    second = gates._remote()
++    assert second.key != first.key
++    stamp[1][0] = (2, 4, 5)  # ... and a request withdrawn (an archived card)
++    stamp[2][:] = [('worker-1', 'default/t_7', {'status': 'archived', 'withdrawal_notice': {'event_id': 3, 'kind': 'request_withdrawn', 'created_at': 1.0}})]
++    from hermes_cli.kanban_withdrawal_notice import envelope
++    assert envelope(stamp[2][0][2]) is not None
++    assert gates._remote().key != second.key
++
++
++def test_remote_probe_ignores_liveness_writes_to_cards_it_does_not_owe(remote_host):
++    """The hub's replica rewrites several non-terminal task rows a second (claims, heartbeats, queue notes). None of
++    them can add a terminal state to observe or change a swept card, so none moves the key (t_48c41072e7cba68d)."""
++    gates, _, stamp, settle = remote_host
++    settle()
++    first = gates._remote()
++    for n in range(2, 6):
++        stamp[1][0] = (1 + 0, n, n)
++        stamp[2][:] = [('worker-1', 'default/t_5', {'status': 'running'}), ('hub', 'default/t_6', {'status': 'ready'})]
++        assert gates._remote() == first
++
++
++def test_remote_probe_runs_when_a_swept_card_is_rewritten_or_unreadable(remote_host):
++    gates, _, stamp, settle = remote_host
++    settle()
++    first = gates._remote()
++    stamp[1][0] = (1, 2, 2)
++    stamp[2][:] = [('macbook', 'default/t_1', {'status': 'ready'})]  # a reopened swept card
++    assert gates._remote().key != first.key
++    again = gates._remote()
++    stamp[1][0] = (1, 3, 3)
++    stamp[2][:] = [('worker-1', 'default/t_5', None)]  # undecodable
++    assert gates._remote().key != again.key
++
++
++def test_remote_probe_runs_when_rows_vanish_or_the_sequence_moves_backwards(remote_host):
++    gates, _, stamp, settle = remote_host
++    stamp[1][0] = (5, 9, 30)
++    settle()
++    first = gates._remote()
++    stamp[1][0] = (4, 9, 29)
++    assert gates._remote().key != first.key
++    second = gates._remote()
++    stamp[1][0] = (4, 3, 12)
++    assert gates._remote().key != second.key
++    third = gates._remote()
++    stamp[1][0] = (7, 10, 40)  # three rows more but only one newer sequence
++    stamp[2][:] = [('worker-1', 'default/t_5', {'status': 'running'})]
++    assert gates._remote().key != third.key
++
++
++def test_remote_probe_unreadable_new_rows_stay_hot(remote_host, monkeypatch):
++    gates, _, stamp, settle = remote_host
++    settle()
++    assert not gates._remote().pending
++    def boom(path, seq):
++        raise OSError('replica unreadable')
++    monkeypatch.setattr(gates, '_replica_rows_after', boom)
++    stamp[1][0] = (1, 2, 2)
++    assert gates._remote().pending
++
++
+ def test_remote_probe_open_chat_in_flight_claim_and_woken_stay_hot(remote_host):
+     from tui_gateway import kanban_remote_notices as remote
+     gates, _, _, settle = remote_host
+@@ -446,19 +525,83 @@ def test_remote_probe_open_chat_in_flight_claim_and_woken_stay_hot(remote_host):
+             remote._woken.clear()
+ 
+ 
+-def test_remote_probe_runs_when_an_unlinked_terminal_card_arrives(remote_host):
+-    """``observe`` records the first sighting of every terminal state, linked or not; skipping the pass that would
+-    record it lets a later link resurrect an expired notice (review of PR #3349)."""
++def test_remote_probe_unreadable_task_signature_stays_hot(remote_host):
+     gates, _, stamp, settle = remote_host
+     settle()
+-    first = gates._remote()
+-    assert not first.pending
+-    stamp[1][0] = (2, 2, 3)  # a task row arrived; no card the sweep owes a notice for changed
+-    assert gates._remote().key != first.key
++    stamp[1][0] = None
++    assert gates._remote().pending
+ 
+ 
+-def test_remote_probe_unreadable_task_signature_stays_hot(remote_host):
++# --- an owed notice the sweep drops for good is not work (t_48c41072e7cba68d) ----------------------------------
++
++@pytest.fixture
++def observe_row(remote_host):
++    """Record this host's observation of the fixture card's state (``first_seen`` None = seeded silently)."""
++    from pathlib import Path
++
++    from hermes_cli import kanban_origin
++    from tui_gateway import kanban_remote_notices as remote
++    gates, cards, _stamp, _settle = remote_host
++
++    def put(first_seen):
++        with contextlib.closing(remote._ledger(remote.ledger_path())) as conn, conn:
++            conn.execute('CREATE TABLE IF NOT EXISTS observations (source TEXT, ref TEXT, state TEXT, first_seen REAL, '
++                         'PRIMARY KEY(source, ref, state))')
++            conn.execute('INSERT OR REPLACE INTO observations VALUES (?,?,?,?)',
++                         (str(Path(kanban_origin._hub_db()).resolve()), 'macbook/default/t_1',
++                          remote._notice_state(cards[0][2]), first_seen))
++        gates._remote_memo.clear()
++    return remote, gates, put
++
++
++def test_remote_probe_expired_unobserved_notice_is_not_work(observe_row):
++    remote, gates, put = observe_row
++    assert gates._remote().pending  # never observed: the pass records it
++    put(None)  # seeded by the source's first snapshot: the sweep counts it stale and delivers nothing
++    assert not gates._remote().pending
++    put(time.time() - remote.LATE_MAX_S - 3600)  # first seen past the late window
++    assert not gates._remote().pending
++
++
++def test_remote_probe_late_notice_is_still_work(observe_row):
++    remote, gates, put = observe_row
++    put(time.time() - 3600)  # observed an hour ago: past FRESH_S by the card's clock? not by the arrival clock
++    assert gates._remote().pending
++    put(time.time() - remote.FRESH_S - 3600)  # observed 7 h ago, inside the 72 h late window: delivered, late
++    assert gates._remote().pending
++
++
++@pytest.mark.parametrize('field', ['ident', 'generation', 'signature'])
++def test_remote_identity_rearms_equal_aggregate_proofs(remote_host, monkeypatch, field):
++    from tui_gateway import kanban_replica_observer as observer
++    gates, _, _, settle = remote_host
++    stamp = [observer.Fingerprint('replica', (1, 2), 3, 4, (100, 200))]
++    monkeypatch.setattr(observer, 'fingerprint', lambda path: stamp[0])
++    settle()
++    before = gates._remote()
++    stamp[0] = stamp[0]._replace(**{field: (9, 9) if field != 'generation' else 9})
++    assert gates._remote().key != before.key
++
++
++def test_remote_expiry_proof_rearms_on_backward_clock(observe_row, monkeypatch):
++    remote, gates, put = observe_row
++    clock = [remote.LATE_MAX_S + 2000]
++    monkeypatch.setattr(gates.time, 'time', lambda: clock[0])
++    put(1000)
++    assert not gates._remote().pending
++    clock[0] = 2000
++    assert gates._remote().pending
++
++
++def test_remote_concurrent_replica_write_does_not_publish(remote_host, monkeypatch):
++    from tui_gateway import kanban_remote_notices as remote
+     gates, _, stamp, settle = remote_host
+     settle()
+-    stamp[1][0] = None
++    original = remote._sweep_snapshot
++    def racing(*args):
++        result = original(*args)
++        stamp[0] += 1
++        return result
++    monkeypatch.setattr(remote, '_sweep_snapshot', racing)
+     assert gates._remote().pending
++    assert 'inputs' not in gates._remote_memo
+diff --git a/tests/tui_gateway/test_remote_change_semantic_gate.py b/tests/tui_gateway/test_remote_change_semantic_gate.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6228e805660272bcdf163da01632b5d75225f358
+--- /dev/null
++++ b/tests/tui_gateway/test_remote_change_semantic_gate.py
+@@ -0,0 +1,135 @@
++"""Real per-task cursor mutation controls for the remote outcome gate. [daveey]"""
++import sqlite3
++from contextlib import contextmanager
++
++import pytest
++
++from hermes_cli import kanban_activity_revision as rev
++from hermes_cli import kanban_session_activity as activity
++from tests.tui_gateway import test_session_outcome_notices as helpers
++from tui_gateway import notice_fanout as nf
++
++
++db = helpers.db
++
++
++@pytest.fixture
++def shadow(tmp_path, monkeypatch):
++    path = tmp_path / 'shadow.db'
++    conn = sqlite3.connect(path, isolation_level=None)
++    conn.executescript('''
++        CREATE TABLE tasks(id TEXT PRIMARY KEY, status TEXT, created_on TEXT, last_heartbeat_at REAL);
++        CREATE TABLE task_chat_links(task_id TEXT, chat_gateway TEXT, chat_profile TEXT,
++                                     chat_session TEXT, kind TEXT, released INTEGER);
++        INSERT INTO tasks VALUES ('t_remote', 'running', 'worker', 1);
++    ''')
++    conn.execute('INSERT INTO task_chat_links VALUES (?,?,?,?,?,?)',
++                 ('t_remote', 'gw', 'default', helpers.CHAT, 'created', 0))
++    rev.ensure_revision(conn, rev.SHADOW_TABLES)
++    conn.commit()
++    base = ('gw', 'default', (('default', str(path)),))
++    ledger = []
++    monkeypatch.setattr(nf, '_remote_inputs_key', lambda: (base, list(ledger)))
++    monkeypatch.setattr(nf, '_remote_memo', None)
++    reads = []
++
++    def project(*args, **kwargs):
++        reads.append(1)
++        return [{'key': f'{owner}/default/{tid}', 'id': tid, 'board': 'default',
++                 'gateway': owner, 'session': session, 'status': status}
++                for tid, status, owner, session in conn.execute(
++                    'SELECT t.id, t.status, t.created_on, l.chat_session FROM tasks t '
++                    'JOIN task_chat_links l ON t.id=l.task_id WHERE l.released=0 AND t.created_on != ? ', ('gw',))]
++
++    monkeypatch.setattr(activity, '_remote_cards', project)
++    yield conn, base, reads, ledger, project
++    conn.close()
++
++
++def run(db):
++    return nf.card_change_pass(session_db=helpers._opener(db), slugs=[])
++
++
++def test_real_cursor_heartbeat_and_rebuilt_ledger_skip(db, shadow):
++    conn, _, reads, ledger, _ = shadow
++    ledger.append({'key': 'owner/default/t_other', 'status': 'running', 'synced_at': 1})
++    run(db)  # initial durable state seed
++    run(db)  # acknowledge and certify the projection
++    before = len(reads)
++    for clock in range(2, 5):
++        conn.execute('UPDATE tasks SET last_heartbeat_at=?', (clock,))
++        conn.commit()
++        ledger[0] = {**ledger[0], 'synced_at': clock}
++        assert run(db) == []
++    assert len(reads) == before
++
++
++@pytest.mark.parametrize('sql', [
++    "UPDATE tasks SET status='blocked'",
++    "UPDATE tasks SET created_on='gw'",
++    "UPDATE task_chat_links SET released=1",
++    "DELETE FROM tasks",
++    "DELETE FROM task_chat_links",
++])
++def test_real_cursor_status_owner_release_and_delete_rearm(db, shadow, sql):
++    conn, _, reads, _, _ = shadow
++    run(db)
++    run(db)
++    before = len(reads)
++    conn.execute(sql)
++    conn.commit()
++    assert len(run(db)) == 1
++    assert len(reads) > before
++
++
++def test_link_to_previously_unprojected_task_rearms(db, shadow):
++    conn, _, reads, _, _ = shadow
++    conn.execute("INSERT INTO tasks VALUES ('t_new', 'running', 'worker', 1)")
++    conn.commit()
++    run(db)
++    run(db)
++    before = len(reads)
++    conn.execute('INSERT INTO task_chat_links VALUES (?,?,?,?,?,?)',
++                 ('t_new', 'gw', 'default', helpers.CHAT, 'shepherd', 0))
++    conn.commit()
++    assert len(run(db)) == 1
++    assert len(reads) > before
++
++
++def test_write_after_projection_cannot_certify_newer_prints(db, shadow, monkeypatch):
++    conn, _, _, _, project = shadow
++    run(db)  # seed before racing the pass that can publish a memo
++    def racing(*args, **kwargs):
++        cards = project(*args, **kwargs)
++        conn.execute("UPDATE tasks SET status='blocked'")
++        conn.commit()
++        return cards
++    monkeypatch.setattr(activity, '_remote_cards', racing)
++    run(db)  # seeds running, but a blocked write races fingerprint collection
++    monkeypatch.setattr(activity, '_remote_cards', project)
++    assert len(run(db)) == 1  # must not acknowledge the newer write without projecting it
++
++
++def test_missing_known_task_keeps_absence_fingerprint(shadow):
++    conn, base, _, _, _ = shadow
++    prints = nf._known_prints(base, {'default': {'missing'}})
++    assert prints == {'default': {'missing': None}}
++    polled = nf._poll_boards(base, None)
++    cursor = {'default': polled['default'][1]}
++    conn.execute("INSERT INTO tasks VALUES ('missing', 'running', 'worker', 1)")
++    conn.commit()
++    assert not nf._remote_boards_quiet(base, nf._poll_boards(base, cursor), prints)
++
++
++def test_unreadable_replica_retries_instead_of_publishing(db, shadow, monkeypatch):
++    _, _, reads, _, _ = shadow
++    @contextmanager
++    def unavailable(*args, **kwargs):
++        raise sqlite3.OperationalError('unavailable')
++        yield
++    monkeypatch.setattr(activity, 'cached_ro', unavailable)
++    run(db)
++    run(db)
++    before = len(reads)
++    run(db)
++    assert len(reads) > before
+diff --git a/tui_gateway/kanban_unloaded_gates.py b/tui_gateway/kanban_unloaded_gates.py
+index a2916e3b02e510ada87acd152cc02c4b0e492aa2..9c7183b7632139711fdf9b7191f9b9d4c5915291 100644
+--- a/tui_gateway/kanban_unloaded_gates.py
++++ b/tui_gateway/kanban_unloaded_gates.py
+@@ -13,6 +13,7 @@ from dataclasses import dataclass
+ import hashlib
+ import logging
+ import math
++from pathlib import Path
+ import time
+ 
+ from hermes_cli import loop_accounting as accounting
+@@ -52,6 +53,8 @@ _killed_empty_keys: dict[object, tuple] = {}
+ def reset_for_tests() -> None:
+     _last.clear()
+     _killed_empty_keys.clear()
++    _replica_watch.clear()
++    _remote_memo.clear()
+ 
+ 
+ def _killed_empty(conn) -> bool:
+@@ -250,6 +253,14 @@ def _session_empty(kind: str) -> Inputs:
+                   due=time.time() + RECOVER_EVERY_S if kind == 'delegation' else float('inf'))
+ 
+ 
++# replica path -> (signature, token, swept refs): the last replica task rows this host examined for changes that
++# ``observe``/the sweep can act on. ``token`` moves only on such a change (see ``_replica_token``).
++_replica_watch: dict = {}
++# The non-pending ``_remote`` answer with the exact inputs it was computed from: an unchanged pass reads none of the
++# replica's cards again.
++_remote_memo: dict = {}
++
++
+ def _remote(live: frozenset = frozenset()) -> Inputs:
+     from hermes_cli.kanban_origin import _hub_db, gateway_names
+     from hermes_cli.kanban_reader_retention import reader
+@@ -263,7 +274,20 @@ def _remote(live: frozenset = frozenset()) -> Inputs:
+     stamp = fingerprint(path)
+     if not me or stamp is None:
+         return Inputs()
+-    cards, _states = remote._sweep_snapshot(path, me)
++    # Commit counters are deliberately excluded, but replacement, observer recovery and same-inode restore
++    # signals must still retire a semantic proof. A normal checkpoint may conservatively rearm it too.
++    identity = (getattr(stamp, 'ident', None), getattr(stamp, 'generation', None),
++                getattr(stamp, 'signature', None))
++    if _remote_memo.get('identity') != identity:
++        _replica_watch.pop(str(path), None)
++        _remote_memo.pop('inputs', None)
++        _remote_memo['identity'] = identity
++    now = time.time()
++    if now < _remote_memo.get('clock', now):
++        _remote_memo.pop('inputs', None)
++        _remote_memo['clock_epoch'] = _remote_memo.get('clock_epoch', 0) + 1
++    _remote_memo['clock'] = now
++    epoch = (identity, _remote_memo.get('clock_epoch', 0))
+     with remote._woken_lock:
+         if remote._woken:
+             return Inputs()
+@@ -275,24 +299,40 @@ def _remote(live: frozenset = frozenset()) -> Inputs:
+             # Holder-death and stale-claim recovery: only a claim WITH a holder is ever settled by the sweep.
+             if conn.execute('SELECT 1 FROM notices WHERE delivered=0 AND holder_pid IS NOT NULL LIMIT 1').fetchone():
+                 return Inputs()
+-            if cards and not _cards_settled(conn, cards, live):
+-                return Inputs()
+-    elif cards:
+-        return Inputs()
+-    # The key is what the pass would read, not the replica's commit counter: the hub's replica commits on every
+-    # sync, and none of those commits changed a card this host owes a notice for (t_48c41072e7cba68d).
++    # The key is what the pass would read, not the replica's commit counter: the hub's replica commits several
++    # task-row writes a second, and almost none touches a card this host owes a notice for (t_48c41072e7cba68d).
+     # ``observe`` records this host's first sighting of EVERY terminal state, linked or not, and a later link must
+-    # not resurrect a notice that expired unseen: so a replica whose task rows changed is never skipped, even when
+-    # no card the sweep owes a notice for changed. Unreadable = unknown = hot.
+-    tasks = _replica_tasks_signature(path)
+-    if tasks is None:
++    # not resurrect a notice that expired unseen: so a task row that is terminal, withdrawn or swept is never
++    # skipped. Unreadable = unknown = hot.
++    token = _replica_token(path)
++    if token is None:
+         return Inputs()
++    memo_key = (str(path), me, token, str(ledger), ledger_stamp, live, epoch)
++    hit = _remote_memo.get('inputs')
++    if hit is not None and hit[0] == memo_key:
++        return hit[1]
++    _remote_memo.pop('inputs', None)
++    cards, _states = remote._sweep_snapshot(path, me)
++    watch = _replica_watch.get(str(path))
++    if watch is not None:  # a later non-terminal write to one of these (a reopened card) must not be skipped
++        _replica_watch[str(path)] = (*watch[:2], frozenset(f'{owner}/{key}' for owner, key, _t, _l in cards))
++    if ledger_stamp is None:
++        if cards:
++            return Inputs()
++    else:
++        with reader(ledger) as conn:
++            if cards and not _cards_settled(conn, cards, live, str(Path(path).resolve())):
++                return Inputs()
+     digest = hashlib.sha256()
+-    digest.update(repr(tasks).encode())
++    digest.update(repr((token, epoch)).encode())
+     for owner, key, task, links in cards:
+         digest.update(repr((owner, key, remote._notice_state(task),
+                             tuple((link.get('profile'), link.get('session')) for link in links))).encode())
+-    return Inputs((str(path), me, digest.hexdigest(), str(ledger), ledger_stamp), pending=False)
++    result = Inputs((str(path), me, digest.hexdigest(), str(ledger), ledger_stamp), pending=False)
++    if fingerprint(path) != stamp:
++        return Inputs()  # never publish a quiet proof across a concurrent replica write or replacement
++    _remote_memo['inputs'] = (memo_key, result)
++    return result
+ 
+ 
+ def _replica_tasks_signature(path):
+@@ -309,7 +349,66 @@ def _replica_tasks_signature(path):
+         return None
+ 
+ 
+-def _cards_settled(conn, cards, live) -> bool:
++def _replica_rows_after(path, seq):
++    """``[(gw, key, task or None)]`` for the task rows written after ``seq`` (the hub numbers every write from one
++    sequence; ``task`` None = undecodable). Raises ``sqlite3.Error``/``OSError`` when unreadable."""
++    import contextlib
++    import json
++
++    from tui_gateway.kanban_remote_notices import _ro
++    with contextlib.closing(_ro(path)) as conn:
++        rows = conn.execute("SELECT gw, key, data FROM replica WHERE coll='tasks' AND seq > ?", (seq,)).fetchall()
++    out = []
++    for gw, key, raw in rows:
++        try:
++            task = json.loads(raw)
++        except (TypeError, ValueError):
++            task = None
++        out.append((gw, key, task if isinstance(task, dict) else None))
++    return out
++
++
++def _substantive(gw, key, task, swept) -> bool:
++    """A replica task row whose write the remote sweep (or ``observe``) may act on."""
++    from hermes_cli.kanban_withdrawal_notice import envelope
++    from tui_gateway.kanban_remote_notices import _TERMINAL
++    if task is None or f'{gw}/{key}' in swept or envelope(task) is not None:
++        return True
++    return task.get('status') in _TERMINAL or not task.get('status')
++
++
++def _moved_since(path, old, sig, swept):
++    """True when a task row written between signatures ``old`` and ``sig`` may matter; None when unreadable."""
++    if any(v is None for v in (*old, *sig)) or sig[1] < old[1] or sig[0] < old[0]:
++        return True  # an empty table, a vanished row or a sequence that went backwards: no basis to skip
++    try:
++        rows = _replica_rows_after(path, old[1])
++    except Exception:  # health: allow BLE001 -- unreadable rows are unknown: hot
++        return None
++    return sig[0] - old[0] > len(rows) or any(_substantive(gw, key, task, swept) for gw, key, task in rows)
++
++
++def _replica_token(path):
++    """A counter that moves only when a replica task row changes in a way ``observe``/the sweep can act on, else
++    None (unknown). The first sight is 0: the first pass runs anyway."""
++    sig = _replica_tasks_signature(path)
++    if sig is None:
++        return None
++    prev = _replica_watch.get(str(path))
++    if prev is None:
++        _replica_watch[str(path)] = (sig, 0, frozenset())
++        return 0
++    old, token, swept = prev
++    if sig != old:
++        moved = _moved_since(path, old, sig, swept)
++        if moved is None:
++            return None
++        token += bool(moved)
++        _replica_watch[str(path)] = (sig, token, swept)
++    return token
++
++
++def _cards_settled(conn, cards, live, source: str = '', now: float | None = None) -> bool:
+     """True when every notice the sweep could deliver already has a settled ledger row, so the pass has nothing to
+     deliver, claim, wait on or count. Anything unproven (a link without a settled row, an open chat, whose poller
+     the sweep notes) keeps the pass hot. Blank and placement-placeholder links are dropped by the delivery
+@@ -317,17 +416,43 @@ def _cards_settled(conn, cards, live) -> bool:
+     from hermes_cli.kanban_placement import is_placeholder_session
+     from tui_gateway import kanban_remote_notices as remote
+ 
++    now = time.time() if now is None else now
+     for owner, key, task, links in cards:
+         ref, state = f'{owner}/{key}', remote._notice_state(task)
+         for link in links:
+             profile, sid = link.get('profile'), link.get('session')
+             if not profile or not sid or is_placeholder_session(sid):
+                 continue
+-            if sid in live or not remote._ledger_settled(conn, (sid,), ref, state):
++            if sid in live:
++                return False
++            if not remote._ledger_settled(conn, (sid,), ref, state) and not _expired_unobserved(
++                    conn, source, task, ref, state, now):
+                 return False
+     return True
+ 
+ 
++def _expired_unobserved(conn, source: str, task, ref: str, state: str, now: float) -> bool:
++    """True when the sweep drops this card's state without a ledger row, for good: it is past ``FRESH_S`` by its
++    freshness time and this host either never observed it (seeded by the source's first snapshot) or first saw it
++    more than ``LATE_MAX_S`` ago (``_deliver_fresh_cards``'s ``stale`` branch). Both only age further. A state with
++    no observation row yet is unknown: ``observe`` writes it, so the pass runs. Eleven of these held the hub's pass
++    hot every 30 s (t_48c41072e7cba68d)."""
++    import sqlite3
++    try:
++        from tui_gateway import kanban_remote_notices as remote
++        row = conn.execute('SELECT first_seen FROM observations WHERE source=? AND ref=? AND state=?',
++                           (source, ref, state)).fetchone()
++    except sqlite3.Error:
++        return False
++    if row is None:
++        return False
++    first, at = row[0], remote._fresh_at(task)
++    observed = max(at, first) if at is not None and first is not None else at
++    if not (observed is None or now - observed > remote.FRESH_S):
++        return False
++    return first is None or remote._late_verdict(now, first) != 'late'
++
++
+ def probe(kind: str, *, every_store: bool = True, live: frozenset | set = frozenset()) -> Inputs:
+     """Fail open; never infer pending state from a delivery function's return."""
+     try:
+diff --git a/tui_gateway/notice_fanout.py b/tui_gateway/notice_fanout.py
+index e12f9470554d8dcc8ed174d29267173c8fa4762c..f7ffdda327f6dee0a3503a5d02ea890a3ebab11f 100644
+--- a/tui_gateway/notice_fanout.py
++++ b/tui_gateway/notice_fanout.py
+@@ -246,34 +246,21 @@ def _fan_out_changes(conn: sqlite3.Connection, _kb: Any, session_db: Callable, s
+     return out
+ 
+ 
+-# The input key of the last remote pass that left every chat acknowledged. A pass over the same inputs reads the same
+-# snapshot.
++# What the last remote pass that left every chat acknowledged was computed over: ``(base, ledger digest, {board:
++# per-task change cursor}, {board: task ids the pass projected})``. A pass whose projection inputs are unchanged reads
++# the same snapshot.
+ _remote_memo: Optional[tuple] = None
+ 
+-# The ledger-card fields ``kanban_chat_links.replica_cards`` reads (owner labels, profile-board cards, cold-start
+-# fallback) and the pass keeps (key, status, chat, origin chat, unfinished).
+-_LEDGER_KEY_FIELDS = ("key", "board", "id", "gateway", "profile", "session", "origin_session", "origin_gateway",
+-                      "origin_profile", "status", "unfinished", "released", "ownership_state")
+-
+-
+-def _ledger_content_key(cards: list[dict]) -> str:
+-    """A digest of what the pass can see of the origin-ledger projection. By content, not object identity: a warm
+-    ``stale_ok`` read re-projects in the background once its entry is older than ``_LINKS_MAX_AGE_S`` (15 s), so
+-    every 30 s pass would see new dicts for an unchanged ledger (t_bbea93e8bb9553ba)."""
+-    rows = sorted(repr(tuple(c.get(f) for f in _LEDGER_KEY_FIELDS)) for c in cards)
+-    return hashlib.blake2b("\n".join(rows).encode(), digest_size=16).hexdigest()
+-
+ 
+ def _remote_inputs_key() -> Optional[tuple]:
+-    """Everything ``activity._remote_cards`` reads for the replica projection that ``_remote_change_pass`` keeps
+-    (card key, status, chat, origin chat), or None when any of it cannot be vouched for. That is each synced board's
+-    replica content revision (trigger-backed only: a stat fallback never vouches), the origin-ledger projection's
+-    content (``_ledger_content_key``), this gateway and profile, and the reader mode. A pull that moves only
+-    ``pulled_at`` changes none of them (t_48c41072e7cba68d)."""
++    """``(base, ledger cards)`` of everything ``activity._remote_cards`` reads for the replica projection that
++    ``_remote_change_pass`` keeps (card key, status, chat, origin chat), or None when any of it cannot be vouched
++    for: this gateway and profile, the synced boards, and the origin-ledger projection's cards. The replica's own
++    content is judged per board by ``_remote_boards_quiet`` (a pull that moves only ``pulled_at``, or writes a task
++    no linked chat of this origin names, is not a change: t_48c41072e7cba68d)."""
+     from hermes_cli import kanban_db_sync as sync
+     from hermes_cli import kanban_session_activity as activity
+     from hermes_cli import kanban_sync_client as ksc
+-    from hermes_cli.kanban_activity_revision import SHADOW_TABLES, is_revision
+     from hermes_cli.profiles import get_active_profile_name
+ 
+     if sync.sync_config().get("links_reader") != "replica":
+@@ -284,15 +271,111 @@ def _remote_inputs_key() -> Optional[tuple]:
+         return None
+     if not gateway:
+         return None
+-    boards = []
+-    for slug, _path in ksc.board_paths():
+-        path = ksc.shadow_path(slug)
+-        content = activity._board_content_key(path, SHADOW_TABLES)
+-        if not is_revision(content):
++    boards = tuple((slug, str(ksc.shadow_path(slug))) for slug, _path in ksc.board_paths())
++    return (gateway, get_active_profile_name(), boards), activity._remote_links(stale_ok=True)
++
++
++# The ledger-card fields ``kanban_chat_links.replica_cards`` reads (owner labels, profile-board cards, cold-start
++# fallback) and the pass keeps (key, status, chat, origin chat, unfinished).
++_LEDGER_KEY_FIELDS = ("key", "board", "id", "gateway", "profile", "session", "origin_session", "origin_gateway",
++                      "origin_profile", "status", "unfinished", "released", "ownership_state")
++
++
++def _ledger_content_key(cards: list[dict]) -> str:
++    """A digest of what the pass can see of the origin-ledger projection. By content, not object identity: a warm
++    ``stale_ok`` read re-projects in the background once its entry is older than ``_LINKS_MAX_AGE_S`` (15 s), so
++    every 30 s pass would see new dicts for an unchanged ledger (t_bbea93e8bb9553ba)."""
++    rows = sorted(repr(tuple(c.get(f) for f in _LEDGER_KEY_FIELDS)) for c in cards)
++    return hashlib.blake2b("\n".join(rows).encode(), digest_size=16).hexdigest()
++
++
++def _poll_boards(base: tuple, previous: Optional[dict]) -> Optional[dict]:
++    """``{board: (task ids changed since the memo's cursor or FULL, next cursor)}`` over the synced replicas, or
++    None when any is unreadable or cannot vouch for a cursor (the per-task change table)."""
++    from hermes_cli.kanban_activity_revision import SHADOW_TABLES
++    from hermes_cli.kanban_session_activity import cached_ro
++    from hermes_cli.kanban_task_change import changed_since
++
++    out = {}
++    for slug, path in base[2]:
++        try:
++            with cached_ro(Path(path), busy_budget=0) as conn:
++                changed, cursor = changed_since(conn, (previous or {}).get(slug), tables=SHADOW_TABLES)
++        except Exception:  # health: allow BLE001 -- unknown is hot
++            return None
++        if cursor is None:
+             return None
+-        boards.append((slug, str(path), content))
+-    ledger = _ledger_content_key(activity._remote_links(stale_ok=True))
+-    return (gateway, get_active_profile_name(), tuple(boards)), ledger
++        out[slug] = (changed, cursor)
++    return out
++
++
++def _task_linked(conn: sqlite3.Connection, ids: list, gateway: str, profile: str) -> bool:
++    """Any of these tasks has a chat link of this origin (released or not): a link written, moved or dropped."""
++    for start in range(0, len(ids), 400):
++        chunk = ids[start:start + 400]
++        marks = ",".join("?" * len(chunk))
++        if conn.execute(f"SELECT 1 FROM task_chat_links WHERE task_id IN ({marks}) AND chat_gateway = ? "
++                        "AND chat_profile = ? LIMIT 1", (*chunk, gateway, profile)).fetchone() is not None:
++            return True
++    return False
++
++
++def _task_prints(conn: sqlite3.Connection, ids: list) -> dict:
++    """``{task id: (status, its chat links)}`` for these tasks (absent tasks are absent)."""
++    out: dict = {}
++    for start in range(0, len(ids), 400):
++        chunk = ids[start:start + 400]
++        marks = ",".join("?" * len(chunk))
++        for tid, status, owner in conn.execute(f"SELECT id, status, created_on FROM tasks WHERE id IN ({marks})", chunk):
++            out[tid] = [(status, owner), []]
++        for row in conn.execute(f"SELECT task_id, chat_gateway, chat_profile, chat_session, kind, released "
++                                f"FROM task_chat_links WHERE task_id IN ({marks})", chunk):
++            if row[0] in out:
++                out[row[0]][1].append(tuple(row[1:]))
++    return {tid: (v[0], tuple(sorted(map(repr, v[1])))) for tid, v in out.items()}
++
++
++def _known_prints(base: tuple, known: dict) -> Optional[dict]:
++    """``{board: {task id: print}}`` for the projected cards, or None when a board cannot be read."""
++    from hermes_cli.kanban_session_activity import cached_ro
++    out = {}
++    for slug, path in base[2]:
++        try:
++            with cached_ro(Path(path), busy_budget=0) as conn:
++                ids = sorted(known.get(slug, ()))
++                prints = _task_prints(conn, ids)
++                out[slug] = {tid: prints.get(tid) for tid in ids}
++        except Exception:  # health: allow BLE001 -- unknown is hot
++            return None
++    return out
++
++
++def _remote_boards_quiet(base: tuple, polled: dict, known: dict) -> bool:
++    """True when every task written since the memo is a projected card whose status and chat links are what the
++    projection saw (a heartbeat, a comment, a run row), or a task no chat of this origin links."""
++    from hermes_cli.kanban_session_activity import cached_ro
++    from hermes_cli.kanban_task_change import FULL
++
++    for slug, path in base[2]:
++        changed = polled[slug][0]
++        if changed is FULL:
++            return False
++        if not changed:
++            continue
++        seen = known.get(slug, {})
++        try:
++            with cached_ro(Path(path), busy_budget=0) as conn:
++                mine = sorted(changed & seen.keys())
++                if mine:
++                    now = _task_prints(conn, mine)
++                    if any(now.get(tid) != seen[tid] for tid in mine):
++                        return False
++                rest = sorted(changed - seen.keys())
++                if rest and _task_linked(conn, rest, base[0], base[1]):
++                    return False
++        except Exception:  # health: allow BLE001 -- unknown is hot
++            return False
++    return True
+ 
+ 
+ def _remote_change_pass(session_db: Callable) -> list[dict]:
+@@ -303,7 +386,20 @@ def _remote_change_pass(session_db: Callable) -> list[dict]:
+     except Exception:  # health: allow BLE001 -- an unreadable input is unknown: run the pass
+         logger.debug("remote card-change inputs unavailable", exc_info=True)
+         inputs = None
+-    if inputs is not None and inputs == _remote_memo:
++    polled = None
++    if inputs is not None:
++        try:
++            memo = _remote_memo
++            polled = _poll_boards(inputs[0], memo[2] if memo is not None and memo[0] == inputs[0] else None)
++        except Exception:  # health: allow BLE001 -- unknown is hot
++            logger.debug("remote card-change boards unavailable", exc_info=True)
++            polled = None
++        if polled is None:
++            inputs = None
++    memo = _remote_memo
++    if inputs is not None and memo is not None and memo[0] == inputs[0] and memo[1] == _ledger_content_key(inputs[1]) \
++            and _remote_boards_quiet(inputs[0], polled, memo[3]):
++        _remote_memo = (memo[0], memo[1], {slug: polled[slug][1] for slug in polled}, memo[3])
+         return []
+     _remote_memo = None
+     from hermes_cli import kanban_session_activity as activity
+@@ -311,7 +407,9 @@ def _remote_change_pass(session_db: Callable) -> list[dict]:
+     from tui_gateway import notice_fanout_state as state
+     from hermes_cli.kanban_session_activity_release import PENDING_RELEASE_STATUSES
+     current: dict[str, set[tuple[str, str]]] = {}
++    known: dict[str, set[str]] = {}
+     for card in activity._remote_cards(None, activity.LISTED_STATUSES, stale_ok=True):
++        known.setdefault(str(card.get("board")), set()).add(str(card.get("id")))
+         status = card.get("status")
+         if status not in activity.LISTED_STATUSES and not (status in PENDING_RELEASE_STATUSES and card.get("unfinished")):
+             continue
+@@ -343,7 +441,12 @@ def _remote_change_pass(session_db: Callable) -> list[dict]:
+                     "status": None, "skipped": skipped, "source": "remote"})
+     state.ack_remote(acked)
+     if inputs is not None and all(previous.get(c) == snapshot.get(c) or c in acked for c in previous.keys() | snapshot.keys()):
+-        _remote_memo = inputs
++        # Only certify a projection if its cursor stayed still THROUGH fingerprint collection. A later
++        # fingerprint must not describe a write the projection never saw.
++        prints = _known_prints(inputs[0], known)
++        after = _poll_boards(inputs[0], {slug: polled[slug][1] for slug in polled})
++        if prints is not None and after is not None and all(after[slug][1] == polled[slug][1] for slug in polled):
++            _remote_memo = (inputs[0], _ledger_content_key(inputs[1]), {slug: polled[slug][1] for slug in polled}, prints)
+     return out
+ 
+ 
+-- 
+2.43.0
+

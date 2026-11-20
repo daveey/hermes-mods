@@ -1,0 +1,262 @@
+From f9af8b6c0fc95eb801b4fcb7d01961d03b275cee Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 06:47:17 +0000
+Subject: [PATCH] [daveey] Remembered cards of an owner the Board no longer
+ carries are released as it last reported them
+
+Problem: 2026-11-18. After workers 2-8 were removed from the Board, 68 hub chats listed 1,231 finished cards and
+28 MacBook chats 1,409 as unfinished `unknown` rows (reported_status done or archived), for good.
+
+Why 1: each is a remembered origin-work row (`_legacy_remote_links` carries the previous projection's rows whose
+record the replica no longer has), still `unknown`/unreleased.
+Why 2: the Board drops a removed machine's records, so no record is left to attest the completion, and no rule
+releases a remembered row without one ("absence is never closure").
+Why 3: that rule was written for ONE missing record of an owner that is otherwise present (evicted copies,
+reprovisioned owners); the removal of the whole owner had no case of its own.
+Root (happened): removing a machine leaves every unconfirmed card it finished as a permanent obligation of the
+chats that handed it work. (Cards the owner attested before going silent are released since 6721503d602; this is
+the remainder: rows already remembered unreleased when the owner disappeared.)
+Root (not caught): no test removed an owner from the replica; an operator edit of the durable snapshot does not
+hold either, because every running process keeps the rows in memory and writes them back within seconds.
+
+Fix: `_release_removed_owners` (kanban_session_activity_records): in a replica that is not stale and carries task
+records, a remembered, qualified row whose owner gateway publishes no task record at all and has no fresh scope
+heartbeat, and whose last reported status is done or archived, reads released with that status (`owner_removed:
+True`). Unchanged: open and unknown-status rows, unqualified rows, any row of an owner that still publishes another
+card or beats, and everything while the replica is stale or carries no task record. The release is remembered
+like any other row (later reads and the durable snapshot keep it).
+
+Tests: tests/hermes_cli/test_kanban_release_removed_owner_rows.py (the pure rule and its controls; OwnerSink;
+`_legacy_remote_links` over a real replica file and durable snapshot: a removed owner's done card is released and
+stays released, its open card and a still-publishing owner's dropped record are not; a stale replica releases
+nothing). Dry run of the patched projection on the MacBook's live data: stuck finished rows 1,409 -> 53 (23 of an
+owner that is alive, the rest unqualified rows). Untested: a replica mid-resync that is fresh yet lacks an owner's
+records; the Desktop render.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_session_activity.py         |  11 +-
+ hermes_cli/kanban_session_activity_records.py |  37 ++++++
+ .../test_kanban_release_removed_owner_rows.py | 118 ++++++++++++++++++
+ 3 files changed, 161 insertions(+), 5 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_release_removed_owner_rows.py
+
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 4a6c7e7ff6622379b31efad3d2f6b8beb83993a4..fbdb4e340639044ca5c9ffa79c407265263ffd89 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -38,7 +38,8 @@ from hermes_cli.kanban_session_activity_release import PENDING_RELEASE_STATUSES,
+ from hermes_cli.kanban_session_activity_release import owner_attests_terminal as _owner_attests_terminal
+ from hermes_cli.kanban_db_sync import sync_enabled as _board_sync_enabled
+ from hermes_cli.kanban_scope_heartbeat import scope_heartbeats as _scope_heartbeats
+-from hermes_cli.kanban_session_activity_records import _fold_legacy_aliases, _moved_evidence, _retire_moved
++from hermes_cli.kanban_session_activity_records import (OwnerSink as _OwnerSink, _fold_legacy_aliases, _moved_evidence,
++                                                          _release_removed_owners, _retire_moved)
+ from hermes_cli.kanban_session_activity_attention import AttentionCache as _AttentionCache
+ from hermes_cli.kanban_session_activity_attention import run_checks as _run_done_checks
+ from hermes_cli.kanban_session_activity_card_details import _add_card_details
+@@ -1078,9 +1079,9 @@ def _legacy_remote_links() -> list[dict[str, Any]]:
+             raise FileNotFoundError("no hub.db")
+         qualified: set[tuple[str, str, str]] = set()
+         from hermes_cli.kanban_replica_aggregates import BorrowedSet, remembered_publications
+-        closed = BorrowedSet()
++        closed, owners = BorrowedSet(), _OwnerSink()
+         moved: dict[str, Any] = {}
+-        cards = _read_remote_links(path, qualified_out=qualified, closed_out=closed, moved_out=moved)
++        cards = _read_remote_links(path, qualified_out=qualified, closed_out=closed, moved_out=moved, owners_out=owners)
+         remembered_publications(moved, previous)
+     except Exception as exc:  # a broken replica must never break the sidebar
+         if previous is None:
+@@ -1100,7 +1101,7 @@ def _legacy_remote_links() -> list[dict[str, Any]]:
+     # may attest closed) under its qualified key. [daveey]
+     qualified_now = {(c["session"], c.get("gateway"), c.get("board"), c.get("id"))
+                      for c in cards if c.get("ownership_state") == "qualified"}
+-    cards.extend(reconcile_carry([{**c, "stale": True} for c in (previous or [])
++    cards.extend(_release_removed_owners(reconcile_carry([{**c, "stale": True} for c in (previous or [])
+                  if (c["session"], c["key"]) not in present
+                  # Successful reads migrate graph-inferred cache entries only.
+                  # Receipt-backed obligations remain in the separate ledger.
+@@ -1112,7 +1113,7 @@ def _legacy_remote_links() -> list[dict[str, Any]]:
+                  and not (c.get("ownership_state") == "unknown"
+                           and (c["session"], c.get("gateway"), c.get("board"), c.get("id")) in qualified_now)
+                  # Fresh replica: the named owner publishes the scope without it, another gateway owns the card.
+-                 and not _retire_moved(c, moved)]))
++                 and not _retire_moved(c, moved)]), owners.value, moved))
+     if _snapshot_saved != (scope, cards):
+         # The durable snapshot only speeds a cold start. Losing a write race (database is locked) must not
+         # fail this read: the sidebar would mark every row kanban_unknown. The next changed read retries.
+diff --git a/hermes_cli/kanban_session_activity_records.py b/hermes_cli/kanban_session_activity_records.py
+index e4a5420899ff6daaab9d633e43e5e2967ff4e25d..952eda7526bfd79667afbc3477590607f2100aa2 100644
+--- a/hermes_cli/kanban_session_activity_records.py
++++ b/hermes_cli/kanban_session_activity_records.py
+@@ -40,6 +40,43 @@ def _retire_moved(card: dict[str, Any], moved: dict[str, Any]) -> bool:
+     return any(gw != card.get('gateway') for gw in gateways)
+ 
+ 
++class OwnerSink:
++    """``owners_out`` sink for ``_release_removed_owners``: borrows a projection's owner set, and takes a full
++    read's one-shot generator as a set at once (the tasks it walks are folded afterwards)."""
++    def __init__(self):
++        self.value = ()
++
++    def update(self, value):
++        self.value = value if hasattr(value, '__contains__') else set(value)
++
++
++def _release_removed_owners(carried: list[dict[str, Any]], owners, moved: dict[str, Any]) -> list[dict[str, Any]]:
++    """Remembered rows of an owner gateway a FRESH replica no longer carries at all, last reported done or archived:
++    released, as the owner reported them. [daveey]
++
++    The Board drops a removed machine's records. Its cards were then remembered rows with no record left to attest
++    them, ``unknown`` forever: 1,231 finished cards in 68 hub chats and 1,409 in 28 MacBook chats after workers 2-8
++    were removed (2026-11-18). Absence of ONE record is still never closure (a live owner publishing other cards
++    keeps its rows as they are, see ``_retire_moved``); this is the absence of the whole owner: no task record from
++    that gateway and no fresh scope heartbeat, in a replica that is not stale (``owners`` is filled only then). An
++    open, unknown-status or unqualified row is left alone, and so is everything while the replica is stale.
++    ``owners`` is the projection's ``(gateway, board, id)`` set; it is walked only when a candidate row exists."""
++    wanted = [i for i, c in enumerate(carried) if c.get('status') == 'unknown' and c.get('ownership_state') == 'qualified'
++              and c.get('reported_status') in ('done', 'archived') and not c.get('released') and c.get('gateway')]
++    if not wanted or not moved:
++        return carried
++    publishing = {owner[0] for owner in owners}
++    if not publishing:  # a read that carries no task record at all proves nothing about who is gone
++        return carried
++    publishing |= {scope[0] for scope in moved.get('live_scopes', ())}
++    out = list(carried)
++    for i in wanted:
++        if carried[i]['gateway'] not in publishing:
++            out[i] = {**carried[i], 'status': carried[i]['reported_status'], 'unfinished': False, 'released': True,
++                      'owner_removed': True}
++    return out
++
++
+ def _fold_legacy_aliases(tasks: dict[tuple, dict[str, Any]], raw: dict[tuple, dict[str, Any]]) -> None:
+     """Merge each unqualified ``board/id`` record into its proven profile-qualified twin, in place.
+ 
+diff --git a/tests/hermes_cli/test_kanban_release_removed_owner_rows.py b/tests/hermes_cli/test_kanban_release_removed_owner_rows.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0513b706b8b1c75a54a0c2a9fde94610a1ade796
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_release_removed_owner_rows.py
+@@ -0,0 +1,118 @@
++"""Remembered rows of an owner the Board no longer carries at all are released as the owner last reported. [daveey]
++
++2026-11-18: workers 2-8 were removed from the Board, which drops their records. The cards they had finished stayed
++remembered ``unknown`` rows with nothing left to attest them: 1,231 in 68 hub chats and 1,409 in 28 MacBook chats.
++
++Entry paths: the pure rule (``_release_removed_owners``) and ``_legacy_remote_links`` over a real replica file and a
++real durable snapshot, through the memoized live read.
++"""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db
++from hermes_cli import kanban_session_activity as activity
++from hermes_cli.kanban_session_activity_records import OwnerSink, _release_removed_owners
++from tests.hermes_cli import test_kanban_replica_read_memo as memo_helpers
++from tests.hermes_cli.test_kanban_replica_read_memo import card
++from tests.hermes_cli.test_kanban_replica_read_memo_heartbeat import ok, set_info, tick
++
++hub = memo_helpers.hub
++FRESH = {'published': {}, 'live_scopes': frozenset({('alive', 'work', 'build')})}
++
++
++def row(tid, gateway, reported, **extra):
++    return {'id': tid, 'session': 's1', 'gateway': gateway, 'key': f'{gateway}/work/build/{tid}', 'board': 'build',
++            'status': 'unknown', 'reported_status': reported, 'unfinished': True, 'released': False,
++            'ownership_state': 'qualified', 'stale': True, **extra}
++
++
++def test_only_finished_rows_of_a_wholly_absent_owner_are_released():
++    rows = [row('t_done', 'gone', 'done'), row('t_arch', 'gone', 'archived'), row('t_open', 'gone', 'running'),
++            row('t_none', 'gone', None), row('t_unq', 'gone', 'done', ownership_state='unknown'),
++            row('t_pub', 'publishes', 'done'), row('t_beat', 'alive', 'done')]
++    out = _release_removed_owners(rows, {('publishes', 'build', 't_other')}, FRESH)
++    got = {r['id']: (r['status'], r['released'], r['unfinished'], r.get('owner_removed', False)) for r in out}
++    assert got == {'t_done': ('done', True, False, True), 't_arch': ('archived', True, False, True),
++                   't_open': ('unknown', False, True, False), 't_none': ('unknown', False, True, False),
++                   't_unq': ('unknown', False, True, False),
++                   't_pub': ('unknown', False, True, False),   # its owner still publishes other cards: one record's
++                   't_beat': ('unknown', False, True, False)}  # absence is never closure; nor with a fresh heartbeat
++    assert rows[0]['status'] == 'unknown', 'the remembered rows are not edited in place'
++
++
++def test_a_stale_or_empty_replica_releases_nothing():
++    rows = [row('t_done', 'gone', 'done')]
++    assert _release_removed_owners(rows, (), FRESH) == rows, 'no owner set and no heartbeat: the read proves nothing'
++    assert _release_removed_owners(rows, {('publishes', 'build', 't_x')}, {}) == rows, 'stale: no moved evidence'
++    assert _release_removed_owners(rows, (), {}) == rows
++
++
++def test_owner_sink_takes_a_generator_once_and_borrows_a_set():
++    sink = OwnerSink()
++    assert tuple(sink.value) == ()
++    owners = frozenset({('a', 'b', 't')})
++    sink.update(owners)
++    assert sink.value is owners
++    sink.update(o for o in [('a', 'b', 't')])
++    assert sink.value == {('a', 'b', 't')} and list(sink.value) == list(sink.value)
++
++
++def put(path, gateway, tid, seq, **extra):
++    with sqlite3.connect(path) as db:
++        db.execute("INSERT INTO replica VALUES (?,'tasks',?,1,?,?,1000000)",
++                   (gateway, f'work/build/{tid}', seq, json.dumps(card(tid, gateway=gateway, **extra))))
++
++
++@pytest.fixture
++def world(hub, tmp_path, monkeypatch):
++    path, _put, _statements, clock = hub
++    monkeypatch.setattr(kanban_db, 'kanban_home', lambda: tmp_path)
++    monkeypatch.setattr(activity, '_hub_db_path', lambda: path)
++    monkeypatch.setattr(activity, '_board_db_paths', list)
++    activity._reset_cache_for_tests()
++    # Neither "gone" nor "partial" ever beat, so their finished cards are remembered unreleased.
++    put(path, 'gone', 't_done', 50, status='done')
++    put(path, 'gone', 't_open', 51, status='running')
++    put(path, 'partial', 't_dropped', 52, status='done')
++    put(path, 'partial', 't_kept', 53, status='running')
++    put(path, 'alive', 't_live', 54, status='running')
++    set_info(path, [ok(1000.0)], gw='alive')
++    return path, clock
++
++
++def by_id(rows):
++    return {r['id']: (r['status'], bool(r.get('released')), bool(r.get('stale'))) for r in rows}
++
++
++def test_legacy_remote_links_release_a_removed_owners_finished_cards(world):
++    path, clock = world
++    first = by_id(activity._legacy_remote_links())
++    assert first['t_done'] == ('unknown', False, False) and first['t_dropped'] == ('unknown', False, False)
++    with sqlite3.connect(path) as db:  # the Board removes "gone" entirely, and one record of "partial"
++        db.execute("DELETE FROM replica WHERE gw = 'gone'")
++        db.execute("DELETE FROM replica WHERE gw = 'partial' AND key = 'work/build/t_dropped'")
++    tick(path, clock, 1010.0)
++    rows = activity._legacy_remote_links()
++    got = by_id(rows)
++    assert got['t_done'] == ('done', True, True), 'the removed owner last reported it done'
++    assert got['t_open'] == ('running', False, True), 'its open card stays a remembered open row'
++    assert got['t_dropped'] == ('unknown', False, True), 'an owner that still publishes keeps its unknown row'
++    assert got['t_kept'] == ('running', False, False) and got['t_live'] == ('running', False, False)
++    done = next(r for r in rows if r['id'] == 't_done')
++    assert done['owner_removed'] is True and done['unfinished'] is False
++    # The release is remembered: a later read and a cold process (the durable snapshot) both keep it.
++    tick(path, clock, 1020.0)
++    assert by_id(activity._legacy_remote_links())['t_done'] == ('done', True, True)
++    saved = {r['id']: r for r in activity._remote_snapshot()}
++    assert saved['t_done']['released'] is True and saved['t_dropped']['released'] is False
++
++
++def test_a_stale_replica_keeps_the_rows_unknown(world):
++    path, clock = world
++    activity._legacy_remote_links()
++    with sqlite3.connect(path) as db:
++        db.execute("DELETE FROM replica WHERE gw = 'gone'")
++    clock['now'] = 1000.0 + 40 * 3600  # no hub pull since: the replica is stale and proves nothing
++    assert by_id(activity._legacy_remote_links())['t_done'] == ('unknown', False, True)
+-- 
+2.43.0
+

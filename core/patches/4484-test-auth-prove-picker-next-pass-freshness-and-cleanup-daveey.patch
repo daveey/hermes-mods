@@ -1,0 +1,249 @@
+From be7f0e350a497f3060da812ba0b919cbdd3d6c2e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 15:25:02 +0000
+Subject: [PATCH] test(auth): prove picker next-pass freshness and cleanup
+ [daveey]
+
+---
+ .../test_picker_auth_pass_visibility.py       | 229 ++++++++++++++++++
+ 1 file changed, 229 insertions(+)
+ create mode 100644 tests/hermes_cli/test_picker_auth_pass_visibility.py
+
+diff --git a/tests/hermes_cli/test_picker_auth_pass_visibility.py b/tests/hermes_cli/test_picker_auth_pass_visibility.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..46dcf96f355623c32b2f1b6069ecc487079fb146
+--- /dev/null
++++ b/tests/hermes_cli/test_picker_auth_pass_visibility.py
+@@ -0,0 +1,229 @@
++"""Next-picker-pass visibility and exception cleanup for the auth pass read memo.
++
++Fixtures only: HERMES_HOME is the suite's temp home; nothing touches live config/auth.
++"""
++import json
++import os
++import socket
++import threading
++
++import pytest
++
++from hermes_cli import auth
++from hermes_cli import auth_pool_read_scope as scope_module
++from hermes_cli.model_switch_providers import picker_build_scope
++
++
++@pytest.fixture(autouse=True)
++def offline(monkeypatch):
++    """No catalog warmers or network escape, including swallowed probe failures."""
++    from hermes_cli import inventory
++    from agent import models_dev
++    monkeypatch.setattr(models_dev, "fetch_models_dev", dict)
++    attempts = []
++
++    def refuse(*args, **kwargs):
++        attempts.append("network")
++        raise AssertionError("visibility fixtures must remain offline")
++
++    monkeypatch.setattr(socket.socket, "connect", refuse)
++    monkeypatch.setattr(socket.socket, "connect_ex", refuse)
++    monkeypatch.setattr(socket, "getaddrinfo", refuse)
++    monkeypatch.setattr(threading.Thread, "start", lambda self: None)
++    monkeypatch.setattr(inventory, "_prewarm_pricing_async", lambda *a, **k: None)
++    yield
++    assert attempts == [], "even caught network attempts violate fixture isolation"
++
++_ROW = {"id": "a", "label": "l", "auth_type": "api_key", "priority": 0,
++        "source": "manual", "access_token": "fixture-key"}
++
++
++@pytest.fixture
++def home(monkeypatch):
++    from hermes_constants import get_hermes_home
++    h = get_hermes_home()
++    for key in list(os.environ):
++        if key.endswith(("_API_KEY", "_TOKEN")):
++            monkeypatch.delenv(key, raising=False)
++    (h / "config.yaml").write_text("model:\n  default: x\n  provider: openrouter\n")
++    return h
++
++
++def _rows():
++    from hermes_cli.inventory import build_model_options_payload, load_picker_context
++    return {p["slug"]: p for p in build_model_options_payload(load_picker_context())["providers"]}
++
++
++def _slugs():
++    return list(_rows())
++
++
++def _auth_write(pool):
++    auth._auth_file_path().write_text(json.dumps({"providers": {}, "credential_pool": pool}))
++
++
++def _current_scope():
++    return scope_module._current_scope()
++
++
++def test_env_key_add_and_remove_visible_to_next_pass(home, monkeypatch):
++    from hermes_cli import model_switch
++    original = model_switch._scoped_key_env
++    observed = []
++
++    def observe(name):
++        value = original(name)
++        if name == "DEEPSEEK_API_KEY":
++            observed.append(value)
++        return value
++
++    # Observe the real credential resolver consumed by each payload build.
++    monkeypatch.setattr(model_switch, "_scoped_key_env", observe)
++    assert "deepseek" not in _slugs()
++    monkeypatch.setenv("DEEPSEEK_API_KEY", "fixture-key")
++    observed.clear()
++    assert "deepseek" in _slugs()
++    assert observed and all(key == "fixture-key" for key in observed)
++    monkeypatch.setenv("DEEPSEEK_API_KEY", "fixture-key-2")
++    observed.clear()
++    assert "deepseek" in _slugs()
++    assert observed and all(key == "fixture-key-2" for key in observed)
++    monkeypatch.delenv("DEEPSEEK_API_KEY")
++    assert "deepseek" not in _slugs()
++
++
++def test_config_provider_add_change_remove_visible_to_next_pass(home):
++    def cfg(extra=""):
++        (home / "config.yaml").write_text(
++            "model:\n  default: x\n  provider: openrouter\n" + extra)
++    block = "providers:\n  myco:\n    api: http://127.0.0.1:9/v1\n    api_key: k\n    default_model: %s\n"
++    cfg()
++    assert "myco" not in _slugs()
++    cfg(block % "m1")
++    assert _rows()["myco"]["models"] == ["m1"]
++    cfg(block % "m2")
++    assert _rows()["myco"]["models"] == ["m2"]
++    cfg()
++    assert "myco" not in _slugs()
++
++
++def test_auth_pool_add_change_remove_visible_to_next_pass(home):
++    _auth_write({})
++    assert "deepseek" not in _slugs()
++    _auth_write({"deepseek": [_ROW]})
++    assert "deepseek" in _slugs()
++    # change: same provider, different token; reader returns the new payload
++    _auth_write({"deepseek": [dict(_ROW, access_token="fixture-key-2")]})
++    with picker_build_scope():
++        assert auth.read_credential_pool("deepseek")[0]["access_token"] == "fixture-key-2"
++    assert "deepseek" in _slugs()
++    _auth_write({})
++    assert "deepseek" not in _slugs()
++
++
++def test_auth_change_inside_one_pass_is_seen_by_raw_reads_and_next_pass(home):
++    # The picker's per-build pool-object memo (_POOL_STATE_MEMO) is by design stable within a
++    # build, so only the raw auth reads are asserted mid-pass; the build sees it next pass.
++    _auth_write({})
++    with picker_build_scope():
++        assert auth.read_credential_pool("deepseek") == []
++        _auth_write({"deepseek": [_ROW]})
++        assert auth.read_credential_pool("deepseek")[0]["id"] == "a"
++        _auth_write({})
++        assert auth.read_credential_pool("deepseek") == []
++        _auth_write({"deepseek": [_ROW]})
++    assert "deepseek" in _slugs()
++
++
++def test_real_writer_add_remove_visible_to_next_pass(home):
++    _auth_write({})
++    with picker_build_scope():
++        auth.read_credential_pool("deepseek")
++        auth.write_credential_pool("deepseek", [dict(_ROW)])
++    assert "deepseek" in _slugs()
++    auth.write_credential_pool("deepseek", [], removed_ids=["a"])
++    assert "deepseek" not in _slugs()
++
++
++def test_exception_in_scope_clears_memo_and_next_pass_reparses(home):
++    _auth_write({"deepseek": [_ROW]})
++    leaked = {}
++    with pytest.raises(RuntimeError):
++        with picker_build_scope():
++            auth.read_credential_pool("deepseek")
++            leaked["scope"] = scope_module._SCOPE.get()
++            assert leaked["scope"].store is not None
++            raise RuntimeError("fixture")
++    assert leaked["scope"].active is False and leaked["scope"].store is None
++    assert scope_module._SCOPE.get() is None and _current_scope() is None
++    _auth_write({})
++    with picker_build_scope():
++        assert auth.read_credential_pool("deepseek") == []
++
++
++def test_exception_inside_build_does_not_leak_into_next_build(home, monkeypatch):
++    from hermes_cli import config, model_switch_providers as msp
++    _auth_write({"deepseek": [_ROW]})
++    assert "deepseek" in _slugs()
++
++    def boom(*a, **k):
++        raise RuntimeError("fixture")
++
++    with monkeypatch.context() as m:
++        m.setattr(config, "stringify_provider_map", boom)
++        with pytest.raises(RuntimeError):
++            from hermes_cli.model_switch import list_authenticated_providers
++            list_authenticated_providers(for_picker=True)
++    assert scope_module._SCOPE.get() is None and msp._POOL_STATE_MEMO.get() is None
++    _auth_write({})
++    assert "deepseek" not in _slugs()
++
++
++def test_inner_scope_exception_keeps_outer_pass_alive(home):
++    _auth_write({"deepseek": [_ROW]})
++    with picker_build_scope():
++        outer = scope_module._SCOPE.get()
++        auth.read_credential_pool("deepseek")
++        with pytest.raises(ValueError):
++            # Enter the raw nested scope too: picker_build_scope has its own nesting
++            # guard, which would otherwise mask removal of the auth-scope guard.
++            with scope_module.auth_pool_read_scope():
++                assert scope_module._SCOPE.get() is outer
++                raise ValueError("fixture")
++        assert outer.active and outer.store is not None
++        assert _current_scope() is outer
++    assert not outer.active and outer.store is None
++
++
++def test_stale_scope_object_never_serves_after_exit(home, monkeypatch):
++    _auth_write({"deepseek": [_ROW]})
++    with picker_build_scope():
++        auth.read_credential_pool("deepseek")
++        stale = scope_module._SCOPE.get()
++    _auth_write({})
++    token = scope_module._SCOPE.set(stale)  # a leaked reference to an ended pass
++    try:
++        assert _current_scope() is None
++        assert auth.read_credential_pool("deepseek") == []
++    finally:
++        scope_module._SCOPE.reset(token)
++
++
++@pytest.mark.parametrize("payload", ['{"credential_pool": []}', '{"providers": {}}', "[]"])
++def test_non_dict_pool_is_not_memoized(home, payload):
++    auth._auth_file_path().write_text(payload)
++    with picker_build_scope():
++        assert auth.read_credential_pool("deepseek") == []
++        assert scope_module._SCOPE.get().store is None
++        _auth_write({"deepseek": [_ROW]})
++        assert auth.read_credential_pool("deepseek")[0]["id"] == "a"
++
++
++def test_deleted_auth_file_mid_pass_is_not_served_stale(home):
++    _auth_write({"deepseek": [_ROW]})
++    with picker_build_scope():
++        assert auth.read_credential_pool("deepseek")
++        auth._auth_file_path().unlink()
++        assert auth.read_credential_pool("deepseek") == []
++        assert scope_module._SCOPE.get().store is None
++    assert "deepseek" not in _slugs()
+-- 
+2.43.0
+

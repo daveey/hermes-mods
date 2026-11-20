@@ -1,0 +1,119 @@
+From d8db17842bedf663b5d4fd51ac2369bd03760ff1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 05:45:17 +0000
+Subject: [PATCH] [daveey] lifecycle guard: past the first ssh hop, read stdin
+ as data only for allowlisted consumers
+
+Review 5914322131 B1: following hops with a shell denylist let through
+multi-hop shapes base refused (bash /dev/stdin, source/eval, busybox sh,
+flock/chroot/sg/script/docker/kubectl/xargs launchers). Past the first
+hop (further ssh or a -c payload) every segment must now run a known
+data consumer (python*, cat, tee, ...) or a command that reads no stdin;
+anything else, a shell's script operand included, fails closed.
+16 new control shapes; RED 16/16 on 3969c41efe.
+---
+ cron/lifecycle_guard_nested_shells.py         | 26 ++++++++++++++++++-
+ .../test_lifecycle_guard_session_aliases.py   | 24 +++++++++++++++++
+ 2 files changed, 49 insertions(+), 1 deletion(-)
+
+diff --git a/cron/lifecycle_guard_nested_shells.py b/cron/lifecycle_guard_nested_shells.py
+index 9f7bef41181882377bc85615638b0160646ddc67..8a7edbb0de066945f1c6751110fb8a5365ccb887 100644
+--- a/cron/lifecycle_guard_nested_shells.py
++++ b/cron/lifecycle_guard_nested_shells.py
+@@ -211,6 +211,24 @@ def _shell_inputs(arguments: list[str], shell: str) -> tuple[str, Optional[str]]
+ # a longer chain fails closed.
+ _MAX_SSH_HOPS = 4
+ 
++# Past the first hop (a further ssh hop or a shell's -c payload) stdin counts as data only when
++# every segment runs one of these: interpreters and filters that never hand stdin to a shell, and
++# commands that do not read stdin at all. Anything else (`source /dev/stdin`, `eval bash`,
++# `busybox sh`, `flock l bash`, `docker exec -i c bash`, `xargs bash`) fails closed, as every
++# multi-hop chain did before it was followed (review 5914322131 B1). Not listed on purpose:
++# `tar`/`sort`/`find` (options that run commands), launchers and wrappers that are not peeled.
++_PYTHON_RE = re.compile(r"python(?:\d+(?:\.\d+)*)?")
++_HOP_DATA_COMMANDS = frozenset({
++    "cat", "tee", "wc", "head", "tail", "base64", "gzip", "gunzip", "zcat", "xz", "unxz",
++    "sha256sum", "sha1sum", "md5sum", "dd", "xxd", "jq", "grep", "cut", "tr", "uniq",
++    # read no stdin
++    "cd", "true", ":", "echo", "printf", "export", "umask", "date", "hostname", "sleep",
++})
++
++
++def _hop_data_command(name: Optional[str]) -> bool:
++    return name is not None and (name in _HOP_DATA_COMMANDS or bool(_PYTHON_RE.fullmatch(name)))
++
+ 
+ def _remote_reads_stdin(remote: list[str], hops: int = 1) -> bool:
+     """Whether an ssh remote command (its words, as ssh joins them) hands stdin to a shell:
+@@ -218,7 +236,9 @@ def _remote_reads_stdin(remote: list[str], hops: int = 1) -> bool:
+     further hop whose own input is such a shell (another ``ssh``), or a user switch (``sudo``,
+     ``su``, ``runuser``, ``doas``: not modelled, fail closed).
+     A further ssh hop is followed to its remote command, so a chain ending in a data consumer
+-    (``python3 -``, ``cat``) reads the file as data (self-heal lifecycleguard-6d64a5ee3d48)."""
++    (``python3 -``, ``cat``) reads the file as data (self-heal lifecycleguard-6d64a5ee3d48).
++    Past the first hop that is an allowlist (``_HOP_DATA_COMMANDS``): any other command, a
++    shell's script operand included (``bash /dev/stdin``), counts as a stdin shell."""
+     if not remote:
+         return True
+     if hops > _MAX_SSH_HOPS:
+@@ -239,11 +259,15 @@ def _remote_reads_stdin(remote: list[str], hops: int = 1) -> bool:
+             # `sh -c "exec sh"`; review 5911756789 B1), under the same depth cap.
+             if kind == "payload" and _remote_reads_stdin([value or ""], hops + 1):
+                 return True
++            if kind == "script" and hops > 1:
++                return True  # `bash /dev/stdin`, `sh -- -`: not modelled past the first hop
+             continue
+         if _nested_shell_input(view, hops=hops + 1) is not None:
+             return True  # an ssh hop feeding a shell, or a user switch's shell (`su -l`, `sudo -i`)
+         if name in ("sudo", "su", "runuser", "doas"):
+             return True  # a user switch on the remote side: fail closed rather than model it
++        if hops > 1 and index is not None and name != "ssh" and not _hop_data_command(name):
++            return True  # past the first hop only known data consumers read stdin as data
+     return False
+ 
+ 
+diff --git a/tests/cron/test_lifecycle_guard_session_aliases.py b/tests/cron/test_lifecycle_guard_session_aliases.py
+index 5b0760ea13de5057531bdd3f470285feaa796c08..719aeabf0e7fb2eb39292b052d7d0260a07810bf 100644
+--- a/tests/cron/test_lifecycle_guard_session_aliases.py
++++ b/tests/cron/test_lifecycle_guard_session_aliases.py
+@@ -832,6 +832,10 @@ _MULTI_HOP_DATA_CONSUMERS = [
+     "ssh h1 \"ssh h2 'bash -c \\\"python3 -\\\"'\" < {py}",
+     "ssh h1 'bash -c \"exec python3 -\"' < {py}",
+     "ssh h1 \"ssh h2 python3 -\" <<'PY'\n" + _PY_TAKEOVER + "PY",
++    # Allowlisted consumers after commands that never read stdin.
++    "ssh h1 \"ssh h2 'cd /tmp && python3 -'\" < {py}",
++    "ssh h1 'ssh h2 python3.12 -' < {py}",
++    "ssh h1 'ssh h2 tee /tmp/takeover.py' < {py}",
+ ]
+ 
+ 
+@@ -878,6 +882,26 @@ _MULTI_HOP_SHELLS = [
+     "ssh h1 \"ssh h2 'bash -c \\\"bash -c sh\\\"'\" < {script}",
+     "ssh h1 \"ssh h2 'sh -c \\\"ssh h3\\\"'\" < {script}",
+     "ssh h1 \"ssh h2 'bash -c \\\"python3 -; sh\\\"'\" < {script}",
++    # A followed hop hands stdin to a command only when it is a known data consumer; anything
++    # else (scripts on /dev/stdin, builtins that run code, launchers) is a shell reader
++    # (review 5914322131 B1: base refused every one of these, so they must stay refused).
++    "ssh h1 'ssh h2 bash /dev/stdin' < {script}",
++    "ssh h1 'ssh h2 sh /dev/stdin' < {script}",
++    "ssh h1 'ssh h2 source /dev/stdin' < {script}",
++    "ssh h1 'ssh h2 . /dev/stdin' < {script}",
++    "ssh h1 'ssh h2 eval bash' < {script}",
++    "ssh h1 'ssh h2 exec -a x bash' < {script}",
++    "ssh h1 'ssh h2 busybox sh' < {script}",
++    "ssh h1 \"ssh h2 'bash -c \\\"source /dev/stdin\\\"'\" < {script}",
++    "ssh h1 \"bash -c 'source /dev/stdin'\" < {script}",
++    "ssh h1 'ssh h2 flock /tmp/l bash' < {script}",
++    "ssh h1 'ssh h2 chroot / bash' < {script}",
++    "ssh h1 'ssh h2 sg grp bash' < {script}",
++    "ssh h1 \"ssh h2 'script -qc bash /dev/null'\" < {script}",
++    "ssh h1 'ssh h2 docker exec -i c bash' < {script}",
++    "ssh h1 'ssh h2 kubectl exec -i p -- bash' < {script}",
++    "ssh h1 'ssh h2 xargs -0 bash' < {script}",
++    "ssh h1 \"ssh h2 'cd /tmp && bash'\" < {script}",
+ ]
+ 
+ 
+-- 
+2.43.0
+

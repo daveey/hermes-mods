@@ -1,0 +1,961 @@
+From b55ea4becd4a1ad6460ec4f55a8254e6b97182bf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 23:23:25 -0800
+Subject: [PATCH] state: every wholesale FTS page-freeing path asks the
+ whole-file plan first [daveey]
+
+On the hub's damage shape (a trigram b-tree page referenced twice), DROP, FTS5
+'rebuild'/'delete-all' and draining a tree's rows free the shared page twice,
+and SQLite later hands it to canonical data. The online recovery and the
+one-shot rebuild already refused; the other paths did not.
+
+One gate, SessionDB._fts_wholesale_free_allowed (hermes_state_fts_online), now
+guards: the open-time source realign, the trigram source-exclusion migration,
+the orphan shadow-table sweep, the missing-trigger 'rebuild' of an existing
+index, rebuild_fts(), the optimize-storage truncation ('delete-all') and the
+trash teardown. A plan naming the family detaches search (fail-open,
+_fts_oneshot_failed) so the retry unlinks it online; a refused plan changes
+nothing. Runtime callers plan before self._lock (_fts_runtime_plan, one call
+only); a gated path reached under the lock without a plan skips. Open-time
+init plans inline once per open, and only when a gated operation would run.
+
+Trash the online recovery creates is recorded in state_meta fts_trash_verified
+in the same transaction and drains without a new plan; other trash (legacy
+demotion, CJK retirement) drains only after a clean plan records it, and is
+left alone when the check names it.
+
+Three test setups that truncate the index under db._lock now make the plan
+first (the new contract for 'delete-all').
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_state_fts.py                           |  11 +-
+ hermes_state_fts_online.py                    | 102 +++-
+ hermes_state_schema.py                        |  51 +-
+ hermes_state_search.py                        |  50 +-
+ tests/hermes_state/test_fts_free_gates.py     | 462 ++++++++++++++++++
+ .../test_fts_tool_write_bounds.py             |   2 +-
+ .../test_fts_trigram_cron_exclusion.py        |   2 +-
+ .../test_fts_trigram_subagent_exclusion.py    |   2 +-
+ 8 files changed, 662 insertions(+), 20 deletions(-)
+ create mode 100644 tests/hermes_state/test_fts_free_gates.py
+
+diff --git a/hermes_state_fts.py b/hermes_state_fts.py
+index 693a75976d7582ec2b7e39f9cbb45752299e780b..c534569756c320db72715bfdbb4ec098afdd9ca5 100644
+--- a/hermes_state_fts.py
++++ b/hermes_state_fts.py
+@@ -5,7 +5,7 @@ import logging
+ import re
+ import sqlite3
+ import time
+-from typing import Sequence
++from typing import Callable, Optional, Sequence
+ 
+ from hermes_state_common import FTS_SQL, FTS_STALE_KEY, FTS_TRIGRAM_SQL, _FTS_TRIGGERS
+ from hermes_state_errors import is_fts_scoped_corruption_error, is_sqlite_lock_error
+@@ -144,9 +144,14 @@ def _orphan_fts_shadows(cursor: sqlite3.Cursor, family: str) -> list[str]:
+     ).fetchall()]
+ 
+ 
+-def _drop_orphan_fts_shadow_tables(cursor: sqlite3.Cursor, families: Sequence[str]) -> list[str]:
++def _drop_orphan_fts_shadow_tables(
++    cursor: sqlite3.Cursor, families: Sequence[str], *, may_drop: Optional[Callable[[str], bool]] = None,
++) -> list[str]:
+     """Drop, per family, shadow tables whose virtual table row is absent from sqlite_master.
+ 
++    *may_drop(family)* is asked once a family has orphans, before any write: DROP frees every page of those
++    trees, so SessionDB passes its whole-file gate (hermes_state_fts_online); False keeps the family.
++
+     Matches exact shadow names only (never a prefix LIKE, so the base family cannot reach
+     ``messages_fts_trigram_*``) and leaves a family alone whenever its vtable is live. The
+     shadows are derived index state; the caller recreates and rebuilds from ``messages``.
+@@ -159,7 +164,7 @@ def _drop_orphan_fts_shadow_tables(cursor: sqlite3.Cursor, families: Sequence[st
+     """
+     repaired: list[str] = []
+     for family in families:
+-        if not _orphan_fts_shadows(cursor, family):
++        if not _orphan_fts_shadows(cursor, family) or (may_drop is not None and not may_drop(family)):
+             continue
+         owns_transaction = not cursor.connection.in_transaction
+         if owns_transaction:
+diff --git a/hermes_state_fts_online.py b/hermes_state_fts_online.py
+index 965752a2c69be378e0d9f334961b835e0ab117d0..bd045300add95776c990607df8620689abd5cb80 100644
+--- a/hermes_state_fts_online.py
++++ b/hermes_state_fts_online.py
+@@ -39,6 +39,7 @@ Never on a read-only or quarantined handle, nor on the legacy inline (pre-v23) l
+ from __future__ import annotations
+ 
+ import contextlib
++import json
+ import logging
+ import re
+ import sqlite3
+@@ -56,6 +57,28 @@ FTS_BACKFILL_TICK_BUDGET_S = 5.0
+ ONLINE_REFUSAL_MEMO_S = 6 * 3600.0
+ FAMILIES = ("messages_fts", "messages_fts_trigram")
+ TRASH_PREFIX = "fts_v22_trash_"  # the optimize-storage teardown drains every table with this prefix
++# state_meta: JSON list of trash tables a whole-file plan proved unshared (the online recovery's own trash, or
++# trash a clean plan vouched for before its first teardown chunk). Only these are drained.
++TRASH_VERIFIED_KEY = "fts_trash_verified"
++
++
++def verified_trash(conn) -> set:
++    """The trash table names recorded under ``TRASH_VERIFIED_KEY`` (empty for a missing or unreadable value)."""
++    row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (TRASH_VERIFIED_KEY,)).fetchone()
++    try:
++        names = json.loads(row[0]) if row else []
++    except (TypeError, ValueError):
++        return set()
++    return {n for n in names if isinstance(n, str)} if isinstance(names, list) else set()
++
++
++def write_verified_trash(conn, names) -> None:
++    """Replace the recorded list; caller holds the write transaction."""
++    if names:
++        conn.execute("INSERT INTO state_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET "
++                     "value = excluded.value", (TRASH_VERIFIED_KEY, json.dumps(sorted(names))))
++    else:
++        conn.execute("DELETE FROM state_meta WHERE key = ?", (TRASH_VERIFIED_KEY,))
+ 
+ 
+ _FAMILY_OBJECT_RE = re.compile(r"(messages_fts(?:_trigram)?)(?:_data|_idx|_content|_docsize|_config)?")
+@@ -154,6 +177,14 @@ def online_recovery_script(*, unlink_tables, trash, trash_tables, trigram: bool,
+                      "AND sql LIKE 'CREATE VIRTUAL TABLE%';")
+     parts.append("PRAGMA writable_schema=RESET;")
+     parts += [f"ALTER TABLE {name} RENAME TO {TRASH_PREFIX}{name}_{stamp};" for name in trash_tables]
++    if trash_tables:
++        # The plan proved these unshared: their teardown needs no new plan (merged into the recorded list here, in
++        # the same transaction as the rename).
++        names = json.dumps(sorted(f"{TRASH_PREFIX}{name}_{stamp}" for name in trash_tables)).replace("'", "''")
++        parts.append(f"INSERT INTO state_meta (key, value) VALUES ('{TRASH_VERIFIED_KEY}', '{names}') "
++                     "ON CONFLICT(key) DO UPDATE SET value = (SELECT json_group_array(value) FROM ("
++                     "SELECT value FROM json_each(CASE WHEN json_valid(state_meta.value) THEN state_meta.value "
++                     "ELSE '[]' END) UNION SELECT value FROM json_each(excluded.value)));")
+     # The claim lands before the triggers exist, so no row is ever both trigger-indexed and backfilled.
+     parts += ["INSERT INTO state_meta (key, value) SELECT 'fts_rebuild_high_water', CAST(COALESCE(MAX(id), 0) AS TEXT) "
+               "FROM messages WHERE true ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+@@ -198,6 +229,72 @@ class SessionFtsOnlineRecoveryMixin:
+             self._fts_online_refused_reason = str(exc)
+             raise
+ 
++    # ── Gate for every other path that frees an FTS tree wholesale ──
++    # DROP, FTS5 'rebuild' / 'delete-all' and a trash teardown free every page of a tree. On the hub's damage shape
++    # (a page referenced twice) that frees the shared page twice, and SQLite later hands it to canonical data. So
++    # each such path asks this gate first, with the same whole-file plan the online recovery uses.
++
++    @contextlib.contextmanager
++    def _fts_runtime_plan(self, needed: bool = True):
++        """Make the plan now, before the caller takes ``self._lock``, for this call only (like the retry tick's
++        ``_fts_tick_plan``). An enclosing attempt's plan stands; *needed* False makes none."""
++        if not needed or getattr(self, "_fts_tick_plan", None) is not None:
++            yield
++            return
++        self._fts_tick_plan = self._fts_plan_outcome()
++        try:
++            yield
++        finally:
++            self._fts_tick_plan = None
++
++    def _fts_wholesale_free_allowed(self, families, *, context: str, cursor=None) -> bool:
++        """True when freeing the trees of *families* (FTS index families; empty for trash teardown) is provably safe.
++
++        False when the plan refuses (damage it cannot attribute: logged, nothing changes) or names one of
++        *families* (the store goes to the fail-open state with ``_fts_oneshot_failed`` set, so the retry tick's
++        online path unlinks the family unread). Uses the attempt's plan (``_fts_tick_plan``); without one it
++        plans inline only when ``self._lock`` is free (open-time schema init, or a caller outside the lock) and
++        otherwise skips: a whole-file check takes minutes and every write of this process waits on that lock.
++        *cursor*: where the fail-open state is written (default: the writer connection; caller holds the lock)."""
++        startup = getattr(self, "_fts_startup_init", False)
++        if getattr(self, "_fts_tick_plan", None) is None and not startup and self._lock.locked():
++            logger.warning("%s skipped: no integrity plan was made for this attempt before the session lock; a later "
++                           "attempt plans first.", context)
++            return False
++        try:
++            plan = self._fts_plan()
++        except OnlineRecoveryRefused as exc:
++            logger.error("%s skipped: %s. `hermes sessions recover` rebuilds the store offline.", context, exc)
++            return False
++        if startup:
++            self._fts_tick_plan = ("ok", plan)  # one whole-file check per open (cleared when schema init ends)
++        named = [f for f in families if f in plan["unlink"]]
++        if not named:
++            return True
++        self._fts_oneshot_failed = True
++        self._detach_fts_stale(cursor if cursor is not None else self._conn.cursor())
++        logger.error("%s skipped: integrity_check names damaged index tree(s) %s, which freeing could release twice. "
++                     "Search is detached (LIKE fallback); the retry recovers online (unlinks them unread).",
++                     context, ", ".join(named))
++        return False
++
++    def _fts_verify_trash(self, names) -> set:
++        """Record *names* (trash tables no plan has vouched for) as verified when a fresh plan, made here outside
++        ``self._lock``, is clean; returns the names recorded. A plan names a trash table only by refusing (it is
++        no index family), so a damaged trash table is never drained."""
++        with self._fts_runtime_plan():
++            if not self._fts_wholesale_free_allowed((), context=f"Teardown of FTS trash {', '.join(sorted(names))}"):
++                return set()
++
++        def _record(conn):
++            present = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE ? "
++                                                  "ESCAPE '\\'", (TRASH_PREFIX.replace("_", "\\_") + "%",))}
++            keep = (verified_trash(conn) | set(names)) & present
++            write_verified_trash(conn, keep)
++            return keep & set(names)
++
++        return self._execute_write(_record)
++
+     def recover_stale_fts_online(self, *, reason: str, force: bool = False) -> bool:
+         """Steps 1-2. True when done (or already done by a peer). Never raises; False leaves everything as it was.
+         *force*: run on a store that is not marked stale (operator)."""
+@@ -315,8 +412,9 @@ class SessionFtsOnlineRecoveryMixin:
+                 t0 = time.monotonic()
+                 if self.get_meta("fts_rebuild_high_water") is not None:
+                     self.fts_rebuild_step()
+-                else:
+-                    self._fts_teardown_trash_step()
++                elif not self._fts_teardown_trash_step():
++                    more = self.fts_online_work_pending()  # left: trash no clean plan vouches for (logged)
++                    break
+                 self._fts_chunk_rows = self._next_chunk_rows(
+                     self._fts_chunk_rows, time.monotonic() - t0, self._FTS_REBUILD_CHUNK_TARGET_S)
+                 more = self.fts_online_work_pending()
+diff --git a/hermes_state_schema.py b/hermes_state_schema.py
+index ed1d1b20509c9169a16af1677d73cd1ce6bf8061..4cf409bdb7a77ac0dc5a7a51c762d2ba22fee6cf 100644
+--- a/hermes_state_schema.py
++++ b/hermes_state_schema.py
+@@ -373,6 +373,10 @@ class SessionSchemaMixin:
+         if not stale_view and not self._fts_index_is_misaligned_source(cursor):
+             return
+         has_messages = cursor.execute("SELECT 1 FROM messages LIMIT 1").fetchone() is not None
++        freed = ("messages_fts", "messages_fts_trigram") if has_messages and _meta_row(
++            cursor, "fts_rebuild_high_water") is not None else ("messages_fts",)
++        if not self._fts_wholesale_free_allowed(freed, context="FTS source realign (DROP + 'rebuild')"):
++            return
+ 
+         def do_align() -> None:
+             for name in _FTS_BASE_TRIGGERS:
+@@ -432,6 +436,9 @@ class SessionSchemaMixin:
+             # Absent: the normal ensure path creates/backfills it. None: this runtime cannot
+             # safely inspect an existing one, so leave the version behind for retry.
+             return trigram_exists is False
++        if not self._fts_wholesale_free_allowed(("messages_fts_trigram",),
++                                                context="Trigram source-exclusion rebuild ('rebuild')"):
++            return False  # schema_version stays behind; a later open retries on a recovered index
+         for name in _FTS_TRIGRAM_TRIGGERS:
+             cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
+         cursor.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
+@@ -1103,7 +1110,14 @@ class SessionSchemaMixin:
+         if memo.try_restore(self):
+             return
+         before = memo.snapshot(self)
+-        healed = self._init_schema_full()
++        # Open-time FTS paths that free index trees may run the whole-file plan inline (nothing else uses this
++        # handle yet), once per open (_fts_wholesale_free_allowed).
++        self._fts_startup_init = True
++        try:
++            healed = self._init_schema_full()
++        finally:
++            self._fts_startup_init = False
++            self._fts_tick_plan = None
+         memo.record(self, before, healed=healed)
+ 
+     def _init_schema_full(self) -> bool:
+@@ -1445,9 +1459,24 @@ class SessionSchemaMixin:
+         # A `.recover`-restored image keeps the shadow tables but not the vtable rows; the DDL
+         # below would fail on the first shadow. Drop only orphaned families, then rebuild the
+         # recreated (empty) index like a missing-trigger repair (#103840).
++        kept: list[str] = []
++
++        def may_drop(family: str) -> bool:
++            allowed = self._fts_wholesale_free_allowed((family,), context=f"Orphan {family} shadow-table DROP")
++            if not allowed:
++                kept.append(family)
++            return allowed
++
+         orphan_repaired = _drop_orphan_fts_shadow_tables(
+-            cursor, ("messages_fts", "messages_fts_trigram"),
++            cursor, ("messages_fts", "messages_fts_trigram"), may_drop=may_drop,
+         )
++        if kept and not self._fts_stale:
++            # Refused: the CREATE below would fail on the kept shadows; this handle runs without FTS.
++            self._fts_enabled = self._trigram_available = False
++            return
++        # Index trees present before any DDL here: a 'rebuild' below frees their pages (gated); a table created
++        # by this open has none to free, so a fresh store never plans.
++        preexisting = tuple(t for t in self._FTS_TABLES if self._sqlite_table_exists(cursor, t))
+         if not self._fts_stale:
+             self._migrate_misaligned_fts_source(cursor, legacy=legacy_fts)
+         if self._fts_stale:
+@@ -1464,7 +1493,17 @@ class SessionSchemaMixin:
+                 self._fts_triggers_missing(cursor, _FTS_TRIGRAM_TRIGGERS) or "messages_fts_trigram" in orphan_repaired
+             )
+ 
++            def rebuild_allowed() -> bool:
++                """The 'rebuild' frees the trees of every index that existed before this open (gate); refused, this
++                handle runs without FTS and the store is left as it was."""
++                if not preexisting or self._fts_wholesale_free_allowed(preexisting, context="Open-time FTS 'rebuild'"):
++                    return True
++                self._fts_enabled = self._trigram_available = False
++                return False
++
+             def ensure_and_rebuild() -> None:
++                if not rebuild_allowed():
++                    return
+                 self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", base_sql)
+                 if not self._fts_enabled:
+                     return
+@@ -1478,6 +1517,8 @@ class SessionSchemaMixin:
+                 # ``executescript`` commits DDL statement-by-statement, so acquiring after ensure exposed a
+                 # partially initialized FTS family while another opener held the rebuild lock.
+                 self._run_admitted_startup_rebuild(cursor, ensure_and_rebuild)
++            elif trigram_triggers_missing and self._trigram_tokenizer_available(cursor) and not rebuild_allowed():
++                pass  # gated before the ensure below publishes triggers over an index it would not rebuild
+             else:
+                 self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", base_sql)
+                 if self._fts_enabled:
+@@ -1514,6 +1555,12 @@ class SessionSchemaMixin:
+             "Deferred startup FTS rebuild: another process holds the "
+             "rebuild authority for this state.db; detaching FTS sync until the stale-index recovery path rebuilds it."
+         )
++        self._detach_fts_stale(cursor)
++
++    def _detach_fts_stale(self, cursor) -> None:
++        """The fail-open state on *cursor*'s connection: the ``fts_stale`` breadcrumb and no FTS triggers (canonical
++        writes continue, search uses LIKE, the stale-index recovery rebuilds). Caller holds ``self._lock`` or runs
++        schema init."""
+         cursor.execute(_STALE_KEY_UPSERT_SQL, (FTS_STALE_KEY,))
+         self._drop_all_fts_triggers(cursor)
+         self._fts_stale = True
+diff --git a/hermes_state_search.py b/hermes_state_search.py
+index 4f42f0a53b1081c61a5088f6a75a9d1771c80c1f..038cc045166a215ecdd2cdf87bcf90d3b6b6ea40 100644
+--- a/hermes_state_search.py
++++ b/hermes_state_search.py
+@@ -447,15 +447,24 @@ class SessionSearchMixin:
+         the start of the table every chunk (O(n²) total on large trash tables, #79324). Compound-key tables
+         keep the chunked ``LIMIT`` delete — they are small by construction.
+         """
++        from hermes_state_fts_online import verified_trash, write_verified_trash
++
+         limit = self._fts_chunk_rows
+         with self._read_ctx() as conn:
+             trash = [r[0] for r in conn.execute(
+                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE ? ESCAPE '\\'",
+                 (self._FTS_TRASH_PREFIX.replace("_", "\\_") + "%",),
+             ).fetchall()]
+-            if trash and progress is not None and progress.table != trash[0]:
++            verified = verified_trash(conn)
++        # Only trash a whole-file plan proved unshared is drained (hermes_state_fts_online); the rest is verified
++        # first, outside self._lock, and stays put when the plan refuses.
++        if any(t not in verified for t in trash):
++            verified |= self._fts_verify_trash([t for t in trash if t not in verified])
++            trash = [t for t in trash if t in verified]
++        if trash and progress is not None and progress.table != trash[0]:
++            with self._read_ctx() as conn:
+                 self._fts_teardown_start_table(conn, trash, progress)
+-                return True
++            return True
+         if not trash:
+             return False
+         tbl = trash[0]
+@@ -491,6 +500,7 @@ class SessionSearchMixin:
+         def _drop(conn, marker_key: Optional[str] = None) -> bool:
+             """Drained — the DROP is cheap now. True: re-check for more trash."""
+             conn.execute(f"DROP TABLE IF EXISTS {tbl}")
++            write_verified_trash(conn, verified_trash(conn) - {tbl})
+             if marker_key is not None:
+                 _delete_meta(conn, marker_key)
+             logger.info("Old FTS shadow table %s torn down.", tbl)
+@@ -537,10 +547,17 @@ class SessionSearchMixin:
+         without an anti-join, so it needs a known-empty index. A missing docsize table counts
+         as empty."""
+         if _meta_row(conn, "fts_rebuild_progress") is None:
+-            if not self._fts_index_known_empty(conn):
+-                self._reset_fts_index_to_empty(conn)
++            if not self._fts_index_known_empty(conn) and not self._reset_fts_index_to_empty(conn):
++                return  # the gate kept the index: no claim over rows it still holds (optimize reports it)
+             self.set_meta("fts_rebuild_progress", "0", cursor=conn)
+ 
++    def _fts_reseed_needs_reset(self) -> bool:
++        """``_reseed_missing_progress`` would truncate the index ('delete-all'): a backfill claim without progress
++        over a non-empty index. Read-only; lets optimize-storage plan before it takes the lock."""
++        with self._read_ctx() as conn:
++            return (_meta_row(conn, "fts_rebuild_high_water") is not None
++                    and _meta_row(conn, "fts_rebuild_progress") is None and not self._fts_index_known_empty(conn))
++
+     @staticmethod
+     def _fts_index_known_empty(conn) -> bool:
+         """True when the base external-content index holds no rows (a missing table counts as empty)."""
+@@ -549,13 +566,18 @@ class SessionSearchMixin:
+         except sqlite3.OperationalError:
+             return True
+ 
+-    @staticmethod
+-    def _reset_fts_index_to_empty(conn) -> None:
++    def _reset_fts_index_to_empty(self, conn) -> bool:
+         """Truncate the v23 external-content tables via FTS5 ``'delete-all'`` (O(1); a plain DELETE is
+-        O(rows) and corrupts the index when indexed rows diverged from ``messages``)."""
++        O(rows) and corrupts the index when indexed rows diverged from ``messages``). 'delete-all' frees every
++        index page, so it first passes the whole-file gate (hermes_state_fts_online); False when the gate kept
++        the index (nothing truncated)."""
++        if not self._fts_wholesale_free_allowed(self._FTS_TABLES, context="FTS index truncation ('delete-all')",
++                                                cursor=conn):
++            return False
+         for tbl in ("messages_fts", "messages_fts_trigram"):
+             with contextlib.suppress(sqlite3.OperationalError):  # table absent — already an empty surface
+                 conn.execute(f"INSERT INTO {tbl}({tbl}) VALUES('delete-all')")
++        return True
+ 
+     def _seed_fts_rebuild_markers(self, conn, *, force: bool = False) -> int:
+         """Write ``fts_rebuild_high_water`` / ``fts_rebuild_progress`` for a full backfill; returns
+@@ -587,7 +609,9 @@ class SessionSearchMixin:
+             if self._fts_external_index_empty_with_messages(conn):
+                 _delete_meta(conn, "fts_storage_version")
+                 self._seed_fts_rebuild_markers(conn, force=True)
+-        self._execute_write(_do)
++        # A reseed truncates the index ('delete-all'): its whole-file plan runs here, before the write lock.
++        with self._fts_runtime_plan(needed=self._fts_reseed_needs_reset()):
++            self._execute_write(_do)
+ 
+     def fts_optimize_available(self) -> bool:
+         """True when `optimize_fts_storage()` has work: legacy inline FTS or a v23 trigram still
+@@ -787,6 +811,8 @@ class SessionSearchMixin:
+ 
+         # Heal bookkeeping BEFORE deciding whether to demote again.
+         self._repair_optimize_bookkeeping()
++        if self._fts_stale or self._fts_reseed_needs_reset():
++            return {"ok": False, "reason": "fts_index_damaged"}  # the gate kept a damaged index (logged)
+         with self._lock:
+             needs_storage_upgrade = self._db_needs_fts_storage_upgrade(self._conn)
+         pending = self.get_meta("fts_rebuild_high_water") is not None
+@@ -1386,7 +1412,8 @@ class SessionSearchMixin:
+         """
+         self._raise_if_db_corrupt()
+         rebuilt = 0
+-        with fts_rebuild_admission(self.db_path) as admitted:
++        # 'rebuild' frees every index page: the whole-file plan runs here, before the lock (hermes_state_fts_online).
++        with self._fts_runtime_plan(), fts_rebuild_admission(self.db_path) as admitted:
+             if not admitted:
+                 logger.warning(
+                     "Deferred in-place FTS rebuild: another process holds the rebuild authority for this state.db.")
+@@ -1395,7 +1422,10 @@ class SessionSearchMixin:
+                 self._raise_if_db_replaced()
+                 if self._conn is None:
+                     self._reopen_after_close_locked(context="write")
+-                for tbl in self._present_fts_tables():
++                tables = self._present_fts_tables()
++                if tables and not self._fts_wholesale_free_allowed(tables, context="In-place FTS rebuild"):
++                    return 0
++                for tbl in tables:
+                     try:
+                         self._conn.execute(f"INSERT INTO {tbl}({tbl}) VALUES('rebuild')")
+                         self._conn.commit()
+diff --git a/tests/hermes_state/test_fts_free_gates.py b/tests/hermes_state/test_fts_free_gates.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5ef01940d881028baccd0664da131c8c366ccea4
+--- /dev/null
++++ b/tests/hermes_state/test_fts_free_gates.py
+@@ -0,0 +1,462 @@
++"""Every path that frees an FTS tree wholesale asks the whole-file plan first (hermes_state_fts_online).
++
++Hub, 2026-11-18: a page of the trigram index's b-tree was referenced twice. DROP, FTS5 'rebuild' / 'delete-all'
++and a teardown of the tree's rows free that page twice, and SQLite later hands it to canonical data. The online
++recovery already refused to free such a tree; these tests cover the other paths: the open-time source realign,
++trigram exclusion migration, orphan shadow sweep and missing-trigger rebuild, ``rebuild_fts()``, the
++optimize-storage truncation and the trash teardown. On the hub's damage shape each gate leaves the tree alone and
++detaches search (or, for damage it cannot attribute, changes nothing); the retry then recovers online and the file
++ends with no double reference. On a healthy store each path behaves as before.
++"""
++
++import json
++import struct
++
++import pytest
++
++import hermes_state_fts_online
++import hermes_state_schema_memo
++from hermes_state import SessionDB
++from hermes_state_fts import base_source_view_is_stale
++from hermes_state_common import FTS_STALE_KEY, FTS_TRIGRAM_SQL, SCHEMA_VERSION, _FTS_TRIGGERS
++from tests.hermes_state.test_fts_online_recovery import _canonical, _drain, _integrity_lines, _meta, _raw, _seed
++
++_TRIGRAM_TRIGGERS = [t for t in _FTS_TRIGGERS if "trigram" in t]
++
++
++def _break(path, table):
++    """The hub's damage shape in *table*'s b-tree (its root names one child twice), without touching FTS state."""
++    with _raw(path) as conn:
++        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
++        root = conn.execute("SELECT rootpage FROM sqlite_master WHERE name = ?", (table,)).fetchone()[0]
++        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
++    with open(path, "r+b") as fh:
++        fh.seek((root - 1) * page_size)
++        page = bytearray(fh.read(page_size))
++        assert page[0] == 5, "fixture needs a multi-page index (interior table root)"
++        first_cell = struct.unpack(">H", page[12:14])[0]
++        page[8:12] = page[first_cell:first_cell + 4]
++        fh.seek((root - 1) * page_size)
++        fh.write(page)
++    assert any("2nd reference" in line for line in _integrity_lines(path)[0])
++
++
++def _root(path, name):
++    with _raw(path) as conn:
++        row = conn.execute("SELECT rootpage FROM sqlite_master WHERE name = ?", (name,)).fetchone()
++    return row[0] if row else None
++
++
++def _assert_never_double_freed(path, before):
++    """Canonical rows unchanged and no page reachable twice or both free and in use."""
++    assert _canonical(path)[:len(before)] == before
++    lines, _master = _integrity_lines(path)
++    assert not [line for line in lines if "2nd reference" in line or line.startswith(("Freelist", "Tree"))]
++
++
++def _recover(db, path, before):
++    """The gateway retry tick recovers the detached store online; the backfill and teardown finish."""
++    db._fts_stale_retry_after = 0.0
++    assert db.retry_deferred_fts_recovery() is True
++    _drain(db)
++    assert db.search_messages("alphaword")
++    db.close()
++    _assert_never_double_freed(path, before)
++
++
++def _assert_gate_fired(db, path, table, root):
++    assert db._fts_stale is True and db._fts_oneshot_failed is True
++    assert _meta(path, FTS_STALE_KEY) == "1"
++    assert _root(path, table) == root, "the damaged tree was dropped or rebuilt"
++    assert any("2nd reference" in line for line in _integrity_lines(path)[0]), "the damaged tree was freed"
++    with _raw(path) as conn:
++        assert not conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'messages_fts%'"
++                                ).fetchone()
++
++
++@pytest.fixture
++def store(tmp_path):
++    path = tmp_path / "state.db"
++    _seed(path)
++    hermes_state_schema_memo.clear()
++    return path, _canonical(path)
++
++
++@pytest.fixture
++def plans(monkeypatch):
++    """Spy on the whole-file check: one entry per check, whether the watched handle's lock was held."""
++    real = hermes_state_fts_online.plan_online_recovery
++    watched, calls = {}, []
++
++    def spy(db_path):
++        db = watched.get("db")
++        calls.append(db._lock.locked() if db is not None else None)
++        return real(db_path)
++
++    monkeypatch.setattr(hermes_state_fts_online, "plan_online_recovery", spy)
++    return watched, calls
++
++
++# ── 1. open-time realign of the base index source (DROP messages_fts + 'rebuild') ──
++
++def _stale_source_view(path, *, claim):
++    with _raw(path) as conn:
++        sql = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'view' AND name = 'messages_fts_src'").fetchone()[0]
++        conn.execute("DROP VIEW messages_fts_src")
++        conn.execute(sql + " AND 1 = 1" if " WHERE " in sql.upper() else sql + " WHERE 1 = 1")
++        if claim:
++            conn.execute("INSERT INTO state_meta (key, value) VALUES ('fts_rebuild_high_water', '1')")
++            conn.execute("INSERT INTO state_meta (key, value) VALUES ('fts_rebuild_progress', '1')")
++
++
++def test_realign_keeps_a_damaged_base_index(store, plans):
++    path, before = store
++    _break(path, "messages_fts_data")
++    _stale_source_view(path, claim=False)
++    root = _root(path, "messages_fts_data")
++    db = SessionDB(db_path=path)
++    _assert_gate_fired(db, path, "messages_fts_data", root)
++    assert plans[1] == [None]  # one whole-file check for the whole open
++    _recover(db, path, before)
++
++
++def test_realign_with_a_claim_keeps_a_damaged_trigram_index(store):
++    path, before = store
++    _break(path, "messages_fts_trigram_data")
++    _stale_source_view(path, claim=True)  # the claim makes the realign 'rebuild' the trigram index too
++    root = _root(path, "messages_fts_trigram_data")
++    db = SessionDB(db_path=path)
++    _assert_gate_fired(db, path, "messages_fts_trigram_data", root)
++    _recover(db, path, before)
++
++
++def test_realign_on_a_healthy_store_runs_as_before(store, plans):
++    path, _before = store
++    _stale_source_view(path, claim=False)
++    db = SessionDB(db_path=path)
++    try:
++        assert db._fts_stale is False and db._fts_enabled is True
++        with _raw(path) as conn:  # dropped and rebuilt from the aligned view
++            assert not base_source_view_is_stale(conn.cursor())
++        assert db.search_messages("charlieword")
++    finally:
++        db.close()
++    assert len(plans[1]) == 1
++
++
++# ── 2. trigram source-exclusion migration (drop view/triggers + 'rebuild') ──
++
++def _behind_v30(path):
++    with _raw(path) as conn:
++        conn.execute("UPDATE schema_version SET version = 29")
++
++
++def _schema_version(path):
++    with _raw(path) as conn:
++        return conn.execute("SELECT version FROM schema_version").fetchone()[0]
++
++
++def test_trigram_exclusion_migration_keeps_a_damaged_trigram_index(store):
++    path, before = store
++    _break(path, "messages_fts_trigram_data")
++    _behind_v30(path)
++    root = _root(path, "messages_fts_trigram_data")
++    db = SessionDB(db_path=path)
++    _assert_gate_fired(db, path, "messages_fts_trigram_data", root)
++    assert _schema_version(path) == 29  # held back: a later open migrates the recovered index
++    _recover(db, path, before)
++
++
++def test_trigram_exclusion_migration_on_a_healthy_store_runs_as_before(store):
++    path, _before = store
++    _behind_v30(path)
++    db = SessionDB(db_path=path)
++    try:
++        assert db._fts_stale is False and db._trigram_available is True
++        assert _schema_version(path) == SCHEMA_VERSION
++    finally:
++        db.close()
++
++
++# ── 3. orphan shadow-table sweep (DROP of shadow tables whose vtable row is gone) ──
++
++def _orphan(path, family):
++    with _raw(path) as conn:
++        for t in _FTS_TRIGGERS:
++            if t.startswith(family + "_") and (family == "messages_fts_trigram" or "trigram" not in t):
++                conn.execute(f"DROP TRIGGER IF EXISTS {t}")
++        conn.execute("PRAGMA writable_schema=ON")
++        conn.execute("DELETE FROM sqlite_master WHERE name = ? AND sql LIKE 'CREATE VIRTUAL TABLE%'", (family,))
++        version = conn.execute("PRAGMA schema_version").fetchone()[0]
++        conn.execute(f"PRAGMA schema_version={version + 1}")
++        conn.execute("PRAGMA writable_schema=OFF")
++
++
++def test_orphan_sweep_keeps_damaged_orphan_shadows(store):
++    path, before = store
++    _break(path, "messages_fts_trigram_data")
++    _orphan(path, "messages_fts_trigram")
++    root = _root(path, "messages_fts_trigram_data")
++    db = SessionDB(db_path=path)
++    _assert_gate_fired(db, path, "messages_fts_trigram_data", root)
++    _recover(db, path, before)
++
++
++def test_orphan_sweep_on_a_healthy_store_runs_as_before(store):
++    path, _before = store
++    _orphan(path, "messages_fts_trigram")
++    db = SessionDB(db_path=path)
++    try:
++        assert db._fts_stale is False and db._trigram_available is True
++        with _raw(path) as conn:  # the orphans were dropped and the index recreated and rebuilt
++            assert conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'messages_fts_trigram'").fetchone()
++        assert db.search_messages("deltaword")
++    finally:
++        db.close()
++
++
++def test_orphan_sweep_refused_changes_nothing(store, monkeypatch):
++    path, _before = store
++    _orphan(path, "messages_fts_trigram")
++    root = _root(path, "messages_fts_trigram_data")
++
++    def refuse(db_path):
++        raise hermes_state_fts_online.OnlineRecoveryRefused("damage outside the index (test)")
++
++    monkeypatch.setattr(hermes_state_fts_online, "plan_online_recovery", refuse)
++    db = SessionDB(db_path=path)
++    try:
++        assert db._fts_enabled is False and db._fts_stale is False
++        assert _meta(path, FTS_STALE_KEY) is None
++        assert _root(path, "messages_fts_trigram_data") == root
++    finally:
++        db.close()
++
++
++# ── 4. open-time 'rebuild' of an existing index whose triggers are missing ──
++
++def _drop_triggers(path, names=_FTS_TRIGGERS):
++    with _raw(path) as conn:
++        for t in names:
++            conn.execute(f"DROP TRIGGER IF EXISTS {t}")
++
++
++@pytest.mark.parametrize("missing", [_FTS_TRIGGERS, _TRIGRAM_TRIGGERS], ids=["base", "trigram"])
++def test_missing_trigger_rebuild_keeps_a_damaged_index(store, missing):
++    path, before = store
++    _break(path, "messages_fts_trigram_data")
++    _drop_triggers(path, missing)
++    root = _root(path, "messages_fts_trigram_data")
++    db = SessionDB(db_path=path)
++    _assert_gate_fired(db, path, "messages_fts_trigram_data", root)
++    _recover(db, path, before)
++
++
++@pytest.mark.parametrize("missing", [_FTS_TRIGGERS, _TRIGRAM_TRIGGERS], ids=["base", "trigram"])
++def test_missing_trigger_rebuild_on_a_healthy_store_runs_as_before(store, missing):
++    path, _before = store
++    _drop_triggers(path, missing)
++    db = SessionDB(db_path=path)
++    try:
++        assert db._fts_stale is False and db._fts_enabled is True and db._trigram_available is True
++        with _raw(path) as conn:
++            present = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")}
++            eligible = conn.execute("SELECT COUNT(*) FROM messages WHERE role <> 'tool'").fetchone()[0]
++            assert conn.execute("SELECT COUNT(*) FROM messages_fts_trigram_docsize").fetchone()[0] == eligible
++        assert set(_FTS_TRIGGERS) <= present
++    finally:
++        db.close()
++
++
++def test_a_healthy_open_runs_no_whole_file_check(store, plans):
++    path, _before = store
++    db = SessionDB(db_path=path)
++    try:
++        assert db._fts_enabled is True and db._fts_stale is False
++    finally:
++        db.close()
++    fresh = path.parent / "fresh.db"
++    SessionDB(db_path=fresh).close()  # a new store: the indexes it creates have nothing to free
++    assert plans[1] == []
++
++
++# ── 5. rebuild_fts() (gateway transcript recovery) ──
++
++def test_rebuild_fts_keeps_a_damaged_index_and_plans_outside_the_lock(store, plans):
++    path, before = store
++    _break(path, "messages_fts_trigram_data")
++    root = _root(path, "messages_fts_trigram_data")
++    db = SessionDB(db_path=path)  # the damage is invisible to a normal open
++    plans[0]["db"] = db
++    assert db._fts_stale is False
++    assert db.rebuild_fts() == 0
++    assert plans[1] == [False]
++    assert db._fts_tick_plan is None  # used for that call only
++    _assert_gate_fired(db, path, "messages_fts_trigram_data", root)
++    _recover(db, path, before)
++
++
++def test_rebuild_fts_on_a_healthy_store_runs_as_before(store, plans):
++    path, _before = store
++    db = SessionDB(db_path=path)
++    plans[0]["db"] = db
++    try:
++        assert db.rebuild_fts() == 2
++        assert plans[1] == [False]
++        assert db.search_messages("echoword")
++    finally:
++        db.close()
++
++
++# ── 6. optimize-storage truncation ('delete-all') ──
++
++def _claim_without_progress(path):
++    with _raw(path) as conn:
++        conn.execute("INSERT INTO state_meta (key, value) VALUES ('fts_rebuild_high_water', '42') "
++                     "ON CONFLICT(key) DO UPDATE SET value = '42'")
++        conn.execute("DELETE FROM state_meta WHERE key = 'fts_rebuild_progress'")
++
++
++def test_truncation_keeps_a_damaged_index(store, plans):
++    path, before = store
++    _break(path, "messages_fts_trigram_data")
++    _claim_without_progress(path)
++    root = _root(path, "messages_fts_trigram_data")
++    db = SessionDB(db_path=path)
++    plans[0]["db"] = db
++    assert db.optimize_fts_storage(vacuum=False) == {"ok": False, "reason": "fts_index_damaged"}
++    assert plans[1] == [False]
++    assert _meta(path, "fts_rebuild_progress") is None  # no claim over rows the index still holds
++    _assert_gate_fired(db, path, "messages_fts_trigram_data", root)
++    with _raw(path) as conn:
++        conn.execute("DELETE FROM state_meta WHERE key = 'fts_rebuild_high_water'")
++    _recover(db, path, before)
++
++
++def test_truncation_on_a_healthy_store_runs_as_before(store, plans):
++    path, _before = store
++    _claim_without_progress(path)
++    db = SessionDB(db_path=path)
++    plans[0]["db"] = db
++    try:
++        db._repair_optimize_bookkeeping()
++        assert plans[1] == [False]
++        assert _meta(path, "fts_rebuild_progress") == "0"
++        with _raw(path) as conn:
++            assert conn.execute("SELECT COUNT(*) FROM messages_fts_docsize").fetchone()[0] == 0
++    finally:
++        db.close()
++
++
++def test_a_runtime_free_reached_under_the_lock_without_a_plan_skips(store, plans):
++    path, _before = store
++    db = SessionDB(db_path=path)
++    plans[0]["db"] = db
++    try:
++        with db._lock:
++            assert db._reset_fts_index_to_empty(db._conn) is False
++            assert db._fts_wholesale_free_allowed((), context="test") is False
++        assert plans[1] == []
++        assert db._fts_stale is False
++        with _raw(path) as conn:
++            assert conn.execute("SELECT COUNT(*) FROM messages_fts_docsize").fetchone()[0] > 0
++    finally:
++        db.close()
++
++
++# ── 7. trash teardown ──
++
++def _foreign_trash(path):
++    """Trash no plan vouched for (optimize-storage's demotion, CJK retirement): the trigram shadow tables renamed
++    to ``fts_v22_trash_*``, a fresh empty trigram index in their place."""
++    with _raw(path) as conn:
++        _drop_triggers(path, _TRIGRAM_TRIGGERS)
++        conn.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
++        conn.execute("PRAGMA writable_schema=ON")
++        conn.execute("DELETE FROM sqlite_master WHERE name = 'messages_fts_trigram' "
++                     "AND sql LIKE 'CREATE VIRTUAL TABLE%'")
++        conn.execute("PRAGMA writable_schema=RESET")
++        conn.execute("PRAGMA legacy_alter_table=ON")
++        names = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' "
++                                            "AND name LIKE 'messages_fts_trigram_%'")]
++        for name in names:
++            conn.execute(f"ALTER TABLE {name} RENAME TO fts_v22_trash_{name}")
++        conn.executescript(FTS_TRIGRAM_SQL)
++    return [f"fts_v22_trash_{n}" for n in names]
++
++
++def _tables(path, like):
++    with _raw(path) as conn:
++        return sorted(r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE ?",
++                                                 (like,)))
++
++
++def test_foreign_trash_named_by_the_check_is_never_drained(store, plans):
++    path, before = store
++    _break(path, "messages_fts_trigram_data")
++    trash = _foreign_trash(path)
++    db = SessionDB(db_path=path)
++    plans[0]["db"] = db
++    try:
++        assert db._fts_enabled is True
++        assert db.advance_fts_backfill(budget_s=2.0) is True  # work remains: the damaged trash stays
++        assert db.advance_fts_backfill(budget_s=2.0) is True
++        assert plans[1] == [False]  # one check outside the lock; its refusal is remembered
++        assert db.optimize_fts_storage(vacuum=False)["reason"] == "teardown_incomplete"
++        assert _tables(path, "fts_v22_trash_%") == sorted(trash)
++        assert _meta(path, hermes_state_fts_online.TRASH_VERIFIED_KEY) is None
++    finally:
++        db.close()
++    assert _canonical(path)[:len(before)] == before
++    assert any("2nd reference" in line for line in _integrity_lines(path)[0])  # left for `hermes sessions recover`
++
++
++def test_foreign_trash_drains_after_a_clean_plan(store, plans):
++    path, _before = store
++    _foreign_trash(path)
++    db = SessionDB(db_path=path)
++    plans[0]["db"] = db
++    try:
++        _drain(db)
++        assert plans[1] == [False]  # one plan vouches for every foreign table; later ticks need none
++        assert _tables(path, "fts_v22_trash_%") == []
++        assert _meta(path, hermes_state_fts_online.TRASH_VERIFIED_KEY) is None
++    finally:
++        db.close()
++    assert _integrity_lines(path)[0] == ["ok"]
++
++
++def test_trash_of_an_online_recovery_drains_without_a_new_plan(store, plans):
++    path, _before = store
++    db = SessionDB(db_path=path)
++    plans[0]["db"] = db
++    try:
++        assert db.recover_stale_fts_online(reason="test", force=True) is True
++        trash = _tables(path, "fts_v22_trash_%")
++        assert trash and sorted(
++            json.loads(_meta(path, hermes_state_fts_online.TRASH_VERIFIED_KEY))) == trash
++        assert len(plans[1]) == 1
++        _drain(db)
++        assert len(plans[1]) == 1  # the recovery's own plan vouched for its trash
++        assert _tables(path, "fts_v22_trash_%") == []
++        assert _meta(path, hermes_state_fts_online.TRASH_VERIFIED_KEY) is None
++    finally:
++        db.close()
++    assert _integrity_lines(path)[0] == ["ok"]
++
++
++def test_verified_list_merges_with_trash_already_recorded(tmp_path):
++    path = tmp_path / "state.db"
++    _seed(path, sessions=1, per=4)
++    with _raw(path) as conn:
++        conn.execute("INSERT INTO state_meta (key, value) VALUES (?, '[\"fts_v22_trash_older\"]')",
++                     (hermes_state_fts_online.TRASH_VERIFIED_KEY,))
++    db = SessionDB(db_path=path)
++    try:
++        assert db.recover_stale_fts_online(reason="test", force=True) is True
++    finally:
++        db.close()
++    with _raw(path) as conn:
++        recorded = hermes_state_fts_online.verified_trash(conn)
++    assert "fts_v22_trash_older" in recorded and len(recorded) > 1
++
+diff --git a/tests/hermes_state/test_fts_tool_write_bounds.py b/tests/hermes_state/test_fts_tool_write_bounds.py
+index 4873f6b113806dc7c0f044182a97cf42f9000fc6..4e54453f4b7744bcdd04d454525dd66f98107809 100644
+--- a/tests/hermes_state/test_fts_tool_write_bounds.py
++++ b/tests/hermes_state/test_fts_tool_write_bounds.py
+@@ -141,7 +141,7 @@ def test_full_rebuild_keeps_every_tool_row_bounded(db):
+     # The deferred chunked backfill + boundary sweep must feed the index through the
+     # same truncated tool projection; an untruncated write path leaves the
+     # external-content index disagreeing with the triggers and fails the strict probe.
+-    with db._lock:
++    with db._fts_runtime_plan(), db._lock:  # truncation needs a plan made before the lock
+         db._reset_fts_index_to_empty(db._conn)
+         db._seed_fts_rebuild_markers(db._conn, force=True)
+         db._conn.commit()
+diff --git a/tests/hermes_state/test_fts_trigram_cron_exclusion.py b/tests/hermes_state/test_fts_trigram_cron_exclusion.py
+index 560ada92c82c36c467d4cc984e25a0ea56771732..df42598173dfd9662a56f771810c74ea683c18b0 100644
+--- a/tests/hermes_state/test_fts_trigram_cron_exclusion.py
++++ b/tests/hermes_state/test_fts_trigram_cron_exclusion.py
+@@ -105,7 +105,7 @@ def test_deferred_rebuild_does_not_reintroduce_cron(db: SessionDB):
+     cli_id = db.append_message("cli", role="assistant", content="交互会话内容")
+     db.append_message("cron", role="assistant", content="定时会话内容")
+ 
+-    with db._lock:
++    with db._fts_runtime_plan(), db._lock:  # truncation needs a plan made before the lock
+         db._reset_fts_index_to_empty(db._conn)
+         db._seed_fts_rebuild_markers(db._conn, force=True)
+         db._conn.commit()
+diff --git a/tests/hermes_state/test_fts_trigram_subagent_exclusion.py b/tests/hermes_state/test_fts_trigram_subagent_exclusion.py
+index efe8f8d98421e82fea13208d79d8eeacf8ad298b..7db57766990d867ef10b82d608106ae83edbd468 100644
+--- a/tests/hermes_state/test_fts_trigram_subagent_exclusion.py
++++ b/tests/hermes_state/test_fts_trigram_subagent_exclusion.py
+@@ -85,7 +85,7 @@ def test_update_and_delete_of_unindexed_child_row_keep_trigram_consistent(db: Se
+ 
+ def test_deferred_rebuild_does_not_reintroduce_children(db: SessionDB):
+     ids = _seed(db)
+-    with db._lock:
++    with db._fts_runtime_plan(), db._lock:  # truncation needs a plan made before the lock
+         db._reset_fts_index_to_empty(db._conn)
+         db._seed_fts_rebuild_markers(db._conn, force=True)
+         db._conn.commit()
+-- 
+2.43.0
+

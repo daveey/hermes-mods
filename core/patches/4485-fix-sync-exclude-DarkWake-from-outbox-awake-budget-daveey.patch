@@ -1,0 +1,420 @@
+From a21b92cffd4d8d20f702b57b9463134199aa3345 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 14:13:23 +0000
+Subject: [PATCH] fix(sync): exclude DarkWake from outbox awake budget [daveey]
+
+Problem: MacBook lid-closed DarkWakes advanced monotonic stale budgets despite
+no full Wake (t_823c0a5431d5993d; real 2026-11-14 pmset evidence).
+Why: the outbox gate added by PR3255 observes sendable identities but still
+counts every monotonic interval. DarkWake runs the clock without giving sync
+normal awake opportunity. Sleep tests froze that clock, missing this case.
+Recurrence: same class as cron restart reruns and replica-age PR3291.
+
+Reuse the existing cron host_fully_awake implementation through replica-age's
+shared fail-awake sampler. Both outbox entrypoints sample once and suppress
+alarms/exclude elapsed observation intervals when false; the dispatcher
+passes the same sample to replica-age. Persist excluded seconds alongside
+seen_at (already the previous observation). Legacy records default to zero.
+Warned timestamps remain absolute even when exclusion moves since past them.
+
+Accepted limits match cron/replica: an idle lid-closed Mac on AC with external
+display and an idle lid-open Mac on battery read not fully awake; active use
+resumes counting. Non-Mac and probe failure read awake. No wake_clock changes.
+
+Proof: RED on unchanged outbox: both warning and card fire at 600 DarkWake s.
+GREEN: 25 DarkWake minutes then ten awake minutes, mixed awake/DarkWake with
+same-boot restart, warned-incident restart, legacy and invalid memo records,
+probe failure, single shared dispatcher sample and alternating entrypoints.
+Focused suites: 171 passed (outbox awake/observation, starvation, replica, cron).
+scripts/check: all 20 checks pass. Live prevention not yet observed; owner
+card retains both-detector installation, telemetry and Mac replay acceptance.
+---
+ hermes_cli/kanban_sync_outbox_age.py          |  37 ++++--
+ hermes_cli/kanban_sync_outbox_observation.py  |  13 +-
+ hermes_cli/kanban_sync_replica_age.py         |  19 +--
+ .../test_kanban_sync_outbox_awake.py          | 111 +++++++++++++++++-
+ .../test_kanban_sync_outbox_observation.py    |   8 ++
+ .../test_kanban_sync_push_starvation.py       |   4 +-
+ 6 files changed, 168 insertions(+), 24 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_outbox_age.py b/hermes_cli/kanban_sync_outbox_age.py
+index 10882efa42d4577ef58717009bb10254345b1eff..d7cacfe0f7e137b3325ee12399714bf031de0c1a 100644
+--- a/hermes_cli/kanban_sync_outbox_age.py
++++ b/hermes_cli/kanban_sync_outbox_age.py
+@@ -19,6 +19,10 @@ Wall age remains diagnostic; alarms require a continuously observed sendable ide
+ Observations persist in each board's ``.outbox-age.json`` sidecar. A same-boot restart resumes them;
+ another boot, unreadable/no sendable op, identity change, or >600 awake seconds without observation resets them.
+ Both entry paths share the observation and report wall age, observed-awake age and op_id, never payloads.
++Both sample the shared cron host_fully_awake probe once: a False sample excludes the interval since
++the previous observation and suppresses warnings/cards. DarkWake advances monotonic time but is not
++fully awake. This also excludes an idle lid-closed Mac on AC with an external display and an idle
++lid-open Mac on battery, until someone is active. Non-macOS and probe failures read awake.
+ 
+ "Unanswered" = pending with no ``retry_after``: the Board never told us to wait. A row the Board deferred
+ (``storage_error``, ``depends_on_rejected``) retries on its own backoff and logs its own reason; counting it would
+@@ -114,13 +118,13 @@ def _age(path: Path) -> Optional[float]:
+     return sample[1] if sample else None
+ 
+ 
+-def _observed(path: Path, mono, age):
++def _observed(path: Path, mono, age, awake=True):
+     sample = _sample(path)
+     # Retain the age injection seam for callers suppressing outbox observations.
+     if age is not _age and age(path) is None:
+         sample = None
+     now = mono()  # sample and timestamp under the same observation lock
+-    seen = observation.observe(path, sample[0] if sample else None, now)
++    seen = observation.observe(path, sample[0] if sample else None, now, awake=awake)
+     return seen, sample[1] if sample else None, now
+ 
+ 
+@@ -131,9 +135,11 @@ def round_started(mono: Callable[[], float] = time.monotonic) -> None:
+ 
+ 
+ def after_round(results: Iterable[Any], boards: Iterable[tuple[str, Path]], *,
+-                mono: Callable[[], float] = time.monotonic, age: Callable[[Path], Optional[float]] = _age) -> list[str]:
++                mono: Callable[[], float] = time.monotonic, age: Callable[[Path], Optional[float]] = _age,
++                awake_fn: Optional[Callable[[], bool]] = None) -> list[str]:
+     """Record round outcome and WARN after :data:`STALE_S` observed-awake seconds for one sendable op.
+     Returns the boards warned about. Never raises."""
++    awake = replica_age.fully_awake(awake_fn)
+     warned: list[str] = []
+     try:
+         paths = dict(boards)
+@@ -151,8 +157,8 @@ def after_round(results: Iterable[Any], boards: Iterable[tuple[str, Path]], *,
+                 if r.error:
+                     observation.observe(path, None, mono())
+                     continue
+-                seen, seconds, now = _observed(path, mono, age)
+-                if seen is None or now - seen.since < STALE_S:
++                seen, seconds, now = _observed(path, mono, age, awake)
++                if not awake or seen is None or now - seen.since < STALE_S:
+                     continue
+                 if seen.warned_at is not None and now - seen.warned_at < STALE_S:
+                     continue
+@@ -160,8 +166,9 @@ def after_round(results: Iterable[Any], boards: Iterable[tuple[str, Path]], *,
+                 observation.remember(path, seen)
+                 warned.append(r.board)
+                 log.warning("kanban sync: %s: op %s has waited %.0f wall s / %.0f observed-awake s in the "
+-                            "outbox although this round succeeded (`hermes kanban sync status` shows the outbox)",
+-                            r.board, seen.op_id, seconds, now - seen.since)
++                            "outbox, excluded %.0f s not fully awake, although this round succeeded "
++                            "(`hermes kanban sync status` shows the outbox)",
++                            r.board, seen.op_id, seconds, now - seen.since, seen.excluded)
+     except Exception:  # health: allow BLE001 -- an alarm must never stop the sync loop
+         log.warning("kanban sync: outbox age check failed", exc_info=True)
+     return warned
+@@ -175,7 +182,8 @@ def _loop_healthy(slug: str, now: float) -> bool:
+ 
+ def check(*, mono: Callable[[], float] = time.monotonic, file_fn: Optional[Callable[[str, str], Optional[str]]] = None,
+           boards: Optional[list[tuple[str, Path]]] = None,
+-          age: Callable[[Path], Optional[float]] = _age) -> list[str]:
++          age: Callable[[Path], Optional[float]] = _age,
++          awake_fn: Optional[Callable[[], bool]] = None) -> list[str]:
+     """One dispatcher-tick observation (at most every :data:`CHECK_EVERY_S`): the outbox, then each replica's
+     freshness (``kanban_sync_replica_age.check``). Returns the card ids filed or commented. Never raises."""
+     try:
+@@ -192,21 +200,24 @@ def check(*, mono: Callable[[], float] = time.monotonic, file_fn: Optional[Calla
+     except Exception:  # health: allow BLE001 -- an alert must never break the dispatcher tick
+         log.warning("kanban: sync outbox age check failed", exc_info=True)
+         return []
+-    return _check_outbox(boards, mono, file_fn, age) + replica_age.check(boards, now=now)
++    awake = replica_age.fully_awake(awake_fn)
++    return _check_outbox(boards, mono, file_fn, age, awake) + replica_age.check(
++        boards, now=now, awake_fn=lambda: awake)
+ 
+ 
+-def _check_outbox(boards: list[tuple[str, Path]], mono, file_fn, age) -> list[str]:
++def _check_outbox(boards: list[tuple[str, Path]], mono, file_fn, age, awake=True) -> list[str]:
+     try:
+         out = []
+         for slug, path in boards:
+             with observation.LOCK:
+                 # Observe even before loop health is established: a stuck first round
+                 # must not acquire an extra ten-minute delay. Replica-age covers failure.
+-                seen, seconds, now = _observed(path, mono, age)
+-                if not _loop_healthy(slug, now) or seen is None or now - seen.since < STALE_S or seen.filed:
++                seen, seconds, now = _observed(path, mono, age, awake)
++                if not awake or not _loop_healthy(slug, now) or seen is None or now - seen.since < STALE_S or seen.filed:
+                     continue
+                 detail = (f"board `{slug}`: oldest sendable unanswered op `{seen.op_id}`; "
+-                          f"wall age {seconds / 60:.0f} min; observed-awake age {now - seen.since:.0f} s "
++                          f"wall age {seconds / 60:.0f} min; observed-awake age {now - seen.since:.0f} s; "
++                          f"excluded {seen.excluded:.0f} s not fully awake "
+                           "while this host's sync loop is not failing")
+                 tid = (file_fn or report)(slug, detail)
+                 if tid:
+diff --git a/hermes_cli/kanban_sync_outbox_observation.py b/hermes_cli/kanban_sync_outbox_observation.py
+index d145e651420b0214c80b8eb1d34e45df9774788d..4c4fc118a9613494c10acdc8949668b39e412d4a 100644
+--- a/hermes_cli/kanban_sync_outbox_observation.py
++++ b/hermes_cli/kanban_sync_outbox_observation.py
+@@ -3,11 +3,14 @@
+ Like replica-age, resume within one boot only across bounded observation gaps.
+ No op (including an unreadable outbox) ends the observation. Wall age is diagnostic,
+ never a substitute for observing the same op. The caller serializes read/observe/claim.
++seen_at is also the last sample: not-fully-awake intervals shift since and accumulate excluded.
++Old records resume with excluded=0. warned_at is an absolute monotonic timestamp, not shifted since.
+ """
+ from __future__ import annotations
+ 
+ import json
+ import logging
++import math
+ import os
+ import threading
+ from dataclasses import asdict, dataclass
+@@ -30,6 +33,7 @@ class Observation:
+     boot: Optional[str]
+     filed: bool = False
+     warned_at: Optional[float] = None
++    excluded: float = 0.0
+ 
+ 
+ def _path(path: Path) -> Path:
+@@ -44,7 +48,8 @@ def _load(path: Path, now: float, boot: Optional[str]) -> Optional[Observation]:
+                 and 0 <= seen.since <= seen.seen_at <= now
+                 and now - seen.seen_at <= MAX_GAP_S
+                 and type(seen.filed) is bool
+-                and (seen.warned_at is None or seen.since <= seen.warned_at <= seen.seen_at)):
++                and math.isfinite(seen.excluded) and seen.excluded >= 0
++                and (seen.warned_at is None or 0 <= seen.warned_at <= seen.seen_at)):
+             return seen
+     except (OSError, ValueError, TypeError):
+         pass
+@@ -64,7 +69,7 @@ def remember(path: Path, seen: Optional[Observation]) -> None:
+         log.debug("kanban sync: cannot persist outbox observation at %s", target, exc_info=True)
+ 
+ 
+-def observe(path: Path, op_id: Optional[str], now: float) -> Optional[Observation]:
++def observe(path: Path, op_id: Optional[str], now: float, *, awake: bool = True) -> Optional[Observation]:
+     key = str(path.resolve())
+     boot = replica_age._boot_id()
+     seen = _SEEN.get(key)
+@@ -77,6 +82,10 @@ def observe(path: Path, op_id: Optional[str], now: float) -> Optional[Observatio
+     if (seen is None or seen.op_id != op_id or seen.boot != boot
+             or not seen.seen_at <= now or now - seen.seen_at > MAX_GAP_S):
+         seen = Observation(op_id, now, now, boot)
++    if not awake:
++        delta = now - seen.seen_at
++        seen.since += delta
++        seen.excluded += delta
+     seen.seen_at = now
+     _SEEN[key] = seen
+     remember(path, seen)
+diff --git a/hermes_cli/kanban_sync_replica_age.py b/hermes_cli/kanban_sync_replica_age.py
+index b6255e9f0b0589a1c421f1162cffaec213f87404..7fe853b1e5c18fae3ee5f222d50ee08d815f9042 100644
+--- a/hermes_cli/kanban_sync_replica_age.py
++++ b/hermes_cli/kanban_sync_replica_age.py
+@@ -136,13 +136,7 @@ def check(boards: list[tuple[str, Path]], *, now: float, wall: Callable[[], floa
+           awake_fn: Optional[Callable[[], bool]] = None) -> list[str]:
+     """One observation of every board (``now``: monotonic). Returns the card ids it filed or commented. Never
+     raises."""
+-    try:
+-        if awake_fn is None:
+-            from cron.restart_rerun import host_fully_awake
+-            awake_fn = host_fully_awake
+-        awake = awake_fn()
+-    except Exception:  # health: allow BLE001 -- a broken probe must not suppress a real stall
+-        awake = True
++    awake = fully_awake(awake_fn)
+     out: list[str] = []
+     for slug, path in boards:
+         try:
+@@ -154,6 +148,17 @@ def check(boards: list[tuple[str, Path]], *, now: float, wall: Callable[[], floa
+     return out
+ 
+ 
++def fully_awake(awake_fn: Optional[Callable[[], bool]] = None) -> bool:
++    """Shared fail-awake probe policy for both sync alarms; sample once per entry call."""
++    try:
++        if awake_fn is None:
++            from cron.restart_rerun import host_fully_awake
++            awake_fn = host_fully_awake
++        return awake_fn()
++    except Exception:  # health: allow BLE001 -- a broken probe must not suppress a real stall
++        return True
++
++
+ def _boot_id() -> Optional[str]:
+     """This boot's identity (monotonic time is comparable across processes only within one boot), else None."""
+     try:
+diff --git a/tests/hermes_cli/test_kanban_sync_outbox_awake.py b/tests/hermes_cli/test_kanban_sync_outbox_awake.py
+index 0422306db1eff594e4f3e178c440dbec1b699891..cdd5f9b91b2f885f99bfd7f0b1dbd3b58250af17 100644
+--- a/tests/hermes_cli/test_kanban_sync_outbox_awake.py
++++ b/tests/hermes_cli/test_kanban_sync_outbox_awake.py
+@@ -16,7 +16,9 @@ live = fixtures.live
+ def host(live, kanban_home, monkeypatch):
+     alarm.reset()
+     backlog.reset()
+-    clock = SimpleNamespace(wall=10000.0, mono=100.0)
++    from cron import restart_rerun
++    clock = SimpleNamespace(wall=10000.0, mono=100.0, awake=True)
++    monkeypatch.setattr(restart_rerun, "host_fully_awake", lambda: clock.awake)
+     monkeypatch.setattr(alarm.time, "time", lambda: clock.wall)
+     monkeypatch.setattr(alarm.replica_age, "check", lambda *a, **kw: [])
+     path = kanban_home / "kanban.db"
+@@ -51,6 +53,23 @@ def _advance(host, seconds):
+     host.clock.mono += seconds
+ 
+ 
++@pytest.mark.parametrize("entry", ["after", "check"])
++def test_darkwake_never_counts_then_awake_stall_alarms(host, entry, caplog):
++    host.after()
++    host.clock.awake = False
++    for _ in range(25):
++        _advance(host, 60)
++        assert getattr(host, entry)() == []
++    host.clock.awake = True
++    for _ in range(9):
++        _advance(host, 60)
++        assert getattr(host, entry)() == []
++    _advance(host, 60)
++    assert getattr(host, entry)() == (["default"] if entry == "after" else ["t_alarm"])
++    text = caplog.text if entry == "after" else host.calls[0]
++    assert "excluded 1500 s not fully awake" in text
++
++
+ @pytest.mark.parametrize("entry", ["after", "check"])
+ def test_same_op_alarms_only_after_600_awake_seconds(host, entry, caplog):
+     assert host.after() == []
+@@ -65,6 +84,96 @@ def test_same_op_alarms_only_after_600_awake_seconds(host, entry, caplog):
+     assert op_id in text and "wall" in text and "observed-awake" in text
+ 
+ 
++@pytest.mark.parametrize("entry", ["after", "check"])
++def test_mixed_awake_darkwake_restart_keeps_budget(host, entry):
++    from hermes_cli import kanban_sync_outbox_observation as obs
++    import json
++    host.after()
++    _advance(host, 300)
++    getattr(host, entry)()
++    host.clock.awake = False
++    for _ in range(10):
++        _advance(host, 60)
++        assert getattr(host, entry)() == []
++    record = json.loads(obs._path(host.path).read_text())
++    assert record["excluded"] == 600
++    alarm.reset()
++    _advance(host, 60)
++    assert host.after() == []
++    record = json.loads(obs._path(host.path).read_text())
++    assert record["excluded"] == 660
++    host.clock.awake = True
++    _advance(host, 299)
++    assert getattr(host, entry)() == []
++    _advance(host, 60)
++    assert getattr(host, entry)() == (["default"] if entry == "after" else ["t_alarm"])
++
++
++def test_warned_incident_survives_long_darkwake_restart(host):
++    from hermes_cli import kanban_sync_outbox_observation as obs
++    host.after()
++    _advance(host, 600)
++    assert host.after() == ["default"]
++    assert host.check() == ["t_alarm"]
++    host.clock.awake = False
++    for _ in range(15):
++        _advance(host, 60)
++        assert host.after() == []
++    alarm.reset()
++    _advance(host, 60)
++    assert host.after() == []
++    seen = obs._SEEN[str(host.path.resolve())]
++    assert seen.excluded == 960
++    assert seen.filed is True
++    assert host.clock.mono - seen.since == 600
++
++
++@pytest.mark.parametrize("entry", ["after", "check"])
++def test_injected_probe_failure_reads_awake_once(host, entry):
++    calls = []
++    def broken():
++        calls.append(True)
++        raise OSError("probe failure")
++    host.after()
++    _advance(host, 600)
++    kwargs = {"mono": lambda: host.clock.mono, "awake_fn": broken}
++    if entry == "after":
++        result = alarm.after_round([SimpleNamespace(board="default", error=None, behind=False)],
++                                   [("default", host.path)], **kwargs)
++    else:
++        result = alarm.check(boards=[("default", host.path)], file_fn=lambda *a: "t_alarm", **kwargs)
++    assert result == (["default"] if entry == "after" else ["t_alarm"])
++    assert calls == [True]
++
++
++def test_dispatcher_samples_once_and_shares_probe_with_replica(host, monkeypatch):
++    calls, replica_samples = [], []
++    def awake():
++        calls.append(True)
++        return False
++    def replica(boards, *, now, awake_fn):
++        replica_samples.append(awake_fn())
++        return []
++    monkeypatch.setattr(alarm.replica_age, "check", replica)
++    assert alarm.check(boards=[("default", host.path), ("other", host.path)],
++                       mono=lambda: host.clock.mono, awake_fn=awake) == []
++    assert calls == [True]
++    assert replica_samples == [False]
++
++
++def test_alternating_entrypoints_exclude_interval_only_once(host):
++    from hermes_cli import kanban_sync_outbox_observation as obs
++    host.after()
++    host.clock.awake = False
++    for _ in range(15):
++        _advance(host, 60)
++        assert host.after() == []
++        assert host.check() == []
++    seen = obs._SEEN[str(host.path.resolve())]
++    assert seen.excluded == 900
++    assert host.clock.mono - seen.since == 0
++
++
+ @pytest.mark.parametrize("change", ["identity", "ack", "held", "retry", "unreadable"])
+ def test_losing_sendable_identity_restarts_budget(host, change):
+     host.after()
+diff --git a/tests/hermes_cli/test_kanban_sync_outbox_observation.py b/tests/hermes_cli/test_kanban_sync_outbox_observation.py
+index d91579e5d96a468e6346549c01fea5a73736c16c..ab3cb21cf846ebd8d7857313c965079601c9fe0e 100644
+--- a/tests/hermes_cli/test_kanban_sync_outbox_observation.py
++++ b/tests/hermes_cli/test_kanban_sync_outbox_observation.py
+@@ -19,6 +19,7 @@ def memo(tmp_path, monkeypatch):
+     {"boot": "other"}, {"since": -1}, {"since": 501}, {"seen_at": 1001},
+     {"seen_at": 399}, {"since": float("nan")}, {"filed": "false"},
+     {"warned_at": 9999}, {"warned_at": "bad"}, {"op_id": []},
++    {"excluded": -1}, {"excluded": float("nan")}, {"excluded": float("inf")}, {"excluded": "bad"},
+ ])
+ def test_invalid_persisted_observation_resets(memo, patch):
+     rec = dict(op_id="op", since=100, seen_at=500, boot="boot", filed=False, warned_at=None)
+@@ -53,3 +54,10 @@ def test_write_failure_preserves_in_memory_budget(memo, monkeypatch):
+     monkeypatch.setattr(type(memo), "write_text", denied)
+     assert obs.observe(memo, "op", 100).since == 100
+     assert obs.observe(memo, "op", 700).since == 100
++
++
++def test_old_memo_resumes_excluding_from_last_observation(memo):
++    rec = dict(op_id="op", since=100, seen_at=500, boot="boot", filed=False, warned_at=None)
++    obs._path(memo).write_text(json.dumps(rec), encoding="utf-8")
++    seen = obs.observe(memo, "op", 600, awake=False)
++    assert (seen.since, seen.seen_at, seen.excluded) == (200, 600, 100)
+diff --git a/tests/hermes_cli/test_kanban_sync_push_starvation.py b/tests/hermes_cli/test_kanban_sync_push_starvation.py
+index 564c4aec67b7948afad0df3d59bc896288663af3..ae86aebb52833d335a99b721dbcf94eb69b3d33b 100644
+--- a/tests/hermes_cli/test_kanban_sync_push_starvation.py
++++ b/tests/hermes_cli/test_kanban_sync_push_starvation.py
+@@ -34,10 +34,12 @@ conn = reserve_fixtures.conn  # a primary board as gateway "hub" (dispatch_tick
+ 
+ 
+ @pytest.fixture(autouse=True)
+-def _fresh_loop_state():
++def _fresh_loop_state(monkeypatch):
+     """Backlog flags and outbox-age verdicts are process-wide (the sync loop's): no test inherits another's."""
+     backlog.reset()
+     outbox_age.reset()
++    from cron import restart_rerun
++    monkeypatch.setattr(restart_rerun, "host_fully_awake", lambda: True)
+     yield
+     backlog.reset()
+     outbox_age.reset()
+-- 
+2.43.0
+
