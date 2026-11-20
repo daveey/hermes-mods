@@ -23,6 +23,21 @@ test('local blocked upstream passes through; older rows omit it', async () => {
   } finally { delete globalThis.window }
 })
 
+test('projects contained blocked_upstream, wait.contained and upstream', async () => {
+  const contained = { episode: 'ep-1', authority: { id: 't_auth', status: 'done' } }
+  const blocked_upstream = { id: 't_leaf', status: 'triage', contained }
+  globalThis.window = { hermesDesktop: { api: async () => ({ tasks: [
+    { id: 'held', status: 'todo', blocked_upstream, wait: { contained }, upstream: { id: 't_run', status: 'running' } },
+  ] }) } }
+  try {
+    const chips = await m.loadKanban(new Set(['contained']))
+    const chip = chips.find(c => c.id === 'held')
+    assert.deepEqual(chip.blockedUpstream, blocked_upstream)
+    assert.deepEqual(chip.contained, contained)
+    assert.deepEqual(chip.upstream, { id: 't_run', status: 'running' })
+  } finally { delete globalThis.window }
+})
+
 // Successful reader fixtures need a resolved route; undefined now means unknown.
 beforeEach(async () => {
   const { host } = await import('@hermes/plugin-sdk')
