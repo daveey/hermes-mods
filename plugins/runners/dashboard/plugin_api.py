@@ -402,6 +402,7 @@ def _shared_gateway_section():
 def _workers_command(args):
     """The scaler CLI owns host detection, locking, validation and all writes."""
     import json
+    import os
     import shutil
     import subprocess
     command = shutil.which('hermes-workers')
@@ -410,9 +411,13 @@ def _workers_command(args):
         command = str(local) if local.is_file() else None
     if command is None:
         raise HTTPException(404, 'scaler_unsupported')
+    # The CLI is a separate program on its own interpreter (#!/usr/bin/python3). This server's
+    # PYTHON* settings (the launcher's PYTHONPATH to its 3.14 site-packages) break the CLI's AWS
+    # imports there: status then answers asg=null and the limits read fails closed with 503.
+    env = {key: value for key, value in os.environ.items() if not key.startswith('PYTHON')}
     try:
         result = subprocess.run([command, *args, '--json'], capture_output=True,
-                                text=True, timeout=45, check=False)
+                                text=True, timeout=45, check=False, env=env)
     except (OSError, subprocess.TimeoutExpired):
         raise HTTPException(503, 'scaler_unavailable') from None
     if result.returncode == 3:
