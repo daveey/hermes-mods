@@ -268,6 +268,7 @@ def _ci_section():
         return dict(state='unavailable', reason='owner_profile_mismatch', machines=[])
     import time
     # Both reads are read-only: the shared memo, not a per-call copy (service.py, card L).
+    # ci_workers publishes os/provider/size from raw labels before platform labels are stripped.
     return fleet.ci_workers(backend.inventory(shared=True), fleet.host_load(backend._snapshot(), time.time()))
 
 
