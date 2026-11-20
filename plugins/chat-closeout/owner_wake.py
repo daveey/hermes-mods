@@ -213,6 +213,32 @@ def _since(ts: Any) -> str:
         return "an unknown time"
 
 
+def containment_instruction(card: dict[str, Any]) -> str:
+    """Explain supported release paths, never generic triage unblock, for a protected hold."""
+    held = (card.get("wait") or {}).get("contained")
+    if not held:
+        return ""
+    authority = held.get("authority") or {}
+    aid, status = authority.get("id"), authority.get("status") or "unknown"
+    episode = held.get("episode")
+    text = (f"; contained episode {episode}; release authority {aid} ({status}). "
+            "archive, promote, unblock and unlink are refused while held. ")
+    if status == "done":
+        text += (f"First comment the resume instruction `kanban_resume_contained(task_id={card.get('id')!r}, "
+                 f"episode={episode!r}, kind='authority')` on authority {aid}, then run "
+                 f"`hermes kanban reopen {aid}` on its home gateway so its live run can decide the release. ")
+    elif status != "archived":
+        text += "Wait for the live authority to decide the release; unknown status counts as open. "
+    producer = held.get("producer")
+    if producer:
+        text += (f"Producer {producer.get('id')} ({producer.get('status') or 'unknown'}): once a new completed "
+                 "producer run newer than containment exists, any live worker run may call "
+                 f"`kanban_resume_contained(task_id={card.get('id')!r}, episode={episode!r}, kind='producer')`. ")
+    elif status == "archived":
+        text += "The authority is archived and there is no producer: no supported exit exists; do not attempt a generic release. "
+    return text
+
+
 def card_line(card: dict[str, Any]) -> str:
     w = card.get("wait") or {}
     where = f" on {card['gateway']}" if card.get("gateway") else ""
@@ -223,7 +249,7 @@ def card_line(card: dict[str, Any]) -> str:
     needed = (f"; still needed by {', '.join(known)}: do NOT close or archive it while they wait" if known else "")
     needed += "".join(f"; {d}" for d in deps if d.startswith("("))
     return (f"- {card.get('key')}{where}{title}: {state}waiting on {w.get('waiting_on') or 'nothing named'} since "
-            f"{_since(w.get('waiting_since'))}{needed}")
+            f"{_since(w.get('waiting_since'))}{needed}{containment_instruction(card)}")
 
 
 # On 10-27 a supervisor wake called a card "safe to close" because its owning chat was archived, while a card on
@@ -257,14 +283,19 @@ def notice_text(cards: list[dict[str, Any]]) -> str:
 
 def supervisor_body(cards: list[dict[str, Any]], session_id: str, why: str) -> str:
     lines = "\n".join(card_line(c) for c in cards)
+    release = (
+        "For contained cards follow only their episode-specific instructions above, never a generic unblock. "
+        if all((c.get("wait") or {}).get("contained") for c in cards) else
+        "Only a NON-contained listed card in triage or blocked whose cause is cleared (or that only needs another "
+        "attempt) can be released with `kanban_unblock(task_id=<id>)`: this card may unblock exactly those "
+        "non-contained cards listed above. For contained cards follow only their episode-specific instructions. ")
     return (
         f"{TAG} These card(s) parked for an agent-owned reason and their owning chat {session_id} is {why}, so "
         f"nobody would wake for them:\n{lines}\n\n"
         "Supervise each: read the card (cross-gateway: `hermes kanban wait-check task <id> --gateway <gw>`, "
         "cross_task), then clear the cause with this gateway's capabilities within the card's approved plan, create "
-        "the owner card where the capability lives, or reassign it. A listed card in triage or blocked whose cause is "
-        "cleared (or that only needs another attempt) can be released with `kanban_unblock(task_id=<id>)`: this card "
-        "may unblock exactly the cards listed above. Do not re-park on the same premise and do not ask "
+        "the owner card where the capability lives, or reassign it. "
+        f"{release}Do not re-park on the same premise and do not ask "
         f"David unless a real human decision is needed (then a visible blocked ask). {REVERSE_DEPS_RULE} Complete "
         "this card with what you changed.")
 

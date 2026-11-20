@@ -62,6 +62,55 @@ def test_wakes_owning_chat_once_per_premise(tmp_path):
     assert len(h.wakes) == 2
 
 
+def contained_card(*, authority='done', producer=None, completion=1, agent=True):
+    c = card('default/t_held', premise=f'contained:episode-a:{authority}:{completion}',
+             agent=agent, state='stalled')
+    c['wait']['contained'] = {'episode': 'episode-a',
+                              'authority': {'id': 't_authority', 'status': authority},
+                              'producer': producer}
+    return c
+
+
+def test_contained_wake_names_real_exits_once_and_recompletion_wakes_again(tmp_path):
+    h = Harness(tmp_path)
+    c = contained_card()
+    assert h.tick([c])
+    assert h.tick([c], now=NOW + 60) == []
+    text = h.wakes[0][1]
+    assert 't_authority (done)' in text
+    assert 'episode-a' in text and 'kanban_resume_contained' in text
+    assert 'comment' in text and 'hermes kanban reopen t_authority' in text
+    assert 'home gateway' in text and 'kind=' in text
+    assert 'archive, promote, unblock and unlink are refused while held' in text
+    assert h.tick([contained_card(authority='running', agent=False)], now=NOW + 120) == []
+    assert h.tick([contained_card(completion=2)], now=NOW + 180)
+    assert len(h.wakes) == 2
+
+
+@pytest.mark.parametrize('c', [contained_card(authority='running', agent=False),
+                              contained_card(producer={'id': 't_producer', 'status': 'running'}, agent=False)])
+def test_contained_open_release_owner_does_not_wake(tmp_path, c):
+    h = Harness(tmp_path)
+    assert h.tick([c]) == [] and h.wakes == []
+
+
+def test_archived_containment_without_producer_has_no_supported_exit():
+    c = contained_card(authority='archived')
+    for text in (ow.wake_prompt([c]), ow.supervisor_body([c], 'gone', 'archived')):
+        assert 'no supported exit exists' in text
+        assert 'hermes kanban reopen t_authority' not in text
+        assert 'can be released with `kanban_unblock' not in text
+        assert 'archive, promote, unblock and unlink are refused while held' in text
+
+
+def test_producer_exit_in_containment_supervisor_body():
+    c = contained_card(authority='archived', producer={'id': 't_producer', 'status': 'done'})
+    text = ow.supervisor_body([c], 'gone', 'archived')
+    assert 't_producer (done)' in text and "kind='producer'" in text
+    assert 'new completed producer run' in text and 'any live worker run' in text
+    assert 'can be released with `kanban_unblock' not in text
+
+
 def test_one_wake_covers_every_due_card_of_a_chat(tmp_path):
     h = Harness(tmp_path)
     h.tick([card('default/t_a'), card('default/t_b', premise='triage:x')])
