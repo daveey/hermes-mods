@@ -873,6 +873,25 @@ export async function warm({ connectionId, profile = 'default', session } = {}) 
   } finally { hubLinkCache = keepHub }
 }
 
+let focusGeneration = 0
+let runtimeGeneration = 0
+let observedFocus = null
+let observedRuntime = null
+function observeFocusAuthority() {
+  const { scope } = focusScope()
+  const runtime = host.state.focusedSessionId.get()
+  if (observedFocus !== scope) {
+    observedFocus = scope
+    focusGeneration++
+    lastKanbanAt = 0
+    lastMachinesAt = 0
+  }
+  if (observedRuntime !== runtime) {
+    observedRuntime = runtime
+    runtimeGeneration++
+  }
+}
+
 function focusScope() {
   const route = focusedRoute()
   return { route, scope: JSON.stringify([route.connectionId || '', route.profile, host.state.focusedStoredSessionId.get()]) }
@@ -904,6 +923,7 @@ export async function refresh() {
   // A refresh for the chat a round is already reading (poll tick, runtime id landing after resume) runs again
   // after it. A switch to another chat starts its own round at once: waiting for the old chat's 2-5 s reads
   // left the new chat's panel empty or last-known that long. The old round's answers are dropped (scope check).
+  observeFocusAuthority()
   const pending = focusScope().scope
   if (inflight && inflight.scope === pending) {
     rerun = true
@@ -918,13 +938,26 @@ export async function refresh() {
     const { route, scope } = focusScope()
     // Kanban and machine answers depend on the stored chat only, so a runtime id that lands mid-round (resume)
     // must not throw them away; only process/sub-agent chips belong to one runtime session.
-    const stillFocused = () => focusScope().scope === scope
+    const capturedFocus = focusGeneration
+    const capturedRuntime = runtimeGeneration
+    const stillFocused = () => {
+      observeFocusAuthority()
+      return focusGeneration === capturedFocus && focusScope().scope === scope
+    }
+    const tokens = new Map()
+    const begin = source => {
+      if (!stored || !route.connectionId) return
+      const read = { connectionId: route.connectionId, profile: route.profile, storedSessionId: stored, source }
+      tokens.set(source, host.sessions?.beginWorkSourceRead?.(read) || read)
+    }
     // Publish actual source failures to core's completion veto, qualified to this owner/chat.
     // Older renderers lack the optional API; never fabricate task/outcome state as a fallback.
     const report = (source, available) => {
       if (!stillFocused() || !stored || !route.connectionId) return
-      host.sessions?.reportWorkSourceRead?.({ connectionId: route.connectionId, profile: route.profile,
-        storedSessionId: stored, source, available })
+      if ((source === 'process' || source === 'subagent') &&
+          (runtimeGeneration !== capturedRuntime || host.state.focusedSessionId.get() !== runtime)) return
+      const token = tokens.get(source)
+      if (token) host.sessions?.reportWorkSourceRead?.({ ...token, available })
     }
     if (!runtime && !stored) {
       snapshot = { runtime, stored, chips: [] }
@@ -959,6 +992,7 @@ export async function refresh() {
       }
       emit()
     }
+    if (runtime) { begin('process'); begin('subagent') }
     const rpc = runtime
       ? Promise.all([
           safe(() => host.request('process.list', { session_id: runtime }), null),
@@ -975,6 +1009,8 @@ export async function refresh() {
     const kanbanDue = stored && (!sameSession || Date.now() - lastKanbanAt >= KANBAN_POLL_MS)
     const machinesDue = stored && (!sameSession || Date.now() - lastMachinesAt >= MACHINE_POLL_MS)
     if (kanbanDue || machinesDue) {
+      begin('lineage')
+      if (kanbanDue) begin('tasks')
       const ids = await lineageIds(stored, route.connectionId, route.profile)
       if (ids.unstored) {
         // Nothing can be linked to a chat that isn't stored yet: show no chips (no flashing
@@ -1299,10 +1335,16 @@ export default {
     // Hosts with the fork's archive confirmation ask before archiving a chat
     // that still holds rented machines (Kanban tasks are core's own check).
     ctx.registerArchiveGuard?.(archiveGuard)
+    observeFocusAuthority()
+    const stops = ['focusedSessionId', 'focusedStoredSessionId', 'focusedSessionOwner'].map(key => {
+      const state = host.state[key]
+      return state?.listen?.(observeFocusAuthority) || state?.subscribe?.(observeFocusAuthority)
+    })
     const onVis = () => document.hidden || void refresh()
     document.addEventListener('visibilitychange', onVis)
     window.__sessionTasks = { version: 'wait-visible-v1', get snapshot() { return snapshot }, refresh, subscribe, openTaskChip, lineageIds, focusedRoute, warm }
     return () => {
+      for (const stop of stops) stop?.()
       document.removeEventListener('visibilitychange', onVis)
       document.getElementById(`${ID}-style`)?.remove()
       delete window.__sessionTasks
