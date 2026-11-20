@@ -250,4 +250,79 @@ test('composed: real openAskKeys bridge reopens same-count replacements and revi
   }
 })
 
+test('composed: recorded question delivery is agent-side, never a red human ask', async () => {
+  await React.act(async () => root.render(null))
+  steps.resetCanonicalCacheForTests()
+  const request = { ...canonicalRequest, aliases: [],
+    resolution: { operationId: 'pending-delivery', choiceId: 'a', revision: 1 } }
+  const requests = [request]
+  const dispose = wire({ chips: [], items: [], ledgerSteps: [], requests })
+  const originalApi = window.hermesDesktop.api
+  window.hermesDesktop.api = async opts => opts.path.includes('/operations/')
+    ? { request, operation: { operationId: 'pending-delivery', state: 'failed', error: 'session busy' } }
+    : originalApi(opts)
+  try {
+    await render('recorded-pending-question')
+    assert.equal(window.__userSteps.openAskCount(), 0)
+    assert.deepEqual(window.__userSteps.openAskKeys(), [])
+    assert.ok(el().querySelector('[data-section="needs-you"]') === null)
+    assert.ok(el().querySelector('[data-pip="needsYou"]') === null)
+    const row = el().querySelector('[data-action-request]')
+    assert.ok(row, 'delivery must remain visible even with no human work')
+    assert.ok(row.closest('[data-agent-deliveries]'), 'not mounted in the human queue')
+    assert.match(row.textContent, /Delivering to chat…/)
+    for (const label of ['Check status', 'Retry']) assert.ok([...row.querySelectorAll('button')].some(b => b.textContent === label), label)
+    assert.equal(row.getAttribute('data-decision-audience'), 'agent')
+    assert.doesNotMatch(row.getAttribute('style'), /destructive|f85149/)
+    // Regression: the same request without a recorded answer is still human work.
+    requests[0] = { ...canonicalRequest, requestId: '00000000-0000-4000-8000-000000000096', aliases: [] }
+    await React.act(async () => { await steps.refreshRequests(); await flush() })
+    assert.equal(window.__userSteps.openAskCount(), 1)
+    assert.match(el().querySelector('[data-section="needs-you"]').textContent, /Needs you · 1/)
+  } finally {
+    await React.act(async () => root.render(null)); dispose(); steps.resetCanonicalCacheForTests()
+  }
+})
+
+test('composed: recording removes red before slow delivery readback and survives moving queues', async () => {
+  await React.act(async () => root.render(null))
+  steps.resetCanonicalCacheForTests()
+  const request = { ...canonicalRequest, requestId: '00000000-0000-4000-8000-000000000095', aliases: [], scope: { complete: true, markdown: 'Choose an option.', sourceRefs: [] } }
+  const requests = [request], pending = []
+  const dispose = wire({ chips: [], items: [], ledgerSteps: [], requests })
+  const originalApi = window.hermesDesktop.api
+  let posts = 0
+  const recorded = { ...request, resolution: { operationId: 'slow-delivery', choiceId: 'a', revision: 1 } }
+  window.hermesDesktop.api = async opts => {
+    if (opts.method === 'POST' && opts.path.endsWith('/decisions')) {
+      posts++; requests[0] = recorded
+      return { request: recorded, operation: { operationId: 'slow-delivery', state: 'pending' } }
+    }
+    if (opts.path.includes('/operations/')) return new Promise(resolve => pending.push(resolve))
+    return originalApi(opts)
+  }
+  try {
+    await render('record-and-move')
+    assert.equal(window.__userSteps.openAskCount(), 1)
+    await React.act(async () => {
+      const button = [...el().querySelectorAll('button')].find(b => b.textContent === 'Keep it')
+      assert.ok(button); button.click(); await flush(); await flush()
+    })
+    assert.equal(posts, 1)
+    assert.equal(window.__userSteps.openAskCount(), 0)
+    assert.ok(el().querySelector('[data-section="needs-you"]') === null)
+    assert.ok(el().querySelector('[data-agent-deliveries] [data-action-request]'))
+    assert.match(el().textContent, /Delivering to chat…/)
+    await React.act(async () => {
+      for (const resolve of pending.splice(0)) resolve({ request: recorded, operation: { operationId: 'slow-delivery', state: 'failed', error: 'session busy' } })
+      await flush(); await flush()
+    })
+    const retry = [...el().querySelectorAll('[data-agent-deliveries] button')].find(b => b.textContent === 'Retry')
+    assert.ok(retry); assert.equal(retry.disabled, false, 'moved row owns its delivery readback')
+    assert.equal(posts, 1, 'moving queues never resubmits the decision')
+  } finally {
+    await React.act(async () => root.render(null)); dispose(); steps.resetCanonicalCacheForTests()
+  }
+})
+
 test('done', () => { root.unmount() })

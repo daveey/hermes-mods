@@ -864,9 +864,9 @@ test('openAskKeys bridge preserves qualified revision identity and exactly match
   ]
   const rows = [...ignored, pending, remote, live, live]
   const key = (r, scope = ['C1', 'default', 'S1']) => `${JSON.stringify(scope)}:${JSON.stringify([r.owner.gatewayId, r.owner.profile, r.requestId])}:${r.revision}`
-  const expected = [live, remote, pending].map(r => key(r)).sort()
+  const expected = [live, remote].map(r => key(r)).sort()
   await m.refreshRequests(async () => ({ requests: rows }))
-  assert.deepEqual(bridge.openAskKeys(), expected, 'no duplicates, agent work, dismissed or terminal history; pending delivery stays')
+  assert.deepEqual(bridge.openAskKeys(), expected, 'no duplicates, agent work, dismissed or terminal history; pending delivery is agent work')
   assert.equal(bridge.openAskCount(), expected.length)
   await m.refreshRequests(async () => ({ requests: [...rows].reverse() }))
   assert.deepEqual(bridge.openAskKeys(), expected, 'poll ordering cannot change identities')
@@ -906,7 +906,7 @@ test('embedded queue drops its own frame, heading and minimize control', async (
  assert.equal(m.openAskCount(), 1)
 })
 
-test('failed recorded decision keeps the ask counted and visible with Retry until confirmed', async () => {
+test('failed recorded decision is not a human ask but stays visible with Retry until confirmed', async () => {
  await show(null)
  const r = freshRequest({ title: 'Failing ask' })
  const resolution = { operationId: 'op-failed-visible', choiceId: 'yes', revision: 1 }
@@ -922,7 +922,7 @@ test('failed recorded decision keeps the ask counted and visible with Retry unti
  window.hermesDesktop = { api: ({ path, ...opts }) => call(path, opts) }
  await m.refreshRequests(call)
  await show(React.createElement(m.ActionQueue, { key: 'failed-visible', embedded: true }))
- assert.equal(m.openAskCount(), 1, 'recorded open decision remains attention-worthy after remount')
+ assert.equal(m.openAskCount(), 0, 'recorded open decision needs agent delivery, not another choice')
  assert.match(el().textContent, /delivery unconfirmed/i)
  assert.ok([...el().querySelectorAll('button')].some(b => b.textContent === 'Retry'))
  await click('Retry')

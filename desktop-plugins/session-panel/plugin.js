@@ -1138,7 +1138,7 @@ export function Panel() {
   const foldMore = foldRows.length - foldLines.length
   const needsYou = [
     (asks > 0 || sorted.unasked.length > 0) && jsx('h3', { 'data-section': 'needs-you', style: heading(C.needsYou), children: `Needs you · ${asks + sorted.unasked.length}` }, 'h-needs-you'),
-    US?.ActionQueue && jsx(US.ActionQueue, { embedded: true }, 'queue'),
+    US?.ActionQueue && jsx(US.ActionQueue, { embedded: true, audience: 'human' }, 'queue'),
     ...sorted.unasked.map(i => jsx(AskRow, { i, session: route.session }, i.key)),
     legacy
   ].filter(Boolean)
@@ -1168,6 +1168,7 @@ export function Panel() {
     ] }),
     !collapsed && jsxs('div', { 'data-panel-body': '', className: 'status-section-body', style: { maxHeight: '55vh', overflowY: 'auto', minWidth: 0, padding: '0 10px 0 12px' }, children: [
       ...needsYou,
+      US?.ActionQueue && jsx('div', { 'data-agent-deliveries': '', style: { color: 'var(--muted-foreground)' }, children: jsx(US.ActionQueue, { embedded: true, audience: 'agent' }, 'agent-queue') }),
       sorted.stuck.length > 0 && jsx('h3', { 'data-section': 'stuck', style: heading(C.stuck), children: `Stuck · ${sorted.stuck.length}` }),
       ...sorted.stuck.map(i => jsx(StuckCard, { i, session: route.session, now }, i.key)),
       sorted.blockedUpstream.length > 0 && jsx('h3', { 'data-section': 'blocked-upstream', style: heading(C.blockedUpstream), children: `Blocked upstream · ${sorted.blockedUpstream.length}` }),
