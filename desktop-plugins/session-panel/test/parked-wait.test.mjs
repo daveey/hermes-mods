@@ -254,3 +254,26 @@ test('pacificShort: weekday within six days, month and day beyond; PDT in daylig
   assert.equal(m.pacificShort(Date.parse('2026-12-03T06:20:00Z') / 1000, NOW), 'Dec 2 22:20 PST')
   assert.equal(m.pacificShort(Date.parse('2026-07-01T07:00:00Z') / 1000, Date.parse('2026-06-30T00:00:00Z')), 'Wed 00:00 PDT')
 })
+
+test('waitTree: a card waiting on another card of the list sits under it; order, cycles and outside blockers', () => {
+  const r = (id, chip = {}) => ({ key: `kb:${id}`, kind: 'kanban', label: id, chip: { id, ...chip } })
+  const shape = rows => m.waitTree(rows).map(n => `${'  '.repeat(n.depth)}${n.i.chip.id}${n.parentId ? `<${n.parentId}` : ''}`)
+  // A ← B (named wait), A ← C (upstream), C ← D (blocked upstream); E waits on a card outside the list.
+  const rows = [r('t_aaaaaaaa'), r('t_eeeeeeee', { waitingOn: 'card t_99999999' }), r('t_dddddddd', { blockedUpstream: { id: 't_cccccccc', status: 'blocked' } }),
+    r('t_bbbbbbbb', { waitingOn: 'card t_aaaaaaaa on hub' }), r('t_cccccccc', { upstream: { id: 't_aaaaaaaa', status: 'scheduled' } })]
+  assert.deepEqual(shape(rows), ['t_aaaaaaaa', '  t_bbbbbbbb<t_aaaaaaaa', '  t_cccccccc<t_aaaaaaaa', '    t_dddddddd<t_cccccccc', 't_eeeeeeee'])
+  // A cycle never nests forever: every card is listed once.
+  const cyc = shape([r('t_11111111', { waitingOn: 'card t_22222222' }), r('t_22222222', { waitingOn: 'card t_11111111' })])
+  assert.equal(cyc.length, 2)
+  assert.deepEqual(cyc.map(x => x.trim().slice(0, 10)).sort(), ['t_11111111', 't_22222222'])
+  // A card naming itself is a root.
+  assert.deepEqual(shape([r('t_33333333', { waitingOn: 'card t_33333333' })]), ['t_33333333'])
+  // A card leading into a cycle still nests: C waits on A; A and B wait on each other.
+  const lead = shape([r('t_cccc0000', { waitingOn: 'card t_aaaa0000' }), r('t_aaaa0000', { waitingOn: 'card t_bbbb0000' }), r('t_bbbb0000', { waitingOn: 'card t_aaaa0000' })])
+  assert.ok(lead.some(x => /^ +t_cccc0000<t_aaaa0000$/.test(x)), JSON.stringify(lead))
+  // Roots are ordered by the most urgent line in their subtree: D (rank 0) is under C, so C's tree comes first.
+  const ranked = m.waitTree([r('t_a1111111'), r('t_e1111111'), r('t_c1111111'), r('t_d1111111', { blockedUpstream: { id: 't_c1111111' } })], i => (i.chip.blockedUpstream ? 0 : 2))
+  assert.deepEqual(ranked.map(n => n.i.chip.id), ['t_c1111111', 't_d1111111', 't_a1111111', 't_e1111111'])
+})
+
+

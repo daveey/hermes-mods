@@ -813,6 +813,71 @@ test('panel: one-line rows carry their full row\'s box: yellow waiting, pink blo
   assert.equal(collapsed.querySelector('[data-waiting-line="kb:t_w"] [data-line-pip]').getAttribute('data-line-pip'), 'waiting')
 })
 
+test('panel: waiting cards that wait on each other show as an outline; the folded cut keeps children under their parent', async () => {
+  window.localStorage.clear()
+  const s = Date.now() / 1000
+  bridges({ chips: [
+    card('t_a0000001', 'scheduled', { label: 'Card A', look: 'waiting', waitingOn: 'ci https://github.com/o/r/actions/runs/7', waitingSince: s - 600 }),
+    card('t_b0000002', 'scheduled', { label: 'Card B', look: 'waiting', waitingOn: 'card t_a0000001', waitingSince: s - 300 }),
+    card('t_c0000003', 'scheduled', { label: 'Card C', look: 'waiting', waitingOn: 'card t_a0000001' }),
+    card('t_d0000004', 'scheduled', { label: 'Card D', look: 'waiting', waitingOn: 'card t_c0000003' }),
+    card('t_e0000005', 'scheduled', { label: 'Card E', look: 'waiting', waitingOn: 'clock 11:00' })
+  ] })
+  await show(React.createElement(m.Panel, { key: 'outline' }))
+  const folded = [...el().querySelectorAll('[data-folded-waiting] [data-waiting-line]')]
+  assert.deepEqual(folded.map(lineText), ['Card A | on CI run 7 | 10m', 'Card B |  | 5m', 'Card C |  | '], 'nested lines drop the "on <parent>" reason')
+  assert.deepEqual(folded.map(e => e.querySelector('[data-wait-head]').getAttribute('data-depth')), [null, '1', '1'])
+  assert.match(el().querySelector('[data-folded-waiting] [data-wait-more]').textContent, /^\+2 more waiting$/)
+  await React.act(async () => el().querySelector('[data-waiting-toggle]').click())
+  const open = [...el().querySelectorAll('[data-open-waiting] [data-waiting-line]')]
+  assert.deepEqual(open.map(e => `${e.querySelector('[data-wait-head]').getAttribute('data-depth') || 0}:${e.querySelector('[data-wait-title]').textContent}`),
+    ['0:Card A', '1:Card B', '1:Card C', '2:Card D', '0:Card E'])
+  assert.equal(open[3].querySelector('[data-wait-head]').style.paddingLeft, '40px')
+})
+
+test('panel: a nested line keeps a reason that is not "on <parent>"; "released by" stays; collapsed keeps urgent lines', async () => {
+  window.localStorage.clear()
+  const s = Date.now() / 1000
+  const due = new Date((s - 3 * 3600) * 1000).toISOString()
+  bridges({ chips: [
+    card('t_a0000001', 'scheduled', { label: 'Card A', look: 'waiting', waitingOn: 'clock 11:00' }),
+    // nested under A through its upstream, but waits on a CI run itself: that reason stays
+    card('t_b0000002', 'scheduled', { label: 'Card B', look: 'waiting', waitingOn: 'ci https://github.com/o/r/actions/runs/9', upstream: { id: 't_a0000001', status: 'scheduled' } }),
+    // released by A (contained): "released by" stays on the nested line
+    card('t_c0000003', 'triage', { label: 'Card C', look: 'waiting', waitingOn: 'release by card t_a0000001 (scheduled)', contained: {} }),
+    card('t_d0000004', 'scheduled', { label: 'Card D', look: 'waiting', waitingOn: 'card t_a0000001' }),
+    // an unrelated, well overdue card after a calm chain
+    card('t_e0000005', 'scheduled', { label: 'Card E', look: 'waiting', waitingOn: `the clock until ${due.slice(0, 10)} ${due.slice(11, 16)} UTC` })
+  ] })
+  await show(React.createElement(m.Panel, { key: 'outline-reasons' }))
+  await React.act(async () => el().querySelector('[data-waiting-toggle]').click())
+  const lines = Object.fromEntries([...el().querySelectorAll('[data-open-waiting] [data-waiting-line]')].map(e => [e.querySelector('[data-wait-title]').textContent, e]))
+  assert.equal(lines['Card B'].querySelector('[data-wait-head]').getAttribute('data-depth'), '1')
+  assert.equal(lines['Card B'].querySelector('[data-wait-reason]').textContent, 'on CI run 9')
+  assert.equal(lines['Card C'].querySelector('[data-wait-head]').getAttribute('data-depth'), '1')
+  assert.match(lines['Card C'].querySelector('[data-wait-reason]').textContent, /^released by /)
+  assert.equal(lines['Card D'].querySelector('[data-wait-reason]').textContent, '')
+  // Collapsed: the overdue card's tree comes first, before the calm chain.
+  await React.act(async () => el().querySelector('[data-panel-toggle]').click())
+  const collapsed = [...el().querySelectorAll('[data-collapsed-waiting] [data-wait-title]')].map(e => e.textContent)
+  assert.equal(collapsed[0], 'Card E')
+})
+
+test('panel: collapsed, a blocked-upstream line nested under a waiting parent still leads the cut', async () => {
+  window.localStorage.clear()
+  bridges({ chips: [
+    card('t_a0000001', 'scheduled', { label: 'Card A', look: 'waiting', waitingOn: 'clock 11:00' }),
+    card('t_b0000002', 'scheduled', { label: 'Card B', look: 'waiting', waitingOn: 'clock 12:00' }),
+    card('t_e0000005', 'scheduled', { label: 'Card E', look: 'waiting', waitingOn: 'clock 13:00' }),
+    card('t_c0000003', 'blocked', { label: 'Card C', look: 'waiting', waitingOn: 'clock 14:00' }),
+    card('t_d0000004', 'todo', { label: 'Card D', blockedUpstream: { id: 't_c0000003', status: 'blocked' } })
+  ] })
+  await show(React.createElement(m.Panel, { key: 'outline-collapsed' }))
+  await React.act(async () => el().querySelector('[data-panel-toggle]').click())
+  const lines = [...el().querySelectorAll('[data-collapsed-waiting] [data-waiting-line]')].map(e => `${e.querySelector('[data-wait-head]').getAttribute('data-depth') || 0}:${e.querySelector('[data-wait-title]').textContent}`)
+  assert.deepEqual(lines.slice(0, 2), ['0:Card C', '1:Card D'])
+})
+
 // [daveey] Switching chats shows the panel at once: last-known data paints first, reads replace it.
 test('panel: a chat whose runtime id has not landed yet (resume) still shows its cards', async () => {
   window.localStorage.clear()

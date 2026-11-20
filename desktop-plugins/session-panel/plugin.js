@@ -34,7 +34,7 @@ import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'session-panel'
-const VERSION = 'session-panel-v10-wait-rows'
+const VERSION = 'session-panel-v11-wait-outline'
 export const STUCK_CARD_S = 2 * 3600 // running card with no event this long
 export const STUCK_SUB_MS = 30 * 60_000 // sub-agent with no new tool call this long
 const DONE_POLL_MS = 30_000
@@ -1001,20 +1001,96 @@ const WAIT_CSS = `[data-wait-row]{border-radius:5px}[data-wait-row]:hover{backgr
 /** Waiting rows share one grid, so the reason column lines up across rows: box · title · reason · age. The reason
  *  column is a fixed 42% in every list, so it starts at the same place folded, opened and in Blocked upstream, and
  *  the title always keeps the rest. */
-export function WaitList({ rows, now = Date.now(), kindOf = () => 'waiting', more = 0, attrs = {} }) {
-  if (!rows.length && !more) return null
-  return jsxs('div', { ...attrs, style: { display: 'grid', gridTemplateColumns: '12px minmax(0,1fr) minmax(0,42%) auto', columnGap: 10, minWidth: 0 }, children: [
-    ...rows.map(i => jsx(WaitRow, { i, now, k: kindOf(i) }, i.key)),
-    more > 0 && jsx('div', { 'data-wait-more': '', style: { ...muted, gridColumn: '2 / -1', padding: '2px 0' }, children: `+${more} more waiting` }, 'more')
+/** The cards a waiting row waits on, nearest first: the cards its published wait names, its upstream, the parent
+ *  holding it (blocked upstream) and, when contained, the card that releases it. */
+const waitsOnIds = i => {
+  const c = i?.chip || {}
+  const ids = str(c.waitingOn).match(/\bt_[0-9a-f]{6,}\b/g) || []
+  for (const id of [c.upstream?.id, c.blockedUpstream?.contained?.authority?.id, c.blockedUpstream?.id]) if (id) ids.push(str(id))
+  return ids
+}
+/** Waiting rows as an outline: a card that waits on another card of the same list sits under it.
+ *  [daveey 2026-11-20] "these cards are waiting for other cards in the session, can we display them as outline view".
+ *  Returns `[{ i, depth, parentId }]` in display order: roots keep the list's order, each followed by its subtree.
+ *  A card whose blocker is not in the list stays a root (and its line names the blocker); a cycle never nests.
+ *  Ids are matched bare (`t_<hex>` is unique in practice); a card seen twice (two gateways) nests under its first copy. */
+export function waitTree(rows, rankOf = () => 0) {
+  const list = (rows || []).filter(Boolean)
+  const byId = new Map(list.filter(i => i.chip?.id).map(i => [str(i.chip.id), i]))
+  const parent = new Map()
+  for (const i of list) {
+    const own = str(i.chip?.id)
+    const p = waitsOnIds(i).find(id => id !== own && byId.has(id))
+    if (p) parent.set(i.key, p)
+  }
+  // Break cycles: a card whose chain comes back to itself is a root. A chain that runs into some other loop just
+  // stops there (that loop is broken when its own cards are walked), so a card leading into a loop still nests.
+  for (const i of list) {
+    const own = str(i.chip?.id), seen = new Set([own])
+    let cur = parent.get(i.key)
+    while (cur) {
+      if (cur === own) { parent.delete(i.key); break }
+      if (seen.has(cur)) break
+      seen.add(cur)
+      cur = parent.get(byId.get(cur)?.key)
+    }
+  }
+  const kids = new Map()
+  for (const i of list) {
+    const p = parent.get(i.key)
+    if (p) kids.set(p, [...(kids.get(p) || []), i])
+  }
+  // A root's rank is the most urgent (lowest) rank in its subtree, so a three-line cut never hides a blocked-upstream
+  // or overdue line behind a long calm chain. Equal ranks keep the list's order.
+  const rankMemo = new Map()
+  const subtreeRank = (i, seen = new Set()) => {
+    if (rankMemo.has(i.key)) return rankMemo.get(i.key)
+    if (seen.has(i.key)) return Infinity
+    seen.add(i.key)
+    let r = Number(rankOf(i)) || 0
+    for (const k of kids.get(str(i.chip?.id)) || []) r = Math.min(r, subtreeRank(k, seen))
+    rankMemo.set(i.key, r)
+    return r
+  }
+  const roots = list.map((i, n) => ({ i, n })).filter(x => !parent.has(x.i.key))
+    .sort((a, b) => subtreeRank(a.i) - subtreeRank(b.i) || a.n - b.n).map(x => x.i)
+  const out = [], done = new Set()
+  const walk = (i, depth, parentId) => {
+    if (done.has(i.key)) return
+    done.add(i.key)
+    out.push({ i, depth, parentId })
+    for (const k of kids.get(str(i.chip?.id)) || []) walk(k, depth + 1, str(i.chip?.id))
+  }
+  for (const i of roots) walk(i, 0, null)
+  return out
+}
+
+/** Waiting rows share one grid, so the reason column lines up across rows: (indent · box · title) · reason · age.
+ *  The reason column is a fixed 42% in every list, so it starts at the same place folded, opened and in Blocked
+ *  upstream, and the title always keeps the rest. Rows are an outline (waitTree); `limit` cuts the outline after
+ *  that many lines (children stay under their parent) and the rest count as "+N more waiting". */
+export function WaitList({ rows, now = Date.now(), kindOf = () => 'waiting', limit = Infinity, more = 0, attrs = {} }) {
+  // Most urgent first when cut: blocked upstream, then a warning (well overdue, a retired ask), then the rest.
+  const tree = waitTree(rows, i => (i.blockedUpstreamRow ? 0 : rowWait(i, now).tone === 'warn' ? 1 : 2))
+  const shown = tree.slice(0, limit)
+  const rest = tree.length - shown.length + more
+  if (!shown.length && !rest) return null
+  return jsxs('div', { ...attrs, style: { display: 'grid', gridTemplateColumns: 'minmax(0,1fr) minmax(0,42%) auto', columnGap: 10, minWidth: 0 }, children: [
+    ...shown.map(n => jsx(WaitRow, { i: n.i, now, k: kindOf(n.i), depth: n.depth, parentId: n.parentId }, n.i.key)),
+    rest > 0 && jsx('div', { 'data-wait-more': '', style: { ...muted, gridColumn: '1 / -1', padding: '2px 0 2px 22px' }, children: `+${rest} more waiting` }, 'more')
   ] })
 }
 
 /** One waiting card on one line of its WaitList (subgrid): box · title · short reason · how long. The title is the
  *  row's disclosure button (keyboard: Tab, Enter/Space); a click anywhere on the line opens it too. The long form:
  *  the full wait text (cards linked, the source), id · state · where, the execution evidence, and Open card. */
-export function WaitRow({ i, now = Date.now(), k = 'waiting' }) {
+export function WaitRow({ i, now = Date.now(), k = 'waiting', depth = 0, parentId = null }) {
   const [open, setOpen] = useState(false)
-  const view = rowWait(i, now)
+  const base = rowWait(i, now)
+  // Nested under the card it waits on: the outline already says "on <parent>", so that reason is dropped.
+  const view = parentId && base.reason[0] === 'on ' && base.reason[1]?.ref?.id === parentId ? { ...base, reason: [], sub: '' } : base
+  // Indent is capped so a deep chain never squeezes the title away; the depth is still on the row (data-depth).
+  const indent = Math.min(depth, 4) * 20
   const hub = onHub(i)
   const st = typeof window !== 'undefined' ? window.__sessionTasks : null
   const canOpen = i.kind === 'kanban' && !!i.chip?.connectionId && !!i.chip?.profile && typeof st?.openTaskChip === 'function'
@@ -1023,14 +1099,16 @@ export function WaitRow({ i, now = Date.now(), k = 'waiting' }) {
   const cell = { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
   return jsxs('div', { 'data-panel-row': i.key, 'data-waiting-line': i.key, 'data-wait-row': '', title: tip, onClick: () => setOpen(o => !o),
     style: { display: 'grid', gridColumn: '1 / -1', gridTemplateColumns: 'subgrid', alignItems: 'center', fontSize: 13, padding: '3px 0', cursor: 'pointer' }, children: [
-      jsx('span', { 'aria-hidden': true, 'data-row-pip': k, 'data-line-pip': k, ...(hub ? { 'data-row-pip-hub': '', 'data-line-pip-hub': '' } : {}), style: { ...pipStyle(k, hub), justifySelf: 'center' }, children: hub ? 'H' : undefined }),
-      jsx('button', { type: 'button', 'data-wait-toggle': '', 'aria-expanded': open, 'data-wait-title': '', style: { ...cell, display: 'block', width: '100%', padding: 0, border: 0, background: 'transparent', font: 'inherit', color: 'inherit', textAlign: 'left', cursor: 'pointer' }, children: i.label }),
+      jsxs('span', { 'data-wait-head': '', ...(depth ? { 'data-depth': depth } : {}), style: { display: 'flex', alignItems: 'center', gap: 10, minWidth: 0, overflow: 'hidden', paddingLeft: indent }, children: [
+        jsx('span', { 'aria-hidden': true, style: { width: 12, flex: 'none', display: 'inline-flex', justifyContent: 'center' }, children: jsx('span', { 'data-row-pip': k, 'data-line-pip': k, ...(hub ? { 'data-row-pip-hub': '', 'data-line-pip-hub': '' } : {}), style: { ...pipStyle(k, hub), display: 'inline-flex' }, children: hub ? 'H' : undefined }) }),
+        jsx('button', { type: 'button', 'data-wait-toggle': '', 'aria-expanded': open, 'data-wait-title': '', style: { ...cell, display: 'block', flex: 1, padding: 0, border: 0, background: 'transparent', font: 'inherit', color: 'inherit', textAlign: 'left', cursor: 'pointer' }, children: i.label })
+      ] }),
       jsxs('span', { 'data-wait-reason': '', ...(view.tone ? { 'data-tone': view.tone } : {}), ...(view.tone === 'warn' ? { 'data-warn': '' } : {}), style: { ...muted, ...cell, ...(tone ? { color: tone } : {}) }, children: [
         ...view.reason.map((p, n) => (typeof p === 'string' ? p : jsx(RefChip, { ref: p.ref, chip: i.chip }, `r${n}`))),
         view.sub && jsx('span', { 'data-wait-sub': '', style: { opacity: 0.75 }, children: ` · ${view.sub}` }, 'sub')
       ] }),
       jsx('span', { 'data-wait-age': '', title: view.age ? `waiting ${view.age}` : '', style: { ...muted, textAlign: 'right', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap', minWidth: '2.6em' }, children: view.age }),
-      open && jsxs('div', { 'data-wait-details': '', onClick: e => e.stopPropagation(), style: { ...muted, gridColumn: '2 / -1', fontSize: 11.5, lineHeight: 1.5, padding: '2px 0 6px', overflowWrap: 'anywhere', cursor: 'auto' }, children: [
+      open && jsxs('div', { 'data-wait-details': '', onClick: e => e.stopPropagation(), style: { ...muted, gridColumn: '1 / -1', fontSize: 11.5, lineHeight: 1.5, padding: `2px 0 6px ${indent + 22}px`, overflowWrap: 'anywhere', cursor: 'auto' }, children: [
         // The wait itself first; where the state was read (`board status` / `reported board status`) joins the id line.
         i.detail && jsx('div', { 'data-row-detail': '', children: jsx(WaitText, { text: str(i.detail).replace(SOURCE_TAIL, ''), chip: i.chip, plain: i.cardStatus }) }),
         i.chip?.id && !i.cardStatus && jsx('div', { 'data-wait-ident': '', children: [i.chip.id, i.chip.state, whereText(i.chip), i.chip.board && i.chip.board !== 'default' ? `board ${i.chip.board}` : '', SOURCE_TAIL.exec(str(i.detail))?.[1] ? `read from ${SOURCE_TAIL.exec(str(i.detail))[1]}` : ''].filter(Boolean).join(' · ') }),
@@ -1275,11 +1353,7 @@ export function Panel() {
   const status = busy ? 'Agent replying in this chat' : sorted.lastActivity ? `Idle · last activity ${ago(sorted.lastActivity, now)}` : 'Idle'
   // Collapsed, a bare "2 waiting" left the user asking "on what?": keep one short line per waiting card.
   const waitingRows = [...sorted.blockedUpstream, ...sorted.waiting]
-  const waitLines = waitingRows.slice(0, WAIT_LINES_COLLAPSED)
-  const waitMore = waitingRows.length - waitLines.length
   const foldRows = sorted.waiting.filter(i => !i.cardStatus) // cardStatus rows always render in full
-  const foldLines = foldRows.slice(0, WAIT_LINES_COLLAPSED)
-  const foldMore = foldRows.length - foldLines.length
   const needsYou = [
     (asks > 0 || sorted.unasked.length > 0) && jsx('h3', { 'data-section': 'needs-you', style: heading(C.needsYou), children: `Needs you · ${asks + sorted.unasked.length}` }, 'h-needs-you'),
     US?.ActionQueue && jsx(US.ActionQueue, { embedded: true }, 'queue'),
@@ -1307,7 +1381,7 @@ export function Panel() {
       summaryParts.length > 0 && jsx('span', { 'data-status-summary': '', ...(collapsed ? { 'data-collapsed-summary': '' } : {}), className: 'min-w-0 truncate', children: summaryParts.flatMap((p, idx) => [idx > 0 && ' · ', jsx('span', { style: p.k === 'needsYou' || p.k === 'stuck' ? { color: C[p.k], fontWeight: 600 } : undefined, children: p.text }, p.k)].filter(Boolean)) })
     ] }) }),
     // Collapsed, a bare "2 waiting" left the user asking "on what?": keep one short line per waiting card.
-    collapsed && waitLines.length > 0 && jsx('div', { style: { padding: '0 12px 2px 30px', minWidth: 0 }, children: jsx(WaitList, { rows: waitLines, now, kindOf: lineKind, more: waitMore, attrs: { 'data-collapsed-waiting': '' } }) }),
+    collapsed && waitingRows.length > 0 && jsx('div', { style: { padding: '0 12px 2px 30px', minWidth: 0 }, children: jsx(WaitList, { rows: waitingRows, now, kindOf: lineKind, limit: WAIT_LINES_COLLAPSED, attrs: { 'data-collapsed-waiting': '' } }) }),
     !collapsed && jsxs('div', { 'data-panel-body': '', className: 'status-section-body', style: { maxHeight: '55vh', overflowY: 'auto', minWidth: 0, padding: '0 10px 0 12px' }, children: [
       ...needsYou,
       sorted.stuck.length > 0 && jsx('h3', { 'data-section': 'stuck', style: heading(C.stuck), children: `Stuck · ${sorted.stuck.length}` }),
@@ -1326,7 +1400,7 @@ export function Panel() {
       ] }),
       // Folded, the counts alone ("1 other") left the user asking "on what?": name up to 3 cards and what each
       // waits on, one line each, as the collapsed panel does. Opening the fold shows the full rows.
-      !waitingOpen && foldLines.length > 0 && jsx(WaitList, { rows: foldLines, now, more: foldMore, attrs: { 'data-folded-waiting': '' } }, 'wl-fold'),
+      !waitingOpen && foldRows.length > 0 && jsx(WaitList, { rows: foldRows, now, limit: WAIT_LINES_COLLAPSED, attrs: { 'data-folded-waiting': '' } }, 'wl-fold'),
       // A still-blocked owner whose ask was retired has no other surface: its status row is never folded away.
       ...(waitingOpen ? [] : sorted.waiting.filter(i => i.cardStatus).map(i => jsx(Row, { i, k: 'waiting' }, i.key))),
       waitingOpen && jsx(WaitList, { rows: sorted.waiting, now, attrs: { 'data-open-waiting': '' } }, 'wl-open'),
