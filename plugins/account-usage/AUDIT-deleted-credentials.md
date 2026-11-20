@@ -22,3 +22,16 @@ those root rows as known rows of its own store (they are additions there), and
 a store with no `credential_pool` section (missing or corrupt) is no evidence of
 peer deletions. Signatures, selection hook points, disablement gates and refresh
 boundaries are unchanged. The earlier digest stays accepted for mixed rollout.
+
+## Revision: single read snapshot and unavailable root
+
+The final digest derives row ownership and generation bases from the same
+picker-scoped read, eliminating both the deletion-during-seeding race and an
+extra parse per provider. The update-only root writer returns unavailable for a
+missing or corrupt pool section; reconciliation then preserves memory and its
+baseline until a valid root read. A valid empty root still removes stale rows.
+Selection hooks, disablement gates and refresh boundaries remain unchanged.
+
+Core tests reproduce all three review findings on the preceding implementation:
+missing/corrupt root, peer removal during load, and three provider loads sharing
+one parse. The broader pool/auth suite passes 1,263 tests across 126 files.
