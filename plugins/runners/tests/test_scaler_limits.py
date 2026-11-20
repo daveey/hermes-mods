@@ -40,16 +40,19 @@ def test_cli_runs_without_the_servers_python_settings(api, monkeypatch, tmp_path
     On the scaler host that leak broke the CLI's AWS imports under the system interpreter, so
     status answered asg=null and the endpoint returned 503 invalid_scaler_response.
     """
+    import shlex
     import sys
     _, client, _ = api
-    fake = tmp_path / 'hermes-workers'
-    fake.write_text(
-        f'#!{sys.executable} -I\n'
+    body = tmp_path / 'hermes_workers_body.py'
+    body.write_text(
         'import json, os\n'
         'leaked = sorted(k for k in os.environ if k.startswith("PYTHON"))\n'
         'asg = None if leaked else {"desired": 2, "max": 5}\n'
         'print(json.dumps(dict(ok=True, min=1, max=5, active=2, asg=asg,\n'
         '                      asg_error=",".join(leaked) or None)))\n')
+    # A shell wrapper, not a shebang: the interpreter path may contain a space (macOS).
+    fake = tmp_path / 'hermes-workers'
+    fake.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -I {shlex.quote(str(body))} "$@"\n')
     fake.chmod(0o755)
     monkeypatch.setattr('shutil.which', lambda name: str(fake))
     monkeypatch.setenv('PYTHONPATH', str(tmp_path / 'server-site-packages'))
