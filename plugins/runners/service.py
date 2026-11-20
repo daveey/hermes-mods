@@ -229,8 +229,14 @@ _STATE_VALUES = itemgetter(*(key for key in State.__dataclass_fields__ if key no
 
 
 def _state_signature(state):
-    if state.keys() == _STATE_KEYS:
-        return _STATE_VALUES(state)
+    # The getter proves projection keys exist; length plus the four excluded
+    # bookkeeping keys then proves the exact schema, without a full key-set scan.
+    if (len(state) == len(_STATE_KEYS) and 'processed_at' in state and 'cycle' in state
+            and 'absent_cycles' in state and 'healthy_cycles' in state):
+        try:
+            return _STATE_VALUES(state)
+        except KeyError:
+            pass
     # Keep unknown/missing keys: ignoring them would hide a State constructor error.
     normalized = state.copy()
     normalized.update(_LIVENESS_ONLY)
@@ -256,9 +262,10 @@ def _carry_sources(snap, carry, built, host_results, maintenance, now, rows, pro
     built.hosts.update(inputs)
     same_hosts = {hid for hid, value in inputs.items()
                   if carry is not None and carry.hosts.get(hid, _NO_CARRY) == value}
-    # Dirty blocks still carry individual unchanged rows using these same
-    # signatures; larger blocks avoid allocating many tiny bookkeeping objects.
-    block_size = 64
+    # Keep sparse refreshes from dirtying the entire fleet: a 5% scattered
+    # refresh touches every 64-row block, but fewer than half of eight-row blocks.
+    # Clean blocks retain their reductions/provenance; dirty ones still carry rows.
+    block_size = 8
     for index, start in enumerate(range(0, len(sources), block_size)):
         chunk = sources[start:start + block_size]
         states = [_state_signature(snap['states'][src['id']]) for src in chunk]
