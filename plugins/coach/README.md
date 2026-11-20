@@ -1473,7 +1473,13 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
   Reapplication is idempotent. Manual-prune aliases are excluded; receipt/backport/undeployed comments remain
   source-card history, never new defect investigations. Retain the private provenance input and review the
   dry-run before applying. Rollback disables `backlog_ranked`; queue schema and lifecycle history stay compatible.
-  Tests: `test_self_heal_backlog.py`, `test_self_heal_ranked.py`, `test_self_heal_backlog_migration.py`.
+  Standing report: key `selfheal-backlog:<board>:<UTC day>` (`:<n>` if closed by hand), excluded from the daily
+  cap like the digest. Each drain edits its body once (top 25 + counts). A new day's card is created and scheduled
+  clock-only once to next 00:00Z + 48 h; only then is the previous day's card archived (a failed create/schedule
+  keeps it). A scheduled card is never re-scheduled (core cannot renew one). If drains stop, the card wakes as a
+  dead-man alarm whose body says to diagnose the drain, file one cause card, and archive it.
+  Tests: `test_self_heal_backlog.py`, `test_self_heal_ranked.py`, `test_self_heal_backlog_migration.py`,
+  `test_self_heal_backlog_report.py`.
 - **Daily card cap** (`daily_card_cap`, default 40, env `COACH_SELFHEAL_DAILY_CAP`): cards created_by `self-heal` on
   the board since 00:00Z. At the cap a new defect (or backport/deploy-check) files no card: the day's digest card
   (key `selfheal-digest:<YYYY-MM-DD>`, title `self-heal digest <date>: defects over the daily cap`, not counted,
