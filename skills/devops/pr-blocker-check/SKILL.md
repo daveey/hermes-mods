@@ -73,7 +73,11 @@ is to give gate jobs `if: ${{ !cancelled() }}` and run them on a light runner la
 workflow file, so open PRs keep the old behavior until they rebase.
 
 Before asking the user anything, check live state again (the head may have changed, a rebase may have reset
-approval) and put the proof in the ask.
+approval) and put the proof in the ask. Before any merge, bypass or "no review is possible" ask, also list the
+open PRs that touch the same file (`gh pr list --state open --search "<file or error text>"`) and read each one's
+reviews and commit statuses (`gh api repos/O/R/commits/<head>/statuses`): a second chat often opened the same fix,
+and one with an exact-head approval or a `claude-code/reviewed-merge` status lands by its owner's own route, so the
+ask is moot. Agree with that owner which PR lands; the other then conflicts and keeps only its extra parts.
 
 ## Telling the user when it merges
 
