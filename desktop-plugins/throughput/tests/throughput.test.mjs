@@ -416,45 +416,62 @@ const throttle = (over = {}) => ({
   ...over
 })
 
-test('throttle maths: cap per unit, live preview, burn scale, durations and labels (hand-computed)', () => {
+test('spend maths: what limits the fleet, the headline, subscriptions, slots, the limit field (hand-computed)', () => {
   assert.equal(P.capRate(throttle(), 's'), 5)
   assert.equal(P.capRate(throttle(), 'm'), 300)
   assert.equal(P.capRate(throttle({ cap_per_s: null }), 'm'), null)
   assert.equal(P.capRate(null, 'm'), null)
-  assert.equal(P.capRate(throttle({ cap_per_s: 0 }), 'h'), 0)
-  // preview: 0 = no cap, 100 = zero, between = (1 - p) x the 24-hour peak; no peak = no cap
-  assert.equal(P.previewThrottle(throttle(), 0).cap_per_s, null)
-  assert.equal(P.previewThrottle(throttle(), 100).cap_per_s, 0)
-  assert.equal(P.previewThrottle(throttle(), 50).cap_per_s, 10)
-  assert.equal(P.previewThrottle(throttle({ reference_per_s: null }), 50).cap_per_s, null)
-  assert.equal(P.previewThrottle(throttle({ reference_per_s: null }), 100).cap_per_s, 0)
   // burn scale: cap 5 under rate 10 halves the burn; a cap above the rate changes nothing; cap 0 pauses
   assert.equal(P.burnScale(throttle()), 0.5)
   assert.equal(P.burnScale(throttle({ cap_per_s: 50 })), 1)
   assert.equal(P.burnScale(throttle({ cap_per_s: null })), 1)
   assert.equal(P.burnScale(throttle({ cap_per_s: 0 })), 0)
-  assert.equal(P.burnScale(throttle({ rate_per_s: null })), 1)
   assert.equal(P.fmtDuration(73200), '20.3 h')
-  assert.equal(P.fmtDuration(3 * 86400), '3.0 d')
-  assert.equal(P.fmtDuration(600), '10 min')
   assert.equal(P.fmtDuration(null), '–')
-  assert.equal(P.throttleText(throttle({ percent: 0, cap_per_s: null }), 'm'), 'Throttle off')
-  assert.equal(P.throttleText(throttle(), 'm'), 'Throttle 75% · cap 300 tok/m · over the cap, pacing calls')
-  assert.equal(P.throttleText(throttle({ percent: 100, cap_per_s: 0 }), 'm'), 'Throttle 100% · cap 0 tok/m · holding every call')
-  assert.equal(P.throttleText(throttle({ holding: false }), 's'), 'Throttle 75% · cap 5.0 tok/s')
-  assert.match(P.throttleText(throttle({ cap_per_s: null }), 'm'), /no cap yet/)
+  // limit mode: the server's word, else read from an older payload
+  assert.equal(P.limitMode(throttle({ limit_mode: 'no_limit' })), 'no_limit')
+  assert.equal(P.limitMode(throttle()), 'limit')
+  assert.equal(P.limitMode(throttle({ percent: 0, cap_per_s: null })), 'none')
+  assert.equal(P.limitMode(throttle({ percent: 100 })), 'hold')
+  assert.equal(P.limitMode(throttle({ mode: 'auto', percent: 0, budget: { state: 'fresh' } })), 'budget')
+  assert.equal(P.limitMode(throttle({ mode: 'auto', percent: 0, budget: { state: 'expired' } })), 'none')
+  assert.equal(P.limitMode(null), null)
+  // headline: 600 tok/m against a 300 limit of the person's own: at the limit, the meter full
+  const at = P.spendHeadline(throttle({ limit_mode: 'limit' }), 'm')
+  assert.deepEqual([at.rate, at.cap, at.limit, at.by, at.state, at.fill], [600, 300, 'limit 300 tok/m', 'yours', 'at', 1])
+  const under = P.spendHeadline(throttle({ limit_mode: 'budget', cap_per_s: 20, mode: 'auto', budget: { state: 'fresh', burst_factor: 2 } }), 'm')
+  assert.deepEqual([under.limit, under.by, under.state, under.fill], ['limit 1.2k tok/m', 'subscription budget · raised 2×', 'under', 0.5])
+  const stale = P.spendHeadline(throttle({ limit_mode: 'budget', cap_per_s: 20, mode: 'auto', budget: { state: 'stale', age_s: 1800 } }), 'm')
+  assert.equal(stale.by, 'subscription budget · budget 30 min old')
+  const free = P.spendHeadline(throttle({ limit_mode: 'no_limit', cap_per_s: null }), 'm')
+  assert.deepEqual([free.limit, free.by, free.state, free.fill], ['No limit', 'budget overridden', 'unlimited', null])
+  assert.equal(P.spendHeadline(throttle({ limit_mode: 'none', cap_per_s: null }), 'm').by, null)
+  assert.equal(P.spendHeadline(throttle({ mode: 'auto', limit_mode: 'none', cap_per_s: null }), 'm').by, 'budget expired')
+  assert.deepEqual([P.spendHeadline(throttle({ limit_mode: 'hold', cap_per_s: 0 }), 'm').limit, P.spendHeadline(throttle({ limit_mode: 'hold', cap_per_s: 0 }), 'm').state], ['Holding every call', 'holding'])
+  // subscriptions: accounts usable, how long the rest lasts (twice as long under the half-rate limit), state
   const [gpt, claude] = throttle().pools
-  // uncapped: 73 200 s = 20.3 h; under the fixture's cap (half the rate) the same allowance lasts twice as long
-  assert.match(P.runwayText(gpt, throttle({ cap_per_s: null })), /^GPT: 122% left, empty in 20\.3 h at this rate, next reset /)
-  assert.match(P.runwayText(gpt, throttle()), /^GPT: 122% left, empty in 40\.7 h at the cap, next reset /)
-  assert.match(P.runwayText(gpt, throttle({ cap_per_s: 0 })), /^GPT: 122% left, paused by the throttle/)
-  assert.equal(P.runwayText(claude, throttle()), 'Claude: 0% left, not burning')
-  // the quota governor's verdict rides on the line: it limits card starts whatever the throttle level is
-  assert.equal(P.pacingText(gpt), '')
-  assert.equal(P.pacingText({ pacing: 'open' }), '')
-  assert.equal(P.runwayText({ ...claude, pacing: 'paced' }, throttle()), 'Claude: 0% left, not burning · quota pacing is limiting card starts')
-  assert.equal(P.pacingText({ pacing: 'held' }), ' · quota pacing holds card starts')
-  assert.match(P.runwayText({ ...gpt, pacing: 'held', pacing_until: 1794960000 }, throttle({ cap_per_s: null })), /at this rate, next reset .* · quota pacing holds card starts until \S+ \d\d:\d\d$/)
+  const g = P.providerRow(gpt, throttle(), END)
+  assert.deepEqual([g.name, g.accounts, g.lasts, g.state], ['GPT', '2 of 3 accounts usable', 'lasts 40.7 h at the limit', 'ok'])
+  assert.match(g.refill, /^next refill \S+ \d\d:\d\d$/)
+  assert.equal(P.providerRow(gpt, throttle({ cap_per_s: null }), END).lasts, 'lasts 20.3 h at this pace')
+  assert.equal(P.providerRow(gpt, throttle({ cap_per_s: null }), END).state, 'tight')  // 20.3 h before the refill in 24 h
+  assert.equal(P.providerRow(gpt, throttle({ cap_per_s: 0 }), END).lasts, 'paused')
+  const c = P.providerRow(claude, throttle(), END)
+  assert.deepEqual([c.accounts, c.lasts, c.refill, c.state, c.why], ['0 of 2 accounts usable', 'not in use', null, 'out', 'every account is at its weekly reserve'])
+  assert.equal(P.providerRow({ ...gpt, pacing: 'paced' }, throttle(), END).state, 'paced')
+  assert.match(P.providerRow({ ...gpt, pacing: 'held', pacing_until: END + 600 }, throttle(), END).why, /^quota pacing holds card starts until /)
+  assert.equal(P.providerRow({ provider: 'xai-oauth', runway_s: null }, throttle(), END).accounts, null)
+  // this gateway's slots
+  assert.equal(P.slotLine(throttle()), null)
+  assert.equal(P.slotLine(throttle({ slot_gate: { allowed: 6, running: 4, per_slot_per_s: 50 } })), '4 cards running · 6 slots open here (3.0k tok/min each)')
+  assert.equal(P.slotLine(throttle({ slot_gate: { allowed: 1, running: null, per_slot_per_s: null } })), '1 slot open here (cost per slot not measured yet)')
+  assert.equal(P.slotLine(throttle({ slot_gate: { allowed: null, running: 9 } })), '9 cards running · no slot limit here')
+  // the limit field: thousands of tokens per minute
+  assert.equal(P.parseLimitK('150'), 150000)
+  assert.equal(P.parseLimitK('150k'), 150000)
+  assert.equal(P.parseLimitK('1.5m'), 1500000)
+  assert.equal(P.parseLimitK('lots'), undefined)
+  assert.equal(P.parseLimitK('-1'), undefined)
 })
 
 test('throttle scope: the fleet with an acknowledgement count, or this gateway alone without the hub link', () => {
@@ -464,141 +481,148 @@ test('throttle scope: the fleet with an acknowledgement count, or this gateway a
   })
   assert.equal(P.scopeText(fleet()), 'applies to all gateways · 2 of 3 have this level')
   assert.match(P.scopeTitle(fleet()), /Not acknowledged yet: mini\.$/)
-  assert.match(P.scopeTitle(fleet({ set_by: 'macbook' })), /^Set on macbook\. /)
-  assert.equal(P.scopeText(fleet({ set_at: null })), 'applies to all gateways')  // never set: nothing to acknowledge
-  assert.doesNotMatch(P.scopeTitle(fleet({ set_at: null })), /Not acknowledged/)
-  assert.doesNotMatch(P.scopeTitle(fleet({ gateways: [{ name: 'hub', seen: true }] })), /Not acknowledged/)
-  assert.equal(P.scopeText(throttle()), 'applies to hub only')  // an older backend, or a host without the link
-  assert.match(P.scopeTitle(throttle()), /no hub link/)
-  assert.equal(P.scopeText(throttle({ fleet: false, scope: undefined })), '')
+  assert.equal(P.scopeText(throttle()), 'applies to hub only')
   assert.equal(P.scopeText(null), '')
 })
 
 const withThrottle = (state) => (path) => (path === '/v1/throttle' ? state.value : forRange(path))
 const capLines = (chart) => [...document.querySelectorAll(`[data-chart="${chart}"] line[data-cap]`)]
-const setRange = async (ui, el, value) => {
-  Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, String(value))
-  await React.act(async () => el.dispatchEvent(new window.Event('input', { bubbles: true })))
-  await ui.flush()
-}
+const spend = () => document.querySelector('[data-slot="spend"]')
 
-test('panel: red cap line on Tokens only, slider at the level, runway per pool', async () => {
+test('panel: Token spend on top (rate, limit, state, meter, subscriptions, slots); the limit line on Tokens only', async () => {
   P.saveView(V())
-  const ctx = ctxWith(withThrottle({ value: throttle() }))
+  const ctx = ctxWith(withThrottle({ value: throttle({ limit_mode: 'limit', user_cap_per_s: 5, slot_gate: { allowed: 6, running: 4, per_slot_per_s: 50 } }) }))
   const ui = await mount(React.createElement(P.Throughput, { ctx }))
   try {
     assert.ok(!ctx.calls.some(([p]) => p === '/v1/throttle'), 'the throttle is not polled while the panel is closed')
     await ui.click(button('Show throughput'))
+    const top = [...document.querySelector('.hermes-tp').children].findIndex((e) => e.dataset.slot === 'spend')
+    const firstChart = [...document.querySelector('.hermes-tp').children].findIndex((e) => e.matches('[data-chart]'))
+    assert.ok(top >= 0 && top < firstChart, 'Token spend comes before the charts')
+    assert.equal(spend().dataset.state, 'at')
+    assert.equal(spend().querySelector('[data-spend-rate]').textContent, '600')
+    assert.equal(spend().querySelector('[data-limit]').textContent, 'limit 300 tok/m · yours')
+    assert.equal(spend().querySelector('[data-spend-state]').textContent, 'at the limit: calls wait their turn')
+    assert.equal(spend().querySelector('[role=meter]').getAttribute('aria-valuenow'), '100')
+    const row = (p) => [...spend().querySelectorAll(`tr[data-pool="${p}"] > *`)].map((e) => e.textContent)
+    assert.deepEqual(row('openai-codex').slice(0, 3), ['GPT', '2 of 3 accounts usable', 'lasts 40.7 h at the limit'])
+    assert.equal(row('anthropic')[4], 'unavailable')
+    assert.match(spend().querySelector('.hermes-tp-slots').textContent, /^4 cards running · 6 slots open here \(3\.0k tok\/min each\) · applies to hub only$/)
+    assert.equal(document.querySelector('input[type=range]'), null, 'no percent slider')
+    assert.equal(spend().querySelector('[data-mode="limit"]').getAttribute('aria-pressed'), 'true')
+    assert.equal(spend().querySelector('input[aria-label^="Limit"]').value, '0')  // 5 tok/s = 0.3k/min, rounded
     const [line] = capLines('tokens')
-    assert.ok(line, 'cap line drawn')
     assert.equal(line.dataset.cap, '300')
-    assert.equal(line.getAttribute('stroke'), P.THROTTLE_RED)
-    // Tokens chart: H 84, baseline 70, 66 px for the 600/m peak; 300/m sits half way = y 37
-    assert.equal(Number(line.getAttribute('y1')), 37)
-    assert.equal(Number(line.getAttribute('y2')), 37)
-    assert.match(document.querySelector('[data-chart="tokens"] .hermes-tp-capl').textContent, /^cap 300\/m$/)
-    assert.equal(capLines('sessions').length, 0)
-    assert.equal(capLines('cards').length, 0)
-    const slider = document.querySelector('[data-slot="throttle"] input[type=range]')
-    assert.equal(slider.value, '75')
-    assert.match(document.querySelector('[data-slot="throttle"]').textContent, /Throttle 75% · cap 300 tok\/m · over the cap, pacing calls/)
-    assert.match(document.querySelector('[data-slot="throttle"]').textContent, /applies to hub/)
-    assert.equal(document.querySelector('[data-scope]').dataset.scope, 'local')
-    assert.match(document.querySelector('[data-pool="openai-codex"]').textContent, /^GPT: 122% left, empty in 40\.7 h at the cap/)
-    assert.equal(document.querySelector('[data-pool="anthropic"]').textContent, 'Claude: 0% left, not burning')
-    // the line follows the unit switch: 5 tok/s on a 10 tok/s peak is still half way
-    await ui.click(button('/s'))
-    assert.equal(capLines('tokens')[0].dataset.cap, '5')
-    assert.equal(Number(capLines('tokens')[0].getAttribute('y1')), 37)
-    // +cache and a gateway filter draw something the in+out fleet cap cannot be compared with: no line
+    assert.equal(Number(line.getAttribute('y1')), 37)  // H 84, baseline 70, 300/m half of the 600/m peak
+    assert.match(document.querySelector('[data-chart="tokens"] .hermes-tp-capl').textContent, /^limit 300\/m$/)
+    assert.equal(capLines('sessions').length + capLines('cards').length, 0)
     await ui.click(button('+cache'))
-    assert.equal(capLines('tokens').length, 0)
+    assert.equal(capLines('tokens').length, 0, '+cache cannot be compared with the in+out limit')
     await ui.click(button('in+out'))
-    assert.equal(capLines('tokens').length, 1)
     await ui.click(document.querySelector('.hermes-tp-legend [data-gw="hub"]'))
-    assert.equal(capLines('tokens').length, 0)
+    assert.equal(capLines('tokens').length, 0, 'nor can one gateway')
   } finally {
     await ui.close()
   }
 })
 
-test('panel: a cap above the chart pins to the top with an arrow; 0 % draws no line; 100 % sits on the baseline', async () => {
+test('panel: a limit above the chart pins to the top with an arrow; no limit draws no line; holding sits on the baseline', async () => {
   P.saveView(V())
-  const state = { value: throttle({ percent: 10, cap_per_s: 18, holding: false }) }
-  const ctx = ctxWith(withThrottle(state))
-  const ui = await mount(React.createElement(P.Throughput, { ctx }))
-  try {
-    await ui.click(button('Show throughput'))
-    assert.equal(Number(capLines('tokens')[0].getAttribute('y1')), 4) // 1080/m is above the 600/m peak
-    assert.match(document.querySelector('[data-chart="tokens"] .hermes-tp-capl').textContent, /^cap 1\.1k\/m ↑$/)
-  } finally {
-    await ui.close()
-  }
-  for (const [value, y] of [[throttle({ percent: 0, cap_per_s: null, holding: false }), null], [throttle({ percent: 100, cap_per_s: 0 }), 70]]) {
-    const ui2 = await mount(React.createElement(P.Throughput, { ctx: ctxWith(withThrottle({ value })) }))
+  for (const [value, y, text] of [
+    [throttle({ cap_per_s: 18, limit_mode: 'limit' }), 4, /^limit 1\.1k\/m ↑$/],
+    [throttle({ cap_per_s: null, limit_mode: 'no_limit' }), null, null],
+    [throttle({ cap_per_s: 0, percent: 100, limit_mode: 'hold' }), 70, null]]) {
+    const ui = await mount(React.createElement(P.Throughput, { ctx: ctxWith(withThrottle({ value })) }))
     try {
-      await ui2.click(button('Show throughput'))
+      await ui.click(button('Show throughput'))
       if (y == null) {
         assert.equal(capLines('tokens').length, 0)
-        assert.match(document.querySelector('[data-slot="throttle"]').textContent, /Throttle off/)
-      } else assert.equal(Number(capLines('tokens')[0].getAttribute('y1')), y)
+        assert.equal(spend().querySelector('[data-limit]').textContent, 'No limit · budget overridden')
+        assert.equal(spend().querySelector('[role=meter]'), null)
+      } else {
+        assert.equal(Number(capLines('tokens')[0].getAttribute('y1')), y)
+        if (text) assert.match(document.querySelector('[data-chart="tokens"] .hermes-tp-capl').textContent, text)
+      }
     } finally {
-      await ui2.close()
+      await ui.close()
     }
   }
 })
 
-test('slider: dragging previews the cap, releasing saves it with PUT, a refused save is shown', async () => {
+test('limit control: Budget, Limit (Enter sets thousands/min once; junk refused) and No limit, one PUT each', async () => {
   P.saveView(V())
-  const state = { value: throttle(), fail: false }
+  const state = { value: throttle({ mode: 'auto', limit_mode: 'budget', percent: 0, cap_per_s: 20, budget: { state: 'fresh', budget_per_s: 20 } }), fail: false }
   const calls = []
   const ctx = {
     calls,
     rest: async (path, opts) => {
       calls.push([path, opts])
-      if (path !== '/v1/throttle') return forRange(path)
+      if (path !== '/v1/throttle') return path.startsWith('/v1/budget') ? budgetFixture() : forRange(path)
       if (opts?.method === 'PUT') {
         if (state.fail) throw Error('HTTP 400')
-        state.value = throttle({ percent: opts.body.percent, cap_per_s: (1 - opts.body.percent / 100) * 20, holding: false })
+        const b = opts.body
+        state.value = b.no_limit ? throttle({ limit_mode: 'no_limit', cap_per_s: null, percent: 0.001 })
+          : b.cap_per_min == null ? throttle({ mode: 'auto', limit_mode: 'budget', percent: 0, cap_per_s: 20, budget: { state: 'fresh', budget_per_s: 20 } })
+            : throttle({ limit_mode: 'limit', cap_per_s: b.cap_per_min / 60, user_cap_per_s: b.cap_per_min / 60 })
       }
       return state.value
     }
   }
   const ui = await mount(React.createElement(P.Throughput, { ctx }))
-  const puts = () => calls.filter(([p, o]) => p === '/v1/throttle' && o?.method === 'PUT')
+  const puts = () => calls.filter(([p, o]) => p === '/v1/throttle' && o?.method === 'PUT').map(([, o]) => o.body)
+  const setText = async (el, v) => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, String(v))
+    await React.act(async () => el.dispatchEvent(new window.Event('input', { bubbles: true })))
+  }
+  const enter = async (el) => React.act(async () => el.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true })))
   try {
     await ui.click(button('Show throughput'))
-    const slider = () => document.querySelector('[data-slot="throttle"] input[type=range]')
-    await setRange(ui, slider(), 50)
-    assert.equal(puts().length, 0, 'nothing is saved while dragging')
-    assert.equal(capLines('tokens')[0].dataset.cap, '600') // preview: half of the 1200/m peak
-    assert.match(document.querySelector('[data-slot="throttle"]').textContent, /Throttle 50% · cap 600 tok\/m/)
-    await ui.event(slider(), 'pointerup')
-    assert.equal(puts().length, 1)
-    assert.deepEqual(puts()[0][1].body, { percent: 50 })
-    assert.equal(slider().value, '50')
-    assert.equal(capLines('tokens')[0].dataset.cap, '600')
-    await ui.event(slider(), 'pointerup')
-    assert.equal(puts().length, 1, 'releasing without a change saves nothing')
+    assert.equal(spend().querySelector('[data-mode="budget"]').getAttribute('aria-pressed'), 'true')
+    assert.equal(spend().querySelector('[data-slot="burst"]') != null, true, 'a budget can be raised for a while')
+    await ui.click(spend().querySelector('[data-mode="budget"]'))
+    assert.deepEqual(puts(), [], 'choosing what is in force sends nothing')
+    await ui.click(spend().querySelector('[data-mode="limit"]'))
+    const field = () => spend().querySelector('input[aria-label^="Limit"]')
+    assert.ok(field(), 'Limit shows the field first')
+    assert.deepEqual(puts(), [])
+    await setText(field(), 'lots')
+    await enter(field())
+    assert.deepEqual(puts(), [])
+    assert.match(spend().querySelector('[role=alert]').textContent, /thousands of tokens per minute/)
+    await setText(field(), '150')
+    await enter(field())
+    await ui.flush()
+    assert.deepEqual(puts(), [{ cap_per_min: 150000 }])
+    assert.equal(spend().querySelector('[data-limit]').textContent, 'limit 150k tok/m · yours')
+    assert.equal(field().value, '150')
+    await setText(field(), '150')
+    await enter(field())
+    assert.equal(puts().length, 1, 'the limit in force: no request')
+    await ui.click(spend().querySelector('[data-mode="no_limit"]'))
+    await ui.flush()
+    assert.deepEqual(puts()[1], { no_limit: true })
+    assert.equal(spend().dataset.state, 'unlimited')
+    assert.equal(spend().querySelector('[data-slot="burst"]'), null, 'nothing to raise without a limit')
+    await ui.click(spend().querySelector('[data-mode="budget"]'))
+    await ui.flush()
+    assert.deepEqual(puts()[2], { cap_per_min: null })
     state.fail = true
-    await setRange(ui, slider(), 90)
-    await ui.event(slider(), 'pointerup')
-    assert.equal(puts().length, 2)
-    assert.match(document.querySelector('[data-slot="throttle"] [role=alert]').textContent, /Throttle not saved: HTTP 400/)
-    assert.equal(slider().value, '50', 'the slider returns to the saved level')
+    await ui.click(spend().querySelector('[data-mode="no_limit"]'))
+    await ui.flush()
+    assert.match(spend().querySelector('[role=alert]').textContent, /^Limit not saved: HTTP 400/)
   } finally {
     await ui.close()
   }
 })
 
-test('no throttle endpoint (older backend): the panel renders without slider or line', async () => {
+test('no throttle endpoint (older backend): no Token spend section and no limit line', async () => {
   P.saveView(V())
   const ctx = ctxWith((path) => { if (path === '/v1/throttle') throw Error('HTTP 404'); return forRange(path) })
   const ui = await mount(React.createElement(P.Throughput, { ctx }))
   try {
     await ui.click(button('Show throughput'))
     assert.equal(document.querySelectorAll('[data-chart]').length, 3)
-    assert.equal(document.querySelector('[data-slot="throttle"]'), null)
+    assert.equal(spend(), null)
     assert.equal(capLines('tokens').length, 0)
   } finally {
     await ui.close()
@@ -613,31 +637,6 @@ test('register: chip right after Runners, palette entry, CSS removed on dispose'
   assert.ok([...document.head.querySelectorAll('style')].some((s) => s.textContent.includes('.hermes-tp-chart')))
   dispose()
   assert.ok(![...document.head.querySelectorAll('style')].some((s) => s.textContent.includes('.hermes-tp-chart')))
-})
-
-test('budget mode: the slider scales the published budget; stale and expired budgets say so', () => {
-  const auto = (over = {}) => throttle({
-    mode: 'auto', percent: 0, cap_per_s: 10, holding: false,
-    budget: { state: 'fresh', budget_at: END - 60, age_s: 60, budget_per_s: 10, cap_per_s: 10, pool_caps: { anthropic: 4 } },
-    ...over
-  })
-  assert.equal(P.throttleText(auto(), 's'), 'Budget · cap 10 tok/s') // 0 % is the full budget, not "off"
-  assert.equal(P.throttleText(auto({ percent: 25, cap_per_s: 7.5, holding: true }), 'm'), 'Budget −25% · cap 450 tok/m · over the cap, holding card starts')
-  assert.equal(P.throttleText(auto({ percent: 100, cap_per_s: 0 }), 'm'), 'Budget −100% · holding every call')
-  assert.equal(P.throttleText(auto({ budget: { state: 'stale', age_s: 1800, budget_per_s: 10 } }), 's'), 'Budget · cap 10 tok/s · budget stale (30 min old), keeping last caps')
-  assert.equal(P.throttleText(auto({ cap_per_s: null, budget: { state: 'expired', age_s: 7200, budget_per_s: 10 } }), 's'), 'Budget · budget expired (2.0 h old), no cap')
-  assert.equal(P.throttleText(auto({ cap_per_s: null, budget: { state: 'fresh', age_s: 60, budget_per_s: null } }), 's'), 'Budget · cap none tok/s')
-  // preview: (1 - p) x the budget; 100 = zero; an expired budget previews no cap
-  assert.equal(P.previewThrottle(auto(), 0).cap_per_s, 10)
-  assert.equal(P.previewThrottle(auto(), 40).cap_per_s, 6)
-  assert.equal(P.previewThrottle(auto(), 100).cap_per_s, 0)
-  assert.equal(P.previewThrottle(auto({ budget: { state: 'expired', budget_per_s: 10 } }), 40).cap_per_s, null)
-  // the preview stays a budget level: mode kept, pool caps scaled from the unscaled budgets, a reserve 0 stays 0
-  const moved = P.previewThrottle(auto({ budget: { state: 'fresh', budget_per_s: 10, pool_budgets: { anthropic: 0, 'openai-codex': 6, 'xai-oauth': null } } }), 50)
-  assert.equal(moved.mode, 'auto')
-  assert.deepEqual(moved.budget.pool_caps, { anthropic: 0, 'openai-codex': 3, 'xai-oauth': null })
-  assert.equal(moved.budget.cap_per_s, 5)
-  assert.match(P.throttleText(moved, 's'), /^Budget −50% · cap 5\.0 tok\/s/)
 })
 
 // ── burst + budget chart ────────────────────────────────────────────────────
@@ -671,27 +670,21 @@ test('burst maths: factor in force, preview and labels scale by it; projection t
   assert.equal(P.burstFactor(auto({ budget: {} })), 2) // an older payload: the burst's own `active`
   assert.equal(P.burstFactor(auto({ budget: {}, burst: { factor: 2, active: false } })), 1)
   assert.equal(P.burstFactor(throttle()), 1)
-  // the slider preview keeps the burst: 10 x (1 - 0.25) x 2 = 15; a reserve 0 stays 0; 100 % is 0
-  const moved = P.previewThrottle(auto(), 25)
-  assert.equal(moved.cap_per_s, 15)
-  assert.deepEqual(moved.budget.pool_caps, { anthropic: 6, 'openai-codex': 0 })
-  assert.equal(P.previewThrottle(auto(), 100).cap_per_s, 0)
-  assert.equal(P.throttleText(auto(), 's'), 'Budget −50% · burst 2× · cap 10 tok/s')
-  assert.equal(P.burstText(auto().burst, END), 'Burst 2× · 40 min left')
+  assert.equal(P.burstText(auto().burst, END), 'Raised 2× · 40 min left')
   assert.equal(P.burstText(auto().burst, END + 2400), null)
   assert.equal(P.burstText(null, END), null)
   assert.equal(P.fmtHours(0.5), '30 min')
   assert.equal(P.fmtHours(4), '4 h')
   const pr = budgetFixture().projection.pools
   assert.deepEqual(P.projectionText('anthropic', pr.anthropic, 2),
-    { text: 'Claude: runs out ~60 min earlier at today’s rate · after the burst the planner slows to 4.5 tok/s (now 10)', warn: null, warn5h: null })
+    { text: 'Claude: runs out ~60 min earlier at today’s rate · after the raise the planner slows to 4.5 tok/s (now 10)', warn: null, warn5h: null })
   const gpt = P.projectionText('openai-codex', pr['openai-codex'], 2)
   assert.match(gpt.text, /^GPT: runs out ~1 min earlier/)
-  assert.match(gpt.warn, /^GPT would hit its reserve during the burst, at \S+ \d\d:\d\d$/)
+  assert.match(gpt.warn, /^GPT would hit its reserve during the raise, at \S+ \d\d:\d\d$/)
   // 2 x 20 = 40 tok/s over a 30 tok/s 5-hour cap
   assert.equal(gpt.warn5h, 'GPT would run over its 5-hour cap (30 tok/s against 40 tok/s): accounts reach their 5-hour reserve and wait for the window to reset')
   assert.equal(P.projectionText('openai-codex', { ...pr['openai-codex'], exceeds_5h_cap: false }, 2).warn5h, null)
-  assert.match(P.projectionText('anthropic', { rate_now: 0, extra_tokens: 0, earlier_s: 0, rate_after: 0 }).text, /a burst adds nothing/)
+  assert.match(P.projectionText('anthropic', { rate_now: 0, extra_tokens: 0, earlier_s: 0, rate_after: 0 }).text, /a raise adds nothing/)
   assert.match(P.projectionText('xai-oauth', { rate_now: null }).text, /^Grok: rate unknown/)
 })
 
@@ -707,7 +700,7 @@ test('budget chart series: history to now, forward curve lifted by the spend so 
   assert.equal(a.ymax, 2100)
   // events of this pool inside the window, plus the curve's future reset; nothing of the other pool, nothing 30 d old
   assert.deepEqual(a.marks.map((m) => [m.t, m.type]), [[END - 5400, 'reset_early'], [END + 7200, 'reset']])
-  assert.equal(a.marks[0].label, 'Claude early reset (5 h window)')
+  assert.equal(a.marks[0].label, 'Claude early refill (5 h window)')
   // the total: both pools (never the unattributed `unknown` provider); the curves merge on their union of times:
   // capacity steps (1000 + 200 = 1200 now, 1500 + 200 at END+7200), plan interpolates (anthropic 200 at END+3600)
   const t = P.chartSeries(b, null, { now: END })
@@ -727,10 +720,10 @@ test('budget chart series: history to now, forward curve lifted by the spend so 
   assert.deepEqual([empty.hist, empty.cap, empty.plan, empty.x0, empty.x1], [[], [], [], END - 7 * 86400, END + 86400])
 })
 
-test('panel: budget charts per pool and total, burst projection, start and end, slider relabelled', async () => {
+test('panel: Forecast folded away with a chart per pool and in total; Raise costs, starts and ends', async () => {
   P.saveView(V())
   const autoThrottle = (burst = null) => throttle({
-    mode: 'auto', percent: 20, cap_per_s: 8, holding: false, burst,
+    mode: 'auto', limit_mode: 'limit', percent: 20, cap_per_s: 8, user_cap_per_s: 8, holding: false, burst,
     budget: { state: 'fresh', age_s: 60, budget_per_s: 10, cap_per_s: 8, pool_budgets: { anthropic: 4, 'openai-codex': 6 }, pool_caps: {}, burst_factor: burst?.active ? burst.factor : 1 }
   })
   const state = { throttle: autoThrottle() }
@@ -747,8 +740,7 @@ test('panel: budget charts per pool and total, burst projection, start and end, 
       }
       if (path.startsWith('/v1/budget')) {
         const q = new URL('http://x' + path).searchParams
-        const factor = Number(q.get('factor')), hours = Number(q.get('hours'))
-        return budgetFixture({ projection: { ...budgetFixture().projection, factor, hours } })
+        return budgetFixture({ projection: { ...budgetFixture().projection, factor: Number(q.get('factor')), hours: Number(q.get('hours')) } })
       }
       return forRange(path)
     }
@@ -757,75 +749,49 @@ test('panel: budget charts per pool and total, burst projection, start and end, 
   try {
     await ui.click(button('Show throughput'))
     await ui.flush()
-    assert.ok(calls.some(([p]) => p === '/v1/budget'), 'the charts are one request')
-    assert.ok(calls.some(([p]) => p === '/v1/budget?factor=2&hours=1&projection_only=1'), 'the default 2x / 1 h burst is costed')
-    const charts = [...document.querySelectorAll('[data-budget-chart]')].map((e) => e.dataset.budgetChart)
-    assert.deepEqual(charts, ['total', 'anthropic', 'openai-codex'])
-    const claude = document.querySelector('[data-budget-chart="anthropic"]')
+    const forecast = document.querySelector('[data-slot="forecast"]')
+    assert.equal(forecast.tagName, 'DETAILS')
+    assert.equal(forecast.open, false, 'folded away by default')
+    assert.match(forecast.querySelector('summary').textContent, /^Forecast · 7 daysusedplannedavailablerefillearly refillaccount addedraise$/)
+    assert.deepEqual([...forecast.querySelectorAll('[data-budget-chart]')].map((e) => e.dataset.budgetChart), ['total', 'anthropic', 'openai-codex'])
+    const claude = forecast.querySelector('[data-budget-chart="anthropic"]')
     for (const line of ['spent', 'plan', 'capacity']) assert.ok(claude.querySelector(`path[data-line="${line}"]`), line)
-    assert.ok(claude.querySelector('line[data-now-line]'))
-    assert.ok(claude.querySelector('line[data-mark="reset_early"]'))
-    assert.ok(claude.querySelector('line[data-mark="reset"]'))
-    assert.ok(claude.querySelector('rect[data-mark="burst"]'), 'the burst being considered is shaded')
-    assert.equal(claude.querySelector('line[data-mark="burst_start"]').getAttribute('stroke-dasharray'), '2 2')
-    assert.ok(document.querySelector('[data-budget-chart="openai-codex"] line[data-mark="account_added"]'))
-    // the panel's own charts are themed by CSS variables; the budget lines by fixed mid-tone colours
-    assert.equal(claude.querySelector('line[data-now-line]').getAttribute('stroke'), 'var(--ui-text-secondary, #8a909c)')
-    // the slider stays, relabelled for budget mode
-    assert.equal(document.querySelector('[data-slider-label]').textContent, 'Hold back 20%')
-    assert.equal(document.querySelector('[data-slot="throttle"] input[type=range]').getAttribute('aria-label'), 'Hold back percent of the budget')
-    // projection per pool, with the reserve warning on GPT
-    assert.match(document.querySelector('[data-projection="anthropic"]').textContent, /^Claude: runs out ~60 min earlier at today’s rate · after the burst the planner slows to 4\.5 tok\/s/)
-    assert.match(document.querySelector('[data-warn="openai-codex"]').textContent, /GPT would hit its reserve during the burst/)
-    assert.equal(document.querySelector('[data-warn="anthropic"]'), null)
-    assert.match(document.querySelector('[data-warn5h="openai-codex"]').textContent, /GPT would run over its 5-hour cap \(30 tok\/s against 40 tok\/s\)/)
-    assert.equal(document.querySelector('[data-warn5h="anthropic"]'), null)
-    // lines take the theme's colours (with fallbacks), not fixed hex
-    assert.equal(claude.querySelector('path[data-line="capacity"]').getAttribute('stroke'), 'var(--ui-green, #1f8a65)')
-    assert.equal(claude.querySelector('path[data-line="spent"]').getAttribute('stroke'), 'var(--ui-blue, #3b82f6)')
-    // another factor and duration: only the projection is asked again, never the charts' history
-    const full = () => calls.filter(([p]) => p === '/v1/budget').length
-    const before = full()
+    assert.match(claude.querySelector('.hermes-tp-lbl').textContent, /^used in 7 d: 600 · still available until \S+ \d\d:\d\d: 1\.5k$/)
+    assert.ok(claude.querySelector('rect[data-mark="burst"]'), 'the raise being considered is shaded')
+    // Raise lives in Token spend, costed per pool before it starts
+    assert.ok(calls.some(([p]) => p === '/v1/budget?factor=2&hours=1&projection_only=1'))
+    assert.match(spend().querySelector('[data-projection="anthropic"]').textContent, /^Claude: runs out ~60 min earlier at today’s rate · after the raise the planner slows to 4\.5 tok\/s/)
+    assert.match(spend().querySelector('[data-warn="openai-codex"]').textContent, /GPT would hit its reserve during the raise/)
     await ui.click(button('3×'))
     await ui.click(button('4 h'))
-    assert.ok(calls.some(([p]) => p === '/v1/budget?factor=3&hours=4&projection_only=1'))
-    assert.equal(full(), before)
-    const start = button('Start 3× for 4 h')
-    assert.equal(start.disabled, false)
-    await ui.click(start)
-    const put = calls.find(([p, o]) => p === '/v1/throttle/burst' && o?.method === 'PUT')
-    assert.deepEqual(put[1].body, { factor: 3, hours: 4 })
-    assert.match(document.querySelector('[data-burst]').textContent, /^Burst 3× · 4\.0 h left$/)
-    assert.match(document.querySelector('[data-slot="throttle"]').textContent, /Budget −20% · burst 3×/)
-    assert.equal(document.querySelector('[data-projection]'), null, 'no projection while a burst runs')
-    await ui.click(button('End burst'))
+    await ui.click(button('Raise 3× for 4 h'))
+    assert.deepEqual(calls.find(([p, o]) => p === '/v1/throttle/burst' && o?.method === 'PUT')[1].body, { factor: 3, hours: 4 })
+    assert.match(spend().querySelector('[data-burst]').textContent, /^Raised 3× · 4\.0 h left$/)
+    assert.equal(spend().querySelector('[data-projection]'), null, 'no costing while a raise runs')
+    await ui.click(button('End raise'))
     assert.ok(calls.some(([p, o]) => p === '/v1/throttle/burst' && o?.method === 'DELETE'))
-    assert.equal(document.querySelector('[data-burst]'), null)
-    assert.ok(button('Start 3× for 4 h'))
+    assert.equal(spend().querySelector('[data-burst]'), null)
   } finally {
     await ui.close()
   }
 })
 
-test('manual mode: budget charts without a burst control; no budget endpoint: no budget section', async () => {
+test('without a published budget: no Raise; no budget endpoint: no Forecast', async () => {
   P.saveView(V())
-  const ctx = ctxWith((path) => (path === '/v1/throttle' ? throttle() : path.startsWith('/v1/budget') ? budgetFixture({ projection: null }) : forRange(path)))
+  const ctx = ctxWith((path) => (path === '/v1/throttle' ? throttle({ limit_mode: 'limit' }) : path.startsWith('/v1/budget') ? budgetFixture({ projection: null }) : forRange(path)))
   const ui = await mount(React.createElement(P.Throughput, { ctx }))
   try {
     await ui.click(button('Show throughput'))
     await ui.flush()
-    assert.ok(ctx.calls.some(([p]) => p === '/v1/budget'), 'no burst is costed on a manual level')
-    assert.match(document.querySelector('[data-slot="burst"]').textContent, /Burst needs budget mode/)
-    assert.equal(document.querySelectorAll('[data-budget-chart]').length, 3)
-    assert.equal(document.querySelector('[data-slider-label]'), null)
-    assert.equal(document.querySelector('[data-slot="throttle"] input[type=range]').getAttribute('aria-label'), 'Token throttle percent')
+    assert.equal(spend().querySelector('[data-slot="burst"]'), null)
+    assert.equal(document.querySelectorAll('[data-slot="forecast"] [data-budget-chart]').length, 3)
   } finally {
     await ui.close()
   }
   const ui2 = await mount(React.createElement(P.Throughput, { ctx: ctxWith(withThrottle({ value: throttle() })) }))
   try {
     await ui2.click(button('Show throughput'))
-    assert.equal(document.querySelector('[data-slot="budget"]'), null)
+    assert.equal(document.querySelector('[data-slot="forecast"]'), null)
     assert.equal(document.querySelectorAll('[data-chart]').length, 3)
   } finally {
     await ui2.close()
