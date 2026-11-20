@@ -40,19 +40,6 @@ def _write(home, **state):
     (home / "cache/core-update/state.json").write_text(json.dumps(state))
 
 
-def test_needs_build_on_current_checkout_requires_consent_and_never_quits(repo):
-    root, home, running, ahead, app = repo
-    cmd = ["python", "sync", "core-prebuild", running, "--local-now"]
-    _write(home, status="needs-local-build", sha=running, local_build_cmd=cmd, peer_blocked_reason="pool reserve")
-    s = core.status(home, checkout=root)
-    assert s["state"] == "needs-local-build" and s["can_build"] and not s["can_restart"]
-    spawned = []
-    assert core.build(home, checkout=root, popen=lambda cmd, **kw: spawned.append((cmd, kw))) == {"ok": True, "sha": running}
-    assert len(spawned) == 1 and spawned[0][0] == cmd
-    assert spawned[0][1]["env"]["HERMES_HOME"] == str(home)
-    assert spawned[0][1]["start_new_session"]
-    assert not core.restart(home, checkout=root, popen=lambda *a, **kw: pytest.fail("must not quit"))["ok"]
-
 
 @pytest.mark.parametrize("terminal_state", ["ready", "failed"])
 def test_same_checkout_build_lifecycle_until_bundle_is_installed(repo, terminal_state):
@@ -66,15 +53,14 @@ def test_same_checkout_build_lifecycle_until_bundle_is_installed(repo, terminal_
     stamp = root / "apps/desktop/release/mac-arm64/Hermes.app/Contents/Resources/install-stamp.json"
     stamp.parent.mkdir(parents=True)
     stamp.write_text(json.dumps({"commit": old}))
-    cmd = ["python", "sync", "core-prebuild", target, "--local-now"]
-    for phase in ("needs-local-build", "building", terminal_state):
+    for phase in ("building", terminal_state):
         _write(home, status=phase, sha=target, app_path=str(app), waiter_cmd=["true"],
-               local_build_cmd=cmd, updated_at="2099-01-01T00:00:00+00:00",
+               updated_at="2099-01-01T00:00:00+00:00",
                error="pack failed" if phase == "failed" else None)
         s = core.status(home, checkout=root)
         assert s["state"] == phase
         assert s["can_restart"] == (phase == "ready")
-        assert s["can_build"] == (phase == "needs-local-build")
+
         if phase != "ready":
             assert not core.restart(home, checkout=root, popen=lambda *a, **kw: pytest.fail("early quit"))["ok"]
         else:
@@ -107,39 +93,6 @@ def test_unknown_installed_identity_never_offers_same_head_restart(repo, stamp_c
     s = core.status(home, checkout=root)
     assert s["state"] == "failed" and s["error"] == "pack failed"
 
-
-def test_build_refuses_invalid_command_and_nonpending_states(repo):
-    root, home, running, ahead, app = repo
-    for state, cmd in (("building", ["python", "sync", "core-prebuild", ahead, "--local-now"]),
-                       ("needs-local-build", ["python", "sync", "core-prebuild", running, "--local-now"]),
-                       ("needs-local-build", ["python", "sync", "core-prebuild", ahead, "--peer"])):
-        _write(home, status=state, sha=ahead, local_build_cmd=cmd)
-        assert not core.build(home, checkout=root, popen=lambda *a, **kw: pytest.fail("invalid spawn"))["ok"]
-
-
-def test_build_route_round_trip_does_not_invoke_restart(repo, monkeypatch):
-    from fastapi import FastAPI
-    from fastapi.testclient import TestClient
-    from types import SimpleNamespace
-    root, home, running, ahead, app = repo
-    cmd = ["python", "sync", "core-prebuild", running, "--local-now"]
-    _write(home, status="needs-local-build", sha=running, local_build_cmd=cmd)
-    spec = importlib.util.spec_from_file_location('core_update_api_fixture', Path(__file__).resolve().parents[1] / 'dashboard/plugin_api.py')
-    assert spec is not None and spec.loader is not None
-    api = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(api)
-    spawned = []
-    bound = SimpleNamespace(status=lambda: core.status(home, checkout=root),
-                            build=lambda: core.build(home, checkout=root, popen=lambda cmd, **kw: spawned.append(cmd)),
-                            restart=lambda: pytest.fail('must not restart'))
-    monkeypatch.setattr(api, '_core', lambda: bound)
-    server = FastAPI()
-    server.include_router(api.router, prefix='/api/plugins/core-update')
-    with TestClient(server) as client:
-        assert client.get('/api/plugins/core-update/status').json()['can_build']
-        response = client.post('/api/plugins/core-update/build')
-        assert response.status_code == 200 and response.json() == {'ok': True, 'sha': running}
-    assert spawned == [cmd]
 
 
 def test_ready_when_a_newer_build_exists(repo):

@@ -40,8 +40,3 @@ async def status() -> Dict[str, Any]:
 @router.post("/restart")
 async def restart() -> Dict[str, Any]:
     return _core().restart()
-
-
-@router.post("/build")
-async def build() -> Dict[str, Any]:
-    return _core().build()
