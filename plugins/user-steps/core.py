@@ -3447,11 +3447,35 @@ def _whether_alternatives(text: str) -> list[str]:
     return [_cap(p) for p in out]
 
 
+_MENU_WORD = re.compile(r"[a-z0-9]{3,}")
+
+
+def _mixed_menu(alts: list[str], found: list[str], step: dict) -> bool:
+    """True when the question's own 'A, or B?' alternatives and the model's literal options are
+    two halves of ONE menu ('Alpha plan, or Beta plan? Also consider Gamma plan, ...').
+
+    Deliberately narrow, because the usual case is the opposite: the options ANSWER the question
+    (authored add_step labels, or short paraphrases of its alternatives) and are the whole menu.
+    Mixed needs all of: an extracted step (never an authored one), every label naming the same
+    kind of thing (a word common to all of them), and no alternative sharing any other word with
+    an option (a shared word means that option restates the alternative). An unrelated closing
+    question ('Should I start now, or wait for you?') has no word common to every label, so its
+    options stay a plain menu."""
+    if step.get('choices') or step.get('source') == 'session_outcome' or len(alts) < 2 or len(found) < 2:
+        return False
+    alt_words = [set(_MENU_WORD.findall(x.casefold())) for x in alts]
+    opt_words = [set(_MENU_WORD.findall(x.casefold())) for x in found]
+    common = set.intersection(*alt_words, *opt_words)
+    if not common:
+        return False
+    return not any((a - common) & (o - common) for a in alt_words for o in opt_words)
+
+
 def _menu_labels(step: dict) -> list[str]:
     """Uncapped unique button candidates for a legacy clarification.
 
-    The question's own 'A, or B?' alternatives come first, then any model option found
-    verbatim. An 'other' tail ('something else', 'neither') is never a button: the
+    Two or more model options found verbatim are the menu as written; a mixed menu (see
+    _mixed_menu) also lists the question's own 'A, or B?' alternatives. An 'other' tail ('something else', 'neither') is never a button: the
     free-text answer covers it, and a lone 'something else' button hid the real choice
     (desktop-1321064734)."""
     source = _ws(step.get('paragraph') or step.get('text'))
@@ -3464,10 +3488,11 @@ def _menu_labels(step: dict) -> list[str]:
             found.append(source[i:i + len(o)])
     alts = _question_alternatives(_ws(step.get('verbatim_span') or step.get('paragraph')), source)
     if len(found) >= 2:
-        # Mixed menu: 2 derived alternatives plus 3+ literal model options used to be
-        # built as found-only then sliced to 4, silently dropping a real option.
-        out = (alts + [x for x in found if not any(x.casefold() in y.casefold() for y in alts)]
-               if alts else found)
+        # The options found verbatim ARE the menu, exactly as written. Only a mixed menu puts the
+        # question's own two alternatives in front, so callers see it is over MAX_OPTIONS; it
+        # used to come back as the literal options alone, silently dropping those two.
+        mixed = len(alts) + len(found) > MAX_OPTIONS and _mixed_menu(alts, found, step)
+        out = alts + found if mixed else found
     else:
         out = alts
         # The agent's own options were paraphrases (dropped above), but the card's title states both: use them.

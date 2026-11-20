@@ -282,3 +282,58 @@ def test_transform_llm_output_trace_carries_diagnostics(home, monkeypatch):
     d = trans[-1]["diagnostics"]
     assert d["raw_steps"] == 1 and d["validated"] == 1 and d["published"] == 1
     assert d["validation_drops"] == [] and d["publication_drops"] == []
+
+
+OWNER = {"gatewayId": "g", "profile": "default", "storedSessionId": "S1"}
+# Shapes from the hub ledger (wording changed, structure kept): the authored labels are short
+# paraphrases of an 'A, or B?' question, so they are not substrings of its alternatives.
+AUTHORED = [
+    ("Submit the promotion PR to the research repo as-is (negative result), or run follow-ups 1-4 first "
+     "(about 4 h on one GPU) and fold them in?",
+     ["Submit as-is", "Run the follow-ups first"]),
+    ("Build the ring ingestion plan as written (dedicated client node, mail-tick pull with a wake file, "
+     "Inbox note for stale or empty captures, audio kept for 30 days)?",
+     ["Go: build as written", "Change a decision first"]),
+    ("Sweep the 18 red cards with no live owner: re-check each premise, archive or finish the stale and "
+     "agent-doable ones, link the rest to this chat, and bring you only the real decisions?",
+     ["Yes, sweep them", "Just link them here, no triage", "Leave them"]),
+    ("The gate card has used 73 runs against a 15-run budget and shipped nothing. Stop the card, or keep "
+     "going with a smaller scope?",
+     ["Archive it (recommended)", "Continue 12 runs: build and ship the gate",
+      "Continue 5 runs: alarm only, drop the gate"]),
+]
+
+
+@pytest.mark.parametrize("question,labels", AUTHORED)
+def test_authored_choices_stay_exactly_the_buttons(home, question, labels):
+    """An add_step menu is the whole menu: the question's own 'A, or B?' halves are never added
+    to it (2 buttons became 4) and never push it over the limit (3 buttons became none)."""
+    lg = core.Ledger(home / "user-steps", home / "state.db")
+    step = core.add_step("S1", question, labels, ledger=lg)
+    assert step["kind"] == "choose"
+    assert core.literal_options(step) == labels
+    r = core.legacy_request(OWNER, step, {"kind": "step", "id": step["id"]})
+    assert r["kind"] == "choice"
+    assert [c["label"] for c in r["choices"]][:-1] == labels
+
+
+@pytest.mark.parametrize("span,opts,paragraph", [
+    # options restate the question's alternatives
+    ("Do you want the short version, or the long version?", ["short version", "long version"],
+     "Do you want the short version, or the long version?"),
+    # an unrelated closing question after the real menu
+    ("Should I start it now, or wait for you?", ["Fast path", "Slow path", "Hybrid path"],
+     "Options: Fast path, Slow path, Hybrid path. Should I start it now, or wait for you?"),
+    ("Should I pick one for you, or wait here?", ["One a", "Two b", "Three c", "Four d"],
+     "One a, Two b, Three c, Four d. Should I pick one for you, or wait here?"),
+    # paraphrases of both alternatives plus a third option: still the model's menu
+    ("Ship the cache patch today, or hold the cache patch for review?",
+     ["ship today", "hold for review", "drop the patch"],
+     "Ship the cache patch today, or hold the cache patch for review? "
+     "In short: ship today, hold for review, or drop the patch."),
+])
+def test_extracted_options_that_answer_the_question_keep_their_labels(span, opts, paragraph):
+    step = {"text": "Pick", "kind": "choose", "verbatim_span": span, "options": opts, "paragraph": paragraph}
+    assert core.literal_options(step) == opts
+    r = core.legacy_request(OWNER, step, {"kind": "step", "id": "x"})
+    assert r["kind"] == "choice" and [c["label"] for c in r["choices"]][:-1] == opts
