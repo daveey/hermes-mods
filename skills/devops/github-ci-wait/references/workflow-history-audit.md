@@ -18,6 +18,11 @@ gh api --method GET --paginate --slurp \
 Check the command's exit status before consuming the file; a failed fetch may leave partial output.
 The endpoint caps filtered searches at 1,000 results. Split any interval at or above that count into
 smaller inclusive intervals, retain each response and deduplicate boundary overlaps by run `id`.
+Inspect every page for a cap-sized `total_count` before requiring stable totals: a capped Actions
+search can append an empty page reporting `total_count=0` after pages reporting the true total
+above 1,000. Preserve that raw response and split the interval; do not accept the empty page as
+completeness, or keep retrying the same capped interval. Apply strict stable-total/count/SHA
+validation to every resulting sub-cap interval.
 Do not sum `total_count` across pages: it describes the query, not the page.
 
 For each interval below the cap, validate and emit full SHAs:
