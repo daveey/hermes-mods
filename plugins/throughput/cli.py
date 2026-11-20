@@ -1,7 +1,8 @@
 """``hermes throttle``: read and set the fleet's token cap from a terminal (the same setting as the Runners panel).
 
     hermes throttle                 # the cap in force, the budget, the fleet rate and this gateway's slots
-    hermes throttle set 150k        # cap the fleet at 150,000 tokens/min (k, m suffixes; plain numbers too)
+    hermes throttle set 150         # cap the fleet at 150,000 tokens/min (a plain number is thousands, like the
+                                    # panel's field; 150k and 1.5m work too)
     hermes throttle set 0           # no model call of a card or cron starts, and no card starts
     hermes throttle set off         # no cap of your own: the subscription budget alone (or no throttle)
 
@@ -19,13 +20,14 @@ _AMOUNT = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([kKmM]?)\s*$")
 
 
 def parse_per_min(text: str) -> Optional[float]:
-    """Tokens per minute from ``150k``, ``1.5m``, ``90000``; None for ``off``/``none``/``auto``. ValueError else."""
+    """Tokens per minute from ``150`` (thousands, as in the Runners panel), ``150k``, ``1.5m``; None for
+    ``off``/``none``/``auto``. ValueError else."""
     if str(text).strip().lower() in ("off", "none", "auto", "budget"):
         return None
     match = _AMOUNT.match(str(text))
     if not match:
-        raise ValueError(f"not a token amount: {text!r} (try 150k, 2m, 90000 or off)")
-    return float(match.group(1)) * {"": 1, "k": 1e3, "m": 1e6}[match.group(2).lower()]
+        raise ValueError(f"not a token amount: {text!r} (thousands of tokens/min: try 150, 150k, 2m or off)")
+    return float(match.group(1)) * {"": 1e3, "k": 1e3, "m": 1e6}[match.group(2).lower()]
 
 
 def fmt(per_s: Optional[float]) -> str:
@@ -38,7 +40,7 @@ def fmt(per_s: Optional[float]) -> str:
 def setup(parser) -> None:
     sub = parser.add_subparsers(dest="throttle_cmd")
     sub.add_parser("status", help="the cap in force, the budget and this gateway's slots (the default)")
-    put = sub.add_parser("set", help="set the fleet's token cap in tokens/min (150k, 2m, 0, off)")
+    put = sub.add_parser("set", help="set the fleet's token cap in thousands of tokens/min (150, 2m, 0, off)")
     put.add_argument("amount")
 
 
@@ -76,7 +78,7 @@ def set_cap(amount: str, now: Optional[float] = None) -> Optional[float]:
     now = time.time() if now is None else now
     level = throttle.effective(root, hub, now)
     stamp = max(now, level["set_at"] + 0.002)  # outrank the level in force even when its setter's clock runs ahead
-    value = throttle.write_cap(root, None if per_min is None else per_min / 60.0, stamp)
+    value = throttle.write_cap(root, None if per_min is None else per_min / 60.0, stamp, level)
     throttle.note_seen(root, hub, stamp)
     return value
 
