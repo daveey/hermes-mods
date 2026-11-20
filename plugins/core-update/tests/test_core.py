@@ -54,6 +54,60 @@ def test_needs_build_on_current_checkout_requires_consent_and_never_quits(repo):
     assert not core.restart(home, checkout=root, popen=lambda *a, **kw: pytest.fail("must not quit"))["ok"]
 
 
+@pytest.mark.parametrize("terminal_state", ["ready", "failed"])
+def test_same_checkout_build_lifecycle_until_bundle_is_installed(repo, terminal_state):
+    root, home, old, _, app = repo
+    source = root / "apps/desktop/source.js"
+    source.parent.mkdir(parents=True)
+    source.write_text("new desktop")
+    _git(root, "add", "apps/desktop/source.js")
+    _git(root, "commit", "-qm", "desktop change")
+    target = _git(root, "rev-parse", "HEAD")
+    stamp = root / "apps/desktop/release/mac-arm64/Hermes.app/Contents/Resources/install-stamp.json"
+    stamp.parent.mkdir(parents=True)
+    stamp.write_text(json.dumps({"commit": old}))
+    cmd = ["python", "sync", "core-prebuild", target, "--local-now"]
+    for phase in ("needs-local-build", "building", terminal_state):
+        _write(home, status=phase, sha=target, app_path=str(app), waiter_cmd=["true"],
+               local_build_cmd=cmd, updated_at="2099-01-01T00:00:00+00:00",
+               error="pack failed" if phase == "failed" else None)
+        s = core.status(home, checkout=root)
+        assert s["state"] == phase
+        assert s["can_restart"] == (phase == "ready")
+        assert s["can_build"] == (phase == "needs-local-build")
+        if phase != "ready":
+            assert not core.restart(home, checkout=root, popen=lambda *a, **kw: pytest.fail("early quit"))["ok"]
+        else:
+            calls = []
+            assert core.restart(home, checkout=root, popen=lambda *a, **kw: calls.append(a))["ok"]
+            assert len(calls) == 2
+    stamp.write_text(json.dumps({"commit": target}))
+    s = core.status(home, checkout=root)
+    assert s["state"] == "idle" and not s["can_restart"]
+    assert not core.restart(home, checkout=root, popen=lambda *a, **kw: pytest.fail("already installed"))["ok"]
+    # An older installed bundle can serve a newer backend-only head too.
+    _git(root, "commit", "-q", "--allow-empty", "-m", "backend only")
+    newer = _git(root, "rev-parse", "HEAD")
+    _write(home, status="ready", sha=target, serves_sha=newer, app_path=str(app), waiter_cmd=["true"])
+    assert core.status(home, checkout=root)["state"] == "idle"
+
+
+@pytest.mark.parametrize("stamp_content", [None, "broken", '{"commit": "short"}'])
+def test_unknown_installed_identity_never_offers_same_head_restart(repo, stamp_content):
+    root, home, running, _, app = repo
+    if stamp_content is not None:
+        stamp = root / "apps/desktop/release/mac/Hermes.app/Contents/Resources/install-stamp.json"
+        stamp.parent.mkdir(parents=True)
+        stamp.write_text(stamp_content)
+    _write(home, status="ready", sha=running, app_path=str(app), waiter_cmd=["true"])
+    s = core.status(home, checkout=root)
+    assert not s["can_restart"] and s["desktop_swap_pending"] is None
+    assert "identity unavailable" in s["reason"]
+    _write(home, status="failed", sha=running, error="pack failed")
+    s = core.status(home, checkout=root)
+    assert s["state"] == "failed" and s["error"] == "pack failed"
+
+
 def test_build_refuses_invalid_command_and_nonpending_states(repo):
     root, home, running, ahead, app = repo
     for state, cmd in (("building", ["python", "sync", "core-prebuild", ahead, "--local-now"]),
