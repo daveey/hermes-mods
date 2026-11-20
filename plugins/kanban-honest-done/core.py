@@ -365,7 +365,7 @@ def check_complete(task_id: str, summary: str, paths: list[Path], title: Optiona
     if why:  # G: a failed threshold never becomes a waiver or a guessed pass
         return why
     if found:
-        return check_origin_reached(task_id, found[0], found[1].get("body") or "")
+        return check_origin_reached(task_id, found[0], found[1].get("body") or "", metadata=metadata)
     return None
 
 
@@ -496,7 +496,7 @@ def _origin_receipt_context(task_id, board, owner):
         return None
 
 
-def check_origin_reached(task_id: str, board: Path, body: str) -> Optional[str]:
+def check_origin_reached(task_id: str, board: Path, body: str, metadata: Any = None) -> Optional[str]:
     """Refusal when the card body/comments name an origin chat that will not hear this completion: no unreleased
     ``task_chat_links`` row, no ``kanban_notify_subs`` subscription, and no ``follow-through: SENT`` comment naming
     it. Fails open (None) on any board read error."""
@@ -551,12 +551,17 @@ def check_origin_reached(task_id: str, board: Path, body: str) -> Optional[str]:
         context = _origin_receipt_context(task_id, board, owner)
         hit = _sibling('origin_receipts').reached(context, ro_connect) if context else set()
         missing = [s for s in missing if not _matches_origin(s, hit)]
+    gone = _sibling('origin_gone').evidence(missing, replica_paths([board]), ro_connect) if missing else {}
+    notes = '\n'.join(comments + [metadata_text(metadata)])
+    missing = [ref for ref in missing if ref not in gone or gone[ref] not in notes]
     if not missing:
         return None
+    audit_hint = ''.join(f'\nAuthenticated gone-origin evidence is available. Include this exact note in completion '
+                         f'metadata (or a kanban_comment), then retry: {gone[ref]}' for ref in missing if ref in gone)
     labels = [f"{profile}@{gw}/{sid}" if gw else f"{profile}/{sid}" if profile else sid
               for gw, profile, sid in missing]
-    return origin_refusal(task_id, labels) + remote_origin_hint(task_id, board, body, comments, missing[0][2],
-                                                               owner=owner)
+    return origin_refusal(task_id, labels) + audit_hint + ('' if missing[0] in gone else remote_origin_hint(
+        task_id, board, body, comments, missing[0][2], owner=owner))
 
 
 def _board_profile(board):
@@ -672,7 +677,11 @@ def origin_refusal(task_id: str, sessions: list[str]) -> str:
         f"2) Record it with kanban_comment on {task_id}: \"follow-through: SENT via cross_session to @session:{s} "
         "at <time>; delivery verified|not verified\" (verified = the send returned delivered/replied). Then complete "
         "again. \"not verified\" means it went out with no readback; a send that returned an error does not count.\n"
-        "3) If the send fails (no relay, chat gone), kanban_block this card with that error instead of completing.\n"
+        "3) If the send fails, use kanban_supervisor_request operator action=comment on the live owning "
+        "gateway's card to request an origin-link repair; do not invent SENT evidence. A terminated gateway may "
+        "use the independently checked origin-chat-gone audit note offered below. Missing/stale evidence is "
+        "unknown: refresh the normal replicas and retry, or route a repair to the owning agent. Use kanban_block "
+        "only for an actual human step with human_request, not an agent-owned relay failure.\n"
         "(Whoever creates such a card should bind the chat up front: kanban_create origin_session='@session:…'.)"
         + (f" Other unlinked origin chats: {', '.join(sessions[1:])}." if len(sessions) > 1 else "")
     )
