@@ -40,9 +40,19 @@ def join(root):
 
 
 def test_cold_fresh_expiry_and_current_cap(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    # Patch both module globals. setattr(time, "monotonic") does not reach slots.payload's
+    # `import time` on every interpreter, so the CACHE_S boundary can stay "fresh".
+    mono = [NOW]
+    fake_time = SimpleNamespace(time=lambda: NOW, monotonic=lambda: mono[0])
+    monkeypatch.setattr(A, "time", fake_time)
+    monkeypatch.setattr(S, "time", fake_time)
     series, replica = measurement(tmp_path)
     assert S.payload(tmp_path, series, 1000, now=NOW, replicas=[replica]) is None
     owner = join(tmp_path)
+    with owner.lock:
+        owner.retry_at = float("inf")
+        owner.next_at = float("inf")
     got = S.payload(tmp_path, series, 1000, now=NOW, replicas=[replica])
     assert got["gateways"]["worker-1"]["allowed"] == 1
     assert got["observed_at"] == NOW and got["window_since"] == START and got["window_until"] == END
@@ -50,14 +60,12 @@ def test_cold_fresh_expiry_and_current_cap(tmp_path, monkeypatch):
     assert S.payload(tmp_path, series, 2000, now=NOW, replicas=[replica])["gateways"]["worker-1"]["allowed"] == 2
     got["gateways"]["worker-1"]["allowed"] = 999
     assert S.payload(tmp_path, series, 0, now=NOW, replicas=[replica])["gateways"]["worker-1"]["allowed"] == 0
-    # Prevent a new refresh so assertions cover the exact old observation boundary.
-    owner.retry_at = float("inf")
     stamp = owner.snapshot[0]
-    monkeypatch.setattr(A.time, "monotonic", lambda: stamp + S.CACHE_S - 0.001)
+    mono[0] = stamp + S.CACHE_S - 0.001
     assert S.payload(tmp_path, series, 1000, now=NOW, replicas=[replica]) is not None
-    monkeypatch.setattr(A.time, "monotonic", lambda: stamp + S.CACHE_S)
+    mono[0] = stamp + S.CACHE_S
     assert S.payload(tmp_path, series, 1000, now=NOW, replicas=[replica]) is None
-    monkeypatch.setattr(A.time, "monotonic", lambda: stamp)
+    mono[0] = stamp
     assert S.payload(tmp_path, series, 1000, now=NOW + 30, replicas=[replica]) is None
     assert S.payload(tmp_path, series, 1000, now=NOW - 1, replicas=[replica]) is None
 
