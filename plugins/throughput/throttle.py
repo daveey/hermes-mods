@@ -1133,14 +1133,15 @@ def read_user_cap(root: Path) -> dict:
     set, when the file is missing or unreadable)."""
     data = _read_json(user_cap_path(root))
     if not isinstance(data, dict):
-        return {"cap_per_s": None, "set_at": 0.0, "published_set_at": None}
+        return {"cap_per_s": None, "set_at": 0.0, "published_set_at": None, "published_percent": None}
     try:
         value = cap_value(data.get("cap_per_s"))
     except ValueError:
         value = None
     published = _number(data.get("published_set_at"))
     return {"cap_per_s": value, "set_at": stamp(data.get("set_at")),
-            "published_set_at": None if published is None else stamp(published)}
+            "published_set_at": None if published is None else stamp(published),
+            "published_percent": _number(data.get("published_percent"))}
 
 
 def person_cap(level: dict, now: float, budget_per_s: Optional[float] = None) -> Optional[float]:
@@ -1154,7 +1155,10 @@ def person_cap(level: dict, now: float, budget_per_s: Optional[float] = None) ->
         return None
     if percent >= 100:
         return 0.0
-    if level.get("mode") != AUTO and budget_per_s is not None:
+    if level.get("mode") == AUTO:  # the budget it was set against, without any burst factor
+        base = level.get("cap_per_s")
+        return None if base is None else base * (1.0 - percent / 100.0)
+    if budget_per_s is not None:
         return budget_per_s * (1.0 - percent / 100.0)
     return limit_of(level, None, now)
 
@@ -1187,7 +1191,11 @@ def publish_budget(root: Path, hub_db: Optional[Path], pacing_file: Path, now: O
     level = effective(root, hub_db, now)
     user = read_user_cap(root)
     own = level["source"] is None and level.get("mode") == AUTO and level["set_at"] == user.get("published_set_at")
-    if not own and level["set_at"] > user["set_at"]:
+    # A budget level written elsewhere with the percent last published (a burst set or ended, a republish) moves
+    # no cap: only a changed percent (an older panel's slider) or a manual level is a person's setting.
+    same_percent = (level.get("mode") == AUTO and user.get("published_percent") is not None
+                    and abs(level["percent"] - user["published_percent"]) < 1e-3)
+    if not own and not same_percent and level["set_at"] > user["set_at"]:
         user = {"cap_per_s": person_cap(level, now, new["cap_per_s"]), "set_at": level["set_at"]}
         _write_json(user_cap_path(root), user)
     percent = percent_for(user["cap_per_s"], new["cap_per_s"])
@@ -1210,7 +1218,7 @@ def publish_budget(root: Path, hub_db: Optional[Path], pacing_file: Path, now: O
         data["burst"] = dict(level["burst"])
     _write_json(path, data)
     _write_json(user_cap_path(root), {"cap_per_s": user["cap_per_s"], "set_at": user["set_at"],
-                                      "published_set_at": set_at})
+                                      "published_set_at": set_at, "published_percent": percent})
     return True
 
 

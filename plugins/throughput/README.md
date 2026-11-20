@@ -119,7 +119,10 @@ and a body that is not a JSON object a 422, and neither changes anything.
   records the newest person-set level in `cache/throughput/user-cap.json` (a manual level as is; a slider level,
   or an older panel's slider on the budget level, as its percent of the budget) and writes its budget level with
   `percent` such that the cap is the lower of the person's cap and the budget (`percent_for`), so pool caps scale
-  with it and older gateways enforce it unchanged. Its own writes are recognised by `published_set_at`.
+  with it and older gateways enforce it unchanged. Its own writes are recognised by `published_set_at`. A budget
+  level written elsewhere with the percent it last published (a burst set or ended) is not a person's setting
+  (`published_percent`). A burst multiplies the cap in force, the person's cap included: it is a deliberate,
+  time-boxed raise; the recorded cap is unchanged when it ends.
   `user_cap_per_s` in the payload is that cap as far as this gateway can tell. Tests: `tests/test_slotgate.py`
   (manual pacing, fold, lower-of, removal, older slider), `tests/test_api.py::test_put_cap_per_min_*` (REST),
   `tests/test_cli.py` (CLI and its registration), Runners `tests/throttle.test.mjs` (panel field).

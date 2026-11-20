@@ -374,3 +374,22 @@ def test_carried_pool_caps_expire_like_the_budget_they_came_from(tmp_path):
     later = NOW + 2 * 3600
     plan = gate.plan(later, "anthropic")
     assert plan[0] == "pace" and len(plan) == 3 and plan[1] == pytest.approx(T.DEFAULT_CALL_TOKENS / 250.0)
+
+
+@pytest.mark.parametrize("cap", [250.0, 2000.0])  # below and above a 1000 tokens/s budget
+def test_a_burst_set_and_ended_never_moves_the_persons_cap(tmp_path, cap):
+    pacing = _pacing(tmp_path, 1000.0)
+    T.write_cap(tmp_path, cap, NOW)
+    T.publish_budget(tmp_path, None, pacing, NOW + 10)
+    assert T.read_user_cap(tmp_path)["cap_per_s"] == cap
+    T.set_burst(tmp_path, T.effective(tmp_path, None, NOW + 20), 2, 3600, NOW + 20)
+    T.publish_budget(tmp_path, None, pacing, NOW + 30)
+    assert T.read_user_cap(tmp_path)["cap_per_s"] == cap
+    level = T.effective(tmp_path, None, NOW + 30)
+    assert level["burst"]["factor"] == 2.0
+    assert T.budget(level, NOW + 30)["cap_per_s"] == pytest.approx(min(cap, 1000.0) * 2)
+    assert T.shown_user_cap(tmp_path / "elsewhere", level, NOW + 30) == (None if cap > 1000 else pytest.approx(cap))
+    T.clear_burst(tmp_path, T.effective(tmp_path, None, NOW + 40), NOW + 40)
+    T.publish_budget(tmp_path, None, pacing, NOW + 50)
+    assert T.read_user_cap(tmp_path)["cap_per_s"] == cap
+    assert T.budget(T.effective(tmp_path, None, NOW + 50), NOW + 50)["cap_per_s"] == pytest.approx(min(cap, 1000.0))
