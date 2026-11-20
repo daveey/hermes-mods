@@ -232,6 +232,30 @@ def test_ci_runners_grouped_into_machines_with_one_slot_each():
     assert {s['state'] for g in stale['machines'] for s in g['slots']} == {'unknown'}
 
 
+def test_ci_stale_display_history_does_not_restore_authoritative_state():
+    rows = [dict(display_name=name, registration=registration, activity=activity,
+                 freshness=freshness, observed_at='2026-11-20T04:09:25Z', labels=[])
+            for name, registration, activity, freshness in [
+                ('mini-1', 'online', 'busy', 'fresh'),
+                ('mini-2', 'online', 'idle', 'stale'),
+                ('mini-3', 'offline', 'unknown', 'stale'),
+                ('unseen', 'unknown', 'unknown', 'unknown'),
+                ('unmeasured', 'online', 'unknown', 'stale'),
+                ('blacksmith-4vcpu-live', 'online', 'busy', 'stale')]]
+    for freshness in ('fresh', 'stale'):
+        out = fleet.ci_workers(dict(meta=dict(freshness=freshness), data=dict(runners=rows)))
+        slots = {s['runner']: s for m in out['machines'] for s in m['slots']}
+        assert slots['mini-1']['last_observed']['state'] == 'busy'
+        assert slots['mini-2']['last_observed']['state'] == 'idle'
+        assert slots['mini-3']['last_observed']['state'] == 'offline'
+        assert slots['blacksmith-4vcpu-live']['last_observed']['state'] == 'busy'
+        assert slots['unseen']['last_observed'] is None
+        assert slots['unmeasured']['last_observed'] is None
+        assert slots['mini-2']['state'] == 'unknown'
+        if freshness == 'stale':
+            assert {s['state'] for s in slots.values()} == {'unknown'}
+
+
 def test_unreachable_registry_and_unseen_machines_are_unknown_not_failed():
     leases = [dict(board='default', task='t_a', title='A', holder='macbook', started_at=1)]
     out = fleet.gateway_workers(None, leases, NOW)
