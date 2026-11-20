@@ -22,8 +22,8 @@ test('forecast request carries weekly used + resets for pooled providers only', 
 })
 
 test('verdict and forecast wording', () => {
-  assert.equal(plugin.verdictText({ verdict: 'short', runout_h: 17 }), 'dry in 17h')
-  assert.equal(plugin.verdictText({ verdict: 'short', runout_h: 0 }), 'dry now')
+  assert.equal(plugin.verdictText({ verdict: 'short', runout_h: 17 }), '17h')
+  assert.equal(plugin.verdictText({ verdict: 'short', runout_h: 0 }), 'out')
   assert.equal(plugin.verdictText({ verdict: 'learning' }), 'learning…')
   assert.equal(plugin.verdictText({ verdict: 'ok' }), 'ok')
   assert.equal(plugin.verdictText(null), '')

@@ -260,7 +260,8 @@ function atHour(h, now) {
 export function verdictText(f) {
   if (!f) return ''
   if (f.verdict === 'learning') return 'learning…'
-  if (f.verdict === 'short') return f.runout_h === 0 ? 'dry now' : `dry in ${fmtHours(f.runout_h)}`
+  // Short: just the hours until it runs dry, in red (the tooltip and popover say the rest).
+  if (f.verdict === 'short') return f.runout_h === 0 ? 'out' : fmtHours(f.runout_h)
   if (f.verdict === 'tight') return 'tight'
   if (f.verdict === 'ok') return 'ok'
   return ''
@@ -315,6 +316,7 @@ export function smoothPath(pts, h) {
   return d
 }
 
+// The popover (ticks) draws dry spells as a red strip; the bar leaves them out so an empty provider reads as one line.
 export function Sparkline({ f, w = 64, h = 14, ticks = false, k = 13 }) {
   if (!f || !Array.isArray(f.curve) || f.curve.length < 2) return null
   const n = f.curve.length - 1
@@ -330,7 +332,7 @@ export function Sparkline({ f, w = 64, h = 14, ticks = false, k = 13 }) {
   const col = VERDICT_COLOR[f.verdict] || 'currentColor'
   return jsxs('svg', { width: w, height: h, viewBox: `0 0 ${w} ${h}`, 'aria-hidden': true, style: { flex: 'none', overflow: 'visible' }, children: [
     jsx('path', { d: `${line} L${w},${top} L0,${top} Z`, fill: col, opacity: 0.16 }),
-    ...(f.gaps || []).map((g, i) => jsx('rect', { key: `g${i}`, x: x(g.start_h), width: Math.max(1.5, x(g.end_h) - x(g.start_h)), y: h - 2, height: 2, rx: 1, fill: COLORS.limited })),
+    ...(ticks ? f.gaps || [] : []).map((g, i) => jsx('rect', { key: `g${i}`, x: x(g.start_h), width: Math.max(1.5, x(g.end_h) - x(g.start_h)), y: h - 2, height: 2, rx: 1, fill: COLORS.limited })),
     ...(ticks ? (f.resets_h || []).filter(r => r >= 0 && r <= n).map((r, i) => jsx('line', { key: `t${i}`, x1: x(r), x2: x(r), y1: top - 2, y2: top, stroke: 'currentColor', opacity: 0.4 })) : []),
     jsx('path', { d: line, fill: 'none', stroke: col, strokeWidth: 1.3, strokeLinecap: 'round', strokeLinejoin: 'round', opacity: f.verdict === 'learning' ? 0.45 : 1 })
   ] })

@@ -18,7 +18,7 @@ try {
  await page.goto(`http://127.0.0.1:${server.address().port}`)
  // Status bar: GPT has a forecast (sparkline + verdict); Claude (no forecast) keeps its account dots.
  const gptChip=page.locator('.hermes-au-chip[data-provider="openai-codex"]'); await gptChip.waitFor()
- assert.equal(await gptChip.locator('svg').count(),1); assert.equal(await gptChip.locator('.hermes-au-vb').textContent(),'dry in 17h')
+ assert.equal(await gptChip.locator('svg').count(),1); assert.equal(await gptChip.locator('svg rect').count(),0,'no dry-spell strip in the bar'); assert.equal(await gptChip.locator('.hermes-au-vb').textContent(),'17h')
  assert.equal(await page.locator('.hermes-au-chip[data-provider="anthropic"] svg').count(),0); evidence.push('Bar: sparkline + verdict with a forecast, dots without')
  // The verdict stays on one line even when the status bar is squeezed.
  await page.evaluate(()=>{document.querySelector('.hermes-au-chip').parentElement.style.width='120px'})
