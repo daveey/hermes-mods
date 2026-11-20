@@ -2,11 +2,11 @@
 // Chip: 34 px token sparkline + "56k tok/m · 1.5 cards/m". Popover: three mirrored stacked charts
 // (inflow above the line, outflow below), stacked by gateway. Data: GET /v1/series?range=… on the
 // local gateway (plugins/throughput/series.py): per-bucket counts, null = gateway doesn't report.
-// Throttle: GET/PUT /v1/throttle (plugins/throughput/throttle.py). A slider under Tokens sets a 0-100 % level;
-// its cap is the red line on the Tokens chart, and each subscription pool's runway is listed beside it.
-// Budget: GET /v1/budget (plugins/throughput/budget_view.py). Under Tokens, one chart per budget pool plus a total:
-// the spend measured over 7 days left of "now", core's capacity steps and planned spend right of it, with resets,
-// account changes and the burst marked. PUT/DELETE /v1/throttle/burst starts or ends a burst (budget mode only).
+// Token spend (top of the popover): GET/PUT /v1/throttle (plugins/throughput/throttle.py): the fleet's rate against
+// what limits it, Budget / Limit / No limit, a raise (PUT/DELETE /v1/throttle/burst, budget only), one row per
+// subscription and this gateway's open slots; the limit is the red line on the Tokens chart.
+// Forecast (folded): GET /v1/budget (plugins/throughput/budget_view.py): per pool and in total, 7 days used left of
+// "now", the planner's use and what is available right of it, refills, account changes and raises marked.
 import { useQuery, useQueryClient, STATUSBAR_AREAS, PALETTE_AREA, Popover, PopoverTrigger, PopoverContent } from '@hermes/plugin-sdk'
 import { createElement as h, useState, useEffect, useMemo, useRef } from 'react'
 
@@ -219,11 +219,13 @@ export function spendHeadline(throttle, unit) {
   return { mode, rate, cap, limit, by, state, fill }
 }
 
-export const STATE_LABEL = { unlimited: 'not limited', under: 'under the limit', at: 'at the limit: calls wait their turn', holding: 'nothing runs' }
+export const POOL_STATE_LABEL = { ok: 'ok', tight: 'tight', paced: 'paced', held: 'starts held', used: 'used up' }
+export const STATE_LABEL = { unlimited: 'not limited', under: 'under the limit', at: 'at the limit', holding: 'nothing runs' }
 
 // One subscription row: accounts still usable, how long what is left lasts at this pace, the next refill, a state.
-// `state`: ok | tight (runs out before the next refill) | paced (quota pacing is starting fewer cards) | out (no usable
-// account, or quota pacing holds every start).
+// `state`: ok | tight (runs out before the next refill) | paced (quota pacing starts fewer cards) | held (quota pacing
+// holds card starts; chats still run) | used (every account has used its week). The pool's runway is scaled by the
+// fleet-wide limit/rate ratio, an estimate: the limit is not split per pool.
 export function providerRow(pool, throttle, now = Date.now() / 1000) {
   const name = POOL_NAMES[pool.provider] || pool.provider
   const n = pool.accounts ?? null
@@ -234,11 +236,12 @@ export function providerRow(pool, throttle, now = Date.now() / 1000) {
   const lasts = pool.runway_s == null ? 'not in use' : scale === 0 ? 'paused' : `lasts ${fmtDuration(runway)} at ${scale < 1 ? 'the limit' : 'this pace'}`
   const refill = pool.next_reset_at ? `next refill ${timeLabel(pool.next_reset_at, '7d')}` : null
   let state = 'ok'
-  if (usable === 0 || pool.pacing === 'held') state = 'out'
+  if (usable === 0) state = 'used'
+  else if (pool.pacing === 'held') state = 'held'
   else if (runway != null && pool.next_reset_at && runway < pool.next_reset_at - now) state = 'tight'
   else if (pool.pacing === 'paced') state = 'paced'
-  const why = state === 'out'
-    ? (usable === 0 ? 'every account is at its weekly reserve' : `quota pacing holds card starts${pool.pacing_until ? ` until ${timeLabel(pool.pacing_until, '7d')}` : ''}`)
+  const why = state === 'used' ? 'every account has used its week'
+    : state === 'held' ? `quota pacing holds card starts${pool.pacing_until ? ` until ${timeLabel(pool.pacing_until, '7d')}` : ''}; chats still run`
     : state === 'tight' ? 'runs out before the next refill' : state === 'paced' ? 'quota pacing starts fewer cards' : null
   return { provider: pool.provider, name, accounts, lasts, refill, state, why }
 }
@@ -582,21 +585,29 @@ export function ForecastSection({ budget, throttle, pick, now = Date.now() / 100
 
 const MODES = [['budget', 'Budget'], ['limit', 'Limit'], ['no_limit', 'No limit']]
 
-// The limit control: Budget (the subscription budget alone), Limit (a number, thousands of tokens per minute; the
-// lower of it and the budget applies) or No limit (nothing limits, the budget included). One request per choice.
+// What a person chose (the server's `chosen`), whatever caps the fleet now; an older payload: read from limitMode.
+export function chosenMode(throttle) {
+  if (throttle?.chosen) return throttle.chosen
+  const m = limitMode(throttle)
+  return m === 'no_limit' || m === 'none' ? 'no_limit' : m === 'budget' ? 'budget' : 'limit'
+}
+
+// The limit control: Budget (the subscription budget alone), Limit (a number in thousands of tokens per minute, set
+// with Enter or Set; the lower of it and the budget applies) or No limit (nothing limits, the budget included). The
+// buttons show the person's choice; a PUT is sent only when it changes. Leaving the field or picking another mode
+// drops an unsaved number.
 export function LimitControl({ throttle, onSet }) {
-  const mode = limitMode(throttle)
-  const current = mode === 'no_limit' || mode === 'none' ? 'no_limit' : mode === 'budget' ? 'budget' : 'limit'
+  const current = chosenMode(throttle)
   const [pick, setPick] = useState(null)
   const [draft, setDraft] = useState(null)
   const [bad, setBad] = useState(false)
   const shown = pick ?? current
-  const userPS = typeof throttle?.user_cap_per_s === 'number' ? throttle.user_cap_per_s : mode === 'hold' ? 0 : null
-  const value = draft ?? (userPS == null ? '' : String(Math.round((userPS * 60) / 1000)))
+  const userPS = typeof throttle?.user_cap_per_s === 'number' ? throttle.user_cap_per_s : limitMode(throttle) === 'hold' ? 0 : null
+  const value = draft ?? (current === 'limit' && userPS != null ? String(Math.round((userPS * 60) / 1000)) : '')
   const choose = (m) => {
-    setBad(false)
-    if (m === 'limit') { setPick('limit'); return }
-    setPick(null); setDraft(null)
+    setBad(false); setDraft(null)
+    if (m === 'limit') { setPick(current === 'limit' ? null : 'limit'); return }
+    setPick(null)
     if (m !== current) onSet?.(m === 'budget' ? { cap_per_min: null } : { no_limit: true })
   }
   const commit = () => {
@@ -614,11 +625,13 @@ export function LimitControl({ throttle, onSet }) {
       }, label))),
     shown === 'limit' ? h('label', { className: 'hermes-tp-limit' },
       h('input', {
-        type: 'text', inputMode: 'decimal', size: 6, value, placeholder: 'e.g. 150', disabled: !onSet,
+        type: 'text', inputMode: 'decimal', size: 6, value,
+        placeholder: current === 'limit' && userPS == null ? 'above budget' : 'e.g. 150', disabled: !onSet,
         'aria-label': 'Limit, thousands of tokens per minute', 'aria-invalid': bad ? 'true' : undefined,
-        onChange: (e) => setDraft(e.target.value), onBlur: commit,
+        onChange: (e) => setDraft(e.target.value),
         onKeyDown: (e) => { if (e.key === 'Enter') commit(); if (e.key === 'Escape') { setDraft(null); setPick(null); setBad(false) } }
-      }), 'k tok/min') : null,
+      }), 'k tok/min',
+      draft != null ? h('button', { type: 'button', className: 'hermes-tp-btn', onClick: commit }, 'Set') : null) : null,
     bad ? h('span', { className: 'hermes-tp-warn', role: 'alert' }, 'Type thousands of tokens per minute, e.g. 150 or 1.5m') : null,
     h('span', { className: 'hermes-tp-lbl' },
       shown === 'budget' ? 'the subscription budget decides' : shown === 'no_limit' ? 'nothing is limited, the budget included'
@@ -641,7 +654,7 @@ export function SpendSection({ throttle, onSet, error, unit, budget, pick, setPi
       h('span', { className: `hermes-tp-badge is-${hd.state}`, 'data-spend-state': hd.state }, STATE_LABEL[hd.state])),
     hd.fill == null ? null : h('div', { className: 'hermes-tp-meter', role: 'meter', 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': Math.round(hd.fill * 100), 'aria-label': 'Spend against the limit' },
       h('span', { style: { width: `${(hd.fill * 100).toFixed(1)}%` } })),
-    h(LimitControl, { key: limitMode(throttle) + String(throttle.user_cap_per_s ?? ''), throttle, onSet }),
+    h(LimitControl, { key: chosenMode(throttle), throttle, onSet }),
     error ? h('div', { className: 'hermes-tp-note', role: 'alert' }, `Limit not saved: ${error}`) : null,
     onBurst && (hd.mode === 'budget' || hd.mode === 'limit') ? h(BurstControl, { throttle, budget, pick, setPick, onStart: onBurst, onEnd: onEndBurst, error: burstError, now }) : null,
     (throttle.pools || []).length ? h('table', { className: 'hermes-tp-subs', 'aria-label': 'Subscriptions' },
@@ -652,7 +665,7 @@ export function SpendSection({ throttle, onSet, error, unit, budget, pick, setPi
           h('td', null, r.accounts ?? '–'),
           h('td', null, r.lasts),
           h('td', null, r.refill ?? ''),
-          h('td', null, h('span', { className: `hermes-tp-badge is-${r.state}`, title: r.why || undefined }, r.state === 'out' ? 'unavailable' : r.state)))
+          h('td', null, h('span', { className: `hermes-tp-badge is-${r.state}`, title: r.why || undefined }, POOL_STATE_LABEL[r.state])))
       }))) : null,
     h('div', { className: 'hermes-tp-lbl hermes-tp-slots' },
       [slots, scopeText(throttle)].filter(Boolean).join(' · ')))
@@ -887,7 +900,6 @@ export const CSS = `
 .hermes-tp-tiprow.is-missing{color:var(--ui-text-tertiary);align-items:flex-start}
 .hermes-tp-num{margin-left:auto;padding-left:12px;font-variant-numeric:tabular-nums}
 .hermes-tp-capl{fill:#ef4444}
-.hermes-tp-throttle{display:flex;flex-direction:column;gap:2px;margin-top:6px;font-size:11px}
 .hermes-tp-spend{display:flex;flex-direction:column;gap:6px;padding:8px 10px;margin:6px 0 10px;border:1px solid var(--ui-stroke-secondary);border-radius:8px;font-size:11px}
 .hermes-tp-spend .hermes-tp-chead{flex-wrap:wrap}
 .hermes-tp-meter{height:6px;border-radius:3px;background:var(--ui-stroke-secondary,#2a2f39);overflow:hidden}
@@ -896,7 +908,7 @@ export const CSS = `
 .hermes-tp-badge{padding:0 6px;border-radius:9px;font-size:10.5px;white-space:nowrap;border:1px solid currentColor}
 .hermes-tp-badge.is-under,.hermes-tp-badge.is-ok,.hermes-tp-badge.is-unlimited{color:var(--ui-green,#1f8a65)}
 .hermes-tp-badge.is-at,.hermes-tp-badge.is-tight,.hermes-tp-badge.is-paced{color:var(--ui-orange,#c2410c)}
-.hermes-tp-badge.is-holding,.hermes-tp-badge.is-out{color:var(--ui-red,#dc3545)}
+.hermes-tp-badge.is-holding,.hermes-tp-badge.is-used,.hermes-tp-badge.is-held{color:var(--ui-red,#dc3545)}
 .hermes-tp-limit{display:inline-flex;align-items:center;gap:4px}
 .hermes-tp-limit input{width:64px;font:inherit;padding:1px 4px;border:1px solid var(--ui-stroke-secondary);border-radius:4px;background:transparent;color:inherit}
 .hermes-tp-limit input[aria-invalid=true]{border-color:var(--ui-red,#dc3545)}
@@ -908,7 +920,6 @@ export const CSS = `
 .hermes-tp-budget[open]>summary::before{content:'▾'}
 .hermes-tp-budget>summary h3{margin:0}
 .hermes-tp-trow{display:flex;align-items:center;gap:8px}
-.hermes-tp-trow input[type=range]{width:160px;accent-color:#ef4444}
 .hermes-tp-ttext{font-variant-numeric:tabular-nums}
 .hermes-tp-runway{color:var(--ui-text-secondary);font-variant-numeric:tabular-nums}
 .hermes-tp-budget{margin-top:10px;display:flex;flex-direction:column;gap:4px}

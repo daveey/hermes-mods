@@ -457,9 +457,11 @@ test('spend maths: what limits the fleet, the headline, subscriptions, slots, th
   assert.equal(P.providerRow(gpt, throttle({ cap_per_s: null }), END).state, 'tight')  // 20.3 h before the refill in 24 h
   assert.equal(P.providerRow(gpt, throttle({ cap_per_s: 0 }), END).lasts, 'paused')
   const c = P.providerRow(claude, throttle(), END)
-  assert.deepEqual([c.accounts, c.lasts, c.refill, c.state, c.why], ['0 of 2 accounts usable', 'not in use', null, 'out', 'every account is at its weekly reserve'])
+  assert.deepEqual([c.accounts, c.lasts, c.refill, c.state, c.why], ['0 of 2 accounts usable', 'not in use', null, 'used', 'every account has used its week'])
   assert.equal(P.providerRow({ ...gpt, pacing: 'paced' }, throttle(), END).state, 'paced')
-  assert.match(P.providerRow({ ...gpt, pacing: 'held', pacing_until: END + 600 }, throttle(), END).why, /^quota pacing holds card starts until /)
+  const held = P.providerRow({ ...gpt, pacing: 'held', pacing_until: END + 600 }, throttle(), END)
+  assert.equal(held.state, 'held')
+  assert.match(held.why, /^quota pacing holds card starts until .*; chats still run$/)
   assert.equal(P.providerRow({ provider: 'xai-oauth', runway_s: null }, throttle(), END).accounts, null)
   // this gateway's slots
   assert.equal(P.slotLine(throttle()), null)
@@ -502,15 +504,17 @@ test('panel: Token spend on top (rate, limit, state, meter, subscriptions, slots
     assert.equal(spend().dataset.state, 'at')
     assert.equal(spend().querySelector('[data-spend-rate]').textContent, '600')
     assert.equal(spend().querySelector('[data-limit]').textContent, 'limit 300 tok/m · yours')
-    assert.equal(spend().querySelector('[data-spend-state]').textContent, 'at the limit: calls wait their turn')
+    assert.equal(spend().querySelector('[data-spend-state]').textContent, 'at the limit')
     assert.equal(spend().querySelector('[role=meter]').getAttribute('aria-valuenow'), '100')
     const row = (p) => [...spend().querySelectorAll(`tr[data-pool="${p}"] > *`)].map((e) => e.textContent)
     assert.deepEqual(row('openai-codex').slice(0, 3), ['GPT', '2 of 3 accounts usable', 'lasts 40.7 h at the limit'])
-    assert.equal(row('anthropic')[4], 'unavailable')
+    assert.equal(row('anthropic')[4], 'used up')
     assert.match(spend().querySelector('.hermes-tp-slots').textContent, /^4 cards running · 6 slots open here \(3\.0k tok\/min each\) · applies to hub only$/)
     assert.equal(document.querySelector('input[type=range]'), null, 'no percent slider')
     assert.equal(spend().querySelector('[data-mode="limit"]').getAttribute('aria-pressed'), 'true')
     assert.equal(spend().querySelector('input[aria-label^="Limit"]').value, '0')  // 5 tok/s = 0.3k/min, rounded
+    assert.equal(P.chosenMode(throttle({ chosen: 'no_limit' })), 'no_limit')
+    assert.equal(P.chosenMode(throttle({ limit_mode: 'none' })), 'no_limit')  // an older payload
     const [line] = capLines('tokens')
     assert.equal(line.dataset.cap, '300')
     assert.equal(Number(line.getAttribute('y1')), 37)  // H 84, baseline 70, 300/m half of the 600/m peak
@@ -549,9 +553,10 @@ test('panel: a limit above the chart pins to the top with an arrow; no limit dra
   }
 })
 
-test('limit control: Budget, Limit (Enter sets thousands/min once; junk refused) and No limit, one PUT each', async () => {
+test('limit control: buttons follow the choice; Limit sets on Enter/Set only; one PUT per change', async () => {
   P.saveView(V())
-  const state = { value: throttle({ mode: 'auto', limit_mode: 'budget', percent: 0, cap_per_s: 20, budget: { state: 'fresh', budget_per_s: 20 } }), fail: false }
+  const budgetT = () => throttle({ mode: 'auto', limit_mode: 'budget', chosen: 'budget', percent: 0, cap_per_s: 20, budget: { state: 'fresh', budget_per_s: 20 } })
+  const state = { value: budgetT(), fail: false }
   const calls = []
   const ctx = {
     calls,
@@ -561,9 +566,11 @@ test('limit control: Budget, Limit (Enter sets thousands/min once; junk refused)
       if (opts?.method === 'PUT') {
         if (state.fail) throw Error('HTTP 400')
         const b = opts.body
-        state.value = b.no_limit ? throttle({ limit_mode: 'no_limit', cap_per_s: null, percent: 0.001 })
-          : b.cap_per_min == null ? throttle({ mode: 'auto', limit_mode: 'budget', percent: 0, cap_per_s: 20, budget: { state: 'fresh', budget_per_s: 20 } })
-            : throttle({ limit_mode: 'limit', cap_per_s: b.cap_per_min / 60, user_cap_per_s: b.cap_per_min / 60 })
+        state.value = b.no_limit ? throttle({ limit_mode: 'no_limit', chosen: 'no_limit', cap_per_s: null, percent: 0.001 })
+          : b.cap_per_min == null ? budgetT()
+            : b.cap_per_min / 60 >= 20  // above the 20 tok/s budget: the budget caps, the choice stays "limit"
+              ? throttle({ mode: 'auto', limit_mode: 'budget', chosen: 'limit', percent: 0.001, cap_per_s: 20, user_cap_per_s: null, budget: { state: 'fresh', budget_per_s: 20 } })
+              : throttle({ limit_mode: 'limit', chosen: 'limit', cap_per_s: b.cap_per_min / 60, user_cap_per_s: b.cap_per_min / 60 })
       }
       return state.value
     }
@@ -575,39 +582,51 @@ test('limit control: Budget, Limit (Enter sets thousands/min once; junk refused)
     await React.act(async () => el.dispatchEvent(new window.Event('input', { bubbles: true })))
   }
   const enter = async (el) => React.act(async () => el.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true })))
+  const mode = (m) => spend().querySelector(`[data-mode="${m}"]`)
+  const field = () => spend().querySelector('input[aria-label^="Limit"]')
   try {
     await ui.click(button('Show throughput'))
-    assert.equal(spend().querySelector('[data-mode="budget"]').getAttribute('aria-pressed'), 'true')
-    assert.equal(spend().querySelector('[data-slot="burst"]') != null, true, 'a budget can be raised for a while')
-    await ui.click(spend().querySelector('[data-mode="budget"]'))
-    assert.deepEqual(puts(), [], 'choosing what is in force sends nothing')
-    await ui.click(spend().querySelector('[data-mode="limit"]'))
-    const field = () => spend().querySelector('input[aria-label^="Limit"]')
-    assert.ok(field(), 'Limit shows the field first')
-    assert.deepEqual(puts(), [])
+    assert.equal(mode('budget').getAttribute('aria-pressed'), 'true')
+    assert.ok(spend().querySelector('[data-slot="burst"]'), 'a budget can be raised for a while')
+    await ui.click(mode('budget'))
+    assert.deepEqual(puts(), [], 'choosing what is chosen sends nothing')
+    // type a number, then change your mind: leaving the field or picking Budget drops it, nothing is sent
+    await ui.click(mode('limit'))
+    await setText(field(), '150')
+    await ui.event(field(), 'blur')
+    await ui.click(mode('budget'))
+    assert.deepEqual(puts(), [], 'an unsaved number is never sent')
+    assert.equal(mode('budget').getAttribute('aria-pressed'), 'true')
+    // junk is refused; Enter sets
+    await ui.click(mode('limit'))
     await setText(field(), 'lots')
     await enter(field())
     assert.deepEqual(puts(), [])
     assert.match(spend().querySelector('[role=alert]').textContent, /thousands of tokens per minute/)
-    await setText(field(), '150')
+    await setText(field(), '0.6')
+    await ui.click(button('Set'))
+    await ui.flush()
+    assert.deepEqual(puts(), [{ cap_per_min: 600 }])
+    assert.equal(spend().querySelector('[data-limit]').textContent, 'limit 600 tok/m · yours')
+    assert.equal(field().value, '1')
+    // a limit above the budget: the budget caps, but the buttons still say Limit and Budget is one click away
+    await setText(field(), '5')
     await enter(field())
     await ui.flush()
-    assert.deepEqual(puts(), [{ cap_per_min: 150000 }])
-    assert.equal(spend().querySelector('[data-limit]').textContent, 'limit 150k tok/m · yours')
-    assert.equal(field().value, '150')
-    await setText(field(), '150')
-    await enter(field())
-    assert.equal(puts().length, 1, 'the limit in force: no request')
-    await ui.click(spend().querySelector('[data-mode="no_limit"]'))
-    await ui.flush()
-    assert.deepEqual(puts()[1], { no_limit: true })
-    assert.equal(spend().dataset.state, 'unlimited')
-    assert.equal(spend().querySelector('[data-slot="burst"]'), null, 'nothing to raise without a limit')
-    await ui.click(spend().querySelector('[data-mode="budget"]'))
+    assert.deepEqual(puts()[1], { cap_per_min: 5000 })
+    assert.equal(mode('limit').getAttribute('aria-pressed'), 'true')
+    assert.equal(spend().querySelector('[data-limit]').textContent, 'limit 1.2k tok/m · subscription budget')
+    assert.equal(field().placeholder, 'above budget')
+    await ui.click(mode('budget'))
     await ui.flush()
     assert.deepEqual(puts()[2], { cap_per_min: null })
+    await ui.click(mode('no_limit'))
+    await ui.flush()
+    assert.deepEqual(puts()[3], { no_limit: true })
+    assert.equal(spend().dataset.state, 'unlimited')
+    assert.equal(spend().querySelector('[data-slot="burst"]'), null, 'nothing to raise without a limit')
     state.fail = true
-    await ui.click(spend().querySelector('[data-mode="no_limit"]'))
+    await ui.click(mode('budget'))
     await ui.flush()
     assert.match(spend().querySelector('[role=alert]').textContent, /^Limit not saved: HTTP 400/)
   } finally {
