@@ -472,35 +472,67 @@ export function fmtTokens(n) {
 export function slotLimit(m, row) {
   if (!row || typeof row.allowed !== 'number' || typeof m.slots !== 'number') return null
   const allowed = Math.max(0, Math.min(m.slots, Math.floor(row.allowed)))
-  const why = `token throttle allows ${allowed} of ${m.slots} slots here: ${fmtTokens((row.cap_per_s || 0) * 60)} tok/min share ÷ ${fmtTokens((row.tokens_per_slot_per_s || 0) * 60)} per slot`
+  const why = `token throttle allows ${allowed} of ${m.slots} slots here: ${fmtTokens((row.cap_per_s || 0) * 60)} tok/min share ÷ ${fmtTokens((row.tokens_per_slot_per_s || 0) * 60)} per slot${row.enforced === false ? ' (estimate; that gateway enforces its own count)' : ''}`
   return { allowed, throttled: Math.max(0, m.slots - allowed), why }
 }
 
+// The cap line: what caps the fleet (a person's cap, the subscription budget, or nothing), the fleet rate, this
+// gateway's open slots, pacing. `user_cap_per_s` and `slot_gate` come from a throughput plugin with the slot gate.
 export function throttleLine(throttle) {
   if (!throttle) return ''
-  const p = Math.round(throttle.percent ?? 0)
-  const cap = typeof throttle.cap_per_s === 'number' ? ` · cap ${fmtTokens(throttle.cap_per_s * 60)} tok/min` : ''
+  const capPS = typeof throttle.cap_per_s === 'number' ? throttle.cap_per_s : null
+  const userPS = typeof throttle.user_cap_per_s === 'number' ? throttle.user_cap_per_s : null
+  const budgetPS = typeof throttle.budget?.budget_per_s === 'number' ? throttle.budget.budget_per_s : null
+  const by = capPS == null ? '' : userPS != null && userPS <= capPS + 1e-6 ? ' (yours)' : budgetPS != null ? ' (budget)' : ''
+  const head = capPS == null ? 'No token cap' : capPS <= 0 ? 'Cap 0 · holding every call' : `Cap ${fmtTokens(capPS * 60)} tok/min${by}`
+  const budget = budgetPS != null && capPS != null && capPS > 0 && Math.abs(budgetPS - capPS) > 1e-6 ? ` · budget ${fmtTokens(budgetPS * 60)}` : ''
   const rate = typeof throttle.rate_per_s === 'number' ? ` · fleet ${fmtTokens(throttle.rate_per_s * 60)} tok/min` : ''
+  const g = throttle.slot_gate
+  const gate = g && typeof g.allowed === 'number'
+    ? ` · here ${typeof g.running === 'number' ? g.running : '?'}/${g.allowed} slots${typeof g.per_slot_per_s === 'number' ? ` at ${fmtTokens(g.per_slot_per_s * 60)}/slot` : ' (unmeasured)'}` : ''
   const paced = (throttle.pools || []).filter((x) => x.pacing === 'paced' || x.pacing === 'held')
     .map((x) => `${x.provider} ${x.pacing}${x.pacing === 'paced' && typeof x.pacing_factor === 'number' ? ` ${Math.round(x.pacing_factor * 100)}%` : ''}`)
   const held = throttle.slots?.pacing?.held_starts
   const holds = typeof held === 'number' && held > 0
     ? ` · ${held} card start${held === 1 ? '' : 's'} held by pacing in the last ${Math.round((throttle.slots.pacing.window_s || 300) / 60)} min` : ''
-  return `Throttle ${p === 0 ? 'off' : `${p}%`}${p > 0 && p < 100 ? cap : p >= 100 ? ' · holding every call' : ''}${rate}${paced.length ? ` · pacing: ${paced.join(', ')}` : ''}${holds}`
+  return `${head}${budget}${rate}${gate}${paced.length ? ` · pacing: ${paced.join(', ')}` : ''}${holds}`
 }
 
+// Thousands of tokens per minute typed in the cap field: '150' or '150k' = 150k, '1.5m' = 1.5M; '' = no cap.
+export function parseCapK(raw) {
+  const s = String(raw ?? '').trim().toLowerCase()
+  if (s === '' || s === 'off' || s === 'none') return null
+  const m = s.match(/^([0-9]+(?:\.[0-9]+)?)\s*([km]?)$/)
+  if (!m) return undefined
+  return Number(m[1]) * (m[2] === 'm' ? 1e6 : 1e3)
+}
+
+// A person's token cap for the whole fleet, in thousands of tokens per minute. Enter (or leaving the field) sets
+// it; "No cap" removes it (the subscription budget alone then caps). onThrottle receives tokens/min or null.
 export function ThrottleBar({ throttle, onThrottle, error }) {
   const [draft, setDraft] = useState(null)
+  const [bad, setBad] = useState(false)
   if (!throttle) return null
-  const percent = draft == null ? Math.round(throttle.percent ?? 0) : draft
-  const commit = () => { const p = draft; setDraft(null); if (p != null && p !== Math.round(throttle.percent ?? 0)) onThrottle?.(p) }
+  const userPS = typeof throttle.user_cap_per_s === 'number' ? throttle.user_cap_per_s : null
+  const shown = userPS == null ? '' : String(Math.round(userPS * 60 / 1000))
+  const commit = () => {
+    if (draft == null) return
+    const v = parseCapK(draft)
+    if (v === undefined) { setBad(true); return }
+    setBad(false); setDraft(null)
+    const same = v == null ? userPS == null : userPS != null && Math.abs(userPS * 60 - v) < 500
+    if (!same) onThrottle?.(v)
+  }
   return h('div', { className: 'hermes-fleet-throttle', 'data-slot': 'runners-throttle' },
-    h('input', {
-      type: 'range', min: 0, max: 100, step: 1, value: percent, disabled: !onThrottle, 'aria-label': 'Token throttle percent',
-      onChange: (e) => setDraft(Number(e.target.value)), onMouseUp: commit, onTouchEnd: commit, onKeyUp: commit, onBlur: commit
-    }),
-    h('span', { className: 'hermes-fleet-throttle-text', 'data-throttle': String(percent) },
-      draft == null ? throttleLine(throttle) : `Throttle ${draft}% (release to set)`),
+    h('label', { className: 'hermes-fleet-throttle-cap' }, 'Token cap ',
+      h('input', {
+        type: 'text', inputMode: 'decimal', size: 6, placeholder: 'none', value: draft ?? shown, disabled: !onThrottle,
+        'aria-label': 'Fleet token cap, thousands of tokens per minute', 'aria-invalid': bad ? 'true' : undefined,
+        onChange: (e) => setDraft(e.target.value), onBlur: commit,
+        onKeyDown: (e) => { if (e.key === 'Enter') commit(); if (e.key === 'Escape') { setDraft(null); setBad(false) } }
+      }), 'k tok/min'),
+    h('button', { type: 'button', className: 'hermes-fleet-throttle-off', disabled: !onThrottle || userPS == null, onClick: () => { setDraft(null); setBad(false); onThrottle?.(null) } }, 'No cap'),
+    h('span', { className: 'hermes-fleet-throttle-text' }, bad ? 'Type thousands of tokens per minute, e.g. 150 or 1.5m' : throttleLine(throttle)),
     error ? h('span', { className: 'hermes-fleet-warning' }, `⚠ ${text(error)}`) : null)
 }
 
@@ -579,6 +611,13 @@ function MeterCell({ k, v }) {
     h('span', { className: 'hermes-fleet-num' }, value))
 }
 
+// A held machine's word: the autoscaler holds a new machine while it enrolls ("worker-scaler: enrolling <id>: ..."),
+// which is not a drain; any other hold is.
+export function holdWord(m) {
+  return m?.state === 'draining' && typeof m.hold_reason === 'string' && /^worker-scaler: enrolling\b/.test(m.hold_reason)
+    ? 'enrolling' : m?.state
+}
+
 function GatewayRow({ m, now, limit }) {
   const lim = slotLimit(m, limit)
   const over = (i) => !!lim && i >= lim.allowed
@@ -587,11 +626,12 @@ function GatewayRow({ m, now, limit }) {
   const v = loadParts(m.load, now)
   // A held machine that is still up or still holds a card. Once it is off ('stopped') it has no row: StoppedNote.
   const held = m.state === 'draining'
-  const holdTail = 'finishes running cards, takes no new ones'
+  const word = holdWord(m)
+  const holdTail = word === 'enrolling' ? 'a new machine, takes cards once it passes its checks' : 'finishes running cards, takes no new ones'
   const drainNote = held
     ? m.hold_reason === undefined
-      ? `${m.state}: reason unavailable (dashboard older than hold metadata); ${holdTail}`
-      : `${m.state}: ${m.hold_reason ? text(m.hold_reason) : 'no reason recorded'} (held by ${m.hold_owner ? text(m.hold_owner) : m.hold_by ? text(m.hold_by) : 'unknown'}, ${typeof m.hold_at === 'number' ? ago(now - m.hold_at) : 'time unknown'}); ${holdTail}`
+      ? `${word}: reason unavailable (dashboard older than hold metadata); ${holdTail}`
+      : `${word}: ${m.hold_reason ? text(m.hold_reason) : 'no reason recorded'} (held by ${m.hold_owner ? text(m.hold_owner) : m.hold_by ? text(m.hold_by) : 'unknown'}, ${typeof m.hold_at === 'number' ? ago(now - m.hold_at) : 'time unknown'}); ${holdTail}`
     : null
   const meta = [
     m.pinned_only ? 'pinned only' : null,
@@ -604,7 +644,7 @@ function GatewayRow({ m, now, limit }) {
   // (native title tooltips do not show inside the Desktop popover).
   return h('div', { className: `hermes-fleet-row is-${m.state}`, 'data-machine': m.name },
     h('span', { className: 'hermes-fleet-name' }, h('span', { className: 'hermes-fleet-machine-name' }, text(m.name)),
-      drainNote ? h('span', { className: 'hermes-fleet-drain-label', title: drainNote }, m.state) : null),
+      drainNote ? h('span', { className: 'hermes-fleet-drain-label', title: drainNote }, word) : null),
     h('span', { className: 'hermes-fleet-slots' },
       ...m.running.map((r, i) => h(Slot, {
         key: `${r.board}/${r.task}`, state: m.state === 'lost' ? 'lost' : 'busy', throttled: over(i),
@@ -996,9 +1036,9 @@ export function Runners({ ctx }) {
     staleTime: 5000
   })
   const throttle = tq.data && typeof tq.data === 'object' && 'percent' in tq.data ? tq.data : null
-  const onThrottle = async (percent) => {
+  const onThrottle = async (capPerMin) => {
     try {
-      await bridge(THROTTLE_PATH, { method: 'PUT', body: { percent } })
+      await bridge(THROTTLE_PATH, { method: 'PUT', body: { cap_per_min: capPerMin } })
       setThrottleError(null)
     } catch (e) {
       setThrottleError(`throttle not set: ${e?.message || e}`)
