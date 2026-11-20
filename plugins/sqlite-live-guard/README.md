@@ -22,7 +22,11 @@ Local directory targets retain the existing `_dir_like` policy; remote directory
 targets require explicit directory syntax or a recognized home root, never a local
 stat. Nesting and possible-value expansion are bounded, with one aggregate work
 budget shared by all variants and nested scripts; exceeding a bound or failing to
-load the analyzer refuses execution. Remote analysis performs
+load the analyzer refuses execution. The aggregate budget is 32768 units: it counts
+source characters (including data/heredocs), expanded characters **before** result
+allocation, and per-statement/variant work. This deliberately fails closed on large
+benign commands too; it is not a maximum accepted input size. Nesting is limited to
+eight child boundaries and possible-value products to 256. Remote analysis performs
 no local SQLite version probe, directory stat or quarantine-directory inspection.
 A detected raw replacement is refused in favor of the existing `swap_db.py`
 preservation/ownership policy; this pass never installs a database itself.

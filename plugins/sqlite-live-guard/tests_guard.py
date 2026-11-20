@@ -1086,6 +1086,39 @@ def test_review_aggregate_work_budget():
     assert result.returncode == 2 and "bounded" in result.stderr, result.stderr
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="fixture-only RLIMIT_AS is Linux-specific")
+@pytest.mark.parametrize("tail", ["echo benign", "ssh remote 'H=/home/u/.hermes; mv x $H/state.db'"])
+def test_review_expansion_allocation_real_hook(tmp_path, tail):
+    import json
+    import resource
+
+    # The command is only classified, never executed. Before expansion accounting,
+    # 294-ish input bytes could request a 256 MiB string and crash fail-open (rc1).
+    code = "A=" + "x" * 64 + ";" + "A=$A$A;" * 22 + tail
+
+    def limit_fixture_memory():
+        limit = 256 * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+
+    result = subprocess.run(
+        [sys.executable, str(HERE / "claude_hook.py")],
+        input=json.dumps({"tool_input": {"command": code}, "cwd": str(tmp_path)}),
+        capture_output=True, text=True, timeout=5, preexec_fn=limit_fixture_memory,
+    )
+    assert result.returncode == 2 and "bounded" in result.stderr, result.stderr
+    assert "MemoryError" not in result.stderr
+
+
+@pytest.mark.parametrize("tail", ["echo $A$A$A$A", "bash <<EOF\necho $A$A$A$A\nEOF"])
+def test_review_expanded_word_and_heredoc_budget(tail):
+    code = "A=" + "x" * 64 + ";" + "A=$A$A;" * 7 + tail
+    assert "bounded" in (plugin.guard.check_shell(code) or "")
+
+
+def test_review_small_assignment_expansion_control():
+    assert plugin.guard.check_shell("A=abc; A=$A$A; echo $A") is None
+
+
 # A recovery built from an earlier cut must go through swap_db's canonical
 # preservation check. A remote shell and path aliases must not hide a raw swap.
 REMOTE_ROLLBACK_SWAP = (
