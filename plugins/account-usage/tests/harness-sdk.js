@@ -15,6 +15,8 @@ host.request=async (...args)=>{
   if(f.reviveVanished) payload.providers[1].usage.accounts.push({id:'inventory-vanish',label:'Vanishing account',state:'ready',windows:[]})
   else if(!f.vanished) payload.providers[1].usage.accounts.push({id:'inventory-vanish',label:'Vanishing account',state:'limited',limit_kind:'cooldown',reason:'auth',cooldown_until:'2099-01-01T00:00:00Z',resets_at:'2099-01-01T00:00:00Z',windows:[]})
  }
+ // What an unbound login beside a surviving manual row produces: a second row, the dead one unchanged.
+ if(f.duplicate && payload?.providers) payload.providers[1].usage.accounts.push({id:'inventory-dead-duplicate',label:'Dead account',state:'ready',windows:[]})
  if(payload?.providers){
   for(const p of payload.providers) for(const a of p.usage?.accounts||[]){
    if((a.id==='inventory-dead'&&f.reviveDead)||(a.id==='inventory-expired'&&(f.reviveDead||f.reviveExpired))){ a.state='ready'; a.reason=null; a.limit_kind=null }

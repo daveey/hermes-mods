@@ -329,6 +329,16 @@ export function reconnectOutcome(r) {
   return 'transient'
 }
 
+// Which stored row a new sign-in must repair, as the backend named it in a /reconnect reply:
+// {mode:'target', credentialId} | {mode:'singleton'} | {mode:'unsupported'}. A reply without a
+// usable answer (an older backend) is 'unknown': the panel then starts no sign-in at all.
+export function signInRoute(r) {
+  const s = r && r.sign_in
+  if (s && s.mode === 'target' && typeof s.credential_id === 'string' && s.credential_id) return { mode: 'target', credentialId: s.credential_id }
+  if (s && (s.mode === 'singleton' || s.mode === 'unsupported')) return { mode: s.mode }
+  return { mode: 'unknown' }
+}
+
 // Display labels are neither unique nor authenticated identity. If a token-fingerprint id changes,
 // only an explicit backend identity mapping can certify its replacement; a matching label cannot.
 export function findAccount(groups, provider, id) {
@@ -697,7 +707,10 @@ export function createReconnectStore(ctx, onDone = () => {}) {
     const put = v => {
       if (owners.get(k) !== me) return
       const prev = $state.get()[k]
-      $state.set({ ...$state.get(), [k]: { ...who.get(k), scope: me.scope, ...(prev?.removed ? { removed: true } : {}), ...v } })
+      // A row core removed cannot be asked about again (its id is gone from the pool): it keeps
+      // both its place on the panel and the backend's answer about where its sign-in belongs.
+      $state.set({ ...$state.get(), [k]: { ...who.get(k), scope: me.scope,
+        ...(prev?.removed ? { removed: true, ...(prev.signInRoute ? { signInRoute: prev.signInRoute } : {}) } : {}), ...v } })
     }
     put.scope = me.scope
     put.owned = () => owners.get(k) === me
@@ -740,6 +753,7 @@ export function createReconnectStore(ctx, onDone = () => {}) {
       if (status === 'needs_sign_in') {
         const external = r?.auth_flow === 'external' || EXTERNAL_SLUGS.has(provider)
         put({ needsSignIn: true, authFlow: external ? 'external' : r?.auth_flow, ...(r?.removed ? { removed: true } : {}),
+          ...(external ? {} : { signInRoute: signInRoute(r) }),
           message: external ? 'Saved sign-in expired — sign in from Settings › Accounts' : 'Saved sign-in expired — sign in again' })
         return
       }
@@ -748,7 +762,7 @@ export function createReconnectStore(ctx, onDone = () => {}) {
       put({ error: true, retry: true, message: `Reconnect failed: ${String(err?.message || err)}` })
     }
   }
-  const pollAuth = async (put, provider, account, sessionId, route, expiresIn, live) => {
+  const pollAuth = async (put, provider, account, sessionId, route, expiresIn, live, target = null) => {
     const api = desktopApi()
     const deadline = Date.now() + Math.min(Math.max(Number(expiresIn) || 900, 30) * 1000, 15 * 60 * 1000)
     let errors = 0
@@ -769,12 +783,21 @@ export function createReconnectStore(ctx, onDone = () => {}) {
       }
       if (!live()) return
       if (poll?.status === 'approved') {
+        // A bound sign-in must report the row it was bound to; anything else was saved elsewhere.
+        if (target && poll.credential_id !== target) {
+          put({ error: true, needsSignIn: true, unverified: true, signInRoute: { mode: 'target', credentialId: target },
+            message: 'Sign-in finished, but not for this account — check again' })
+          return
+        }
         put({ busy: true, needsSignIn: true, message: 'Checking account…' })
         await verify(put, provider, account, live)
         return
       }
       if (poll?.status && poll.status !== 'pending') {
-        put({ error: true, needsSignIn: true, message: poll.status === 'cancelled' ? 'Sign-in cancelled' : 'Sign-in did not complete' })
+        put({ error: true, needsSignIn: true, ...(target ? { signInRoute: { mode: 'target', credentialId: target } } : {}),
+          message: poll.status === 'cancelled' ? 'Sign-in cancelled'
+            : poll.reason === 'reauth_conflict' ? 'That sign-in was for a different account, or this account changed — nothing was saved'
+              : 'Sign-in did not complete' })
         return
       }
       await new Promise(ok => setTimeout(ok, POLL_GAP_MS))
@@ -803,24 +826,41 @@ export function createReconnectStore(ctx, onDone = () => {}) {
     await verify(put, provider, account, () => true, keep)
   }
   const signIn = async (provider, account, route = ownerRoute()) => {
-    const seen = cur(reconnectKey(provider, account.id), route)
+    let seen = cur(reconnectKey(provider, account.id), route)
     if (seen?.busy) return
     if (EXTERNAL_SLUGS.has(provider) || seen?.authFlow === 'external') { openSettings(provider, account); return }
+    // The backend names the stored row a sign-in must repair. Without that answer nothing is
+    // started: an unbound login could add a second row beside the dead one.
+    if (!seen?.signInRoute) {
+      await reconnect(provider, account, route)
+      seen = cur(reconnectKey(provider, account.id), route)
+      if (!seen?.needsSignIn || seen.authFlow === 'external' || !seen.signInRoute) return
+    }
+    const bound = seen.signInRoute
+    const target = bound.mode === 'target' ? bound.credentialId : null
     const k = begin(provider, account, route)
     const put = writer(k)
+    if (bound.mode !== 'target' && bound.mode !== 'singleton') {
+      put({ error: true, needsSignIn: true, signInRoute: bound, message: bound.mode === 'unknown'
+        ? 'Restart this gateway to sign in to this account again'
+        : 'This sign-in is managed outside this profile — renew it where it was created' })
+      return
+    }
     const api = desktopApi()
-    if (!api) { put({ error: true, needsSignIn: true, message: 'Secure sign-in is unavailable on this Desktop' }); return }
+    if (!api) { put({ error: true, needsSignIn: true, signInRoute: bound, message: 'Secure sign-in is unavailable on this Desktop' }); return }
     const token = {}
     flows.set(k, token)
     // Live = not cancelled, not superseded by a newer sign-in, and the key is still this gateway's.
     const live = () => flows.get(k) === token && put.owned()
-    put({ busy: true, needsSignIn: true, message: 'Starting sign-in…' })
+    const keep = { busy: true, needsSignIn: true, signInRoute: bound }
+    put({ ...keep, message: 'Starting sign-in…' })
     let sessionId = null // a started server session: every path that abandons it deletes it
     let settled = false // the server session reached a terminal state (approved / denied / cancelled)
     try {
       const start = await api({
         path: `/api/providers/oauth/${encodeURIComponent(provider)}/start`,
-        method: 'POST', body: {}, timeoutMs: 30000, connectionId: route?.connectionId, profile: route?.profile
+        method: 'POST', body: target ? { credential_id: target } : {}, timeoutMs: 30000,
+        connectionId: route?.connectionId, profile: route?.profile
       })
       sessionId = start?.session_id || null
       if (!live()) return
@@ -828,22 +868,27 @@ export function createReconnectStore(ctx, onDone = () => {}) {
         put({ error: true, needsSignIn: true, authFlow: 'external', message: 'Sign-in for this provider runs from Settings › Accounts' })
         return
       }
+      // A gateway that ignored the target started an ordinary login. It is deleted (finally), not shown.
+      if (target && (start.target_bound !== true || start.credential_id !== target)) {
+        put({ error: true, needsSignIn: true, signInRoute: bound, message: 'Update this gateway to sign in to this account again' })
+        return
+      }
       // Recorded before the browser opens, so Cancel can always reach the server session.
-      put({ busy: true, needsSignIn: true, launching: true, sessionId, userCode: start.user_code,
+      put({ ...keep, launching: true, sessionId, userCode: start.user_code,
         verificationUrl: start.verification_url, message: 'Opening the sign-in page…' })
       let opened = false
       try { opened = ctx.os?.openExternal ? !!(await ctx.os.openExternal(start.verification_url)) : false } catch { opened = false }
       if (!live()) return
-      put({ busy: true, needsSignIn: true, launching: true, sessionId, userCode: start.user_code,
+      put({ ...keep, launching: true, sessionId, userCode: start.user_code,
         verificationUrl: start.verification_url, message: opened ? 'Complete sign-in in the browser' : 'Open the sign-in page to continue' })
-      await pollAuth(put, provider, account, sessionId, route, start.expires_in, live)
+      await pollAuth(put, provider, account, sessionId, route, start.expires_in, live, target)
       settled = live() && !$state.get()[k]?.launching
     } catch (err) {
       if (!live()) return
       const msg = String(err?.message || err)
       put(/external CLI|Unsupported flow/i.test(msg)
         ? { error: true, needsSignIn: true, authFlow: 'external', message: 'Sign-in for this provider runs from Settings › Accounts' }
-        : { error: true, needsSignIn: true, message: `Sign-in failed: ${msg}` })
+        : { error: true, needsSignIn: true, signInRoute: bound, message: `Sign-in failed: ${msg}` })
     } finally {
       // Whoever leaves a started session unfinished deletes it (cancelled, superseded, taken over by
       // another gateway, failed): core would otherwise keep polling and could still save a sign-in
@@ -859,7 +904,7 @@ export function createReconnectStore(ctx, onDone = () => {}) {
     // Retire the flow first: its poll loop may be parked in a 25 s long-poll and must not write
     // state when that returns, least of all over a sign-in started after this cancel.
     flows.delete(k)
-    writer(k)({ needsSignIn: true, cancelled: true, message: 'Sign-in cancelled' })
+    writer(k)({ needsSignIn: true, cancelled: true, ...(st.signInRoute ? { signInRoute: st.signInRoute } : {}), message: 'Sign-in cancelled' })
     const api = desktopApi()
     if (api && st.sessionId) await drop(api, st.sessionId, route)
   }

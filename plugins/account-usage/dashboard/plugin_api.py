@@ -111,7 +111,7 @@ _QUOTA_MARKERS = ('quota', 'rate_limit', 'usage_limit', 'billing', 'exhausted')
 
 @router.get('/ping')
 def ping() -> Dict[str, Any]:
-    return {'api': 2, 'features': ['reconnect_status', 'auth_launch', 'reconnect_removed']}
+    return {'api': 2, 'features': ['reconnect_status', 'auth_launch', 'reconnect_removed', 'sign_in_route']}
 
 
 class ReconnectBody(BaseModel):
@@ -198,6 +198,29 @@ def _pick_status(renewed: int, statuses: list[str]) -> str:
     return 'unsupported'
 
 
+def sign_in_route(dead: list[tuple[Any, bool]]) -> Dict[str, Any]:
+    """Where a fresh sign-in for this account's dead rows must be written.
+
+    ``dead``: ``(pool row, left the pool)`` for each row whose grant is dead. The wire account id
+    is not a pool row id, so the row is named here, by the backend that just matched it:
+    - ``target``: one ``manual:*`` row this profile owns. Core replaces that exact row
+      (``/start`` with ``credential_id``); an ordinary login would add a second row beside it.
+    - ``singleton``: the row was seeded from the provider's own sign-in state (``device_code``),
+      or core already dropped it. The ordinary login rewrites that state and reseeds the row.
+    - ``unsupported``: any other owner (env, borrowed, relayed), or several manual rows: no
+      sign-in started from this panel can be bound to the right place.
+    """
+    if not dead:
+        return {'mode': 'unsupported'}
+    manual = [e for e, gone in dead if not gone and str(getattr(e, 'source', '') or '').startswith('manual:')]
+    seeded = [e for e, gone in dead if gone or str(getattr(e, 'source', '') or '') == 'device_code']
+    if len(manual) == 1 and len(dead) == 1 and getattr(manual[0], 'id', None):
+        return {'mode': 'target', 'credential_id': str(manual[0].id)}
+    if len(seeded) == len(dead):
+        return {'mode': 'singleton'}
+    return {'mode': 'unsupported'}
+
+
 def reconnect_account(provider: str, account_id: str, tools=None) -> Dict[str, Any]:
     """Force-refresh every pooled OAuth credential of one account (the wire ``accounts[].id``).
 
@@ -219,6 +242,7 @@ def reconnect_account(provider: str, account_id: str, tools=None) -> Dict[str, A
         raise HTTPException(404, detail='Account not found; refresh the panel')
     renewed = removed = 0
     statuses: list[str] = []
+    dead: list[tuple[Any, bool]] = []
     for item in matches:
         if getattr(item, 'auth_type', None) != 'oauth' or not getattr(item, 'refresh_token', None):
             continue
@@ -239,6 +263,8 @@ def reconnect_account(provider: str, account_id: str, tools=None) -> Dict[str, A
         status = classify_refresh(refreshed=refreshed, entry=current if current is not None else item,
                                   status_dead=status_dead, exc=exc, removed=gone)
         removed += 1 if gone and status == 'needs_sign_in' else 0
+        if status == 'needs_sign_in':
+            dead.append((current if current is not None else item, gone))
         statuses.append(status)
         if status == 'renewed':
             renewed += 1
@@ -254,6 +280,9 @@ def reconnect_account(provider: str, account_id: str, tools=None) -> Dict[str, A
         'provider': provider,
         'label': str(getattr(matches[0], 'label', '') or ''),
         'auth_flow': AUTH_FLOWS.get(provider),
+        # Only for a dead grant on a provider with in-app sign-in: which stored row it must repair.
+        **({'sign_in': sign_in_route(dead)}
+           if overall == 'needs_sign_in' and AUTH_FLOWS.get(provider) == 'device_code' else {}),
     }
 
 

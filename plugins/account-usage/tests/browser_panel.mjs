@@ -131,6 +131,28 @@ try {
  assert.deepEqual(await pills(),{'Try Dead account next':'hermes-au-signin|sign-in needed'})
  const signIn=page.getByRole('button',{name:'Sign in to Dead account again',exact:true}); await signIn.waitFor()
  assert.equal(await page.getByText('hermes auth add').count(),0)
+ const deadRows=()=>page.getByRole('button',{name:'Try Dead account next',exact:true}).count()
+ const startBodies=async()=>(await page.evaluate(()=>window.__api||[])).filter(c=>String(c.path).endsWith('/start')).map(c=>c.body)
+ // A gateway whose core ignores the selected row would complete as an account-add: the panel deletes
+ // that session unopened instead, and no second row appears.
+ await page.evaluate(()=>{window.fixture.oldCore=true})
+ await signIn.click()
+ await page.getByText('Update this gateway to sign in to this account again',{exact:true}).waitFor()
+ assert.deepEqual(await startBodies(),[{credential_id:'pool-dead'}],'the click resolves the pool row and sends it')
+ assert.equal(await page.evaluate(()=>window.fixture.oauthCancelled),true,'the unbound session is deleted')
+ assert.deepEqual(await page.evaluate(()=>window.__opened||[]),[],'its sign-in page is never opened')
+ await page.getByRole('button',{name:'↻ Refresh',exact:true}).click()
+ assert.deepEqual([await deadRows(),await page.evaluate(()=>!!window.fixture.duplicate)],[1,false])
+ evidence.push('Old-core gateway: selected-row sign-in refused and its session deleted; no duplicate row')
+ // Signing in as another account: core refuses, nothing is saved, the row still asks for sign-in.
+ await page.evaluate(()=>{window.fixture.oldCore=false;window.fixture.wrongPrincipal=true})
+ await signIn.click()
+ await page.getByText('That sign-in was for a different account, or this account changed — nothing was saved',{exact:true}).waitFor()
+ assert.equal(await page.getByText('fixture conflict text').count(),0)
+ assert.deepEqual(await pills(),{'Try Dead account next':'hermes-au-signin|sign-in needed'})
+ assert.deepEqual([await deadRows(),await page.evaluate(()=>!!window.fixture.duplicate)],[1,false])
+ await page.evaluate(()=>{window.fixture.wrongPrincipal=false;window.__opened=[]})
+ evidence.push('Wrong-account sign-in: refused by the gateway, nothing saved, row still needs sign-in')
  // Approved sign-in whose panel readback fails must not claim success.
  await page.evaluate(()=>{window.fixture.requestFail=true})
  await signIn.click()
@@ -143,6 +165,8 @@ try {
  assert.deepEqual(await page.evaluate(()=>window.__nav||[]),[])
  let apiCalls=await page.evaluate(()=>window.__api||[])
  assert.ok(apiCalls.some(c=>String(c.path).includes('/api/providers/oauth/openai-codex/start') && c.connectionId==='local'))
+ assert.ok((await startBodies()).every(b=>b.credential_id==='pool-dead'),'every Dead-account sign-in was bound to its pool row')
+ assert.deepEqual([await deadRows(),await page.evaluate(()=>!!window.fixture.duplicate)],[1,false],'one row for the repaired account')
  evidence.push('Dead grant -> in-app device-code OAuth on the chip gateway; no CLI paste, no Settings dead-end')
  // Core drops a Codex device_code row whose grant died: the account must stay on the panel with sign-in.
  await page.evaluate(()=>{window.fixture.extra=true}); await page.getByRole('button',{name:'↻ Refresh',exact:true}).click()
@@ -179,7 +203,9 @@ try {
  assert.equal(await page.getByText('Reconnected',{exact:true}).count(),0,'matching Claude label cannot certify identity')
  evidence.push('Claude changed fingerprint remains unverified; Settings handoff is not proof of reconnect')
  const posts=(await page.evaluate(()=>window.fixture.calls)).filter(c=>c.path==='/reconnect')
- assert.deepEqual(posts.map(c=>[c.method,c.body.provider,c.body.account_id]),[['POST','openai-codex','inventory-expired'],['POST','openai-codex','inventory-vanish']])
+ // One /reconnect per account: Dead's first sign-in click asks the backend which pool row to repair; retries,
+ // and the removed Vanishing row (which could only answer 404 now), reuse that answer.
+ assert.deepEqual(posts.map(c=>[c.method,c.body.provider,c.body.account_id]),[['POST','openai-codex','inventory-expired'],['POST','openai-codex','inventory-dead'],['POST','openai-codex','inventory-vanish']])
  await page.screenshot({path:path.join(artifacts,'account-usage-reconnect.png'),fullPage:true})
  const calls=await page.evaluate(()=>window.fixture.calls)
  assert.ok(calls.filter(c=>c.method==='PUT').every(c=>c.body.session_id==='runtime-a'))
