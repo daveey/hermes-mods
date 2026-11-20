@@ -675,33 +675,6 @@ function GatewayRow({ m, now, limit }) {
   )
 }
 
-function CiRow({ m, now, repairClient, route, sourceError }) {
-  const [openKey, setOpenKey] = useState(null)
-  const interactive = !!(repairClient && route)
-  const busy = m.slots.filter((s) => s.state === 'busy').length
-  const offline = m.slots.filter((s) => s.state === 'offline').length
-  const open = m.slots.find((s, i) => (s.id || s.runner || String(i)) === openKey)
-  return h('div', { className: 'hermes-fleet-row', 'data-machine': m.name },
-    h('span', { className: 'hermes-fleet-name' }, text(m.name) + (m.ephemeral ? ' (ephemeral)' : '')),
-    h('span', { className: 'hermes-fleet-slots' },
-      ...m.slots.map((s, i) => {
-        const key = s.id || s.runner || String(i)
-        return h(Slot, {
-          key, state: s.state, slotId: s.id,
-          title: `${text(s.runner)} · ${SLOT_TITLE[s.state]}\n${(s.labels || []).join(', ')}`,
-          // Hover already opened this slot's popover, so a click must open, not toggle:
-          // a real pointer always enters before it clicks.
-          onClick: interactive ? () => setOpenKey(key) : undefined,
-          onMouseEnter: interactive ? () => setOpenKey(key) : undefined
-        })
-      })),
-    h('span', { className: 'hermes-fleet-count' }, `${busy}/${m.slots.length}`),
-    h('span', { className: 'hermes-fleet-meta' }, [m.labels.join(', '), offline ? `${offline} offline` : null].filter(Boolean).join(' · ')),
-    m.load ? h(Meters, { load: m.load, now }) : null,
-    ...m.warnings.map((w) => h('div', { key: w, className: 'hermes-fleet-warning' }, `⚠ ${text(w)}`)),
-    open ? h(SlotRepair, { key: openKey, slot: open, route, repairClient, sourceError }) : null
-  )
-}
 
 function SlotRepair({ slot, route, repairClient, sourceError }) {
   const [prep, setPrep] = useState(null)
@@ -775,42 +748,136 @@ export function groupCi(machines) {
   })
 }
 
-const OPEN_KEY = 'hermes-runners-ci-open'
-function readOpen() {
-  try { return new Set(JSON.parse(globalThis.localStorage?.getItem(OPEN_KEY) || '[]')) } catch { return new Set() }
-}
-function writeOpen(set) {
-  try { globalThis.localStorage?.setItem(OPEN_KEY, JSON.stringify([...set])) } catch {}
+
+const CI_PROVIDERS = { blacksmith: 'Blacksmith', namespace: 'Namespace', 'hub-ci': 'hub CI VMs' }
+export const CI_STALE_MS = 5 * 60000
+
+// The backend supplies dimensions. Fallbacks keep older connected gateways usable during rollout.
+function ciDimensions(m) {
+  const labels = (m.slots || []).flatMap((s) => s.labels || [])
+  const name = (m.name || '').toLowerCase()
+  return {
+    os: m.os || (m.category === 'Macs' || labels.some((l) => /macos|(^|-)mac(-|$)/i.test(l)) || ciCategory(m) === 'Macs' ? 'mac' : 'linux'),
+    provider: m.provider === undefined ? (name.startsWith('blacksmith') ? 'blacksmith' : name.startsWith('nsc-') ? 'namespace' : m.ephemeral ? 'hub-ci' : null) : m.provider,
+    size: m.size || null
+  }
 }
 
-function CiGroup({ g, open, onToggle, rowProps }) {
-  const health = { good: 'all online', warn: `${g.offline} offline`, bad: `${g.warnings} readiness warning${g.warnings > 1 ? 's' : ''}` }[g.health]
-  return h('div', { className: 'hermes-fleet-group', 'data-ci-group': g.name },
-    h('button', {
-      type: 'button', className: 'hermes-fleet-group-head', 'aria-expanded': open ? 'true' : 'false',
-      title: `${g.machines.length} machines · ${health}`, onClick: onToggle
-    },
-      h('span', { className: 'hermes-fleet-chev' }, open ? '▾' : '▸'),
-      h(StatusDot, { tone: g.health }),
-      h('span', { className: 'hermes-fleet-group-name' }, `${g.name} (${g.machines.length})`),
-      h('span', { className: 'hermes-fleet-group-meta' },
-        [g.offline ? `${g.offline} offline` : null, g.warnings ? `⚠ ${g.warnings}` : null,
-          g.load1Max != null ? `load ≤ ${g.load1Max}` : null].filter(Boolean).join(' · ')),
-      h('span', { className: 'hermes-fleet-count' }, `${g.busy}/${g.total}`)),
-    open ? g.machines.map((m) => h(CiRow, { key: m.name, m, ...rowProps })) : null)
+export function ciModel(ci, now = Date.now()) {
+  const sections = ['mac', 'linux'].map((os) => ({ os, name: os === 'mac' ? 'Mac' : 'Linux', fixed: [], elastic: [], unobserved: 0, readinessWarnings: [] }))
+  let hidden = 0
+  for (const m of ci.machines || []) {
+    const dim = ciDimensions(m), section = sections.find((s) => s.os === dim.os) || sections[1]
+    section.readinessWarnings.push(...(m.warnings || []))
+    if (dim.provider) {
+      let pool = section.elastic.find((p) => p.id === dim.provider)
+      if (!pool) section.elastic.push(pool = { id: dim.provider, name: CI_PROVIDERS[dim.provider] || dim.provider, busy: 0, sizes: {} })
+      for (const slot of m.slots || []) {
+        if (slot.state !== 'busy') { hidden++; continue }
+        pool.busy++
+        if (dim.size) pool.sizes[dim.size] = (pool.sizes[dim.size] || 0) + 1
+      }
+    } else for (const slot of m.slots || []) {
+      if (!['busy', 'idle', 'offline'].includes(slot.state)) { section.unobserved++; continue }
+      const warning = slot.warning ?? (m.warnings || []).some((w) => w.startsWith(`${slot.runner}:`))
+      section.fixed.push({ ...slot, machine: m.name, labels: m.labels || slot.labels || [], warning })
+    }
+  }
+  for (const s of sections) {
+    s.fixed.sort((a, b) => Number(b.warning) - Number(a.warning) || ({ busy: 0, idle: 1, offline: 2 }[a.state] - { busy: 0, idle: 1, offline: 2 }[b.state]) || (a.runner || '').localeCompare(b.runner || ''))
+    s.online = s.fixed.filter((r) => r.state !== 'offline')
+    s.offline = s.fixed.filter((r) => r.state === 'offline')
+    s.busy = s.fixed.filter((r) => r.state === 'busy').length
+    const ready = s.online.filter((r) => !r.warning)
+    s.full = ready.length > 0 && ready.every((r) => r.state === 'busy')
+    s.elastic.sort((a, b) => Object.keys(CI_PROVIDERS).indexOf(a.id) - Object.keys(CI_PROVIDERS).indexOf(b.id))
+    s.running = s.elastic.reduce((n, p) => n + p.busy, 0)
+    s.warnings = s.fixed.filter((r) => r.warning)
+    s.title = `${s.name}: ${[
+      `${s.busy}/${s.online.length} self-hosted busy`,
+      s.offline.length ? `${s.offline.length} offline` : null,
+      s.warnings.length ? `${s.warnings.map((r) => r.runner).join(', ')}: readiness check failed` : null,
+      ...s.readinessWarnings.filter((w) => !s.warnings.some((r) => w.startsWith(`${r.runner}:`))),
+      ...s.elastic.filter((p) => p.busy).map((p) => `${p.name} ${p.busy} running`),
+      s.unobserved ? `${s.unobserved} not observed` : null
+    ].filter(Boolean).join(' · ')}`
+  }
+  const at = Date.parse(ci.observed_at), age = Number.isFinite(at) ? Math.max(0, now - at) : null
+  const stale = !['ready', 'not_configured'].includes(ci.state) || (age != null && age > CI_STALE_MS)
+  const minutes = age == null ? null : Math.round(age / 60000)
+  return { sections, stale, minutes, hidden, total: sections.reduce((n, s) => n + s.busy + s.running, 0),
+    tone: sections.some((s) => s.warnings.length || s.readinessWarnings.length) ? 'bad' : stale ? 'warn' : null,
+    title: sections.map((s) => s.title).join('\n') + (stale ? `\nCI data ${minutes == null ? 'age unknown' : `${minutes} min old`}` : '') }
 }
 
-function CiGroups({ view, now, repairClient }) {
-  const [open, setOpen] = useState(readOpen)
-  const toggle = (name) => setOpen((prev) => {
-    const next = new Set(prev)
-    next.has(name) ? next.delete(name) : next.add(name)
-    writeOpen(next)
-    return next
-  })
-  const rowProps = { now, repairClient, route: view.ci.route, sourceError: view.ci.error }
-  return groupCi(view.ci.machines).map((g) =>
-    h(CiGroup, { key: g.name, g, open: open.has(g.name), onToggle: () => toggle(g.name), rowProps }))
+function CiPips({ section }) {
+  return h('span', { className: 'hermes-ci-grid', 'aria-hidden': true }, ...section.fixed.map((r) => h('span', {
+    key: r.id || r.runner, title: `${r.runner}: ${r.warning ? 'readiness check failed' : r.state}`,
+    className: `hermes-ci-pip is-${r.warning ? 'warn' : r.state === 'busy' && section.full ? 'full' : r.state}${r.warning && r.state === 'busy' ? ' is-busy-warn' : ''}`
+  })))
+}
+
+export function CiChip({ model }) {
+  return h('span', { className: `hermes-ci-chip${model.stale ? ' is-stale' : ''}`, title: model.title },
+    h('span', { className: 'hermes-ci-label' }, 'CI'),
+    model.tone ? h('span', { className: `hermes-ci-dot is-${model.tone}`, 'data-ci-tone': model.tone }) : null,
+    ...model.sections.flatMap((s, i) => [i ? h('span', { key: 'divider', className: 'hermes-ci-divider' }) : null,
+      h('span', { key: s.os, className: 'hermes-ci-section', 'data-ci-os': s.os }, h(CiPips, { section: s }),
+        s.running ? h('span', { className: 'hermes-ci-number' }, s.running) : null)]))
+}
+
+function CiFixedRow({ slot, section, repairClient, route, onOpen }) {
+  const interactive = !!(repairClient && route)
+  const title = `${slot.runner} · ${slot.warning ? 'readiness check failed' : SLOT_TITLE[slot.state]}\n${slot.labels.join(', ')}`
+  return h('div', { className: 'hermes-ci-row', 'data-machine': slot.machine },
+    h('span', { className: 'hermes-ci-name', title: slot.runner }, text(slot.runner)),
+    h('span', { className: 'hermes-ci-row-detail' },
+      h(interactive ? 'button' : 'span', { type: interactive ? 'button' : undefined, className: 'hermes-ci-slot-action',
+        title, 'aria-label': title, 'data-runner-slot': slot.id,
+        onClick: interactive ? () => onOpen(slot) : undefined, onMouseEnter: interactive ? () => onOpen(slot) : undefined
+      }, h(CiPips, { section: { ...section, fixed: [slot] } })),
+      h('span', { className: 'hermes-ci-labels', title: slot.labels.join(', ') }, slot.labels.join(', '))),
+    h('span', { className: 'hermes-ci-count' }, `${slot.state === 'busy' ? 1 : 0}/1`))
+}
+
+function CiOfflineNote({ section, repairClient, route, onOpen }) {
+  const interactive = !!(repairClient && route)
+  return h('div', { className: 'hermes-ci-note' },
+    section.offline.length ? `${section.offline.length} offline: ` : null,
+    ...section.offline.flatMap((slot, i) => [i ? ', ' : null, h(interactive ? 'button' : 'span', {
+      key: slot.id || slot.runner, className: 'hermes-ci-offline-name', type: interactive ? 'button' : undefined,
+      title: `${slot.runner}: offline`, 'data-runner-slot': slot.id,
+      onClick: interactive ? () => onOpen(slot) : undefined, onMouseEnter: interactive ? () => onOpen(slot) : undefined
+    }, slot.runner)]),
+    section.unobserved ? `${section.offline.length ? ' · ' : ''}${section.unobserved} not observed (no fresh reading)` : null)
+}
+
+export function CiPanel({ view, now = Date.now(), repairClient }) {
+  const [openSlot, setOpenSlot] = useState(null)
+  const model = ciModel(view.ci, now)
+  const slotKey = (s) => s.id || s.runner
+  const open = openSlot && model.sections.flatMap((s) => s.fixed).find((s) => slotKey(s) === openSlot)
+  const onOpen = (slot) => setOpenSlot(slotKey(slot))
+  return h('div', { className: 'hermes-ci-panel' },
+    h('div', { className: 'hermes-ci-head' }, h('span', null, 'CI (GitHub Actions)'), h('span', null, `${model.total} running`)),
+    h(SectionNote, { section: view.ci }),
+    ...model.sections.map((s) => h('section', { key: s.os, 'data-ci-section': s.os },
+      h('div', { className: 'hermes-ci-section-head' }, h('b', null, s.name), h(CiPips, { section: s }),
+        h('span', null, `${s.busy}/${s.online.length} self-hosted busy${s.running ? ` · ${s.running} elastic running` : ''}`)),
+      ...s.online.toSorted((a, b) => (a.runner || '').localeCompare(b.runner || '')).map((slot) => h(CiFixedRow, { key: slot.id || slot.runner, slot, section: s, repairClient, route: view.ci.route, onOpen })),
+      ...s.elastic.map((p) => h('div', { key: p.id, className: 'hermes-ci-row', 'data-ci-provider': p.id },
+        h('span', { className: 'hermes-ci-name' }, p.name, ' ', h('span', { className: 'hermes-ci-labels' }, 'elastic')),
+        h('span', { className: 'hermes-ci-row-detail' },
+          p.busy ? h('span', { className: 'hermes-ci-elastic-strip', 'aria-hidden': true }, ...Array.from({ length: p.busy }, (_, i) => h('i', { key: i }))) : null,
+          h('span', { className: 'hermes-ci-labels' }, Object.entries(p.sizes).map(([size, count]) => `${count} × ${size}`).join(' · ') || (p.busy ? `${p.busy} running` : 'idle'))),
+        h('span', { className: 'hermes-ci-count' }, p.busy))),
+      h(CiOfflineNote, { section: s, repairClient, route: view.ci.route, onOpen }),
+      s.readinessWarnings.length ? h('div', { className: 'hermes-ci-note' }, s.readinessWarnings.join(' · ')) : null)),
+    open && repairClient && view.ci.route ? h('div', null,
+      h('button', { type: 'button', onClick: () => setOpenSlot(null), 'aria-label': 'Close CI runner actions' }, 'Close actions'),
+      h(SlotRepair, { key: slotKey(open), slot: open, repairClient, route: view.ci.route, sourceError: view.ci.error })) : null,
+    h('div', { className: 'hermes-ci-note' }, `${model.hidden} finished elastic registrations and ${view.ci.hidden_deregistered || 0} deregistered runners hidden`),
+    h('div', { className: 'hermes-fleet-foot' }, `Updated ${ago(now - view.at)} · every ${POLL_OPEN_MS / 1000}s`))
 }
 
 function SectionNote({ section }) {
@@ -955,14 +1022,6 @@ export function Panel({ view, now, repairClient, throttle = null, onThrottle, th
       ...view.gateways.machines.filter((m) => m.state !== 'stopped').map((m) => h(GatewayRow, { key: m.name, m, now, limit: limitRow(throttle, m.name) }))),
     h(Timeline, { events: view.gateways.events, now }),
     h(StoppedNote, { machines: stopped, now }),
-    h('div', { className: 'hermes-fleet-head' },
-      h('span', null, 'CI workers (GitHub Actions)'),
-      h('span', null, `${s.cBusy} / ${s.cSlots} busy${s.cOffline ? ` · ${s.cOffline} offline` : ''}`)),
-    h(SectionNote, { section: view.ci }),
-    h(CiGroups, { view, now, repairClient }),
-    view.ci.hidden_deregistered
-      ? h('div', { className: 'hermes-fleet-note' }, `${view.ci.hidden_deregistered} deregistered runners (history) hidden`)
-      : null,
     h('div', { className: 'hermes-fleet-foot' }, `Updated ${ago(now - view.at)} · every ${POLL_OPEN_MS / 1000}s`)
   )
 }
@@ -1099,7 +1158,73 @@ export function Runners({ ctx }) {
   )
 }
 
-const CSS = `
+export function CI({ ctx }) {
+  const [open, setOpen] = useState(false)
+  const visible = useVisible()
+  const now = useNow(visible)
+  const transport = useMemo(() => transportFor(ctx), [ctx])
+  const repairClient = useMemo(() => createRepairClient(ctx), [ctx])
+  // Runners owns the shared cache's polling interval. CI observes it and refreshes on open,
+  // rather than adding a second observer timer (deduplication only covers in-flight reads).
+  const query = useQuery({ queryKey: ['runners', 'fleet'], queryFn: () => transport.poll(),
+    refetchInterval: false, refetchIntervalInBackground: false,
+    refetchOnWindowFocus: false, retry: false, staleTime: 5000 })
+  useEffect(() => {
+    const show = () => setOpen(true)
+    window.addEventListener('hermes-show-ci', show)
+    return () => window.removeEventListener('hermes-show-ci', show)
+  }, [])
+  useEffect(() => { if (open && visible) query.refetch() }, [open])
+  const view = query.data
+  const model = ciModel(view?.ci || { state: 'unknown', machines: [] }, now)
+  return h(Popover, { open, onOpenChange: setOpen },
+    h(PopoverTrigger, { asChild: true }, h('button', { type: 'button', className: BAR,
+      'data-slot': 'ci-chip', 'aria-label': `Show CI: ${model.title}`, title: model.title }, h(CiChip, { model }))),
+    h(PopoverContent, { side: 'top', align: 'end', sticky: 'always', 'aria-label': 'CI (GitHub Actions)',
+      className: 'hermes-ci-popover', style: { width: '620px', maxWidth: 'calc(100vw - 24px)', maxHeight: '70vh', overflowY: 'auto' } },
+    view ? h(CiPanel, { view, now, repairClient }) : h('div', { className: 'hermes-fleet-note' }, query.error ? `Unavailable: ${text(query.error.message)}` : 'Loading…')))
+}
+
+export const CSS = `
+.hermes-ci-chip{display:inline-flex;align-items:center;gap:6px;color:var(--ui-text-tertiary,#8b8b94);font-size:10px;line-height:1;white-space:nowrap}
+.hermes-ci-chip.is-stale{opacity:.45}
+.hermes-ci-label{font-size:10px;font-weight:600;color:#a9a9b2;letter-spacing:.03em;margin-right:1px}
+.hermes-ci-dot{width:6px;height:6px;border-radius:50%;background:#d08a1e}
+.hermes-ci-dot.is-bad{background:#d64545}
+.hermes-ci-section{display:inline-flex;align-items:center;gap:3px}
+.hermes-ci-grid{display:inline-grid;grid-auto-flow:column;grid-template-rows:repeat(2,4px);grid-auto-columns:4px;gap:1px;flex:none}
+.hermes-ci-pip{width:4px;height:4px;border-radius:50%;background:rgba(255,255,255,.14)}
+.hermes-ci-pip.is-busy{background:#2ea043}
+.hermes-ci-pip.is-full,.hermes-ci-pip.is-busy-warn{background:#d64545}
+.hermes-ci-pip.is-offline{background:transparent;box-shadow:inset 0 0 0 1px rgba(255,255,255,.34)}
+.hermes-ci-pip.is-warn{background:transparent;box-shadow:inset 0 0 0 1px #d64545}
+.hermes-ci-pip.is-warn.is-busy-warn{background:#d64545}
+.hermes-ci-number{font-variant-numeric:tabular-nums;color:#2ea043;font-size:10px}
+.hermes-ci-divider{width:1px;height:9px;background:rgba(255,255,255,.16)}
+.hermes-ci-panel{font-size:12px;padding:12px 14px;color:var(--ui-text-primary,#e6e6ea)}
+.hermes-ci-head{display:flex;justify-content:space-between;font-weight:600;margin-bottom:8px}
+.hermes-ci-head>span:last-child{font-weight:400;color:var(--ui-text-tertiary,#8b8b94)}
+.hermes-ci-panel section{margin-top:10px}
+.hermes-ci-section-head{display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid rgba(255,255,255,.08);margin-bottom:4px}
+.hermes-ci-section-head b{font-size:12px;width:44px}
+.hermes-ci-section-head>.hermes-ci-grid{zoom:1.5}
+.hermes-ci-section-head>span:last-child{margin-left:auto;color:var(--ui-text-tertiary,#8b8b94)}
+.hermes-ci-row{display:grid;grid-template-columns:180px minmax(0,1fr) 44px;align-items:center;gap:8px;padding:3px 0}
+.hermes-ci-name,.hermes-ci-labels{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hermes-ci-row-detail{display:flex;gap:6px;align-items:center;min-width:0}
+.hermes-ci-slot-action{display:inline-flex;flex:none;align-items:center;justify-content:center;width:12px;height:12px;padding:0;border:0;background:none;color:inherit}
+button.hermes-ci-slot-action{cursor:pointer}
+.hermes-ci-slot-action .hermes-ci-grid{zoom:1.5}
+.hermes-ci-slot-action:focus-visible{outline:1px solid #d08a1e;outline-offset:2px}
+.hermes-ci-labels{color:#6f6f78;font-size:11px}
+.hermes-ci-count{text-align:right;font-variant-numeric:tabular-nums;color:var(--ui-text-tertiary,#8b8b94)}
+.hermes-ci-elastic-strip{display:inline-grid;grid-auto-flow:column;grid-template-rows:repeat(3,4px);grid-auto-columns:4px;gap:1px;flex:none;max-width:45%;overflow:hidden}
+.hermes-ci-elastic-strip i{display:block;width:4px;height:4px;border-radius:1px;background:#2ea043}
+.hermes-ci-offline-name{font:inherit;color:inherit;padding:0;border:0;background:none}
+button.hermes-ci-offline-name{cursor:pointer}
+button.hermes-ci-offline-name:hover{text-decoration:underline}
+.hermes-ci-note{color:#7b7b84;font-size:11px;padding:3px 0;overflow-wrap:anywhere}
+.hermes-ci-panel>.hermes-ci-note{margin-top:10px}
 [data-slot="runners-chip"]{white-space:nowrap}
 .hermes-fleet-chipgroups{display:inline-flex;align-items:center;gap:15px}
 .hermes-fleet-chippool{display:inline-flex;align-items:center;gap:4px}
@@ -1212,11 +1337,16 @@ export default {
     document.head.append(style)
     ctx.onDispose(() => style.remove())
     ctx.register({ id: 'chip', area: STATUSBAR_AREAS.right, order: 6, render: () => h(Runners, { ctx }) })
+    ctx.register({ id: 'ci-chip', area: STATUSBAR_AREAS.right, order: 7, render: () => h(CI, { ctx }) })
+    ctx.register({ id: 'show-ci', area: PALETTE_AREA, data: {
+      id: 'show-ci', label: 'Show CI', keywords: ['ci', 'github', 'actions', 'builds'],
+      run: () => window.dispatchEvent(new window.Event('hermes-show-ci'))
+    } })
     ctx.register({
       id: 'show-runners',
       area: PALETTE_AREA,
       data: {
-        id: 'show-runners', label: 'Show runners', keywords: ['runners', 'workers', 'slots', 'ci', 'gateways'],
+        id: 'show-runners', label: 'Show runners', keywords: ['runners', 'workers', 'slots', 'gateways'],
         run: () => window.dispatchEvent(new window.Event('hermes-show-runners'))
       }
     })

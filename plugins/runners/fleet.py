@@ -347,6 +347,23 @@ def category(name, ephemeral, labels):
     return 'Other'
 
 
+def ci_identity(name, ephemeral, labels, group=None):
+    """Stable CI dimensions; elastic registrations never represent fixed capacity."""
+    low = (name or '').lower()
+    os_name = 'mac' if group == 'Macs' or any(
+        'macos' in label.lower() or 'mac' in label.lower().split('-') for label in labels
+    ) else 'linux'
+    provider = ('blacksmith' if low.startswith('blacksmith') else
+                'namespace' if low.startswith('nsc-') else 'hub-ci' if ephemeral else None)
+    size = None
+    if provider == 'blacksmith':
+        match = re.search(r'(\d+)\s*vcpu', low)
+        size = f'{match.group(1)} vCPU' if match else None
+    elif provider == 'namespace':
+        size = labels[0] if labels else None
+    return dict(os=os_name, provider=provider, size=size)
+
+
 def ci_workers(inventory, loads=None):
     """Group the collector inventory into machines; one GitHub runner = one slot.
 
@@ -364,13 +381,16 @@ def ci_workers(inventory, loads=None):
         if g['load'] is None and row.get('host_id') in (loads or {}):
             g['load'] = loads[row['host_id']]
         g['slots'].append(dict(id=row.get('id'), runner=row.get('display_name'),
-                               state=_slot(row, fresh), labels=list(row.get('labels') or [])))
+                               state=_slot(row, fresh), labels=list(row.get('labels') or []),
+                               warning=row.get('readiness') == 'fail' and row.get('registration') == 'online'))
         if row.get('readiness') == 'fail' and row.get('registration') == 'online':
             failed = (row.get('readiness_evidence') or {}).get('failed') or []
             g['warnings'].append(f"{row.get('display_name')}: "
                                  + (', '.join(f'{c} failed' for c in failed) if failed else 'a check failed'))
     for g in groups.values():
-        g['category'] = category(g['name'], g['ephemeral'], [l for s in g['slots'] for l in s['labels']])
+        labels = list(dict.fromkeys(l for s in g['slots'] for l in s['labels']))
+        g['category'] = category(g['name'], g['ephemeral'], labels)
+        g.update(ci_identity(g['name'], g['ephemeral'], labels, g['category']))
         g['slots'].sort(key=lambda s: s['runner'] or '')
         common = set.intersection(*(set(s['labels']) for s in g['slots']))
         g['labels'] = sorted(l for l in common if l.lower() not in _PLATFORM and not _SLOT_LABEL.match(l))

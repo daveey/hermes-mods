@@ -14,7 +14,7 @@ holds remain draining; the popover's existing enrolling label is unchanged. The 
 retains hub/worker totals and names launching workers. Reduced motion disables the pulse.
 A status dot appears only for warn/bad (stale data, lost machine). The popover layout is unchanged.
 
-The panel has two groups, one row per machine, one square per slot:
+The Runners panel now contains **gateway workers only** (see the independent CI chip below):
 
 - **Gateway workers**: machines that run Kanban card runs, from the Board machine registry. Slots are the
   registry's `max_card_runs` (this gateway falls back to its own `kanban.max_in_progress`; otherwise
@@ -29,21 +29,29 @@ The panel has two groups, one row per machine, one square per slot:
   quotas and transient admission limits are separate: a fit does not promise immediate dispatch.
   The projection assumes the shared board's machine-wide dispatcher policy; it does not inventory remote
   profile configs. Older gateways and unreadable replica scans show no waiting count, never a false 0.
-- **CI workers**: GitHub Actions runners from the runners collector, grouped into machines by runner name
-  (`ec2-gwgen-2` → `ec2-gwgen`, `…-i-<instance>` → one ephemeral group). One runner = one slot. Each slot
-  carries the runner entity id (`runner_…`) from the fleet projection. Click or hover a slot to open its
-  popover: **Repair in new session** (or **Open repair session** when that runner already has an active
-  repair). The action is enabled only when that gateway's enrollment has `features.repair_sessions` and the
-  runner has an open incident, or an active repair to reopen. It uses the captured owner route: idempotency
-  keys, owner/epoch checks, status reconciliation, and no prompt resend. Deregistered
-  runners are history: only their count is shown. A failed readiness check is a ⚠ line, not a red slot.
+## CI (GitHub Actions)
 
-CI groups: CI machines are grouped by category (`fleet.category` on the gateway; the panel falls back to the same
-rule for older gateways): **Macs** (macOS label or `mac` in the name), **EC2 Linux** (`ec2-*`, `hermes-hub*`,
-other Linux), **Metta** (`metta*`), **Ephemeral** (per-instance runners), **Other**. Each group is one collapsed
-row: `▸ ● EC2 Linux (9) · 2 offline · ⚠ 1 … 5/14` (slots busy/total; dot red = a readiness warning, amber = some
-offline, green = all fine). Click to expand its machines as before; which groups are open is remembered in
-localStorage (`hermes-runners-ci-open`). Gateway workers stay a flat list. Each gateway machine is one line under a column header
+A separate **CI** chip (order 7, right of Runners) opens its own panel. Mac then Linux each show a
+2-row grid of round 4×4 px pips, one per observed self-hosted runner, and a green count of running
+elastic jobs (hidden at zero). Busy pips are green, or red when all ready online runners in that
+section are busy. Idle pips are grey, offline pips hollow, and readiness failures get a red ring
+and a red status dot. Unknown runners are counted as not observed, never idle capacity. Stale
+CI data dims the chip to 45% and shows an amber dot (readiness red takes precedence).
+The tooltip names each OS's busy/online count, offline runners, running providers and observation age.
+
+The panel lists **Mac**, then **Linux**: online self-hosted rows, one row per elastic provider with
+busy counts by size, then a muted offline/unobserved line. Finished elastic registrations and
+deregistered runners appear only as hidden counts. Provider identity and OS come from the fleet
+projection's `os`, `provider`, and `size` fields; Blacksmith, Namespace and ephemeral hub CI VMs
+never contribute fixed-capacity pips. Older gateway responses use a compatibility fallback.
+
+Each runner retains its entity id (`runner_…`). Click or hover its pip (or its name in the offline
+line) for **Repair in new session** / **Open repair session**. The captured owner route, enrollment
+`features.repair_sessions`, incident checks, idempotency and epoch fencing are unchanged.
+**Show CI** opens this panel; **Show runners** opens gateway workers only. Both chips observe the
+same query cache, with Runners owning the single fleet polling interval.
+
+Gateway workers stay a flat list. Each gateway machine is one line under a column header
 (Machine, Slots, Waiting, Can't run, CPU, RAM, Disk free, Busy): rows hold bare numbers and bars, the
 header carries the unit, and all rows share one column grid. Flags and reasons (pinned only, slots not set, on hold,
 not seen, load N min old, load not reported) are a tooltip on a small ⓘ at the right end of the row,
@@ -53,8 +61,7 @@ Load: each gateway machine reports CPU load, RAM in use and disk space to the Bo
 `hermes_cli/machine_metrics.py` → `POST /v2/machines/me/metrics`, returned by `GET /v2/machines`). The row
 shows a bar and a number under the CPU, RAM and Disk free headers (CPU = 1-min load ÷ cores; a bar at 90 % or more is
 orange), "–" (hover: "load not reported") until the machine's core has the reporter, and grey cells (hover: "load N min old") after 2 min.
-CI machines show load and free disk only when the runners collector probes their host (no RAM there); the
-others have no meter line.
+CI's panel is an activity/readiness view; host load telemetry remains in the backend but is not drawn there.
 
 Slot styles: filled = busy, outline = free, dotted = offline/unknown, hatched = draining (registry `hold`; a held machine with nothing running that the Board has not seen for 10 min is "stopped": it has no row and no slots in any total, only its name in the "N off: ..." line under the grid),
 red = lost (machine holds cards but the Board has not seen it for 10 min). An asleep machine with nothing

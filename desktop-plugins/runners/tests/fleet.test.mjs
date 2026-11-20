@@ -136,9 +136,8 @@ test('load meters: reported, absent and stale', async () => {
   assert.match(ui.container.querySelector('[data-machine="mini"] > .hermes-fleet-info').dataset.tip, /load not reported/)
   assert.doesNotMatch(ui.container.querySelector('.hermes-fleet-gw').textContent, /load not reported|old/)
   assert.equal(P.loadParts({ cpus: 16, at: NOW }), null, 'a report with no readable values is "not reported"')
-  // CI: the collector's probe has load (no core count) and disk; machines without a probe show no meter line.
-  assert.match(ui.container.querySelector('[data-machine="mac-mini"] .hermes-fleet-load').textContent, /load\s+30.35.*24 GB free/)
-  assert.equal(ui.container.querySelector('[data-machine="ec2-gwgen"] .hermes-fleet-load'), null)
+  // CI is a separate surface; no CI rows or meters remain in the gateway panel.
+  assert.ok(ui.container.querySelector('[data-machine="mac-mini"]') === null)
   await ui.close()
 })
 
@@ -155,16 +154,10 @@ test('live leases: busy slots name the card and open it on click', async () => {
   await ui.close()
 })
 
-test('CI runners: one slot per runner, failed checks are warnings, history hidden', async () => {
+test('Runners panel renders only gateway workers, never CI', async () => {
   const ui = await render(P.merge([{ route, body: fleet(), at: NOW }], NOW))
-  const gen = ui.container.querySelector('[data-machine="ec2-gwgen"]')
-  assert.deepEqual([...gen.querySelectorAll('.hermes-fleet-slot')].map((e) => e.className.split('is-')[1]), ['busy', 'idle'])
-  const mini = ui.container.querySelector('[data-machine="mac-mini"]')
-  assert.match(mini.textContent, /⚠ mac-mini: tool:xcode failed/)
-  assert.equal(mini.querySelectorAll('.is-lost, .is-busy').length, 0)
-  assert.match(ui.container.querySelector('[data-machine="metta4"]').textContent, /2 offline/)
-  assert.match(ui.container.textContent, /1 \/ 5 busy · 2 offline/)
-  assert.match(ui.container.textContent, /220 deregistered runners \(history\) hidden/)
+  assert.doesNotMatch(ui.container.textContent, /CI|GitHub|deregistered|mac-mini|ec2-gwgen|metta4/)
+  assert.ok(ui.container.querySelector('[data-ci-section]') === null)
   await ui.close()
 })
 

@@ -21,6 +21,29 @@ def _shadow(tmp_path, board, rows):
     db.close()
 
 
+def test_ci_identity_dimensions_from_raw_labels():
+    cases = [
+        ('blacksmith-4vcpu-abcd', ['self-hosted', 'Linux'], 'linux', 'blacksmith', '4 vCPU'),
+        ('nsc-mac-build', ['namespace-macos-arm64', 'self-hosted'], 'mac', 'namespace', 'namespace-macos-arm64'),
+        ('nsc-linux-build', ['namespace-linux-amd64'], 'linux', 'namespace', 'namespace-linux-amd64'),
+        ('mac-mini-1', ['self-hosted', 'bb-sign'], 'mac', None, None),
+        ('custom-1', ['hermes-mac-session'], 'mac', None, None),
+        ('custom-2', ['host-macos-arm64'], 'mac', None, None),
+        ('hermes-hub-canary-1', ['linux'], 'linux', None, None),
+        ('ci_i-0123456789abcdef', ['linux'], 'linux', 'hub-ci', None),
+    ]
+    rows = [dict(id=str(i), display_name=name, labels=labels, registration='online',
+                 activity='busy', freshness='fresh') for i, (name, labels, *_rest) in enumerate(cases)]
+    out = fleet.ci_workers(dict(meta=dict(freshness='fresh'), data=dict(runners=rows)))
+    machines = {g['name']: g for g in out['machines']}
+    for name, labels, os_name, provider, size in cases:
+        key, _ = fleet.machine_of(name)
+        m = machines[key]
+        assert (m['os'], m['provider'], m['size']) == (os_name, provider, size)
+    # 'mac' must be a dash token, not an arbitrary substring.
+    assert fleet.ci_identity('custom', False, ['machine-fast'])['os'] == 'linux'
+
+
 def test_registry_sets_slots_flags_and_drain():
     reg = _registry(hub={}, **{'worker-1': dict(max_card_runs=16, labels=['linux', 'machine:worker-1'])},
                     mini=dict(pinned_only=True), spare=dict(hold=True, max_card_runs=4))

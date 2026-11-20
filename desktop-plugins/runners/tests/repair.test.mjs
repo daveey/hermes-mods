@@ -101,7 +101,7 @@ async function openAction(ui, id) {
 
 test('create-new: slot popover reserves a repair and opens the owner session', async () => {
   const f = harness()
-  const ui = await mount(React.createElement(P.Panel, { view: f.view, now: NOW, repairClient: f.repairClient }))
+  const ui = await mount(React.createElement(P.CiPanel, { view: f.view, now: NOW, repairClient: f.repairClient }))
   try {
     const action = await openAction(ui, ENTITY)
     assert.equal(action.textContent, 'Repair in new session')
@@ -126,7 +126,7 @@ test('create-new: slot popover reserves a repair and opens the owner session', a
 
 test('reopen-existing: the same session id opens twice and no second repair is reserved', async () => {
   const f = harness({ repair: repairRecord() })
-  const ui = await mount(React.createElement(P.Panel, { view: f.view, now: NOW, repairClient: f.repairClient }))
+  const ui = await mount(React.createElement(P.CiPanel, { view: f.view, now: NOW, repairClient: f.repairClient }))
   try {
     const action = await openAction(ui, ENTITY)
     assert.equal(action.textContent, 'Open repair session')
@@ -143,7 +143,7 @@ test('reopen-existing: the same session id opens twice and no second repair is r
 
 test('hover-then-click: a real pointer (mouseenter, then click) keeps the popover open', async () => {
   const f = harness({ repair: repairRecord() })
-  const ui = await mount(React.createElement(P.Panel, { view: f.view, now: NOW, repairClient: f.repairClient }))
+  const ui = await mount(React.createElement(P.CiPanel, { view: f.view, now: NOW, repairClient: f.repairClient }))
   try {
     const slot = ui.container.querySelector(`[data-runner-slot="${ENTITY}"]`)
     const { MouseEvent } = ui.container.ownerDocument.defaultView
@@ -162,7 +162,7 @@ test('hover-then-click: a real pointer (mouseenter, then click) keeps the popove
 
 test('disabled-without-incident: the action stays disabled and opens nothing', async () => {
   const f = harness({ incident: false })
-  const ui = await mount(React.createElement(P.Panel, { view: f.view, now: NOW, repairClient: f.repairClient }))
+  const ui = await mount(React.createElement(P.CiPanel, { view: f.view, now: NOW, repairClient: f.repairClient }))
   try {
     const action = await openAction(ui, ENTITY)
     assert.equal(action.disabled, true)
