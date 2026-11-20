@@ -23,10 +23,22 @@ pytest_plugins = ["tests.agent.test_pre_final_gate"]
 
 
 @pytest.fixture(autouse=True)
-def clean_native_environments():
-    yield
-    from tools.terminal_tool_lifecycle import cleanup_vm
-    cleanup_vm("default")
+def clean_native_environments(tmp_path, monkeypatch):
+    # A launched pytest can inherit HERMES_SESSION_KEY (or a caller's bound
+    # ContextVar). Native local environments then live under session:<key>,
+    # not "default": cleaning the latter reused the first case's shell snapshot
+    # and skipped the next case's real shell-init config read. Own a session per
+    # test, and release its actual cache key before monkeypatch restores config.
+    from gateway.session_context import scoped_session_key
+    from tools.terminal_tool import _resolve_container_task_id
+    from tools.terminal_tool_lifecycle import cleanup_vm, get_active_env
+
+    with scoped_session_key("coach-native:" + str(tmp_path)):
+        try:
+            yield
+        finally:
+            cleanup_vm(_resolve_container_task_id("default"))
+            assert get_active_env("default") is None, "native fixture environment leaked"
 
 
 def probe(url):
