@@ -92,6 +92,16 @@ class ForecastTests(unittest.TestCase):
         self.assertEqual(out['verdict'], 'short')  # 40 left at 10/3 per h: dry in 12 h, no reset before 147 h
         self.assertEqual(out['runout_h'], 12)
 
+    def test_near_miss_before_a_reset_is_tight(self):
+        # 2 h of history at 5/h; 50 left lasts 10 h; nine spent accounts are back at 9 h -> 5 left at the low point,
+        # while the week's pace (5/h * 168 h over 50 + 900 + 50 supply) stays under 90%.
+        fc.forecast(self.home, 'openai-codex', [acct('x', used=40, week_reset=NOW + 150 * H)], NOW - 2 * H)
+        spent = [acct(f'y{i}', 'limited', back=NOW + 9 * H) for i in range(9)]
+        out = fc.forecast(self.home, 'openai-codex', [acct('x', used=50, week_reset=NOW + 150 * H), *spent], NOW)
+        self.assertEqual(out['gaps'], [])
+        self.assertLess(out['pace'], fc.TIGHT_PACE)
+        self.assertEqual(out['verdict'], 'tight')
+
     def test_records_are_throttled_per_provider(self):
         a = [acct('x', used=1)]
         fc.forecast(self.home, 'anthropic', a, NOW)

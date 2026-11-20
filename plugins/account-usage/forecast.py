@@ -16,7 +16,7 @@ Model (weekly windows only; the 5-hour session window is ignored):
 * projection, hourly for ``HORIZON_H``: fuel starts at ``left``, loses ``burn`` each hour, and gains each account
   back at its reset (a spent account +100 at its ``resets_at``; a ready one its used share at its weekly reset).
 * ``verdict``: ``short`` when fuel reaches 0 inside the horizon (``gaps`` say when), ``tight`` when the burn is over
-  90% of what the week refills, else ``ok``.
+  90% of what the week refills or fuel dips under ``TIGHT_MARGIN_H`` hours of burn before a reset, else ``ok``.
 
 Account labels (e-mail addresses) are hashed on arrival and never stored or returned.
 """
@@ -41,6 +41,7 @@ RECORD_EVERY_S = 300
 KEEP_S = 8 * 24 * 3600
 SAME_RESET_S = 600
 TIGHT_PACE = 0.9
+TIGHT_MARGIN_H = 3
 FILE_NAME = "account-usage-history.jsonl"
 PACING_DB = "llm_pacing_history.sqlite"
 WEEK_KIND = "seven_day"
@@ -229,7 +230,9 @@ def forecast(home: Path, provider: str, accounts: list[dict], now: Optional[floa
         return {"verdict": "learning", "left": p["left"], "burn_per_h": None, "history_h": round(span / 3600, 2),
                 "curve": p["curve"], "gaps": [], "runout_h": None, "pace": None, "resets_h": p["resets_h"]}
     p = project(norm, burn, now)
-    verdict = "short" if p["gaps"] else ("tight" if (p["pace"] or 0) > TIGHT_PACE else "ok")
+    # tight: over 90% of the week's supply, or the curve comes within TIGHT_MARGIN_H hours of empty before a reset.
+    near = burn > 0 and min(p["curve"]) < burn * TIGHT_MARGIN_H
+    verdict = "short" if p["gaps"] else ("tight" if near or (p["pace"] or 0) > TIGHT_PACE else "ok")
     return {"verdict": verdict, "left": p["left"], "burn_per_h": round(burn, 3), "history_h": round(span / 3600, 2),
             "curve": p["curve"], "gaps": p["gaps"], "runout_h": p["gaps"][0]["start_h"] if p["gaps"] else None,
             "pace": p["pace"], "resets_h": p["resets_h"]}

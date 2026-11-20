@@ -272,10 +272,17 @@ export function forecastText(f, now = Date.now()) {
   if (f.verdict === 'learning') return `learning… ${Math.round((f.history_h || 0) * 10) / 10}h of 2h history`
   if (f.verdict === 'short') {
     const g = f.gaps[0]
-    return `out ${atHour(g.start_h, now)} → ${g.end_h >= 168 ? 'past 7 days' : atHour(g.end_h, now)}`
+    const first = `out ${atHour(g.start_h, now)} → ${g.end_h >= 168 ? 'past 7 days' : atHour(g.end_h, now)}`
+    // Several dry spells: say how much of the week is dry in total, not just the first one.
+    const dry = f.gaps.reduce((n, x) => n + (x.end_h - x.start_h), 0)
+    return f.gaps.length > 1 ? `${first} · dry ${fmtHours(dry)} of 7d` : first
   }
   const pace = f.pace == null ? '' : ` · ${Math.round(f.pace * 100)}% of supply`
-  return f.verdict === 'tight' ? `tight${pace}` : `lasts the week${pace}`
+  if (f.verdict !== 'tight') return `lasts the week${pace}`
+  // Tight on timing (a near miss before a refill) rather than on the week's total.
+  if (f.pace != null && f.pace <= 0.9 && f.burn_per_h > 0 && Array.isArray(f.curve) && f.curve.length)
+    return `tight · ~${fmtHours(Math.min(...f.curve) / f.burn_per_h)} spare before a refill`
+  return `tight${pace}`
 }
 
 export function leftText(f) {
