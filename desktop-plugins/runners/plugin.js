@@ -10,7 +10,7 @@ import {
   PopoverContent,
   StatusDot
 } from '@hermes/plugin-sdk'
-import { createElement as h, useState, useEffect, useMemo } from 'react'
+import { createElement as h, useState, useEffect, useMemo, useRef } from 'react'
 
 const BAR =
   'inline-flex h-full items-center gap-1.5 px-1.5 text-[0.6875rem] text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground'
@@ -1022,7 +1022,116 @@ function StoppedNote({ machines, now }) {
     }, text(m.name))]))
 }
 
-export function Panel({ view, now, repairClient, throttle = null, onThrottle, throttleError }) {
+export const SCALER_COMMIT_MS = 200
+const SCALER_PATH = '/v1/scaler/limits'
+
+function validLimits(body) {
+  if (body?.contract_version !== 1 || body.ok !== true ||
+      !['min', 'max', 'active', 'asg_max'].every((k) => Number.isInteger(body[k]) && body[k] >= 0 && body[k] <= 5) ||
+      body.min > body.max) throw Error('Invalid scaler response')
+  return body
+}
+
+// Discover once per connection (limits are machine-wide), then pin every write to the answering route.
+// Never retry a POST on another host: a failed response may still have applied the change.
+export function createScalerClient(ctx, hostRef = host) {
+  const request = async (route, options = {}) => validLimits(await ctx.rest(
+    `${SCALER_PATH}?profile=${encodeURIComponent(route.targetProfile)}`,
+    { connectionId: route.connectionId, timeoutMs: 60000, ...options }))
+  return {
+    async read() {
+      const routes = new Map()
+      for (const route of (await hostRef.profileRoutes()).filter(validRoute)) {
+        const prev = routes.get(route.connectionId)
+        if (!prev || route.targetProfile === 'default') routes.set(route.connectionId, route)
+      }
+      const results = await Promise.all([...routes.values()].map(async (route) => {
+        try { return { route, limits: await request(route) } }
+        catch (e) { return (e?.status ?? e?.statusCode) === 404 ? null : { error: e } }
+      }))
+      const supported = results.filter((r) => r?.limits)
+      if (supported.length > 1) throw Error('Multiple autoscalers connected; limits not changed')
+      if (!supported.length && results.some((r) => r?.error)) throw results.find((r) => r?.error).error
+      return supported[0] || null
+    },
+    async write(source, limits) {
+      return { route: source.route, limits: await request(source.route, { method: 'POST', body: limits }) }
+    }
+  }
+}
+
+export function ScalerControls({ client }) {
+  const [source, setSource] = useState(null)
+  const [draft, setDraft] = useState(null)
+  const [error, setError] = useState(null)
+  const [saving, setSaving] = useState(false)
+  const current = useRef(null), pending = useRef(null), busy = useRef(false)
+  const timer = useRef(null), revision = useRef(0), alive = useRef(false)
+  useEffect(() => {
+    alive.current = true
+    const load = async () => {
+      if (busy.current || pending.current || document.visibilityState === 'hidden') return
+      const rev = revision.current
+      try {
+        const next = await client.read()
+        if (alive.current && rev === revision.current) { current.current = next; setSource(next); setError(null) }
+      } catch (e) {
+        if (alive.current && rev === revision.current) { setError(text(e?.message || e)); current.current = null; setSource(null) }
+      }
+    }
+    load()
+    const poll = setInterval(load, POLL_OPEN_MS)
+    return () => { alive.current = false; clearInterval(poll); clearTimeout(timer.current) }
+  }, [client])
+  const change = (key, value) => {
+    if (busy.current || !current.current) return
+    clearTimeout(timer.current)
+    revision.current++
+    const next = { ...(pending.current || current.current.limits), [key]: Number(value) }
+    if (key === 'min') next.max = Math.max(next.min, next.max)
+    else next.min = Math.min(next.min, next.max)
+    pending.current = { min: next.min, max: next.max }
+    setDraft(pending.current)
+  }
+  const commit = () => {
+    clearTimeout(timer.current)
+    if (busy.current || !pending.current || !current.current) return
+    timer.current = setTimeout(async () => {
+      const next = pending.current, owner = current.current
+      if (!next || !owner || !alive.current) return
+      if (next.min === owner.limits.min && next.max === owner.limits.max) {
+        pending.current = null; setDraft(null); return
+      }
+      busy.current = true; setSaving(true); setError(null)
+      revision.current++
+      try {
+        const readback = await client.write(owner, next)
+        if (alive.current) { current.current = readback; setSource(readback) }
+      } catch (e) {
+        if (alive.current) {
+          current.current = null; setSource(null)
+          setError(`Limits not confirmed: ${text(e?.message || e)}. Refresh before retrying.`)
+        }
+      } finally {
+        busy.current = false; pending.current = null
+        if (alive.current) { setSaving(false); setDraft(null) }
+      }
+    }, SCALER_COMMIT_MS)
+  }
+  if (!source && !error) return null // older/non-scaler gateways: unsupported, not a broken slider
+  const limits = draft || source?.limits
+  return h('div', { className: 'hermes-fleet-scaler', 'data-slot': 'runners-scaler' },
+    limits ? ['min', 'max'].map((key) => h('label', { key },
+      `${key === 'min' ? 'Min' : 'Max'} workers `,
+      h('input', { type: 'range', min: 0, max: 5, step: 1, value: limits[key],
+        'aria-label': `${key === 'min' ? 'Min' : 'Max'} workers`, disabled: saving,
+        onChange: (e) => change(key, e.target.value), onPointerUp: commit, onKeyUp: commit, onBlur: commit }),
+      h('output', null, String(limits[key])))) : null,
+    source ? h('span', { role: 'status' }, `ACTIVE ${source.limits.active}${saving ? ' · Saving…' : ''}`) : null,
+    error ? h('span', { role: 'alert', className: 'hermes-fleet-warning' }, error) : null)
+}
+
+export function Panel({ view, now, repairClient, throttle = null, onThrottle, throttleError, scalerClient }) {
   const s = summarize(view, throttle)
   const stopped = view.gateways.machines.filter((m) => m.state === 'stopped')
   return h('div', { className: 'hermes-fleet' },
@@ -1032,6 +1141,7 @@ export function Panel({ view, now, repairClient, throttle = null, onThrottle, th
         s.gWaiting != null ? h('span', { title: 'Unleased ready cards assigned to gateway-dispatched profiles, counted once across board replicas. Excludes non-dispatched assignees; some cards cannot run on every machine.' }, ` · ${s.gWaiting} waiting`) : null)),
     h(SectionNote, { section: view.gateways }),
     h(ThrottleBar, { throttle, onThrottle, error: throttleError }),
+    scalerClient ? h(ScalerControls, { client: scalerClient }) : null,
     h('div', { className: 'hermes-fleet-gw' },
       h(GatewayHead),
       ...view.gateways.machines.filter((m) => m.state !== 'stopped').map((m) => h(GatewayRow, { key: m.name, m, now, limit: limitRow(throttle, m.name) }))),
@@ -1114,6 +1224,7 @@ export function Runners({ ctx }) {
   const visible = useVisible()
   const transport = useMemo(() => transportFor(ctx), [ctx])
   const repairClient = useMemo(() => createRepairClient(ctx), [ctx])
+  const scalerClient = useMemo(() => createScalerClient(ctx), [ctx])
   const query = useQuery({
     queryKey: ['runners', 'fleet'],
     queryFn: () => transport.poll(),
@@ -1169,7 +1280,7 @@ export function Runners({ ctx }) {
       side: 'top', align: 'end', sticky: 'always', 'aria-label': 'Runners',
       className: 'hermes-fleet-popover',
       style: { width: 'max-content', minWidth: 'min(680px, calc(100vw - 24px))', maxWidth: 'calc(100vw - 24px)', maxHeight: '70vh', overflowY: 'auto', overflowX: 'auto', scrollbarGutter: 'stable' }
-    }, view ? h(Panel, { view, now, repairClient }) : h('div', { className: 'hermes-fleet-note' }, query.error ? `Unavailable: ${text(query.error.message)}` : 'Loading…'))
+    }, view ? h(Panel, { view, now, repairClient, scalerClient }) : h('div', { className: 'hermes-fleet-note' }, query.error ? `Unavailable: ${text(query.error.message)}` : 'Loading…'))
   )
 }
 
@@ -1201,6 +1312,10 @@ export function CI({ ctx }) {
 }
 
 export const CSS = `
+.hermes-fleet-scaler{display:flex;align-items:center;gap:16px;flex-wrap:wrap;font-size:11px;color:var(--ui-text-secondary);margin:6px 0 10px}
+.hermes-fleet-scaler label{display:flex;align-items:center;gap:6px;white-space:nowrap}
+.hermes-fleet-scaler input{width:110px;accent-color:var(--ui-text-secondary)}
+.hermes-fleet-scaler output{min-width:1ch;font-variant-numeric:tabular-nums}
 .hermes-ci-chip{display:inline-flex;align-items:center;gap:6px;color:var(--ui-text-tertiary,#8b8b94);font-size:10px;line-height:1;white-space:nowrap}
 .hermes-ci-chip.is-stale{opacity:.45}
 .hermes-ci-label{font-size:10px;font-weight:600;color:#a9a9b2;letter-spacing:.03em;margin-right:1px}

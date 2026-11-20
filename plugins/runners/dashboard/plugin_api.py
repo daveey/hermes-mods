@@ -399,6 +399,66 @@ def _shared_gateway_section():
     return _cached(_gateway_cache, lambda: _section(_gateway_section))
 
 
+def _workers_command(args):
+    """The scaler CLI owns host detection, locking, validation and all writes."""
+    import json
+    import shutil
+    import subprocess
+    command = shutil.which('hermes-workers')
+    if command is None:
+        local = Path.home() / '.local/bin/hermes-workers'
+        command = str(local) if local.is_file() else None
+    if command is None:
+        raise HTTPException(404, 'scaler_unsupported')
+    try:
+        result = subprocess.run([command, *args, '--json'], capture_output=True,
+                                text=True, timeout=45, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        raise HTTPException(503, 'scaler_unavailable') from None
+    if result.returncode == 3:
+        raise HTTPException(404, 'scaler_unsupported')
+    try:
+        body = json.loads(result.stdout)
+    except (ValueError, TypeError):
+        raise HTTPException(503, 'invalid_scaler_response') from None
+    if not isinstance(body, dict):
+        raise HTTPException(503, 'invalid_scaler_response')
+    if result.returncode == 2 and body.get('ok') is False and isinstance(body.get('error'), str):
+        raise HTTPException(400, body['error'])
+    if result.returncode != 0:
+        raise HTTPException(503, 'scaler_unavailable')
+    return body
+
+
+def _limits_response(body):
+    values = {key: body.get(key) for key in ('min', 'max', 'active')}
+    asg = body.get('asg')
+    asg_max = body.get('asg_max') if 'asg_max' in body else (asg.get('max') if isinstance(asg, dict) else None)
+    if (not all(type(v) is int for v in values.values())
+            or not 0 <= values['min'] <= values['max'] <= 5
+            or not 0 <= values['active'] <= 5
+            or type(asg_max) is not int or not 0 <= asg_max <= 5):
+        raise HTTPException(503, 'invalid_scaler_response')
+    return dict(contract_version=1, ok=True, **values, asg_max=asg_max)
+
+
+@router.get('/scaler/limits')
+def scaler_limits():
+    return _limits_response(_workers_command(['status']))
+
+
+@router.post('/scaler/limits')
+def set_scaler_limits(payload: dict):
+    if (set(payload) != {'min', 'max'}
+            or type(payload['min']) is not int or type(payload['max']) is not int
+            or not 0 <= payload['min'] <= payload['max'] <= 5):
+        raise HTTPException(400, 'limits must be integers with 0 <= min <= max <= 5')
+    body = _workers_command(['scale', '--min', str(payload['min']), '--max', str(payload['max'])])
+    if body.get('ok') is not True:
+        raise HTTPException(503, 'invalid_scaler_response')
+    return _limits_response(body)
+
+
 @router.get('/fleet')
 def fleet_view():
     """Machines and slots: gateway workers (Board registry + leases) and CI workers (collector).

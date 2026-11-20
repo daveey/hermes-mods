@@ -37,6 +37,7 @@ function ctxWith(responses) {
   return {
     calls,
     rest: async (path, opts) => {
+      if (path.startsWith('/v1/scaler/limits')) throw Object.assign(Error('unsupported'), { status: 404 })
       calls.push([path, opts])
       const next = responses.length > 1 ? responses.shift() : responses[0]
       if (next instanceof Error) throw next
