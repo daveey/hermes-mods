@@ -133,6 +133,23 @@ class RealCorePollTests(unittest.TestCase):
         self.assertEqual(list(out['accounts']), ['anthropic'])
         self.assertEqual(len(out['accounts']['anthropic']), 1)
 
+    def test_credential_health_reads_the_persisted_row_and_never_load_pool(self):
+        # load_pool can seed, heal and save auth.json; a health readback must leave the file alone.
+        import os
+        path = os.path.join(self.home, 'auth.json')
+        with open(path, 'rb') as fh:
+            before = fh.read()
+        stamp = os.stat(path).st_mtime_ns
+        out = api.credential_health('anthropic', 'row0')
+        self.assertEqual((out['found'], out['credential_id'], out['status']), (True, 'row0', 'ok'))
+        self.assertTrue(out['account_id'])
+        self.assertNotIn('fixture-a', repr(out))
+        gone = api.credential_health('anthropic', 'nope')
+        self.assertEqual((gone['found'], gone['status']), (False, 'unknown'))
+        with open(path, 'rb') as fh:
+            self.assertEqual(fh.read(), before)
+        self.assertEqual(os.stat(path).st_mtime_ns, stamp)
+
 
 if __name__ == '__main__':
     unittest.main()
