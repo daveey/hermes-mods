@@ -3820,29 +3820,35 @@ def backlog_report(store, now: float, board: str = "default", *, filed_today=Non
 
 
 def refresh_backlog_report(store, now: float, board: str = "default", runner=None) -> dict:
-    """Replace the standing body, then rearm its 48-hour dead-man alarm.
+    """Standing report, rotated once per UTC day (never re-scheduled; core cannot renew a scheduled card).
 
-    Called under the drain lock. A failed edit must not extend the old deadline.
-    The brief also parks an early claimant across the create/schedule CLI gap.
+    Key `selfheal-backlog:<board>:<day>` (`:<n>` when closed by hand). A new day's card is created, scheduled
+    clock-only to next 00:00Z + 48 h (the dead-man horizon), and only then is the previous day's card archived.
+    Every drain edits the body once. Called under the drain lock.
     """
     state = _json_state(store, BACKLOG_REPORT_STATE)
     slot = state.get(board) or {}
-    tid = slot.get("card")
-    gen = int(slot.get("gen") or 1)
-    wake = _iso(now + 48 * 3600)
+    day = _utc_day(now)
+    wake = _iso((int(now) // 86400 + 1) * 86400 + 48 * 3600)
     body = (f"## Drain dead-man alarm (wake {wake})\n"
             f"Before {wake}, schedule this card to {wake} with clock_only=true and stop.\n"
             "If you are running this card after that deadline, the self-heal backlog drain has not "
             "refreshed it in 48 h. Diagnose why cron()'s drain stopped (hub selfheal_lane.py cron, "
             "log.jsonl selfheal_backlog_* events), fix it or file one card for the cause, then "
-            "re-arm this card (schedule +48 h) and stop. Never edit the backlog rows or file defects "
-            "from here.\n\n" + backlog_report(store, now, board)["body"])
+            "archive this card (the next healthy drain recreates it) and stop. Never edit the backlog "
+            "rows or file defects from here.\n\n" + backlog_report(store, now, board)["body"])
+    tid, prev = None, slot.get("prev")
+    gen = int(slot.get("gen") or 1)
     try:
-        if tid and _card_ended(board, tid):
-            gen, tid = gen + 1, None
+        if slot.get("day") == day and slot.get("card"):
+            tid = slot["card"]
+            if _card_ended(board, tid):
+                gen, tid = gen + 1, None
+        elif slot.get("card"):
+            prev, gen = slot["card"], 1  # yesterday's card: archived only after today's is scheduled
         if not tid:
             for _ in range(3):
-                key = f"{BACKLOG_KEY}{board}" + (f":{gen}" if gen > 1 else "")
+                key = f"{BACKLOG_KEY}{board}:{day}" + (f":{gen}" if gen > 1 else "")
                 args = {"title": f"self-heal backlog: {board}", "body": body,
                         "idempotency_key": key, "max_runtime": DIGEST_RUNTIME,
                         "board": board, "assignee": "default", "created_by": CREATED_BY,
@@ -3857,15 +3863,25 @@ def refresh_backlog_report(store, now: float, board: str = "default", runner=Non
                 gen, tid = gen + 1, None
             if not tid:
                 raise RuntimeError("report keys returned closed cards")
-            state[board] = {"card": tid, "gen": gen}
+            state[board] = {"card": tid, "gen": gen, "day": day, "scheduled": False, "prev": prev}
             _save_json_state(store, BACKLOG_REPORT_STATE, state)
+        slot = state[board]
         rc, out, err = _run(_kanban_board_argv(board) + ["edit", tid, "--body", body], runner)
         if rc:
             raise RuntimeError("report edit failed: " + (err or out)[-300:])
-        rc, out, err = _run(_kanban_board_argv(board) + ["schedule", tid,
-            f"SCHEDULED_UNTIL={wake} self-heal drain dead-man alarm", "--clock-only"], runner)
-        if rc:
-            raise RuntimeError("report schedule failed: " + (err or out)[-300:])
+        if not slot.get("scheduled"):
+            rc, out, err = _run(_kanban_board_argv(board) + ["schedule", tid,
+                f"SCHEDULED_UNTIL={wake} self-heal drain dead-man alarm", "--clock-only"], runner)
+            if rc:
+                raise RuntimeError("report schedule failed: " + (err or out)[-300:])
+            slot["scheduled"] = True
+            _save_json_state(store, BACKLOG_REPORT_STATE, state)
+        if slot.get("prev"):
+            rc, out, err = _run(_kanban_board_argv(board) + ["archive", slot["prev"]], runner)
+            if rc:
+                raise RuntimeError("previous report archive failed: " + (err or out)[-300:])
+            slot["prev"] = None
+            _save_json_state(store, BACKLOG_REPORT_STATE, state)
     except Exception as exc:  # health: allow BLE001 -- report failure never discards queue evidence
         store.log({"event": "selfheal_backlog_report_error", "board": board,
                    "card": tid, "error": str(exc)[:400]})
