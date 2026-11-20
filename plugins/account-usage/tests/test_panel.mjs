@@ -291,9 +291,9 @@ test('a row core removed for a dead grant stays listed as signed out until sign-
  // The provider's last account: the chip itself must not vanish.
  const alone=plugin.withSignedOut([{slug:'anthropic',accounts:[{id:'c',label:'c',state:'ready'}],total:1}],r.$state.get())
  assert.deepEqual(alone.map(x=>x.slug),['anthropic','openai-codex']); assert.equal(alone[1].accounts[0].signedOut,true); assert.equal(alone[1].tag,'GPT')
- // Still listed by the backend (by id or by label): no ghost, no duplicate row.
+ // Only the same backend identity suppresses a ghost; a matching label proves nothing.
  assert.equal(plugin.withSignedOut([{slug:'openai-codex',total:1,accounts:[{id:'gone',label:'x',state:'unavailable'}]}],r.$state.get())[0].accounts.length,1)
- assert.equal(plugin.withSignedOut([{slug:'openai-codex',total:1,accounts:[{id:'new',label:'Gone acct',state:'ready'}]}],r.$state.get())[0].accounts.length,1)
+ assert.equal(plugin.withSignedOut([{slug:'openai-codex',total:1,accounts:[{id:'new',label:'Gone acct',state:'ready'}]}],r.$state.get())[0].accounts.length,2)
  // Sign-in on the ghost row survives cancel, and a verified sign-in removes the ghost.
  await r.cancelAuth('openai-codex',acct); assert.equal(r.$state.get()[k].removed,true)
  groups=[{slug:'openai-codex',total:2,accounts:[{id:'keep',label:'keep',state:'ready'},{id:'gone',label:'Gone acct',state:'ready'}]}]
@@ -347,7 +347,7 @@ test('every auth row has a supported next step: Reconnect, in-app sign-in, or Se
  assert.equal(pill('openai-codex',{id:'q',label:'Q',state:'limited',limit_kind:'quota',reason:'usage_limit'}),null)
  assert.equal(pill('openai-codex',{...dead,disabled:true}),null)
 })
-test('Claude sign-in: Settings handoff, then Check reads health back across the token-fingerprint id change', async () => {
+test('Claude sign-in: a changed fingerprint cannot be verified by a matching display label', async () => {
  const {mod,nav}=await setupUi(); const apiCalls=[]
  let groups=[{slug:'anthropic',accounts:[{id:'fp:old',label:'me',state:'unavailable',reason:'auth'}]}]
  const ctx={onDispose(){},api:async req=>{apiCalls.push(req); throw new Error('no in-app Anthropic OAuth')},async rest(){return {ok:false,status:'needs_sign_in',needs_sign_in:true,auth_flow:'external'}}}
@@ -360,9 +360,13 @@ test('Claude sign-in: Settings handoff, then Check reads health back across the 
  let st=r.$state.get()[k]; assert.equal(st.message,'Still needs sign-in'); assert.equal(st.opened,true); assert.equal(st.authFlow,'external'); assert.notEqual(st.done,true)
  groups=[{slug:'anthropic',accounts:[{id:'fp:new',label:'me',state:'ready'}]}]
  await r.check('anthropic',acct)
- st=r.$state.get()[k]; assert.equal(st.done,true); assert.equal(st.message,'Reconnected')
- assert.equal(mod.rowFix(r.$state.get(),'anthropic',groups[0].accounts[0]).message,'Reconnected','result follows the account to its new id')
+ st=r.$state.get()[k]; assert.notEqual(st.done,true); assert.equal(st.unverified,true)
+ assert.deepEqual(mod.rowFix(r.$state.get(),'anthropic',groups[0].accounts[0]),{},'a label is not verified account identity')
  assert.deepEqual(mod.rowFix(r.$state.get(),'anthropic',{id:'fp:other',label:'someone else'}),{})
+ // Supported external add retains the old DEAD row: never claim it was repaired.
+ groups[0].accounts.push({id:'fp:old',label:'me',state:'unavailable',reason:'auth'})
+ await r.check('anthropic',acct)
+ assert.equal(r.$state.get()[k].message,'Still needs sign-in')
  // Two accounts sharing a label: no guess.
  assert.equal(mod.accountHealth([{slug:'anthropic',accounts:[{id:'1',label:'me',state:'ready'},{id:'2',label:'me',state:'ready'}]}],'anthropic','fp:old','me'),'missing')
  // Another account that merely shares the label keeps its own dead-grant controls.
@@ -371,6 +375,15 @@ test('Claude sign-in: Settings handoff, then Check reads health back across the 
  const store={key:r.key,openSettings(){},check(){},reconnect(){},signIn(){},cancelAuth(){},openPage(){}}
  assert.deepEqual(controls(mod.ReconnectLine({g:{slug:'anthropic'},a:twin,reconnectStore:store,reconnectState:r.$state.get()})).map(x=>x[1]),
   ['Open sign-in settings for me','Saved sign-in expired — sign in from Settings › Accounts'])
+})
+test('same-label siblings neither verify nor hide a removed selected account', async () => {
+ const {plugin}=await setup()
+ const sibling={id:'sibling',label:'Shared name',state:'ready'}
+ const groups=[{slug:'openai-codex',accounts:[sibling],total:1}]
+ assert.equal(plugin.accountHealth(groups,'openai-codex','removed','Shared name'),'missing')
+ const state={x:{removed:true,provider:'openai-codex',id:'removed',label:'Shared name'}}
+ assert.deepEqual(plugin.withSignedOut(groups,state)[0].accounts.map(a=>a.id),['sibling','removed'])
+ assert.equal(plugin.withSignedOut([{...groups[0],accounts:[{...sibling,id:'removed'}]}],state)[0].accounts.length,1)
 })
 test('reconnect state is scoped to its gateway and profile: no ghost, result or action crosses over', async () => {
  const {plugin,state}=await setup(); state.connectionId.set('gw-A'); state.profile.set('pA')
