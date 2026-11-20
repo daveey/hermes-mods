@@ -113,9 +113,13 @@ def sections(scope: str) -> dict[str, str]:
     scope = _clean(scope)
     marks = [(m.start(), m.end(), _norm(m.group(1))) for m in _HEADING.finditer(scope)]
     taken = [(s, e) for s, e, _ in marks]
-    for m in _WORD_LABEL.finditer(scope):
-        if _at_boundary(scope, m.start()) and not any(s <= m.start() < e for s, e in taken):
-            marks.append((m.start(), m.end(), _norm(m.group(1))))
+    words = [m for m in _WORD_LABEL.finditer(scope)
+             if _at_boundary(scope, m.start()) and not any(s <= m.start() < e for s, e in taken)]
+    # With two or more line-start labels (headings count) the scope is laid out line by line, and a sentence-end
+    # "Recommended:" inside an option's text is prose; a single-line scope keeps its sentence-end labels.
+    if len(marks) + sum(_line_start(scope, m.start(), bullets=True) for m in words) >= 2:
+        words = [m for m in words if _line_start(scope, m.start(), bullets=True)]
+    marks += [(m.start(), m.end(), _norm(m.group(1))) for m in words]
     marks.sort()
     stops = sorted([s for s, _, _ in marks] + [m.start() for m in _CONTRACT_LINE.finditer(scope)])
     out: dict[str, str] = {}
@@ -123,14 +127,19 @@ def sections(scope: str) -> dict[str, str]:
         if name in out:
             continue
         nxt = next((s for s in stops if s >= end), len(scope))
-        out[name] = scope[end:nxt].strip()
+        out[name] = re.sub(r"[\s>*-]+$", "", scope[end:nxt]).strip()  # the next label's bullet/quote marker
     return out
 
 
-def _line_start(text: str, pos: int) -> bool:
+def _line_start(text: str, pos: int, bullets: bool = False) -> bool:
+    """pos starts a line (after spaces; with bullets=True also after a bullet/quote marker)."""
     i = pos - 1
     while i >= 0 and text[i] in " \t":
         i -= 1
+    if bullets and i >= 0 and text[i] in "-*>":
+        i -= 1
+        while i >= 0 and text[i] in " \t":
+            i -= 1
     return i < 0 or text[i] == "\n"
 
 
@@ -141,6 +150,9 @@ def options(text: str) -> list[str]:
     text = _clean(text)
     cands = [m.start() for m in _OPTION.finditer(text)]
     line = [s for s in cands if _line_start(text, s)]
+    lettered = [s for s in line if re.match(r"[-*\s]*(?:\*\*)?(?:[Oo]ption\s+)?\(?[A-F]", text[s:])]
+    if len(lettered) >= 2:
+        line = lettered  # numbered sub-steps under lettered options stay inside their option
     starts = line if len(line) >= 2 else [s for s in cands if _at_boundary(text, s)]
     items = []
     for i, s in enumerate(starts):

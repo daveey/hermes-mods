@@ -357,7 +357,12 @@ const BRIEF_MIN = 20
 const flatText = t => t.replace(/\*\*|__/g, '').replace(/\s+/g, ' ').trim()
 const cleanText = t => String(t || '').replace(/\r\n?/g, '\n')
 const skipBack = (t, i) => { while (i >= 0 && (t[i] === ' ' || t[i] === '\t')) i--; return i }
-const lineStart = (t, pos) => { const i = skipBack(t, pos - 1); return i < 0 || t[i] === '\n' }
+/** pos starts a line (after spaces; with bullets also after a bullet/quote marker). */
+const lineStart = (t, pos, bullets = false) => {
+  let i = skipBack(t, pos - 1)
+  if (bullets && i >= 0 && '-*>'.includes(t[i])) i = skipBack(t, i - 1)
+  return i < 0 || t[i] === '\n'
+}
 /** pos starts a line (after spaces, a bullet/quote) or follows a sentence end (. ! ? ;) and spaces. */
 function atBoundary(t, pos) {
   const i = skipBack(t, pos - 1)
@@ -371,7 +376,9 @@ const briefName = n => { n = n.toLowerCase(); return n.startsWith('situation') ?
 export function briefOptions(text) {
   text = cleanText(text)
   const cands = [...text.matchAll(BRIEF_OPTION)].map(m => m.index)
-  const line = cands.filter(s => lineStart(text, s))
+  let line = cands.filter(s => lineStart(text, s))
+  const lettered = line.filter(s => /^[-*\s]*(?:\*\*)?(?:[Oo]ption\s+)?\(?[A-F]/.test(text.slice(s)))
+  if (lettered.length >= 2) line = lettered // numbered sub-steps under lettered options stay inside their option
   const starts = line.length >= 2 ? line : cands.filter(s => atBoundary(text, s))
   return starts.map((s, i) => flatText(text.slice(s, starts[i + 1] ?? text.length)).replace(/^[-*]\s*/, '')).filter(Boolean)
 }
@@ -381,16 +388,18 @@ export function briefOf(scope) {
   scope = cleanText(scope)
   const marks = [...scope.matchAll(BRIEF_HEADING)].map(m => ({ start: m.index, end: m.index + m[0].length, name: briefName(m[1]) }))
   const taken = marks.map(m => [m.start, m.end])
-  for (const m of scope.matchAll(BRIEF_WORD)) {
-    if (atBoundary(scope, m.index) && !taken.some(([s, e]) => s <= m.index && m.index < e)) marks.push({ start: m.index, end: m.index + m[0].length, name: briefName(m[1]) })
-  }
+  let words = [...scope.matchAll(BRIEF_WORD)].filter(m => atBoundary(scope, m.index) && !taken.some(([s, e]) => s <= m.index && m.index < e))
+  // With two or more line-start labels (headings count) the scope is laid out line by line, and a sentence-end
+  // "Recommended:" inside an option's text is prose; a single-line scope keeps its sentence-end labels.
+  if (marks.length + words.filter(m => lineStart(scope, m.index, true)).length >= 2) words = words.filter(m => lineStart(scope, m.index, true))
+  for (const m of words) marks.push({ start: m.index, end: m.index + m[0].length, name: briefName(m[1]) })
   marks.sort((x, y) => x.start - y.start)
   const stops = [...marks.map(m => m.start), ...[...scope.matchAll(BRIEF_CONTRACT)].map(m => m.index)].sort((x, y) => x - y)
   const parts = {}
   for (const m of marks) {
     if (m.name in parts) continue
     const next = stops.find(s => s >= m.end) ?? scope.length
-    parts[m.name] = scope.slice(m.end, next).trim()
+    parts[m.name] = scope.slice(m.end, next).replace(/[\s>*-]+$/, '').trim() // the next label's bullet/quote marker
   }
   const situation = flatText(parts.situation || '')
   if (situation.length < BRIEF_MIN) return null

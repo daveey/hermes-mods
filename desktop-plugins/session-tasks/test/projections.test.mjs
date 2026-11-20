@@ -881,3 +881,12 @@ test('briefOf parity: option over-split, double spaces, CRLF (review of ask-gate
   assert.equal(m.briefOf('## Situation\r\nThe app closed so the last check cannot attach.\r\n').situation, 'The app closed so the last check cannot attach.')
   assert.equal(m.briefOf('Situation: **short** __x__'), null, 'length counts after markup is removed')
 })
+
+test('briefOf parity: label inside option text, bullet leak, nested sub-steps (third review)', () => {
+  const b = m.briefOf('Situation: The patch is ready and the vendor signed off on it.\nOptions:\nA) Apply the patch. Recommended: by vendor.\nB) Wait a week.\nRecommend: A because it fixes it now.')
+  assert.deepEqual(b.options, ['A) Apply the patch. Recommended: by vendor.', 'B) Wait a week.'])
+  assert.equal(b.recommend, 'A because it fixes it now.')
+  const c = m.briefOf('- Situation: The app closed and the check is open.\n- Options:\n- A) one\n- B) two\n- Recommend: A - it is cheap enough.')
+  assert.deepEqual(c, { situation: 'The app closed and the check is open.', options: ['A) one', 'B) two'], recommend: 'A - it is cheap enough.' })
+  assert.deepEqual(m.briefOptions('A) restart\n1. stop\n2. start\nB) accept'), ['A) restart 1. stop 2. start', 'B) accept'])
+})

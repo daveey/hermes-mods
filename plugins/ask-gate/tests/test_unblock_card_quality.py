@@ -231,9 +231,9 @@ def test_contract_scope_hold_says_keep_the_scope(gate):
     hr = dict(INCIDENT, scope="acme/widgets#12 head abcdef1", choices=None)
     r = _block(gate, hr, task="t_33333333")
     assert r and r["action"] == "block"
-    if "unblock_card_hold" in r["message"]:
-        assert "keep scope exactly as it is" in r["message"]
-        assert "'Situation:'" not in r["message"]
+    assert "unblock_card_hold" in r["message"]
+    assert "keep scope exactly as it is" in r["message"]
+    assert "'Situation:'" not in r["message"]
     msg = gate.unblock_card_quality.hit(hr)["message"]
     assert "keep scope exactly as it is" in msg and "why_human" in msg
 
@@ -274,3 +274,23 @@ def test_retitled_creates_are_capped_per_session(gate):
                                args={"title": f"retitle {i}", "initial_status": "blocked", "human_request": INCIDENT})
         held += bool(r and "unblock_card_hold" in r.get("message", ""))
     assert held == gate.unblock_card_quality.MAX_CREATE_HOLDS
+
+
+# ── third review ────────────────────────────────────────────────────────────────────────────────────────────────
+def test_label_inside_option_text_is_prose(gate):
+    q = gate.unblock_card_quality
+    scope = ("Situation: The patch is ready and the vendor signed off on it.\nOptions:\n"
+             "A) Apply the patch. Recommended: by vendor.\nB) Wait a week.\nRecommend: A because it fixes it now.")
+    parts = q.sections(scope)
+    assert q.options(parts["options"]) == ["A) Apply the patch. Recommended: by vendor.", "B) Wait a week."]
+    assert parts["recommend"] == "A because it fixes it now."
+
+
+def test_next_labels_bullet_does_not_leak(gate):
+    parts = gate.unblock_card_quality.sections("- Situation: The app closed and the check is open.\n- Options:\n- A) one\n- B) two\n- Recommend: A - it is cheap enough.")
+    assert parts["situation"] == "The app closed and the check is open."
+    assert gate.unblock_card_quality.options(parts["options"]) == ["A) one", "B) two"]
+
+
+def test_numbered_substeps_stay_in_their_option(gate):
+    assert gate.unblock_card_quality.options("A) restart\n1. stop\n2. start\nB) accept") == ["A) restart 1. stop 2. start", "B) accept"]
