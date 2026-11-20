@@ -74,7 +74,11 @@ say what's running, never what needs the user.
   summed across every board DB. Also grep that log for `dispatch held for a core update drain`, or check
   for `~/.hermes/core-update/drain-hold`. Remembered capacity goes stale, and a drain holds every spawn
   however many slots are free. The latest `dispatcher stuck` line names each held card's reason
-  (`update_admission_hold`, `labels_mismatch`, `waiting_for_worker_capacity`). When you bump a card the chat
+  (`update_admission_hold`, `labels_mismatch`, `waiting_for_worker_capacity`). For a pool card, read that line on the
+  workers (`~/.hermes/bin/hub-worker-exec all -- '<cmd>'`; one target or `all`, not a list): `claim_deferred(sync_first_round)`
+  on every card means that worker's sync loop is dead and it claims nothing. Confirm with `hermes kanban sync status`
+  (`running: no`) and `grep "kanban_sync_watcher died" gateway.log`. That is a pool outage: no bump or re-place helps, so
+  file the crash on its own card. When you bump a card the chat
   waits on, first read the priority spread across `ready`, `scheduled` and `todo`, plus the priorities of
   recent `spawned` events (`task_events` joined to `tasks`). Set it above the top of all of them, because
   scheduled cards and continuations that wake later, at 9000+, jump ahead of a value that only beat the ready
