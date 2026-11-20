@@ -551,7 +551,17 @@ def check_origin_reached(task_id: str, board: Path, body: str, metadata: Any = N
         context = _origin_receipt_context(task_id, board, owner)
         hit = _sibling('origin_receipts').reached(context, ro_connect) if context else set()
         missing = [s for s in missing if not _matches_origin(s, hit)]
-    gone = _sibling('origin_gone').evidence(missing, replica_paths([board]), ro_connect) if missing else {}
+    gone = {}
+    if missing:
+        try:
+            from contextlib import closing
+            with closing(ro_connect(board)) as creation_conn:
+                row = creation_conn.execute('SELECT created_at FROM tasks WHERE id=?', (task_id,)).fetchone()
+                created = row[0] if row else None
+            gone = _sibling('origin_gone').evidence(
+                missing, replica_paths([board]), ro_connect, task_created_at=created)
+        except Exception:  # health: allow BLE001 -- unknown evidence retains the refusal
+            gone = {}
     notes = '\n'.join(comments + [metadata_text(metadata)])
     missing = [ref for ref in missing if ref not in gone or gone[ref] not in notes]
     if not missing:

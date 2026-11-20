@@ -12,9 +12,9 @@ def runtime():
     return _hub_db(), Hub(load_identity()).machines()
 
 
-def recent(value, now):
+def recent(value, now, limit=180):
     value = float(value)
-    return math.isfinite(value) and 0 <= now - value <= 180
+    return math.isfinite(value) and 0 <= now - value <= limit
 
 
 def coverage(hub, registry, now, terminated=()):
@@ -51,6 +51,9 @@ def coverage(hub, registry, now, terminated=()):
             fresh = any(s.get('state') == 'ok' and recent(s.get('observed_at'), now)
                         for s in info['task_scopes'])
             if not fresh and gw in terminated:
+                checked = terminated[gw]
+                if any(float(s['observed_at']) > checked for s in info['task_scopes']):
+                    raise ValueError('inventory postdates termination')
                 continue
         profiles = info['profiles']
         if (info['gateway'] != gw or not isinstance(profiles, list) or not profiles
@@ -77,11 +80,11 @@ def owner_read(hub, gw, profile, sid, now):
         if (body.get('to_gw'), body.get('coll'), body.get('key'), body.get('action')) != (
                 gw, 'sessions', f'{profile}/{sid}', 'notice-receipts'):
             continue
-        if not recent(created, now):
+        if not recent(created, now, 600):
             continue
         res = json.loads(answer) if answer else None
         keys = body.get('args', {}).get('keys')
-        if (body.get('id') != rid or state != 'done' or not recent(done, now) or done < created
+        if (body.get('id') != rid or state != 'done' or not recent(done, now, 600) or done < created
                 or not isinstance(keys, str) or not keys
                 or not isinstance(res, dict) or res.get('code') != 'notice_receipts'
                 or res.get('profile') != profile or res.get('session') != sid
@@ -102,7 +105,7 @@ def absent_rounds(hub, required, sid, now):
     first = [rows[0][2] for rows in reads]
     second = []
     for rows in reads:
-        later = [r for r in rows if r[0] > boundary]
+        later = [r for r in rows if r[0] > boundary and recent(r[0], now)]
         if not later:
             raise ValueError('second absence sweep missing')
         second.append(later[0][2])
@@ -119,7 +122,7 @@ def terminal(record, now):
             and bool(event.get('to')) and event['to'] != event.get('from'))
 
 
-def evidence(refs, replicas, ro_connect):
+def evidence(refs, replicas, ro_connect, *, task_created_at=None):
     """No writes/refreshes. All errors are unknown, never exception permission."""
     refs = [r for r in refs if r[0] and r[1]]
     if not refs:
@@ -144,7 +147,9 @@ def evidence(refs, replicas, ro_connect):
                         terminations[gw] = (at, uid, event)
         with closing(ro_connect(path)) as hub:
             hub.execute('BEGIN')
-            dead = {gw for gw, record in terminations.items() if terminal(record, now)}
+            dead = {gw: record[2]['proof']['checked_at'] for gw, record in terminations.items()
+                    if terminal(record, now) and task_created_at is not None
+                    and 0 < task_created_at <= record[2]['proof']['checked_at']}
             required = coverage(hub, registry, now, dead)
             out = {}
             for ref in refs:
@@ -153,14 +158,12 @@ def evidence(refs, replicas, ro_connect):
                     at, uid, event = terminations.get(ref[0], (0, '', {}))
                     proof = event.get('proof', {})
                     checked = proof.get('checked_at')
-                    if (proof.get('ec2_state') != 'terminated' or not proof.get('instance_id')
-                            or type(checked) is not int or not 0 < checked <= at <= now
-                            or at - checked > 300 or not event.get('to') or event['to'] == ref[0]):
+                    if ref[0] not in dead or not terminal((at, uid, event), now):
                         continue
                     # This only explains the missing member; it is NOT identity
                     # authority for the SID. Exact absence everywhere else is
                     # mandatory independently, including any reused name.
-                    lifecycle = f'; server rehomed {uid}; instance {proof["instance_id"]}; terminated checked_at={checked}'
+                    lifecycle = f'; Board admin-attested rehome {uid}; instance {proof["instance_id"]}; terminated checked_at={checked}'
                 ids = absent_rounds(hub, required, ref[2], now)
                 out[ref] = (f'follow-through: origin chat gone @session:{ref[1]}@{ref[0]}/{ref[2]}; '
                             'fresh exact owner-store absence on every registered gateway/profile; '

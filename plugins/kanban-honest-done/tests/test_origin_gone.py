@@ -24,9 +24,9 @@ def world(tmp_path, monkeypatch):
     now = int(time.time())
     live = tmp_path / 'kanban.db'
     with sqlite3.connect(live) as c:
-        c.executescript('CREATE TABLE tasks(id TEXT, title TEXT, body TEXT, status TEXT); '
+        c.executescript('CREATE TABLE tasks(id TEXT, title TEXT, body TEXT, status TEXT, created_at INT); '
                         'CREATE TABLE task_comments(task_id TEXT,body TEXT);')
-        c.execute('INSERT INTO tasks VALUES(?,?,?,?)', (TASK, 'Repair', BODY, 'running'))
+        c.execute('INSERT INTO tasks VALUES(?,?,?,?,?)', (TASK, 'Repair', BODY, 'running', now - 3600))
     shadow = tmp_path / 'shadow.db'
     with sqlite3.connect(shadow) as c:
         c.executescript('CREATE TABLE kanban_sync_state(mode TEXT,pulled_at REAL); '
@@ -66,8 +66,60 @@ def check(world, metadata=None):
 
 
 def note(world):
-    evidence = core._sibling('origin_gone').evidence([('retired-worker', 'default', SID)], [world[1]], core.ro_connect)
+    evidence = core._sibling('origin_gone').evidence([('retired-worker', 'default', SID)], [world[1]], core.ro_connect,
+                                                    task_created_at=int(time.time()) - 3600)
     return evidence.get(('retired-worker', 'default', SID))
+
+
+@pytest.mark.parametrize('inventory', [True, False])
+def test_termination_before_card_or_later_inventory_is_unknown(world, inventory):
+    now = int(time.time())
+    world[3]['machines'].pop()
+    event = {'from': 'retired-worker', 'to': 'reader', 'proof': {
+        'instance_id': 'i-0123456789abcdef0', 'ec2_state': 'terminated', 'checked_at': now - 86400}}
+    with sqlite3.connect(world[1]) as c:
+        c.execute('INSERT INTO task_events VALUES(?,?,?,?,?)',
+                  ('old-incarnation', 'rehomed', 'server', json.dumps(event), now - 86400))
+    with sqlite3.connect(world[2]) as c:
+        if inventory:
+            info = json.loads(c.execute("SELECT data FROM replica WHERE gw='retired-worker'").fetchone()[0])
+            info['task_scopes'][0]['observed_at'] = now - 3600
+            c.execute("UPDATE replica SET data=? WHERE gw='retired-worker'", (json.dumps(info),))
+        else:
+            c.execute("DELETE FROM replica WHERE gw='retired-worker'")
+    assert note(world) is None
+
+
+def test_production_length_sequential_sweeps(world):
+    now = time.time()
+    with sqlite3.connect(world[2]) as c:
+        c.execute("UPDATE sent SET created_at=?,done_at=? WHERE id NOT LIKE '%round2'", (now-240, now-120))
+        c.execute("UPDATE sent SET created_at=?,done_at=? WHERE id LIKE '%round2'", (now-119, now-1))
+    assert note(world)
+
+
+def test_inventory_after_post_card_termination_refuses(world):
+    now = int(time.time())
+    world[3]['machines'].pop()
+    event = {'from': 'retired-worker', 'to': 'reader', 'proof': {
+        'instance_id': 'i-0123456789abcdef0', 'ec2_state': 'terminated', 'checked_at': now - 600}}
+    with sqlite3.connect(world[1]) as c:
+        c.execute('INSERT INTO task_events VALUES(?,?,?,?,?)',
+                  ('post-card-old-incarnation', 'rehomed', 'server', json.dumps(event), now - 600))
+    with sqlite3.connect(world[2]) as c:
+        info = json.loads(c.execute("SELECT data FROM replica WHERE gw='retired-worker'").fetchone()[0])
+        info['task_scopes'][0]['observed_at'] = now - 300
+        c.execute("UPDATE replica SET data=? WHERE gw='retired-worker'", (json.dumps(info),))
+    assert note(world) is None
+
+
+@pytest.mark.parametrize('first,second', [(601, 10), (400, 181)])
+def test_bounded_sweeps_still_expire(world, first, second):
+    now = time.time()
+    with sqlite3.connect(world[2]) as c:
+        c.execute("UPDATE sent SET created_at=?,done_at=? WHERE id NOT LIKE '%round2'", (now-first, now-second-2))
+        c.execute("UPDATE sent SET created_at=?,done_at=? WHERE id LIKE '%round2'", (now-second, now-1))
+    assert note(world) is None
 
 
 def test_reused_gateway_exact_absence_passes_only_with_note(world):

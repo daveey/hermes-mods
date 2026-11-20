@@ -107,9 +107,20 @@ read-only `SessionDB.get_session`, not the truncated published catalog. Envelope
 receiver echo, successful state and freshness are checked independently. A live
 session, missing/stale/failed/partial answer or unreachable owner refuses.
 
-An absent registry member can only be omitted with explicit server-authored
-structured terminal rehome evidence and no fresh published heartbeat. The newest
-observed rehome is selected across available board replicas, not per board. This
+Registry, replica and inventory freshness is 180 seconds. Owner reads have a
+600-second total window to accommodate sequential fleet fan-out; every second
+sweep request must additionally have been created within 180 seconds. All
+positive, pending, rejected or malformed reads within the full 600-second window
+veto absence, even if other newer reads say absent. These are bounded observations,
+not an atomic fleet snapshot.
+
+An absent registry member can only be omitted with explicit structured terminal
+rehome evidence checked at or after this card's creation, no fresh heartbeat,
+and no published collection newer than that termination check. Missing card
+creation time cannot authorize omission. The trust root for EC2 proof is the
+Board admin-key caller's attestation: the server verifies revocation, but does not
+independently query EC2. The newest observed rehome is selected across available
+board replicas, not per board. This
 lifecycle evidence explains a missing member; it does **not** establish which
 incarnation held a session. Exact absence on all remaining owners is independently
 mandatory. A reused gateway name is queried rather than inferred dead.
