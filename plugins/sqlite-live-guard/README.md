@@ -1,5 +1,39 @@
 # sqlite-live-guard
 
+## Shell execution-context checks
+
+The existing shell policy is applied first. A second, bounded lexical pass follows
+literal `ssh` remote command arguments (including OpenSSH options), explicit
+`sh`/`bash`/`dash`/`zsh`/`ksh -c` scripts and shell-owned heredoc input. It resolves
+simple ordered `NAME=value`, `$NAME` and `${NAME}` path aliases without treating
+expanded values as new shell syntax. SSH does not inherit local shell aliases;
+local shell children receive exported and command-prefix variables. Quoted data
+arguments to commands such as `echo` are not interpreted as scripts.
+
+The pass checks file operations and redirects against the existing live-file and
+quarantine predicates. Conditional assignments retain possible values; an
+unconditional assignment resets them. Subshell, pipeline and background assignment
+scopes do not replace the parent's aliases. `readonly` bindings survive failed
+reassignment/unset. Nesting and possible-value expansion are bounded; exceeding a
+bound or failing to load the analyzer refuses execution. Remote analysis performs
+no local SQLite version probe, directory stat or quarantine-directory inspection.
+A detected raw replacement is refused in favor of the existing `swap_db.py`
+preservation/ownership policy; this pass never installs a database itself.
+
+This is defense in depth, **not a shell sandbox or a complete interpreter**.
+Unsupported forms include dynamic commands (`eval`, functions, sourced scripts,
+command substitution/backticks), computed/default-value parameter expansions,
+ANSI-C quoting, unquoted word-splitting/globbing, SSH wrappers, stdin pipelines or
+here-strings into interpreters, and remote relative working-directory inference.
+It does not add remote SQLite SQL/interpreter policy or remote version discovery.
+Use explicit absolute paths and the guarded helper, not alternate syntax to evade
+checks. A passing lexical check is not authorization for a database replacement.
+
+Regression coverage is in `tests_guard.py`: remote rollback-shaped swaps, option
+boundaries, alias ordering/branches/scopes, heredoc ownership and real
+`claude_hook.py` subprocess allow/refuse controls. All inputs are synthetic; tests
+do not execute SSH or modify a production database.
+
 ## Offline recovered state installation (Linux)
 
 `swap_db.py` is an **offline operator command**, not an automatic recovery daemon.

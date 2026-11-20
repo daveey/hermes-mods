@@ -1012,3 +1012,139 @@ def test_trusted_directory_match_needs_a_path_boundary(monkeypatch):
     assert plugin.guard._trusted("/usr/bin/sqlite3")
     assert not plugin.guard._trusted("/usr/binx/sqlite3")
     assert not plugin.guard._trusted("/binaries/sqlite3")
+
+
+# A recovery built from an earlier cut must go through swap_db's canonical
+# preservation check. A remote shell and path aliases must not hide a raw swap.
+REMOTE_ROLLBACK_SWAP = (
+    "ssh recovery-host 'export XDG_RUNTIME_DIR=/run/user/1000; "
+    "H=/home/u/.hermes; R=$H/state-recovery/example; "
+    "mkdir -p $R/live-preswap; "
+    "mv $H/state.db $R/live-preswap/state.db; "
+    "mv $R/recovered-state.db $H/state.db'"
+)
+
+
+@pytest.mark.parametrize("command", [
+    REMOTE_ROLLBACK_SWAP,
+    "ssh recovery-host 'mv /work/recovered.db /home/u/.hermes/state.db'",
+    "ssh -p 22 -o BatchMode=yes recovery-host 'H=/home/u/.hermes; mv /work/recovered.db $H/state.db'",
+    "H=/home/u/.hermes; mv /work/recovered.db $H/state.db",
+])
+def test_recovery_raw_swap_cannot_hide_behind_remote_shell_or_alias(command):
+    assert plugin.guard.check_shell(command), command
+
+
+def test_claude_hook_refuses_remote_recovery_raw_swap(tmp_path):
+    import json
+    result = subprocess.run(
+        [sys.executable, str(HERE / "claude_hook.py")],
+        input=json.dumps({"tool_input": {"command": REMOTE_ROLLBACK_SWAP},
+                          "cwd": str(tmp_path), "session_id": "test-recovery"}),
+        capture_output=True, text=True, encoding="utf-8", check=False,
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "swap_db" in result.stderr
+
+
+@pytest.mark.parametrize("command", [
+    "ssh recovery-host 'cat /home/u/.hermes/state.db.recovery-report'",
+    "ssh recovery-host 'echo \"mv /work/recovered.db /home/u/.hermes/state.db\"'",
+    "ssh recovery-host 'H=/work; mv /work/recovered.db $H/state.db'",
+    "echo 'ssh recovery-host mv /work/recovered.db /home/u/.hermes/state.db'",
+])
+def test_remote_recovery_analysis_does_not_execute_quoted_data(command):
+    assert plugin.guard.check_shell(command) is None
+
+
+@pytest.mark.parametrize("command", [
+    "H=/home/u/.hermes; cat <<EOF\ndata\nEOF\nssh remote mv $H/state.db /work/old",
+    "ssh remote bash <<'EOF'\nH=/home/u/.hermes; mv $H/state.db /work/old\nEOF",
+    "H=/home/u/.hermes; echo 'a << b'; mv $H/state.db /work/old",
+    "H=/work; if condition; then H=/home/u/.hermes; fi; mv $H/state.db /work/old",
+    "H=/home/u/.hermes; false && H=/work; mv $H/state.db /work/old",
+    "H=/home/u/.hermes; ssh -t remote -- mv $H/state.db /work/old",
+    "H=/home/u/.hermes; ssh remote -l user mv $H/state.db /work/old",
+    "export H=/home/u/.hermes; sh -c 'mv $H/state.db /work/old'",
+    "H=/home/u/.hermes sh -c 'mv $H/state.db /work/old'",
+    "H=/home/u/.hermes; cat /work/new > $H/state.db",
+    "ssh remote 'H=/home/u/.hermes; cat /work/new > $H/state.db'",
+    "H=/home/u/.hermes; { mv $H/state.db /work/old; }",
+    "H=/home/u/.hermes; ! mv $H/state.db /work/old",
+    "readonly H=/home/u/.hermes; mv $H/state.db /work/old",
+])
+def test_execution_context_adversarial_writes(command):
+    assert plugin.guard.check_shell(command), command
+
+
+@pytest.mark.parametrize("command", [
+    "H=/home/u/.hermes; H=/work; mv $H/state.db /work/old",
+    "H=/work; H=/home/u/.hermes true; mv $H/state.db /work/old",
+    "H=/home/u/.hermes; unset H; H=/work; mv $H/state.db /work/old",
+    "ssh remote bash <<'EOF'\nH=/home/u/.hermes; cat $H/state.db\nEOF\nH=/work; mv $H/state.db /work/old",
+    "export H=/home/u/.hermes; ssh remote 'mv $H/state.db /work/old'",
+    "H=/work; echo 'H=/home/u/.hermes'; mv $H/state.db /work/old",
+])
+def test_execution_context_scope_and_data_controls(command):
+    assert plugin.guard.check_shell(command) is None, command
+
+
+@pytest.mark.parametrize("command", [
+    "H=/home/u/.hermes; ssh remote bash <<EOF\nmv /work/new $H/state.db\nEOF",
+    "H=/home/u/.hermes; bash <<EOF\nmv /work/new $H/state.db\nEOF",
+    "ssh -P tag remote 'H=/home/u/.hermes; mv /work/new $H/state.db'",
+    "H=/work; if c; then H=/home/u/.hermes; fi; H=/work; mv $H/state.db /work/old",
+])
+def test_context_heredoc_expansion_and_option_boundaries(command):
+    # The final case is a control: an unconditional assignment after fi must
+    # reset possible values rather than retaining sticky path taint forever.
+    if "fi; H=/work" in command:
+        assert plugin.guard.check_shell(command) is None
+    else:
+        assert plugin.guard.check_shell(command)
+
+
+@pytest.mark.parametrize("command", [
+    "H=/home/u/.hermes; (H=/work); mv /work/new $H/state.db",
+    "H=/home/u/.hermes; false && { true; H=/work; }; mv /work/new $H/state.db",
+    "H=/home/u/.hermes; echo x | H=/work; mv /work/new $H/state.db",
+    "H=/home/u/.hermes; H=/work & mv /work/new $H/state.db",
+    "H=/home/u/.hermes; export H; sh -c 'mv /work/new $H/state.db'",
+    "declare -x H=/home/u/.hermes; sh -c 'mv /work/new $H/state.db'",
+    "env H=/home/u/.hermes sh -c 'mv /work/new $H/state.db'",
+    "ssh remote 'H=/home/u/.hermes; mv -t $H /work/state.db'",
+])
+def test_context_additional_adversarial_alias_writes(command):
+    assert plugin.guard.check_shell(command), command
+
+
+@pytest.mark.parametrize("command", [
+    "readonly H=/home/u/.hermes; H=/work; mv /work/new $H/state.db",
+    "H=/home/u/.hermes; readonly H; unset H; H=/work; mv /work/new $H/state.db",
+    "H=/home/u/.hermes; (H=/work; true); H=/work; mv /work/new $H/state.db",
+    "H=/work; (H=/home/u/.hermes); mv /work/new $H/state.db",
+    "H=/work; echo x | H=/home/u/.hermes; mv /work/new $H/state.db",
+    "H=/work; H=/home/u/.hermes & mv /work/new $H/state.db",
+    "H=/home/u/.hermes; false && { H=/work; }; H=/work; mv /work/new $H/state.db",
+])
+def test_context_scope_restoration_and_readonly(command):
+    if command.startswith("readonly") or "readonly H;" in command:
+        assert plugin.guard.check_shell(command)
+    else:
+        assert plugin.guard.check_shell(command) is None
+
+
+@pytest.mark.parametrize("command,blocked", [
+    (REMOTE_ROLLBACK_SWAP, True),
+    ("ssh remote 'H=/work; mv /work/new $H/state.db'", False),
+    ("ssh remote 'echo \"mv /work/new /home/u/.hermes/state.db\"'", False),
+    ("H=/home/u/.hermes; (H=/work); mv /work/new $H/state.db", True),
+])
+def test_real_claude_context_verdicts(tmp_path, command, blocked):
+    import json
+    result = subprocess.run(
+        [sys.executable, str(HERE / "claude_hook.py")],
+        input=json.dumps({"tool_input": {"command": command}, "cwd": str(tmp_path)}),
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == (2 if blocked else 0), result.stderr
