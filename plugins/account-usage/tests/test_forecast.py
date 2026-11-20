@@ -5,6 +5,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _here = Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location('account_usage_forecast_t', _here / 'forecast.py')
@@ -122,6 +123,41 @@ class ForecastTests(unittest.TestCase):
         self.assertEqual(out['verdict'], 'ok')
         self.assertAlmostEqual(out['burn_per_h'], 0.5)
         self.assertEqual(out['history_h'], 10.0)
+
+    def test_pacing_wal_fallback_reads_without_allowing_writes(self):
+        path = self.home / fc.PACING_DB
+        with sqlite3.connect(path) as db:
+            db.execute('PRAGMA journal_mode=WAL')
+            db.execute('CREATE TABLE samples (ts, provider, account_hash, kind, used, reset_at)')
+            db.execute('INSERT INTO samples VALUES (?,?,?,?,?,?)',
+                       (NOW, 'openai-codex', 'hashed', 'seven_day', 15.0, None))
+        db.close()
+        self.assertFalse(Path(str(path) + '-wal').exists())
+        connect = sqlite3.connect
+        attempts = []
+
+        def missing_sidecars(database, **kwargs):
+            attempts.append(database)
+            if database.endswith('mode=ro'):
+                raise sqlite3.OperationalError('unable to open database file')
+            return connect(database, **kwargs)
+
+        with mock.patch.object(fc.sqlite3, 'connect', side_effect=missing_sidecars):
+            self.assertEqual(fc.read_samples(self.home, 'openai-codex', NOW),
+                             [(NOW, 'hashed', 15.0, None)])
+            with fc._ro_connect(path) as conn:
+                self.assertEqual(conn.execute('PRAGMA query_only').fetchone(), (1,))
+                with self.assertRaises(sqlite3.OperationalError):
+                    conn.execute('DELETE FROM samples')
+            conn.close()
+        self.assertEqual(attempts, [f'file:{path}?mode=ro', f'file:{path}?mode=rw'] * 2)
+
+    def test_pacing_fallback_does_not_create_a_missing_database(self):
+        path = self.home / fc.PACING_DB
+        with self.assertRaises(sqlite3.OperationalError):
+            fc._ro_connect(path)
+        self.assertFalse(path.exists())
+        self.assertEqual(fc.read_samples(self.home, 'openai-codex', NOW), [])
 
     def test_old_lines_are_pruned_after_eight_days(self):
         path = fc.history_path(self.home)

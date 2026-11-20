@@ -130,6 +130,20 @@ def _prune(path: Path, now: float) -> None:
         os.replace(tmp, path)
 
 
+def _ro_connect(db: Path) -> sqlite3.Connection:
+    """Read existing history even when a WAL database's sidecars are absent."""
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=0.5)  # noqa: kanban-lockguard (read-only history)
+    except sqlite3.OperationalError:
+        conn = sqlite3.connect(f"file:{db}?mode=rw", uri=True, timeout=0.5)  # noqa: kanban-lockguard (query-only history)
+    try:
+        conn.execute("PRAGMA query_only=ON")
+    except sqlite3.Error:
+        conn.close()
+        raise
+    return conn
+
+
 def read_samples(home: Path, provider: str, since: float) -> list[tuple[float, str, float, Optional[float]]]:
     """``(ts, account_hash, used, reset_at)`` weekly readings since ``since``, from both histories."""
     out = []
@@ -147,8 +161,7 @@ def read_samples(home: Path, provider: str, since: float) -> list[tuple[float, s
     db = Path(home) / PACING_DB
     if db.exists():
         try:
-            uri = f"file:{db}?mode=ro"
-            with closing(sqlite3.connect(uri, uri=True, timeout=0.5)) as conn:  # noqa: kanban-lockguard (read-only history)
+            with closing(_ro_connect(db)) as conn:
                 out += [(float(t), a, float(u), r) for t, a, u, r in conn.execute(
                     "SELECT ts, account_hash, used, reset_at FROM samples WHERE provider=? AND kind=? AND ts>=?",
                     (provider, WEEK_KIND, since))]
