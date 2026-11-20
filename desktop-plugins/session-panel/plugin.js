@@ -367,8 +367,8 @@ export function waitKind(i) {
 export function waitBreakdown(rows) {
   const n = { parent: 0, schedule: 0, unknown: 0, other: 0 }
   for (const i of rows || []) n[waitKind(i)]++
-  // The three named buckets always show (a zero is information); `other` only when something is in it.
-  return { n, text: WAIT_KINDS.filter(k => k !== 'other' || n.other).map(k => `${n[k]} ${WAIT_LABEL[k]}`).join(' · ') }
+  // Only buckets with something in them show; a zero bucket is noise.
+  return { n, text: WAIT_KINDS.filter(k => n[k]).map(k => `${n[k]} ${WAIT_LABEL[k]}`).join(' · ') }
 }
 
 /** True when the chat has anything not finished: an ask, a card/sub-agent/process that is open, an open ledger

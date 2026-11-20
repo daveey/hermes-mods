@@ -656,7 +656,7 @@ test('waitKind sorts waiting rows into parent, schedule, unknown and other', () 
   assert.equal(m.waitKind({ kind: 'kanban', detail: 'status unknown (missing qualified identity) · last known: running', chip: { state: 'running' } }), 'unknown',
     'a status-unknown row is never guessed from its last known state')
   assert.equal(m.waitBreakdown(out.waiting).text, '1 on parent · 2 on schedule · 2 unknown · 1 other')
-  assert.equal(m.waitBreakdown(out.waiting.filter(i => i.key === 'kb:t_gone')).text, '0 on parent · 0 on schedule · 1 unknown', 'other shows only when non-zero')
+  assert.equal(m.waitBreakdown(out.waiting.filter(i => i.key === 'kb:t_gone')).text, '1 unknown', 'zero buckets are hidden')
 })
 
 test('panel: Waiting is folded to counts by default and opens per chat', async () => {
