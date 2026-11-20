@@ -24,16 +24,19 @@ try {
  await page.evaluate(()=>{document.querySelector('.hermes-au-chip').parentElement.style.width='120px'})
  const vb=await gptChip.locator('.hermes-au-vb').boundingBox(); assert.ok(vb.height<20,`verdict wrapped: ${vb.height}px tall`)
  await page.evaluate(()=>{document.querySelector('.hermes-au-chip').parentElement.style.width=''}); evidence.push('Verdict never wraps')
- // Hover opens the popover on that provider without a click, and leaving closes it.
- await gptChip.hover(); const pop=page.locator('section[aria-label="Account usage popover"]'); await pop.waitFor()
+ // Hover alone never opens it; a click opens on the clicked provider.
+ const pop=page.locator('section[aria-label="Account usage popover"]')
+ await gptChip.hover(); await page.waitForTimeout(400); assert.equal(await pop.count(),0,'hover does not open the popover')
+ await gptChip.click(); await pop.waitFor()
  assert.equal(await page.locator('.hermes-au-fc tr[data-hl="true"]').getAttribute('data-provider'),'openai-codex')
  await page.getByRole('button',{name:'Try GPT account next',exact:true}).waitFor()
- assert.equal(await page.getByRole('button',{name:'Try Account B next',exact:true}).count(),0,'only the hovered provider\'s accounts')
+ assert.equal(await page.getByRole('button',{name:'Try Account B next',exact:true}).count(),0,'only the clicked provider\'s accounts')
  // Saved render snapshot of the forecast table (synthetic fixture).
  const table=await page.evaluate(()=>[...document.querySelectorAll('.hermes-au-fc tbody tr')].map(r=>[...r.cells].map(c=>c.textContent.trim()).filter(Boolean).join(' | ')))
  assert.deepEqual(table.map(t=>t.replace(/out \S+ [^→]+ → .+$/,'out <when> → <when>')),['Claude | 2/4 | — | no forecast (backend too old)','GPT | 1/3 | 0.8 acct | out <when> → <when>'])
  await page.screenshot({path:path.join(artifacts,'account-usage-hover.png'),fullPage:true})
- await page.mouse.move(5,5); await pop.waitFor({state:'detached'}); evidence.push('Hover opens on that provider (highlighted, its accounts); leaving closes')
+ await page.mouse.move(5,5); await page.waitForTimeout(300); assert.equal(await pop.count(),1,'pointer leaving keeps it open')
+ await gptChip.click(); await pop.waitFor({state:'detached'}); evidence.push('Click opens on that provider (highlighted, its accounts); clicking it again closes; hover does nothing')
  // Keyboard: focus + arrows switch provider, Escape closes.
  await page.getByRole('button',{name:'Account usage',exact:true}).focus(); await page.keyboard.press('ArrowRight'); await pop.waitFor()
  await page.keyboard.press('Escape'); await pop.waitFor({state:'detached'}); evidence.push('Keyboard: arrows open/switch, Escape closes')

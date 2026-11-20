@@ -1,7 +1,7 @@
 /**
  * Account Usage — status-bar chips showing every pooled Claude / ChatGPT (Codex)
  * subscription pool: a 7-day weekly-quota forecast sparkline (red where it runs dry), ready count and a
- * verdict. Hover or focus a provider (or click to pin) for a popover: the 4-provider forecast table with
+ * verdict. Click a provider for a popover: the 4-provider forecast table with
  * that provider highlighted, then its accounts with 5-hour session + weekly bars and reset times.
  * Forecast: REST POST /forecast (plugins/account-usage/forecast.py) from the weekly windows below plus
  * the backend's usage history; an older backend without it just shows no forecast.
@@ -61,7 +61,7 @@ const CSS = `
 .hermes-au-fc th { font-weight: 500; text-align: left; opacity: .6; font-size: 10px; padding: 0 6px 4px 3px }
 .hermes-au-fc { table-layout: auto }
 .hermes-au-fc td { padding: 4px 6px 4px 3px; border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent); white-space: nowrap }
-.hermes-au-fc td.hermes-au-verdict { white-space: normal; min-width: 0; line-height: 1.25 }
+.hermes-au-fc td.hermes-au-verdict { white-space: nowrap }
 .hermes-au-fc tr[data-hl='true'] td { background: var(--chrome-action-hover) }
 .hermes-au-fc tr[data-hl='true'] td:first-child { box-shadow: inset 2px 0 0 var(--ui-accent, var(--accent)) }
 .hermes-au-fc tbody tr { cursor: pointer }
@@ -273,16 +273,15 @@ export function forecastText(f, now = Date.now()) {
   if (f.verdict === 'learning') return `learning… ${Math.round((f.history_h || 0) * 10) / 10}h of 2h history`
   if (f.verdict === 'short') {
     const g = f.gaps[0]
-    const first = `out ${atHour(g.start_h, now)} → ${g.end_h >= 168 ? 'past 7 days' : atHour(g.end_h, now)}`
-    // Several dry spells: say how much of the week is dry in total, not just the first one.
-    const dry = f.gaps.reduce((n, x) => n + (x.end_h - x.start_h), 0)
-    return f.gaps.length > 1 ? `${first} · dry ${fmtHours(dry)} of 7d` : first
+    // Several dry spells: when it first runs out and how much of the week is dry in total.
+    if (f.gaps.length > 1) return `out ${atHour(g.start_h, now)} · dry ${fmtHours(f.gaps.reduce((n, x) => n + (x.end_h - x.start_h), 0))} of 7d`
+    return `out ${atHour(g.start_h, now)} → ${g.end_h >= 168 ? 'past 7d' : atHour(g.end_h, now)}`
   }
   const pace = f.pace == null ? '' : ` · ${Math.round(f.pace * 100)}% of supply`
   if (f.verdict !== 'tight') return `lasts the week${pace}`
   // Tight on timing (a near miss before a refill) rather than on the week's total.
   if (f.pace != null && f.pace <= 0.9 && f.burn_per_h > 0 && Array.isArray(f.curve) && f.curve.length)
-    return `tight · ~${fmtHours(Math.min(...f.curve) / f.burn_per_h)} spare before a refill`
+    return `tight · ~${fmtHours(Math.min(...f.curve) / f.burn_per_h)} spare`
   return `tight${pace}`
 }
 
@@ -291,19 +290,49 @@ export function leftText(f) {
 }
 
 // Fuel curve as SVG: line + fill, red bands where it is dry, ticks at resets.
-export function Sparkline({ f, w = 64, h = 14, ticks = false }) {
+// Centered moving average over `k` hours: hides the hourly refill sawtooth, keeps the trend.
+export function smoothCurve(curve, k) {
+  if (!Array.isArray(curve) || k <= 1) return curve
+  const r = Math.floor(k / 2)
+  return curve.map((_, i) => {
+    let sum = 0, n = 0
+    for (let j = Math.max(0, i - r); j <= Math.min(curve.length - 1, i + r); j++) { sum += Math.max(0, curve[j]); n++ }
+    return sum / n
+  })
+}
+
+// Smooth SVG path through points (Catmull-Rom as cubic Béziers), clamped to the box.
+export function smoothPath(pts, h) {
+  if (pts.length < 2) return ''
+  const c = v => Math.min(h, Math.max(0, v))
+  let d = `M${pts[0][0].toFixed(1)},${pts[0][1].toFixed(1)}`
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[i - 1] || pts[i], p1 = pts[i], p2 = pts[i + 1], p3 = pts[i + 2] || p2
+    const c1 = [p1[0] + (p2[0] - p0[0]) / 6, c(p1[1] + (p2[1] - p0[1]) / 6)]
+    const c2 = [p2[0] - (p3[0] - p1[0]) / 6, c(p2[1] - (p3[1] - p1[1]) / 6)]
+    d += ` C${c1[0].toFixed(1)},${c1[1].toFixed(1)} ${c2[0].toFixed(1)},${c2[1].toFixed(1)} ${p2[0].toFixed(1)},${p2[1].toFixed(1)}`
+  }
+  return d
+}
+
+export function Sparkline({ f, w = 64, h = 14, ticks = false, k = 13 }) {
   if (!f || !Array.isArray(f.curve) || f.curve.length < 2) return null
   const n = f.curve.length - 1
-  const max = Math.max(100, ...f.curve)
+  const curve = smoothCurve(f.curve, k)
+  const max = Math.max(100, ...curve)
   const x = i => (i / n) * w
-  const y = v => h - 1 - (Math.max(0, v) / max) * (h - 2)
-  const line = f.curve.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ')
+  const top = h - 3 // the bottom 2px carry the dry-spell strip
+  const y = v => top - (Math.max(0, v) / max) * (top - 1)
+  // ~1 point per 2px is plenty for a smooth line this size.
+  const stride = Math.max(1, Math.round(n / (w / 2)))
+  const idx = curve.map((_, i) => i).filter(i => i % stride === 0 || i === n)
+  const line = smoothPath(idx.map(i => [x(i), y(curve[i])]), top)
   const col = VERDICT_COLOR[f.verdict] || 'currentColor'
   return jsxs('svg', { width: w, height: h, viewBox: `0 0 ${w} ${h}`, 'aria-hidden': true, style: { flex: 'none', overflow: 'visible' }, children: [
-    jsx('polygon', { points: `0,${h} ${line} ${w},${h}`, fill: col, opacity: 0.18 }),
-    ...(f.gaps || []).map((g, i) => jsx('rect', { key: `g${i}`, x: x(g.start_h), width: Math.max(1.5, x(g.end_h) - x(g.start_h)), y: 0, height: h, fill: COLORS.limited, opacity: 0.55 })),
-    ...(ticks ? (f.resets_h || []).filter(r => r >= 0 && r <= n).map((r, i) => jsx('line', { key: `t${i}`, x1: x(r), x2: x(r), y1: h - 3, y2: h, stroke: 'currentColor', opacity: 0.5 })) : []),
-    jsx('polyline', { points: line, fill: 'none', stroke: col, strokeWidth: 1.2, opacity: f.verdict === 'learning' ? 0.45 : 1 })
+    jsx('path', { d: `${line} L${w},${top} L0,${top} Z`, fill: col, opacity: 0.16 }),
+    ...(f.gaps || []).map((g, i) => jsx('rect', { key: `g${i}`, x: x(g.start_h), width: Math.max(1.5, x(g.end_h) - x(g.start_h)), y: h - 2, height: 2, rx: 1, fill: COLORS.limited })),
+    ...(ticks ? (f.resets_h || []).filter(r => r >= 0 && r <= n).map((r, i) => jsx('line', { key: `t${i}`, x1: x(r), x2: x(r), y1: top - 2, y2: top, stroke: 'currentColor', opacity: 0.4 })) : []),
+    jsx('path', { d: line, fill: 'none', stroke: col, strokeWidth: 1.3, strokeLinecap: 'round', strokeLinejoin: 'round', opacity: f.verdict === 'learning' ? 0.45 : 1 })
   ] })
 }
 
@@ -313,14 +342,14 @@ function ForecastTable({ groups, hl, onPick }) {
     jsx('thead', { children: jsxs('tr', { children: ['Provider', 'Ready', 'Left', 'Next 7 days', 'Forecast'].map(t => jsx('th', { key: t, children: t })) }) }),
     jsx('tbody', { children: groups.map(g => {
       const f = g.forecast
-      return jsxs('tr', { key: g.slug, 'data-hl': g.slug === hl ? 'true' : undefined, 'data-provider': g.slug, onMouseEnter: () => onPick(g.slug), onClick: () => onPick(g.slug), children: [
+      return jsxs('tr', { key: g.slug, 'data-hl': g.slug === hl ? 'true' : undefined, 'data-provider': g.slug, onClick: () => onPick(g.slug), children: [
         jsx('td', { children: jsx('button', { type: 'button', 'aria-label': `Show ${g.title} accounts`, 'aria-pressed': g.slug === hl, onFocus: () => onPick(g.slug), children: g.name }) }),
         jsx('td', { style: { color: countColor(g) }, children: `${g.ready}/${g.total}` }),
         g.statusOnly
           ? jsx('td', { colSpan: 3, style: { opacity: 0.65 }, children: g.ready ? 'up · no usage API' : g.limited ? `down · ${g.statusBad || 'blocked'}` : 'not checked yet' })
           : null,
         g.statusOnly ? null : jsx('td', { children: leftText(f) }),
-        g.statusOnly ? null : jsx('td', { children: jsx(Sparkline, { f, w: 96, h: 12, ticks: true }) }),
+        g.statusOnly ? null : jsx('td', { children: jsx(Sparkline, { f, w: 96, h: 14, ticks: true, k: 13 }) }),
         g.statusOnly ? null : jsx('td', { className: 'hermes-au-verdict', style: { color: VERDICT_COLOR[f?.verdict], opacity: f && VERDICT_COLOR[f.verdict] ? 1 : 0.65 }, children: forecastText(f, now) })
       ].filter(Boolean) })
     }) })
@@ -546,7 +575,7 @@ function Meter({ win }) {
   return jsxs('div', { style: { display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }, children: [
     jsxs('span', { style: { display: 'flex', justifyContent: 'space-between', fontSize: 10, gap: 6 }, children: [
       jsx('b', { style: { color: pct >= 100 ? COLORS.limited : undefined, fontWeight: 600 }, children: `${Math.round(pct)}%` }),
-      jsx('span', { style: { opacity: 0.65 }, children: pct >= 100 ? `back ${fmtReset(win.resets_at)}` : fmtReset(win.resets_at) })
+      jsx('span', { style: { opacity: 0.65, whiteSpace: 'nowrap' }, children: pct >= 100 ? `back ${fmtReset(win.resets_at)}` : fmtReset(win.resets_at) })
     ] }),
     jsx('div', { style: { height: 4, borderRadius: 2, background: 'color-mix(in srgb, currentColor 18%, transparent)', overflow: 'hidden' }, children:
       jsx('div', { style: { height: '100%', width: `${pct}%`, background: COLORS[t] } }) })
@@ -667,47 +696,42 @@ function UsageBar({ store, selectionStore, reconnectStore, disableStore }) {
   const profile = useValue(host.state.profile)
   const model = useValue(host.state.model)
   const [open, setOpen] = useState(false)
-  // How it opened: 'hover' closes when the pointer leaves; 'pin' (click, keyboard) stays until Esc / outside click.
-  const [via, setVia] = useState(null)
+  // Opens on click (or Enter/Space/arrows); stays until Esc, an outside click, or clicking the same provider again.
   const [hl, setHl] = useState(null)
-  const timer = useRef(null)
-  const quietUntil = useRef(0)
   useEffect(() => { store.refresh() }, [connection, profile, store])
   useEffect(() => { if (open) selectionStore.refresh() }, [open, focused, owner, connection, profile, model, selectionStore])
-  useEffect(() => () => clearTimeout(timer.current), [])
   if (!groups.length) {
     if (!error) return null
     const { label, title } = unavailableLabel(error)
     return jsx('span', { className: BAR_CLASS, title, children: label })
   }
   const shown = groups.find(g => g.slug === hl) || groups[0]
-  const show = (slug, how) => {
-    clearTimeout(timer.current)
+  const show = slug => {
     if (slug) setHl(slug)
     if (!open) { setOpen(true); store.refresh() }
-    if (how === 'pin' || via !== 'pin') setVia(how)
   }
-  const close = () => { clearTimeout(timer.current); setOpen(false); setVia(null); quietUntil.current = Date.now() + 400 }
-  const leave = () => { if (via === 'hover') { clearTimeout(timer.current); timer.current = setTimeout(close, 220) } }
-  const stay = () => clearTimeout(timer.current)
+  const close = () => setOpen(false)
   const step = d => { const i = groups.findIndex(g => g.slug === shown.slug); setHl(groups[(i + d + groups.length) % groups.length].slug) }
-  return jsxs(Popover, { open, onOpenChange: v => { if (v) show(null, 'pin'); else close() }, children: [
+  return jsxs(Popover, { open, onOpenChange: v => { if (v) show(null); else close() }, children: [
     jsx(PopoverTrigger, { asChild: true, children: jsx('button', { type: 'button', className: cn(BAR_CLASS, open && 'text-foreground'), 'aria-label': 'Account usage',
       'aria-expanded': open,
-      // Click pins (or unpins) the popover; Radix skips its own toggle when the click is default-prevented.
-      onClick: e => { e.preventDefault(); if (open && via === 'pin') close(); else show(null, 'pin') },
-      onMouseLeave: leave, onMouseEnter: stay,
-      onFocus: e => { if (Date.now() > quietUntil.current && e.target.matches?.(':focus-visible')) show(null, 'pin') },
+      // Click opens on the clicked provider; clicking the shown provider again closes. Radix skips its
+      // own toggle when the click is default-prevented.
+      onClick: e => {
+        e.preventDefault()
+        const slug = e.target.closest?.('.hermes-au-chip')?.dataset.provider || null
+        if (open && (!slug || slug === shown.slug)) close(); else show(slug)
+      },
       onKeyDown: e => {
         if (e.key === 'Escape' && open) { e.preventDefault(); close() }
-        else if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') { e.preventDefault(); if (!open) show(null, 'pin'); step(e.key === 'ArrowRight' ? 1 : -1) }
+        else if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') { e.preventDefault(); if (!open) show(null); step(e.key === 'ArrowRight' ? 1 : -1) }
       },
       children:
       groups.map(g => {
         const f = g.forecast
         const tip = `${g.title}: ${g.ready} of ${g.total} ready${g.limited ? ` · ${g.limited} ${g.statusBad || 'out of quota'}` : ''}${g.cooling ? ` · ${g.cooling} cooling down` : ''}${g.disabled ? ` · ${g.disabled} disabled` : ''}${f && !g.statusOnly ? ` · ${leftText(f)} left · ${forecastText(f)}` : ''}${g.markId ? ` · ${g.mark === 'active' ? 'in use' : 'last used'}: ${(g.accounts.find(a => a.id === g.markId) || {}).label} (${since(g.markAt)})` : ''}${g.nextBack ? ` · next back ${fmtReset(g.nextBack)}` : ''}`
         return jsxs('span', { key: g.slug, className: 'hermes-au-chip', 'data-provider': g.slug, 'data-hl': open && g.slug === shown.slug ? 'true' : undefined,
-          onMouseEnter: () => show(g.slug, 'hover'), title: open ? undefined : tip, children: [
+          title: open ? undefined : tip, children: [
           // Compact provider tag in the bar; the popover table keeps the full name.
           jsx('b', { className: 'hermes-au-tag', 'aria-label': g.name, children: g.tag || g.name }),
           f && !g.statusOnly ? jsx(Sparkline, { f })
@@ -718,13 +742,12 @@ function UsageBar({ store, selectionStore, reconnectStore, disableStore }) {
         ] })
       })
     }) }),
-    jsx(PopoverContent, { side: 'top', align: 'end', className: 'w-[460px]', style: PANEL_STYLE,
-      onMouseEnter: stay, onMouseLeave: leave,
-      // A hover-opened popover never steals focus from the composer; closing never refocuses the bar (no reopen loop).
-      onOpenAutoFocus: e => { if (via !== 'pin') e.preventDefault() }, onCloseAutoFocus: e => e.preventDefault(),
+    jsx(PopoverContent, { side: 'top', align: 'end', className: 'w-[480px]', style: PANEL_STYLE,
+      // Never steal focus from the composer on open; closing never refocuses the bar.
+      onOpenAutoFocus: e => e.preventDefault(), onCloseAutoFocus: e => e.preventDefault(),
       children:
       jsxs('div', { style: { display: 'flex', flexDirection: 'column', gap: 10, padding: 4, fontSize: 12 }, children: [
-        jsx(ForecastTable, { groups, hl: shown.slug, onPick: slug => { stay(); setHl(slug) } }),
+        jsx(ForecastTable, { groups, hl: shown.slug, onPick: setHl }),
         jsx('div', { style: { borderTop: '1px solid var(--border)' } }),
         jsx(GroupPanel, { key: shown.slug, g: shown, selectionStore, selectionState, reconnectStore, reconnectState, disableStore, disableState }),
         jsx('div', { style: { borderTop: '1px solid var(--border)' } }),
