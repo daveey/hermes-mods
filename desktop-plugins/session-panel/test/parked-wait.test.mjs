@@ -277,3 +277,107 @@ test('waitTree: a card waiting on another card of the list sits under it; order,
 })
 
 
+
+test('owner park: read from the card detail; the line shows the real wake instead of "no wake published"', async () => {
+  const NOW = Date.parse('2026-11-20T22:53:00Z'), S = NOW / 1000
+  // The exact shape of t_01a1fb17e589fdd8 on 2026-11-20: a `continued` park with a declared CI wait.
+  const detail = { task: { status: 'scheduled', wake_check: null }, events: [
+    { id: 1, kind: 'created', created_at: S - 9000, payload: {} },
+    { id: 2, kind: 'continued', created_at: S - 240, payload: { continuation: 1, status: 'scheduled', wake_at: S + 360, awaiting: { kind: 'ci', ref: 'local core-wt consumer suite PID 4143137', why: 'Full requested consumer regression suite running on worker.' } } }
+  ] }
+  const pk = m.parkFromDetail(detail)
+  assert.deepEqual([pk.wakeAt, pk.awaiting.kind, pk.continued, pk.parkedAt], [S + 360, 'ci', true, S - 240])
+  const row = (park, chip = {}) => m.rowWait({ key: 'kb:x', kind: 'kanban', label: 'X', chip: { id: 't_x', state: 'scheduled', connectionId: 'C1', profile: 'default', ...chip } }, NOW, park)
+  const line = v => [v.reason.map(p => (typeof p === 'string' ? p : `[${p.ref.id}]`)).join(''), v.sub, v.age, v.tone]
+  assert.deepEqual(line(row({ state: 'ok', park: pk })), ['on CI: local core-wt consumer suite PID 4143137', 'by Fri 14:59 PST', '4m', ''])
+  const mk = (awaiting, extra = {}) => ({ state: 'ok', park: { wakeAt: S + 3600, awaiting, check: '', continued: false, parkedAt: S - 600, ...extra } })
+  assert.deepEqual(line(row(mk({ kind: 'ci', ref: 'https://github.com/o/r/actions/runs/44830930932' }))), ['on CI: run 44830930932', 'by Fri 15:53 PST', '10m', ''])
+  assert.deepEqual(line(row(mk({ kind: 'deploy', ref: 'https://github.com/o/r/pull/3824' }))), ['on deploy PR #3824', 'by Fri 15:53 PST', '10m', ''])
+  assert.deepEqual(line(row(mk({ kind: 'deploy', ref: 'e4fd7587390a189fa2726896a7809979858d1e2d' }))), ['on deploy e4fd75873', 'by Fri 15:53 PST', '10m', ''])
+  assert.deepEqual(line(row(mk({ kind: 'card', ref: 't_01a1eea7e9cf1de6' }))), ['on [t_01a1eea7e9cf1de6]', 'by Fri 15:53 PST', '10m', ''])
+  assert.deepEqual(line(row(mk({ kind: 'external', ref: 'natural GitHub REST use/reset' }, { wakeAt: S - 3 * 3600 }))), ['on natural GitHub REST use/reset', '⚠ 3h overdue', '10m', 'warn'])
+  assert.deepEqual(line(row(mk({ kind: 'clock', why: 'two-day soak' }, { wakeAt: S + 86_400 }))), ['1d left (two-day soak)', 'Sat 14:53 PST', '10m', ''])
+  assert.deepEqual(line(row(mk(null, { check: 'python3 probe_quiet.py --pool x' }))), ['on probe probe_quiet.py', 'by Fri 15:53 PST', '10m', ''])
+  assert.deepEqual(line(row(mk(null, { continued: true }))), ['resumes in 1h', 'Fri 15:53 PST', '10m', ''])
+  assert.deepEqual(line(row(mk({ kind: 'human', why: 'pick a window' }))), ['waits on a person (pick a window)', '', '10m', 'warn'])
+  // Loading, a failed read and an owner with no park.
+  assert.deepEqual(line(row({ state: 'loading', park: null })).slice(0, 1), ['reading wake…'])
+  assert.deepEqual(line(row({ state: 'failed', park: null })).slice(0, 1), ['no wake published'])
+  assert.equal(m.parkFromDetail({ task: { status: 'scheduled' }, events: [] }), null)
+  // Only rows whose own wait names nothing read the owner.
+  const i = (chip, extra = {}) => ({ kind: 'kanban', chip: { state: 'scheduled', ...chip }, ...extra })
+  assert.equal(m.needsPark(i({})), true)
+  assert.equal(m.needsPark(i({ waitingOn: 'a producer the owner did not publish' })), true)
+  assert.equal(m.needsPark(i({ waitingOn: 'ci run 1' })), false)
+  assert.equal(m.needsPark(i({ upstream: { id: 't_u' } })), false)
+  assert.equal(m.needsPark(i({ state: 'triage' })), false)
+  assert.equal(m.needsPark(i({}, { cardStatus: true })), false)
+})
+
+test('owner park: one cached read per card on its owner route; failures retry after 2 minutes', async () => {
+  const reads = []
+  const read = (route, id) => { reads.push([route.connectionId, route.profile, route.board, id]); return Promise.resolve(id === 't_bad' ? { failed: true } : { park: { wakeAt: 1, awaiting: null, check: '', continued: false, parkedAt: null } }) }
+  const chip = id => ({ id, connectionId: 'C1', profile: 'work', board: 'ops' })
+  const B = Date.now()
+  assert.equal(m.parkFor(chip('t_ok'), B, read).state, 'loading')
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(m.parkFor(chip('t_ok'), B + 1_000, read).state, 'ok')
+  assert.deepEqual(reads, [['C1', 'work', 'ops', 't_ok']])
+  m.parkFor(chip('t_ok'), Date.now() + 60_001, read)
+  assert.equal(reads.length, 2, 'a park is re-read after a minute')
+  m.parkFor(chip('t_bad'), B, read); await new Promise(r => setTimeout(r, 0))
+  assert.equal(m.parkFor(chip('t_bad'), Date.now() + 50_000, read).state, 'failed')
+  assert.equal(reads.filter(r => r[3] === 't_bad').length, 1)
+  m.parkFor(chip('t_bad'), Date.now() + 2 * 60_000 + 1, read)
+  assert.equal(reads.filter(r => r[3] === 't_bad').length, 2)
+  assert.equal(m.parkFor({ id: 't_none', connectionId: null }, 1, read, () => null).state, 'failed', 'no route: no read')
+})
+
+test('owner park mirrors core: not scheduled, spent parks, implied wakes, a human block, a failed re-read', async () => {
+  const NOW = Date.parse('2026-11-20T22:00:00Z'), S = NOW / 1000
+  const ev = (id, kind, payload = {}, extra = {}) => ({ id, kind, created_at: S - 10_000 + id * 100, payload, ...extra })
+  const park = ev(2, 'scheduled', { wake_at: S - 86_000, awaiting: { kind: 'ci', ref: 'https://github.com/o/r/actions/runs/123' } }, { run_id: 1 })
+  // A blocked card: core wakes only scheduled cards, so no park is read (and rows never ask for one).
+  assert.equal(m.parkFromDetail({ task: { status: 'blocked' }, events: [park] }), null)
+  assert.equal(m.needsPark({ kind: 'kanban', chip: { state: 'blocked' } }), false)
+  // Spent: woken, or claimed by another run -> superseded, backstop one hour after the last event.
+  for (const later of [ev(3, 'continuation_woken'), ev(3, 'claimed', {}, { run_id: 2 }), ev(3, 'spawned', {}, { run_id: null })]) {
+    const pk = m.parkFromDetail({ task: { status: 'scheduled' }, events: [ev(1, 'created'), park, later] })
+    assert.deepEqual([pk.superseded, pk.wakeAt, pk.awaiting], [true, later.created_at + 3600, null], later.kind)
+  }
+  // The parking run's own claim does not spend it.
+  assert.equal(m.parkFromDetail({ task: { status: 'scheduled' }, events: [park, ev(3, 'claimed', {}, { run_id: 1 })] }).superseded, false)
+  // Events are ordered by id, not by array position.
+  assert.equal(m.parkFromDetail({ task: { status: 'scheduled' }, events: [ev(3, 'continuation_woken'), park] }).superseded, true)
+  // Implied wake: marker (with offset), else 24 h after the park.
+  const legacy = ev(4, 'scheduled', { reason: 'soak SCHEDULED_UNTIL=2026-11-21T08:00:00-08:00.' })
+  assert.equal(m.parkFromDetail({ task: { status: 'scheduled' }, events: [legacy] }).wakeAt, Date.parse('2026-11-21T16:00:00Z') / 1000)
+  const bare = ev(5, 'scheduled', { reason: 'waiting' })
+  assert.equal(m.parkFromDetail({ task: { status: 'scheduled' }, events: [bare] }).wakeAt, bare.created_at + 86_400)
+  assert.equal(m.impliedWake({ reason: 'SCHEDULED_UNTIL=2030-01-01T00:00:00Z' }, S), S + 14 * 86_400, 'clamped to 14 days')
+  // A human block kind and no timed wake: the dispatcher blocks it for a person.
+  assert.equal(m.parkFromDetail({ task: { status: 'scheduled', block_kind: 'needs_input' }, events: [bare] }).forHuman, true)
+  // No park event and a person block kind: core blocks it for a person, so no countdown.
+  const noPark = m.parkFromDetail({ task: { status: 'scheduled', block_kind: 'needs_input' }, events: [ev(7, 'blocked')] })
+  assert.deepEqual([noPark.forHuman, noPark.superseded], [true, false])
+  // A date-only marker is local midnight.
+  assert.equal(m.impliedWake({ reason: 'SCHEDULED_UNTIL=2026-11-22' }, S), new Date(2026, 10, 22, 0, 0).getTime() / 1000)
+  // Lines.
+  const row = pi => m.rowWait({ key: 'kb:x', kind: 'kanban', label: 'X', chip: { id: 't_x', state: 'scheduled' } }, NOW, pi)
+  const spentPk = m.parkFromDetail({ task: { status: 'scheduled' }, events: [park, ev(3, 'continuation_woken')] })
+  assert.deepEqual([row({ state: 'ok', park: spentPk }).reason[0], row({ state: 'ok', park: spentPk }).tone], ['new park not synced yet', ''])
+  assert.equal(row({ state: 'ok', park: m.parkFromDetail({ task: { status: 'scheduled' }, events: [bare] }) }).reason[0].endsWith('left'), true, 'a legacy park has its implied deadline')
+  assert.equal(row({ state: 'ok', park: m.parkFromDetail({ task: { status: 'scheduled', block_kind: 'needs_input' }, events: [bare] }) }).reason[0], 'no timed wake · will be blocked for a person')
+  assert.equal(row({ state: 'ok', park: noPark }).reason[0], 'no timed wake · will be blocked for a person')
+  const okPk = m.parkFromDetail({ task: { status: 'scheduled' }, events: [ev(6, 'scheduled', { wake_at: S + 3600, awaiting: { kind: 'deploy', ref: 'x' } })] })
+  assert.match(row({ state: 'stale', park: okPk }).sub, / · not re-read$/)
+  // parkFor: a failed re-read keeps the old park and marks it stale.
+  let fail = false
+  const read = () => Promise.resolve(fail ? { failed: true } : { park: okPk })
+  const chip = { id: 't_stale', connectionId: 'C1', profile: 'default', board: 'default' }
+  m.parkFor(chip, Date.now(), read); await new Promise(r => setTimeout(r, 0))
+  fail = true
+  m.parkFor(chip, Date.now() + 60_001, read); await new Promise(r => setTimeout(r, 0))
+  const st = m.parkFor(chip, Date.now() + 60_002, read)
+  assert.deepEqual([st.state, st.park === okPk], ['stale', true])
+})

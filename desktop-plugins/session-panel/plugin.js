@@ -34,7 +34,7 @@ import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'session-panel'
-const VERSION = 'session-panel-v11-wait-outline'
+const VERSION = 'session-panel-v12-owner-wake'
 export const STUCK_CARD_S = 2 * 3600 // running card with no event this long
 export const STUCK_SUB_MS = 30 * 60_000 // sub-agent with no new tool call this long
 const DONE_POLL_MS = 30_000
@@ -438,6 +438,96 @@ export function noteTitles(chips) {
 }
 export const subscribeTitles = fn => (titleSubs.add(fn), () => titleSubs.delete(fn))
 /** One title read: `{ title, board }`, title '' when no board on that route has the card. */
+// [daveey 2026-11-20] "no wake published - not acceptable". A parked card whose list row carries no wait still has a
+// real wake on its owner: the newest park event (`continued` / `scheduled`: wake_at, declared awaiting) and an armed
+// wake check. When the row has none, the panel reads the card once from its owner (the same read as titles) and shows
+// that wake. Cached per card: a park is re-read after PARK_FRESH_MS, a failed read after PARK_RETRY_MS.
+const PARK_FRESH_MS = 60_000, PARK_RETRY_MS = 2 * 60_000, PARK_PENDING_MS = 30_000
+const PARK_EVENTS = new Set(['continued', 'scheduled'])
+const parks = new Map()
+// Core's own constants (hermes_cli/kanban_continuation.py, kanban_timed_park.py); the panel reads the park the way
+// park_state / implied_wake / blocks_for_human do, so it never shows a wake the dispatcher does not hold.
+const DEFAULT_WAKE_S = 24 * 3600, MIN_WAKE_S = 60, MAX_WAKE_S = 14 * 24 * 3600, SUPERSEDED_GRACE_S = 3600
+const HUMAN_BLOCK_KINDS = new Set(['needs_input', 'capability'])
+const evId = e => Number(e?.id ?? e?.created_at) || 0
+const payloadOf = e => (e?.payload && typeof e.payload === 'object' ? e.payload : (() => { try { return JSON.parse(e?.payload || '{}') || {} } catch { return {} } })())
+/** implied_wake: the payload's wake_at, else its reason's SCHEDULED_UNTIL= marker clamped to [park+60 s, park+14 d],
+ *  else 24 h after the park. */
+export function impliedWake(p, parkedAt) {
+  if (Number(p?.wake_at) > 0) return Number(p.wake_at)
+  const raw = /SCHEDULED_UNTIL=(\S+)/.exec(str(p?.reason))?.[1]?.replace(/[.,;:)\]}'"]+$/, '')
+  // An offset is honoured; a naive stamp is read as local time, as core's datetime.fromisoformat().timestamp() does.
+  // A date-only stamp is local midnight too (Date.parse alone would read it as UTC).
+  const at = raw ? Date.parse(/^\d{4}-\d\d-\d\d$/.test(raw) ? `${raw}T00:00` : raw) / 1000 : NaN
+  if (Number.isFinite(at)) return Math.max(parkedAt + MIN_WAKE_S, Math.min(Math.floor(at), parkedAt + MAX_WAKE_S))
+  return parkedAt + DEFAULT_WAKE_S
+}
+/** The park in a card read (`/api/plugins/kanban/tasks/<id>`), read like core's park_state, or null when the card is
+ *  not `scheduled` (core only wakes scheduled cards; a leftover probe on a blocked card wakes nothing).
+ *  `{ wakeAt, awaiting, check, nextProbeAt, continued, parkedAt, superseded, forHuman }`:
+ *  - the newest `continued`/`scheduled` event, unless spent (a later `continuation_woken`, or a later
+ *    `claimed`/`spawned` of another run): then `superseded`, its wake a backstop one hour after the last event;
+ *  - `wakeAt` = implied_wake (wake_at, else the SCHEDULED_UNTIL marker, else 24 h after the park);
+ *  - `forHuman` when the park has no timed wake and a human block kind (the dispatcher blocks it for a person). */
+export function parkFromDetail(detail) {
+  if (str(detail?.task?.status) !== 'scheduled') return null
+  const events = (Array.isArray(detail?.events) ? detail.events : []).slice().sort((a, b) => evId(a) - evId(b))
+  let ev = null
+  for (const e of events) if (PARK_EVENTS.has(e?.kind)) ev = e
+  const wc = detail?.task?.wake_check
+  const check = wc && wc.purpose !== 'ask_resolved' ? str(wc.cmd) : ''
+  const lastAt = Math.max(0, ...events.map(e => Number(e?.created_at) || 0))
+  const spent = !!ev && events.some(e => evId(e) > evId(ev) && (e.kind === 'continuation_woken' ||
+    (['claimed', 'spawned'].includes(e.kind) && (e.run_id == null || ev.run_id == null || e.run_id !== ev.run_id))))
+  if (!ev || spent) {
+    if (!check && !ev && !lastAt) return null
+    const parkedAt = lastAt || Math.floor(Date.now() / 1000)
+    return { wakeAt: ev ? parkedAt + SUPERSEDED_GRACE_S : parkedAt + DEFAULT_WAKE_S, awaiting: null, check, nextProbeAt: Number(wc?.next_at) > 0 ? Number(wc.next_at) : null,
+      // No park event at all (core: untimed, not superseded): a person block kind is blocked for a person on the next tick.
+      continued: false, parkedAt, superseded: !!ev, forHuman: !ev && HUMAN_BLOCK_KINDS.has(str(detail?.task?.block_kind)) }
+  }
+  const p = payloadOf(ev)
+  const parkedAt = Number(ev.created_at) || lastAt
+  const aw = p.awaiting && typeof p.awaiting === 'object' ? p.awaiting : null
+  const timed = Number(p.wake_at) > 0
+  return {
+    wakeAt: impliedWake(p, parkedAt),
+    awaiting: aw ? { kind: str(aw.kind), ref: str(aw.ref), why: str(aw.why), ...(aw.inferred ? { inferred: true } : {}) } : null,
+    check, nextProbeAt: Number(wc?.next_at) > 0 ? Number(wc.next_at) : null,
+    continued: ev.kind === 'continued', parkedAt, superseded: false,
+    forHuman: !timed && HUMAN_BLOCK_KINDS.has(str(detail?.task?.block_kind))
+  }
+}
+async function readPark(route, id) {
+  const bridge = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
+  if (!bridge || !route.connectionId) return { failed: true }
+  try {
+    const r = await bridge({ path: `/api/plugins/kanban/tasks/${encodeURIComponent(id)}?board=${encodeURIComponent(route.board)}`, connectionId: route.connectionId, profile: route.profile, timeoutMs: 8_000 })
+    return { park: parkFromDetail(r) }
+  } catch { return { failed: true } }
+}
+/** `{ state: 'loading' | 'ok' | 'failed', park }` for a parked card; starts at most one read. */
+export function parkFor(chip, nowMs = Date.now(), read = readPark, fallback) {
+  if (!chip?.id) return { state: 'failed', park: null }
+  const route = refRoute(chip, fallback)
+  if (!route.connectionId) return { state: 'failed', park: null }
+  const k = titleKey(route, chip.id), hit = parks.get(k)
+  const age = hit ? nowMs - hit.at : Infinity
+  if (hit && (hit.pending ? age < PARK_PENDING_MS : age < (hit.failed ? PARK_RETRY_MS : PARK_FRESH_MS))) {
+    return { state: hit.pending && !hit.park ? 'loading' : hit.failed && !hit.park ? 'failed' : hit.stale ? 'stale' : 'ok', park: hit.park || null }
+  }
+  if (parks.size >= TITLE_MAX) parks.delete(parks.keys().next().value)
+  parks.set(k, { ...(hit || {}), at: nowMs, pending: true })
+  Promise.resolve(read(route, chip.id)).catch(() => ({ failed: true })).then(r => {
+    parks.set(k, { park: r?.failed ? hit?.park || null : r?.park || null, failed: !!r?.failed, stale: !!r?.failed && !!hit?.park, at: Date.now() })
+    titleSubs.forEach(fn => fn())
+  })
+  return { state: hit?.park ? (hit.stale ? 'stale' : 'ok') : 'loading', park: hit?.park || null }
+}
+/** True when a waiting row's own wait names nothing, so its owner's park is worth reading. */
+export const needsPark = i => i?.kind === 'kanban' && !i.cardStatus && str(i.chip?.state) === 'scheduled' &&
+  (!str(i.chip?.waitingOn) || /did not publish/i.test(str(i.chip?.waitingOn))) && !i.chip?.upstream?.id && !i.chip?.stale
+
 async function readTitle(route, id) {
   const bridge = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
   if (!bridge || !route.connectionId) return { title: '', board: route.board }
@@ -920,7 +1010,9 @@ export function shortWait(w) {
   const run = /actions\/runs\/(\d+)/.exec(t), pr = /\/pull\/(\d+)/.exec(t)
   if (/^ci\b/i.test(t) && run) return `CI run ${run[1]}`
   if (pr) return `${/^ci\b/i.test(t) ? 'CI on ' : ''}PR #${pr[1]}`
+  // URLs lose their scheme and are cut; a full commit sha is cut to 9 characters.
   return t.replace(/https?:\/\/\S+/g, u => { const bare = u.replace(/^https?:\/\/(www\.)?/, ''); return bare.length > 40 ? `${bare.slice(0, 39)}…` : bare })
+    .replace(/\b([0-9a-f]{9})[0-9a-f]{31}\b/g, '$1')
 }
 
 /** What a Waiting row shows on its line: `{ reason: [text | { ref }], tone, age, sub }`. `ref` is
@@ -928,7 +1020,7 @@ export function shortWait(w) {
  *  or reason published);
  *  `age` is how long it has waited (from the card's published wait start). Built from the chip, not from
  *  the long `detail` string, which stays for the details and tooltip. */
-export function rowWait(i, nowMs = Date.now()) {
+export function rowWait(i, nowMs = Date.now(), parkInfo = null) {
   const c = i?.chip || {}, now = nowMs / 1000
   const since = Number(c.waitingSince) > 0 && Number(c.waitingSince) <= now ? Number(c.waitingSince) : 0
   const age = since ? shortDur(now - since) : ''
@@ -975,6 +1067,39 @@ export function rowWait(i, nowMs = Date.now()) {
     return v([`no reviewer running${kind ? ` · ${kind}${at > 0 ? ` ${shortDur(now - at)} ago` : ''}` : ''}`])
   }
   if (w && !/did not publish/i.test(w)) return v([`on ${shortWait(w)}`])
+  // Nothing on the row: the owner's park (read by the caller via parkFor) says what wakes it.
+  if (parkInfo?.state === 'loading' && !parkInfo.park) return v(['reading wake…'])
+  const pk = parkInfo?.park
+  if (pk) {
+    const vv = (reason, tone = '', extra = {}) => ({ ...v(reason, tone, extra), age: age || (pk.parkedAt && pk.parkedAt <= now ? shortDur(now - pk.parkedAt) : '') })
+    const by = pk.wakeAt ? (pk.wakeAt >= now ? `by ${pacificShort(pk.wakeAt, nowMs)}` : `due ${pacificShort(pk.wakeAt, nowMs)}`) : ''
+    const late = pk.wakeAt && pk.wakeAt < now ? now - pk.wakeAt : 0
+    const lateText = late ? `${late >= OVERDUE_FLAG_S ? '⚠ ' : ''}${shortDur(late)} overdue` : ''
+    const tone = late >= OVERDUE_FLAG_S ? 'warn' : ''
+    const a = pk.awaiting && !pk.awaiting.inferred ? pk.awaiting : null
+    const staleNote = parkInfo.state === 'stale' ? ' · not re-read' : ''
+    if (pk.forHuman) return vv(['no timed wake · will be blocked for a person'], 'warn')
+    if (pk.superseded) return vv(['new park not synced yet'], '', { sub: `backstop ${pacificShort(pk.wakeAt, nowMs)}${staleNote}` })
+    if (a?.kind === 'human') return vv([`waits on a person${a.why ? ` (${a.why.slice(0, 60)})` : ''}`], 'warn')
+    if (a && /\bt_[0-9a-f]{6,}\b/.test(a.ref)) {
+      const id = /\bt_[0-9a-f]{6,}\b/.exec(a.ref)[0]
+      return vv(['on ', { ref: { id, status: '', text: `card ${id}` } }], tone, { sub: (lateText || by) + staleNote })
+    }
+    if (a && a.kind !== 'clock' && a.ref) {
+      const ci = a.kind === 'ci' ? shortWait(`ci ${a.ref}`) : ''
+      const what = ci ? (/^ci /i.test(ci) ? `CI: ${ci.slice(3)}` : ci) : a.kind === 'external' || a.kind === 'resource' ? shortWait(a.ref) : `${a.kind} ${shortWait(a.ref)}`
+      return vv([`on ${what}`], tone, { sub: (lateText || by) + staleNote })
+    }
+    if (pk.check) {
+      const probe = /([\w.-]+\.(?:py|sh|mjs|js))\b/.exec(pk.check)?.[1] || shortWait(pk.check).split(/\s+/).slice(0, 3).join(' ')
+      return vv([`on probe ${probe}`], tone, { sub: (lateText || by) + staleNote })
+    }
+    if (pk.wakeAt) {
+      const why = a?.kind === 'clock' && a.why ? ` (${a.why.slice(0, 60)})` : ''
+      if (pk.wakeAt >= now) return vv([`${pk.continued ? 'resumes in ' : ''}${shortDur(pk.wakeAt - now)}${pk.continued ? '' : ' left'}${why}`], '', { sub: pacificShort(pk.wakeAt, nowMs) + staleNote })
+      return vv([lateText], tone, { sub: `due ${pacificShort(pk.wakeAt, nowMs)}${staleNote}` })
+    }
+  }
   if (c.state === 'scheduled') return v(['no wake published'], 'note')
   if (c.state === 'blocked') return v(['blocked · no reason given'], 'note')
   if (c.state === 'todo') return v(['on parent cards'])
@@ -1078,7 +1203,7 @@ export function waitTree(rows, rankOf = () => 0) {
  *  that many lines (children stay under their parent) and the rest count as "+N more waiting". */
 export function WaitList({ rows, now = Date.now(), kindOf = () => 'waiting', limit = Infinity, more = 0, attrs = {} }) {
   // Most urgent first when cut: blocked upstream, then a warning (well overdue, a retired ask), then the rest.
-  const tree = waitTree(rows, i => (i.blockedUpstreamRow ? 0 : rowWait(i, now).tone === 'warn' ? 1 : 2))
+  const tree = waitTree(rows, i => (i.blockedUpstreamRow ? 0 : rowWait(i, now, needsPark(i) ? parkFor(i.chip, now) : null).tone === 'warn' ? 1 : 2))
   const shown = tree.slice(0, limit)
   const rest = tree.length - shown.length + more
   if (!shown.length && !rest) return null
@@ -1088,12 +1213,26 @@ export function WaitList({ rows, now = Date.now(), kindOf = () => 'waiting', lim
   ] })
 }
 
+/** The owner's park in words, for the long form: what it waits on (and why), the probe, and the wake. */
+export function parkLine(pk) {
+  if (!pk) return ''
+  const a = pk.awaiting
+  const parts = []
+  if (a && (a.ref || a.why)) parts.push(`${a.inferred ? 'inferred: ' : ''}waits on ${a.kind}${a.ref ? ` ${a.ref}` : ''}${a.why ? ` (${a.why})` : ''}`)
+  if (pk.check) parts.push(`probe \`${pk.check}\`${pk.nextProbeAt ? `, next ${pacificShort(pk.nextProbeAt)}` : ''}`)
+  if (pk.superseded) parts.push('its newest park already ended; the next park has not synced')
+  if (pk.forHuman) parts.push('no timed wake: the dispatcher blocks it for a person on its next tick')
+  else if (pk.wakeAt) parts.push(`${pk.superseded ? 'backstop' : pk.continued ? 'resumes' : 'wakes'} ${pacificShort(pk.wakeAt)}`)
+  return `owner's park: ${parts.join(' · ') || 'no wake'}`
+}
+
 /** One waiting card on one line of its WaitList (subgrid): box · title · short reason · how long. The title is the
  *  row's disclosure button (keyboard: Tab, Enter/Space); a click anywhere on the line opens it too. The long form:
  *  the full wait text (cards linked, the source), id · state · where, the execution evidence, and Open card. */
 export function WaitRow({ i, now = Date.now(), k = 'waiting', depth = 0, parentId = null }) {
   const [open, setOpen] = useState(false)
-  const base = rowWait(i, now)
+  const parkInfo = needsPark(i) ? parkFor(i.chip, now) : null
+  const base = rowWait(i, now, parkInfo)
   // Nested under the card it waits on: the outline already says "on <parent>", so that reason is dropped.
   const view = parentId && base.reason[0] === 'on ' && base.reason[1]?.ref?.id === parentId ? { ...base, reason: [], sub: '' } : base
   // Indent is capped so a deep chain never squeezes the title away; the depth is still on the row (data-depth).
@@ -1119,6 +1258,7 @@ export function WaitRow({ i, now = Date.now(), k = 'waiting', depth = 0, parentI
         // The wait itself first; where the state was read (`board status` / `reported board status`) joins the id line.
         i.detail && jsx('div', { 'data-row-detail': '', children: jsx(WaitText, { text: str(i.detail).replace(SOURCE_TAIL, ''), chip: i.chip, plain: i.cardStatus }) }),
         i.chip?.id && !i.cardStatus && jsx('div', { 'data-wait-ident': '', children: [i.chip.id, i.chip.state, whereText(i.chip), i.chip.board && i.chip.board !== 'default' ? `board ${i.chip.board}` : '', SOURCE_TAIL.exec(str(i.detail))?.[1] ? `read from ${SOURCE_TAIL.exec(str(i.detail))[1]}` : ''].filter(Boolean).join(' · ') }),
+        parkInfo?.park && jsx('div', { 'data-wait-park': '', children: parkLine(parkInfo.park) }),
         i.evidenceText && jsx('div', { 'data-evidence': i.evidenceState || '', children: `evidence: ${i.evidenceText}` }),
         canOpen && jsx('button', { type: 'button', 'data-open-card': '', style: { ...btn, minHeight: 26, marginTop: 4, fontSize: 12 }, onClick: () => st.openTaskChip(i.chip), children: 'Open card' })
       ] })

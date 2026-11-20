@@ -878,6 +878,23 @@ test('panel: collapsed, a blocked-upstream line nested under a waiting parent st
   assert.deepEqual(lines.slice(0, 2), ['0:Card C', '1:Card D'])
 })
 
+test('panel: a scheduled card with no published wait shows its owner\'s wake, read from the card', async () => {
+  window.localStorage.clear()
+  const s = Date.now() / 1000
+  const b = bridges({ chips: [card('t_park0001', 'scheduled', { label: 'Parked one' })] })
+  window.hermesDesktop = { api: async a => (a.path.startsWith('/api/plugins/kanban/tasks/t_park0001')
+    ? { task: { status: 'scheduled', wake_check: null }, events: [{ id: 9, kind: 'continued', created_at: s - 300, payload: { wake_at: s + 1800, awaiting: { kind: 'ci', ref: 'local suite PID 7', why: 'suite running' } } }] }
+    : { tasks: [], includes: ['done'] }) }
+  await show(React.createElement(m.Panel, { key: 'owner-park' }))
+  await React.act(async () => { await flush(); await flush() })
+  const line = el().querySelector('[data-folded-waiting] [data-waiting-line]')
+  assert.match(lineText(line), /^Parked one \| on CI: local suite PID 7 · by \w{3} \d\d:\d\d P[SD]T \| 5m$/)
+  assert.doesNotMatch(el().textContent, /no wake published/)
+  await React.act(async () => { line.querySelector('[data-wait-toggle]').click() })
+  assert.match(el().querySelector('[data-wait-park]').textContent, /^owner's park: waits on ci local suite PID 7 \(suite running\) · resumes /)
+  void b
+})
+
 // [daveey] Switching chats shows the panel at once: last-known data paints first, reads replace it.
 test('panel: a chat whose runtime id has not landed yet (resume) still shows its cards', async () => {
   window.localStorage.clear()
