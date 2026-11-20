@@ -265,7 +265,8 @@ def test_the_budget_host_folds_a_persons_cap_in_as_the_lower_of_the_two(tmp_path
     # the budget falls under the person's cap: the budget caps, the person's cap is kept for later
     assert T.publish_budget(tmp_path, None, _pacing(tmp_path, 200.0), NOW + 80)
     level = T.effective(tmp_path, None, NOW + 80)
-    assert level["percent"] == 0.0 and T.budget(level, NOW + 80)["cap_per_s"] == pytest.approx(200.0)
+    # the marker percent: theirs is above the budget (the budget caps, a hair under it)
+    assert level["percent"] == T.MANUAL_MIN_PERCENT and T.budget(level, NOW + 80)["cap_per_s"] == pytest.approx(200.0, rel=1e-4)
     assert T.read_user_cap(tmp_path)["cap_per_s"] == 250.0
     # its own write is not taken for a person's setting
     os.utime(T.level_path(tmp_path), (NOW + 80, NOW + 80))
@@ -277,7 +278,7 @@ def test_a_cap_above_the_budget_leaves_the_budget_in_force_and_none_removes_it(t
     pacing = _pacing(tmp_path, 1000.0)
     T.write_cap(tmp_path, 5000.0, NOW)
     T.publish_budget(tmp_path, None, pacing, NOW + 10)
-    assert T.effective(tmp_path, None, NOW + 10)["percent"] == 0.0
+    assert T.effective(tmp_path, None, NOW + 10)["percent"] == T.MANUAL_MIN_PERCENT
     T.write_cap(tmp_path, 100.0, NOW + 20)
     T.publish_budget(tmp_path, None, pacing, NOW + 30)
     assert T.effective(tmp_path, None, NOW + 30)["percent"] == pytest.approx(90.0)
@@ -301,8 +302,8 @@ def test_percent_for():
     assert T.percent_for(None, 1000.0) == 0.0
     assert T.percent_for(0.0, 1000.0) == 100.0
     assert T.percent_for(250.0, 1000.0) == 75.0
-    assert T.percent_for(2000.0, 1000.0) == 0.0
-    assert T.percent_for(250.0, None) == 0.0
+    assert T.percent_for(2000.0, 1000.0) == T.MANUAL_MIN_PERCENT  # theirs above the budget: the marker
+    assert T.percent_for(250.0, None) == T.MANUAL_MIN_PERCENT
 
 
 # --- review fixes: per-card grants, rollout compatibility, reserve holds, batched wait writes ------------------
@@ -387,12 +388,12 @@ def test_a_burst_set_and_ended_never_moves_the_persons_cap(tmp_path, cap):
     assert T.read_user_cap(tmp_path)["cap_per_s"] == cap
     level = T.effective(tmp_path, None, NOW + 30)
     assert level["burst"]["factor"] == 2.0
-    assert T.budget(level, NOW + 30)["cap_per_s"] == pytest.approx(min(cap, 1000.0) * 2)
+    assert T.budget(level, NOW + 30)["cap_per_s"] == pytest.approx(min(cap, 1000.0) * 2, rel=1e-4)
     assert T.shown_user_cap(tmp_path / "elsewhere", level, NOW + 30) == (None if cap > 1000 else pytest.approx(cap))
     T.clear_burst(tmp_path, T.effective(tmp_path, None, NOW + 40), NOW + 40)
     T.publish_budget(tmp_path, None, pacing, NOW + 50)
     assert T.read_user_cap(tmp_path)["cap_per_s"] == cap
-    assert T.budget(T.effective(tmp_path, None, NOW + 50), NOW + 50)["cap_per_s"] == pytest.approx(min(cap, 1000.0))
+    assert T.budget(T.effective(tmp_path, None, NOW + 50), NOW + 50)["cap_per_s"] == pytest.approx(min(cap, 1000.0), rel=1e-4)
 
 
 # --- no limit: a person's override of the budget, and limit_mode ---------------------------------------------
@@ -435,3 +436,34 @@ def test_limit_mode_names_what_caps_the_fleet(tmp_path):
     assert st(NOW + 30) == "budget"  # theirs is above the budget: the budget caps
     T.write_cap(tmp_path, 0, NOW + 40)
     assert st(NOW + 40) == "hold"
+
+
+def test_chosen_is_what_a_person_chose_whatever_caps_the_fleet(tmp_path):
+    pacing = _pacing(tmp_path, 1000.0)
+    ch = lambda root, t: T.status(root, tmp_path / "s.sqlite", t)["chosen"]
+    T.publish_budget(tmp_path, None, pacing, NOW)
+    assert ch(tmp_path, NOW) == "budget"
+    T.write_cap(tmp_path, 5000.0, NOW + 10, T.effective(tmp_path, None, NOW + 10))
+    T.publish_budget(tmp_path, None, pacing, NOW + 20)
+    st = T.status(tmp_path, tmp_path / "s.sqlite", NOW + 20)
+    assert (st["chosen"], st["limit_mode"], st["user_cap_per_s"]) == ("limit", "budget", 5000.0)  # the budget caps
+    # another gateway sees the same choice from the published level alone (no record of its own)
+    other = tmp_path / "other"
+    other.mkdir()
+    T._write_json(T.level_path(other), json.loads(T.level_path(tmp_path).read_text()))
+    st = T.status(other, tmp_path / "s.sqlite", NOW + 20)
+    assert (st["chosen"], st["limit_mode"], st["user_cap_per_s"]) == ("limit", "budget", None)  # value known on the host
+    T.write_cap(tmp_path, T.UNLIMITED, NOW + 30, T.effective(tmp_path, None, NOW + 30))
+    assert ch(tmp_path, NOW + 30) == "no_limit"
+    T.write_cap(tmp_path, None, NOW + 40)
+    assert ch(tmp_path, NOW + 40) == "budget"
+    T.write_cap(tmp_path, 0, NOW + 50)
+    assert ch(tmp_path, NOW + 50) == "limit"
+    T.write_level(tmp_path, 0, now=NOW + 60)  # the old "throttle off"
+    assert ch(tmp_path, NOW + 60) == "no_limit"
+
+
+def test_limit_mode_of_a_carried_budget_that_expired_is_none(tmp_path):
+    T._write_json(T.level_path(tmp_path), {"mode": "manual", "percent": 0.0, "pool_caps": {"anthropic": 0.0},
+                                           "budget_at": NOW - 2 * 3600, "set_at": NOW - 10})
+    assert T.status(tmp_path, tmp_path / "s.sqlite", NOW)["limit_mode"] == "none"

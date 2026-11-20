@@ -32,7 +32,10 @@ def parse_per_min(text: str) -> Optional[float]:
     match = _AMOUNT.match(str(text))
     if not match:
         raise ValueError(f"not a token amount: {text!r} (thousands of tokens/min: try 150, 150k, 2m or off)")
-    return float(match.group(1)) * {"": 1e3, "k": 1e3, "m": 1e6}[match.group(2).lower()]
+    value = float(match.group(1)) * {"": 1e3, "k": 1e3, "m": 1e6}[match.group(2).lower()]
+    if value / 60.0 >= 1e12:
+        raise ValueError(f"{text!r} is beyond any real limit: use `unlimited` for no limit")
+    return value
 
 
 def fmt(per_s: Optional[float]) -> str:

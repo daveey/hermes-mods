@@ -27,7 +27,7 @@ def test_amounts():
     import math
     for word in ("unlimited", "nolimit", "No-Limit"):
         assert math.isinf(C.parse_per_min(word))
-    for bad in ("-5k", "lots", "5g", ""):
+    for bad in ("-5k", "lots", "5g", "", "70000000m"):
         with pytest.raises(ValueError):
             C.parse_per_min(bad)
 
