@@ -421,6 +421,15 @@ def test_budget_view_endpoint_shape(api, tmp_path, monkeypatch):
     assert h["bucket_s"] == 3600 and len(h["t"]) == len(h["providers"]["anthropic"]["rate"]) in (168, 169)
     assert h["providers"]["anthropic"]["cumulative"][-1] == 7200.0
     assert got["burst"]["factor"] == 2.0 and got["burst"]["active"] is True
+    # the history is read at most once a minute per process: a new series row shows only after the cache expires
+    store.put("hub", "tokens_io:claude-opus-5-5", [(until - 60, 3600.0)])
+    assert c.get("/p/v1/budget").json()["history"]["providers"]["anthropic"]["cumulative"][-1] == 7200.0
+    api._history_cache.clear()
+    assert c.get("/p/v1/budget").json()["history"]["providers"]["anthropic"]["cumulative"][-1] == 10800.0
+    only = c.get("/p/v1/budget?factor=2&hours=1&projection_only=1").json()
+    assert set(only) == {"now", "computed_at", "burst", "projection"}
+    assert only["projection"]["pools"]["anthropic"]["extra_tokens"] == pytest.approx(360_000.0)
+    assert c.get("/p/v1/budget?projection_only=1").status_code == 400
     proj = c.get("/p/v1/budget?factor=2&hours=1").json()["projection"]
     assert proj["factor"] == 2.0 and proj["hours"] == 1.0
     assert proj["pools"]["anthropic"]["extra_tokens"] == pytest.approx(360_000.0)

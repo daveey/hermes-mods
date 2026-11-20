@@ -20,22 +20,40 @@ def test_project_hand_computed():
         # exhaustion in the burst; 3600 s earlier; after it (1M - 720k) / (10 000 - 3600) = 43.75/s.
         "anthropic": {"rate_tokens_per_s": 100.0, "remaining_tokens": 1_000_000.0, "exhaust_plan_at": NOW + 10_000,
                       "at_reserve": False},
-        # 100/s, 300k left, plan says 2500 s: at 200/s it is empty after 1500 s, inside the burst. Extra capped by
-        # remaining (300k), earlier capped by the plan's 2500 s, and the re-planned rate is 0 (the plan ends first).
+        # 100/s, 300k left, plan says 2500 s: at 200/s it is empty after 1500 s, inside the burst, 1000 s before the
+        # plan's end. The plan alone would also spend all 300k within the hour, so the burst adds no tokens over that
+        # hour (300k - 300k); the re-planned rate is 0 (the plan ends during the burst).
         "openai-codex": {"rate_tokens_per_s": 100.0, "remaining_tokens": 300_000.0, "exhaust_plan_at": NOW + 2500,
-                         "at_reserve": False},
+                         "at_reserve": False, "rate_cap_5h": 150.0},
     })
     out = B.project(v2, 2.0, 3600.0, NOW)
     assert out["anthropic"] == {"rate_now": 100.0, "extra_tokens": pytest.approx(360_000.0),
                                 "exhausts_during_burst_at": None, "earlier_s": pytest.approx(3600.0),
-                                "rate_after": pytest.approx(43.75)}
-    assert out["openai-codex"] == {"rate_now": 100.0, "extra_tokens": pytest.approx(300_000.0),
+                                "rate_after": pytest.approx(43.75), "rate_cap_5h": None, "exceeds_5h_cap": None}
+    assert out["openai-codex"] == {"rate_now": 100.0, "extra_tokens": 0.0,
                                    "exhausts_during_burst_at": pytest.approx(NOW + 1500.0),
-                                   "earlier_s": pytest.approx(2500.0), "rate_after": 0.0}
+                                   "earlier_s": pytest.approx(1000.0), "rate_after": 0.0,
+                                   "rate_cap_5h": 150.0, "exceeds_5h_cap": True}  # 200/s burst over a 150/s cap
     # 1.5x for 30 min on the first pool: +90k, 900 s earlier, (1M - 270k) / (10 000 - 1800) = 89.02/s
     half = B.project(v2, 1.5, 1800.0, NOW)["anthropic"]
     assert half["extra_tokens"] == pytest.approx(90_000.0) and half["earlier_s"] == pytest.approx(900.0)
     assert half["rate_after"] == pytest.approx(730_000.0 / 8200.0)
+
+
+def test_project_runs_out_during_the_burst_earlier_is_the_gap_to_the_plan_end():
+    # 100/s, 500k left, plan ends in 5000 s. 3x for an hour: empty after 500k / 300 = 1666.7 s, 3333.3 s before the
+    # plan's end (not the 2 x 100 x 3600 / 100 = 7200 s the uncapped formula gives, nor the 5000 s to the plan end).
+    # Extra: min(500k, 1.08M) - min(500k, 360k) = 140k.
+    v2 = _v2({"anthropic": {"rate_tokens_per_s": 100.0, "remaining_tokens": 500_000.0, "exhaust_plan_at": NOW + 5000,
+                            "at_reserve": False, "rate_cap_5h": 400.0}})
+    out = B.project(v2, 3.0, 3600.0, NOW)["anthropic"]
+    assert out["exhausts_during_burst_at"] == pytest.approx(NOW + 500_000 / 300)
+    assert out["earlier_s"] == pytest.approx(5000 - 500_000 / 300)
+    assert out["extra_tokens"] == pytest.approx(140_000.0)
+    assert out["exceeds_5h_cap"] is False  # 300/s is under the 400/s 5-hour cap
+    # without exhaust_plan_at the plan's own end is remaining / rate = 5000 s too
+    v2["pools"]["anthropic"]["exhaust_plan_at"] = None
+    assert B.project(v2, 3.0, 3600.0, NOW)["anthropic"]["earlier_s"] == pytest.approx(5000 - 500_000 / 300)
 
 
 def test_project_after_rate_is_floored_and_plan_end_after_burst():
@@ -56,9 +74,9 @@ def test_project_edge_cases_reserve_null_and_malformed():
     out = B.project(v2, 3.0, 7200.0, NOW)
     assert set(out) == {"anthropic", "openai-codex", "xai-oauth"}
     assert out["anthropic"] == {"rate_now": 0.0, "extra_tokens": 0.0, "exhausts_during_burst_at": None,
-                                "earlier_s": 0.0, "rate_after": 0.0}
+                                "earlier_s": 0.0, "rate_after": 0.0, "rate_cap_5h": None, "exceeds_5h_cap": False}
     nulls = {"rate_now": None, "extra_tokens": None, "exhausts_during_burst_at": None, "earlier_s": None,
-             "rate_after": None}
+             "rate_after": None, "rate_cap_5h": None, "exceeds_5h_cap": None}
     assert out["openai-codex"] == nulls and out["xai-oauth"] == nulls
     for bad in (None, [], "v2", {}, {"pools": {}}, {"computed_at": "now", "pools": {}},
                 {"computed_at": NOW, "pools": []}, {"computed_at": float("nan"), "pools": {}}):
@@ -67,7 +85,7 @@ def test_project_edge_cases_reserve_null_and_malformed():
     idle = B.project(_v2({"anthropic": {"rate_tokens_per_s": 0.0, "remaining_tokens": 5.0, "exhaust_plan_at": None}}),
                      2.0, 3600.0, NOW)["anthropic"]
     assert idle == {"rate_now": 0.0, "extra_tokens": 0.0, "exhausts_during_burst_at": None, "earlier_s": 0.0,
-                    "rate_after": 0.0}
+                    "rate_after": 0.0, "rate_cap_5h": None, "exceeds_5h_cap": None}
 
 
 def test_chart_v2_drops_account_readings_and_unknown_events():

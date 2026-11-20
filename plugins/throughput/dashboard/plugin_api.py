@@ -3,8 +3,9 @@ GET / PUT /api/plugins/throughput/v1/throttle: the fleet's token throttle level 
 subscription pools' runway (../runway.py). PUT body ``{"percent": 0..100}``.
 PUT / DELETE /api/plugins/throughput/v1/throttle/burst: start a burst on the budget level (body ``{"factor": 1 < f <= 4,
 "hours": 0 < h <= 24}``; 409 on a manual or expired level) or end it now.
-GET /api/plugins/throughput/v1/budget[?factor=&hours=]: this host's capacity model, the measured spend per provider
-over 7 days and the current burst, plus the cost of the given burst (../budget_view.py).
+GET /api/plugins/throughput/v1/budget[?factor=&hours=[&projection_only=1]]: this host's capacity model, the measured
+spend per provider over 7 days (cached a minute per process) and the current burst, plus the cost of the given burst
+(../budget_view.py); ``projection_only`` returns just the burst and its cost.
 
 Loaded by path by the dashboard, outside its package: the plugin package is imported under a private name.
 Single-flight per (range, by) for 15 s; the slow work (sqlite reads, registry fetch) runs in a worker thread.
@@ -249,10 +250,31 @@ async def delete_burst() -> Dict[str, Any]:
     return await asyncio.to_thread(clear_burst)
 
 
-def budget_payload(factor: float | None = None, hours: float | None = None, now: float | None = None) -> Dict[str, Any]:
+HISTORY_CACHE_S = 60.0  # the 7-day hourly history moves by one bucket an hour: re-read it at most once a minute
+_history_lock = threading.Lock()
+_history_cache: Dict[str, tuple] = {}
+
+
+def cached_history(view, series_db, now: float, clock=time.monotonic) -> Dict[str, Any]:
+    """``budget_view.history`` for this process, re-read at most every ``HISTORY_CACHE_S`` per series db (single
+    flight: concurrent callers wait for one read)."""
+    key = str(series_db)
+    with _history_lock:  # the read is ~0.2 s on a large series; one at a time is fine for one panel
+        hit = _history_cache.get(key)
+        if hit is not None and 0 <= clock() - hit[0] < HISTORY_CACHE_S:
+            return hit[1]
+        value = view.history(series_db, now)
+        _history_cache[key] = (clock(), value)
+        return value
+
+
+def budget_payload(factor: float | None = None, hours: float | None = None, now: float | None = None,
+                   projection_only: bool = False) -> Dict[str, Any]:
     """``{now, computed_at, margin_s, global_rate_tokens_per_s, pools, events, curve, history, burst, projection}``:
-    one read of this host's ``llm_pacing.json`` and one 7-day slice of the series. ``projection`` is the cost of a
-    ``factor`` x burst for ``hours`` (``budget_view.project``), or None when no burst was asked about."""
+    one read of this host's ``llm_pacing.json`` and the 7-day series slice (``cached_history``, at most once a
+    minute). ``projection`` is the cost of a ``factor`` x burst for ``hours`` (``budget_view.project``), or None when
+    no burst was asked about. ``projection_only``: just ``{now, computed_at, burst, projection}`` (the panel asks
+    this when only its burst pick changes; it reads no series)."""
     sampler, _ = _services()
     import importlib
     import json
@@ -266,8 +288,11 @@ def budget_payload(factor: float | None = None, hours: float | None = None, now:
     except (OSError, ValueError):
         data = None
     v2 = data.get("v2") if isinstance(data, dict) else None
-    out: Dict[str, Any] = {"now": now, **view.chart_v2(v2)}
-    out["history"] = view.history(sampler.series_path(root), now)
+    chart = view.chart_v2(v2)
+    if projection_only:
+        out: Dict[str, Any] = {"now": now, "computed_at": chart["computed_at"]}
+    else:
+        out = {"now": now, **chart, "history": cached_history(view, sampler.series_path(root), now)}
     out["burst"] = throttle.burst_status(throttle.effective(root, throttle.hub_db_path(), now), now)
     out["projection"] = None
     if factor is not None:
@@ -276,12 +301,15 @@ def budget_payload(factor: float | None = None, hours: float | None = None, now:
 
 
 @router.get("/v1/budget")
-async def get_budget(factor: float | None = Query(None), hours: float | None = Query(None)) -> Dict[str, Any]:
+async def get_budget(factor: float | None = Query(None), hours: float | None = Query(None),
+                     projection_only: bool = Query(False)) -> Dict[str, Any]:
     if (factor is None) != (hours is None):
         raise HTTPException(status_code=400, detail="give both factor and hours, or neither")
+    if projection_only and factor is None:
+        raise HTTPException(status_code=400, detail="projection_only needs factor and hours")
     if factor is not None:
         try:
             factor, hours = _burst_args(factor, hours)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
-    return await asyncio.to_thread(budget_payload, factor, hours)
+    return await asyncio.to_thread(budget_payload, factor, hours, None, projection_only)

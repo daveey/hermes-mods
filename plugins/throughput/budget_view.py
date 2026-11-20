@@ -34,22 +34,29 @@ def _pools(v2) -> Optional[dict]:
 
 def _nulls() -> dict:
     return {"rate_now": None, "extra_tokens": None, "exhausts_during_burst_at": None, "earlier_s": None,
-            "rate_after": None}
+            "rate_after": None, "rate_cap_5h": None, "exceeds_5h_cap": None}
 
 
 def project(v2, factor: float, duration_s: float, now: float) -> dict:
-    """``{pool: {rate_now, extra_tokens, exhausts_during_burst_at, earlier_s, rate_after}}`` for a burst of
-    ``factor`` x the planned rate (``rate_tokens_per_s``) for ``duration_s`` starting ``now``:
+    """``{pool: {rate_now, extra_tokens, exhausts_during_burst_at, earlier_s, rate_after, rate_cap_5h,
+    exceeds_5h_cap}}`` for a burst of ``factor`` x the planned rate (``rate_tokens_per_s``) for ``duration_s`` starting
+    ``now``:
 
-    * ``extra_tokens``: ``(factor - 1) x rate_now x duration_s``, at most ``remaining_tokens``.
+    * ``extra_tokens``: the burst's incremental spend over the plan's in the same time, ``min(remaining, factor x
+      rate_now x duration_s) - min(remaining, rate_now x duration_s)``.
     * ``exhausts_during_burst_at``: when the remaining tokens run out at the burst rate, if before the burst ends.
     * ``earlier_s``: how much earlier the pool runs out if spend returns to the old plan afterwards without
-      re-planning: ``extra_tokens / rate_now``, at most the time left to ``exhaust_plan_at``.
+      re-planning: ``extra_tokens / rate_now``, at most the time left to ``exhaust_plan_at``. When the pool runs out
+      during the burst it is exactly how much sooner that is than the plan's end, ``exhaust_plan_at -
+      exhausts_during_burst_at`` (``now + remaining / rate_now`` standing in for an unknown ``exhaust_plan_at``).
     * ``rate_after``: the rate the planner re-plans to after the burst, ``(remaining - burst spend) /
       (exhaust_plan_at - burst end)``, at least 0 (0 when the plan ends during the burst).
+    * ``exceeds_5h_cap``: whether the burst rate is above the pool's ``rate_cap_5h`` (core: the summed rate at which
+      each account under reserve would spend its 5-hour window down to its reserve by that window's reset), i.e. a
+      sustained burst would push accounts into their 5-hour reserve; None when core has no 5-hour cap for the pool.
 
-    A pool at reserve: zeros (and no exhaustion time). A pool whose rate or remaining is unknown: nulls. A missing
-    or malformed ``v2``: ``{}``."""
+    A pool at reserve: zeros (no exhaustion time, ``exceeds_5h_cap`` false). A pool whose rate or remaining is
+    unknown: nulls. A missing or malformed ``v2``: ``{}``."""
     pools = _pools(v2)
     if pools is None:
         return {}
@@ -58,7 +65,8 @@ def project(v2, factor: float, duration_s: float, now: float) -> dict:
     for provider, entry in sorted(pools.items()):
         if entry.get("at_reserve") is True:
             out[provider] = {"rate_now": 0.0, "extra_tokens": 0.0, "exhausts_during_burst_at": None,
-                             "earlier_s": 0.0, "rate_after": 0.0}
+                             "earlier_s": 0.0, "rate_after": 0.0, "rate_cap_5h": _number(entry.get("rate_cap_5h")),
+                             "exceeds_5h_cap": False}
             continue
         rate, remaining = _number(entry.get("rate_tokens_per_s")), _number(entry.get("remaining_tokens"))
         if rate is None or remaining is None or rate < 0:
@@ -68,11 +76,15 @@ def project(v2, factor: float, duration_s: float, now: float) -> dict:
         exhaust_at = _number(entry.get("exhaust_plan_at"))
         burst_rate = factor * rate
         burst_spend = min(remaining, burst_rate * duration_s)
-        extra = min(remaining, (factor - 1.0) * rate * duration_s)
+        extra = burst_spend - min(remaining, rate * duration_s)
         runs_out = now + remaining / burst_rate if burst_rate > 0 and remaining / burst_rate < duration_s else None
         earlier = extra / rate if rate > 0 else 0.0
         if exhaust_at is not None:
             earlier = min(earlier, max(0.0, exhaust_at - now))
+        if runs_out is not None:  # rate > 0 here
+            plan_end = exhaust_at if exhaust_at is not None else now + remaining / rate
+            earlier = max(0.0, plan_end - runs_out)
+        cap5 = _number(entry.get("rate_cap_5h"))
         if exhaust_at is None:
             after = None if rate > 0 else 0.0
         elif exhaust_at <= end:
@@ -80,7 +92,8 @@ def project(v2, factor: float, duration_s: float, now: float) -> dict:
         else:
             after = max(0.0, (remaining - burst_spend) / (exhaust_at - end))
         out[provider] = {"rate_now": rate, "extra_tokens": extra, "exhausts_during_burst_at": runs_out,
-                         "earlier_s": earlier, "rate_after": after}
+                         "earlier_s": earlier, "rate_after": after, "rate_cap_5h": cap5,
+                         "exceeds_5h_cap": None if cap5 is None else burst_rate > cap5}
     return out
 
 

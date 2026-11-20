@@ -189,19 +189,28 @@ and a body that is not a JSON object a 422, and neither changes anything.
     burst; the budget publisher keeps a running burst when it rewrites the level (and folds in one set on another
     gateway, like a slider move) and drops an expired one. A manual level (`write_level`) never carries one.
   - **Expiry** needs no action: once `until` passes the burst is ignored everywhere. An expired or malformed burst,
-    or a burst on a manual level, is ignored.
+    a burst on a manual level, or one whose `until` is more than 24 h from this gateway's clock, is ignored.
+  - **Mixed versions: update before using it.** The budget-publish host and every host where a burst is set must run
+    this plugin and hub client 1.9.56 or newer before anyone starts a burst: an older publisher rewrites the level
+    without `burst` (ending it fleet-wide on its next write), and an older client drops it in transit. A gateway on an
+    older plugin ignores the burst and keeps the unboosted caps; its start gate then compares the fleet's burst-level
+    spend against those caps, so it holds card starts for the length of the burst until it updates.
   - **API**: `PUT /v1/throttle/burst` with `{"factor": 1 < f <= 4, "hours": 0 < h <= 24}` starts one on the budget
     level in force; any other value is a 400, and a manual level (or an expired budget) a 409 that says why.
     `DELETE /v1/throttle/burst` ends it now (a no-op without one). Both answer with the `GET /v1/throttle` payload,
     which carries `burst: {factor, until, set_at, remaining_s, active}` (`null` without one).
   - **What it costs** (`budget_view.project`, `GET /v1/budget?factor=&hours=`): per pool in core's `v2`, `rate_now`
-    (the planned `rate_tokens_per_s`), `extra_tokens = (factor - 1) x rate_now x duration` (at most
-    `remaining_tokens`), `exhausts_during_burst_at` (when the remaining tokens run out at the burst rate, if before
-    the burst ends: the pool would hit its reserve), `earlier_s = extra_tokens / rate_now` (how much earlier the pool
-    runs out if spend goes back to the old plan without re-planning, at most the time to `exhaust_plan_at`) and
-    `rate_after = (remaining - burst spend) / (exhaust_plan_at - burst end)`, at least 0 (the slower rate the
-    planner re-plans to). A pool at reserve gives zeros, a pool of unknown rate nulls, a missing or malformed `v2`
-    `{}`.
+    (the planned `rate_tokens_per_s`), `extra_tokens = min(remaining, factor x rate_now x duration) - min(remaining,
+    rate_now x duration)` (the burst's spend over the plan's in the same time), `exhausts_during_burst_at` (when the
+    remaining tokens run out at the burst rate, if before the burst ends: the pool would hit its reserve),
+    `earlier_s` (how much earlier the pool runs out if spend goes back to the old plan without re-planning:
+    `extra_tokens / rate_now`, at most the time to `exhaust_plan_at`; when it runs out during the burst, exactly
+    `exhaust_plan_at - exhausts_during_burst_at`), `rate_after = (remaining - burst spend) / (exhaust_plan_at -
+    burst end)`, at least 0 (the slower rate the planner re-plans to), and `exceeds_5h_cap` with `rate_cap_5h`:
+    whether the burst rate is above core's 5-hour cap for the pool (the summed rate at which each account under
+    reserve would spend its 5-hour window down to its reserve by that window's reset; null when core has none), so a
+    sustained burst would park accounts at their 5-hour reserve until the window resets. A pool at reserve gives
+    zeros (`exceeds_5h_cap` false), a pool of unknown rate nulls, a missing or malformed `v2` `{}`.
   - Tests: `tests/test_throttle_burst.py`, `tests/test_budget_view.py`, `tests/test_api.py`
     (`test_burst_routes_set_end_and_refuse`). **Not tested**: a burst travelling through two real hub links.
 - **Budget view** (`GET /v1/budget[?factor=&hours=]`, `budget_view.py`): `{now, computed_at, margin_s,
@@ -214,8 +223,10 @@ and a body that is not a JSON object a 422, and neither changes anything.
   `{bucket_s: 3600, since, until, t: [bucket starts], providers: {p: {rate: [tokens/s or null when no gateway
   sampled the hour], cumulative: [tokens from since through each bucket's end]}}}`. `projection` is
   `{factor, hours, pools: project(...)}` when both are given (each validated like the burst route; one without the
-  other is a 400), else null. One read of the pacing file and one 7-day slice of the series (the query walks the
-  primary key per gateway: about 0.2 s on a 60 MB series). Test: `tests/test_api.py`
+  other is a 400), else null. One read of the pacing file and the 7-day slice of the series (the query walks the
+  primary key per gateway: about 0.2 s on a 60 MB series), cached for 60 s per process. `&projection_only=1` (with
+  factor and hours) returns just `{now, computed_at, burst, projection}` and reads no series: the panel fetches the
+  charts once per poll and asks only this when the burst pick changes. Test: `tests/test_api.py`
   (`test_budget_view_endpoint_shape`).
 - **Fail open**: an unreadable level, a missing series db or replica, or a failed read never holds a call. A core
   without `register_middleware` shows the slider but enforces nothing.
@@ -267,10 +278,11 @@ continue the measured line. Ticks along the bottom mark resets (and the curve's 
 resets, accounts added or removed; a red shaded span marks the burst (dashed edges while it is only being
 considered). The burst control (budget mode) picks 1.5x, 2x or 3x for 30 min, 1, 2 or 4 h and, before it can be
 started, lists each pool's cost ("runs out ~X earlier at today's rate · after the burst the planner slows to Y
-tok/s") with a warning when a pool would hit its reserve during the burst; a running burst shows its time left and
+tok/s") with a warning when a pool would hit its reserve during the burst or run over its 5-hour cap; a running burst shows its time left and
 an End button. In budget mode the slider stays, labelled "Hold back N%" (the share of the budget held back), and the
-cap text shows the burst ("Budget −20% · burst 2x · cap ..."). Lines use fixed mid-tone colours and the text the
-theme's variables, so the charts read in light and dark themes. Tests: `desktop-plugins/throughput/tests/throughput.test.mjs`.
+cap text shows the burst ("Budget −20% · burst 2x · cap ..."). Lines and text use the theme's variables
+(`--ui-blue`, `--ui-green`, `--ui-orange`, `--ui-purple`, `--ui-red`, `--ui-text-*`), with fallbacks of at least 3:1
+contrast on white and on near-black, so the charts read in light and dark themes. Tests: `desktop-plugins/throughput/tests/throughput.test.mjs`.
 
 ## Sampler
 

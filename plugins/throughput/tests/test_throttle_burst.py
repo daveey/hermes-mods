@@ -109,6 +109,18 @@ def test_expired_or_malformed_burst_is_ignored(tmp_path):
                                                                                "set_at": NOW}
 
 
+def test_burst_running_further_than_24_hours_from_now_is_ignored(tmp_path):
+    # a valid record (until - set_at = 24 h) read 1 h before its set_at (a clock behind): 25 h from here, not applied
+    db = _db(tmp_path)
+    _auto(tmp_path, burst=_burst(factor=2.0, set_at=NOW + 3600, until=NOW + 3600 + 86400), budget_at=NOW + 3000)
+    level = T.effective(tmp_path, None, NOW)
+    assert level["burst"]["factor"] == 2.0 and T.burst_active(level, NOW) is None
+    assert T.budget(level, NOW)["cap_per_s"] == 1000.0
+    assert T.status(tmp_path, db, NOW)["burst"]["active"] is False
+    assert T.burst_active(level, NOW + 3600) is not None  # within 24 h of until: applied
+    assert T.budget(level, NOW + 3600)["cap_per_s"] == pytest.approx(2000.0)
+
+
 def test_burst_on_a_manual_level_is_ignored_and_refused(tmp_path):
     db = _db(tmp_path)
     T.level_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)

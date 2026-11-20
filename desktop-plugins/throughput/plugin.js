@@ -270,9 +270,13 @@ export function throttleText(throttle, unit) {
 export const BURST_FACTORS = [1.5, 2, 3]
 export const BURST_HOURS = [0.5, 1, 2, 4]
 export const DEFAULT_BURST = { factor: 2, hours: 1 }
+// The Desktop theme's own colours (light and dark each define them), with fallbacks that keep at least 3:1 against
+// a white or a near-black background for a host without them. Capacity is a darker green than the chip's, which is
+// too faint on white.
 export const BUDGET_COLORS = {
-  spent: '#7aa2ff', capacity: '#3ddc97', reset: '#3ddc97', reset_early: '#f0a43a',
-  account_added: '#d982f0', account_removed: '#9aa0aa', burst_start: '#ef4444', burst_end: '#ef4444'
+  spent: 'var(--ui-blue, #3b82f6)', capacity: 'var(--ui-green, #1f8a65)', reset: 'var(--ui-green, #1f8a65)',
+  reset_early: 'var(--ui-orange, #d9822b)', account_added: 'var(--ui-purple, #8b6fd6)',
+  account_removed: 'var(--ui-text-tertiary, #8a909c)', burst_start: 'var(--ui-red, #dc3545)', burst_end: 'var(--ui-red, #dc3545)'
 }
 const MARK_LABEL = {
   reset: 'reset', reset_early: 'early reset', account_added: 'account added', account_removed: 'account removed',
@@ -297,15 +301,18 @@ export function burstText(burst, now) {
   return `Burst ${fmtFactor(burst.factor)} \u00b7 ${fmtDuration(burst.until - now)} left`
 }
 
-// One pool's cost of the burst being considered (budget_view.project): `{text, warn}`.
-export function projectionText(provider, pr) {
+// One pool's cost of a `factor` x burst (budget_view.project): `{text, warn, warn5h}`. `warn`: the pool would hit
+// its reserve before the burst ends; `warn5h`: the burst rate is above the pool's 5-hour cap (core's rate_cap_5h).
+export function projectionText(provider, pr, factor = null) {
   const name = poolName(provider)
-  if (!pr || pr.rate_now == null) return { text: `${name}: rate unknown, the burst cannot be costed`, warn: null }
-  if (pr.rate_now <= 0) return { text: `${name}: planned at 0 tok/s (at reserve or idle), a burst adds nothing`, warn: null }
+  if (!pr || pr.rate_now == null) return { text: `${name}: rate unknown, the burst cannot be costed`, warn: null, warn5h: null }
+  if (pr.rate_now <= 0) return { text: `${name}: planned at 0 tok/s (at reserve or idle), a burst adds nothing`, warn: null, warn5h: null }
   const text = `${name}: runs out ~${fmtDuration(pr.earlier_s)} earlier at today\u2019s rate \u00b7 after the burst the planner slows to ${fmt(pr.rate_after)} tok/s (now ${fmt(pr.rate_now)})`
   const warn = pr.exhausts_during_burst_at == null ? null
     : `${name} would hit its reserve during the burst, at ${timeLabel(pr.exhausts_during_burst_at, '7d')}`
-  return { text, warn }
+  const warn5h = !pr.exceeds_5h_cap ? null
+    : `${name} would run over its 5-hour cap (${fmt(pr.rate_cap_5h)} tok/s${factor ? ` against ${fmt(factor * pr.rate_now)} tok/s` : ''}): accounts reach their 5-hour reserve and wait for the window to reset`
+  return { text, warn, warn5h }
 }
 
 // A step curve's value at t: the last point at or before t (the first point before the curve starts).
@@ -529,7 +536,7 @@ export function BurstControl({ throttle, budget, pick, setPick, onStart, onEnd, 
   }
   const proj = budget?.projection
   const fresh = proj && proj.factor === pick.factor && proj.hours === pick.hours
-  const rows = fresh ? Object.entries(proj.pools || {}).map(([p, pr]) => [p, projectionText(p, pr)]) : []
+  const rows = fresh ? Object.entries(proj.pools || {}).map(([p, pr]) => [p, projectionText(p, pr, proj.factor)]) : []
   return h('div', { className: 'hermes-tp-burst', 'data-slot': 'burst' },
     h('div', { className: 'hermes-tp-trow' },
       h('span', { className: 'hermes-tp-lbl' }, 'Burst'),
@@ -539,7 +546,8 @@ export function BurstControl({ throttle, budget, pick, setPick, onStart, onEnd, 
         `Start ${fmtFactor(pick.factor)} for ${fmtHours(pick.hours)}`)),
     fresh ? null : h('div', { className: 'hermes-tp-lbl', role: 'status' }, 'Costing this burst…'),
     rows.map(([p, r]) => h('div', { key: p, className: 'hermes-tp-runway', 'data-projection': p },
-      r.text, r.warn ? h('span', { className: 'hermes-tp-warn', 'data-warn': p }, ` \u26a0 ${r.warn}`) : null)),
+      r.text, r.warn ? h('span', { className: 'hermes-tp-warn', 'data-warn': p }, ` \u26a0 ${r.warn}`) : null,
+      r.warn5h ? h('span', { className: 'hermes-tp-warn', 'data-warn5h': p }, ` \u26a0 ${r.warn5h}`) : null)),
     error ? h('div', { className: 'hermes-tp-note', role: 'alert' }, `Burst not changed: ${error}`) : null)
 }
 
@@ -706,18 +714,31 @@ export function Throughput({ ctx }) {
   const [burstPick, setBurstPick] = useState(DEFAULT_BURST)
   const [burstError, setBurstError] = useState(null)
   const auto = throttleQuery.data?.mode === 'auto'
+  // The charts (history, curve, events) and the cost of the picked burst are two requests: changing the pick asks
+  // only `projection_only`, which reads no series on the server.
   const budgetQuery = useQuery({
-    queryKey: ['throughput', 'budget', auto ? burstPick.factor : null, auto ? burstPick.hours : null],
+    queryKey: ['throughput', 'budget'],
     queryFn: async () => {
-      const q = auto ? `?factor=${encodeURIComponent(burstPick.factor)}&hours=${encodeURIComponent(burstPick.hours)}` : ''
-      const body = await ctx.rest(`/v1/budget${q}`, { timeoutMs: REQUEST_TIMEOUT_MS })
+      const body = await ctx.rest('/v1/budget', { timeoutMs: REQUEST_TIMEOUT_MS })
       if (!body || typeof body.pools !== 'object' || !body.history) throw Error('Invalid budget response')
       return body
     },
     enabled: open && !!throttleQuery.data, refetchInterval: visible && open ? POLL_MS : false,
+    refetchIntervalInBackground: false, refetchOnWindowFocus: false, retry: false, staleTime: 10000
+  })
+  const projectionQuery = useQuery({
+    queryKey: ['throughput', 'budget', 'projection', burstPick.factor, burstPick.hours],
+    queryFn: async () => {
+      const q = `?factor=${encodeURIComponent(burstPick.factor)}&hours=${encodeURIComponent(burstPick.hours)}&projection_only=1`
+      const body = await ctx.rest(`/v1/budget${q}`, { timeoutMs: REQUEST_TIMEOUT_MS })
+      if (!body || !body.projection) throw Error('Invalid projection response')
+      return body
+    },
+    enabled: open && auto && !!budgetQuery.data, refetchInterval: visible && open && auto ? POLL_MS : false,
     refetchIntervalInBackground: false, refetchOnWindowFocus: false, retry: false, staleTime: 10000,
     placeholderData: (prev) => prev
   })
+  const budget = budgetQuery.data ? { ...budgetQuery.data, projection: projectionQuery.data?.projection ?? null } : null
   const changeBurst = async (opts) => {
     try {
       const body = await ctx.rest('/v1/throttle/burst', { ...opts, timeoutMs: REQUEST_TIMEOUT_MS })
@@ -760,7 +781,7 @@ export function Throughput({ ctx }) {
       side: 'top', align: 'end', sticky: 'always', 'aria-label': 'Throughput', className: 'hermes-tp-popover',
       style: { width: 'min(680px, calc(100vw - 24px))', maxHeight: '80vh', overflowY: 'auto' }
     }, frame
-      ? h(Panel, { payload, frame, status, modelPayload, modelFrame: lastModel.current, modelStatus, modelFilter, setModelFilter, view, setView, filter, setFilter, onHoverRange: prefetch, throttle: throttleQuery.data || null, onThrottle, throttleError, budget: budgetQuery.data || null, burstPick, setBurstPick, onBurst, onEndBurst, burstError })
+      ? h(Panel, { payload, frame, status, modelPayload, modelFrame: lastModel.current, modelStatus, modelFilter, setModelFilter, view, setView, filter, setFilter, onHoverRange: prefetch, throttle: throttleQuery.data || null, onThrottle, throttleError, budget, burstPick, setBurstPick, onBurst, onEndBurst, burstError })
       : h('div', { className: 'hermes-tp-note' }, query.error ? `Unavailable: ${String(query.error.message || query.error).slice(0, 200)}` : 'Loading\u2026')))
 }
 
@@ -820,7 +841,7 @@ export const CSS = `
 .hermes-tp-btn{padding:1px 8px;font:inherit;font-size:11px;border:1px solid var(--ui-stroke-secondary);border-radius:5px;background:transparent;color:var(--ui-text-primary,inherit);cursor:pointer}
 .hermes-tp-btn:hover:not(:disabled){background:var(--chrome-action-hover)}
 .hermes-tp-btn:disabled{opacity:.5;cursor:default}
-.hermes-tp-warn{color:#d97706}
+.hermes-tp-warn{color:var(--ui-orange,#c2410c)}
 `
 
 export default {

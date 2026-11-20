@@ -162,9 +162,12 @@ def burst_of(raw) -> Optional[dict]:
 
 
 def burst_active(level: dict, now: float) -> Optional[dict]:
-    """The burst a level applies right now: a budget level's valid burst while ``now < until``; else None."""
+    """The burst a level applies right now: a budget level's valid burst while ``now < until <= now +
+    BURST_MAX_S``; else None."""
     burst = level.get("burst") if level.get("mode") == AUTO else None
-    return burst if isinstance(burst, dict) and now < burst["until"] else None
+    # ``burst_of`` bounds until - set_at; also bound until - now, so a burst stamped under a clock far behind (or
+    # crafted with an old set_at) never runs for more than BURST_MAX_S from here.
+    return burst if isinstance(burst, dict) and 0 < burst["until"] - now <= BURST_MAX_S + 0.001 else None
 
 
 def burst_status(level: dict, now: float) -> Optional[dict]:
@@ -172,9 +175,9 @@ def burst_status(level: dict, now: float) -> Optional[dict]:
     burst = level.get("burst") if level.get("mode") == AUTO else None
     if not isinstance(burst, dict):
         return None
-    left = max(0.0, burst["until"] - now)
-    return {"factor": burst["factor"], "until": burst["until"], "set_at": burst["set_at"], "remaining_s": left,
-            "active": left > 0}
+    active = burst_active(level, now) is not None
+    return {"factor": burst["factor"], "until": burst["until"], "set_at": burst["set_at"],
+            "remaining_s": max(0.0, burst["until"] - now) if active else 0.0, "active": active}
 
 
 def _record(data) -> Optional[dict]:

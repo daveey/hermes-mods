@@ -658,8 +658,8 @@ const budgetFixture = (over = {}) => ({
       unknown: { rate: [1, 1, 1], cumulative: [3600, 7200, 10800] } } },
   burst: null,
   projection: { factor: 2, hours: 1, pools: {
-    anthropic: { rate_now: 10, extra_tokens: 36000, exhausts_during_burst_at: null, earlier_s: 3600, rate_after: 4.5 },
-    'openai-codex': { rate_now: 20, extra_tokens: 200, exhausts_during_burst_at: END + 300, earlier_s: 10, rate_after: 0 } } },
+    anthropic: { rate_now: 10, extra_tokens: 36000, exhausts_during_burst_at: null, earlier_s: 3600, rate_after: 4.5, rate_cap_5h: null, exceeds_5h_cap: null },
+    'openai-codex': { rate_now: 20, extra_tokens: 200, exhausts_during_burst_at: END + 300, earlier_s: 10, rate_after: 0, rate_cap_5h: 30, exceeds_5h_cap: true } } },
   ...over
 })
 
@@ -683,11 +683,14 @@ test('burst maths: factor in force, preview and labels scale by it; projection t
   assert.equal(P.fmtHours(0.5), '30 min')
   assert.equal(P.fmtHours(4), '4 h')
   const pr = budgetFixture().projection.pools
-  assert.deepEqual(P.projectionText('anthropic', pr.anthropic),
-    { text: 'Claude: runs out ~60 min earlier at today’s rate · after the burst the planner slows to 4.5 tok/s (now 10)', warn: null })
-  const gpt = P.projectionText('openai-codex', pr['openai-codex'])
+  assert.deepEqual(P.projectionText('anthropic', pr.anthropic, 2),
+    { text: 'Claude: runs out ~60 min earlier at today’s rate · after the burst the planner slows to 4.5 tok/s (now 10)', warn: null, warn5h: null })
+  const gpt = P.projectionText('openai-codex', pr['openai-codex'], 2)
   assert.match(gpt.text, /^GPT: runs out ~1 min earlier/)
   assert.match(gpt.warn, /^GPT would hit its reserve during the burst, at \S+ \d\d:\d\d$/)
+  // 2 x 20 = 40 tok/s over a 30 tok/s 5-hour cap
+  assert.equal(gpt.warn5h, 'GPT would run over its 5-hour cap (30 tok/s against 40 tok/s): accounts reach their 5-hour reserve and wait for the window to reset')
+  assert.equal(P.projectionText('openai-codex', { ...pr['openai-codex'], exceeds_5h_cap: false }, 2).warn5h, null)
   assert.match(P.projectionText('anthropic', { rate_now: 0, extra_tokens: 0, earlier_s: 0, rate_after: 0 }).text, /a burst adds nothing/)
   assert.match(P.projectionText('xai-oauth', { rate_now: null }).text, /^Grok: rate unknown/)
 })
@@ -754,7 +757,8 @@ test('panel: budget charts per pool and total, burst projection, start and end, 
   try {
     await ui.click(button('Show throughput'))
     await ui.flush()
-    assert.ok(calls.some(([p]) => p === '/v1/budget?factor=2&hours=1'), 'the default 2x / 1 h burst is costed')
+    assert.ok(calls.some(([p]) => p === '/v1/budget'), 'the charts are one request')
+    assert.ok(calls.some(([p]) => p === '/v1/budget?factor=2&hours=1&projection_only=1'), 'the default 2x / 1 h burst is costed')
     const charts = [...document.querySelectorAll('[data-budget-chart]')].map((e) => e.dataset.budgetChart)
     assert.deepEqual(charts, ['total', 'anthropic', 'openai-codex'])
     const claude = document.querySelector('[data-budget-chart="anthropic"]')
@@ -774,10 +778,18 @@ test('panel: budget charts per pool and total, burst projection, start and end, 
     assert.match(document.querySelector('[data-projection="anthropic"]').textContent, /^Claude: runs out ~60 min earlier at today’s rate · after the burst the planner slows to 4\.5 tok\/s/)
     assert.match(document.querySelector('[data-warn="openai-codex"]').textContent, /GPT would hit its reserve during the burst/)
     assert.equal(document.querySelector('[data-warn="anthropic"]'), null)
-    // another factor and duration: costed again before it can start
+    assert.match(document.querySelector('[data-warn5h="openai-codex"]').textContent, /GPT would run over its 5-hour cap \(30 tok\/s against 40 tok\/s\)/)
+    assert.equal(document.querySelector('[data-warn5h="anthropic"]'), null)
+    // lines take the theme's colours (with fallbacks), not fixed hex
+    assert.equal(claude.querySelector('path[data-line="capacity"]').getAttribute('stroke'), 'var(--ui-green, #1f8a65)')
+    assert.equal(claude.querySelector('path[data-line="spent"]').getAttribute('stroke'), 'var(--ui-blue, #3b82f6)')
+    // another factor and duration: only the projection is asked again, never the charts' history
+    const full = () => calls.filter(([p]) => p === '/v1/budget').length
+    const before = full()
     await ui.click(button('3×'))
     await ui.click(button('4 h'))
-    assert.ok(calls.some(([p]) => p === '/v1/budget?factor=3&hours=4'))
+    assert.ok(calls.some(([p]) => p === '/v1/budget?factor=3&hours=4&projection_only=1'))
+    assert.equal(full(), before)
     const start = button('Start 3× for 4 h')
     assert.equal(start.disabled, false)
     await ui.click(start)
