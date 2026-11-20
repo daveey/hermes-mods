@@ -1,4 +1,4 @@
-// Token throttle in the Runners panel: slots a limit will not let run are crossed out, the cap field sets the
+// Token throttle in the Runners panel: slots a limit will not let run are crossed out, the cap line shows the
 // cap, and the chip's Workers bar hatches the throttled part. One test per path: pure maths, panel render,
 // slider commit, chip, and a gateway without the throughput plugin.
 import test from 'node:test'
@@ -76,30 +76,13 @@ test('panel without the throughput plugin: no slider, nothing crossed out', asyn
   await ui.close()
 })
 
-test('cap field: Enter sets thousands of tokens/min once, a bad value sets nothing, No cap removes it', async () => {
-  const sets = []
-  const th = { ...throttle({}), user_cap_per_s: 1000 }  // 60k tok/min, the person's own
-  const ui = await mount(React.createElement(P.Panel, { view: view(), now: NOW, throttle: th, onThrottle: (v) => sets.push(v) }))
-  const input = ui.container.querySelector('[data-slot="runners-throttle"] input')
-  assert.equal(input.value, '60')
-  const set = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set
-  const type = async (v) => React.act(async () => { set.call(input, String(v)); input.dispatchEvent(new window.Event('input', { bubbles: true })) })
-  const enter = async () => React.act(async () => { input.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true })) })
-  await type('150')
-  await enter()
-  assert.deepEqual(sets, [150000])
-  await type('60')
-  await enter()
-  assert.deepEqual(sets, [150000], 'the cap in force: no request')
-  await type('lots')
-  await enter()
-  assert.deepEqual(sets, [150000])
-  assert.match(ui.container.querySelector('.hermes-fleet-throttle-text').textContent, /thousands of tokens per minute/)
-  await type('1.5m')
-  await enter()
-  assert.deepEqual(sets, [150000, 1500000])
-  await React.act(async () => { ui.container.querySelector('.hermes-fleet-throttle-off').click() })
-  assert.deepEqual(sets, [150000, 1500000, null])
+test('limit line: read-only, pointing at the Throughput panel where it is changed', async () => {
+  const th = { ...throttle({}), user_cap_per_s: 1000 }
+  const ui = await mount(React.createElement(P.Panel, { view: view(), now: NOW, throttle: th }))
+  const bar = ui.container.querySelector('[data-slot="runners-throttle"]')
+  assert.equal(bar.querySelector('input'), null, 'no control here')
+  assert.equal(bar.querySelector('button'), null)
+  assert.match(bar.textContent, /^Cap 60k tok\/min \(yours\).*change it in Throughput$/)
   await ui.close()
 })
 
@@ -113,9 +96,7 @@ test('cap line: whose cap, the budget, this gateway\'s open slots', () => {
   assert.equal(P.throttleLine({ ...base, cap_per_s: 1000, user_cap_per_s: null, budget: { budget_per_s: 1000 },
     slot_gate: { allowed: 2, running: 0, per_slot_per_s: null } }),
   'Cap 60k tok/min (budget) · fleet 30k tok/min · here 0/2 slots (unmeasured)')
-  assert.equal(P.parseCapK(''), null)
-  assert.equal(P.parseCapK('2.5k'), 2500)
-  assert.equal(P.parseCapK('-1'), undefined)
+  assert.equal(P.throttleLine({ ...base, cap_per_s: null, limit_mode: 'no_limit' }), 'No token limit (budget overridden) · fleet 30k tok/min')
 })
 
 test('an advisory row from another gateway is marked as an estimate', () => {

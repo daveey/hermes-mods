@@ -682,3 +682,24 @@ test('timeline: events come from the gateway that has them, whichever gateway an
   assert.deepEqual(none.gateways.events, [])
   assert.equal('events' in P.merge([{ route, body: fleet(), at: NOW }], NOW).gateways, false)
 })
+
+test('the open popover shows the fleet token limit it reads from the throughput plugin', async () => {
+  const saved = window.hermesDesktop
+  window.hermesDesktop = {
+    api: async ({ path }) => {
+      if (path === P.THROTTLE_PATH) return { percent: 0.001, cap_per_s: null, rate_per_s: 500, limit_mode: 'no_limit', pools: [] }
+      throw Error('not here')
+    }
+  }
+  const ui = await mount(React.createElement(P.Runners, { ctx: ctxWith([fleet(), fleet(), fleet()]) }))
+  try {
+    await ui.click(document.querySelector('[data-slot="runners-chip"]'))
+    await ui.flush()
+    const bar = document.querySelector('[data-slot="runners-throttle"]')
+    assert.ok(bar, 'the limit line is in the popover')
+    assert.match(bar.textContent, /^No token limit \(budget overridden\) · fleet 30k tok\/min/)
+  } finally {
+    await ui.close()
+    window.hermesDesktop = saved
+  }
+})

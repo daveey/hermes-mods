@@ -484,7 +484,7 @@ export function throttleLine(throttle) {
   const userPS = typeof throttle.user_cap_per_s === 'number' ? throttle.user_cap_per_s : null
   const budgetPS = typeof throttle.budget?.budget_per_s === 'number' ? throttle.budget.budget_per_s : null
   const by = capPS == null ? '' : userPS != null && userPS <= capPS + 1e-6 ? ' (yours)' : budgetPS != null ? ' (budget)' : ''
-  const head = capPS == null ? 'No token cap' : capPS <= 0 ? 'Cap 0 · holding every call' : `Cap ${fmtTokens(capPS * 60)} tok/min${by}`
+  const head = throttle.limit_mode === 'no_limit' ? 'No token limit (budget overridden)' : capPS == null ? 'No token cap' : capPS <= 0 ? 'Cap 0 · holding every call' : `Cap ${fmtTokens(capPS * 60)} tok/min${by}`
   const budget = budgetPS != null && capPS != null && capPS > 0 && Math.abs(budgetPS - capPS) > 1e-6 ? ` · budget ${fmtTokens(budgetPS * 60)}` : ''
   const rate = typeof throttle.rate_per_s === 'number' ? ` · fleet ${fmtTokens(throttle.rate_per_s * 60)} tok/min` : ''
   const g = throttle.slot_gate
@@ -498,42 +498,12 @@ export function throttleLine(throttle) {
   return `${head}${budget}${rate}${gate}${paced.length ? ` · pacing: ${paced.join(', ')}` : ''}${holds}`
 }
 
-// Thousands of tokens per minute typed in the cap field: '150' or '150k' = 150k, '1.5m' = 1.5M; '' = no cap.
-export function parseCapK(raw) {
-  const s = String(raw ?? '').trim().toLowerCase()
-  if (s === '' || s === 'off' || s === 'none') return null
-  const m = s.match(/^([0-9]+(?:\.[0-9]+)?)\s*([km]?)$/)
-  if (!m) return undefined
-  return Number(m[1]) * (m[2] === 'm' ? 1e6 : 1e3)
-}
-
-// A person's token cap for the whole fleet, in thousands of tokens per minute. Enter (or leaving the field) sets
-// it; "No cap" removes it (the subscription budget alone then caps). onThrottle receives tokens/min or null.
-export function ThrottleBar({ throttle, onThrottle, error }) {
-  const [draft, setDraft] = useState(null)
-  const [bad, setBad] = useState(false)
+// The fleet's token limit, read-only: it is set in the Throughput panel (Token spend).
+export function ThrottleBar({ throttle }) {
   if (!throttle) return null
-  const userPS = typeof throttle.user_cap_per_s === 'number' ? throttle.user_cap_per_s : null
-  const shown = userPS == null ? '' : String(Math.round(userPS * 60 / 1000))
-  const commit = () => {
-    if (draft == null) return
-    const v = parseCapK(draft)
-    if (v === undefined) { setBad(true); return }
-    setBad(false); setDraft(null)
-    const same = v == null ? userPS == null : userPS != null && Math.abs(userPS * 60 - v) < 500
-    if (!same) onThrottle?.(v)
-  }
   return h('div', { className: 'hermes-fleet-throttle', 'data-slot': 'runners-throttle' },
-    h('label', { className: 'hermes-fleet-throttle-cap' }, 'Token cap ',
-      h('input', {
-        type: 'text', inputMode: 'decimal', size: 6, placeholder: 'none', value: draft ?? shown, disabled: !onThrottle,
-        'aria-label': 'Fleet token cap, thousands of tokens per minute', 'aria-invalid': bad ? 'true' : undefined,
-        onChange: (e) => setDraft(e.target.value), onBlur: commit,
-        onKeyDown: (e) => { if (e.key === 'Enter') commit(); if (e.key === 'Escape') { setDraft(null); setBad(false) } }
-      }), 'k tok/min'),
-    h('button', { type: 'button', className: 'hermes-fleet-throttle-off', disabled: !onThrottle || userPS == null, onClick: () => { setDraft(null); setBad(false); onThrottle?.(null) } }, 'No cap'),
-    h('span', { className: 'hermes-fleet-throttle-text' }, bad ? 'Type thousands of tokens per minute, e.g. 150 or 1.5m' : throttleLine(throttle)),
-    error ? h('span', { className: 'hermes-fleet-warning' }, `⚠ ${text(error)}`) : null)
+    h('span', { className: 'hermes-fleet-throttle-text' }, throttleLine(throttle)),
+    h('span', { className: 'hermes-fleet-throttle-hint' }, 'change it in Throughput'))
 }
 
 const SLOT_TITLE = { busy: 'busy', idle: 'free', offline: 'offline', unknown: 'state unknown' }
@@ -936,7 +906,7 @@ function StoppedNote({ machines, now }) {
     }, text(m.name))]))
 }
 
-export function Panel({ view, now, repairClient, throttle = null, onThrottle, throttleError }) {
+export function Panel({ view, now, repairClient, throttle = null }) {
   const s = summarize(view, throttle)
   const stopped = view.gateways.machines.filter((m) => m.state === 'stopped')
   return h('div', { className: 'hermes-fleet' },
@@ -945,7 +915,7 @@ export function Panel({ view, now, repairClient, throttle = null, onThrottle, th
       h('span', null, `${s.gBusy} / ${s.gSlots} slots busy`,
         s.gWaiting != null ? h('span', { title: 'Unleased ready cards assigned to gateway-dispatched profiles, counted once across board replicas. Excludes non-dispatched assignees; some cards cannot run on every machine.' }, ` · ${s.gWaiting} waiting`) : null)),
     h(SectionNote, { section: view.gateways }),
-    h(ThrottleBar, { throttle, onThrottle, error: throttleError }),
+    h(ThrottleBar, { throttle }),
     h('div', { className: 'hermes-fleet-gw' },
       h(GatewayHead),
       ...view.gateways.machines.filter((m) => m.state !== 'stopped').map((m) => h(GatewayRow, { key: m.name, m, now, limit: limitRow(throttle, m.name) }))),
@@ -1025,7 +995,6 @@ export function Runners({ ctx }) {
   const now = useNow(open && visible)
   const view = query.data
   // The token throttle and per-gateway slot limits (throughput plugin). Absent or failing: nothing is crossed out.
-  const [throttleError, setThrottleError] = useState(null)
   const tq = useQuery({
     queryKey: ['runners', 'throttle'],
     queryFn: async () => { try { return await bridge(THROTTLE_PATH) } catch { return null } },
@@ -1036,15 +1005,6 @@ export function Runners({ ctx }) {
     staleTime: 5000
   })
   const throttle = tq.data && typeof tq.data === 'object' && 'percent' in tq.data ? tq.data : null
-  const onThrottle = async (capPerMin) => {
-    try {
-      await bridge(THROTTLE_PATH, { method: 'PUT', body: { cap_per_min: capPerMin } })
-      setThrottleError(null)
-    } catch (e) {
-      setThrottleError(`throttle not set: ${e?.message || e}`)
-    }
-    tq.refetch()
-  }
   const s = view ? summarize(view, throttle) : null
   const label = s
     ? `Runners · hub ${s.hub.busy}/${s.hub.slots} · workers ${s.workers.busy}/${s.workers.slots}`
@@ -1062,7 +1022,7 @@ export function Runners({ ctx }) {
       side: 'top', align: 'end', sticky: 'always', 'aria-label': 'Runners',
       className: 'hermes-fleet-popover',
       style: { width: 'max-content', minWidth: 'min(680px, calc(100vw - 24px))', maxWidth: 'calc(100vw - 24px)', maxHeight: '70vh', overflowY: 'auto', overflowX: 'auto', scrollbarGutter: 'stable' }
-    }, view ? h(Panel, { view, now, repairClient }) : h('div', { className: 'hermes-fleet-note' }, query.error ? `Unavailable: ${text(query.error.message)}` : 'Loading…'))
+    }, view ? h(Panel, { view, now, repairClient, throttle }) : h('div', { className: 'hermes-fleet-note' }, query.error ? `Unavailable: ${text(query.error.message)}` : 'Loading…'))
   )
 }
 
