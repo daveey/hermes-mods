@@ -22,7 +22,7 @@ Route quickly, recover stalled work, and verify closeout in the originating sess
 | Route | When | Do |
 |---|---|---|
 | **Answer here** | A few tool calls: status, "what's blocked", a lookup | Answer from the ledger and one fresh read |
-| **Existing work** | A card or session already owns it | Comment on the card (`kanban_comment`) or resume that session with the message; reply with the id |
+| **Existing work** | A card or session already owns it | Comment on the card (`kanban_comment`) or resume that session with the message; reply with the id. A comment only subscribes this chat to notices, which don't count toward its outcome, so it paints green while the work is open: bind it with `hermes kanban --board <b> notify-subscribe <task> --platform tui --chat-id <this session>` (`kanban_origin_adopt` is for cross-gateway courier adoption only) and read back `outcome` = `waiting` on that card |
 | **New work** | Anything bigger or long-running | `kanban_create` a card with acceptance criteria (never `hermes kanban create` from a shell, so it links to this chat); reply with the card id at once |
 
 Never wait on a worker inside a turn and never predict its result.
@@ -30,7 +30,8 @@ Never wait on a worker inside a turn and never predict its result.
 ## What to read on each sweep
 
 1. **Sessions:** `hermes sessions outcome-audit --json` first (see Classify), then `hermes sessions list --limit 60` (add `--workspace <repo>` to narrow). For
-   detail, query `~/.hermes/state.db` **read-only** (`sqlite3 -readonly`): `sessions` has `title`,
+   detail, query `~/.hermes/state.db` with `~/.hermes/bin/hermes-core-python -m sqlite3 ~/.hermes/state.db "<select>"`
+   (the system `sqlite3` is refused on live DBs, WAL-reset bug): `sessions` has `title`,
    `source`, `parent_session_id`, `last_activity_at`, `last_activity_description`, `ended_at`,
    `end_reason`, `archived`, `pinned`, `hidden`. Use `session_search` to read what a session last
    said.
@@ -93,6 +94,12 @@ say what's running, never what needs the user.
   repeating priority-only updates. Have the reviewer check for a dispatcher claim before running tests:
   if that worker has started, coordinate through the card and distinguish source-only findings from the
   test-backed verdict so concurrent recovery neither duplicates tests nor bypasses the review gate.
+- A chat that went silent after the user's message with no reply: grep `agent.log*` for
+  `prompt.submit for session <ui_session> queued behind the core-update admission hold` with no later
+  `tui prompt accepted` for that ui_session, plus `startup_resume: marker <session> ... skipped: writer pid N is
+  still alive`. That's a prompt stranded in an old Desktop `serve` that outlived the update. Re-send the user's
+  exact text with `cross_session.send` (it runs, unlike the stranded copy), then check for other chats stranded
+  by the same hold. A later replacement of that `serve` replays the marker too, so check for double delivery.
 - When a chain waits on a PR whose exact head is green and `CLEAN`, with no changes requested, but its owner card
   is queued, merge it yourself (`gh pr merge --rebase --match-head-commit <head>` via token-broker). Then
   `kanban_comment` each owner card that the merge step is done, so it resumes from the next step.
