@@ -192,6 +192,53 @@ test('a replaced client cannot publish a late read into the new effect', async (
   } finally { await ui.close() }
 })
 
+test('bare Desktop 404 errors hide controls without an alert', async () => {
+  const client = P.createScalerClient({ rest: async () => { throw Error('404: {"detail":"scaler_unsupported"}') } },
+    { profileRoutes: async () => [route] })
+  assert.equal(await client.read(), null)
+  const ui = await mount(React.createElement(P.ScalerControls, { client }))
+  try {
+    assert.ok(ui.container.querySelector('input') === null)
+    assert.ok(ui.container.querySelector('[role="alert"]') === null)
+  } finally { await ui.close() }
+})
+
+for (const fail of [false, true]) {
+  test(`replaced client fences old write ${fail ? 'failure' : 'success'} and its cleanup`, async () => {
+    let finishOld, replaceClient, finishNew
+    const oldClient = { read: async () => ({ route, limits: limits() }),
+      write: () => new Promise((resolve, reject) => { finishOld = () => fail
+        ? reject(Error('old write failed')) : resolve({ route, limits: limits({ min: 3 }) }) }) }
+    const writes = []
+    const newClient = { read: async () => ({ route, limits: limits({ min: 2, max: 4 }) }),
+      write: (owner, value) => { writes.push(value); return new Promise(resolve => {
+        finishNew = () => resolve({ route, limits: limits(value) })
+      }) } }
+    function Harness() {
+      const [client, setClient] = React.useState(oldClient)
+      replaceClient = () => setClient(newClient)
+      return React.createElement(P.ScalerControls, { client })
+    }
+    const ui = await mount(React.createElement(Harness))
+    try {
+      await drag(ui.container.querySelector('input'), 3)
+      await release(ui.container.querySelector('input')); await waitCommit()
+      await React.act(async () => replaceClient())
+      assert.equal(ui.container.querySelector('[aria-label="Min workers"]')?.value, '2')
+      const max = ui.container.querySelector('[aria-label="Max workers"]')
+      await drag(max, 3); await release(max); await waitCommit()
+      await React.act(async () => finishOld())
+      assert.ok(ui.container.querySelector('[role="alert"]') === null)
+      assert.equal(ui.container.querySelector('[aria-label="Min workers"]')?.value, '2')
+      assert.equal(max.disabled, true, 'old finally cannot clear the new write busy state')
+      assert.equal(max.value, '3', 'old finally cannot clear the new draft')
+      await React.act(async () => finishNew())
+      assert.deepEqual(writes, [{ min: 2, max: 3 }])
+      assert.equal(max.disabled, false)
+    } finally { await ui.close() }
+  })
+}
+
 test('unmount cancels a queued commit', async () => {
   const f = fixture()
   const ui = await mount(React.createElement(P.ScalerControls, { client: f.client }))

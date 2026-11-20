@@ -1047,7 +1047,10 @@ export function createScalerClient(ctx, hostRef = host) {
       }
       const results = await Promise.all([...routes.values()].map(async (route) => {
         try { return { route, limits: await request(route) } }
-        catch (e) { return (e?.status ?? e?.statusCode) === 404 ? null : { error: e } }
+        catch (e) {
+          // Desktop's expected-404 bridge preserves only the message, not status.
+          return (e?.status ?? e?.statusCode) === 404 || /^404:/.test(e?.message || '') ? null : { error: e }
+        }
       }))
       const supported = results.filter((r) => r?.limits)
       if (supported.length > 1) throw Error('Multiple autoscalers connected; limits not changed')
@@ -1066,9 +1069,11 @@ export function ScalerControls({ client }) {
   const [error, setError] = useState(null)
   const [saving, setSaving] = useState(false)
   const current = useRef(null), pending = useRef(null), busy = useRef(false)
-  const timer = useRef(null), revision = useRef(0), alive = useRef(false)
+  const timer = useRef(null), revision = useRef(0), generation = useRef(0)
   useEffect(() => {
-    alive.current = true
+    generation.current++
+    busy.current = false; pending.current = null; current.current = null
+    setSaving(false); setDraft(null); setSource(null); setError(null)
     let disposed = false, readSequence = 0
     const load = async () => {
       if (busy.current || pending.current || document.visibilityState === 'hidden') return
@@ -1084,7 +1089,7 @@ export function ScalerControls({ client }) {
     }
     load()
     const poll = setInterval(load, POLL_OPEN_MS)
-    return () => { disposed = true; alive.current = false; clearInterval(poll); clearTimeout(timer.current) }
+    return () => { disposed = true; generation.current++; clearInterval(poll); clearTimeout(timer.current) }
   }, [client])
   const change = (key, value) => {
     if (busy.current || !current.current) return
@@ -1099,9 +1104,11 @@ export function ScalerControls({ client }) {
   const commit = () => {
     clearTimeout(timer.current)
     if (busy.current || !pending.current || !current.current) return
+    const epoch = generation.current
+    const isCurrent = () => epoch === generation.current
     timer.current = setTimeout(async () => {
       const next = pending.current, owner = current.current
-      if (!next || !owner || !alive.current) return
+      if (!next || !owner || !isCurrent()) return
       if (next.min === owner.limits.min && next.max === owner.limits.max) {
         pending.current = null; setDraft(null); return
       }
@@ -1109,15 +1116,17 @@ export function ScalerControls({ client }) {
       revision.current++
       try {
         const readback = await client.write(owner, next)
-        if (alive.current) { current.current = readback; setSource(readback) }
+        if (isCurrent()) { current.current = readback; setSource(readback) }
       } catch (e) {
-        if (alive.current) {
+        if (isCurrent()) {
           current.current = null; setSource(null)
           setError(`Limits not confirmed: ${text(e?.message || e)}. Refresh before retrying.`)
         }
       } finally {
-        busy.current = false; pending.current = null
-        if (alive.current) { setSaving(false); setDraft(null) }
+        if (isCurrent()) {
+          busy.current = false; pending.current = null
+          setSaving(false); setDraft(null)
+        }
       }
     }, SCALER_COMMIT_MS)
   }
