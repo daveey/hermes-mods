@@ -222,15 +222,87 @@ class ReconnectTests(unittest.TestCase):
                 out = api.reconnect_account('openai-codex', 'X', tools(Pool(rows, lambda cid: None)))
                 self.assertEqual(out['sign_in'], {'mode': 'unsupported'})
 
-    def test_sign_in_route_only_accompanies_a_dead_grant_with_in_app_auth(self):
-        row = entry('a', 'X', last_status=DEAD)
-        row.source = 'manual:pkce'
-        self.assertNotIn('sign_in', api.reconnect_account('anthropic', 'X', tools(Pool([row], lambda cid: None))))
+    def test_sign_in_route_only_accompanies_a_dead_grant(self):
         for refresh in (lambda cid: SimpleNamespace(last_status='ok'),
                         lambda cid: SimpleNamespace(last_status='exhausted', last_error_code=429, last_error_reason='quota')):
-            live = entry('a', 'X')
-            live.source = 'manual:device_code'
-            self.assertNotIn('sign_in', api.reconnect_account('openai-codex', 'X', tools(Pool([live], refresh))))
+            for provider, source in (('openai-codex', 'manual:device_code'), ('anthropic', 'manual:pkce')):
+                live = entry('a', 'X')
+                live.source = source
+                self.assertNotIn('sign_in', api.reconnect_account(provider, 'X', tools(Pool([live], refresh))))
+
+    def test_dead_anthropic_manual_row_names_itself_as_the_sign_in_target(self):
+        row = entry('pool-9', 'fp:old', last_status=DEAD)
+        row.source = 'manual:pkce'
+        out = api.reconnect_account('anthropic', 'fp:old', tools(Pool([row, entry('other', 'Y')], lambda cid: None)))
+        self.assertEqual(out['status'], 'needs_sign_in')
+        self.assertEqual(out['auth_flow'], 'external')
+        self.assertEqual(out['sign_in'], {'mode': 'target', 'credential_id': 'pool-9'})
+        self.assertNotIn('rt', repr(out))
+
+    def test_anthropic_never_routes_to_an_ordinary_login(self):
+        # Anthropic has no in-app login to rewrite a singleton: every row that is not one owned
+        # manual row is unsupported, including the shapes Codex answers with ``singleton``.
+        for sources in (['device_code'], ['claude_code'], ['env:ANTHROPIC_TOKEN'], ['borrowed:hub'], [''],
+                        ['manual:pkce', 'manual:pkce']):
+            with self.subTest(sources=sources):
+                rows = []
+                for i, source in enumerate(sources):
+                    row = entry(f'r{i}', 'X', last_status=DEAD)
+                    row.source = source
+                    rows.append(row)
+                out = api.reconnect_account('anthropic', 'X', tools(Pool(rows, lambda cid: None)))
+                self.assertEqual(out['sign_in'], {'mode': 'unsupported'})
+        gone = entry('a', 'X')
+        gone.source = 'manual:pkce'
+        pool = Pool([gone], None)
+        pool._refresh = lambda cid: setattr(pool, '_entries', []) or None
+        self.assertEqual(api.reconnect_account('anthropic', 'X', tools(pool))['sign_in'], {'mode': 'unsupported'})
+
+    def test_credential_health_follows_the_row_id_to_its_current_account(self):
+        # After a sign-in replaced the row in place, the same row id carries a new account id.
+        row = entry('pool-9', 'fp:new', last_status='ok')
+        pool = Pool([row, entry('other', 'fp:new2', last_status=DEAD)], lambda cid: self.fail('health never refreshes'))
+        out = api.credential_health('anthropic', 'pool-9', tools(pool))
+        self.assertEqual(out, {'found': True, 'provider': 'anthropic', 'credential_id': 'pool-9',
+                               'account_id': 'fp:new', 'status': 'ok'})
+        self.assertEqual(pool.refreshed, [])
+        self.assertNotIn('rt', repr(out))
+
+    def test_credential_health_reports_dead_quota_disabled_and_missing_rows(self):
+        dead = entry('d', 'D', last_status=DEAD)
+        quota = entry('q', 'Q', last_status='exhausted', last_error_code=429, last_error_reason='usage_limit')
+        off = entry('o', 'O', last_status=DEAD)
+        pool = Pool([dead, quota, off], lambda cid: None)
+        t = tools(pool, is_disabled=lambda provider, e: e.id == 'o')
+        self.assertEqual(api.credential_health('anthropic', 'd', t)['status'], 'needs_sign_in')
+        self.assertEqual(api.credential_health('anthropic', 'q', t)['status'], 'quota')
+        self.assertEqual(api.credential_health('anthropic', 'o', t)['status'], 'disabled')
+        gone = api.credential_health('anthropic', 'nope', t)
+        self.assertEqual((gone['found'], gone['account_id'], gone['status']), (False, None, 'unknown'))
+
+    def test_credential_health_refuses_other_providers_and_hides_pool_errors(self):
+        with self.assertRaises(HTTPException) as bad:
+            api.credential_health('gemini', 'a', tools(Pool([], lambda cid: None)))
+        self.assertEqual(bad.exception.status_code, 400)
+
+        def broken(provider):
+            raise RuntimeError('secret-token-in-traceback')
+        with self.assertRaises(HTTPException) as down:
+            api.credential_health('anthropic', 'a', (broken, lambda provider, e: e.ident, DEAD))
+        self.assertEqual(down.exception.status_code, 503)
+        self.assertNotIn('secret', str(down.exception.detail))
+
+    def test_credential_health_request_rejects_ids_that_are_not_plain_row_ids(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        app = FastAPI()
+        app.include_router(api.router)
+        client = TestClient(app)
+        for body in ({'provider': 'anthropic', 'credential_id': '-rf'}, {'provider': 'anthropic', 'credential_id': 'a b'},
+                     {'provider': 'anthropic', 'credential_id': 'a;id'}, {'provider': 'anthropic', 'credential_id': ''},
+                     {'provider': 'anthropic', 'credential_id': 'a', 'x': 1}, {'provider': 'anthropic'}):
+            with self.subTest(body=body):
+                self.assertEqual(client.post('/credential-health', json=body).status_code, 422)
 
     def test_ping_advertises_reconnect_status(self):
         from fastapi import FastAPI

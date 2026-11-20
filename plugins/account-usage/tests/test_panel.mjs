@@ -193,13 +193,17 @@ test('dead grant sign-in launches device-code auth on the account gateway, not S
  await p
  assert.ok(apiCalls.some(c=>c.method==='DELETE' && String(c.path).includes('sess-1')))
  assert.match(r2.$state.get()[r2.key('openai-codex','acct-8')].message,/cancelled/i)
+ // Anthropic never calls the dashboard OAuth start and never leaves for Settings. On a Desktop
+ // without the recovery terminal it says so and starts nothing (test_terminal_signin.mjs has the flow).
  const before=apiCalls.length; const nav=[]; globalThis.__auTestHost.navigate=p=>nav.push(p)
- await r2.signIn('anthropic',{id:'acct-7'})
+ const ctx3={...ctx,async rest(){return {ok:false,status:'needs_sign_in',needs_sign_in:true,sign_in:{mode:'target',credential_id:'row7'}}}}
+ const r3=plugin.createReconnectStore(ctx3,async()=>[{slug:'anthropic',accounts:[{id:'acct-7',state:'unavailable',reason:'auth'}]}])
+ await r3.signIn('anthropic',{id:'acct-7'})
  assert.equal(apiCalls.length,before,'Anthropic never calls the in-app OAuth start')
- assert.deepEqual(nav,['/settings?tab=providers&pview=accounts'])
- const ext=r2.$state.get()[r2.key('anthropic','acct-7')]
- assert.equal(ext.needsSignIn,true); assert.equal(ext.authFlow,'external'); assert.equal(ext.opened,true)
- assert.match(ext.message,/Settings › Accounts/)
+ assert.deepEqual(nav,[])
+ const ext=r3.$state.get()[r3.key('anthropic','acct-7')]
+ assert.equal(ext.needsSignIn,true); assert.equal(ext.authFlow,'terminal'); assert.equal(ext.error,true)
+ assert.match(ext.message,/Update Hermes Desktop/)
 })
 
 // ── review round 1 regressions ───────────────────────────────────────────────
@@ -311,9 +315,9 @@ async function setupUi() {
  return {mod,nav}
 }
 const controls=el=>el ? el.props.children.map(c=>c.type==='button'?['button',c.props['aria-label'],c.props.onClick]:['text',c.props.children]) : null
-test('every auth row has a supported next step: Reconnect, in-app sign-in, or Settings for Claude', async () => {
+test('every auth row has a supported next step: Reconnect or in-app sign-in, never Settings', async () => {
  const {mod,nav}=await setupUi(); const calls=[]
- const store={key:(p,id)=>`${p}\u0000${id}`,reconnect:(...x)=>calls.push(['reconnect',...x]),signIn:(...x)=>calls.push(['signIn',...x]),openSettings:(...x)=>calls.push(['openSettings',...x]),check:(...x)=>calls.push(['check',...x]),cancelAuth(){},openPage(){}}
+ const store={key:(p,id)=>`${p}\u0000${id}`,reconnect:(...x)=>calls.push(['reconnect',...x]),signIn:(...x)=>calls.push(['signIn',...x]),check:(...x)=>calls.push(['check',...x]),cancelAuth(){},openPage(){}}
  const line=(slug,a,state={})=>controls(mod.ReconnectLine({g:{slug},a,reconnectStore:store,reconnectState:state}))
  const dead={id:'d',label:'D',state:'unavailable',reason:'auth'}, benched={id:'b',label:'B',state:'limited',limit_kind:'cooldown',reason:'auth'}
  // Codex: auth-benched -> Reconnect only; dead -> sign-in, no Reconnect.
@@ -322,15 +326,16 @@ test('every auth row has a supported next step: Reconnect, in-app sign-in, or Se
  assert.deepEqual(calls.length,0)
  c=line('openai-codex',dead); assert.deepEqual(c.map(x=>x.slice(0,2)),[['button','Sign in to D again'],['text','Saved sign-in expired — sign in again']])
  c[0][2](); const signed=calls.pop(); assert.deepEqual(signed.slice(0,3),['signIn','openai-codex',dead]); assert.deepEqual(signed[3],{connectionId:'gw-hub',profile:'work'},'sign-in targets the chip gateway and profile')
- // Claude dead grant: a control, not just a message; never Reconnect, never in-app sign-in.
- c=line('anthropic',dead); assert.deepEqual(c.map(x=>x.slice(0,2)),[['button','Open sign-in settings for D'],['text','Saved sign-in expired — sign in from Settings › Accounts']])
- c[0][2](); assert.deepEqual(calls.pop(),['openSettings','anthropic',dead])
+ // Claude dead grant: the same sign-in control as Codex, on the chip gateway; never Reconnect.
+ c=line('anthropic',dead); assert.deepEqual(c.map(x=>x.slice(0,2)),[['button','Sign in to D again'],['text','Saved sign-in expired — sign in again']])
+ c[0][2](); const claude=calls.pop(); assert.deepEqual(claude.slice(0,3),['signIn','anthropic',dead]); assert.deepEqual(claude[3],{connectionId:'gw-hub',profile:'work'})
  const k='anthropic\u0000b'
- c=line('anthropic',benched,{[k]:{needsSignIn:true,authFlow:'external',message:'Saved sign-in expired — sign in from Settings › Accounts'}})
- assert.deepEqual(c.map(x=>x[1]),['Open sign-in settings for B','Saved sign-in expired — sign in from Settings › Accounts'])
- c=line('anthropic',benched,{[k]:{needsSignIn:true,authFlow:'external',opened:true,message:'m'}})
- assert.deepEqual(c.map(x=>x[1]),['Open sign-in settings for B','Check sign-in for B','m'])
- c[1][2](); assert.deepEqual(calls.pop(),['check','anthropic',benched])
+ c=line('anthropic',benched,{[k]:{needsSignIn:true,authFlow:'terminal',message:'Saved sign-in expired — sign in again'}})
+ assert.deepEqual(c.map(x=>x[1]),['Sign in to B again','Saved sign-in expired — sign in again'])
+ // An unconfirmed result offers a re-check next to the sign-in.
+ c=line('anthropic',benched,{[k]:{needsSignIn:true,authFlow:'terminal',check:true,message:'m'}})
+ assert.deepEqual(c.map(x=>x[1]),['Sign in to B again','Check sign-in for B','m'])
+ c[1][2](); assert.deepEqual(calls.pop().slice(0,3),['check','anthropic',benched])
  // Finished, quota, disabled-provider rows offer no auth control.
  assert.deepEqual(line('anthropic',{id:'b',label:'B',state:'ready'},{[k]:{done:true,message:'Reconnected'}}).map(x=>x.slice(0,2)),[['text','Reconnected']])
  assert.equal(line('openai-codex',{id:'q',state:'limited',limit_kind:'quota',reason:'usage_limit'}),null)
@@ -350,20 +355,22 @@ test('every auth row has a supported next step: Reconnect, in-app sign-in, or Se
 test('Claude sign-in: a changed fingerprint cannot be verified by a matching display label', async () => {
  const {mod,nav}=await setupUi(); const apiCalls=[]
  let groups=[{slug:'anthropic',accounts:[{id:'fp:old',label:'me',state:'unavailable',reason:'auth'}]}]
+ // An older backend: a dead grant, but no answer about which stored row a sign-in must repair.
  const ctx={onDispose(){},api:async req=>{apiCalls.push(req); throw new Error('no in-app Anthropic OAuth')},async rest(){return {ok:false,status:'needs_sign_in',needs_sign_in:true,auth_flow:'external'}}}
  const r=mod.createReconnectStore(ctx,async()=>groups); const acct={id:'fp:old',label:'me'}, k=r.key('anthropic','fp:old')
  await r.reconnect('anthropic',acct)
- assert.equal(r.$state.get()[k].authFlow,'external'); assert.match(r.$state.get()[k].message,/Settings › Accounts/)
+ assert.equal(r.$state.get()[k].authFlow,'terminal'); assert.equal(r.$state.get()[k].message,'Saved sign-in expired — sign in again')
  await r.signIn('anthropic',acct)
- assert.deepEqual(nav,['/settings?tab=providers&pview=accounts']); assert.equal(apiCalls.length,0); assert.equal(r.$state.get()[k].opened,true)
+ assert.deepEqual(nav,[]); assert.equal(apiCalls.length,0)
+ assert.match(r.$state.get()[k].message,/Restart this gateway/); assert.equal(r.$state.get()[k].error,true)
  await r.check('anthropic',acct)
- let st=r.$state.get()[k]; assert.equal(st.message,'Still needs sign-in'); assert.equal(st.opened,true); assert.equal(st.authFlow,'external'); assert.notEqual(st.done,true)
+ let st=r.$state.get()[k]; assert.equal(st.message,'Still needs sign-in'); assert.equal(st.authFlow,'terminal'); assert.notEqual(st.done,true)
  groups=[{slug:'anthropic',accounts:[{id:'fp:new',label:'me',state:'ready'}]}]
  await r.check('anthropic',acct)
  st=r.$state.get()[k]; assert.notEqual(st.done,true); assert.equal(st.unverified,true)
  assert.deepEqual(mod.rowFix(r.$state.get(),'anthropic',groups[0].accounts[0]),{},'a label is not verified account identity')
  assert.deepEqual(mod.rowFix(r.$state.get(),'anthropic',{id:'fp:other',label:'someone else'}),{})
- // Supported external add retains the old DEAD row: never claim it was repaired.
+ // A sign-in made elsewhere that added a row keeps the old DEAD row: never claim it was repaired.
  groups[0].accounts.push({id:'fp:old',label:'me',state:'unavailable',reason:'auth'})
  await r.check('anthropic',acct)
  assert.equal(r.$state.get()[k].message,'Still needs sign-in')
@@ -372,9 +379,9 @@ test('Claude sign-in: a changed fingerprint cannot be verified by a matching dis
  // Another account that merely shares the label keeps its own dead-grant controls.
  const twin={id:'fp:twin',label:'me',state:'unavailable',reason:'auth'}
  assert.deepEqual(mod.rowFix(r.$state.get(),'anthropic',twin),{})
- const store={key:r.key,openSettings(){},check(){},reconnect(){},signIn(){},cancelAuth(){},openPage(){}}
+ const store={key:r.key,check(){},reconnect(){},signIn(){},cancelAuth(){},openPage(){}}
  assert.deepEqual(controls(mod.ReconnectLine({g:{slug:'anthropic'},a:twin,reconnectStore:store,reconnectState:r.$state.get()})).map(x=>x[1]),
-  ['Open sign-in settings for me','Saved sign-in expired — sign in from Settings › Accounts'])
+  ['Sign in to me again','Saved sign-in expired — sign in again'])
 })
 test('same-label siblings neither verify nor hide a removed selected account', async () => {
  const {plugin}=await setup()
