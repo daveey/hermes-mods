@@ -29,7 +29,12 @@ const el = () => document.getElementById('root')
 const flush = () => new Promise(r => setTimeout(r, 0))
 const show = async node => React.act(async () => { root.render(node); await flush() })
 // Waiting rows are folded by default (README "Waiting says what each card waits on"): open the fold before reading them.
-const openWaiting = async () => { const t = el().querySelector('[data-waiting-toggle]'); if (t && t.getAttribute('aria-expanded') !== 'true') await React.act(async () => { t.click(); await flush() }) }
+const openWaiting = async () => {
+  const t = el().querySelector('[data-waiting-toggle]')
+  if (t && t.getAttribute('aria-expanded') !== 'true') await React.act(async () => { t.click(); await flush() })
+  // A waiting row is one line; its long form (full wait text, evidence) opens on click.
+  for (const r of el().querySelectorAll('[data-wait-toggle][aria-expanded=false]')) await React.act(async () => { r.click(); await flush() })
+}
 afterEach(async () => { await show(null) })
 after(async () => { await React.act(async () => { root.unmount() }); dom.window.close() })
 
@@ -40,7 +45,9 @@ test('fresh board status survives a parked card with no execution generation', {
   const b = bridges({ chips })
   await show(React.createElement(m.Panel, { key: 'board-status' }))
   await openWaiting()
-  assert.match(el().querySelector('[data-panel-row]').textContent, /scheduled · its owner has not published what wakes it · board status/)
+  assert.match(el().querySelector('[data-wait-reason]').textContent, /^no wake published$/)
+  assert.equal(el().querySelector('[data-row-detail]').textContent, 'scheduled · its owner has not published what wakes it')
+  assert.match(el().querySelector('[data-wait-ident]').textContent, /^t_x · scheduled.* · read from board status$/)
   assert.match(el().querySelector('[data-evidence]').textContent, /hub\/default\/default\/card:t_x/)
   // A parked card has no run: its unknown execution evidence is not a counted gap (README).
   assert.doesNotMatch(el().querySelector('[data-status-summary]').textContent, /evidence unknown/)

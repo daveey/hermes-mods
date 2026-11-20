@@ -34,7 +34,7 @@ import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'session-panel'
-const VERSION = 'session-panel-v9-readable-waits'
+const VERSION = 'session-panel-v10-wait-rows'
 export const STUCK_CARD_S = 2 * 3600 // running card with no event this long
 export const STUCK_SUB_MS = 30 * 60_000 // sub-agent with no new tool call this long
 const DONE_POLL_MS = 30_000
@@ -432,7 +432,7 @@ export function noteTitles(chips) {
     if (c?.kind !== 'kanban' || !c.id || !c.connectionId || !str(c.label) || c.label === c.id) continue
     const k = titleKey(refRoute(c), c.id)
     titles.delete(k) // re-insert: Map order is recency, so eviction drops the least recently seen
-    titles.set(k, { title: str(c.label), board: str(c.board) || 'default', at: Date.now() })
+    titles.set(k, { title: str(c.label), board: str(c.board) || 'default', state: str(c.state), at: Date.now() })
   }
   while (titles.size > TITLE_MAX) titles.delete(titles.keys().next().value)
 }
@@ -455,7 +455,7 @@ export function cardRef(chip, id, nowMs = Date.now(), read = readTitle, fallback
   if (!route.connectionId) return { route, title: '', board: route.board }
   const k = titleKey(route, id), hit = titles.get(k)
   const age = hit ? nowMs - hit.at : Infinity
-  if (hit && (hit.pending ? age < TITLE_PENDING_MS : age < (hit.title ? TITLE_FRESH_MS : TITLE_RETRY_MS))) return { route, title: hit.title, board: hit.board || route.board }
+  if (hit && (hit.pending ? age < TITLE_PENDING_MS : age < (hit.title ? TITLE_FRESH_MS : TITLE_RETRY_MS))) return { route, title: hit.title, board: hit.board || route.board, state: hit.state || '' }
   if (titles.size >= TITLE_MAX) titles.delete(titles.keys().next().value)
   titles.set(k, { title: hit?.title || '', board: hit?.board || route.board, at: nowMs, pending: true })
   Promise.resolve(read(route, id)).catch(() => ({ title: '' })).then(r => {
@@ -486,7 +486,7 @@ export function waitSegments(text, chip, nowMs = Date.now(), read = readTitle, f
     // A local card (gateway '' / 'local') cannot tell its own name from another's: only a known, different name is foreign.
     const foreign = !!gw && own.length > 0 && !['its', 'the', 'hub-sync', ...own].includes(gw)
     const linkable = !!chip?.connectionId && !foreign
-    out.push({ id: m[0], title: ref.title, status: st ? st[1] : '', linkable, open: linkable ? { kind: 'kanban', id: m[0], board: ref.board, connectionId: ref.route.connectionId, profile: ref.route.profile } : null })
+    out.push({ id: m[0], title: ref.title, state: ref.state || '', status: st ? st[1] : '', linkable, open: linkable ? { kind: 'kanban', id: m[0], board: ref.board, connectionId: ref.route.connectionId, profile: ref.route.profile } : null })
     last = end
   }
   if (last < t.length) out.push({ text: t.slice(last) })
@@ -510,9 +510,9 @@ function WaitText({ text, chip, plain }) {
   const st = typeof window !== 'undefined' ? window.__sessionTasks : null
   return waitSegments(text, chip).map((s, idx) => {
     if (!s.id) return overdueSpans(s.text, idx)
-    const label = refText(s)
+    const label = refText(s.title && s.title.length > 60 ? { ...s, title: `${s.title.slice(0, 59).trimEnd()}…` } : s)
     if (!s.linkable || typeof st?.openTaskChip !== 'function') return label
-    return jsx('button', { type: 'button', 'data-wait-card': s.id, title: `Open card ${s.id}`, style: linkBtn,
+    return jsx('button', { type: 'button', 'data-wait-card': s.id, title: `Open card ${s.id}${s.title ? `: ${s.title}` : ''}`, style: linkBtn,
       onClick: e => { e.stopPropagation(); st.openTaskChip(s.open) },
       children: label }, `${s.id}:${idx}`)
   })
@@ -849,11 +849,6 @@ export const PIPS_MAX = 24 // boxes drawn before the rest fold into "+N"
 // A hub-scheduled card's box is a little larger and carries an "H" (running and waiting work alike).
 // A one-line waiting row carries the same box as its full row, so its colour says what it is (yellow = waiting).
 const lineKind = i => (i.blockedUpstreamRow ? 'blockedUpstream' : 'waiting')
-/** The one-line row's box: the full row's box (a hub card's is larger and carries an "H"). */
-const linePip = i => {
-  const k = lineKind(i), hub = onHub(i)
-  return jsx('span', { 'aria-hidden': true, 'data-line-pip': k, ...(hub ? { 'data-line-pip-hub': '' } : {}), style: { ...pipStyle(k, hub), display: 'inline-flex', marginRight: 6, verticalAlign: hub ? '-2px' : '-1px' }, children: hub ? 'H' : undefined }, 'p')
-}
 const pipStyle = (k, hub = false) => {
   const base = { width: 9, height: 9, borderRadius: 2, boxSizing: 'border-box', flex: 'none' }
   const h = hub ? { width: 12, height: 12, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: 8.5, fontWeight: 700, lineHeight: 1 } : {}
@@ -894,6 +889,155 @@ function Row({ i, k }) {
       i.evidenceText && jsx('div', { 'data-evidence': i.evidenceState || '', style: { ...muted, fontSize: 11, overflowWrap: 'anywhere' }, children: `evidence: ${i.evidenceText}` })
     ] })
   ] })
+}
+
+// ── waiting rows ───────────────────────────────────────────────────────────
+// [daveey 2026-11-20] "come on, this is ugly": a waiting row is one line like a running row, box · title on the
+// left, and on the right a SHORT reason plus how long it has waited. A card it waits on is named by a short
+// linked title with its status as a tag, never its whole title inline; "board status" and other source notes
+// live in the click-open details, never on the line.
+const CLOCK_WAIT = /^the clock until (\d{4}-\d\d-\d\d) (\d\d:\d\d) UTC\b/
+const PT_DAY = typeof Intl !== 'undefined' ? new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23', timeZoneName: 'short' }) : null
+/** `Sat 00:00 PST` within the coming/past 6 days, else `Dec 2 22:20 PST` (Pacific wall clock). */
+export function pacificShort(sec, nowMs = Date.now()) {
+  if (!PT_DAY || !Number.isFinite(Number(sec))) return ''
+  const p = Object.fromEntries(PT_DAY.formatToParts(new Date(Number(sec) * 1000)).map(x => [x.type, x.value]))
+  const near = Math.abs(Number(sec) - nowMs / 1000) < 6 * 86_400
+  return `${near ? p.weekday : `${p.month} ${p.day}`} ${p.hour}:${p.minute} ${p.timeZoneName}`
+}
+
+/** A published wait, short enough for the line: a CI run URL reads `CI run 44819160264`, a PR URL `PR #121`; the
+ *  full text stays in the details. */
+export function shortWait(w) {
+  const t = str(w).trim()
+  const run = /actions\/runs\/(\d+)/.exec(t), pr = /\/pull\/(\d+)/.exec(t)
+  if (/^ci\b/i.test(t) && run) return `CI run ${run[1]}`
+  if (pr) return `${/^ci\b/i.test(t) ? 'CI on ' : ''}PR #${pr[1]}`
+  return t.replace(/https?:\/\/\S+/g, u => { const bare = u.replace(/^https?:\/\/(www\.)?/, ''); return bare.length > 40 ? `${bare.slice(0, 39)}…` : bare })
+}
+
+/** What a Waiting row shows on its line: `{ reason: [text | { ref }], tone, age, sub }`. `ref` is
+ *  `{ id, status, text }`; `tone` 'warn' (orange: well overdue, a retired ask still blocked) or 'note' (yellow: no wake
+ *  or reason published);
+ *  `age` is how long it has waited (from the card's published wait start). Built from the chip, not from
+ *  the long `detail` string, which stays for the details and tooltip. */
+export function rowWait(i, nowMs = Date.now()) {
+  const c = i?.chip || {}, now = nowMs / 1000
+  const since = Number(c.waitingSince) > 0 && Number(c.waitingSince) <= now ? Number(c.waitingSince) : 0
+  const age = since ? shortDur(now - since) : ''
+  const v = (reason, tone = '', extra = {}) => ({ reason, tone, age, sub: '', ...extra })
+  // A retired ask's still-blocked owner: its own status text (gateway / profile / board / id · blocked · request …).
+  if (i?.cardStatus) {
+    const [path, ...rest] = str(i?.detail).split(' · ')
+    const id = /\bt_[0-9a-f]{6,}\b|[^/\s]+$/.exec(path.trim())?.[0] || ''
+    return v([rest.length ? `${rest.join(' · ')}${id ? ` · ${id}` : ''}` : 'still blocked · its ask was retired'], 'warn')
+  }
+  if (i?.blockedUpstreamRow) {
+    const bu = c.blockedUpstream || {}, auth = bu.contained?.authority
+    return bu.contained ? v(['released by ', { ref: { id: str(auth?.id), status: str(auth?.status) || 'unknown', text: `card ${str(auth?.id)}` } }])
+      : v(['parent blocked: ', { ref: { id: str(bu.id), status: str(bu.status), text: `card ${str(bu.id)}` } }])
+  }
+  if (i?.kind !== 'kanban') return v([str(i?.detail) || 'waiting'])
+  if (waitKind(i) === 'unknown') {
+    // The cause stays on the line (source expired, card could not be re-read); the last known state is in the details.
+    const why = /^status unknown \(([^)]+)\)/.exec(str(i?.detail))?.[1] || (c.stale ? 'could not be re-read' : '')
+    return v([`status unknown${why ? ` · ${why}` : ''}`])
+  }
+  const w = str(c.waitingOn).trim()
+  const clock = CLOCK_WAIT.exec(w)
+  if (clock) {
+    const at = Date.parse(`${clock[1]}T${clock[2]}:00Z`) / 1000
+    if (Number.isFinite(at)) {
+      if (at >= now) return v([`${shortDur(at - now)} left`], '', { sub: pacificShort(at, nowMs) })
+      const late = now - at
+      return v([`${late >= OVERDUE_FLAG_S ? '⚠ ' : ''}${shortDur(late)} overdue`], late >= OVERDUE_FLAG_S ? 'warn' : '', { sub: `due ${pacificShort(at, nowMs)}` })
+    }
+  }
+  // A card named in the wait is parsed exactly as the long form parses it (waitSegments: id, status, other gateway).
+  const named = /\bt_[0-9a-f]{6,}\b/.test(w) ? waitSegments(w, c, nowMs).find(x => x.id) : null
+  const refId = named ? named.id : (!w || /did not publish/i.test(w)) && c.upstream?.id ? str(c.upstream.id) : ''
+  if (refId) {
+    const status = named?.status || (c.upstream?.id === refId ? str(c.upstream.status) : '')
+    return v([/\brelease\b/.test(w) ? 'released by ' : 'on ', { ref: { id: refId, status, text: named ? w : `card ${refId}` } }])
+  }
+  if (c.state === 'triage' && (!w || w === 'triage')) return v(['needs triage'])
+  if (c.state === 'review' && (!w || /did not publish/i.test(w))) {
+    const label = typeof window !== 'undefined' ? window.__sessionTasks?.activityLabel : null
+    const kind = (typeof label === 'function' ? str(label(c.activity)) : str(c.activity).replace(/_/g, ' ')).trim()
+    const at = Number(c.activityAt)
+    return v([`no reviewer running${kind ? ` · ${kind}${at > 0 ? ` ${shortDur(now - at)} ago` : ''}` : ''}`])
+  }
+  if (w && !/did not publish/i.test(w)) return v([`on ${shortWait(w)}`])
+  if (c.state === 'scheduled') return v(['no wake published'], 'note')
+  if (c.state === 'blocked') return v(['blocked · no reason given'], 'note')
+  if (c.state === 'todo') return v(['on parent cards'])
+  return v([str(i?.detail) || str(c.state) || 'waiting'])
+}
+
+const refLink = { padding: 0, border: 0, background: 'transparent', font: 'inherit', color: 'inherit', cursor: 'pointer', textDecoration: 'underline', textDecorationColor: 'color-mix(in srgb, currentColor 45%, transparent)', textUnderlineOffset: 3 }
+const REF_CHARS = 28
+const SOURCE_TAIL = / · ((?:reported )?board status)$/
+/** A card named in a wait: its title cut to REF_CHARS (the whole title, id and status in the tooltip), linked when this
+ *  Desktop can open it, the bare id until its title is known; then its status as plain muted text. The link is its own
+ *  button (its click never reaches the row; the row handles no keys). Its known state is the fallback status. */
+function RefChip({ ref: r, chip }) {
+  const seg = waitSegments(r.text || `card ${r.id}`, chip).find(x => x.id === r.id) || { id: r.id, title: '', linkable: false }
+  const st = typeof window !== 'undefined' ? window.__sessionTasks : null
+  const status = r.status || seg.state || ''
+  const name = seg.title ? (seg.title.length > REF_CHARS ? `${seg.title.slice(0, REF_CHARS - 1).trimEnd()}…` : seg.title) : r.id
+  const tip = `${seg.title ? `${seg.title}\n` : ''}${r.id}${status ? ` · ${status}` : ''}`
+  const open = e => { e.stopPropagation(); st.openTaskChip(seg.open) }
+  return jsxs('span', { 'data-wait-ref': r.id, children: [
+    seg.linkable && typeof st?.openTaskChip === 'function'
+      ? jsx('button', { type: 'button', 'data-wait-card': r.id, title: `Open: ${tip}`, style: refLink, onClick: open, children: name })
+      : jsx('span', { title: tip, children: name }),
+    status && jsx('span', { 'data-wait-status': '', style: { opacity: 0.75 }, children: ` · ${status.replace(/_/g, ' ')}` })
+  ] })
+}
+
+// One stylesheet for the waiting rows: a hover tint says a row opens; the disclosure button is the title itself.
+const WAIT_CSS = `[data-wait-row]{border-radius:5px}[data-wait-row]:hover{background:color-mix(in srgb,var(--foreground) 5%,transparent)}
+[data-wait-toggle]:focus-visible{outline:1px solid color-mix(in srgb,var(--foreground) 50%,transparent);outline-offset:1px;border-radius:3px}`
+/** Waiting rows share one grid, so the reason column lines up across rows: box · title · reason · age. The reason
+ *  column is a fixed 42% in every list, so it starts at the same place folded, opened and in Blocked upstream, and
+ *  the title always keeps the rest. */
+export function WaitList({ rows, now = Date.now(), kindOf = () => 'waiting', more = 0, attrs = {} }) {
+  if (!rows.length && !more) return null
+  return jsxs('div', { ...attrs, style: { display: 'grid', gridTemplateColumns: '12px minmax(0,1fr) minmax(0,42%) auto', columnGap: 10, minWidth: 0 }, children: [
+    ...rows.map(i => jsx(WaitRow, { i, now, k: kindOf(i) }, i.key)),
+    more > 0 && jsx('div', { 'data-wait-more': '', style: { ...muted, gridColumn: '2 / -1', padding: '2px 0' }, children: `+${more} more waiting` }, 'more')
+  ] })
+}
+
+/** One waiting card on one line of its WaitList (subgrid): box · title · short reason · how long. The title is the
+ *  row's disclosure button (keyboard: Tab, Enter/Space); a click anywhere on the line opens it too. The long form:
+ *  the full wait text (cards linked, the source), id · state · where, the execution evidence, and Open card. */
+export function WaitRow({ i, now = Date.now(), k = 'waiting' }) {
+  const [open, setOpen] = useState(false)
+  const view = rowWait(i, now)
+  const hub = onHub(i)
+  const st = typeof window !== 'undefined' ? window.__sessionTasks : null
+  const canOpen = i.kind === 'kanban' && !!i.chip?.connectionId && !!i.chip?.profile && typeof st?.openTaskChip === 'function'
+  const tip = `${str(i.chip?.title) || i.label}${i.detail ? `\n${i.cardStatus ? i.detail : waitLabel(i.detail, i.chip)}` : ''}`
+  const tone = view.tone === 'warn' ? C.stuck : view.tone === 'note' ? C.waiting : null
+  const cell = { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
+  return jsxs('div', { 'data-panel-row': i.key, 'data-waiting-line': i.key, 'data-wait-row': '', title: tip, onClick: () => setOpen(o => !o),
+    style: { display: 'grid', gridColumn: '1 / -1', gridTemplateColumns: 'subgrid', alignItems: 'center', fontSize: 13, padding: '3px 0', cursor: 'pointer' }, children: [
+      jsx('span', { 'aria-hidden': true, 'data-row-pip': k, 'data-line-pip': k, ...(hub ? { 'data-row-pip-hub': '', 'data-line-pip-hub': '' } : {}), style: { ...pipStyle(k, hub), justifySelf: 'center' }, children: hub ? 'H' : undefined }),
+      jsx('button', { type: 'button', 'data-wait-toggle': '', 'aria-expanded': open, 'data-wait-title': '', style: { ...cell, display: 'block', width: '100%', padding: 0, border: 0, background: 'transparent', font: 'inherit', color: 'inherit', textAlign: 'left', cursor: 'pointer' }, children: i.label }),
+      jsxs('span', { 'data-wait-reason': '', ...(view.tone ? { 'data-tone': view.tone } : {}), ...(view.tone === 'warn' ? { 'data-warn': '' } : {}), style: { ...muted, ...cell, ...(tone ? { color: tone } : {}) }, children: [
+        ...view.reason.map((p, n) => (typeof p === 'string' ? p : jsx(RefChip, { ref: p.ref, chip: i.chip }, `r${n}`))),
+        view.sub && jsx('span', { 'data-wait-sub': '', style: { opacity: 0.75 }, children: ` · ${view.sub}` }, 'sub')
+      ] }),
+      jsx('span', { 'data-wait-age': '', title: view.age ? `waiting ${view.age}` : '', style: { ...muted, textAlign: 'right', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap', minWidth: '2.6em' }, children: view.age }),
+      open && jsxs('div', { 'data-wait-details': '', onClick: e => e.stopPropagation(), style: { ...muted, gridColumn: '2 / -1', fontSize: 11.5, lineHeight: 1.5, padding: '2px 0 6px', overflowWrap: 'anywhere', cursor: 'auto' }, children: [
+        // The wait itself first; where the state was read (`board status` / `reported board status`) joins the id line.
+        i.detail && jsx('div', { 'data-row-detail': '', children: jsx(WaitText, { text: str(i.detail).replace(SOURCE_TAIL, ''), chip: i.chip, plain: i.cardStatus }) }),
+        i.chip?.id && !i.cardStatus && jsx('div', { 'data-wait-ident': '', children: [i.chip.id, i.chip.state, whereText(i.chip), i.chip.board && i.chip.board !== 'default' ? `board ${i.chip.board}` : '', SOURCE_TAIL.exec(str(i.detail))?.[1] ? `read from ${SOURCE_TAIL.exec(str(i.detail))[1]}` : ''].filter(Boolean).join(' · ') }),
+        i.evidenceText && jsx('div', { 'data-evidence': i.evidenceState || '', children: `evidence: ${i.evidenceText}` }),
+        canOpen && jsx('button', { type: 'button', 'data-open-card': '', style: { ...btn, minHeight: 26, marginTop: 4, fontSize: 12 }, onClick: () => st.openTaskChip(i.chip), children: 'Open card' })
+      ] })
+    ] })
 }
 
 // ── running rows ───────────────────────────────────────────────────────────
@@ -1153,6 +1297,7 @@ export function Panel() {
   // stays. A folded ask is never muted: its count keeps the needs-you colour, and a new ask reopens the panel.
   const trigger = 'status-section-trigger flex min-w-0 flex-1 items-center gap-1.5 px-2 py-1 text-left text-xs font-normal text-muted-foreground/92 transition-colors hover:text-foreground/90'
   return jsxs('section', { 'data-session-panel': '', 'data-slot': 'status-section', 'aria-label': 'Session status', style: { width: '100%', minWidth: 0, boxSizing: 'border-box', paddingBottom: collapsed ? 2 : 6, borderBottom: '1px solid color-mix(in srgb, var(--border) 60%, transparent)', color: 'var(--foreground)', userSelect: 'text', WebkitUserSelect: 'text' }, children: [
+    jsx('style', { 'data-wait-css': '', children: WAIT_CSS }, 'wait-css'),
     jsx('div', { className: 'status-section-header flex items-center gap-1 pr-1', children: jsxs('button', { type: 'button', 'data-panel-toggle': '', className: trigger, 'aria-expanded': !collapsed, 'aria-label': collapsed ? 'Expand session status' : 'Collapse session status', title: collapsed ? 'Expand' : 'Collapse (reopens when something new needs you or gets stuck)', onClick: toggle, style: { background: 'transparent', border: 0, cursor: 'pointer', minWidth: 0 }, children: [
       jsx(DisclosureCaret, { className: 'shrink-0', open: !collapsed, size: '1em' }),
       jsx('span', { className: 'status-section-icon flex shrink-0 items-center', children: jsx(Codicon, { className: 'text-muted-foreground/70', name: 'pulse', size: '0.8rem' }) }),
@@ -1162,16 +1307,13 @@ export function Panel() {
       summaryParts.length > 0 && jsx('span', { 'data-status-summary': '', ...(collapsed ? { 'data-collapsed-summary': '' } : {}), className: 'min-w-0 truncate', children: summaryParts.flatMap((p, idx) => [idx > 0 && ' · ', jsx('span', { style: p.k === 'needsYou' || p.k === 'stuck' ? { color: C[p.k], fontWeight: 600 } : undefined, children: p.text }, p.k)].filter(Boolean)) })
     ] }) }),
     // Collapsed, a bare "2 waiting" left the user asking "on what?": keep one short line per waiting card.
-    collapsed && waitLines.length > 0 && jsxs('div', { 'data-collapsed-waiting': '', style: { ...muted, padding: '0 8px 0 30px', minWidth: 0 }, children: [
-      ...waitLines.map(i => jsx('div', { 'data-waiting-line': i.key, title: `${str(i.chip?.title) || i.label}${i.detail ? `\n${i.cardStatus ? i.detail : waitLabel(i.detail, i.chip)}` : ''}`, style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: [linePip(i), `${i.label} · `, i.detail ? jsx(WaitText, { text: i.detail, chip: i.chip, plain: i.cardStatus }, 'w') : 'waiting'] }, i.key)),
-      waitMore > 0 && jsx('div', { children: `+${waitMore} more waiting` }, 'more')
-    ] }),
+    collapsed && waitLines.length > 0 && jsx('div', { style: { padding: '0 12px 2px 30px', minWidth: 0 }, children: jsx(WaitList, { rows: waitLines, now, kindOf: lineKind, more: waitMore, attrs: { 'data-collapsed-waiting': '' } }) }),
     !collapsed && jsxs('div', { 'data-panel-body': '', className: 'status-section-body', style: { maxHeight: '55vh', overflowY: 'auto', minWidth: 0, padding: '0 10px 0 12px' }, children: [
       ...needsYou,
       sorted.stuck.length > 0 && jsx('h3', { 'data-section': 'stuck', style: heading(C.stuck), children: `Stuck · ${sorted.stuck.length}` }),
       ...sorted.stuck.map(i => jsx(StuckCard, { i, session: route.session, now }, i.key)),
       sorted.blockedUpstream.length > 0 && jsx('h3', { 'data-section': 'blocked-upstream', style: heading(C.blockedUpstream), children: `Blocked upstream · ${sorted.blockedUpstream.length}` }),
-      ...sorted.blockedUpstream.map(i => jsx(Row, { i, k: 'blockedUpstream' }, i.key)),
+      jsx(WaitList, { rows: sorted.blockedUpstream, now, kindOf: () => 'blockedUpstream' }, 'wl-bu'),
       // The header already says "N running" with N blue boxes: the heading only earns its line when other
       // sections share the body and the running rows need telling apart from them.
       sorted.active.length > 0 && otherSections &&
@@ -1184,12 +1326,10 @@ export function Panel() {
       ] }),
       // Folded, the counts alone ("1 other") left the user asking "on what?": name up to 3 cards and what each
       // waits on, one line each, as the collapsed panel does. Opening the fold shows the full rows.
-      !waitingOpen && foldLines.length > 0 && jsxs('div', { 'data-folded-waiting': '', style: { ...muted, padding: '0 0 4px 18px', minWidth: 0 }, children: [
-        ...foldLines.map(i => jsx('div', { 'data-waiting-line': i.key, title: `${str(i.chip?.title) || i.label}${i.detail ? `\n${i.cardStatus ? i.detail : waitLabel(i.detail, i.chip)}` : ''}`, style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: [linePip(i), `${i.label} · `, i.detail ? jsx(WaitText, { text: i.detail, chip: i.chip, plain: i.cardStatus }, 'w') : 'waiting'] }, i.key)),
-        foldMore > 0 && jsx('div', { children: `+${foldMore} more waiting` }, 'more')
-      ] }),
+      !waitingOpen && foldLines.length > 0 && jsx(WaitList, { rows: foldLines, now, more: foldMore, attrs: { 'data-folded-waiting': '' } }, 'wl-fold'),
       // A still-blocked owner whose ask was retired has no other surface: its status row is never folded away.
-      ...sorted.waiting.filter(i => waitingOpen || i.cardStatus).map(i => jsx(Row, { i, k: 'waiting' }, i.key)),
+      ...(waitingOpen ? [] : sorted.waiting.filter(i => i.cardStatus).map(i => jsx(Row, { i, k: 'waiting' }, i.key))),
+      waitingOpen && jsx(WaitList, { rows: sorted.waiting, now, attrs: { 'data-open-waiting': '' } }, 'wl-open'),
       (finished?.length || reported.length || sorted.ready.length || sorted.queued.length) ? jsxs('div', { style: { borderTop: '1px solid color-mix(in srgb, var(--border) 60%, transparent)', marginTop: 10, paddingTop: 4 }, children: [
         jsx(Fold, { label: `Ready · ${sorted.ready.length}`, items: sorted.ready, k: 'ready' }),
         jsx(Fold, { label: `Not started · ${sorted.queued.length}`, items: sorted.queued, k: 'queued' }),

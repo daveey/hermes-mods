@@ -199,3 +199,58 @@ test('a review card through the real projection: no reviewer running, newest eve
     assert.equal(cont.waiting[0].detail, 'waiting for a reviewer (none running) · last: checkpointed 1m ago · board status')
   } finally { delete globalThis.window }
 })
+
+test('row line: a short reason per kind of wait, tone and age; the long form stays in `detail`', () => {
+  const NOW = Date.parse('2026-11-20T22:00:00Z'), S = NOW / 1000
+  const row = (state, chip = {}, extra = {}) => ({ key: `kb:${state}`, kind: 'kanban', label: 'T', detail: 'long form', chip: { state, connectionId: 'C1', profile: 'default', ...chip }, ...extra })
+  const line = v => v.reason.map(p => (typeof p === 'string' ? p : `[${p.ref.id}${p.ref.status ? `:${p.ref.status}` : ''}]`)).join('')
+  const cases = [
+    [row('scheduled', { waitingOn: 'the clock until 2026-11-21 08:00 UTC', waitingSince: S - 7200 }), '10h left', '', '2h', 'Sat 00:00 PST'],
+    [row('scheduled', { waitingOn: 'the clock until 2026-11-20 21:50 UTC', waitingSince: S - 3600 }), '10m overdue', '', '1h', 'due Fri 13:50 PST'],
+    [row('scheduled', { waitingOn: 'the clock until 2026-11-20 18:00 UTC', waitingSince: S - 86_400 }), '⚠ 4h overdue', 'warn', '1d', 'due Fri 10:00 PST'],
+    [row('scheduled', { waitingOn: 'card t_01a1fa96bc4ff0f5 on hub', waitingSince: S - 600 }), 'on [t_01a1fa96bc4ff0f5]', '', '10m', ''],
+    [row('todo', { upstream: { id: 't_01a197166756bd53', status: 'scheduled' } }), 'on [t_01a197166756bd53:scheduled]', '', '', ''],
+    [row('triage', { waitingOn: 'release by card t_01a1e1778ac09234 (running)', contained: {} }), 'released by [t_01a1e1778ac09234:running]', '', '', ''],
+    [row('scheduled', { waitingOn: 'ci https://github.com/o/r/actions/runs/44819160264' }), 'on CI run 44819160264', '', '', ''],
+    [row('scheduled', {}), 'no wake published', 'note', '', ''],
+    [row('scheduled', { waitingOn: 'a producer the owner did not publish' }), 'no wake published', 'note', '', ''],
+    [row('blocked', {}), 'blocked · no reason given', 'note', '', ''],
+    [row('triage', { waitingOn: 'triage', waitingSince: S - 5400 }), 'needs triage', '', '1h 30m', ''],
+    [row('review', { activity: 'review_route_deferred', activityAt: S - 900 }), 'no reviewer running · review route deferred 15m ago', '', '', ''],
+    [row('running', { stale: true }, { detail: 'status unknown · last known: running' }), 'status unknown · could not be re-read', '', '', ''],
+    [row('running', {}, { detail: 'status unknown (source expired) · last known: running' }), 'status unknown · source expired', '', '', ''],
+  ]
+  for (const [i, reason, tone, age, sub] of cases) {
+    const v = m.rowWait(i, NOW)
+    assert.deepEqual([line(v), v.tone, v.age, v.sub], [reason, tone, age, sub], JSON.stringify(i.chip))
+  }
+  // Blocked upstream and a retired ask.
+  assert.equal(line(m.rowWait({ kind: 'kanban', blockedUpstreamRow: true, chip: { blockedUpstream: { id: 't_par', status: 'blocked' } } }, NOW)), 'parent blocked: [t_par:blocked]')
+  // A retired ask's owner: its own status text on the line.
+  const ask = { kind: 'kanban', cardStatus: true, detail: 'G1 / default / default / t_0123abcd · blocked · request dismissed', chip: {} }
+  assert.deepEqual([line(m.rowWait(ask, NOW)), m.rowWait(ask, NOW).tone], ['blocked · request dismissed · t_0123abcd', 'warn'], 'the status first, then the id')
+  // Contained blocked upstream: released by its authority.
+  assert.equal(line(m.rowWait({ kind: 'kanban', blockedUpstreamRow: true, chip: { blockedUpstream: { id: 't_leaf', status: 'triage', contained: { authority: { id: 't_auth', status: 'running' } } } } }, NOW)), 'released by [t_auth:running]')
+  // A sub-agent or process row (not a card) keeps its own detail line.
+  assert.equal(line(m.rowWait({ kind: 'sub', detail: 'unknown (no observation) · progress unknown', chip: {} }, NOW)), 'unknown (no observation) · progress unknown')
+  // "waits on deploy" after a card id is not a gateway: same parse as the long form.
+  const notGw = m.rowWait(row('scheduled', { waitingOn: 'card t_01a1fa96bc4ff0f5 (running) waits on deploy' }), NOW).reason.find(p => p.ref)
+  assert.equal(notGw.ref.status, 'running')
+  assert.equal(m.waitSegments(notGw.ref.text, { kind: 'kanban', connectionId: 'C1', profile: 'default', gateway: 'hub' }).find(x => x.id).linkable, true, 'and still linked')
+  // A wait start in the future (clock skew) shows no age rather than a negative one.
+  assert.equal(m.rowWait(row('triage', { waitingOn: 'triage', waitingSince: S + 60 }), NOW).age, '')
+})
+
+test('shortWait: URLs never reach the line', () => {
+  assert.equal(m.shortWait('ci https://github.com/o/r/actions/runs/123'), 'CI run 123')
+  assert.equal(m.shortWait('ci https://github.com/o/r/pull/7'), 'CI on PR #7')
+  assert.equal(m.shortWait('deploy https://example.com/a/very/long/path/that/goes/on/and/on/forever'), 'deploy example.com/a/very/long/path/that/goes/…')
+  assert.equal(m.shortWait('deploy abc123'), 'deploy abc123')
+})
+
+test('pacificShort: weekday within six days, month and day beyond; PDT in daylight time', () => {
+  const NOW = Date.parse('2026-11-20T22:00:00Z')
+  assert.equal(m.pacificShort(Date.parse('2026-11-21T08:00:00Z') / 1000, NOW), 'Sat 00:00 PST')
+  assert.equal(m.pacificShort(Date.parse('2026-12-03T06:20:00Z') / 1000, NOW), 'Dec 2 22:20 PST')
+  assert.equal(m.pacificShort(Date.parse('2026-07-01T07:00:00Z') / 1000, Date.parse('2026-06-30T00:00:00Z')), 'Wed 00:00 PDT')
+})
