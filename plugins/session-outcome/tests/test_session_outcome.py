@@ -145,6 +145,48 @@ def test_done_without_summary_is_refused(plugin, fake):
     assert not out["ok"] and "summary" in out["error"] and fake.declared == []
 
 
+def _fake_ksa(monkeypatch, rows=None, raises=False):
+    if "hermes_cli" not in sys.modules:
+        try:
+            import hermes_cli  # noqa: F401
+        except ImportError:
+            pkg = types.ModuleType("hermes_cli")
+            pkg.__path__ = []
+            monkeypatch.setitem(sys.modules, "hermes_cli", pkg)
+    mod = types.ModuleType("hermes_cli.kanban_session_activity")
+    mod.ACTIVE_STATUSES = ("todo", "ready", "running", "scheduled", "review")
+    seen = []
+
+    def session_tasks(ids, statuses):
+        seen.append((list(ids), statuses))
+        if raises:
+            raise OSError("board busy")
+        return rows or []
+    mod.session_tasks = session_tasks
+    monkeypatch.setitem(sys.modules, "hermes_cli.kanban_session_activity", mod)
+    monkeypatch.setattr(sys.modules["hermes_cli"], "kanban_session_activity", mod, raising=False)
+    return seen
+
+
+def test_done_refused_while_a_linked_card_is_open(plugin, fake, monkeypatch):
+    # 20261119_073752_746173: done was declared while a parked staging-check card was still owed.
+    seen = _fake_ksa(monkeypatch, [{"id": "t_watch1", "status": "scheduled"}])
+    out = call(plugin, {"kind": "done", "summary": "GitHub setup finished."})
+    assert not out["ok"] and "t_watch1" in out["error"] and '"wait"' in out["error"]
+    assert fake.declared == []
+    assert seen and seen[0][0] == ["S1"] and "scheduled" in seen[0][1]
+    # The suggested wait is accepted.
+    out = call(plugin, {"kind": "wait", "on": [{"kind": "card", "id": "t_watch1", "label": "staging checks"}]})
+    assert out["ok"] and fake.declared[-1][1]["kind"] == "waiting"
+
+
+def test_done_allowed_with_no_open_cards_or_unreadable_board(plugin, fake, monkeypatch):
+    _fake_ksa(monkeypatch, [])
+    assert call(plugin, {"kind": "done", "summary": "Shipped."})["ok"]
+    _fake_ksa(monkeypatch, raises=True)
+    assert call(plugin, {"kind": "done", "summary": "Shipped."})["ok"]
+
+
 def test_wait_declares_named_items(plugin, fake):
     out = call(plugin, {"kind": "wait", "on": [{"kind": "card", "id": "t_abc12345", "label": "deploy", "eta": 1793300000},
                                               {"kind": "capacity", "id": "hub", "label": "hub slot"}]})

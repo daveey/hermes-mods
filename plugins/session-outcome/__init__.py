@@ -448,6 +448,22 @@ def _step_identities(us, session_id: str, steps: list[dict]) -> list[dict]:
     return out
 
 
+def _open_linked_cards(session_id: str) -> list[dict]:
+    """Open (todo/ready/running/scheduled/review) cards this chat created or shepherds, incl. parked watches.
+
+    20261119_073752_746173: the chat was declared done twice while it still owed a staging check after someone
+    else's merge; the sidebar said done. A chat with an open linked card is waiting, not done. Fails open: an
+    unreadable board never refuses a declaration."""
+    try:
+        from hermes_cli import kanban_session_activity as ksa  # type: ignore
+
+        rows = ksa.session_tasks([session_id], ksa.ACTIVE_STATUSES)
+    except Exception:
+        log.debug("session-outcome: open-card probe failed; allowing done", exc_info=True)
+        return []
+    return [r for r in rows or [] if isinstance(r, dict) and r.get("id")]
+
+
 def handle(args: dict, session_id: str = "", tool_call_id: str = "", **_: Any) -> str:
     try:
         if not session_id:
@@ -459,6 +475,15 @@ def handle(args: dict, session_id: str = "", tool_call_id: str = "", **_: Any) -
         except ValueError as exc:
             return _err(str(exc))
         api = _outcome_api()
+        if spec["kind"] == "done":
+            owed = _open_linked_cards(session_id)
+            if owed:
+                ids = ", ".join(t["id"] for t in owed[:6])
+                return _err(
+                    f"done refused: this chat still has open linked cards ({ids}). Done means nothing is owed by "
+                    "anyone, including a check you parked. Declare "
+                    '{"kind": "wait", "on": [{"kind": "card", "id": "<card>", "label": "..."}]} for them instead, '
+                    "or archive a card that is truly not needed, then declare done.")
         result: dict[str, Any] = {"ok": True}
         added: list[str] = []
         made_steps: list[dict] = []
