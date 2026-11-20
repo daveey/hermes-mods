@@ -95,21 +95,32 @@ malformed-token regression and query-only connection/closure checks).
 ### Destroyed origin gateways
 
 Gate D accepts a `follow-through: origin chat gone` note in completion metadata
-(for example `origin_note`) or an existing card comment only after independently
-checking all of these: a Board-shadow `rehomed` event authored by `server` with
-structured EC2 `terminated` proof; a fresh authenticated `/v2/machines` response
-with no active gateway of that name; and a caught-up hub session replica with no
-owner for the session ID on **any** gateway/profile. Both replicas must have a
-successful observation within 180 seconds, not in the future or offline.
+(or a card comment) only after independent exact owner-store absence checks. A
+bounded session catalog, `where` miss or offline gateway is **not** absence.
 
-The refusal offers the exact required note (qualified session, event UID, instance,
-termination check time and absence checks). Copy it into completion metadata and
-retry; no adoption, SENT claim, raw database write or human ask is needed. The
-gate does no writes. The successful completion makes metadata durable; a read-only
-replay can supply that same metadata without completing anything. Re-enrolled or
-merely unreachable gateways, restored sessions, missing/stale replicas, malformed
-proof and registry failures remain refused, even with a copied note. Tests:
-`tests/test_origin_gone.py` (positive comment/metadata paths and negative controls).
+The gate requires a fresh authenticated registry, fresh caught-up hub and Board
+replicas, and complete gateway/profile inventory. It checks every registered or
+publishing gateway, including a reused origin name and profiles holding archived
+sessions. Each scope must have two complete, sequential sweeps of authenticated
+`notice-receipts` answers reporting `session_exists=false`. That reader uses
+read-only `SessionDB.get_session`, not the truncated published catalog. Envelope,
+receiver echo, successful state and freshness are checked independently. A live
+session, missing/stale/failed/partial answer or unreachable owner refuses.
+
+An absent registry member can only be omitted with explicit server-authored
+structured terminal rehome evidence and no fresh published heartbeat. The newest
+observed rehome is selected across available board replicas, not per board. This
+lifecycle evidence explains a missing member; it does **not** establish which
+incarnation held a session. Exact absence on all remaining owners is independently
+mandatory. A reused gateway name is queried rather than inferred dead.
+
+The exact note names the qualified session, read request IDs and any lifecycle
+proof; it is audit-only regardless of its author. The gate performs no writes.
+Queue read-only `hermes-hub request <gateway> sessions <profile>/<sid>
+notice-receipts --arg keys=<valid-remote-notice-key> --id <unique-id>` separately,
+wait for every answer, then queue the second sweep. No notice is delivered by this
+lookup. Copy the gate's exact note into metadata, not a SENT or adoption claim.
+Tests: `tests/test_origin_gone.py`.
 
 Each refusal says what to do: finish the missing part, or `kanban_create` the follow-up (`parents=[<this card>]`)
 and name its id, or `kanban_block` with the exact physical step. Completing another card (a reviewer approving a

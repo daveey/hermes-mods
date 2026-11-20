@@ -1,4 +1,4 @@
-"""Destroyed gateway exception: notes never replace independent evidence."""
+"""Exact owner reads, not bounded catalogs or reused gateway names."""
 import http.client
 import importlib.util
 import json
@@ -16,7 +16,7 @@ SID = 'local-0123456789abcdef'
 REF = f'@session:default@retired-worker/{SID}'
 BODY = f'Origin chat: {REF}'
 TASK = 't_1234567890abcdef'
-UID = 'rehome-proof-123'
+KEY = f'remote:reader:default/default/{TASK}:0'
 
 
 @pytest.fixture
@@ -28,95 +28,131 @@ def world(tmp_path, monkeypatch):
                         'CREATE TABLE task_comments(task_id TEXT,body TEXT);')
         c.execute('INSERT INTO tasks VALUES(?,?,?,?)', (TASK, 'Repair', BODY, 'running'))
     shadow = tmp_path / 'shadow.db'
-    payload = {'from': 'retired-worker', 'to': 'hub', 'proof': {
-        'instance_id': 'i-0123456789abcdef0', 'ec2_state': 'terminated', 'checked_at': now - 60}}
     with sqlite3.connect(shadow) as c:
         c.executescript('CREATE TABLE kanban_sync_state(mode TEXT,pulled_at REAL); '
                         'CREATE TABLE task_events(uid TEXT,kind TEXT,origin_gateway TEXT,payload TEXT,created_at INT);')
         c.execute('INSERT INTO kanban_sync_state VALUES(?,?)', ('shadow', now))
-        c.execute('INSERT INTO task_events VALUES(?,?,?,?,?)',
-                  (UID, 'rehomed', 'server', json.dumps(payload), now - 60))
     hub = tmp_path / 'hub.db'
     with sqlite3.connect(hub) as c:
-        c.executescript('CREATE TABLE meta(k TEXT,v TEXT); CREATE TABLE replica(gw TEXT,coll TEXT,key TEXT,data TEXT);')
+        c.executescript('CREATE TABLE meta(k TEXT,v TEXT); '
+                        'CREATE TABLE replica(gw TEXT,coll TEXT,key TEXT,data TEXT); '
+                        'CREATE TABLE sent(id TEXT,body TEXT,state TEXT,result TEXT,created_at REAL,done_at REAL);')
         c.executemany('INSERT INTO meta VALUES(?,?)', [('last_ok', str(now)), ('cursor', '42'), ('head', '42')])
-    registry = {'me': 'local-reader', 'machines': [{'name': 'local-reader'}]}
+        for gw in ['reader', 'retired-worker']:
+            info = {'gateway': gw, 'profiles': ['default', 'archive'],
+                    'task_scopes': [{'profile': 'default', 'board': 'default', 'state': 'ok', 'observed_at': now}]}
+            c.execute('INSERT INTO replica VALUES(?,?,?,?)', (gw, 'gateway', 'info', json.dumps(info)))
+            for profile in info['profiles']:
+                rid = f'gone-{gw}-{profile}'
+                envelope = {'id': rid, 'to_gw': gw, 'coll': 'sessions', 'key': f'{profile}/{SID}',
+                            'action': 'notice-receipts', 'args': {'keys': KEY}}
+                result = {'code': 'notice_receipts', 'profile': profile, 'session': SID,
+                          'keys': [KEY], 'session_exists': False, 'delivered': []}
+                c.execute('INSERT INTO sent VALUES(?,?,?,?,?,?)',
+                          (rid, json.dumps(envelope), 'done', json.dumps(result), now - 20, now - 19))
+                envelope['id'] = rid + '-round2'
+                c.execute('INSERT INTO sent VALUES(?,?,?,?,?,?)',
+                          (envelope['id'], json.dumps(envelope), 'done', json.dumps(result), now - 10, now - 9))
+    registry = {'me': 'reader', 'machines': [{'name': gw, 'last_seen': now * 1000} for gw in ['reader', 'retired-worker']]}
     gone = core._sibling('origin_gone')
     monkeypatch.setattr(gone, 'runtime', lambda: (hub, registry))
     monkeypatch.setattr(core, 'replica_paths', lambda paths: [shadow])
     monkeypatch.setattr(core, '_origin_receipt_context', lambda *args: None)
-    note = (f'follow-through: origin chat gone {REF}; server rehomed {UID}; '
-            f'instance i-0123456789abcdef0; terminated checked_at={now - 60}; '
-            'fresh registry has no active gateway; fresh session replica has no owner')
-    # A comment is already durable, so check_origin_reached can remain read-only.
-    with sqlite3.connect(live) as c:
-        c.execute('INSERT INTO task_comments VALUES(?,?)', (TASK, note))
-    return live, shadow, hub, registry, note
+    return live, shadow, hub, registry
 
 
-def check(world):
-    return core.check_origin_reached(TASK, world[0], BODY)
+def check(world, metadata=None):
+    return core.check_origin_reached(TASK, world[0], BODY, metadata=metadata)
 
 
-def test_terminated_and_unowned_with_durable_note_passes(world):
+def note(world):
+    evidence = core._sibling('origin_gone').evidence([('retired-worker', 'default', SID)], [world[1]], core.ro_connect)
+    return evidence.get(('retired-worker', 'default', SID))
+
+
+def test_reused_gateway_exact_absence_passes_only_with_note(world):
+    n = note(world)
+    assert n and 'follow-through: origin chat gone' in n and 'gone-retired-worker-archive' in n
+    assert check(world)
+    assert check(world, {'origin_note': n}) is None
+    with sqlite3.connect(world[0]) as c:
+        c.execute('INSERT INTO task_comments VALUES(?,?)', (TASK, n))
     assert check(world) is None
 
 
-def test_note_required_and_hint_is_exact(world):
-    with sqlite3.connect(world[0]) as c:
-        c.execute('DELETE FROM task_comments')
-    why = check(world)
-    assert why and world[4] in why
-
-
-@pytest.mark.parametrize('case', ['active', 'human-desktop', 'human-cli', 'human-tui', 'other-owner',
-                                 'stale-hub', 'behind-hub', 'missing-hub', 'stale-board', 'missing-board',
-                                 'not-server', 'offline-only', 'malformed', 'future-proof', 'wrong-gateway'])
+@pytest.mark.parametrize('case', ['human-desktop', 'human-cli', 'human-tui', 'other-profile-owner',
+                                 'pending', 'rejected', 'missing-receipt', 'stale-receipt', 'future-receipt',
+                                 'wrong-echo', 'wrong-envelope', 'invalid-bool', 'delivered',
+                                 'stale-hub', 'behind-hub', 'offline-hub', 'missing-hub',
+                                 'stale-board', 'missing-board', 'missing-info', 'stale-info', 'empty-profiles',
+                                 'new-profile', 'new-gateway', 'missing-me', 'unregistered-me',
+                                 'empty-membership', 'offline-gateway'])
 def test_unknown_or_live_still_refuses(world, case):
-    live, shadow, hub, registry, note = world
-    if case == 'active':
-        registry['machines'] = [{'name': 'retired-worker', 'state': 'active'}]
-    elif case.startswith('human-') or case == 'other-owner':
-        with sqlite3.connect(hub) as c:
-            gw = 'another-live-gateway' if case == 'other-owner' else 'retired-worker'
-            c.execute('INSERT INTO replica VALUES(?,?,?,?)', (gw, 'sessions', f'default/{SID}',
-                      json.dumps({'id': SID, 'source': case.removeprefix('human-')})))
-    elif case == 'missing-hub':
+    n = note(world)
+    live, shadow, hub, registry = world
+    if case == 'missing-hub':
         hub.unlink()
     elif case == 'missing-board':
         shadow.unlink()
-    elif case in ('stale-hub', 'behind-hub'):
-        with sqlite3.connect(hub) as c:
-            c.execute('UPDATE meta SET v=? WHERE k=?',
-                      ('0' if case == 'stale-hub' else '43', 'last_ok' if case == 'stale-hub' else 'head'))
     elif case == 'stale-board':
         with sqlite3.connect(shadow) as c:
             c.execute('UPDATE kanban_sync_state SET pulled_at=0')
+    elif case == 'missing-me':
+        registry.pop('me')
+    elif case == 'unregistered-me':
+        registry['me'] = 'other'
+    elif case == 'empty-membership':
+        registry['machines'] = []
+    elif case == 'new-gateway':
+        registry['machines'].append({'name': 'new-worker', 'last_seen': time.time() * 1000})
+    elif case == 'offline-gateway':
+        registry['machines'][1]['last_seen'] = 0
     else:
-        with sqlite3.connect(shadow) as c:
-            if case == 'not-server':
-                c.execute("UPDATE task_events SET origin_gateway='worker'")
-            else:
-                event = json.loads(c.execute('SELECT payload FROM task_events').fetchone()[0])
-                if case == 'offline-only':
-                    event['proof']['ec2_state'] = 'running'
-                elif case == 'malformed':
-                    event['proof'] = 'terminated'
-                elif case == 'future-proof':
-                    event['proof']['checked_at'] = int(time.time()) + 1000
+        with sqlite3.connect(hub) as c:
+            if case == 'missing-receipt':
+                c.execute("DELETE FROM sent WHERE id='gone-retired-worker-archive'")
+            elif case in ['pending', 'rejected']:
+                c.execute('UPDATE sent SET state=?', (case,))
+            elif case in ['stale-receipt', 'future-receipt']:
+                c.execute('UPDATE sent SET created_at=?,done_at=?', (0, 0) if case == 'stale-receipt' else (time.time()+1000, time.time()+1000))
+            elif case in ['stale-hub', 'behind-hub', 'offline-hub']:
+                k, v = {'stale-hub': ('last_ok', '0'), 'behind-hub': ('head', '43'), 'offline-hub': ('offline_since', '1')}[case]
+                c.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', (k, v)) if case == 'offline-hub' else c.execute('UPDATE meta SET v=? WHERE k=?', (v,k))
+            elif case == 'missing-info':
+                c.execute("DELETE FROM replica WHERE gw='retired-worker'")
+            elif case in ['stale-info', 'empty-profiles', 'new-profile']:
+                info = json.loads(c.execute("SELECT data FROM replica WHERE gw='retired-worker'").fetchone()[0])
+                if case == 'stale-info':
+                    info['task_scopes'][0]['observed_at'] = 0
+                elif case == 'empty-profiles':
+                    info['profiles'] = []
                 else:
-                    event['from'] = 'different-gateway'
-                c.execute('UPDATE task_events SET payload=?', (json.dumps(event),))
-    assert check(world), case
+                    info['profiles'].append('new-profile')
+                c.execute("UPDATE replica SET data=? WHERE gw='retired-worker'", (json.dumps(info),))
+            else:
+                rid = 'gone-retired-worker-archive' if case == 'other-profile-owner' else 'gone-retired-worker-default'
+                raw_body, raw_result = c.execute('SELECT body,result FROM sent WHERE id=?', (rid,)).fetchone()
+                b, r = json.loads(raw_body), json.loads(raw_result)
+                if case.startswith('human-') or case == 'other-profile-owner':
+                    r['session_exists'] = True
+                elif case == 'wrong-echo':
+                    r['session'] = 'different-session'
+                elif case == 'wrong-envelope':
+                    b['to_gw'] = 'other'
+                elif case == 'invalid-bool':
+                    r['session_exists'] = 0
+                elif case == 'delivered':
+                    r['delivered'] = [KEY]
+                c.execute('UPDATE sent SET body=?,result=? WHERE id=?', (json.dumps(b), json.dumps(r), rid))
+    assert check(world, {'origin_note': n}), case
+    assert note(world) is None, case
 
 
-# Mirrors Board Resync's direct Exception base in public core-free CI.
 class Resync(Exception):
     pass
 
 
-@pytest.mark.parametrize('error', [RuntimeError('registry unreachable'), Resync('registry reset'),
-                                   http.client.IncompleteRead(b'')])
+@pytest.mark.parametrize('error', [RuntimeError('registry unreachable'), Resync('registry reset'), http.client.IncompleteRead(b'')])
 def test_failed_registry_read_is_unknown(world, monkeypatch, error):
     def fail():
         raise error
@@ -124,50 +160,65 @@ def test_failed_registry_read_is_unknown(world, monkeypatch, error):
     assert check(world)
 
 
-@pytest.mark.parametrize('case', ['missing-me', 'unregistered-me', 'empty-membership'])
-def test_incomplete_registry_is_unknown(world, case):
-    registry = world[3]
-    if case == 'missing-me':
-        registry.pop('me')
-    elif case == 'unregistered-me':
-        registry['me'] = 'not-enrolled'
-    else:
-        registry['machines'] = []
-    assert check(world)
-
-
-def test_completion_metadata_note_is_accepted(world):
-    with sqlite3.connect(world[0]) as c:
-        c.execute('DELETE FROM task_comments')
-    assert core.check_complete(TASK, 'Shipped.', [world[0]], metadata={'origin_note': world[4]}) is None
-
-
-def test_worker_refusal_has_actionable_agent_route(world):
-    world[3]['machines'] = [{'name': 'retired-worker'}]
-    why = check(world)
-    assert 'kanban_supervisor_request' in why
-    assert 'kanban_block this card with that error' not in why
-
-
-def test_read_only_and_no_obsolete_adoption_hint(world, monkeypatch):
+def test_read_only_connections_closed(world, monkeypatch):
     opened = []
     original = core.ro_connect
     def query_only(path):
-        conn = original(path)
-        conn.execute('PRAGMA query_only=ON')
-        opened.append(conn)
-        return conn
+        c = original(path)
+        c.execute('PRAGMA query_only=ON')
+        opened.append(c)
+        return c
     monkeypatch.setattr(core, 'ro_connect', query_only)
-    assert check(world) is None
-    for conn in opened:
+    n = note(world)
+    assert n
+    assert check(world, {'origin_note': n}) is None
+    for c in opened:
         with pytest.raises(sqlite3.ProgrammingError):
-            conn.execute('SELECT 1')
-    with sqlite3.connect(world[0]) as c:
-        c.execute('DELETE FROM task_comments')
-    assert 'adopt-task' not in check(world)
+            c.execute('SELECT 1')
 
 
-def test_note_for_another_proof_does_not_count(world):
-    with sqlite3.connect(world[0]) as c:
-        c.execute('UPDATE task_comments SET body=?', (world[4].replace(UID, 'forged-proof'),))
-    assert check(world)
+def test_copied_note_never_authorizes_changed_proof(world):
+    n = note(world)
+    assert n
+    with sqlite3.connect(world[2]) as c:
+        c.execute("UPDATE sent SET id='replacement' WHERE id='gone-reader-default'")
+    assert check(world, {'origin_note': n})
+
+
+def test_worker_refusal_has_actionable_agent_route(world):
+    assert 'kanban_supervisor_request' in check(world)
+
+
+@pytest.mark.parametrize('state', ['terminated', 'running', 'missing'])
+def test_terminated_gateway_requires_proof_and_all_other_exact_reads(world, state):
+    world[3]['machines'].pop()
+    with sqlite3.connect(world[2]) as c:
+        c.execute("DELETE FROM replica WHERE gw='retired-worker'")
+    if state != 'missing':
+        now = int(time.time())
+        event = {'from': 'retired-worker', 'to': 'reader', 'proof': {
+            'instance_id': 'i-0123456789abcdef0', 'ec2_state': state, 'checked_at': now - 60}}
+        with sqlite3.connect(world[1]) as c:
+            c.execute('INSERT INTO task_events VALUES(?,?,?,?,?)',
+                      ('termination-record', 'rehomed', 'server', json.dumps(event), now - 60))
+    n = note(world)
+    if state == 'terminated':
+        assert n and 'termination-record' in n
+        assert check(world, {'origin_note': n}) is None
+    else:
+        assert n is None
+        assert check(world)
+
+
+def test_publishing_nonmember_must_also_answer(world):
+    world[3]['machines'].pop()
+    assert note(world)
+    with sqlite3.connect(world[2]) as c:
+        c.execute("DELETE FROM sent WHERE id LIKE 'gone-retired-worker%'")
+    assert note(world) is None
+
+
+def test_complete_second_round_is_required(world):
+    with sqlite3.connect(world[2]) as c:
+        c.execute("DELETE FROM sent WHERE id LIKE '%round2'")
+    assert note(world) is None
