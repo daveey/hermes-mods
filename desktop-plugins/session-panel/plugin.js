@@ -702,6 +702,13 @@ export function whereText(c) {
   return str(c?.gateway) && c.gateway !== 'local' ? c.gateway : ''
 }
 
+/** A run's model, short: `class:deep` -> `deep`, `claude-opus-5-5` -> `opus-5-5`; '' when unknown. */
+export function modelText(c) {
+  const m = str(c?.runModel)
+  if (!m) return ''
+  return m.split(',').map(s => s.trim().replace(/^class:/, '').replace(/^claude-/, '')).filter(Boolean).join(', ')
+}
+
 /** The right-hand meta of a running row: `{ text, quiet, tip }`. `text` is short (`hub · 12 min`); `tip` says the
  *  same in full words for the tooltip. `quiet` = a running card whose newest event is older than QUIET_S. */
 export function runningMeta(i, nowMs = Date.now()) {
@@ -714,19 +721,21 @@ export function runningMeta(i, nowMs = Date.now()) {
   if (i?.kind === 'bg') return { text: 'process', quiet: false, tip: 'background process' }
   if (i?.kind === 'machine') return { text: 'rented machine', quiet: false, tip: 'rented machine' }
   const where = whereText(c)
+  const model = modelText(c)
+  const modelTip = model && (str(c.runModel).startsWith('class:') ? `model class ${model}` : `model ${str(c.runModel)}`)
   const progress = Number(c.activityAt) || Number(c.progressAt) || 0
   const since = Number(c.since) || 0
   const lastEvent = progress ? `last event${c.activity ? ` ${c.activity}` : ''} ${ago(progress, nowMs)}` : 'last event unknown'
   if (c.state === 'review') {
     const at = progress || since
-    return { text: join('in review', at ? span(now - at) : ''), quiet: false, tip: join('in review', where && `on ${where}`, lastEvent) }
+    return { text: join('in review', model, at ? span(now - at) : ''), quiet: false, tip: join('in review', where && `on ${where}`, modelTip, lastEvent) }
   }
   const quiet = !!progress && now - progress >= QUIET_S
   const runFor = since ? span(now - since) : ''
   return {
-    text: join(where, quiet ? `quiet ${span(now - progress)}` : runFor || (progress ? ago(progress, nowMs) : '')),
+    text: join(where, model, quiet ? `quiet ${span(now - progress)}` : runFor || (progress ? ago(progress, nowMs) : '')),
     quiet,
-    tip: join(where ? `running on ${where}` : 'running', runFor && `for ${runFor}`, lastEvent)
+    tip: join(where ? `running on ${where}` : 'running', modelTip, runFor && `for ${runFor}`, lastEvent)
   }
 }
 
@@ -736,7 +745,7 @@ export function runningDetails(i, nowMs = Date.now()) {
   const progress = Number(c.activityAt) || Number(c.progressAt) || 0
   const lines = []
   if (i?.kind === 'kanban') {
-    lines.push([i.id && `card ${i.id}`, c.assignee && `assignee ${c.assignee}`, c.board && c.board !== 'default' && `board ${c.board}`, c.gateway && `on ${c.gateway}`].filter(Boolean).join(' · '))
+    lines.push([i.id && `card ${i.id}`, c.assignee && `assignee ${c.assignee}`, c.runModel && `model ${c.runModel}`, c.board && c.board !== 'default' && `board ${c.board}`, c.gateway && `on ${c.gateway}`].filter(Boolean).join(' · '))
     lines.push([c.since && `started ${ago(c.since, nowMs)}`, progress ? `last event${c.activity ? ` ${c.activity}` : ''} ${ago(progress, nowMs)}` : 'last event unknown'].filter(Boolean).join(' · '))
   } else if (i?.kind === 'sub' && c.lastTool) lines.push(`last tool ${c.lastTool}`)
   return lines.filter(Boolean)

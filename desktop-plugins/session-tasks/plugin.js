@@ -380,6 +380,8 @@ function taskChip(t, status) {
     assignee: str(t.assignee) || null,
     // Where the card runs or will run (backend `run_machine`): 'hub', a worker name, 'worker-pool', or null.
     runMachine: str(t.run_machine) || null,
+    // Which model the newest run uses (backend `run_model`): a concrete name, or `class:<tier>` until attested.
+    runModel: str(t.run_model) || null,
     note: str(t.note) || null,
     prUrl: /^https:\/\/github\.com\//.test(str(t.pr_url)) ? str(t.pr_url) : null,
     activity: str(t.activity_kind) || null,

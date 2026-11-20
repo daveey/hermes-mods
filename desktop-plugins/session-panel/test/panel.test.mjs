@@ -834,6 +834,19 @@ test('running meta: quiet after 20 min without an event, pool and worker names, 
   assert.equal(m.runningMeta({ kind: 'bg', chip: {} }, NOW).text, 'process')
 })
 
+test('running meta shows the run model between worker and runtime', () => {
+  const at = extra => ({ kind: 'kanban', chip: card('t', 'running', extra) })
+  const deep = m.runningMeta(at({ runMachine: 'worker-a2', runModel: 'class:deep', since: S - 20 * 60, activityAt: S - 60 }), NOW)
+  assert.equal(deep.text, 'worker-a2 · deep · 20 min')
+  assert.match(deep.tip, /running on worker-a2 · model class deep · for 20 min/)
+  const pinned = m.runningMeta(at({ runMachine: 'hub', runModel: 'claude-opus-5-5', since: S - 600, activityAt: S - 60 }), NOW)
+  assert.equal(pinned.text, 'hub · opus-5-5 · 10 min')
+  assert.match(pinned.tip, /model claude-opus-5-5/)
+  assert.equal(m.runningMeta(at({ runMachine: 'hub', runModel: null, since: S - 600, activityAt: S - 60 }), NOW).text, 'hub · 10 min')
+  assert.equal(m.runningMeta({ kind: 'kanban', chip: card('t', 'review', { runModel: 'gpt-6-astra', activityAt: S - 7200 }) }, NOW).text, 'in review · gpt-6-astra · 2 h')
+  assert.match(m.runningDetails(at({ runModel: 'class:deep', assignee: 'default' }), NOW)[0], /assignee default · model class:deep/)
+})
+
 test('a quiet running card renders its meta in the waiting colour, still one line', async () => {
   const realNow = Date.now
   Date.now = () => NOW

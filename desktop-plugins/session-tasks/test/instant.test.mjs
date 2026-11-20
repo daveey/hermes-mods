@@ -296,6 +296,12 @@ test('a hub-scheduled card shows [H] in its status box; a worker card does not',
   assert.doesNotMatch(by.t_none.title, /runs on/)
 })
 
+test('a card carries its run model from the backend; none reads null', () => {
+  const chips = m.sessionTaskChips([card('t_a', 'running', { run_model: 'class:deep' }), card('t_b', 'running')],
+    { connectionId: 'conn', profile: 'default' })
+  assert.deepEqual(chips.map(c => c.runModel), ['class:deep', null])
+})
+
 
 test('warm caches another chat\'s cards without touching the focused snapshot; a failed read caches nothing', async () => {
   focus.stored = 'chat-focused'
