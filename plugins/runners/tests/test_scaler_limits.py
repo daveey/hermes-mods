@@ -26,8 +26,38 @@ def test_accept_returns_cli_readback(cli):
     response = client.post(PREFIX + '/scaler/limits', headers=TOKEN, json={'min': 1, 'max': 5})
     assert response.status_code == 200
     assert response.json() == dict(contract_version=1, ok=True, min=1, max=5, active=2, asg_max=5)
-    assert calls == [(['/example/bin/hermes-workers', 'scale', '--min', '1', '--max', '5', '--json'],
-                      dict(capture_output=True, text=True, timeout=45, check=False))]
+    assert len(calls) == 1
+    argv, kwargs = calls[0]
+    assert argv == ['/example/bin/hermes-workers', 'scale', '--min', '1', '--max', '5', '--json']
+    assert {k: v for k, v in kwargs.items() if k != 'env'} == dict(
+        capture_output=True, text=True, timeout=45, check=False)
+
+
+@pytest.mark.parametrize('method', ['get', 'post'])
+def test_cli_runs_without_the_servers_python_settings(api, monkeypatch, tmp_path, method):
+    """Real subprocess: the server's PYTHONPATH (its own site-packages) must not reach the CLI.
+
+    On the scaler host that leak broke the CLI's AWS imports under the system interpreter, so
+    status answered asg=null and the endpoint returned 503 invalid_scaler_response.
+    """
+    import sys
+    _, client, _ = api
+    fake = tmp_path / 'hermes-workers'
+    fake.write_text(
+        f'#!{sys.executable} -I\n'
+        'import json, os\n'
+        'leaked = sorted(k for k in os.environ if k.startswith("PYTHON"))\n'
+        'asg = None if leaked else {"desired": 2, "max": 5}\n'
+        'print(json.dumps(dict(ok=True, min=1, max=5, active=2, asg=asg,\n'
+        '                      asg_error=",".join(leaked) or None)))\n')
+    fake.chmod(0o755)
+    monkeypatch.setattr('shutil.which', lambda name: str(fake))
+    monkeypatch.setenv('PYTHONPATH', str(tmp_path / 'server-site-packages'))
+    monkeypatch.setenv('PYTHONUNBUFFERED', '1')
+    response = getattr(client, method)(PREFIX + '/scaler/limits', headers=TOKEN,
+                                     **({'json': {'min': 1, 'max': 5}} if method == 'post' else {}))
+    assert response.status_code == 200, response.text
+    assert response.json() == dict(contract_version=1, ok=True, min=1, max=5, active=2, asg_max=5)
 
 
 def test_get_normalizes_status_without_writing(cli):
