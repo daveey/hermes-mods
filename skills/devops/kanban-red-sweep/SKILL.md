@@ -117,7 +117,11 @@ Read `references/prevent-decision-blocks.md` (apply-the-recommendation rule, `IF
 
 - Unblock: `kanban_unblock` (or `hermes kanban unblock <id>` for triage/scheduled), always after a comment that says what changed.
   A `triage` card with a `spend_budget_triaged` event needs `hermes kanban promote <id>` after a re-scope comment:
-  `unblock` prints "released", then the next tick silently re-triages it. Read back status a tick later.
+  `unblock` prints "released", then the next tick silently re-triages it.  Read back status a tick later.
+  A `triage` card whose newest lifecycle event is `contained` is neither: unblock/promote can't release it. Only a
+  live run of the task named in that event's `policy.authority` (or a new completed run of its `policy.producer`)
+  can, via `kanban_resume_contained` with the episode uid (`tasks.containment_episode` on the home board). Read the
+  authority's status first: a `done` authority (e.g. a review card that finished without resuming) leaves it parked forever.
   Any card comment (unblock, move, correction) cites only facts you checked this turn. Another card's "PR landed" is a
   self-report until `gh pr view <N> -R <repo> --json state,mergedAt` shows it merged, and the owner acts on your comment as fact.
 - A PR completion contract runs `pr_acceptance` with the **assignee profile's** `gh` login, not yours, so wrapping
@@ -151,7 +155,7 @@ Read `references/prevent-decision-blocks.md` (apply-the-recommendation rule, `IF
   required worker labels`; `kanban edit` can't change requirements): archive it unstarted and recreate it without the pin.
   If you do a queued card's work in the chat instead, comment the evidence and archive the card the same turn,
   or a worker repeats it. `no_machine` for a worker usually means a Board hold; read its owner
-  card before filing a fault. Free slots but nothing starting: after the queue line, check `~/.hermes/core-update/drain-hold` (a
+  card before filing a fault. Free slots but nothing starting: after the queue line, grep the home gateway.log for `kanban dispatch held: <board>/<id>: start_gate:token_throttle` (the throughput plugin's fleet-wide token budget; `throttle.status()` shows rate vs cap): that is pacing, not a fault, and the card starts in the next gap under the cap, so don't bump or move it. Then check `~/.hermes/core-update/drain-hold` (a
   core-update drain pauses hub dispatch; `max_s` is not the end: `grep core-drain ~/.hermes/logs/hermes-sync.log`
   shows "claim hold kept past its bound" while workers run, up to a 2 h hard max, and no priority beats it, so
   move the card to a pool worker or do it here; before doing a fix card's work, `git log origin/main -- <file>`,
