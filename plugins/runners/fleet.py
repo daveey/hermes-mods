@@ -312,6 +312,16 @@ def _slot(row, fresh):
     return 'offline' if row.get('registration') == 'offline' else 'unknown'
 
 
+def _last_observed(row):
+    """Display-only history; never a source of repair eligibility or fresh capacity."""
+    if row.get('freshness') not in ('fresh', 'stale'):
+        return None
+    registration, activity = row.get('registration'), row.get('activity')
+    state = ('offline' if registration == 'offline' else activity
+             if registration == 'online' and activity in ('busy', 'idle') else None)
+    return dict(state=state, observed_at=row.get('observed_at')) if state else None
+
+
 def host_load(snapshot, now_s):
     """Collector host probes -> ``{host_id: load}`` (CPU load and free disk; the probe has no RAM)."""
     out = {}
@@ -382,6 +392,7 @@ def ci_workers(inventory, loads=None):
             g['load'] = loads[row['host_id']]
         g['slots'].append(dict(id=row.get('id'), runner=row.get('display_name'),
                                state=_slot(row, fresh), labels=list(row.get('labels') or []),
+                               last_observed=_last_observed(row),
                                warning=row.get('readiness') == 'fail' and row.get('registration') == 'online'))
         if row.get('readiness') == 'fail' and row.get('registration') == 'online':
             failed = (row.get('readiness_evidence') or {}).get('failed') or []

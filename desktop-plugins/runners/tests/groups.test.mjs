@@ -1,10 +1,57 @@
 // Approved CI composition: self-hosted capacity and elastic activity stay separate.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { React, loadPlugin, mount, host, route } from './sdk-mock.mjs'
+import { execFileSync } from 'node:child_process'
+import { React, loadPlugin, mount } from './sdk-mock.mjs'
+
+// Exercise the actual producer boundary, not only timestamp-edited UI fixtures.
+export function backendCi(inventory) {
+  const fleet = new URL('../../../plugins/runners/fleet.py', import.meta.url)
+  return JSON.parse(execFileSync(process.env.PYTHON || 'python3', ['-c',
+    'import json, runpy, sys; print(json.dumps(runpy.run_path(sys.argv[1])["ci_workers"](json.load(sys.stdin))))', fleet.pathname],
+    { input: JSON.stringify(inventory), encoding: 'utf8' }))
+}
+
+export function staleBackendFixture() {
+  const rows = [
+    ['mini-1', 'macOS', 'online', 'busy', 'stale'],
+    ['mini-2', 'macOS', 'online', 'idle', 'stale'],
+    ['mini-3', 'macOS', 'offline', 'unknown', 'stale'],
+    ['blacksmith-4vcpu-live', 'linux', 'online', 'busy', 'stale'],
+    ['blacksmith-4vcpu-idle', 'linux', 'online', 'idle', 'stale'],
+    ['blacksmith-4vcpu-offline', 'linux', 'offline', 'unknown', 'stale'],
+    ['blacksmith-4vcpu-unseen', 'linux', 'unknown', 'unknown', 'unknown'],
+    ['unseen', 'linux', 'unknown', 'unknown', 'unknown']
+  ].map(([display_name, label, registration, activity, freshness]) => ({
+    id: display_name, display_name, labels: [label], registration, activity, freshness,
+    observed_at: freshness === 'unknown' ? null : '2026-11-20T04:09:25Z'
+  }))
+  return backendCi({ meta: { freshness: 'stale', observed_at: '2026-11-20T04:09:25Z' }, data: { runners: rows } })
+}
 
 const P = await loadPlugin()
 export const NOW = Date.parse('2026-11-20T04:23:25Z')
+
+test('real stale backend retains display activity without upgrading authoritative slots or hiding unknown elastic', async () => {
+  const ci = staleBackendFixture()
+  assert.ok(ci.machines.every((m) => m.slots.every((s) => s.state === 'unknown')))
+  const model = P.ciModel(ci, NOW)
+  assert.equal(model.total, 2)
+  assert.equal(model.sections[0].fixed.length, 3)
+  assert.equal(model.sections[0].busy, 1)
+  assert.equal(model.sections[0].online.length, 2)
+  assert.equal(model.sections[1].unobserved, 4)
+  assert.equal(model.hidden, 0)
+  assert.equal(model.stale, true)
+  assert.equal(model.tone, 'warn')
+  const ui = await mount(React.createElement(P.CiChip, { model }))
+  try {
+    assert.equal(ui.container.querySelectorAll('.hermes-ci-pip').length, 3)
+    assert.ok(ui.container.querySelector('.hermes-ci-chip.is-stale'))
+    assert.equal(ui.container.querySelector('[data-ci-tone]').dataset.ciTone, 'warn')
+  } finally { await ui.close() }
+})
+
 export function fixture(state = 'now') {
   const machine = (name, os, states, extra = {}) => ({ name, os, provider: null, labels: ['build'], warnings: [],
     slots: states.map((state, i) => ({ id: `${name}-${i}`, runner: `${name}-${i}`, state, labels: ['build'] })), ...extra })
@@ -20,6 +67,20 @@ export function fixture(state = 'now') {
     machines.at(-1).slots[0].state = 'busy'
   }
   if (state === 'trouble') { machines[0].slots[2].warning = true; machines[1].slots[0].state = 'offline' }
+  if (state === 'stale') {
+    const observed_at = new Date(NOW - 14 * 60000).toISOString()
+    const runners = machines.flatMap((m) => m.slots.map((s, i) => ({
+      id: s.id, display_name: m.provider === 'blacksmith' ? `blacksmith-${m.size?.split(' ')[0] || '4'}vcpu-${m.name}-${i}`
+        : m.provider === 'namespace' ? `nsc-${m.name}-${i}` : s.runner,
+      labels: [m.os === 'mac' ? 'macOS' : 'linux', 'build'],
+      registration: s.state === 'unknown' ? 'unknown' : s.state === 'offline' ? 'offline' : 'online',
+      activity: s.state === 'busy' ? 'busy' : s.state === 'idle' ? 'idle' : 'unknown',
+      freshness: s.state === 'unknown' ? 'unknown' : 'stale', observed_at
+    })))
+    return { at: NOW, gateways: { state: 'ready', machines: [] }, ci: {
+      ...backendCi({ meta: { freshness: 'stale', observed_at }, data: { runners } }), hidden_deregistered: 941
+    } }
+  }
   return { at: NOW, gateways: { state: 'ready', machines: [] }, ci: { state: 'ready',
     observed_at: new Date(NOW - (state === 'stale' ? 14 * 60000 : 0)).toISOString(), machines, hidden_deregistered: 941 } }
 }
@@ -85,6 +146,36 @@ test('CI chip opens its own panel by click and Show CI; both chips share one fle
     await React.act(async () => window.dispatchEvent(new window.Event('hermes-show-ci')))
     assert.ok(document.body.querySelector('[aria-label="CI (GitHub Actions)"]'))
   } finally { await commandUI.close() }
+})
+
+test('fresh inventory cannot conceal old per-row observations in chip age or panel', async () => {
+  const ci = staleBackendFixture()
+  ci.state = 'ready'
+  ci.observed_at = new Date(NOW).toISOString()
+  const model = P.ciModel(ci, NOW)
+  assert.equal(model.stale, true)
+  assert.equal(model.minutes, 14)
+  const ui = await mount(React.createElement(P.CiPanel, { view: { ci, at: NOW }, now: NOW }))
+  try { assert.match(ui.container.textContent, /Last-observed CI display · 14 min old; not current capacity/) }
+  finally { await ui.close() }
+  ci.machines[0].slots[0].last_observed.observed_at = null
+  assert.equal(P.ciModel(ci, NOW).minutes, null)
+})
+
+test('stale display passes authoritative unknown state to repair preparation', async () => {
+  const ci = staleBackendFixture()
+  ci.route = { connectionId: 'example', targetProfile: 'example' }
+  const prepared = []
+  const repairClient = { prepare: async (_route, slot) => {
+    prepared.push(slot)
+    return { enabled: false, reason: 'Stale inventory' }
+  } }
+  const ui = await mount(React.createElement(P.CiPanel, { view: { ci, at: NOW }, now: NOW, repairClient }))
+  try {
+    await ui.click(ui.container.querySelector('[data-runner-slot="mini-1"]'))
+    assert.equal(prepared[0].state, 'unknown')
+    assert.match(ui.container.querySelector('[role="dialog"]').textContent, /Stale inventory/)
+  } finally { await ui.close() }
 })
 
 test('CI panel switches one repair popover between slots and can close it', async () => {

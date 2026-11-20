@@ -765,19 +765,33 @@ function ciDimensions(m) {
 
 export function ciModel(ci, now = Date.now()) {
   const sections = ['mac', 'linux'].map((os) => ({ os, name: os === 'mac' ? 'Mac' : 'Linux', fixed: [], elastic: [], unobserved: 0, readinessWarnings: [] }))
-  let hidden = 0
+  let hidden = 0, historical = false
+  const historicalTimes = []
+  const displaySlot = (slot) => {
+    if (slot.state !== 'unknown' || !['busy', 'idle', 'offline'].includes(slot.last_observed?.state)) return slot
+    historical = true
+    historicalTimes.push(Date.parse(slot.last_observed.observed_at))
+    return { ...slot, state: slot.last_observed.state, authoritativeSlot: slot }
+  }
   for (const m of ci.machines || []) {
     const dim = ciDimensions(m), section = sections.find((s) => s.os === dim.os) || sections[1]
     section.readinessWarnings.push(...(m.warnings || []))
     if (dim.provider) {
       let pool = section.elastic.find((p) => p.id === dim.provider)
       if (!pool) section.elastic.push(pool = { id: dim.provider, name: CI_PROVIDERS[dim.provider] || dim.provider, busy: 0, sizes: {} })
-      for (const slot of m.slots || []) {
-        if (slot.state !== 'busy') { hidden++; continue }
+      for (const raw of m.slots || []) {
+        const slot = displaySlot(raw)
+        if (!['busy', 'idle', 'offline'].includes(slot.state)) { section.unobserved++; continue }
+        if (slot.state !== 'busy') {
+          if (raw.state === 'idle' || raw.state === 'offline') hidden++
+          else section.unobserved++
+          continue
+        }
         pool.busy++
         if (dim.size) pool.sizes[dim.size] = (pool.sizes[dim.size] || 0) + 1
       }
-    } else for (const slot of m.slots || []) {
+    } else for (const raw of m.slots || []) {
+      const slot = displaySlot(raw)
       if (!['busy', 'idle', 'offline'].includes(slot.state)) { section.unobserved++; continue }
       const warning = slot.warning ?? (m.warnings || []).some((w) => w.startsWith(`${slot.runner}:`))
       section.fixed.push({ ...slot, machine: m.name, labels: m.labels || slot.labels || [], warning })
@@ -802,8 +816,10 @@ export function ciModel(ci, now = Date.now()) {
       s.unobserved ? `${s.unobserved} not observed` : null
     ].filter(Boolean).join(' · ')}`
   }
-  const at = Date.parse(ci.observed_at), age = Number.isFinite(at) ? Math.max(0, now - at) : null
-  const stale = !['ready', 'not_configured'].includes(ci.state) || (age != null && age > CI_STALE_MS)
+  const times = [Date.parse(ci.observed_at), ...historicalTimes]
+  const at = times.every(Number.isFinite) ? Math.min(...times) : NaN
+  const age = Number.isFinite(at) ? Math.max(0, now - at) : null
+  const stale = historical || !['ready', 'not_configured'].includes(ci.state) || (age != null && age > CI_STALE_MS)
   const minutes = age == null ? null : Math.round(age / 60000)
   return { sections, stale, minutes, hidden, total: sections.reduce((n, s) => n + s.busy + s.running, 0),
     tone: sections.some((s) => s.warnings.length || s.readinessWarnings.length) ? 'bad' : stale ? 'warn' : null,
@@ -861,6 +877,8 @@ export function CiPanel({ view, now = Date.now(), repairClient }) {
   return h('div', { className: 'hermes-ci-panel' },
     h('div', { className: 'hermes-ci-head' }, h('span', null, 'CI (GitHub Actions)'), h('span', null, `${model.total} running`)),
     h(SectionNote, { section: view.ci }),
+    model.stale ? h('div', { className: 'hermes-ci-note', role: 'status' },
+      `Last-observed CI display · ${model.minutes == null ? 'age unknown' : `${model.minutes} min old`}; not current capacity.`) : null,
     ...model.sections.map((s) => h('section', { key: s.os, 'data-ci-section': s.os },
       h('div', { className: 'hermes-ci-section-head' }, h('b', null, s.name), h(CiPips, { section: s }),
         h('span', null, `${s.busy}/${s.online.length} self-hosted busy${s.running ? ` · ${s.running} elastic running` : ''}`)),
@@ -875,7 +893,7 @@ export function CiPanel({ view, now = Date.now(), repairClient }) {
       s.readinessWarnings.length ? h('div', { className: 'hermes-ci-note' }, s.readinessWarnings.join(' · ')) : null)),
     open && repairClient && view.ci.route ? h('div', null,
       h('button', { type: 'button', onClick: () => setOpenSlot(null), 'aria-label': 'Close CI runner actions' }, 'Close actions'),
-      h(SlotRepair, { key: slotKey(open), slot: open, repairClient, route: view.ci.route, sourceError: view.ci.error })) : null,
+      h(SlotRepair, { key: slotKey(open), slot: open.authoritativeSlot || open, repairClient, route: view.ci.route, sourceError: view.ci.error })) : null,
     h('div', { className: 'hermes-ci-note' }, `${model.hidden} finished elastic registrations and ${view.ci.hidden_deregistered || 0} deregistered runners hidden`),
     h('div', { className: 'hermes-fleet-foot' }, `Updated ${ago(now - view.at)} · every ${POLL_OPEN_MS / 1000}s`))
 }
