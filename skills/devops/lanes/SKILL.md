@@ -29,6 +29,8 @@ hermes kanban lanes explain <card>       # one card: its lane, where that came f
 
 A lane under its target with `ready: 0` is short of cards, not slots. Say that; changing shares will not help it.
 
+Before changing shared lane matching policy, inspect the host's `shared_config_exclude`: the hub can deliberately exclude the whole `kanban.admission.lanes` map so Desktop steering survives sync. Updating only that excluded parent map does not deploy matches there. Publish reviewed match-only dotted keys separately (after matcher support is installed), preserving live shares, gates and budgets; verify the installed policy rather than just the source JSON.
+
 When extending the lanes dashboard, match the CLI's fleet connection selection for both summary and flow reads; close an owned replica even when snapshot generation fails. A flow card's `pr` is its own PR, not its dependency's PR: without explicit blocker evidence, say it waits on an open parent rather than claiming which merge frees it. Test daily-cap writes against an older `set_lane` signature and reject unsupported fields before any write with a clear 409, while preserving share-only writes.
 
 ## When the user asks for a change
