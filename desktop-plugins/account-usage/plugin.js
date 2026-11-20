@@ -285,6 +285,7 @@ export function needsReconnect(account, slug) {
 // needs_sign_in (`st`). An auth-benched row (limited + reason auth) may still renew by plain refresh:
 // that one is only "disconnected".
 export function signInConfirmed(account, st, slug) {
+  if (deadFollowed(st, account, slug)) return true
   if (!needsReconnect(account, slug)) return false
   // The backend answered for this row that it is out of quota or disabled, not signed out.
   if (settledFor(st, account)) return false
@@ -309,7 +310,17 @@ export function scopedFix(reconnectState, route = ownerRoute()) {
 export function rowFix(reconnectState, slug, a) {
   const own = reconnectState[reconnectKey(slug, a.id)]
   if (own) return own
-  return Object.values(reconnectState).find(st => st && (st.done || st.settled || st.unverified) && st.provider === slug && st.resolvedId && st.resolvedId === a.id) || {}
+  // Several stored rows can name one account id: the most recent answer (`seq`) is the one shown.
+  return Object.values(reconnectState).filter(st => st && (st.done || st.settled || st.unverified) && st.provider === slug && st.resolvedId && st.resolvedId === a.id)
+    .reduce((best, st) => !best || (st.seq || 0) > (best.seq || 0) ? st : best, null) || {}
+}
+
+// The backend said the stored row is still signed out (`rowDead`), and usage lists that row under
+// another account id, the one this answer followed to. Usage may show that id as ready (it is
+// behind): the row is still labelled, counted and offered sign-in as signed out.
+export function deadFollowed(st, a, slug) {
+  if (slug !== undefined && !RECONNECT_SLUGS.has(slug)) return false
+  return !!(st && a && !a.disabled && st.rowDead && st.resolvedId && st.resolvedId === a.id && st.id !== a.id)
 }
 
 // Does a settled answer (the backend said the stored row is out of quota or disabled, not signed
@@ -328,8 +339,8 @@ export function settledFor(st, a) {
 export function authCounts(g, reconnectState = {}) {
   let signIn = 0, disconnected = 0
   for (const a of (g && g.accounts) || []) {
-    if (!needsReconnect(a, g.slug)) continue
     const st = rowFix(reconnectState, g.slug, a)
+    if (!needsReconnect(a, g.slug) && !deadFollowed(st, a, g.slug)) continue
     if (settledFor(st, a)) continue // quota or disabled per the backend: no auth problem to count
     if (signInConfirmed(a, st, g.slug)) signIn++
     else disconnected++
@@ -728,6 +739,7 @@ export function createReconnectStore(ctx, onDone = () => {}) {
         connectionId: route?.connectionId, profile: route?.profile })
     } catch { /* cancelling a server session is best-effort */ }
   }
+  let seq = 0 // order of answers, for rowFix
   const owners = new Map() // key -> {scope, route}: the gateway + profile whose actions own the key's state
   // The state of `k` as seen from `route`: another gateway's entry under the same id is not ours.
   const cur = (k, route = ownerRoute()) => {
@@ -759,7 +771,7 @@ export function createReconnectStore(ctx, onDone = () => {}) {
       const prev = $state.get()[k]
       // A row core removed cannot be asked about again (its id is gone from the pool): it keeps
       // both its place on the panel and the backend's answer about where its sign-in belongs.
-      $state.set({ ...$state.get(), [k]: { ...who.get(k), scope: me.scope,
+      $state.set({ ...$state.get(), [k]: { ...who.get(k), scope: me.scope, seq: ++seq,
         ...(prev?.removed ? { removed: true, ...(prev.signInRoute ? { signInRoute: prev.signInRoute } : {}) } : {}), ...v } })
     }
     put.scope = me.scope
@@ -869,6 +881,8 @@ export function createReconnectStore(ctx, onDone = () => {}) {
   // account id changes with the token), then read the panel back for that exact account.
   const afterRecovery = async (put, provider, account, route, bound, live, cancelled = false) => {
     const keep = { needsSignIn: true, authFlow: 'terminal', signInRoute: bound }
+    // The account id an earlier answer about this stored row was shown on (a re-check from that row).
+    const shownOn = cur(reconnectKey(provider, account.id), route)?.resolvedId
     put({ ...keep, busy: true, message: 'Checking account…' })
     let seen = null
     try {
@@ -884,7 +898,12 @@ export function createReconnectStore(ctx, onDone = () => {}) {
       return
     }
     if (seen.status === 'needs_sign_in' || !seen.account_id) {
-      put({ ...keep, ...(cancelled ? { cancelled: true } : { error: true }), message: cancelled ? 'Sign-in cancelled' : 'Sign-in did not finish — nothing was saved' })
+      // Still signed out. If usage lists this stored row under another account id (the one the
+      // backend names now, else the one an earlier answer was shown on), the answer is shown on
+      // that row: labelled sign-in needed, with sign-in and a re-check (`rowDead`). Never settled.
+      const named = seen.account_id || shownOn
+      put({ ...keep, ...(cancelled ? { cancelled: true } : { error: true }), message: cancelled ? 'Sign-in cancelled' : 'Sign-in did not finish — nothing was saved',
+        ...(named && named !== account.id ? { resolvedId: named, unverified: true, check: true, ...(seen.status === 'needs_sign_in' ? { rowDead: true } : {}) } : {}) })
       return
     }
     // The backend's row status decides what may be said. Quota and disabled are that row's own
@@ -1155,14 +1174,16 @@ function DisableLine({ g, a, disableStore, disableState }) {
 
 export function ReconnectLine({ g, a, reconnectStore, reconnectState }) {
   const seen = rowFix(reconnectState, g.slug, a)
-  const wanted = needsReconnect(a, g.slug)
+  // The backend said the stored row behind this account id is still signed out.
+  const dead = deadFollowed(seen, a, g.slug)
+  const wanted = needsReconnect(a, g.slug) || dead
   // A finished result is spent once the row needs action again (the grant died later in the session).
   // A settled answer (the backend said this row is out of quota or disabled) is not spent by a
   // usage panel that still lists the row as signed out: it shows that answer and a re-check.
   // An answer followed here from the row's earlier account id is spent the same way.
   const settled = settledFor(seen, a)
   const followed = !!seen.id && seen.id !== a.id
-  const st = wanted && !settled && (seen.done || seen.settled || followed) ? {} : seen
+  const st = wanted && !dead && !settled && (seen.done || seen.settled || followed) ? {} : seen
   if (!wanted && !st.message) return null
   const route = ownerRoute()
   const name = a.label || a.id
@@ -1192,6 +1213,13 @@ export function ReconnectLine({ g, a, reconnectStore, reconnectState }) {
     if (st.verificationUrl) children.push(jsx('button', { type: 'button', 'aria-label': `Open sign-in page for ${name}`,
       onClick: () => reconnectStore.openPage(st.verificationUrl), children: 'Open sign-in page' }))
     if (st.message) say(st.message)
+  } else if (dead) {
+    // Sign-in starts from the visible row; the re-check asks about the stored row.
+    children.push(jsx('button', { type: 'button', 'aria-label': `Sign in to ${name} again`, disabled: !!st.busy,
+      onClick: () => reconnectStore.signIn(g.slug, a, route), children: 'Sign in again…' }))
+    children.push(jsx('button', { type: 'button', 'aria-label': `Check sign-in for ${name}`, disabled: !!st.busy,
+      onClick: () => reconnectStore.check(g.slug, asked), children: 'Check sign-in' }))
+    say(st.message, COLORS.limited)
   } else if (settled || (followed && !st.done && !!st.message)) {
     // Quota or disabled per the backend, or an unconfirmed answer shown on the account it named:
     // a re-check only, never a sign-in offer.
@@ -1230,7 +1258,7 @@ export function AccountRow({ g, a, open, onToggle, selectionStore, selectionStat
   const refused = a.disabled ? 'disabled' : typeof selectionState.selection?.unavailable === 'string' ? selectionState.selection.unavailable : ''
   const fix = rowFix(reconnectState, g.slug, a)
   const details = hasDetails(g, a)
-  const signIn = needsReconnect(a, g.slug)
+  const signIn = needsReconnect(a, g.slug) || deadFollowed(fix, a, g.slug)
   // The backend answered for this exact row (quota or disabled, not signed out): a usage panel that
   // still lists it as signed out must not label it so.
   const settled = settledFor(fix, a)

@@ -312,21 +312,24 @@ function render(el, out = { text: [], buttons: [], auth: [] }) {
 const NEW = { ready: { id: 'fp:new', label: 'me', state: 'ready' },
   limited: { id: 'fp:new', label: 'me', state: 'limited', limit_kind: 'quota', reason: 'usage_limit' },
   unavailable: { id: 'fp:new', label: 'me', state: 'unavailable', reason: 'auth' } }
-async function recovered(status, usage) {
+async function recovered(status, usage, cancel = false) {
   const term = fakeTerminal()
-  let groups = [{ slug: 'anthropic', accounts: [DEAD] }], answer = status
+  let groups = [{ slug: 'anthropic', accounts: [DEAD] }], answer = status, named = 'fp:new'
   const r = await setup({ term, groups: () => groups,
-    rest: path => path === '/reconnect' ? deadGrant() : { found: true, account_id: 'fp:new', ...(answer ? { status: answer } : {}) } })
+    rest: path => path === '/reconnect' ? deadGrant() : { found: true, account_id: named, ...(answer ? { status: answer } : {}) } })
   const flow = r.store.signIn('anthropic', DEAD, ROUTE)
   await tick(); await tick(); await tick()
   if (usage) groups = [{ slug: 'anthropic', accounts: [NEW[usage]] }]
-  term.end(0); await flow
+  const exit = term.exit.get('pty-1')
+  if (cancel) { await r.store.cancelAuth('anthropic', DEAD, ROUTE); exit({ code: 130, signal: null }) }
+  else term.end(0)
+  await flow
   const row = a => {
     const state = r.store.$state.get(), g = { slug: 'anthropic', accounts: [a] }
     return { ...render(r.mod.AccountRow({ g, a, open: false, onToggle() {}, selectionStore: { select() {} }, selectionState: {}, reconnectStore: r.store, reconnectState: state })),
       line: controls(r.mod.ReconnectLine({ g, a, reconnectStore: r.store, reconnectState: state })), counts: r.mod.authCounts(g, state) }
   }
-  return { ...r, row, answer: s => { answer = s }, usage: u => { groups = [{ slug: 'anthropic', accounts: [NEW[u]] }] } }
+  return { ...r, term, row, answer: (s, id = 'fp:new') => { answer = s; named = id }, usage: u => { groups = [{ slug: 'anthropic', accounts: [NEW[u]] }] } }
 }
 
 test('the new account row shows the backend answer: disabled or quota is said on fp:new and never offers sign-in', async t => {
@@ -380,6 +383,96 @@ test('a disabled or quota answer does not hide a sign-in that dies afterwards', 
     assert.deepEqual(later.auth, ['sign-in']); assert.deepEqual(later.counts, { signIn: 1, disconnected: 0 })
     assert.ok(!later.text.includes('Account is disabled') && !later.text.includes('Signed in · out of quota until it resets'))
   })
+})
+
+// The backend says the stored row is still signed out while usage lists it, stale, as ready under
+// its new account id: that answer must show on the visible row, not vanish with the old id.
+test('a still-signed-out answer follows the row to its new account id instead of reading as healthy', async t => {
+  const MSG = 'Sign-in did not finish — nothing was saved'
+  for (const first of ['disabled', 'quota', 'unknown']) for (const id of ['fp:new', null]) await t.test(`${first} on stale-ready fp:new, then Check again says needs_sign_in (account id ${id})`, async () => {
+    const r = await recovered(first, 'ready')
+    r.answer('needs_sign_in', id)
+    await r.row(NEW.ready).buttons[0][1]()
+    const asked = r.restCalls.filter(c => c.path === '/credential-health')
+    assert.deepEqual(asked[asked.length - 1].body, { provider: 'anthropic', credential_id: 'pool-9' })
+    // Usage still says ready; the backend says signed out. The visible row says so and is counted.
+    const seen = r.row(NEW.ready)
+    assert.ok(seen.text.includes(MSG), `the answer is on the visible row: ${JSON.stringify(seen.text)}`)
+    assert.deepEqual(seen.auth, ['sign-in']); assert.ok(seen.text.includes('sign-in needed'))
+    assert.deepEqual(seen.counts, { signIn: 1, disconnected: 0 }); assert.equal(r.mod.signInCount([{ slug: 'anthropic', accounts: [NEW.ready] }], r.store.$state.get()), 1)
+    assert.deepEqual(seen.buttons.map(b => b[0]), ['Sign in to me again', 'Check sign-in for me'], 'sign-in and the re-check are on the visible row')
+    assert.deepEqual(seen.line.map(x => x[1]), ['Sign in to me again', 'Check sign-in for me', MSG])
+    assert.ok(!seen.text.includes('Reconnected') && !seen.text.includes('Account is disabled'))
+    // A disabled listing of that id is neither counted nor offered sign-in; another id with the label is untouched.
+    const off = r.row({ ...NEW.ready, disabled: true })
+    assert.deepEqual(off.counts, { signIn: 0, disconnected: 0 }); assert.deepEqual(off.auth, []); assert.deepEqual(off.buttons, [])
+    const twin = r.row({ id: 'fp:twin', label: 'me', state: 'ready' })
+    assert.deepEqual(twin.counts, { signIn: 0, disconnected: 0 }); assert.deepEqual(twin.auth, []); assert.deepEqual(twin.buttons, [])
+    // Usage catching up (signed out) keeps the same single count and offer.
+    const dead = r.row(NEW.unavailable)
+    assert.equal(dead.line[0][1], 'Sign in to me again'); assert.deepEqual(dead.auth, ['sign-in']); assert.deepEqual(dead.counts, { signIn: 1, disconnected: 0 })
+    // The re-check still asks about the stored row, twice in a row, and can finish.
+    await seen.buttons[1][1]()
+    assert.ok(r.row(NEW.ready).text.includes(MSG)); assert.deepEqual(r.row(NEW.ready).counts, { signIn: 1, disconnected: 0 })
+    r.answer('ok')
+    await r.row(NEW.ready).buttons[1][1]()
+    assert.equal(r.restCalls.filter(c => c.path === '/credential-health').every(c => c.body.credential_id === 'pool-9'), true)
+    const ok = r.row(NEW.ready)
+    assert.ok(ok.text.includes('Reconnected')); assert.deepEqual(ok.auth, []); assert.deepEqual(ok.counts, { signIn: 0, disconnected: 0 })
+  })
+  await t.test('the first readback says needs_sign_in while usage already lists stale-ready fp:new', async () => {
+    const r = await recovered('needs_sign_in', 'ready')
+    const seen = r.row(NEW.ready)
+    assert.ok(seen.text.includes(MSG), JSON.stringify(seen.text))
+    assert.deepEqual(seen.buttons.map(b => b[0]), ['Sign in to me again', 'Check sign-in for me'])
+    assert.deepEqual(seen.auth, ['sign-in']); assert.deepEqual(seen.counts, { signIn: 1, disconnected: 0 })
+    // Sign in again from the visible row starts the recovery for the stored row the backend binds it to.
+    const before = r.term.calls.length
+    const flow = seen.buttons[0][1]()
+    await tick(); await tick(); await tick()
+    assert.equal(r.term.calls.length, before + 1); assert.equal(r.term.calls[before].credentialId, 'pool-9')
+    assert.equal(r.restCalls.filter(c => c.path === '/reconnect').pop().body.account_id, 'fp:new')
+    r.answer('ok'); r.term.end(0); await flow
+    assert.ok(r.row(NEW.ready).text.includes('Reconnected')); assert.deepEqual(r.row(NEW.ready).counts, { signIn: 0, disconnected: 0 })
+  })
+  await t.test('cancel with the row still signed out is shown on the stale-ready new row too', async () => {
+    const r = await recovered('needs_sign_in', 'ready', true)
+    const seen = r.row(NEW.ready)
+    assert.ok(seen.text.includes('Sign-in cancelled'), JSON.stringify(seen.text))
+    assert.deepEqual(seen.buttons.map(b => b[0]), ['Sign in to me again', 'Check sign-in for me'])
+    assert.deepEqual(seen.auth, ['sign-in']); assert.deepEqual(seen.counts, { signIn: 1, disconnected: 0 })
+  })
+  await t.test('a readback with no account id and no status confirms nothing: no sign-in label on a ready row', async () => {
+    const r = await recovered('disabled', 'ready')
+    r.answer(undefined, null)
+    await r.row(NEW.ready).buttons[0][1]()
+    const seen = r.row(NEW.ready)
+    assert.ok(seen.text.includes(MSG)); assert.deepEqual(seen.buttons.map(b => b[0]), ['Check sign-in for me'])
+    assert.deepEqual(seen.auth, []); assert.deepEqual(seen.counts, { signIn: 0, disconnected: 0 })
+  })
+  await t.test('usage still lists the old id: that row keeps its sign-in offer and badge', async () => {
+    const r = await recovered('needs_sign_in', null)
+    const old = r.row(DEAD)
+    assert.equal(old.line[0][1], 'Sign in to me again'); assert.deepEqual(old.auth, ['sign-in']); assert.deepEqual(old.counts, { signIn: 1, disconnected: 0 })
+    assert.ok(old.text.includes(MSG))
+  })
+})
+
+// Two stored rows the backend maps to one account id: the row shows the most recent answer.
+test('answers from two stored rows naming one account id: the latest answer is the one shown', async () => {
+  const { mod, store } = await setup({ term: null, groups: () => [], rest: () => ({}) })
+  const base = { provider: 'anthropic', resolvedId: 'fp:new', scope: mod.scopeOf(ROUTE) }
+  const quota = { ...base, id: 'fp:a', settled: true, done: true, message: 'Signed in · out of quota until it resets', seq: 3 }
+  const off = { ...base, id: 'fp:b', settled: true, error: true, message: 'Account is disabled', seq: 7 }
+  for (const state of [{ a: quota, b: off }, { b: off, a: quota }]) assert.equal(mod.rowFix(state, 'anthropic', NEW.ready).message, 'Account is disabled')
+  assert.equal(mod.rowFix({ a: { ...quota, seq: 9 }, b: off }, 'anthropic', NEW.ready).message, 'Signed in · out of quota until it resets')
+  // The row's own entry still wins over any followed one.
+  assert.equal(mod.rowFix({ a: quota, b: off, [store.key('anthropic', 'fp:new')]: { id: 'fp:new', message: 'own' } }, 'anthropic', NEW.ready).message, 'own')
+  // The store numbers its answers in order.
+  const r = await recovered('disabled', 'ready')
+  const first = Object.values(r.store.$state.get())[0].seq
+  r.answer('quota'); await r.row(NEW.ready).buttons[0][1]()
+  assert.ok(Object.values(r.store.$state.get())[0].seq > first)
 })
 
 test('terminal text helpers: plain text only, bounded, https links only', async () => {
