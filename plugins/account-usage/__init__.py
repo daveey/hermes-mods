@@ -110,7 +110,8 @@ def _on_api(**kw):
         with _lock:
             path = _state_path()
             prev = _last.get((path, provider))
-            if prev and prev["entry_id"] == rec["entry_id"] and now - prev["at"] < 20:
+            if (prev and prev["entry_id"] == rec["entry_id"]
+                    and prev.get("account_id") == rec.get("account_id") and now - prev["at"] < 20):
                 return None
             _last[(path, provider)] = rec
             try:

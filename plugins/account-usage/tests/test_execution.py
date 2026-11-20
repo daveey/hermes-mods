@@ -272,6 +272,16 @@ class Execution(unittest.TestCase):
             hooks['post_api_request'](session_id=a.session_id, provider=a.provider, api_request_id='named-A')
         named = json.loads((self.home / 'account_usage_last.json').read_text())['anthropic']
         self.assertEqual((named['entry_id'], named['account_id']), ('A', 'wire-A'))
+        # Inside the 20 s window: the same row and id is not rewritten, a changed id for the same row is.
+        with patch.object(plugin, '_find_agent', return_value=a), \
+                patch('agent.account_usage_cache._identity_id_for', lambda provider, e: f'wire-{e.id}'):
+            hooks['post_api_request'](session_id=a.session_id, provider=a.provider, api_request_id='named-A-again')
+        self.assertEqual(json.loads((self.home / 'account_usage_last.json').read_text())['anthropic']['at'], named['at'])
+        with patch.object(plugin, '_find_agent', return_value=a), \
+                patch('agent.account_usage_cache._identity_id_for', lambda provider, e: f'renewed-{e.id}'):
+            hooks['post_api_request'](session_id=a.session_id, provider=a.provider, api_request_id='renewed-A')
+        renewed = json.loads((self.home / 'account_usage_last.json').read_text())['anthropic']
+        self.assertEqual((renewed['entry_id'], renewed['account_id']), ('A', 'renewed-A'))
         plugin._last.clear()
         with patch.object(plugin, '_find_agent', return_value=a), \
                 patch('agent.account_usage_cache._identity_id_for', side_effect=RuntimeError('no identity')):
