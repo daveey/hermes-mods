@@ -23,3 +23,10 @@ def _no_real_hub_link(tmp_path, monkeypatch):
     # The throttle classifies a call by these (card run vs chat): a test run inside a card must not inherit them.
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_WORKER_TASK", raising=False)
+    from throughput_under_test import runway, slotgate
+    # Core-backed runs resolve pacing via kanban_home(), which is this host's live file. Keep it in the test root
+    # so a budget-publish host cannot rewrite the fixture level during sampler._loop.
+    monkeypatch.setattr(runway, "pacing_path", lambda root: Path(root) / "llm_pacing.json")
+    # Core's active_card_runs() is this machine's live count. Without this, Gate.start_gate takes the slot-gate
+    # path (token_slots) instead of the rate-rule tests' token_throttle / None.
+    monkeypatch.setattr(slotgate, "active_runs", lambda: None)
