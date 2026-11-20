@@ -64,16 +64,28 @@ its token cost per slot and `allowed`: the slots its share of the token cap pays
 free, and every slot past `allowed` gets an X: a free one "cannot start", a busy one "over the limit". The
 reason is the slot's hover text and a line in the row's ⓘ. The **Tok/slot** column is in+out tokens per busy
 slot per minute over the last 15 minutes (grey when it is the fleet median because the machine ran too little
-to measure, "–" when unknown). A machine without a slot cap has nothing to cross out.
+to measure, "–" when unknown). A machine without a slot cap has nothing to cross out. The gateway serving the
+panel shows the slot count its start gate enforces (`enforced: true`, from `plugins/throughput/slotgate.py`);
+other gateways' counts are advisory estimates and their hover text says so.
+
+Above the grid, **Token cap** is a person's cap for the whole fleet in thousands of tokens per minute (`150`,
+`1.5m`): Enter or leaving the field sends `PUT … {"cap_per_min": N}` once, an unchanged or unreadable value sends
+nothing, **No cap** sends `null` (the subscription budget alone then caps). The line beside it says what caps
+the fleet (`Cap 60k tok/min (yours)` / `(budget)`, `No token cap`, `Cap 0 · holding every call`), the budget
+when it differs, the fleet rate, this gateway's open slots (`here 4/6 slots at 3k/slot`) and pacing.
+
+A machine the autoscaler holds while it enrolls (hold reason `worker-scaler: enrolling …`) is labelled
+"enrolling", not "draining".
 
 The chip's Workers and Hub bars hatch the right end of the track for the crossed-out share, and the bar turns
 red once the usable slots are taken, even if crossed-out ones are free.
 
 Without the throughput plugin, with an older one that sends no `slots`, or when that request fails, there is no
-slider, no column value and nothing is crossed out.
+cap field, no column value and nothing is crossed out.
 
 Tests (`tests/throttle.test.mjs`): the limit maths, a rendered panel with a token limit, the panel without
-throttle data, the slider's preview and single commit, and the chip summary. **Not tested**: the request to the
+throttle data, the cap field's single commit, refusal and No cap, the cap line, the estimate marker, the
+"enrolling" label, and the chip summary. **Not tested**: the request to the
 throughput API from a live Desktop (the tests pass the payload in), and the X drawing itself (CSS).
 
 ## Worker lifecycle timeline
