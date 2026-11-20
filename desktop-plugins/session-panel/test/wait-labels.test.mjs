@@ -39,6 +39,22 @@ test('unreadable containment authority stays explicit', () => {
   }
 })
 
+for (const [status, reason] of [['blocked', 'Awaiting human approval'], ['triage', 'spend budget'], ['scheduled', 'Awaiting CI']]) {
+  test(`producer to panel preserves ${status} reason`, () => {
+    const parent = { id: 't_parent', status, reason }
+    const chips = tasks.sessionTaskChips([{
+      id: 't_child', title: 'Child', status: 'todo', board: 'default',
+      ...(status === 'scheduled' ? { upstream: parent } : { blocked_upstream: parent }),
+    }], { connectionId: 'C1', profile: 'default' })
+    const result = m.classify(chips, { evidence: c => tasks.chipObservation(c, Date.now() / 1000) })
+    const rows = status === 'scheduled' ? result.waiting : result.blockedUpstream
+    assert.equal(rows.length, 1)
+    assert.ok(rows[0].detail.endsWith(` · ${reason}${status === 'scheduled' ? ' · board status' : ''}`), rows[0].detail)
+    assert.ok(rows[0].detail.includes('t_parent'))
+    assert.equal(result.unasked.length, 0)
+  })
+}
+
 for (const status of ['todo', 'scheduled']) {
   test(`real ${status} projection names upstream on the board-status path`, () => {
     const chips = tasks.sessionTaskChips([{
