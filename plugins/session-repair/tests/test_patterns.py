@@ -513,3 +513,22 @@ def test_machine_lane_skip_recorded_in_the_episode_explains_the_wait(env, monkey
     monkeypatch.setattr(kqp, 'read', lambda conn, task, board=None: {'lane': 'machine', 'machines': ['w1']})
     tid = F.ready_with_old_skip(env.conn, env.now)  # the machine-lane place has no `skip`: core's latest() does
     none(env, 'BS-ready-worker-free', tid)
+
+
+def test_a_timed_skip_whose_until_has_passed_no_longer_explains(env):
+    tid = F.ready_worker_free(env.conn, env.now, waited_s=7200)
+    F.event(env.conn, tid, 'dispatch_skipped', {'reason': 'pinned_quota_wall', 'detail': 'm (p)',
+                                                'until': int(env.now - 600)}, at=env.now - 3000)
+    assert one(env, 'BS-ready-worker-free', tid)['variant'] == 'free_slot', 'the hold ended 10 min ago'
+    S = env.scan_mod._skip_explains
+    assert S({'reason': 'x', 'until': env.now + 600}, env.now) and S({'reason': 'x'}, env.now)
+    assert not S({'reason': 'x', 'until': (env.now - 60) * 1000}, env.now), 'a ms stamp in the past'
+    assert not S(None, env.now)
+
+
+def test_ledger_rows_that_are_not_objects_are_ignored(env):
+    tid = F.blocked_no_reason(env.conn, env.now)
+    (env.home / 'session-repair').mkdir()
+    (env.home / 'session-repair' / 'ledger-live.jsonl').write_text('[1, 2]\n"x"\n' + json.dumps(
+        {'fingerprint': 'f', 'outcome': 'card', 'filed': tid}) + '\n')
+    assert env.sources().tracked() == {'f': {tid}}

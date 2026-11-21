@@ -85,8 +85,8 @@ or a pool worker is idle.
 
 **Detection** (`rule_ready_worker_free`): status `ready`; ready since `ready_since`, else the newest
 promoted/unblocked/woken/created event. Any dispatcher skip recorded in the current ready episode (core
-`kanban_dispatch_skip.latest`, the queue view's `skip`, however old, with or without `until`) explains the wait: no
-finding. Otherwise, by core's queue view (`kanban_queue_position.read`):
+`kanban_dispatch_skip.latest`, the queue view's `skip`, however old) explains the wait (no finding),
+unless it is a timed hold whose `until` has passed. Otherwise, by core's queue view (`kanban_queue_position.read`):
 - `lane: leftover_claim` (ready but still holding a claim: the dispatcher never picks it), ready > 10 min →
   `leftover_claim`;
 - `pool_could_run` names pool workers, ready > 10 min → `pool_could_run`;

@@ -121,3 +121,19 @@ def test_rerun_reconciles_an_existing_jobs_failure_target(tmp_path, monkeypatch,
     out = capsys.readouterr().out
     assert 'would config: shadow' in out and 'refuse: bot-chat: warnings suppressed' in out
     assert not (tmp_path / 'session-repair' / 'config.json').exists(), 'refused: nothing written'
+
+
+def test_a_chosen_failure_target_is_kept_unless_passed_explicitly(tmp_path, monkeypatch):
+    monkeypatch.setattr(inst, 'failure_target_problem', lambda h, target: None)
+
+    def setup(current):
+        (tmp_path / 'cron').mkdir(exist_ok=True)
+        (tmp_path / 'cron' / 'jobs.json').write_text(json.dumps({'jobs': [{'id': 'j1', 'name': 'session-repair',
+                                                                           'failure_deliver': current}]}))
+    setup('telegram')
+    assert not [k for k, _ in inst.plan(tmp_path, None) if k == 'reconcile'], 'a chosen target is kept'
+    assert [w for k, w in inst.plan(tmp_path, None, 'slack:C1', explicit_target=True) if k == 'reconcile'] == [
+        ' '.join(inst.edit_argv('j1', 'slack:C1'))]
+    for missing in (None, '', 'local'):
+        setup(missing)
+        assert [k for k, _ in inst.plan(tmp_path, None) if k == 'reconcile'] == ['reconcile'], missing

@@ -12,8 +12,9 @@ What it does:
 2. `$HERMES_HOME/session-repair/config.json` `{"mode": "shadow"}` unless it exists (or `--mode` is given).
 3. `hermes cron create "every 15m" --name session-repair --no-agent --script session_repair_tick.py --deliver local
    --failure-deliver bot-chat --catch-up off`, unless a job named `session-repair` exists (read from
-   `$HERMES_HOME/cron/jobs.json`). An existing job whose `failure_deliver` differs is reconciled with
-   `hermes cron edit <id> --failure-deliver <target>`, after the same target check. Successes stay local (silent); a failed tick (exit 1: the repair turn failed) is
+   `$HERMES_HOME/cron/jobs.json`). An existing job's `failure_deliver` is reconciled with
+   `hermes cron edit <id> --failure-deliver <target>`, after the same target check, only when `--failure-deliver` is
+   passed or the job has none (or `local`): a target someone chose is kept. Successes stay local (silent); a failed tick (exit 1: the repair turn failed) is
    delivered to the profile's Bot Chat, a visible chat, instead of only `hermes cron list`.
 """
 from __future__ import annotations
@@ -110,7 +111,8 @@ def failure_target_problem(h: Path, target: str) -> str | None:
     return None
 
 
-def plan(h: Path, mode: str | None, failure_deliver: str = FAILURE_DELIVER) -> list[tuple[str, str]]:
+def plan(h: Path, mode: str | None, failure_deliver: str = FAILURE_DELIVER, *,
+         explicit_target: bool = False) -> list[tuple[str, str]]:
     steps = []
     script = h / 'scripts' / SCRIPT_NAME
     if not script.exists() or script.read_text() != WRAPPER:
@@ -121,7 +123,11 @@ def plan(h: Path, mode: str | None, failure_deliver: str = FAILURE_DELIVER) -> l
     if not (h / 'plugins' / 'session-repair' / 'run.py').exists():
         steps.append(('warn', f'{h}/plugins/session-repair is not linked yet: run hermes-sync first'))
     job = find_job(h)
-    if job is None or job.get('failure_deliver') != failure_deliver:
+    current = (job or {}).get('failure_deliver')
+    # An existing job keeps a target someone chose; it is changed only when --failure-deliver is passed, or when
+    # it has none (or `local`, which hides failures).
+    needs = job is None or (current != failure_deliver and (explicit_target or current in (None, '', 'local')))
+    if needs:
         problem = failure_target_problem(h, failure_deliver)
         if problem:
             steps.append(('refuse', f'{problem}: pass --failure-deliver <a visible target> (telegram, slack:<chat>, ...)'))
@@ -136,13 +142,15 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument('--apply', action='store_true')
     p.add_argument('--mode', choices=('off', 'shadow', 'live'))
-    p.add_argument('--failure-deliver', default=FAILURE_DELIVER,
+    p.add_argument('--failure-deliver', default=None,
                    help='cron --failure-deliver target for failed ticks (default bot-chat; never local)')
     args = p.parse_args(argv)
+    explicit = args.failure_deliver is not None
+    args.failure_deliver = args.failure_deliver or FAILURE_DELIVER
     if args.failure_deliver == 'local':
         p.error('--failure-deliver local would hide failed ticks')
     h = home()
-    steps = plan(h, args.mode, args.failure_deliver)
+    steps = plan(h, args.mode, args.failure_deliver, explicit_target=explicit)
     if not steps:
         print('session-repair: already installed')
         return 0

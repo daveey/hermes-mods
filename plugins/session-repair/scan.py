@@ -182,7 +182,9 @@ class Sources:
                     row = json.loads(line)
                 except ValueError:
                     continue
-                filed = row.get('filed') if isinstance(row, dict) else None
+                if not isinstance(row, dict):
+                    continue
+                filed = row.get('filed')
                 if row.get('outcome') in ('card', 'queued') and isinstance(filed, str) and filed:
                     out.setdefault(str(row.get('fingerprint') or ''), set()).add(filed)
         except OSError:
@@ -541,6 +543,19 @@ def _ready_since(c, card: Card) -> Optional[float]:
     return _num(ev[0]['at']) if ev else _num(getattr(card.task, 'created_at', None))
 
 
+def _skip_explains(skip: Any, now: float) -> bool:
+    """A recorded skip explains a ready wait, however old, unless it is a timed hold whose `until` has passed
+    (core's diagnostics drop such a hold too). `until` in seconds; a millisecond stamp is read as such."""
+    if not skip:
+        return False
+    until = _num(skip.get('until')) if isinstance(skip, dict) else None
+    if until is None:
+        return True
+    if until > 1e12:
+        until /= 1000.0
+    return until > now
+
+
 def rule_ready_worker_free(card: Card, src: Sources) -> Optional[Finding]:
     """BS-ready-worker-free: ready and unclaimed while a worker that can run it has a free slot, with no recorded
     dispatcher skip in the current ready episode (a skip of any age, or one with `until`, explains the wait)."""
@@ -575,7 +590,7 @@ def rule_ready_worker_free(card: Card, src: Sources) -> Optional[Finding]:
     except Exception as e:  # noqa: BLE001
         src.error(f'dispatch skip {card.board}/{card.id}', e)
         skip = None
-    if skip:
+    if _skip_explains(skip, now):
         return None  # the current ready episode has a recorded skip: the wait is explained, however old
     if place.get('pool_could_run'):
         if waited < READY_UNCLAIMED_S:
@@ -590,7 +605,8 @@ def rule_ready_worker_free(card: Card, src: Sources) -> Optional[Finding]:
                                                            kanban_cmd(card.board, 'move', card.id, '--help')],
                          'why': 'a dispatcher pass here only uses host slots; the pool needs a re-placement'}, 'hermes')
     if lane == 'local':
-        if not kds.unrecorded(place, waited):  # core: >= 30 min, running < limit, no recorded skip
+        # core: >= 30 min, running < limit, no recorded skip (an expired timed hold counts as none)
+        if not kds.unrecorded({**place, 'skip': None}, waited):
             return None
         return _finding('BS-ready-worker-free', card, 'free_slot',
                         f'ready {_fmt_age(waited)}, unclaimed, with no recorded skip, while the host runs '
