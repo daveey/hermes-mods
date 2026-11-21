@@ -306,17 +306,15 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     const progress = Number(c.activityAt) || Number(c.progressAt) || 0
     const last = progress || Number(c.since) || 0
     const on = waitPhrase(c, nowMs)
-    // A stale chip is session-tasks' last-known copy after a failed read: the card may have been answered,
-    // re-blocked or archived since, so it is never stuck (no nudge) or needs-you, only "status unknown".
-    if (c.stale) { out.waiting.push({ ...item(c), detail: `status unknown · last known: ${c.look === 'needs-you' ? 'needs you' : c.state || 'unknown'}${last ? ` (${ago(last, nowMs)})` : ''}; the card could not be re-read` }); continue }
-    // A closed card on another gateway that its owner never confirmed to this chat (session-tasks `reported`): say
-    // what the owner reported, in its own group. It is not waiting on anything and asks nothing, and it is never
-    // counted as done. Chat 20261110_185031_4f5f4b listed 198 such cards of retired workers under Waiting as
-    // "status unknown (missing qualified identity)" four days after they finished.
+    // A failed read is not evidence of reopened work. Last-known closed cards ask nothing;
+    // unconfirmed remote completions stay reported (never counted as confirmed done).
+    if (TERMINAL.has(str(c.state))) continue
     if (c.state === 'unknown' && (c.reported === 'done' || c.reported === 'archived')) {
-      out.reported.push({ ...item(c), detail: `reported ${c.reported} by ${c.gateway || c.gatewayId || 'another gateway'} · not confirmed by its owner` })
+      out.reported.push({ ...item(c), detail: `${c.stale ? 'last known: ' : ''}reported ${c.reported} by ${c.gateway || c.gatewayId || 'another gateway'} · not confirmed by its owner${c.stale ? '; the card could not be re-read' : ''}` })
       continue
     }
+    // Only last-known open/unknown work becomes uncertain Waiting on a failed read.
+    if (c.stale) { out.waiting.push({ ...item(c), detail: `status unknown · last known: ${c.look === 'needs-you' ? 'needs you' : c.state || 'unknown'}${last ? ` (${ago(last, nowMs)})` : ''}; the card could not be re-read` }); continue }
     if (c.look === 'needs-you') {
       // A finished, archived or cancelled card asks nothing, whatever wait it last reported.
       if (!TERMINAL.has(str(c.state))) {

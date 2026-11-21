@@ -12,6 +12,36 @@ export async function resolve(spec, ctx, next) {
 const m = await import('../plugin.js')
 const tasks = await import('../../session-tasks/plugin.js')
 const NOW = Date.parse('2026-10-29T15:00:00Z'), S = NOW / 1000
+
+for (const status of ['done', 'archived', 'done_pending_release', 'released']) {
+  test(`failed read preserves last-known closed ${status} outside Waiting`, async () => {
+    const direct = m.classify([{ key: 'closed-direct', id: 'closed-direct', kind: 'kanban', state: status, stale: true }], { nowMs: NOW })
+    if (status === 'done' || status === 'archived') assert.equal(direct.waiting.length, 0)
+    let online = true
+    const ids = new Set([`failed-closed-${status}`])
+    const route = { connectionId: 'closed-fixture', profile: 'default' }
+    globalThis.window = { hermesDesktop: { api: async ({ path }) => {
+      if (!online) throw new Error('forced read failure')
+      assert.ok(path.startsWith('/api/session-kanban-tasks'))
+      return { tasks: [
+        { id: 'closed', status, unfinished: status === 'done_pending_release', gateway: 'remote', profile: 'default', board: 'default' },
+        { id: 'reported', status: 'unknown', reported_status: status === 'archived' ? 'archived' : 'done', unfinished: true, gateway: 'remote', profile: 'default', board: 'default' },
+        { id: 'open', status: 'running', gateway: 'remote', profile: 'default', board: 'default' },
+      ] }
+    } } }
+    try {
+      await tasks.loadKanban(ids, route)
+      online = false
+      const failed = await tasks.loadKanban(ids, route)
+      const result = m.classify(failed, { nowMs: NOW })
+      assert.equal(result.waiting.some(c => c.id === 'closed' || c.id === 'reported'), false)
+      assert.equal(result.reported.some(c => c.id === 'reported'), true)
+      assert.match(result.reported.find(c => c.id === 'reported').detail, /last known.*could not be re-read/)
+      assert.equal(result.waiting.some(c => c.id === 'open'), true)
+      assert.equal(failed.find(c => c.id === 'open').stale, true)
+    } finally { delete globalThis.window }
+  })
+}
 const card = (id, state, extra = {}) => ({ key: `kb:${id}`, kind: 'kanban', id, state, label: `Card ${id}`, connectionId: 'C1', profile: 'default', board: 'default', gateway: 'G1', since: S - 600, activityAt: S - 60, ...extra })
 
 test('contained wait kind and blocked-upstream / on-parent labels', () => {
