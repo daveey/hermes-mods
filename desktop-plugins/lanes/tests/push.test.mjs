@@ -64,7 +64,9 @@ test('connection-pinned native stream changes parameters without reconnecting an
     stop.update({hours:24,window:'24h',expanded:true})
     assert.deepEqual(ws.sent.at(-1),{hours:24,window:'24h',expanded:true})
     assert.equal(sockets.length,1);assert.equal(reads.length,1)
+    const oldDeadlines=[...timeouts.keys()]
     ws.close();assert.deepEqual([...intervals.values()].map(t=>t.ms),[60000])
+    assert.ok(oldDeadlines.every(id=>!timeouts.has(id)), 'disconnect clears its watchdog')
     const reconnect=[...timeouts.values()].find(t=>t.ms<30000);reconnect.fn();await flush()
     const next=sockets[1];next.readyState=1;next.onopen();next.onmessage({data:JSON.stringify({version:1,view:fixture})});await flush()
     assert.equal(intervals.size,0);assert.equal(reads.length,2)

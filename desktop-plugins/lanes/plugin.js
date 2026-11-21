@@ -141,7 +141,11 @@ export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
       if (disposed) return
       if (frame?.params && (frame.params.hours !== params.hours || frame.params.window !== params.window || frame.params.expanded !== params.expanded)) return
       timers.clearTimeout(watchdog)
-      watchdog = timers.setTimeout(() => { if (socket) socket.close(); else unavailable() }, 45000)
+      const owner = socket, at = epoch
+      watchdog = timers.setTimeout(() => {
+        if (disposed || at !== epoch || owner !== socket) return
+        if (owner) owner.close(); else unavailable()
+      }, 45000)
       if (!live) { live = true; onLive(true); timers.clearInterval(poll); poll = undefined }
       attempt = 0
       if (frame?.view) {
@@ -152,6 +156,8 @@ export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
       }
     }
     const dial = async () => {
+      timers.clearTimeout(watchdog)
+      timers.clearTimeout(retry)
       const at = epoch
       const bridge = globalThis.window?.hermesDesktop
       // The legacy SDK cannot pin a connection or send updates. Use its socket only
@@ -176,13 +182,17 @@ export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
         const current = new WebSocket(url)
         socket = current
         current.onopen = () => { if (disposed || at !== epoch) { current.close(); return }; current.send(JSON.stringify(params)) }
-        current.onmessage = (event) => { if (!disposed && at === epoch) { try { receive(JSON.parse(event.data)) } catch {} } }
+        current.onmessage = (event) => { if (!disposed && at === epoch && socket === current) { try { receive(JSON.parse(event.data)) } catch {} } }
         current.onclose = () => {
-          if (disposed || at !== epoch) return
+          if (disposed || at !== epoch || socket !== current) return
+          timers.clearTimeout(watchdog)
           unavailable()
           retry = timers.setTimeout(() => void dial(), Math.min(30000, 500 * 2 ** Math.min(attempt++, 6)))
         }
-        watchdog = timers.setTimeout(() => { unavailable(); current.close() }, 45000)
+        watchdog = timers.setTimeout(() => {
+          if (disposed || at !== epoch || socket !== current) return
+          unavailable(); current.close()
+        }, 45000)
       } catch {
         if (!disposed && at === epoch) { unavailable(); retry = timers.setTimeout(() => void dial(), 5000) }
       }
