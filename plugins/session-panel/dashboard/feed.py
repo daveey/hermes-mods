@@ -25,6 +25,8 @@ and each batch's `prev` is the revision right before it. Pure: every read goes t
 from __future__ import annotations
 
 import hashlib
+import importlib.util
+from pathlib import Path
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 import itertools
@@ -49,6 +51,16 @@ PROCESS_FEED = None          # the one feed of this process (plugin_api.feed())
 PROCESS_LOCK = threading.Lock()
 RESTART = None               # plugin_api.feed: a plugin reload restarts (resumes) the feed at once
 log = logging.getLogger('session-panel')
+_MODEL_PATH = Path(__file__).resolve().parents[1] / 'model.py'
+# Content-addressed module generation: model/brief changes cannot leave a hot
+# feed on old reducer code. No mutable global sys.path or half-loaded singleton.
+def _model():
+    spec = importlib.util.spec_from_file_location('_session_panel_model', _MODEL_PATH)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
 
 
 def _hash(bundle: dict) -> str:
@@ -106,6 +118,7 @@ class Feed:
         self.last_tick_s = 0.0               # duration of the last tick that recomputed (shown by /status)
         self._seq = itertools.count(1)       # compute order: a bundle computed earlier never replaces a later one
         self._stamps: Any = None
+        self._panel_stamps: dict[str, Any] = {}
         self._cursor: Any = None
         self._last_full = 0.0
         self._flights: dict[str, _Flight] = {}
@@ -171,6 +184,7 @@ class Feed:
 
     def _forget(self, s: str) -> None:
         self.interest.pop(s, None)
+        self._panel_stamps.pop(s, None)
         self.bundles.pop(s, None)
         self.failures.pop(s, None)
         self._retry.discard(s)
@@ -201,8 +215,13 @@ class Feed:
             for ref in chain_refs(row, rec.get('detail')):
                 if ref not in seen:
                     queue.append((ref, rec.get('board') or board, None, depth + 1))
-        return {'session': session, 'lineage': lineage, 'tasks': tasks, 'done': done, 'cards': cards,
-                'computed_at': self.clock(), 'computed_seq': seq}
+        bundle = {'session': session, 'lineage': lineage, 'tasks': tasks, 'done': done, 'cards': cards,
+                  'computed_at': self.clock(), 'computed_seq': seq}
+        panel_inputs = getattr(r, 'panel_inputs', None)
+        if callable(panel_inputs):
+            bundle.update(panel_inputs(session, lineage))
+        bundle['model'] = _model().reduce_panel(bundle, now=bundle['computed_at'])
+        return bundle
 
     def _wait_flight(self, flight: _Flight) -> Optional[dict]:
         # No interest/publication lock while waiting, including heartbeat emits.
@@ -334,11 +353,19 @@ class Feed:
             watched = list(self.interest)
         if not watched:
             return 0
+        panel_dirty = set()
+        stamp_reader = getattr(self.readers, 'panel_stamp', None)
+        if callable(stamp_reader):
+            for s in watched:
+                stamp = tuple(stamp_reader(i) for i in self.bundles.get(s, {}).get('bundle', {}).get('lineage', [s]))
+                if self._panel_stamps.get(s) != stamp:
+                    panel_dirty.add(s)
+                self._panel_stamps[s] = stamp
         stamps = self.readers.stamps()
         full = now - self._last_full >= self.full_every_s
         with self.lock:
             retry = self._retry.intersection(watched)
-        if stamps == self._stamps and not full and not retry:
+        if stamps == self._stamps and not full and not retry and not panel_dirty:
             self._publish({}, heartbeat=True)
             return 0
         changed_cards, self._cursor = self.readers.changed_cards(self._cursor)
@@ -348,7 +375,7 @@ class Feed:
             # Open cards carry run evidence that expires: those chats every FULL_EVERY_S. A chat with none changes
             # only through card events (handled below) or a link adopted with no event: every QUIET_FULL_EVERY_S.
             with self.lock:
-                dirty = {s for s in watched if s not in self.bundles or self.bundles[s]['bundle'].get('tasks')
+                dirty = {s for s in watched if s not in self.bundles or any(self.bundles[s]['bundle'].get(k) for k in ('tasks', 'requests', 'subagents', 'processes', 'rentals'))
                          or now - self.bundles[s]['bundle'].get('computed_at', 0) >= QUIET_FULL_EVERY_S}
             touched = {v for v in changed_cards.values() if v}
             with self.lock:
@@ -365,6 +392,7 @@ class Feed:
                     if b and (b['refs'] & set(changed_cards) or b['lineage'] & touched):
                         dirty.add(s)
         dirty.update(retry)
+        dirty.update(panel_dirty)
         started = time.monotonic()
         computed = self._compute_all(sorted(dirty), refresh=True) if dirty else {}
         if dirty:

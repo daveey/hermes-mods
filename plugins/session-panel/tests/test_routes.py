@@ -191,7 +191,11 @@ def test_a_reload_from_real_older_feed_code_hands_over_with_the_same_epoch(monke
             time.sleep(0.01)
         f = new_mod.PROCESS_FEED  # resumed without any request
         assert isinstance(f, new_mod.Feed) and not f.stopped.is_set()
-        assert f.epoch == first['epoch'] and f.rev == running.rev
+        # The revision space survives. Recomputing the old raw-only bundle now
+        # adds model, so the resumed feed may already have published a new rev.
+        assert f.epoch == first['epoch'] and f.rev >= running.rev
+        if f.rev > running.rev:
+            assert f.bundles['S1']['bundle']['model']['version'] == 1
         sent.clear()
         rev = running.rev
         older.Feed._publish(running, {'S1': running.compute('S1')})  # the old class's own publish, still in flight

@@ -398,6 +398,29 @@ class CoreReaders:
         return preserve_origin_obligations(selected, origin, gateway=gateway, profile=profile,
                                            ids=ids, statuses=statuses)
 
+    def panel_stamp(self, session):
+        """Cheap per-session outcome/request invalidation; no board hydration."""
+        c = self.conn(self.state_db())
+        try:
+            row = c.execute('SELECT outcome_json FROM sessions WHERE id=?', (session,)).fetchone() if c else None
+            outcome = row['outcome_json'] if row else None
+        except sqlite3.Error:
+            outcome = None
+        c = self.conn(self.state_db().parent / 'user-steps' / 'actions.sqlite3')
+        try:
+            requests = tuple(tuple(r) for r in c.execute('SELECT id,revision,state,resolution FROM requests WHERE session=? ORDER BY id', (session,))) if c else ()
+        except sqlite3.Error:
+            requests = None
+        return (outcome, requests)
+
+    def panel_inputs(self, session, lineage):
+        path = Path(__file__).resolve().parents[1] / 'inputs.py'
+        spec = importlib.util.spec_from_file_location('_session_panel_inputs', path)
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.read(self, session, lineage)
+
     def linked(self, ids):
         from hermes_cli import kanban_session_activity as ksa
         return _calm(self._session_tasks(list(ids)[:50], tuple(ksa.LISTED_STATUSES)))
