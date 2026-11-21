@@ -153,3 +153,23 @@ def test_release_closes_this_threads_connections(api, board, monkeypatch):
     with pytest.raises(_sq.ProgrammingError):
         c.execute('select 1')
     assert r.conn(path) is not None, 'reopened on demand'
+
+
+
+def test_a_board_whose_wal_files_were_removed_by_the_last_writer_still_opens(api, board, monkeypatch):
+    path, conn = board
+    a = kanban_db.create_task(conn, title='A', initial_status='running', session_id='S1')
+    conn.close()  # the last writer's checkpoint removes -wal / -shm
+    for suffix in ('-wal', '-shm'):
+        try:
+            os.remove(f'{path}{suffix}')
+        except FileNotFoundError:
+            pass
+    r = readers_for(api, path, monkeypatch)
+    assert r.card(a, 'default') is not None
+    import sqlite3 as _sq
+    with pytest.raises(_sq.OperationalError):
+        r.conn(path).execute('DELETE FROM tasks')
+    assert not (path.parent / 'missing.db').exists()
+    assert r.conn(path.parent / 'missing.db') is None, 'a missing file is never created'
+    assert not (path.parent / 'missing.db').exists()

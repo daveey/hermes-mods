@@ -48,7 +48,7 @@ def _load_feed():
 
 
 class CoreReaders:
-    """Feed reads against this gateway's own boards, board replicas and state.db, read-only. Each thread has its own
+    """Feed reads against this gateway's own boards, board replicas and state.db, read-only (query_only). Each thread has its own
     connections (the feed thread and catch-up request threads read concurrently); a connection is reopened when its
     file was replaced (another inode) and dropped when the file is gone."""
 
@@ -106,7 +106,11 @@ class CoreReaders:
         if hit:
             hit[0].close()
         try:
-            c = sqlite3.connect(f'file:{path}?mode=ro', uri=True, timeout=2)
+            # mode=rw + query_only, never a ro URI: SQLite cannot open a WAL database read-only while its -wal / -shm
+            # are absent, and Hermes writers delete them on each last-close checkpoint (tests/test_sqlite_ro_guard.py).
+            # mode=rw never creates a missing file; query_only refuses every write.
+            c = sqlite3.connect(f'file:{path}?mode=rw', uri=True, timeout=2)
+            c.execute('PRAGMA query_only=ON')
             c.row_factory = sqlite3.Row
         except sqlite3.Error:
             return None
