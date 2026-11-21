@@ -127,7 +127,10 @@ class PluginSuitesWorkflow(unittest.TestCase):
         # The hub used to run these (hub-mods-suite, hermes-sync mods-suite-gate); now core is public, CI does.
         step = self.text.split("      - name: Check out public core (3.14 leg)\n", 1)[1].split("\n      - ", 1)[0]
         self.assertRegex(step, r"(?m)^        if: matrix\.python == '3\.14'$")
-        self.assertIn("https://github.com/daveey/hermes-agent.git", step)
+        self.assertIn('fetch -q --depth 1 -- https://github.com/daveey/hermes-agent.git "$CORE_REF"', step)  # ref never an option
+        self.assertNotIn("${{ inputs", step.split("run: |", 1)[1])  # inputs reach the shell only through env
+        self.assertIn("--locked --group dev --group test", step)  # core's own venv, as the hub syncs it
+        self.assertIn('echo "HERMES_MODS_PYTHON=${core}/.venv/bin/python" >> "$GITHUB_ENV"', step)
         self.assertIn("CORE_REF: ${{ inputs.core_ref || 'main' }}", step)
         self.assertIn('echo "HERMES_CORE_CHECKOUT=${core}" >> "$GITHUB_ENV"', step)
         self.assertNotIn("secrets.", step)  # public mirror: no credential reaches this public repo's CI
