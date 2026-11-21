@@ -37,7 +37,7 @@ When extending the lanes dashboard, match the CLI's fleet connection selection f
 
 ## When the user asks for a change
 
-Turn the sentence into the smallest set of `set` commands, show them, run them, then show the new `show`.
+Use the smallest applicable command below, then read back the result: `show` for shares, `explain <card>` for assignment. When creating cards under an established project-lane direction, assign and verify the lane as the creator rather than leaving that administrative step in the worker's brief. If a worker returns a creator-only lane request, run `assign`, read back with `explain`, and post the evidence via `kanban_comment` so the parked task can finish; this avoids another worker run merely to attempt a mutation outside its authority.
 
 | They say | Run |
 |---|---|
