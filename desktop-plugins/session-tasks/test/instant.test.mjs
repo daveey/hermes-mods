@@ -396,3 +396,58 @@ test('a malformed RPC response is unknown, never an authoritative empty source',
     assert.ok(window.__sessionTasks.snapshot.chips.some(c => c.label === 'Process status unknown'))
   } finally { dispose(); delete host.sessions; delete host.request; delete globalThis.window }
 })
+
+// [daveey 2026-11-20] the panel judges the switch's cached cards as of `cachedAt` (when they were read) until this
+// chat's kanban read answers: snapshots carry it only while the cards on screen are that cached copy.
+test('a switch carries cachedAt (the kanban read time) until the fresh kanban read lands', async () => {
+  const chips = m.sessionTaskChips([card('t_c')], { connectionId: 'conn', profile: 'default' })
+  m.rememberChips(scopeOf('chat-at'), chips, [])
+  const readAt = m.cachedChips(scopeOf('chat-at')).kanbanAt
+  assert.ok(readAt > 0)
+  focus.stored = 'chat-at'
+  const kanban = deferred()
+  host.request = async () => ({ processes: [], subagents: [] })
+  globalThis.window = { hermesDesktop: { api: async ({ path }) => {
+    if (path.startsWith('/api/sessions/')) return { id: 'chat-at', parent_session_id: null }
+    if (path.startsWith('/api/session-kanban-tasks')) return kanban.promise
+    return { machines: [] }
+  } } }
+  const dispose = m.default.register({ register() {} })
+  try {
+    const round = m.refresh()
+    for (let i = 0; i < 20 && !window.__sessionTasks.snapshot.fresh; i++) await new Promise(r => setTimeout(r, 5))
+    assert.equal(window.__sessionTasks.snapshot.fresh, true, 'process/sub-agent answers published')
+    assert.equal(window.__sessionTasks.snapshot.cachedAt, readAt, 'kanban cards are still the cached copy')
+    assert.deepEqual(window.__sessionTasks.cachedSnapshot(scopeOf('chat-at'), 'chat-at').chips.map(c => c.id), ['t_c'])
+    kanban.resolve({ tasks: [card('t_c')] })
+    await round
+    assert.equal(window.__sessionTasks.snapshot.cachedAt, undefined, 'the fresh read is judged at now')
+  } finally { dispose(); delete globalThis.window; delete host.request }
+})
+
+test('a failed kanban read drops cachedAt (the cached cards are then judged at now: unknown)', async () => {
+  m.rememberChips(scopeOf('chat-fail'), m.sessionTaskChips([card('t_f')], { connectionId: 'conn', profile: 'default' }), [])
+  focus.stored = 'chat-fail'
+  host.request = async () => ({ processes: [], subagents: [] })
+  globalThis.window = { hermesDesktop: { api: async ({ path }) => {
+    if (path.startsWith('/api/sessions/')) return { id: 'chat-fail', parent_session_id: null }
+    if (path.startsWith('/api/session-kanban-tasks')) throw new Error('hub down')
+    return { machines: [] }
+  } } }
+  const dispose = m.default.register({ register() {} })
+  try {
+    await m.refresh()
+    assert.equal(window.__sessionTasks.snapshot.cachedAt, undefined)
+  } finally { dispose(); delete globalThis.window; delete host.request }
+})
+
+test('a machines-only refresh does not make old kanban evidence look newly read', async () => {
+  const realNow = Date.now
+  try {
+    Date.now = () => 1_000_000
+    m.rememberChips(scopeOf('chat-m'), [card('t_m')], [])
+    Date.now = () => 2_000_000
+    m.rememberChips(scopeOf('chat-m'), undefined, [])
+    assert.equal(m.cachedChips(scopeOf('chat-m')).kanbanAt, 1_000_000)
+  } finally { Date.now = realNow }
+})

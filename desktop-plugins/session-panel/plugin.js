@@ -264,14 +264,17 @@ const TERMINAL = new Set(['done', 'archived', 'cancelled', 'canceled', 'resolved
 const LEGACY_LIVE = new Set(['running', 'review', 'ready', 'todo'])
 const NO_OBSERVATIONS = 'producer_sent_no_observations'
 const legacyLive = (c, ev) => (ev?.reason === NO_OBSERVATIONS || ev?.reason === REPLICA_REASON) && c?.kind === 'kanban' && c.look !== 'needs-you' && LEGACY_LIVE.has(str(c.state))
-export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsked = () => false, presentationFor = () => null, evidence = () => null } = {}) {
+// `asOfMs`: the time evidence is judged at. Now, except while the cards are session-tasks' cached copy painted on a
+// switch (its `cachedAt`): then as of when that copy was read, so a running card stays running for the 2-5 s until
+// the fresh read lands, instead of flashing to "status unknown". A failed read clears cachedAt (unknown again).
+export function classify(chips, { nowMs = Date.now(), asOfMs = nowMs, silence = new Map(), isAsked = () => false, presentationFor = () => null, evidence = () => null } = {}) {
   const now = nowMs / 1000
   const out = { active: [], stuck: [], blockedUpstream: [], waiting: [], ready: [], queued: [], unasked: [], reported: [], lastActivity: 0 }
   const seen = at => { if (Number(at) > out.lastActivity) out.lastActivity = Number(at) }
   for (const c of chips || []) {
     if (!c || !c.key) continue
     if (c.kind === 'bg' || c.kind === 'sub') {
-      const ev = evidence(c) || chipObservation(c, now)
+      const ev = evidence(c) || chipObservation(c, asOfMs / 1000)
       const row = { ...item(c), detail: observationLine(ev, now) }
       if (ev.state === 'running') out.active.push(row)
       else out.waiting.push(row)
@@ -340,7 +343,7 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     // whatever the run evidence says (a fresh parked read used to take it to Waiting first, so it never showed).
     if (c.look === 'stalled') { out.stuck.push({ ...item(c), reason: 'stalled', detail: `stalled: ${on || 'agent-owned wait over 2 h'}` }); continue }
     if ((!ev || ev.state === 'unknown') && board && board.state === c.state && ['scheduled', 'blocked', 'triage', 'review', 'ready', 'todo'].includes(c.state) &&
-        Number.isFinite(board.readAt) && nowMs >= board.readAt && nowMs - board.readAt <= 60_000) {
+        Number.isFinite(board.readAt) && asOfMs >= board.readAt && asOfMs - board.readAt <= 60_000) {
       // A parked card has no run to observe: its fresh board lifecycle is the answer, so its unknown execution
       // evidence is not counted (`parked`). The row leads with what it waits on; the source comes last.
       const source = board.source === 'replica' ? 'reported board status' : 'board status'
@@ -511,6 +514,7 @@ async function readPark(route, id) {
 /** `{ state: 'loading' | 'ok' | 'failed', park }` for a parked card; starts at most one read. */
 export function parkFor(chip, nowMs = Date.now(), read = readPark, fallback) {
   if (!chip?.id) return { state: 'failed', park: null }
+  loadReads()
   const route = refRoute(chip, fallback)
   if (!route.connectionId) return { state: 'failed', park: null }
   const k = titleKey(route, chip.id), hit = parks.get(k)
@@ -522,9 +526,12 @@ export function parkFor(chip, nowMs = Date.now(), read = readPark, fallback) {
   parks.set(k, { ...(hit || {}), at: nowMs, pending: true })
   Promise.resolve(read(route, chip.id)).catch(() => ({ failed: true })).then(r => {
     parks.set(k, { park: r?.failed ? hit?.park || null : r?.park || null, failed: !!r?.failed, stale: !!r?.failed && !!hit?.park, at: Date.now() })
+    saveReadsSoon()
     titleSubs.forEach(fn => fn())
   })
-  return { state: hit?.park ? (hit.stale ? 'stale' : 'ok') : 'loading', park: hit?.park || null }
+  // A known answer (a park, or a read that found none) shows while it is re-read; only a first read is loading.
+  const known = hit && !hit.pending && !hit.failed
+  return { state: hit?.park ? (hit.stale ? 'stale' : 'ok') : known ? 'ok' : 'loading', park: hit?.park || null }
 }
 /** True when a waiting row's own wait names nothing, so its owner's park is worth reading. */
 export const needsPark = i => i?.kind === 'kanban' && !i.cardStatus && str(i.chip?.state) === 'scheduled' &&
@@ -543,6 +550,7 @@ async function readTitle(route, id) {
 }
 /** `{ title, board }` for card `id` named by `chip`; '' title until (or unless) a read answers. */
 export function cardRef(chip, id, nowMs = Date.now(), read = readTitle, fallback) {
+  loadReads()
   const route = refRoute(chip, fallback)
   if (!route.connectionId) return { route, title: '', board: route.board }
   const k = titleKey(route, id), hit = titles.get(k)
@@ -553,6 +561,7 @@ export function cardRef(chip, id, nowMs = Date.now(), read = readTitle, fallback
   Promise.resolve(read(route, id)).catch(() => ({ title: '' })).then(r => {
     const title = str(r?.title) || hit?.title || ''
     titles.set(k, { title, board: str(r?.board) || hit?.board || route.board, at: Date.now() })
+    if (title) saveReadsSoon()
     if (str(r?.title) && r.title !== hit?.title) titleSubs.forEach(fn => fn())
   })
   return { route, title: hit?.title || '', board: hit?.board || route.board }
@@ -568,10 +577,11 @@ export function sessionTitle(route, sid, nowMs = Date.now(), read = readSessionT
     if (row && str(row.title)) return str(row.title)
   } catch {}
   if (!route?.connectionId) return ''
+  loadReads()
   const k = `${route.connectionId}|${route.profile}|${sid}`, hit = sessionTitles.get(k)
   if (hit && (hit.title || nowMs - hit.at < (hit.pending ? TITLE_PENDING_MS : TITLE_RETRY_MS))) return hit.title
   sessionTitles.set(k, { title: hit?.title || '', at: nowMs, pending: true })
-  Promise.resolve(read(route, sid)).catch(() => '').then(t => { sessionTitles.set(k, { title: str(t), at: Date.now() }); if (t) titleSubs.forEach(fn => fn()) })
+  Promise.resolve(read(route, sid)).catch(() => '').then(t => { sessionTitles.set(k, { title: str(t) || hit?.title || '', at: Date.now() }); if (t) { saveReadsSoon(); titleSubs.forEach(fn => fn()) } })
   return hit?.title || ''
 }
 async function readSessionTitle(route, sid) {
@@ -1290,6 +1300,47 @@ function parkHop(detail, nowMs) {
 // One cached card read per (route, id) for the walk: title, status, owning chat, owner gateway and the next hop.
 const CARD_FRESH_MS = 60_000, CARD_RETRY_MS = 2 * 60_000
 const cards = new Map()
+
+// [daveey 2026-11-20] "session changes must be instant". Card, wake, title and chat-title reads are kept across
+// launches and plugin reloads (localStorage), so a revisited chat's chains, titles and wakes paint from the last
+// answer instead of "reading…" for the 1-5 s of reads. A restored entry is always due (at -Infinity): it is shown at once and
+// re-read in the background, exactly like an in-memory answer past its freshness (at -Infinity: always due). Pending reads are never saved.
+const READS_KEY = 'hermes.sessionPanel.reads.v1'
+let readsLoaded = false
+let readsSaveTimer = null
+const readStore = () => { try { return typeof window !== 'undefined' ? window.localStorage : null } catch { return null } }
+const READ_MAPS = () => [
+  ['cards', cards, v => (v.info ? { info: v.info } : null)],
+  ['parks', parks, v => (!v.failed && !v.pending ? { park: v.park || null } : v.park ? { park: v.park } : null)],
+  ['titles', titles, v => (v.title ? { title: v.title, board: v.board, state: v.state } : null)],
+  ['sessions', sessionTitles, v => (v.title ? { title: v.title } : null)]
+]
+export function loadReads() {
+  if (readsLoaded) return
+  readsLoaded = true
+  try {
+    const raw = JSON.parse(readStore()?.getItem(READS_KEY) || '{}')
+    for (const [name, map] of READ_MAPS()) {
+      for (const [k, v] of Array.isArray(raw[name]) ? raw[name] : []) if (typeof k === 'string' && v && !map.has(k)) map.set(k, { ...v, at: -Infinity })
+    }
+  } catch {} // corrupt or unavailable: start empty
+}
+/** Write every read map now (newest TITLE_MAX each; pending reads keep only an answer they already had). */
+export function writeReads() {
+  clearTimeout(readsSaveTimer)
+  readsSaveTimer = null
+  try {
+    const out = {}
+    for (const [name, map, pick] of READ_MAPS()) out[name] = [...map.entries()].slice(-TITLE_MAX).map(([k, v]) => [k, pick(v)]).filter(([, v]) => v)
+    readStore()?.setItem(READS_KEY, JSON.stringify(out))
+  } catch {} // quota or unavailable: memory still serves this window
+}
+export function saveReadsSoon(delayMs = 2_000) {
+  if (readsSaveTimer) return
+  readsSaveTimer = setTimeout(writeReads, delayMs)
+  readsSaveTimer?.unref?.()
+}
+export const resetReadsForTests = () => { readsLoaded = false; clearTimeout(readsSaveTimer); readsSaveTimer = null; cards.clear(); parks.clear(); titles.clear(); sessionTitles.clear() }
 async function readCard(route, id) {
   const bridge = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
   if (!bridge || !route.connectionId) return null
@@ -1313,6 +1364,7 @@ function sharePark(route, id, r) {
 }
 /** `{ state: 'loading' | 'ok' | 'stale' | 'failed', info }`, info = `{ id, title, status, session, owner, board, hop }`. */
 export function cardInfo(chip, id, nowMs = Date.now(), read = readCard, fallback) {
+  loadReads()
   const route = refRoute(chip, fallback)
   if (!route.connectionId) return { state: 'failed', info: null }
   const k = titleKey(route, id), hit = cards.get(k), age = hit ? nowMs - hit.at : Infinity
@@ -1326,6 +1378,7 @@ export function cardInfo(chip, id, nowMs = Date.now(), read = readCard, fallback
     // A failed re-read keeps the last answer but marks it stale (shown as "not re-read"), never as current.
     cards.set(k, { info, stale: !t && !!hit?.info, at: Date.now() })
     if (info?.title && t) { titles.delete(k); titles.set(k, { title: info.title, board: info.board, state: info.status, at: Date.now() }); while (titles.size > TITLE_MAX) titles.delete(titles.keys().next().value) }
+    saveReadsSoon()
     titleSubs.forEach(fn => fn())
   })
   return { state: hit?.info ? (hit.stale ? 'stale' : 'ok') : 'loading', info: hit?.info ? (hit.stale ? { ...hit.info, stale: true } : hit.info) : null }
@@ -1832,14 +1885,18 @@ export function Panel() {
   const now = Date.now()
   // Match on the stored chat only: the runtime id lands later (resume), and gating on it hid this chat's
   // already-painted cards until session-tasks' next round (seconds after a switch).
-  const chips = tasks && tasks.stored === stored ? tasks.chips || [] : []
+  // Before session-tasks repaints for this chat (the first frame after a switch), its per-chat cache paints.
+  const snap = tasks && tasks.stored === stored ? tasks : (stored && (typeof window !== 'undefined' ? window.__sessionTasks : null)?.cachedSnapshot?.(scope, stored)) || null
+  const chips = snap?.chips || []
+  // The switch's cached copy is judged as of when it was read until the fresh read lands (see classify asOfMs).
+  const asOf = Number(snap?.cachedAt) > 0 ? Math.min(now, Number(snap.cachedAt)) : now
   const silence = trackSubagents(chips, now, subMemory)
   noteTitles(chips)
   const isAsked = c => !!US?.requestForSource?.({ gatewayId: c.gatewayId || c.gateway, profile: c.profile, type: 'kanban', board: c.board, id: c.id })
   const presentationFor = c => US?.presentationForSource?.({ gatewayId: c.gatewayId || c.gateway, profile: c.profile, type: 'kanban', board: c.board, id: c.id })
-  const sorted = classify(chips, { nowMs: now, silence, isAsked, presentationFor, evidence: c => (c.kind === 'kanban' ? chipObservation(c, now / 1000) : null) })
+  const sorted = classify(chips, { nowMs: now, asOfMs: asOf, silence, isAsked, presentationFor, evidence: c => (c.kind === 'kanban' ? chipObservation(c, asOf / 1000) : null) })
   const known = new Set(chips.filter(c => c?.kind === 'kanban' && c.id).map(c => str(c.id))) // this chat's cards
-  const evidenceUnknown = annotateEvidence(sorted, now)
+  const evidenceUnknown = annotateEvidence(sorted, asOf)
   const asks = typeof US?.openAskCount === 'function' ? US.openAskCount() : 0
   const finished = doneState.scope === scope ? doneState.rows : cachedDone(scope)
   const n = counts(sorted, { asks, done: finished ? finished.filter(d => !d.archived).length : null })
@@ -1870,7 +1927,7 @@ export function Panel() {
   // would show again: hand those identities to the strip so each card renders once. Exact identity only.
   const legacy = US?.Strip ? jsx(US.Strip, { hideCards: sorted.unasked.map(i => i.chip) }, 'legacy') : null
   // Keep finished history reachable even after the final open card closes.
-  const fresh = !!(tasks && tasks.stored === stored && tasks.fresh)
+  const fresh = !!(snap?.fresh && !snap.cachedAt)
   if (!finished?.length && !US?.hasQueuePresentation?.() && !hasOpenWork(sorted, { asks, steps: US?.snapshot?.ledger?.steps, issues: US?.snapshot?.issues })) {
     tracePanel(route, `hidden${fresh ? ' fresh' : ''} chips${chips.length}`)
     return null
@@ -1922,7 +1979,9 @@ export function Panel() {
       jsx(DisclosureCaret, { className: 'shrink-0', open: !collapsed, size: '1em' }),
       jsx('span', { className: 'status-section-icon flex shrink-0 items-center', children: jsx(Codicon, { className: 'text-muted-foreground/70', name: 'pulse', size: '0.8rem' }) }),
       jsx('span', { 'data-panel-title': '', className: 'shrink-0', children: 'This session' }),
-      jsxs('span', { 'data-session-status': '', className: 'min-w-0 truncate', style: { display: 'flex', alignItems: 'center', gap: 5, opacity: 0.8 }, children: [busy && jsx('span', { 'aria-hidden': true, style: { color: C.running }, children: '●' }), status] }),
+      jsxs('span', { 'data-session-status': '', className: 'min-w-0 truncate', style: { display: 'flex', alignItems: 'center', gap: 5, opacity: 0.8 }, children: [busy && jsx('span', { 'aria-hidden': true, style: { color: C.running }, children: '●' }), status,
+        // The switch's cached copy is on screen until this chat's fresh read lands: say so, quietly.
+        asOf < now && jsx('span', { 'data-panel-updating': '', style: { opacity: 0.7 }, title: `Last-known cards from ${ago(asOf / 1000, now)}; refreshing`, children: '· updating…' })] }),
       jsx(Pips, { n, hub: hubCounts(sorted) }),
       summaryParts.length > 0 && jsx('span', { 'data-status-summary': '', ...(collapsed ? { 'data-collapsed-summary': '' } : {}), className: 'min-w-0 truncate', children: summaryParts.flatMap((p, idx) => [idx > 0 && ' · ', jsx('span', { style: p.k === 'needsYou' || p.k === 'stuck' ? { color: C[p.k], fontWeight: 600 } : undefined, children: p.text }, p.k)].filter(Boolean)) })
     ] }) }),

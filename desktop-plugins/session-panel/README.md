@@ -94,3 +94,14 @@ Clicking the row opens its details: card id, assignee, board and gateway; start 
 The **In progress** heading shows only when another section shares the body; alone, the header's `N running` and blue boxes already name it.
 
 `test/panel.test.mjs` covers the one-line row (the card from the 2026-11-20 screenshot), the click-open details and Open card, quiet/pool/worker/review/sub-agent meta; `test/evidence.test.mjs` covers evidence moving into the details.
+
+## Switching chats is instant
+
+[daveey 2026-11-20] "Session changes must be instant." A switch paints the chat's final-looking panel from caches in the first frame, then fresh reads replace it in place.
+
+- **First frame.** Until session-tasks repaints for the new chat, the panel reads `window.__sessionTasks.cachedSnapshot(scope, stored)` (its per-chat localStorage cache), so the first frame is never empty.
+- **Cached cards are judged as of their read.** The cached copy carries `cachedAt` (when its kanban list was read; a machines-only refresh does not move it). Until this chat's kanban read answers, `classify(..., { asOfMs })`, `chipObservation` and `annotateEvidence` judge evidence and board status at `cachedAt`, not now: a running card stays running instead of flashing to `status unknown · evidence unknown` for the 2-5 s read. The header shows `· updating…` (tooltip: `Last-known cards from N min ago; refreshing`). The read answering clears `cachedAt`; a failed read clears it too, so the cards are then judged at now (unknown), as before.
+- **Reads survive a relaunch.** Card reads (chains), wakes (parks), card titles and chat titles persist to localStorage (`hermes.sessionPanel.reads.v1`, newest 500 each). A restored answer shows at once and is always due for a background re-read; pending reads are never saved; a failed re-read keeps the answer marked stale.
+- **Measured.** Each switch writes one `[panel-timing]` line to `~/.hermes/logs/desktop.log`: `{"session","connection","steps":[[ms,"signature"],...]}`, every distinct thing the panel showed in the 12 s after focus reached the chat. Signature fields: `fresh|cached`, section counts (`a` active, `s` stuck, `w` waiting, `bu` blocked upstream, `r` ready, `q` queued, `u` unasked, `r` reported), asks, done, header pips, `evunk` (evidence unknown), `reading` (chains still being read), root causes.
+
+Tests: `test/instant-switch.test.mjs` (persisted reads, trace line), `test/evidence.test.mjs` (cached running and parked cards across the pending read, first frame; needs `HERMES_CORE_SOURCE`), `../session-tasks/test/instant.test.mjs` (`cachedAt` lifecycle, failed read, machines-only refresh). Untested: the kanban endpoint's own 2-5 s latency on the hub is unchanged; only what the panel shows while it runs.
