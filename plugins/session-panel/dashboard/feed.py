@@ -40,6 +40,7 @@ INTEREST_TTL_S = 15 * 60.0   # a chat nobody re-registers stops being computed
 MAX_WATCHED = 200            # interest cap across all clients
 CHAIN_DEPTH = 6              # hops per chain (session-panel walks at most six cards)
 CHAIN_CARDS = 80             # cards per bundle
+CATCHUP_WAIT_S = 8.0         # a catch-up waits at most this long for chats another thread is computing (< 15 s client timeout)
 TERMINAL = {'done', 'archived', 'cancelled'}
 CARD_ID = re.compile(r'\bt_[0-9a-f]{6,}\b')
 PROCESS_FEED = None          # the one feed of this process (plugin_api.feed())
@@ -97,6 +98,7 @@ class Feed:
         self._stamps: Any = None
         self._cursor: Any = None
         self._last_full = 0.0
+        self._inflight: dict[str, threading.Event] = {}  # session -> set once its running compute is stored
 
     # ── interest ────────────────────────────────────────────────────────────
     def watch(self, sessions: Iterable[str]) -> list[str]:
@@ -167,6 +169,30 @@ class Feed:
                 (log.warning if first else log.debug)('session-panel feed: %s failed', s, exc_info=True)
         return out
 
+    def _compute_publish(self, sessions: Iterable[str], *, always: bool = False
+                         ) -> tuple[dict[str, dict], list[threading.Event]]:
+        """Single-flight compute + store + push: `(pushed, waits)`, where `waits` are the events of the chats another
+        thread was already computing (skipped here; that thread stores and pushes them, then sets the event).
+        `always` (the tick) computes every chat anyway: a change can land after a running catch-up read its data,
+        and only the newer compute wins (`computed_seq`). Catch-ups may still wait on the tick's compute.
+
+        Without this every catch-up that found a chat missing recomputed it in parallel; under load each took
+        longer than the Desktop's 15 s timeout, whose retries added still more computes until no request reached
+        the backend in time and the panel showed no cards (hub serve, 2026-11-21). [daveey]"""
+        wanted = list(dict.fromkeys(sessions))
+        with self.lock:
+            waits = [] if always else [self._inflight[s] for s in wanted if s in self._inflight]
+            owned = [s for s in wanted if s not in self._inflight]
+            for s in owned:
+                self._inflight[s] = threading.Event()
+        todo = wanted if always else owned
+        try:
+            return (self._publish(self._compute_all(todo)) if todo else {}), waits
+        finally:
+            with self.lock:  # after the store: a woken waiter finds the bundle (or, on failure, recomputes later)
+                for s in owned:
+                    self._inflight.pop(s).set()
+
     def _store(self, session: str, bundle: dict) -> bool:
         """Keep `bundle`; True when it differs from what clients last got (it took a new revision)."""
         h = _hash(bundle)
@@ -229,10 +255,12 @@ class Feed:
                     if b and (b['refs'] & set(changed_cards) or b['lineage'] & touched):
                         dirty.add(s)
         started = time.monotonic()
-        computed = self._compute_all(sorted(dirty)) if dirty else {}
+        pushed, _ = self._compute_publish(sorted(dirty), always=True) if dirty else ({}, [])
         if dirty:
             self.last_tick_s = time.monotonic() - started
-        return len(self._publish(computed, heartbeat=True))
+        if not pushed:
+            self._publish({}, heartbeat=True)
+        return len(pushed)
 
     # ── catch-up ────────────────────────────────────────────────────────────
     def changes(self, sessions: Iterable[str], *, since: int = 0, epoch: Optional[str] = None) -> dict:
@@ -245,11 +273,16 @@ class Feed:
             missing = [s for s in wanted if s not in self.bundles]
         if missing:
             try:
-                self._publish(self._compute_all(missing))
+                _, waits = self._compute_publish(missing)
             finally:
                 release = getattr(self.readers, 'release', None)
                 if callable(release):
                     release()  # request threads keep no connections between catch-ups
+            # Another thread's compute of a chat we also miss: wait for it, bounded below the Desktop's request
+            # timeout. Whatever is still computing is left out; its push reaches this client anyway.
+            deadline = time.monotonic() + CATCHUP_WAIT_S
+            for ev in waits:
+                ev.wait(max(0.0, deadline - time.monotonic()))
         with self.compute_lock, self.lock:
             out = {s: self.bundles[s]['bundle'] for s in wanted
                    if s in self.bundles and (reset or self.bundles[s]['rev'] > since)}
