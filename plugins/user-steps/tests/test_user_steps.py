@@ -439,7 +439,8 @@ def test_pre_llm_call_note_only_when_steps_are_open(home, monkeypatch):
     run(home, APPROVE, llm=fake_llm({"steps": [{"text": "Approve deploy", "kind": "approve",
                                                 "verbatim_span": "Want me to deploy"}]}))
     note = plugin.pre_llm_call(session_id="S1", user_message="what's left?", platform="tui")["context"]
-    assert "Canonical requests" in note and "Approve deploy" in note
+    assert "[Agent work:" in note and "Approve deploy" in note
+    assert "Canonical requests awaiting a user decision" not in note
     assert '"complete": false' in note
     assert plugin._USER_MSG["S1"] == "what's left?"
     assert plugin.pre_llm_call(session_id="S1", platform="cron") is None

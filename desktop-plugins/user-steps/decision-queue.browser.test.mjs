@@ -96,10 +96,9 @@ test('real DOM: 640px and 200% zoom, long inline plan, keyboard and many-request
   await page.evaluate(value=>window.setRequests([value]),incomplete)
   const blocked=page.getByRole('article',{name:incomplete.title})
   await blocked.locator('[data-action-scope] [data-streamdown="strong"]').waitFor()
-  // desktop-1321064734: a plan-less ask offers exactly two things to do, never a greyed-out Approve. This owner
-  // advertises withdraw, so the second is the owner-side Not needed (older owners get the local Dismiss).
+  // Repair is agent work, not a request for the user to demand a plan. Owner-side withdrawal remains available.
   assert.equal(await blocked.getByRole('button',{name:'Approve',exact:true}).count(),0)
-  assert.deepEqual(await blocked.getByRole('button').allInnerTexts(),['Ask agent for the plan','Not needed'])
+  assert.deepEqual(await blocked.getByRole('button').allInnerTexts(),['Not needed'])
   assert.match(await blocked.locator('[data-approval-blocked]').innerText(),/without a plan/)
   for(const width of [640,360]){
    await page.setViewportSize({width,height:1000})

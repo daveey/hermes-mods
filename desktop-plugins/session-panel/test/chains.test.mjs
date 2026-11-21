@@ -67,9 +67,46 @@ test('chainFor: walks card to card to the leaf; this chat\'s cards come from the
   const long = m.chainFor(root('t_r', 'card t_000001'), NOW, { info: longInfo, local: new Map() })
   assert.deepEqual([long.nodes.length, long.leaf.text], [m.MAX_HOPS, `chain longer than ${m.MAX_HOPS} cards`])
   // A card of this chat: from its own row (running here), no remote read.
-  const local = new Map([['t_a0a0a0', { item: { chip: { id: 't_a0a0a0', state: 'running' } }, waiting: false, label: 'Mine', chip: { id: 't_a0a0a0', state: 'running' } }]])
+  const local = m.chainLocal([], [{ label: 'Mine', chip: { id: 't_a0a0a0', state: 'running', connectionId: 'C1', profile: 'default', board: 'default' } }])
   const lc = m.chainFor(root('t_r', 'card t_a0a0a0'), NOW, { info: () => { throw new Error('no remote read') }, local })
   assert.deepEqual([lc.nodes[0].title, lc.leaf.kind], ['Mine', 'running'])
+})
+
+test('chainFor: local prerequisites are connection/profile/board qualified, never bare ids', () => {
+  const row = (id, extra = {}) => ({ key: id, kind: 'kanban', label: id, chip: { id, look: 'waiting', connectionId: 'C1', profile: 'default', board: 'default', state: 'running', ...extra } })
+  const root = row('t_111111', { state: 'scheduled', waitingOn: 'card t_aaaaaa' })
+  for (const extra of [{ connectionId: 'C2' }, { profile: 'other' }, { board: 'other' }, { connectionId: null }, { profile: null }]) {
+    const local = m.chainLocal([], [row('t_aaaaaa', extra)])
+    const ch = m.chainFor(root, NOW, { local, info: () => ({ state: 'failed', info: null }) })
+    assert.equal(ch.leaf.kind, 'unknown', JSON.stringify(extra))
+  }
+  const ch = m.chainFor(root, NOW, { local: m.chainLocal([], [row('t_aaaaaa')]), info: () => { throw new Error('qualified local row must not fetch') } })
+  assert.equal(ch.leaf.kind, 'running')
+})
+
+test('chainFor: cycle detection uses the actual read route without granting local lookup authority', () => {
+  const root = { kind: 'kanban', chip: { id: 't_aaaaaa', state: 'scheduled', waitingOn: 'card t_bbbbbb' } }
+  const fallback = () => ({ connectionId: 'C1', profile: 'default' })
+  const info = (_chip, id) => ({ state: 'ok', info: { id, board: 'default', hop: { ref: { id: id === 't_bbbbbb' ? 't_aaaaaa' : 't_bbbbbb' } } } })
+  assert.equal(m.chainFor(root, NOW, { fallback, info }).leaf.text, 'circular wait')
+})
+
+test('chainFor: records the actual fallback board and detects its cycle', () => {
+  const root = { kind: 'kanban', chip: { id: 't_aaaaaa', connectionId: 'C1', profile: 'default', board: 'other', state: 'scheduled', waitingOn: 'card t_bbbbbb' } }
+  const info = (_chip, id) => ({ state: 'ok', info: { id, board: 'default', hop: { ref: { id: 't_bbbbbb' } } } })
+  const ch = m.chainFor(root, NOW, { info })
+  assert.equal(ch.leaf.text, 'circular wait')
+  assert.equal(ch.nodes.length, 1, 'same actual card is never listed twice after board fallback')
+})
+
+test('groupSharedRunning: preserve unrelated order and order capped ancestors before dependents', () => {
+  const row = (id, on) => ({ key: id, kind: 'kanban', label: id, chip: { id, connectionId: 'C1', profile: 'default', board: 'default', state: 'scheduled', waitingOn: on ? `card ${on}` : 'ci https://github.com/o/r/actions/runs/7' } })
+  const long = row('t_aaaaaa', 't_bbbbbb'), middle = row('t_bbbbbb'), short = row('t_cccccc')
+  const ordered = rows => m.groupSharedRunning(rows, NOW, m.chainLocal([long, middle, short])).order.map(o => o.row.key)
+  assert.deepEqual(ordered([long, short]), [long.key, short.key], 'unrelated roots retain source order despite different chain lengths')
+  const chain = Array.from({ length: 10 }, (_, n) => row(`t_${(n + 1).toString(16).padStart(6, '0')}`, `t_${(n + 2).toString(16).padStart(6, '0')}`))
+  const result = m.groupSharedRunning(chain.slice(0, 2), NOW, m.chainLocal(chain))
+  assert.deepEqual(result.order.map(o => o.row.key), [chain[1].key, chain[0].key], 'MAX_HOPS ties do not erase the known ancestor edge')
 })
 
 test('firstHop: a waiting card\'s own row starts the walk; causeBreakdown counts by root cause', () => {
@@ -234,7 +271,7 @@ test('lane_gate triage reads "Waiting for admission to lane", never worker slot;
 })
 
 test('two waiting cards sharing one running prerequisite: waiters are counted once each, the running card is not counted as waiting', () => {
-  const run = { chip: { id: 't_a0a0d0', state: 'running', where: 'worker-a1' }, label: 'Stage2 (d)' }
+  const run = { chip: { id: 't_a0a0d0', state: 'running', where: 'worker-a1', connectionId: 'C1', profile: 'default', board: 'default' }, label: 'Stage2 (d)' }
   const local = m.chainLocal([], [run])
   const w = id => ({ key: `kb:${id}`, kind: 'kanban', label: id, chip: { id, state: 'scheduled', look: 'waiting', waitingOn: 'card t_a0a0d0', connectionId: 'C1', profile: 'default' } })
   const rows = [w('t_a0a0e0'), w('t_a0a0f0')]

@@ -25,7 +25,9 @@ PERMISSIONS = ('absent', 'true', 'false', 'legacy')
 
 
 def test_backend_views_satisfy_desktop_contract(tmp_path):
-    node = find_node()  # first Node >= 18.19; fails (never skips) listing candidates if none
+    # Core-backed runs forbid scanning the real Hermes home; PATH still supplies
+    # the actual Node executable used for this cross-language contract.
+    node = find_node(home=tmp_path)  # fails (never skips) if PATH has no qualifying Node
     store = core.ActionStore(tmp_path / 'actions.sqlite3')
     cases = list(itertools.product(KINDS, PERMISSIONS, (False, True)))
     for kind, permission, withdrawn in cases:

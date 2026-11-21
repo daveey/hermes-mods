@@ -389,6 +389,13 @@ def pre_llm_call(session_id: str = "", user_message: str = "", platform: str = "
         pending = [{k: v for k, v in r.items() if k != 'resolution'}
                    for r in requests if r['state'] in ('open', 'needs_context') and not r.get('resolution')]
         import json
+        incomplete = [r for r in pending if (
+            r['state'] == 'needs_context' or not r['scope']['complete']
+            or not r['scope']['markdown'].strip()
+            or (r['kind'] == 'approval' and not any(c['effect'] == 'approve' for c in r['choices']))
+        )]
+        repair_ids = {r['requestId'] for r in incomplete}
+        decidable = [r for r in pending if r['requestId'] not in repair_ids]
         note = ('[Canonical requests awaiting a user decision: this list grants NO execution '
                 'permission for the requests listed here. Recorded decisions are omitted: '
                 'their authority comes from the admitted user decision or confirmed receipt, '
@@ -396,29 +403,32 @@ def pre_llm_call(session_id: str = "", user_message: str = "", platform: str = "
                 'If one is no longer needed (work finished, answered in chat, superseded), withdraw it with '
                 'action_request {"withdraw": {"requestId": "<id>", "reason": "<why>"}} so it leaves the '
                 'user\'s For you queue.]\n'
-                + json.dumps(pending)) if pending else ''
-        if pending:
+                + json.dumps(decidable)) if decidable else ''
+        if decidable:
             import time
-            created = {r['requestId']: st.created_at(own, r['requestId']) for r in pending}
-            note = _open_asks_index(pending, created, now=time.time(), budget=_head_budget()) + '\n' + note
+            created = {r['requestId']: st.created_at(own, r['requestId']) for r in decidable}
+            note = _open_asks_index(decidable, created, now=time.time(), budget=_head_budget()) + '\n' + note
             if _LETTER_REPLY.match(user_message if isinstance(user_message, str) else ""):
                 # Only a letter-shaped reply pays for presentation; first in the context so no spill hides it.
                 try:
                     presenter = _presenter(st)
-                    letters = _panel_letter_hint(user_message, [presenter.present(r) for r in pending])
+                    letters = _panel_letter_hint(user_message, [presenter.present(r) for r in decidable])
                 except Exception:
                     log.exception("user-steps panel letter mapping failed")
                     letters = ''
                 if letters:
                     note = letters + '\n' + note
-        incomplete = [r for r in pending if r['kind'] == 'approval' and not r['scope']['complete']]
         if incomplete:
-            # Missing plans are agent work: the user has no button for them.
-            note += ('\n[Agent work: these approvals lack a complete plan, so the user cannot decide them. '
-                     'If still needed, publish action_request with the same requestId and expectedRevision, '
-                     'the FULL exact plan, scope, consequences and approve/change/decline choices. Do not ask '
-                     'the user to request a plan. If it is no longer needed, withdraw it instead. Similar titles are not '
+            # Missing context is agent work for every request kind, not user consent.
+            note += ('\n[Agent work: these requests need complete context before the user can decide. '
+                     'If still needed, publish action_request with the same requestId and expectedRevision. '
+                     'Supply the FULL exact plan, scope and consequences for approvals, with approve/change/decline choices; '
+                     'for choice, input or external_step supply the complete question or step and valid answer choices. '
+                     'Do not ask the user to request a plan or repair missing context. This grants NO execution permission. '
+                     'If it is no longer needed, withdraw it instead. Similar titles are not '
                      'duplicates: withdraw one only when you know it asks the same decision.] ' + json.dumps([{'requestId': r['requestId'],
+                                                                     'kind': r['kind'],
+                                                                     'scope': r['scope'],
                                                                      'expectedRevision': r['revision'],
                                                                      'title': r['title']} for r in incomplete]))
         gone = st.unnotified_withdrawals(own)

@@ -27,6 +27,17 @@ let serial = 0
 const request = extra => ({ schemaVersion: 2, owner, requestId: `00000000-0000-4000-8000-${String(++serial).padStart(12, '0')}`, revision: 1, kind: 'choice', title: 'Raw card title t_example', scope: { complete: true, markdown: 'Unblock = continue; archive = abandon. No commands run from this panel.', sourceRefs: [] }, limits: [], exclusions: [], outcomes: { answer: 'Record answer' }, choices: ['Red','Green','Blue'].map((label, i) => ({ id: `card-${i}`, label, effect: 'answer' })), aliases: [], state: 'open', presentation: { kind: 'kanban-question', question: 'Which color should we use?', details: 'Original context and evidence. Unblock = continue; archive = abandon.', recommendedChoiceId: 'card-1', other: true }, ...extra })
 after(async () => { await React.act(async () => root.unmount()); dom.window.close() })
 
+test('repair questions suppress actions but recorded delivery keeps question context', async () => {
+ for (const extra of [{state:'needs_context'}, {resolution:{operationId:'op-context',choiceId:'card-1',revision:1}}]) {
+  const r = request(extra), recorded = !!r.resolution
+  await show(React.createElement(m.DecisionRow, {key:r.requestId, request:r, route, call:async()=>({operation:{operationId:'op-context',state:'pending'},request:r})}))
+  assert.equal(!!el().querySelector('[data-clarify-question]'), recorded)
+  assert.equal(el().querySelector('article').getAttribute('aria-label'), recorded ? r.presentation.question : r.title)
+  assert.equal(!!el().querySelector('[data-clarify-row]'), false)
+  assert.equal(!!el().querySelector('[data-ask-plan]'), false)
+ }
+})
+
 // Compare the visible compact face, not hidden Details textContent.
 test('card question has lettered ordered rows, hidden details and unchanged choice payload', async () => {
  const r = request(), calls = []

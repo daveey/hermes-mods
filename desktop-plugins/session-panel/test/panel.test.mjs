@@ -31,6 +31,31 @@ after(async () => {
   dom.window.close()
 })
 
+test('source failures are footer diagnostics, not waiting cards', async () => {
+  const chip = { key: 'unavailable-lineage', kind: 'kanban-status', title: 'Session lineage unavailable' }
+  const sorted = m.classify([chip])
+  assert.equal(sorted.waiting.length, 0)
+  assert.equal(sorted.sources.length, 1)
+  assert.equal(m.hasOpenWork(sorted), true)
+  host.state.focusedStoredSessionId.value = 'source-failure-chat'
+  window.localStorage.removeItem('hermes.sessionPanel.collapsed.v1')
+  window.__userSteps = { openAskCount: () => 0 }
+  window.__sessionTasks = { snapshot: { stored: 'source-failure-chat', chips: [chip] } }
+  await show(J.jsx(m.Panel, {}))
+  assert.match(el().querySelector('[data-source-unavailable]').textContent, /Session lineage unavailable/)
+  assert.equal(el().querySelector('[data-waiting-line]'), null)
+  assert.doesNotMatch(el().textContent, /1 waiting/)
+  host.state.focusedStoredSessionId.value = 'S1'
+})
+
+test('WaitLine pip reflects its own card rather than a container default', async () => {
+  for (const [state, expected] of [['ready', 'ready'], ['todo', 'queued'], ['running', 'running'], ['blocked', 'waiting']]) {
+    const chip = { key: `own-${state}`, id: `own-${state}`, kind: 'kanban', state, waitingOn: 'external service' }
+    await show(J.jsx(m.WaitLine, { i: { key: chip.key, label: state, kind: 'kanban', chip } }))
+    assert.equal(el().querySelector('[data-line-pip]').getAttribute('data-line-pip'), expected)
+  }
+})
+
 test('person dependency is linked and visible even without card work or with panel collapsed', async () => {
   host.state.focusedStoredSessionId.value = 'person-chat'
   window.localStorage.setItem('hermes.sessionPanel.collapsed.v1', '[]')
@@ -779,7 +804,8 @@ test('panel: a chain through this chat\'s running card ends there; its card open
   const tree = el().querySelector('[data-running-list] [data-wait-group="t_aaaaaaaa"]')
   assert.equal(tree.querySelector('[data-running-title]').textContent, 'Parent build')
   const chain = tree.querySelector('[data-wait-kids] [data-wait-chain="kb:t_kid"]')
-  assert.equal(chain.querySelector('[data-wait-parent]').textContent, 'Waiting on Parent build')
+  assert.equal(chain.querySelector('[data-wait-parent]').textContent, 'scheduled')
+  assert.doesNotMatch(chain.querySelector('[data-wait-reason]').textContent, /Waiting on Parent build/)
   // The running card opens from its own row; its dependent's long form opens the waiting card itself.
   await React.act(async () => { tree.querySelector('[data-running-row] button').click() })
   await React.act(async () => { tree.querySelector('[data-running-row] [data-open-card]').click() })
@@ -843,7 +869,8 @@ test('panel: one-line rows carry their box (yellow waiting, the hub "H"); a bloc
   const hub = folded.querySelector('[data-waiting-line="kb:t_h"] [data-line-pip]')
   assert.equal(hub.hasAttribute('data-line-pip-hub'), true)
   assert.equal(hub.textContent, 'H')
-  assert.equal(folded.querySelector('[data-waiting-line="kb:t_bu"] [data-line-pip]').getAttribute('data-line-pip'), 'waiting')
+  // The dependency reason stays separate; the todo card's own box is queued.
+  assert.equal(folded.querySelector('[data-waiting-line="kb:t_bu"] [data-line-pip]').getAttribute('data-line-pip'), 'queued')
 })
 
 test('panel: chains cross chats: each card names the chat that owns it (opens it), ending on the leaf', async () => {
@@ -905,6 +932,102 @@ const settle = async () => { for (let n = 0; n < 3; n++) await React.act(async (
 const D = 't_a0a0d001', E = 't_a0a0e001', F = 't_a0a0f001', G = 't_a0a0a001'
 const wchip = (id, label, on) => card(id, 'scheduled', { label, look: 'waiting', waitingOn: `card ${on}`, waitingSince: Date.now() / 1000 - 600 })
 
+test('panel (whole): flat ancestors precede descendants and are never drawn again in their chains', async () => {
+  window.localStorage.clear()
+  bridges({ chips: [wchip(G, 'Descendant', E), wchip(F, 'Other dependent', E),
+    card(E, 'scheduled', { label: 'Ancestor', look: 'waiting', waitingOn: 'ci https://github.com/o/r/actions/runs/7' })] })
+  await show(React.createElement(m.Panel, { key: 'flat-ancestor-first' }))
+  await React.act(async () => el().querySelector('[data-waiting-toggle]').click())
+  await settle()
+  assert.equal(drawn(E), 1, 'visible ancestor is not repeated as a dependency node')
+  assert.deepEqual([...el().querySelectorAll('[data-open-waiting] [data-wait-chain]')].map(e => e.getAttribute('data-wait-chain')), [`kb:${E}`, `kb:${G}`, `kb:${F}`])
+  for (const id of [G, F]) assert.match(el().querySelector(`[data-wait-chain="kb:${id}"] [data-chain-same]`).textContent, /Ancestor/)
+  await React.act(async () => el().querySelector('[data-waiting-toggle]').click())
+  assert.equal(drawn(E), 1, 'folded row remains visible without a false reference to a hidden tree')
+  assert.equal(el().querySelectorAll('[data-chain-same]').length, 0)
+})
+
+test('panel (whole): shared remote intermediate is drawn once beneath a running root', async () => {
+  window.localStorage.clear()
+  const remote = 't_a0a0b001'
+  bridges({ chips: [card(D, 'running', { label: 'Build', activityAt: Date.now() / 1000 - 30 }), wchip(E, 'Dependent one', remote), wchip(F, 'Dependent two', remote)] })
+  m.resetReadsForTests()
+  window.hermesDesktop = { api: async a => a.path.includes(`/tasks/${remote}`)
+    ? { task: { id: remote, title: 'Shared intermediate', status: 'todo' }, events: [], links: { parents: [D] }, link_tasks: [{ id: D, status: 'running' }] }
+    : { tasks: [], includes: ['done'] } }
+  await show(React.createElement(m.Panel, { key: 'shared-intermediate' }))
+  await settle()
+  assert.equal(drawn(D), 1)
+  assert.equal(drawn(remote), 1, 'shared remote prerequisite must not repeat under multiple dependents')
+  assert.match(el().querySelector(`[data-wait-chain="kb:${F}"] [data-chain-same]`).textContent, /same prerequisite.*Dependent one/)
+})
+
+test('extra parent suppression requires qualified identity and the actual read board', () => {
+  const chip = { connectionId: 'C1', profile: 'default', board: 'requested' }
+  const info = { board: 'default', parents: ['t_parent', 't_extra', 't_extra'] }
+  const key = m.chainKey({ ...chip, board: 'default' }, 't_parent')
+  assert.deepEqual(m.extraChainParents(chip, info, key), ['t_extra'])
+  assert.deepEqual(m.extraChainParents(chip, info, m.chainKey(chip, 't_parent')), ['t_parent', 't_extra'])
+  assert.deepEqual(m.extraChainParents({ ...chip, connectionId: 'C2' }, info, key), ['t_parent', 't_extra'])
+  assert.deepEqual(m.extraChainParents({ ...chip, profile: 'other' }, info, key), ['t_parent', 't_extra'])
+  assert.deepEqual(m.extraChainParents({}, info, undefined), ['t_parent', 't_extra'])
+  assert.deepEqual(m.extraChainParents(chip, { parents: null }, key), [])
+})
+
+test('WaitChain does not read a stale chip for extra parents', async () => {
+  window.localStorage.clear()
+  m.resetReadsForTests()
+  let reads = 0
+  window.hermesDesktop = { api: async () => { reads++; return null } }
+  const chip = { kind: 'kanban', id: 't_stale', connectionId: 'C1', profile: 'default', board: 'default', state: 'scheduled', stale: true }
+  await show(J.jsx(m.WaitChain, { i: { key: 'stale', kind: 'kanban', label: 'Stale card', chip } }))
+  await flush()
+  assert.equal(reads, 0)
+  assert.equal(el().querySelector('[data-wait-extra-parents]'), null)
+})
+
+test('panel: nested dependency hides redundant ancestor text but preserves additional parents', async () => {
+  window.localStorage.clear()
+  bridges({ chips: [card(D, 'running', { label: 'Visible build', activityAt: Date.now() / 1000 - 30 }), wchip(E, 'Dependent', D)] })
+  m.resetReadsForTests()
+  window.hermesDesktop = { api: async a => a.path.includes(`/tasks/${E}`)
+    ? { task: { id: E, title: 'Dependent', status: 'todo' }, events: [], links: { parents: [D, F] }, link_tasks: [{ id: D, status: 'running' }, { id: F, status: 'done' }] }
+    : { tasks: [], includes: ['done'] } }
+  await show(React.createElement(m.Panel, { key: 'nested-extra-parent' }))
+  await settle()
+  const reason = el().querySelector(`[data-wait-chain="kb:${E}"] [data-wait-reason]`)
+  assert.doesNotMatch(reason.textContent, /Waiting on Visible build/)
+  assert.match(reason.textContent, /scheduled/)
+  const extra = reason.querySelector('[data-wait-extra-parents]')
+  assert.ok(!!extra, 'additional parents remain visible, even when not the followed chain')
+  assert.match(extra.textContent, new RegExp(F))
+  assert.doesNotMatch(extra.textContent, /waiting|open/i, 'parent membership alone does not prove unfinished work')
+  assert.equal(extra.textContent.includes(D), false, 'visible followed parent is not repeated')
+  // Without a visible ancestor the flat row keeps its normal reason and the extra edge.
+  const chip = { ...wchip(E, 'Dependent', D), connectionId: 'C1', profile: 'default', board: 'default' }
+  const i = { key: `kb:${E}`, kind: 'kanban', label: 'Dependent', chip }
+  const running = { key: `kb:${D}`, kind: 'kanban', label: 'Visible build', chip: { ...chip, id: D, state: 'running' } }
+  await show(J.jsx(m.WaitChain, { i, known: new Set(), local: m.chainLocal([i], [running]) }))
+  assert.equal(el().querySelector('[data-wait-parent]'), null)
+  assert.match(el().querySelector('[data-wait-reason]').textContent, /waiting on running work/)
+  assert.match(el().querySelector('[data-wait-extra-parents]').textContent, new RegExp(F))
+})
+
+test('panel (whole): identical running prerequisite ids on different routes remain separate trees', async () => {
+  window.localStorage.clear()
+  bridges({ chips: [wchip(E, 'Wait local', D), { ...wchip(F, 'Wait other', D), connectionId: 'C2', profile: 'other', board: 'other' }] })
+  window.hermesDesktop = { api: async a => a.path.includes(`/tasks/${D}`)
+    ? { task: { id: D, title: `Build ${a.connectionId}`, status: 'running' }, events: [], links: { parents: [] } }
+    : { tasks: [], includes: ['done'] } }
+  m.resetReadsForTests()
+  await show(React.createElement(m.Panel, { key: 'qualified-groups' }))
+  await settle()
+  await React.act(async () => el().querySelector('[data-waiting-toggle]').click())
+  await settle()
+  assert.equal(el().querySelectorAll('[data-wait-group]').length, 2, 'bare-id equality cannot merge distinct routes')
+  assert.deepEqual([...el().querySelectorAll('[data-prereq-title]')].map(e => e.textContent).sort(), ['Build C1', 'Build C2'])
+})
+
 test('panel (whole): two dependents + a multilevel waiter nest under the running card in In progress; the root is drawn once and nothing is left in a flat Waiting list', async () => {
   window.localStorage.clear()
   bridges({ chips: [card(D, 'running', { label: 'Stage2 (d)', activityAt: Date.now() / 1000 - 30 }), wchip(E, 'Stage2 (e)', D), wchip(F, 'Baseline producer', D), wchip(G, 'Closeout', E)] })
@@ -923,7 +1046,7 @@ test('panel (whole): two dependents + a multilevel waiter nest under the running
   const top = [...tree.querySelector(':scope > [data-wait-kids]').children].map(x => x.getAttribute('data-wait-chain'))
   assert.deepEqual(top, [`kb:${E}`, `kb:${F}`])
   const e = tree.querySelector(`[data-wait-chain="kb:${E}"]`)
-  assert.equal(e.querySelector('[data-wait-parent]').textContent, 'Waiting on Stage2 (d)')
+  assert.equal(e.querySelector('[data-wait-parent]').textContent, 'scheduled')
   assert.equal(e.querySelector('[data-line-pip]').getAttribute('data-line-pip'), 'waiting', 'waiters stay yellow, not running')
   assert.ok(e.querySelector(`:scope > [data-wait-kids] [data-wait-chain="kb:${G}"]`), 'Closeout nests under Stage2 (e)')
   for (const id of [E, F, G]) assert.equal(drawn(id), 1, id)
@@ -946,7 +1069,7 @@ test('panel (whole): a single waiting dependent uses the same hierarchy (no two-
   assert.equal(tree.getAttribute('data-wait-group'), D)
   const kid = tree.querySelector(':scope > [data-wait-kids] > [data-wait-chain]')
   assert.equal(kid.getAttribute('data-wait-chain'), `kb:${E}`)
-  assert.equal(kid.querySelector('[data-wait-parent]').textContent, 'Waiting on Stage2 (d)')
+  assert.equal(kid.querySelector('[data-wait-parent]').textContent, 'scheduled')
   assert.equal(root.querySelector('[data-section="waiting"]'), null)
   assert.match(root.querySelector('[data-status-summary]').textContent, /1 running.*1 waiting/)
 })
@@ -1593,16 +1716,51 @@ test('panel: a failed session-cards read keeps the last-known Done count', async
   window.hermesDesktop = { api: async () => { throw new Error('500 database is locked: cached reader is borrowed') } }
   await React.act(async () => { await m.refreshDone(); await flush() })
   assert.deepEqual(summary(), ['1 running', '1 done'], 'a failed read keeps what was known')
+  assert.match(el().querySelector('[data-history-unavailable]')?.textContent || '', /Showing last-known finished cards/)
   // After a relaunch (memory gone), a failed read still paints the stored list.
   await show(null)
   m.resetDoneCacheForTests()
   await show(React.createElement(m.Panel, { key: 'keep-done-2' }))
   await React.act(async () => { await m.refreshDone(); await flush() })
   assert.deepEqual(summary(), ['1 running', '1 done'])
-  // An answer from an owner that cannot list finished cards is not a failure: Done is unknown, never a stale list.
+  // Unsupported answers also retain last-known rows, explicitly labelled as unavailable.
   window.hermesDesktop = { api: async () => ({ tasks: [] }) }
   await React.act(async () => { await m.refreshDone(); await flush() })
-  assert.deepEqual(summary(), ['1 running'])
+  assert.deepEqual(summary(), ['1 running', '1 done'])
+  assert.match(el().querySelector('[data-history-unavailable]')?.textContent || '', /Showing last-known finished cards/)
+})
+
+test('panel: first failed history read stays visible without inventing empty or finished work', async () => {
+  await show(null)
+  window.localStorage.clear()
+  m.resetDoneCacheForTests()
+  bridges({ chips: [], cards: [] })
+  window.hermesDesktop = { api: async () => { throw new Error('private backend error') } }
+  await show(React.createElement(m.Panel, { key: 'first-history-failure' }))
+  await React.act(async () => { await m.refreshDone(); await flush() })
+  assert.ok(el().querySelector('[data-history-unavailable]') !== null, 'failed initial history must remain visible')
+  assert.match(el().querySelector('[data-history-unavailable]').textContent, /Finished history unavailable/)
+  assert.equal(el().textContent.includes('private backend error'), false, 'no raw backend error in UI')
+  assert.ok(el().querySelector('[data-finished-cards]') === null, 'failure is not finished work')
+  assert.ok(el().querySelector('[data-waiting-toggle]') === null, 'failure is not a waiting card')
+  for (const response of [{ tasks: [] }, { tasks: [], includes: ['archived'] }, { tasks: null, includes: ['done'] }]) {
+    window.hermesDesktop = { api: async () => response }
+    await React.act(async () => { await m.refreshDone(); await flush() })
+    assert.ok(el().querySelector('[data-history-unavailable]') !== null, 'unsupported history answer is still unknown')
+  }
+  await React.act(async () => {
+    m.ingestBundle('C1', 'default', { session: host.state.focusedStoredSessionId.value, done: [] }, { trusted: false })
+    await flush()
+  })
+  assert.ok(el().querySelector('[data-history-unavailable]') !== null, 'untrusted cached bundle cannot clear failure')
+  window.__sessionTasks.lineageIds = async () => Object.assign(new Set(), { incomplete: true })
+  await React.act(async () => { await m.refreshDone(); await flush() })
+  assert.ok(el().querySelector('[data-history-unavailable]') !== null, 'incomplete lineage is not empty history')
+  window.__sessionTasks.lineageIds = async s => new Set([s])
+  window.hermesDesktop = { api: async () => ({ tasks: [], includes: ['done', 'archived'] }) }
+  await React.act(async () => { await m.refreshDone(); await flush() })
+  assert.ok(el().querySelector('[data-history-unavailable]') === null, 'successful recovery clears diagnostic')
+  assert.ok(el().querySelector('[data-session-panel]') === null, 'verified empty panel may hide')
 })
 
 test('panel: a Done read that fails after focus moved leaves the new chat alone', async () => {

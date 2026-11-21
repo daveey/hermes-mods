@@ -41,8 +41,8 @@ test('chain leaf from a card read: task.ready_since gives the age, beside the qu
 })
 
 test('chain through a ready card of this chat: its own row gives the age', () => {
-  const ready = { id: 't_a0a0a0', state: 'ready', readySince: (NOW - 2 * 3600_000) / 1000 }
-  const local = new Map([['t_a0a0a0', { item: { chip: ready }, waiting: false, label: 'Mine', chip: ready }]])
+  const ready = { id: 't_a0a0a0', connectionId: 'C1', profile: 'default', board: 'default', state: 'ready', readySince: (NOW - 2 * 3600_000) / 1000 }
+  const local = m.chainLocal([], [{ label: 'Mine', chip: ready }])
   const root = { key: 'kb:t_r', kind: 'kanban', label: 't_r', chip: { id: 't_r', state: 'scheduled', look: 'waiting', waitingOn: 'card t_a0a0a0', connectionId: 'C1', profile: 'default' } }
   const ch = m.chainFor(root, NOW, { info: () => ({ state: 'failed', info: null }), local })
   assert.deepEqual(ch.leaf, { kind: 'slot', text: 'waiting 2 h for a worker' })
@@ -71,8 +71,8 @@ test('ready panel row names provider pacing and Pacific reset, not a worker wait
   assertPacing(readyRows({}, NOW, pacedInfo)[0].detail)
 })
 test('waiting parent via a ready card ends on pacing, including a same-chat card', () => {
-  const ready = { id: 't_a0a0a0', state: 'ready' }
-  const local = new Map([['t_a0a0a0', { item: { chip: ready }, waiting: false, label: 'Mine', chip: ready }]])
+  const ready = { id: 't_a0a0a0', connectionId: 'C1', profile: 'default', board: 'default', state: 'ready' }
+  const local = m.chainLocal([], [{ label: 'Mine', chip: ready }])
   const root = { key: 'kb:t_r', kind: 'kanban', chip: { id: 't_r', state: 'scheduled', look: 'waiting', waitingOn: 'card t_a0a0a0', connectionId: 'C1', profile: 'default' } }
   for (const map of [new Map(), local]) {
     const ch = m.chainFor(root, NOW, { info: pacedInfo, local: map })

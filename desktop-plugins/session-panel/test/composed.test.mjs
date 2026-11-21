@@ -43,7 +43,7 @@ const STEP = { id: 'us_0dd02bb1aa', kind: 'decide', text: TITLE, status: 'open',
 const canonicalRequest = {
   schemaVersion: 2, requestId: '0dd02bb1-bcb2-434b-acb2-ab36816ce2a5', revision: 1, kind: 'choice', title: TITLE, state: 'open',
   owner: { gatewayId: 'G1', profile: 'default', storedSessionId: 'S1' },
-  scope: { markdown: '', complete: false, sourceRefs: [] }, aliases: [{ gatewayId: 'G1', profile: 'default', type: 'user_step', id: STEP.id }],
+  scope: { markdown: 'Keep the shared runner or release it?', complete: true, sourceRefs: [] }, aliases: [{ gatewayId: 'G1', profile: 'default', type: 'user_step', id: STEP.id }],
   limits: [], exclusions: [], outcomes: { answer: 'The agent continues with your answer.' },
   choices: [{ id: 'a', label: 'Keep it', effect: 'answer' }, { id: 'b', label: 'Release it', effect: 'answer' }]
 }
@@ -72,6 +72,18 @@ async function render(key) {
 
 const unaskedRows = id => [...el().querySelectorAll('[data-panel-row]')].filter(r => r.getAttribute('data-panel-row').endsWith(`/${id}`))
 const stripCards = id => [...el().querySelectorAll(`[data-user-steps-card="${id}"]`)]
+
+test('composed: incomplete questions are agent repair, not needs-you', async () => {
+ const repair = {...canonicalRequest, state:'needs_context', scope:{complete:false, markdown:'Clarify the missing scope',sourceRefs:[]}}
+ const dispose = wire({chips:[], items:[], requests:[repair], ledgerSteps:[]})
+ try {
+  await render('repair-audience')
+  assert.equal(steps.openAskCount(),0)
+  assert.equal(el().querySelectorAll('[data-agent-deliveries] [data-action-request]').length,1)
+  assert.equal(el().querySelectorAll('[data-decision-audience="human"]').length,0)
+  assert.doesNotMatch(el().textContent,/Needs you · 1/)
+ } finally { dispose() }
+})
 
 test('composed: the unlinked legacy card renders once; the same-title canonical request stays its own tile', async () => {
   const dispose = wire({ chips: [chip('t_01a18c6adae1fae9')], items: [item('t_01a18c6adae1fae9')], requests: [canonicalRequest] })

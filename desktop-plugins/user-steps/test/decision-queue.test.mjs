@@ -30,6 +30,21 @@ let serial = 0
 const freshRequest = extra => request({ requestId: `00000000-0000-4000-8000-${String(++serial).padStart(12, '0')}`, ...extra })
 after(async () => { await React.act(async () => root.unmount()); dom.window.close() })
 
+test('all incomplete request kinds are agent repair, with no decision or repair-demand buttons', async () => {
+ for (const kind of ['approval', 'choice', 'input', 'external_step']) {
+  for (const extra of [{state: 'needs_context'}, {scope: {complete: false, markdown: 'Repair this scope', sourceRefs: []}}, {scope: {complete: true, markdown: '  ', sourceRefs: []}}]) {
+   const r = freshRequest({kind, ...extra})
+   assert.equal(m.agentPending(r), true, `${kind} ${JSON.stringify(extra)}`)
+   await show(React.createElement(m.DecisionRow, {key: r.requestId, request: r, route, call: async () => ({})}))
+   assert.equal(el().querySelector('article').dataset.decisionAudience, 'agent')
+   assert.equal(!!el().querySelector('[data-decision-effect], [data-ask-plan]'), false, 'agent repair must not require a user action')
+   assert.ok(el().querySelector('[data-agent-completion-pending]'))
+  }
+  assert.equal(m.agentPending(freshRequest({kind})), false)
+ }
+ assert.equal(m.agentPending(freshRequest({choices: [{id:'no', label:'No', effect:'decline'}]})), true)
+})
+
 test('canonical projection uses exact identity and qualified aliases only', () => {
  const r = freshRequest(), other = request({ requestId: '00000000-0000-4000-8000-000000000002' })
  assert.equal(m.projectRequests([r,r,other]).length, 2)
@@ -279,19 +294,15 @@ test('answer-text focuses and validates free text, then sends an answer rather t
  assert.equal(posts[0].revisionText,'Plain text please');assert.equal(posts[0].choiceId,'answer-text')
 })
 
-test('incomplete approvals await agent completion while legacy clarification labels stay literal',async()=>{
+test('incomplete approvals and questions await agent completion',async()=>{
  for(const kind of ['approval','choice','input']) {
   const r=freshRequest({kind,state:'needs_context',scope:{complete:false,markdown:'Which change?',sourceRefs:[]},choices:[{id:'context',label:'Explain the target',effect:'revise'}]})
   await show(React.createElement(m.DecisionRow,{key:r.requestId,request:r,route,call:async()=>assert.fail('no submission')}))
   const labels=[...el().querySelectorAll('button')].map(b=>b.textContent)
   assert.equal(labels.includes('Request full plan inline'),false)
-  if(kind==='approval'){
-   assert.match(el().querySelector('[data-agent-completion-pending]').textContent,/asked you to approve this without a plan/)
-   assert.deepEqual(labels,['Ask agent for the plan','Dismiss'])
-  }else{
-   assert.equal(el().querySelector('[data-approval-blocked]'),null)
-   assert.deepEqual(labels,['Explain the target'])
-  }
+  assert.equal(el().querySelector('article').dataset.decisionAudience,'agent')
+  assert.ok(el().querySelector('[data-agent-completion-pending]'))
+  assert.deepEqual(labels,['Dismiss'])
  }
 })
 
@@ -302,18 +313,15 @@ test('legacy "Request complete action" placeholder never renders for any kind (D
   await show(React.createElement(m.DecisionRow,{key:r.requestId,request:r,route,call:async()=>assert.fail('no submission')}))
   assert.doesNotMatch(el().textContent,/Request complete action/,kind)
   const labels=[...el().querySelectorAll('button')].map(b=>b.textContent)
-  if(kind==='approval') assert.deepEqual(labels,['Ask agent for the plan','Dismiss'])
-  else if(kind==='external_step') assert.deepEqual(labels,['Ask agent for the full step','Dismiss'])
-  else assert.deepEqual(labels,[],kind)
-  if(['approval','external_step'].includes(kind)) assert.match(el().querySelector('[data-agent-completion-pending]').textContent,/without a (plan|complete step)/)
-  else assert.match(el().querySelector('[data-approval-blocked]').textContent,/Answer in chat/)
+  assert.deepEqual(labels,['Dismiss'],kind)
+  assert.ok(el().querySelector('[data-agent-completion-pending]'))
  }
 })
 
 test('incomplete external steps await agent completion; complete external steps keep their choices',async()=>{
  const pending=freshRequest({kind:'external_step',state:'needs_context',scope:{complete:false,markdown:'Plug in the cable',sourceRefs:[]},choices:[{id:'ctx',label:'Explain',effect:'revise'}]})
  await show(React.createElement(m.DecisionRow,{key:pending.requestId,request:pending,route,call:async()=>assert.fail('no submission')}))
- assert.deepEqual([...el().querySelectorAll('button')].map(b=>b.textContent),['Ask agent for the full step','Dismiss'])
+ assert.deepEqual([...el().querySelectorAll('button')].map(b=>b.textContent),['Dismiss'])
  const done=freshRequest({kind:'external_step',choices:[{id:'did',label:'I did it',effect:'approve'},{id:'edit',label:'Change it',effect:'revise'}]})
  await show(React.createElement(m.DecisionRow,{key:done.requestId,request:done,route,call:async()=>assert.fail('no submission')}))
  assert.deepEqual([...el().querySelectorAll('button')].map(b=>b.textContent),['I did it','Change it'])
@@ -423,16 +431,15 @@ test('busy session: approve collapses the row, auto-retries the same operation u
  m.autoRetry && (m.autoRetry.ms=15000)
 })
 
-test('plan-less approval: Ask agent for the plan drafts the ask, Dismiss hides it until a new revision (desktop-1321064734)',async()=>{
+test('plan-less approval needs no user draft; Dismiss hides it until a new revision',async()=>{
  const drafts=[];const prev=host.composer.setDraft;host.composer.setDraft=(sid,text)=>drafts.push([sid,text])
  const r=freshRequest({title:'Open a pull request implementing these strategy changes',state:'needs_context',scope:{complete:false,markdown:'Do you want me to open a PR?',sourceRefs:[]},outcomes:{revise:'Waiting for the agent'},choices:[{id:'revise',label:'Request changes',effect:'revise'}]})
  window.hermesDesktop={api:async()=>({requests:[r]})}
  await show(React.createElement(m.ActionQueue,{key:'planless'}))
  assert.equal(el().querySelectorAll('[data-action-request]').length,1)
  assert.doesNotMatch(el().textContent,/Request changes|keep work blocked|Work stays blocked/)
- await click('Ask agent for the plan')
- assert.equal(drafts.length,1);assert.equal(drafts[0][0],'S1')
- assert.match(drafts[0][1],/full plan/i);assert.match(drafts[0][1],/Open a pull request implementing these strategy changes/)
+ assert.equal(!!el().querySelector('[data-ask-plan]'),false)
+ assert.equal(drafts.length,0)
  await click('Dismiss')
  assert.equal(el().querySelectorAll('[data-action-request]').length,0)
  window.hermesDesktop.api=async()=>({requests:[{...r,revision:2}]})
@@ -726,9 +733,9 @@ test('a withdrawn ask with a stranded retry intent never renders Check status or
  await show(null); delete window.hermesDesktop; window.localStorage.clear()
 })
 
-test('a plan-less ask offers Ask agent for the plan plus Not needed when the owner can withdraw, else the local Dismiss', async () => {
+test('a plan-less ask offers only Not needed when the owner can withdraw, else local Dismiss', async () => {
  const planless = askable({ title: 'Approve without a plan', state: 'needs_context', scope: { complete: false, markdown: 'Do you mean **open a pull request**, or something else?', sourceRefs: [] }, outcomes: { revise: 'Request complete action; keep work blocked.' }, exclusions: [], choices: [{ id: 'request-context', label: 'Request complete action', effect: 'revise' }] })
- for (const [ping, want] of [[pingWithdraw, ['Ask agent for the plan', 'Not needed']], [{ ok: true, api: 2 }, ['Ask agent for the plan', 'Dismiss']]]) {
+ for (const [ping, want] of [[pingWithdraw, ['Not needed']], [{ ok: true, api: 2 }, ['Dismiss']]]) {
   m.clearFeatureCache?.()
   const call = async path => path.endsWith('/ping') ? ping : {}
   await show(React.createElement(m.DecisionRow, { key: want.join('+'), request: planless, route, call }))
