@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, superseding, physical_asks, replan, agent_condition, owner_recommendation, unblock_card_quality, merge_ask, access_scope, approval_reuse, judge as judge_mod
+    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, superseding, physical_asks, replan, agent_condition, owner_recommendation, unblock_card_quality, merge_ask, desktop_reopen, access_scope, approval_reuse, judge as judge_mod
 except ImportError:  # pytest/spec loading imports the hyphenated plugin dir without a parent package
     import importlib.util as _ilu
     import sys as _sys
@@ -46,6 +46,7 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
     owner_recommendation = _sib("owner_recommendation")
     unblock_card_quality = _sib("unblock_card_quality")
     merge_ask = _sib("merge_ask")
+    desktop_reopen = _sib("desktop_reopen")
     access_scope = _sib("access_scope")
     approval_reuse = _sib("approval_reuse")
 
@@ -485,6 +486,16 @@ def _record_answers(session_id: str, msg: str | None, history: list,
 def post_tool_call(tool_name: str = "", args: Any = None, result: Any = None, session_id: str = "", **_: Any) -> None:
     if session_id:
         LOG.add(session_id, tool_name, args, result)
+        # Keep ETA evidence for 15 minutes across turn-log resets; same session only.
+        try:
+            rows = _DESKTOP_TOOLS.setdefault(session_id, [])
+            now = time.time()
+            rows[:] = [r for r in rows if now - r['t'] <= desktop_reopen.MAX_AGE]
+            if desktop_reopen._COMMAND.search(str(args)):
+                rows.append({'tool': tool_name, 'args': str(args), 'result': result, 't': now})
+                del rows[:-60]
+        except Exception as e:
+            core.log_event('desktop_reopen_error', session=session_id, error=repr(e)[:300])
 
 
 # ---- L2 -----------------------------------------------------------------------------------------------
@@ -610,6 +621,11 @@ def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", fi
     if not _gate_eligible(session_id, platform) or not isinstance(final_response, str):
         return None
     budget = MAX_NUDGES if hold_budget is None else min(MAX_NUDGES, max(0, hold_budget))
+    reopened = _desktop_reopen_gate(session_id, 'pre_final_gate', final_response, turn_messages,
+                                   attempt < budget)
+    if reopened is not None:
+        record_verdict(session_id, 'held', final_response)
+        return {'hold': True, 'nudge': reopened['message']}
     # Exact source reconciliation must not fail open when unrelated history or
     # audit storage is corrupt. Reporting is best-effort, suppression is not.
     exact = user_step_lifecycle.preflight({"session_id": session_id, "draft": final_response})
@@ -787,6 +803,45 @@ _WORKER_NO_ASK_KINDS = {"dependency", "time", "transient"}
 
 def _tools_now(session_id: str) -> list[dict]:
     return LOG.get(session_id)
+
+
+_DESKTOP_HELD: dict[str, int] = {}
+_DESKTOP_TOOLS: dict[str, list[dict]] = {}
+
+
+def _desktop_reopen_gate(session_id: str, surface: str, text: str, messages=None,
+                         can_hold: bool = True) -> dict | None:
+    """Bounded per-session lint; proof errors fail open without changing other ask gates."""
+    try:
+        if not desktop_reopen.asks(text):
+            return None
+        tools = list(_DESKTOP_TOOLS.get(session_id, [])) + _tools_now(session_id)
+        tools += desktop_reopen.message_tools(messages or [])
+        if desktop_reopen.ready(tools):
+            return None
+        n = _DESKTOP_HELD.get(session_id, 0)
+        if n >= desktop_reopen.MAX_HOLDS or not can_hold:
+            core.log_event('desktop_reopen_released', session=session_id, tool=surface, holds=n)
+            return None
+        _DESKTOP_HELD[session_id] = n + 1
+        core.log_event('desktop_reopen_hold', session=session_id, tool=surface, attempt=n)
+        return {'action': 'block', 'message': desktop_reopen.HOLD_MESSAGE}
+    except Exception as e:
+        core.log_event('desktop_reopen_error', session=session_id, tool=surface, error=repr(e)[:300])
+        return None
+
+
+def _desktop_reopen_tool_gate(session_id: str, tool_name: str, args: dict) -> dict | None:
+    if tool_name == 'action_request' and 'withdraw' not in args:
+        req = args.get('request')
+        if not isinstance(req, dict):
+            return None
+        text = str(req.get('title') or '') + '\n' + json.dumps(req.get('scope') or '')
+    elif tool_name in ('kanban_create', 'kanban_block') and isinstance(args.get('human_request'), dict):
+        text = str(args['human_request'].get('action') or '')
+    else:
+        return None
+    return _desktop_reopen_gate(session_id, tool_name, text)
 
 
 def _reconcile_prose(session_id: str, surface: str, asks: list[str]) -> dict | None:
@@ -1247,6 +1302,9 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
             replanned = _replan_hold(session_id, tool_name, "\n".join(replan.chat_hits(candidates)), chat=True)
             if replanned is not None:
                 return replanned
+        reopened = _desktop_reopen_tool_gate(session_id, tool_name, args)
+        if reopened is not None:
+            return reopened
         merged = _merge_ask_gate(session_id, tool_name, args)
         if merged is not None:
             return merged
