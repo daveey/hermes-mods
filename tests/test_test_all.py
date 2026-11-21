@@ -71,6 +71,16 @@ class TestAll(unittest.TestCase):
         self.assertIn("Python >= 3.11", r.stderr)
         self.assertNotIn("Traceback", r.stderr)
 
+    def test_empty_core_venv_falls_through_to_production(self):
+        core = self.root / 'core'
+        import venv
+        venv.EnvBuilder(with_pip=False).create(core / '.venv')
+        runner = runpy.run_path(str(RUNNER))
+        select = runner['select_python']
+        with patch.dict(os.environ, {'HERMES_MODS_PYTHON': ''}), \
+                patch.dict(select.__globals__, production_python=lambda c: '/production/python'):
+            self.assertEqual(select(core), ('/production/python', False))
+
     def test_no_core_excludes_inherited_checkout_and_editable_install(self):
         make_tree(self.root, {'example': '''
             import importlib.util, os, subprocess, sys
@@ -513,6 +523,7 @@ class TestAll(unittest.TestCase):
             p.parent.mkdir(parents=True, exist_ok=True)
             p.touch()
         with patch('pathlib.Path.home', return_value=self.root), patch('sys.platform', 'darwin'), \
+                patch.dict(runner['select_python'].__globals__, core_python_usable=lambda c, p: True), \
                 patch.dict(os.environ, {'HERMES_MODS_PYTHON': str(override)}):
             self.assertEqual(runner['select_python'](core), (str(override), False))
             override.unlink()  # a missing override is not a candidate
