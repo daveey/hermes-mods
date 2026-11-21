@@ -43,7 +43,11 @@ invalidated once per revision, and a frame is sent only when the view/parameter 
 differs. `&debug=true` adds a `timing` object to view frames (wall-clock epoch seconds:
 `project_start`, `project_end`, `sent`; change-triggered frames additionally carry
 `cursor_poll`, `detected`, `released`). Timing is outside the view hash and absent
-otherwise. An unchanged board produces
+otherwise. Debug frames also include `load: {pid, stream_viewers}`: accepted
+lanes stream connections in that backend process, including non-debug viewers.
+This is a point-in-time connection census, not a count of projection builds;
+HTTP request traffic is recorded separately by the request tracer.
+An unchanged board produces
 only `{type: "heartbeat", version}` every 30 seconds. Time-window/age values are
 snapshots at board/config changes, not a separate clock-driven feed.
 
