@@ -3282,6 +3282,22 @@ def _sender(session_id: str | None) -> dict:
     return info
 
 
+def _take_back(path: Path) -> bool:
+    """Take an unclaimed request back out of the outbox. True only when this call took it, so the courier never did.
+
+    The courier's claim is os.replace of the same file, and the take-back must use os.replace too: on APFS a
+    concurrent unlink(outbox/x) can return success after the claim's rename already moved x (both "won" in about
+    1 of 5 races in a probe), whereas two renames of one name never both succeed. The taken copy keeps a dotted,
+    non-.json name, so no outbox listing or sweep ever sees it, and is deleted at once."""
+    taken = path.with_name(f".{path.stem}.taken")
+    try:
+        os.replace(path, taken)
+    except FileNotFoundError:
+        return False
+    taken.unlink(missing_ok=True)
+    return True
+
+
 def relay_once(base: Path, device: str, args: dict, sender: dict, result_wait: float,
                yieldable: bool = False, rid: str | None = None) -> dict:
     """One request to the Mac's courier. Errors (never a hang) when nobody claims it within PICKUP_S.
@@ -3305,8 +3321,7 @@ def relay_once(base: Path, device: str, args: dict, sender: dict, result_wait: f
                 continue
             result.unlink(missing_ok=True)
             return data if isinstance(data, dict) else {"ok": False, "error": "courier posted no result"}
-        if outbox.exists() and time.time() > pickup:
-            outbox.unlink(missing_ok=True)
+        if time.time() > pickup and _take_back(outbox):  # claimed at the last moment: wait for its answer
             return {"ok": False, "code": "not_picked_up",
                     "error": (f"The Hermes Desktop on `{device}` did not pick up the request (it may "
                               f"be quitting, asleep, or running an older session-mentions plugin). "
@@ -3314,8 +3329,7 @@ def relay_once(base: Path, device: str, args: dict, sender: dict, result_wait: f
         if _interrupted():
             return {"ok": False, "error": "interrupted"}
         if yieldable and _yield_requested():  # a chat message: hand control back; the Mac's job keeps waiting
-            if outbox.exists():
-                outbox.unlink(missing_ok=True)  # unclaimed status poll: nobody needs its answer now
+            _take_back(outbox)  # unclaimed status poll: nobody needs its answer now
             return {"ok": True, "status": "pending", "yielded": True}
         time.sleep(0.3)
     return {"ok": False, "code": "no_answer", "error": f"`{device}` claimed the request but sent no answer in time"}
@@ -3441,8 +3455,9 @@ def duplicate_note(entry: dict, job_id: str) -> str:
 # ---------------------------------------------------------------- withdrawing a relayed request (t_01a1d47bf0506084)
 # Problem: an owner chat superseded a relayed Terraform apply while the MacBook's Desktop was away, and withdraw
 # was refused for every relayed job, so the stale apply stayed armed. Now:
-#  1. still in this gateway's outbox (unclaimed): unlink it. The courier's claim is os.replace of that same file,
-#     so exactly one of the two succeeds; a reconnecting Mac never sees a withdrawn request.
+#  1. still in this gateway's outbox (unclaimed): take it back with os.replace (_take_back). The courier's claim is
+#     os.replace of that same file, so exactly one of the two succeeds (rename vs unlink is not exclusive on APFS);
+#     a reconnecting Mac never sees a withdrawn request.
 #  2. already claimed: the withdrawal goes to the Mac as a request of its own (withdraw_relayed there: a
 #     tombstone under the start lock, or withdraw_job on the existing job). Courier away or not picking up:
 #     the withdrawal is queued in the outbox for WITHDRAW_QUEUE_S, the longest any outbox file lives (sweep).
@@ -3486,13 +3501,8 @@ def withdraw_remote(base: Path, ident: str, reason: str, session_id: str | None 
         return {**out, "ok": False, "status": entry.get("status") or entry.get("state"),
                 "error": (f"nothing to withdraw: request {rid} already ended ({entry.get('status') or entry.get('state')})"
                           f" and its outcome was read.")}
-    # 1. unclaimed: the outbox file is the request; whoever moves or removes it first wins.
-    try:
-        (base / "outbox" / f"{rid}.json").unlink()
-        won = True
-    except FileNotFoundError:
-        won = False
-    if won:
+    # 1. unclaimed: the outbox file is the request; whoever moves it first (claim or _take_back) wins.
+    if _take_back(base / "outbox" / f"{rid}.json"):
         entry.update(withdraw_reason=reason, withdrawn_where="gateway outbox", withdraw_confirmed=True)
         ledger_close(base, entry, "withdrawn", "withdrawn")
         return {**out, "ok": True, "status": "withdrawn", "where": "gateway outbox",

@@ -55,7 +55,7 @@ Invariants (each has a test in `tests_user_terminal.py` or `../session-mentions/
   `test_claimed_then_mac_offline_withdraw_is_queued_and_applied_on_reconnect`,
   `test_withdraw_claimed_running_job_through_a_live_courier`, `test_withdraw_through_an_old_mac_says_nothing_was_withdrawn`,
   `../session-mentions/tests/user-terminal.test.mjs` ("withdraw: ..."):
-  - Still in the gateway's outbox (unclaimed): the gateway unlinks it. The courier's claim is `os.replace` of that
+  - Still in the gateway's outbox (unclaimed): the gateway takes it back with `os.replace` (`_take_back`; an `unlink` racing the claim can also succeed on APFS). The courier's claim is `os.replace` of that
     same file, so exactly one wins; a Mac that reconnects never sees it. Ledger `withdrawn`, result `ok`,
     `status: withdrawn`; a later poll by that id reads `withdrawn` without a courier.
   - Already claimed: the withdrawal goes to the Mac as a `user_terminal` request with `args.withdraw_request`;

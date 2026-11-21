@@ -1459,6 +1459,66 @@ def test_hub_claim_and_withdraw_race_exactly_one_wins(remote, monkeypatch, tmp_p
     assert claims + withdraws == 60
 
 
+def test_take_back_and_courier_claim_race_exactly_one_wins(tmp_path):
+    """The primitive under withdraw and relay_once's pickup timeout. Both sides look the name up first (as
+    claim_pending and withdraw_remote do): with unlink as the take-back, APFS let both succeed in ~1 of 5 races."""
+    (tmp_path / "outbox").mkdir()
+    (tmp_path / "claimed").mkdir()
+    for _ in range(300):
+        path = tmp_path / "outbox" / "r.json"
+        path.write_text("{}")
+        go, got = threading.Barrier(2), {}
+
+        def look():
+            try:
+                path.read_text()
+            except OSError:
+                pass
+
+        def claim():
+            go.wait()
+            look()
+            try:
+                os.replace(path, tmp_path / "claimed" / path.name)  # relay_files.claim_pending's claim
+                got["claimed"] = True
+            except OSError:
+                got["claimed"] = False
+
+        def take_back():
+            go.wait()
+            look()
+            got["taken"] = ut._take_back(path)
+
+        ts = [threading.Thread(target=claim), threading.Thread(target=take_back)]
+        [t.start() for t in ts]
+        [t.join(10) for t in ts]
+        assert got["claimed"] != got["taken"], got
+        assert (tmp_path / "claimed" / "r.json").exists() == got["claimed"]
+        assert not path.exists() and not list((tmp_path / "outbox").iterdir())  # no taken copy left behind
+        (tmp_path / "claimed" / "r.json").unlink(missing_ok=True)
+
+
+def test_relay_once_claimed_at_the_pickup_deadline_waits_for_its_answer(remote, monkeypatch):
+    """A courier that claims the request just as pickup expires: relay_once must not say not_picked_up (a start
+    reported unclaimed may be resent while the Mac opens its window); it waits for that courier's answer."""
+    base, _ = remote
+    monkeypatch.setattr(ut, "PICKUP_S", 0.05)
+    real, claimed = ut._take_back, []
+
+    def courier_first(path):
+        if not claimed:  # the courier wins the outbox file, then answers a moment later
+            claimed.extend(rf.claim_pending(base, home=False, courier="macbook", reach=["nous-1"]))
+            threading.Timer(0.3, rf.write_result, (path.stem, {"ok": True, "status": "running", "job_id": "j1"},
+                                                   base)).start()
+        return real(path)
+
+    monkeypatch.setattr(ut, "_take_back", courier_first)
+    res = ut.relay_once(base, "macbook", {"job_id": "j1"}, {"platform": "desktop"}, 5.0)
+    assert [r["args"] for r in claimed] == [{"job_id": "j1"}], claimed
+    assert res == {"ok": True, "status": "running", "job_id": "j1"}, res
+    assert not _outbox(base)
+
+
 def test_mac_start_and_withdraw_of_one_request_exactly_one_wins(remote, monkeypatch, tmp_path):
     """Mac side: a claimed start racing its withdrawal. Withdraw first -> the start is refused before any job or
     window; start first -> the job exists and is withdrawn (the error-free result names the Mac job dir)."""
