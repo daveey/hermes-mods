@@ -145,10 +145,21 @@ def launching_workers(machines, events):
     return rows, median(durations) if durations else None
 
 
-def live_leases(shadow_dir, now_ms):
-    """Live leases from every board replica: [{board, task, title, holder, started_at}]."""
+def _replicas(shadow_dir, boards):
+    """Board replica files, limited to ``boards`` (the slugs this gateway syncs) when known.
+
+    A board dropped from ``kanban.sync.boards`` keeps its last replica in the shadow dir forever; its
+    frozen ready rows showed as waiting cards on an idle machine (hub, 2026-11-21: an archived askeve
+    card still "ready" in a replica last written 2026-11-12). None scans every replica.
+    """
+    paths = sorted(Path(shadow_dir).glob('*.db'))
+    return paths if boards is None else [p for p in paths if p.stem in boards]
+
+
+def live_leases(shadow_dir, now_ms, boards=None):
+    """Live leases from each synced board replica: [{board, task, title, holder, started_at}]."""
     out = []
-    for path in sorted(Path(shadow_dir).glob('*.db')):
+    for path in _replicas(shadow_dir, boards):
         try:
             db = _ro_connect(path, timeout=1)
         except sqlite3.Error:
@@ -167,16 +178,17 @@ def live_leases(shadow_dir, now_ms):
     return out
 
 
-def waiting_cards(shadow_dir, profile_dispatchable):
+def waiting_cards(shadow_dir, profile_dispatchable, boards=None):
     """Unleased ready cards assigned to profiles the gateway dispatcher can spawn.
 
     Retain placement fields for the core's eligibility predicate. Old replicas
-    without an assignee cannot establish slot demand and are excluded.
+    without an assignee cannot establish slot demand and are excluded. ``boards``
+    limits the scan to synced boards (``_replicas``).
     """
     out = []
     if profile_dispatchable is None:
         return None  # unknown is not zero (nor every ready card)
-    for path in sorted(Path(shadow_dir).glob('*.db')):
+    for path in _replicas(shadow_dir, boards):
         try:
             db = _ro_connect(path, timeout=1)
         except sqlite3.Error:
