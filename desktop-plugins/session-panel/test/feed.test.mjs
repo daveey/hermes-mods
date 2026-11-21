@@ -158,7 +158,9 @@ test('a catch-up answer older than a push that landed meanwhile is dropped', asy
 test('one catch-up in flight per connection', async () => {
   let release
   window.__answer = () => new Promise(r => { release = () => r(answer()) })
-  const a = m.feedCatchUp(target()), b = m.feedCatchUp(target())
+  const a = m.feedCatchUp(target())
+  await settle()
+  const b = m.feedCatchUp(target())
   await settle()
   assert.equal(calls.length, 1, 'the second waits for the first')
   release()
@@ -191,13 +193,28 @@ test('a push re-stamps only the chats it vouches for; the gateway\'s own profile
   assert.deepEqual(touched.at(-1)[2], ['S1'], 'S2 (dropped or failing on the gateway) is left to age')
 })
 
-test('three queued catch-ups for one connection run one after another, never two at once', async () => {
+test('catch-ups for one connection never overlap, and those waiting merge into one', async () => {
   let inFlight = 0, most = 0
   const releases = []
   window.__answer = () => { inFlight++; most = Math.max(most, inFlight); return new Promise(r => releases.push(() => { inFlight--; r(answer()) })) }
-  const all = [m.feedCatchUp(target()), m.feedCatchUp(target()), m.feedCatchUp(target())]
+  const first = m.feedCatchUp(target(['S1']))
+  await settle()
+  const all = [first, m.feedCatchUp(target(['S2'])), m.feedCatchUp(target(['S3']), { full: true })]
   for (let i = 0; i < 3; i++) { await settle(); await settle(); releases.shift()?.() }
   await Promise.all(all)
-  assert.equal(calls.length, 3)
+  assert.equal(calls.length, 2, 'the two waiting calls merged')
+  assert.deepEqual(calls[1].body.sessions, ['S2', 'S3'])
   assert.equal(most, 1)
+})
+
+test('a catch-up bundle is trusted only for chats the last push vouched for; warm skips only those', async () => {
+  window.__answer = () => answer({ rev: 3 })
+  await m.feedCatchUp(target(['S1', 'S2']))
+  window.__answer = () => answer({ rev: 3, reset: false, bundles: { S1: bundle('S1'), S2: bundle('S2') } })
+  push({ heartbeat: true, prev: 3, rev: 3, fresh: ['S1'] })
+  await settle(); await settle()
+  const byS = Object.fromEntries(ingested.slice(-2).map(x => [x.session, x.trusted]))
+  assert.deepEqual(byS, { S1: true, S2: false }, 'S2 is failing on the gateway: a cached copy here')
+  assert.equal(m.feedVouches({ connectionId: 'C1', profile: 'default', session: 'S1' }), true)
+  assert.equal(m.feedVouches({ connectionId: 'C1', profile: 'default', session: 'S2' }), false)
 })

@@ -1073,7 +1073,7 @@ export async function warmRecent({ nowMs = Date.now(), force = false } = {}) {
     for (const route of warmTargets()) {
       const key = routeKey(route)
       if (key === focused || nowMs - (warmedAt.get(key) || 0) < WARM_EVERY_MS) continue
-      if (feedIsLive(route)) continue // the gateway's feed keeps this chat current: nothing to warm
+      if (feedVouches(route)) continue // the gateway's feed keeps this chat current: nothing to warm
       if (typeof document !== 'undefined' && document.hidden) break
       if (routeKey(panelRoute()) !== focused) break // the user switched: stop, the next pass starts over
       warmedAt.set(key, nowMs)
@@ -1955,7 +1955,12 @@ export function feedIsLive(route, nowMs = Date.now()) {
   const st = route?.connectionId ? feeds.get(connKey(route.connectionId, route.profile)) : null
   return !!st?.liveAt && !st.unsupported && nowMs - st.liveAt <= FEED_STALE_MS
 }
-export const resetFeedForTests = () => { feeds.clear(); feedFlights.clear(); feedScopes.clear(); doneFeedAt.clear() }
+/** True while `route`'s gateway feed is live and its last push vouched for this chat. */
+export function feedVouches(route, nowMs = Date.now()) {
+  const st = route?.connectionId ? feeds.get(connKey(route.connectionId, route.profile)) : null
+  return feedIsLive(route, nowMs) && !!st?.fresh?.includes(route.session)
+}
+export const resetFeedForTests = () => { feeds.clear(); feedFlights.clear(); feedQueued.clear(); feedScopes.clear(); doneFeedAt.clear() }
 
 /** Fill every cache the panel renders from with one chat's bundle. `trusted`: it came while pushes are flowing, so
  *  it is current (re-stamped by later pushes); otherwise it is an ordinary cached copy. Exported for tests. */
@@ -1991,6 +1996,7 @@ export function ingestBundle(connectionId, profile, b, { nowMs = Date.now(), tru
  *  re-stamp their cards, wakes, Done and kanban. A chat it does not name is left to age. */
 function confirmFeed(st, fresh, nowMs = Date.now()) {
   st.liveAt = nowMs
+  st.fresh = Array.isArray(fresh) ? fresh : []
   const vouched = (st.sessions || []).filter(s => Array.isArray(fresh) && fresh.includes(s))
   for (const session of vouched) {
     const scope = routeKey({ connectionId: st.connectionId, profile: st.profile, session })
@@ -2022,14 +2028,29 @@ export function feedTargets(rows) {
 
 /** Register `target.sessions` with its gateway's feed and apply what changed since our last revision. One in flight
  *  per connection (a later call waits for it). False when the gateway has no feed or the call failed. */
+const feedQueued = new Map() // connection key -> the one catch-up waiting its turn ({ target, opts, p })
 export function feedCatchUp(target, opts = {}) {
   const key = connKey(target?.connectionId, target?.profile)
+  // One waiting catch-up per connection: later calls merge into it (their chats and flags), so a stalled gateway
+  // never builds a queue.
+  const q = feedQueued.get(key)
+  if (q) {
+    q.target.sessions = [...new Set([...(q.target.sessions || []), ...(target?.sessions || [])])]
+    q.opts.full = q.opts.full || !!opts.full
+    q.opts.reset = q.opts.reset || !!opts.reset
+    return q.p
+  }
+  const entry = { target: { ...target, sessions: [...(target?.sessions || [])] }, opts: { ...opts } }
   const before = feedFlights.get(key) || Promise.resolve()
-  // Chained: each call runs after every earlier one for this connection has answered (never two at once).
-  const p = before.catch(() => {}).then(() => feedCatchUpNow(target, opts))
-  const tail = p.finally(() => { if (feedFlights.get(key) === tail) feedFlights.delete(key) })
+  // Chained: each runs after the one before it for this connection has answered (never two at once).
+  entry.p = before.catch(() => {}).then(() => {
+    if (feedQueued.get(key) === entry) feedQueued.delete(key)
+    return feedCatchUpNow(entry.target, entry.opts)
+  }).catch(e => { log('feed catch-up failed', key, e?.message || e); return false })
+  feedQueued.set(key, entry)
+  const tail = entry.p.finally(() => { if (feedFlights.get(key) === tail) feedFlights.delete(key) })
   feedFlights.set(key, tail)
-  return p
+  return entry.p
 }
 
 async function feedCatchUpNow(target, { nowMs = Date.now(), reset = false, full = false } = {}) {
@@ -2061,8 +2082,11 @@ async function feedCatchUpNow(target, { nowMs = Date.now(), reset = false, full 
   const next = { connectionId: target.connectionId, profile, feedProfile: str(r.profile) || profile, feed: r.feed, epoch: r.epoch, rev: Number(r.rev) || 0,
     sessions: [...target.sessions], liveAt: cur?.feed === r.feed && cur?.epoch === r.epoch ? cur.liveAt : 0, at: Date.now() }
   feeds.set(key, next)
-  const trusted = feedIsLive({ connectionId: target.connectionId, profile })
-  for (const b of Object.values(r.bundles || {})) ingestBundle(target.connectionId, profile, b, { trusted })
+  // Trusted only while pushes flow, and only for chats the last push vouched for (a chat failing on the gateway
+  // keeps its old bundle there: it is a cached copy here).
+  const live = feedIsLive({ connectionId: target.connectionId, profile })
+  next.fresh = cur?.feed === r.feed && cur?.epoch === r.epoch ? cur.fresh || [] : []
+  for (const b of Object.values(r.bundles || {})) ingestBundle(target.connectionId, profile, b, { trusted: live && next.fresh.includes(b.session) })
   notifyTitles()
   return true
 }
@@ -2089,7 +2113,7 @@ export function onFeedEvent(ev) {
   if (rev <= st.rev) return // already have it (a catch-up answered first)
   if (Number(p.prev) !== st.rev || (Array.isArray(p.sessions) && p.sessions.length)) { void feedCatchUp(target); return }
   st.rev = rev
-  for (const b of Object.values(p.bundles || {})) ingestBundle(st.connectionId, st.profile, b, { trusted: true })
+  for (const b of Object.values(p.bundles || {})) ingestBundle(st.connectionId, st.profile, b, { trusted: Array.isArray(p.fresh) && p.fresh.includes(b.session) })
   confirmFeed(st, p.fresh)
   notifyTitles()
   if (!wasLive) void feedCatchUp(target, { full: true })

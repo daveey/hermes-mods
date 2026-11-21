@@ -91,7 +91,7 @@ class Feed:
         self.lock = threading.RLock()        # interest / bundles / failures
         self.compute_lock = threading.Lock() # store + revision + emit, in order
         self.stopped = threading.Event()
-        self.last_emit = 0.0
+        self.last_emit = clock()          # the heartbeat clock starts with the feed
         self.last_tick_s = 0.0               # duration of the last tick that recomputed (shown by /status)
         self._seq = itertools.count(1)       # compute order: a bundle computed earlier never replaces a later one
         self._stamps: Any = None
@@ -153,6 +153,8 @@ class Feed:
         """Compute outside any lock. A chat that fails keeps its last bundle; its failure is counted and logged."""
         out = {}
         for s in sessions:
+            # A long pass must not starve clients of heartbeats (their trust lapses after three missed ones).
+            self._publish({}, heartbeat=True)
             try:
                 out[s] = self.compute(s)
                 with self.lock:

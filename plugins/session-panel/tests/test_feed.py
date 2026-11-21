@@ -324,3 +324,18 @@ def test_every_push_names_the_chats_it_vouches_for():
     t['now'] += feedmod.HEARTBEAT_S + 1
     f.tick()
     assert 'S2' not in pushed[-1]['fresh'], 'nor a chat no longer watched'
+
+
+def test_a_long_recompute_pass_keeps_heartbeating():
+    f, r, pushed, t = make()
+    f.changes(['S1', 'S2'])
+    pushed.clear()
+    real = r.linked
+
+    def slow(ids):
+        t['now'] += feedmod.HEARTBEAT_S + 1   # each chat takes longer than a heartbeat interval
+        return real(ids)
+    r.linked = slow
+    t['now'] += feedmod.FULL_EVERY_S + 1
+    f.tick()
+    assert sum(1 for p in pushed if p.get('heartbeat')) >= 1, 'heartbeats went out during the pass'
