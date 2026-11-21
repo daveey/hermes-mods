@@ -14,9 +14,11 @@ POST /api/plugins/session-mentions/cancel  {id}          -> {"ok": bool}  (only 
 
 Push: any write to the outbox emits ``plugin.session-mentions.outbox`` {feed, seq} on this process's event stream
 (``relay_files.notify_outbox``), and a watcher thread started by the first /ping or /outbox (so it runs in the
-process that serves the Desktop) stats the outbox dir every WATCH_TICK_S and emits when it changed and holds a
-request — that covers writers in other processes (user-terminal, coach, ``hermes gateway run`` turns) — plus a
-{feed, seq, heartbeat: true} every HEARTBEAT_S, which tells the Desktop that this gateway's pushes reach it.
+process that serves the Desktop) checks the outbox every WATCH_TICK_S (see ``watch_once``): it pushes for a request
+it has not seen — that covers writers in other processes (user-terminal, coach, ``hermes gateway run`` turns) —
+re-pushes every REPUSH_S while an unclaimed request is younger than REPUSH_WINDOW_S (a push lost on a socket
+reconnect), and sends {feed, seq, heartbeat: true, pending} every HEARTBEAT_S, which tells the Desktop that this
+gateway's pushes reach it and whether anything waits. Plugin unload stops it (``stop`` / ``__init__.stop_watcher``).
 
 ``home=1`` marks this gateway's own Desktop courier. Any other drainer (another Mac's Desktop,
 reaching this gateway through a separate serve process) gets nothing while the home courier is
@@ -28,10 +30,12 @@ re-executes relay_files.py whenever the file changes, so protocol fixes land wit
 from __future__ import annotations
 
 import importlib.util
+import logging
 import os
 import sys
 import threading
 import time
+import types
 from pathlib import Path
 from typing import Any, Dict
 
@@ -41,10 +45,13 @@ router = APIRouter()
 
 WATCH_TICK_S = 1.0
 HEARTBEAT_S = 20.0
+REPUSH_S = 5.0          # re-push an unclaimed request this often ...
+REPUSH_WINDOW_S = 30.0  # ... while it is younger than this (the tools' pickup timeouts are 15 s / 30 s)
+SHARED_KEY = "_session_mentions_outbox_watch"
 # Off only for test processes (tests/conftest.py), which drive watch_once() directly instead of a thread.
 WATCH_ENABLED = os.environ.get("HERMES_SESSION_MENTIONS_OUTBOX_WATCH", "1") != "0"
 _WATCH_LOCK = threading.Lock()
-_WATCHER: list = []  # [thread] once started in this process
+log = logging.getLogger("session-mentions")
 
 
 def _rf():
@@ -72,46 +79,99 @@ def _outbox_key(path) -> tuple | None:
     return (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_ctime_ns)
 
 
+def _pending(outbox) -> Dict[str, float]:
+    """Unclaimed requests in the outbox: name -> mtime (a request claimed or withdrawn meanwhile is left out)."""
+    out: Dict[str, float] = {}
+    for p in outbox.glob("*.json"):
+        try:
+            out[p.name] = p.stat().st_mtime
+        except OSError:
+            continue
+    return out
+
+
 def watch_once(state: dict, now: float) -> str:
-    """One watcher step: '' (nothing), 'outbox' (dir changed and holds a request) or 'heartbeat'. Emits it.
-    ``state`` carries {key, beat_at} between steps. Never raises."""
+    """One watcher step; emits and returns what it sent: '' (nothing), 'outbox' (a request it had not seen),
+    'repush' (a still-unclaimed request younger than REPUSH_WINDOW_S, every REPUSH_S: a push the Desktop never got
+    is re-sent) or 'heartbeat' (every HEARTBEAT_S, with ``pending`` from the dir listing). Never raises.
+
+    The dir's stat key only lets a step skip the listing when nothing can have been missed: the key is trusted
+    only once the dir is DIR_SETTLE_SECONDS old (a coarse or racing timestamp — a temp-file create and its rename
+    in one tick — can leave the key unchanged after a request lands), and the dir is listed every step while it
+    is unsettled, holds a young request, or a heartbeat is due. New requests are found by name, not by the key."""
     try:
         rf = _rf()
         base = rf.root()
-        key = _outbox_key(base / "outbox")
-        if key is not None and key != state.get("key"):
-            state["key"] = key
-            if any((base / "outbox").glob("*.json")):
-                rf.notify_outbox(base)
-                state["beat_at"] = now
-                return "outbox"
-        if now - state.get("beat_at", 0.0) >= HEARTBEAT_S:
-            rf.notify_outbox(base, heartbeat=True)
+        outbox = base / "outbox"
+        key = _outbox_key(outbox)
+        settle = float(getattr(rf, "DIR_SETTLE_SECONDS", 2.0))
+        settled = key is not None and now - max(key[2], key[3]) / 1e9 >= settle
+        beat_due = now - state.get("beat_at", 0.0) >= HEARTBEAT_S
+        if key == state.get("key") and settled and not state.get("young") and not beat_due:
+            return ""
+        files = _pending(outbox)
+        state["key"] = key if settled else None  # an unsettled dir is listed again next step
+        state["young"] = any(now - m < REPUSH_WINDOW_S for m in files.values())
+        seen = state.get("seen", set())
+        state["seen"] = set(files)
+        if set(files) - seen:
+            rf.notify_outbox(base)
+            state["push_at"] = now
+            return "outbox"
+        if state["young"] and now - state.get("push_at", 0.0) >= REPUSH_S:
+            rf.notify_outbox(base)
+            state["push_at"] = now
+            return "repush"
+        if beat_due:
+            rf.notify_outbox(base, heartbeat=True, pending=bool(files))
             state["beat_at"] = now
             return "heartbeat"
     except Exception:
-        pass
+        log.debug("session-mentions outbox watch step failed", exc_info=True)
     return ""
 
 
-def _watch() -> None:
+def _shared():
+    """Watcher state shared with the plugin module (``__init__.stop_watcher``), which is a separate import."""
+    mod = sys.modules.get(SHARED_KEY)
+    if mod is None:
+        mod = types.ModuleType(SHARED_KEY)
+        mod.thread = None
+        mod.stop = threading.Event()
+        mod.disabled = False
+        sys.modules[SHARED_KEY] = mod
+    return mod
+
+
+def _watch(stop: threading.Event) -> None:
     state: dict = {}
-    while True:
+    while not stop.is_set():
         watch_once(state, time.time())
-        time.sleep(WATCH_TICK_S)
+        stop.wait(WATCH_TICK_S)
 
 
 def ensure_watcher() -> bool:
-    """Start this process's outbox watcher once (the process serving the Desktop). True when it started now."""
+    """Start this process's outbox watcher once (the process serving the Desktop). True when it started now.
+    Not while the plugin is unloaded (``stop()``): its routes stay mounted, but nothing restarts it."""
     if not WATCH_ENABLED:
         return False
     with _WATCH_LOCK:
-        if _WATCHER and _WATCHER[0].is_alive():
+        sh = _shared()
+        if sh.disabled or (sh.thread is not None and sh.thread.is_alive() and not sh.stop.is_set()):
             return False
-        t = threading.Thread(target=_watch, name="session-mentions-outbox-watch", daemon=True)
-        t.start()
-        _WATCHER[:] = [t]
+        sh.stop = threading.Event()
+        sh.thread = threading.Thread(target=_watch, args=(sh.stop,), name="session-mentions-outbox-watch", daemon=True)
+        sh.thread.start()
         return True
+
+
+def stop(join_s: float = 0.0) -> None:
+    """Stop the watcher (plugin unload / disable) and keep it stopped until the plugin registers again."""
+    sh = _shared()
+    sh.disabled = True
+    sh.stop.set()
+    if join_s and sh.thread is not None:
+        sh.thread.join(join_s)
 
 
 def _courier_args(rf, q) -> Dict[str, Any]:

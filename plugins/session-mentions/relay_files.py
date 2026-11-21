@@ -334,22 +334,33 @@ def feed_id(base: Path | None = None) -> str:
     return f"{socket.gethostname()}:{hashlib.sha1(path.encode()).hexdigest()[:12]}"
 
 
-def notify_outbox(base: Path | None = None, heartbeat: bool = False) -> bool:
-    """Push ``plugin.session-mentions.outbox`` {feed, seq[, heartbeat]} to this process's Desktop clients.
+_EMIT_WARNED = [False]
+
+
+def notify_outbox(base: Path | None = None, heartbeat: bool = False, pending: bool | None = None) -> bool:
+    """Push ``plugin.session-mentions.outbox`` {feed, seq[, heartbeat, pending]} to this process's Desktop clients.
 
     Never raises: a process with no Desktop client (``hermes gateway run``, cron, a worker) or no core at all
-    is a no-op, and the request still waits in the outbox for the next drain. True when the broadcast call ran."""
+    is a no-op, and the request still waits in the outbox for the next drain. The first failure in a process is
+    logged at warning, later ones at debug. True when the broadcast call ran."""
     try:
         with _SEQ_LOCK:
             _SEQ[0] += 1
             seq = _SEQ[0]
-        payload = {"feed": feed_id(base), "seq": seq}
+        payload: dict = {"feed": feed_id(base), "seq": seq}
         if heartbeat:
             payload["heartbeat"] = True
+        if pending is not None:
+            payload["pending"] = bool(pending)
         from hermes_cli.plugin_events import broadcast_plugin_event  # type: ignore
         broadcast_plugin_event("session-mentions", OUTBOX_EVENT, payload)
         return True
-    except Exception:
+    except Exception as exc:
+        import logging
+        log = logging.getLogger("session-mentions")
+        level = logging.DEBUG if _EMIT_WARNED[0] else logging.WARNING
+        _EMIT_WARNED[0] = True
+        log.log(level, "session-mentions: outbox push not sent (%s); the courier finds the request on its next drain", exc)
         return False
 
 

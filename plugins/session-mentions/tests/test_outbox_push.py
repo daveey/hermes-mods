@@ -122,32 +122,130 @@ def _api(tmp_path, monkeypatch):
     return api
 
 
-def test_watcher_emits_on_new_request_and_heartbeats(tmp_path, monkeypatch, events):
+def _write(base: Path, rid: str, age: float = 0.0) -> Path:
+    path = base / "outbox" / f"{rid}.json"
+    rf.atomic_write(path, {"id": rid, "action": "list", "created_at": time.time() - age, "ttl": 600})
+    if age:
+        os.utime(path, (time.time() - age, time.time() - age))
+    return path
+
+
+def test_watcher_pushes_new_requests_and_heartbeats_with_pending(tmp_path, monkeypatch, events):
     api = _api(tmp_path, monkeypatch)
     assert api.WATCH_ENABLED is False and api.ensure_watcher() is False  # tests/conftest.py: no threads in tests
     base = tmp_path / "session_mentions"
+    api._rf()  # creates the dirs
     state: dict = {}
-    t = 1000.0
+    t = time.time()
     assert api.watch_once(state, t) == "heartbeat"  # first step: tell the Desktop pushes reach it
-    assert events[-1][2].get("heartbeat") is True
-    assert api.watch_once(state, t + 1) == ""
+    assert events[-1][2] == {"feed": api._rf().feed_id(), "seq": events[-1][2]["seq"], "heartbeat": True, "pending": False}
     # A writer in another process (user-terminal, coach, `hermes gateway run`) never emits itself.
-    rf_live = api._rf()
-    rf_live.atomic_write(base / "outbox" / "x1.json", {"id": "x1", "action": "list"})
-    assert api.watch_once(state, t + 2) == "outbox"
-    assert events[-1][1] == "outbox" and "heartbeat" not in events[-1][2]
-    assert events[-1][2]["feed"] == rf_live.feed_id()
-    assert api.watch_once(state, t + 3) == ""  # unchanged dir: no repeat
-    # A claim empties the dir: it changed, but there is nothing to drain.
+    _write(base, "x1")
+    assert api.watch_once(state, t + 1) == "outbox"
+    assert events[-1][1] == "outbox" and set(events[-1][2]) == {"feed", "seq"}
+    # Claimed: nothing to push, and the next heartbeat says nothing waits.
     os.replace(base / "outbox" / "x1.json", base / "claimed" / "x1.json")
-    os.utime(base / "outbox", ns=(time.time_ns(), time.time_ns() + 5_000_000_000))
-    assert api.watch_once(state, t + 4) == ""
-    assert api.watch_once(state, t + 2 + api.HEARTBEAT_S) == "heartbeat"
+    assert api.watch_once(state, t + 2) == ""
+    assert api.watch_once(state, t + 1 + api.HEARTBEAT_S) == "heartbeat"
+    assert events[-1][2]["pending"] is False
 
 
-def test_watcher_survives_emit_failure(tmp_path, monkeypatch, broken):
+def test_lost_push_is_resent_every_5s_while_the_request_is_young(tmp_path, monkeypatch, events):
+    """The first push is lost (socket reconnect): the watcher re-pushes every REPUSH_S while the request is
+    unclaimed and younger than REPUSH_WINDOW_S, so a push-live Desktop drains it inside the 15 s / 30 s pickup
+    timeouts instead of at its 60 s safety drain (the Desktop half: outbox-push.test.mjs)."""
     api = _api(tmp_path, monkeypatch)
-    assert api.watch_once({}, 1000.0) == "heartbeat"  # notify_outbox swallowed the failure
+    base = tmp_path / "session_mentions"
+    api._rf().root()
+    state: dict = {}
+    t = time.time()
+    api.watch_once(state, t)  # heartbeat
+    _write(base, "r1")
+    sent = [(dt, api.watch_once(state, t + dt)) for dt in range(1, 16)]
+    pushes = [dt for dt, kind in sent if kind in ("outbox", "repush")]
+    assert pushes[0] == 1 and sent[0][1] == "outbox"
+    assert pushes[1:] == [6, 11]  # re-sent every 5 s: a Desktop that missed the first drains within 15 s
+    os.replace(base / "outbox" / "r1.json", base / "claimed" / "r1.json")
+    after = [api.watch_once(state, t + dt) for dt in range(16, 40)]
+    assert not {"outbox", "repush"} & set(after)  # claimed: no more pushes (heartbeats only)
+
+
+def test_old_unclaimed_request_is_not_repushed_but_heartbeat_says_pending(tmp_path, monkeypatch, events):
+    api = _api(tmp_path, monkeypatch)
+    base = tmp_path / "session_mentions"
+    api._rf().root()
+    t = time.time()
+    state: dict = {}
+    assert api.watch_once(state, t) == "heartbeat"
+    _write(base, "stuck", age=api.REPUSH_WINDOW_S + 5)  # routed to a Mac nobody here serves
+    assert api.watch_once(state, t + 1) == "outbox"  # first sighting
+    assert [api.watch_once(state, t + dt) for dt in range(2, int(api.HEARTBEAT_S))] == [""] * (int(api.HEARTBEAT_S) - 2)
+    assert api.watch_once(state, t + api.HEARTBEAT_S) == "heartbeat"
+    assert events[-1][2]["pending"] is True
+
+
+def test_watcher_lists_an_unsettled_dir_even_when_its_stat_key_did_not_change(tmp_path, monkeypatch, events):
+    """ext4/HFS+ race: a temp-file create and its rename in one timestamp tick can leave the dir's stat key the
+    same after a request lands. The key is trusted only once the dir is DIR_SETTLE_SECONDS old."""
+    api = _api(tmp_path, monkeypatch)
+    base = tmp_path / "session_mentions"
+    api._rf().root()
+    t = time.time()
+    frozen = (1, 2, int(t * 1e9), int(t * 1e9))  # the same key at every step, dir modified "just now"
+    monkeypatch.setattr(api, "_outbox_key", lambda _p: frozen)
+    state: dict = {}
+    assert api.watch_once(state, t) == "heartbeat"
+    _write(base, "raced")
+    assert api.watch_once(state, t + 0.5) == "outbox"
+    # Once settled with nothing young, an unchanged key skips the listing.
+    old = (1, 2, int((t - 100) * 1e9), int((t - 100) * 1e9))
+    monkeypatch.setattr(api, "_outbox_key", lambda _p: old)
+    os.replace(base / "outbox" / "raced.json", base / "claimed" / "raced.json")
+    assert api.watch_once(state, t + 1) == ""
+    calls = []
+    monkeypatch.setattr(api, "_pending", lambda p: calls.append(p) or {})
+    assert api.watch_once(state, t + 2) == ""
+    assert calls == []
+
+
+def test_watcher_survives_emit_failure_and_logs_once_at_warning(tmp_path, monkeypatch, broken, caplog):
+    import logging
+    api = _api(tmp_path, monkeypatch)
+    live = api._rf()
+    caplog.set_level(logging.DEBUG, logger="session-mentions")
+    assert api.watch_once({}, time.time()) == "heartbeat"  # notify_outbox swallowed the failure
+    assert live.notify_outbox() is False
+    recs = [r for r in caplog.records if "outbox push not sent" in r.getMessage()]
+    assert [r.levelno for r in recs] == [logging.WARNING, logging.DEBUG]
+
+
+def test_watcher_thread_stops_on_unload_and_stays_stopped_until_register(tmp_path, monkeypatch):
+    api = _api(tmp_path, monkeypatch)
+    monkeypatch.setattr(api, "WATCH_ENABLED", True)
+    monkeypatch.setattr(api, "WATCH_TICK_S", 0.01)
+    monkeypatch.delitem(sys.modules, api.SHARED_KEY, raising=False)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugin_events",
+                        types.SimpleNamespace(broadcast_plugin_event=lambda *a, **k: None))
+    try:
+        assert api.ensure_watcher() is True
+        assert api.ensure_watcher() is False  # one per process
+        thread = sys.modules[api.SHARED_KEY].thread
+        assert thread.is_alive()
+        # The plugin module's on_unload hook (a separate import of __init__.py) stops it.
+        unloads = []
+        sm.register(types.SimpleNamespace(register_tool=lambda **k: None, register_hook=lambda *a: None,
+                                          on_unload=unloads.append))
+        assert unloads == [sm.stop_watcher]
+        unloads[0]()
+        thread.join(2)
+        assert not thread.is_alive()
+        assert api.ensure_watcher() is False  # routes stay mounted after unload; a /ping must not restart it
+        sm.register(types.SimpleNamespace(register_tool=lambda **k: None, register_hook=lambda *a: None,
+                                          on_unload=unloads.append))
+        assert api.ensure_watcher() is True  # enabled again
+    finally:
+        api.stop(join_s=2)
+        monkeypatch.delitem(sys.modules, api.SHARED_KEY, raising=False)
 
 
 def test_ping_with_courier_refreshes_liveness_and_claims_nothing(tmp_path, monkeypatch, events):
@@ -170,3 +268,15 @@ def test_ping_with_courier_refreshes_liveness_and_claims_nothing(tmp_path, monke
     assert rec["aliases"] == ["laptop-1", "macbook"] and rec["reach"] == ["hub"]
     assert [c["device"] for c in api._rf().live_couriers(base)] == ["macbook"]
     assert client.get("/outbox", params={"courier": "macbook"}).json()["feed"] == plain["feed"]
+
+
+def test_unload_before_any_route_still_keeps_the_watcher_off(tmp_path, monkeypatch):
+    api = _api(tmp_path, monkeypatch)
+    monkeypatch.setattr(api, "WATCH_ENABLED", True)
+    monkeypatch.delitem(sys.modules, api.SHARED_KEY, raising=False)
+    try:
+        sm.stop_watcher()
+        assert api.ensure_watcher() is False
+    finally:
+        api.stop(join_s=2)
+        monkeypatch.delitem(sys.modules, api.SHARED_KEY, raising=False)

@@ -35,11 +35,13 @@ const MAX_MATCHES = 8
 const MAX_RECENT = 15
 // The courier's tick (on a worker, see register). What it sends per connection depends on whether that gateway's
 // outbox pushes (`plugin.session-mentions.outbox`) reach this window:
-//  - push-live (a push or 20 s heartbeat from its feed within PUSH_STALE_MS): drain on each push, at once, plus a
+//  - push-live (a push or 20 s heartbeat attributed to it within PUSH_STALE_MS): drain on each push, at once, plus a
 //    safety drain every SAFETY_POLL_MS; between drains a /ping?courier=… every COURIER_PING_MS keeps this courier's
-//    couriers/<device>.json fresh (the gateway calls a courier gone after 20 s, see courier-liveness.test.mjs);
+//    couriers/<device>.json fresh (the gateway calls a courier gone after 20 s, see courier-liveness.test.mjs).
+//    A push lost while push-live (a socket reconnect) is covered by the gateway, not the safety drain: it re-pushes
+//    every 5 s while an unclaimed request is under 30 s old, and its heartbeat carries `pending`, which drains too;
 //  - otherwise (a backend without the push, or pushes that do not reach this window: its socket is not open): drain
-//    every COURIER_INTERVAL_MS, as before. A push that never arrives is covered by that drain or the safety drain.
+//    every COURIER_INTERVAL_MS, as before.
 const COURIER_INTERVAL_MS = 3_000
 export const SAFETY_POLL_MS = 60_000
 export const PUSH_STALE_MS = 60_000 // three missed 20 s heartbeats
@@ -1637,16 +1639,28 @@ function learnFeed(feed, connectionId) {
   feedConns.get(feed).add(connectionId)
 }
 
-/** `plugin.session-mentions.outbox` {feed, seq[, heartbeat]}: mark the connections behind `feed` push-live and, for
- *  a push, drain them now. A feed this window has not learned yet (no drain answered) is ignored: its fallback
+/** `plugin.session-mentions.outbox` {feed, seq[, heartbeat, pending]}: find the connection(s) it came from, mark
+ *  them push-live and, for a push or a heartbeat with `pending`, drain them now.
+ *  Attribution: the Desktop tags an event with the `connectionId` whose socket delivered it, and that is exact.
+ *  An untagged event (the primary/local socket, or an older shell) is matched by `feed` against the feeds the
+ *  connections answered with. `feed` names a gateway's outbox (host + path hash), so two gateways cloned from
+ *  one image can share it: an untagged event whose feed maps to more than one connection drains them all (a spare
+ *  drain claims nothing it shouldn't) but marks none push-live, so each keeps its 3 s fallback drain rather than
+ *  trusting pushes that may be another gateway's. A feed no drain has answered with yet is ignored: the fallback
  *  drain is due within COURIER_INTERVAL_MS anyway. */
 export async function onOutboxEvent(ev) {
   const p = ev?.payload
-  const ids = typeof p?.feed === 'string' ? feedConns.get(p.feed) : null
+  if (!p || typeof p !== 'object') return
+  const tagged = typeof ev.connectionId === 'string' && ev.connectionId ? ev.connectionId : ''
+  if (tagged) learnFeed(p.feed, tagged)
+  const ids = tagged ? new Set([tagged]) : typeof p.feed === 'string' ? feedConns.get(p.feed) : null
   if (!ids?.size) return
-  const now = Date.now()
-  for (const id of ids) pushAt.set(id, now)
-  if (p.heartbeat) return
+  if (tagged || ids.size === 1) {
+    const now = Date.now()
+    for (const id of ids) pushAt.set(id, now)
+  }
+  // A heartbeat that says a request waits: the push for it was lost (socket reconnect) or never sent. Drain.
+  if (p.heartbeat && !p.pending) return
   const conns = await connections()
   await Promise.all(conns.filter(c => ids.has(c.id)).map(c => drainConnection(c, conns, { push: true })))
 }

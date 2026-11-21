@@ -213,3 +213,73 @@ test('register subscribes to the outbox push and unsubscribes on dispose', async
   disposers.forEach(fn => fn())
   assert.ok(offs.includes(m.OUTBOX_EVENT))
 })
+
+test('a push lost while push-live: the gateway re-push (every 5 s) or a pending heartbeat drains it within 15 s', async () => {
+  const c = clock()
+  try {
+    let waiting = false // a request sits in the hub outbox
+    const drainedAt = []
+    const start = Date.now()
+    const { api, calls } = backend({
+      outbox: id => {
+        if (id === 'hub' && waiting) {
+          waiting = false
+          drainedAt.push(Date.now() - start)
+        }
+        return { requests: [], feed: FEEDS[id] }
+      }
+    })
+    const m = await load(api)
+    await m.courierTick()
+    await m.onOutboxEvent({ payload: { feed: FEEDS.hub, seq: 1, heartbeat: true } })
+    const before = calls.outbox.hub
+    waiting = true // ... and its push never reached this window
+    // The gateway's watcher (plugin_api.watch_once, pinned in test_outbox_push.py) re-pushes 5 s later;
+    // meanwhile the courier's ticks only ping, they do not drain a push-live connection.
+    for (let t = 3_000; t <= 15_000 && waiting; t += 1_000) {
+      c.advance(1_000)
+      if (t % 3_000 === 0) await m.courierTick()
+      if (t === 5_000) await m.onOutboxEvent({ payload: { feed: FEEDS.hub, seq: 2 } })
+    }
+    assert.equal(waiting, false)
+    assert.ok(drainedAt[0] <= 15_000, `drained after ${drainedAt[0]} ms`)
+    assert.equal(calls.outbox.hub, before + 1)
+  } finally {
+    c.restore()
+  }
+})
+
+test('a heartbeat with pending drains; one without does not', async () => {
+  const { api, calls } = backend()
+  const m = await load(api)
+  await m.courierTick()
+  await m.onOutboxEvent({ payload: { feed: FEEDS.hub, seq: 1, heartbeat: true, pending: false } })
+  assert.equal(calls.outbox.hub, 1)
+  await m.onOutboxEvent({ payload: { feed: FEEDS.hub, seq: 2, heartbeat: true, pending: true } })
+  assert.equal(calls.outbox.hub, 2)
+  assert.equal(calls.outbox.local, 1)
+})
+
+test('an event tagged with the delivering connectionId goes to that connection, whatever its feed says', async () => {
+  const { api, calls } = backend()
+  const m = await load(api)
+  await m.courierTick()
+  await m.onOutboxEvent({ connectionId: 'hub', payload: { feed: FEEDS.local, seq: 1 } })
+  assert.deepEqual(calls.outbox, { local: 1, hub: 2 })
+  assert.equal(m.pushLive('hub'), true)
+  assert.equal(m.pushLive('local'), false)
+})
+
+test('two gateways sharing a feed id (cloned image): an untagged event drains both and marks neither push-live', async () => {
+  const shared = 'clone:dddddddddddd'
+  const { api, calls } = backend({ outbox: () => ({ requests: [], feed: shared }) })
+  const m = await load(api)
+  await m.courierTick()
+  await m.onOutboxEvent({ payload: { feed: shared, seq: 1 } })
+  assert.deepEqual(calls.outbox, { local: 2, hub: 2 })
+  assert.equal(m.pushLive('local'), false) // both keep their 3 s fallback drain
+  assert.equal(m.pushLive('hub'), false)
+  await m.onOutboxEvent({ connectionId: 'hub', payload: { feed: shared, seq: 2, heartbeat: true } })
+  assert.equal(m.pushLive('hub'), true) // a tagged event is exact
+  assert.equal(m.pushLive('local'), false)
+})

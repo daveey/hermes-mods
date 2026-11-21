@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import time
 import uuid
 
@@ -537,7 +538,27 @@ def _relay_guard(tool_name="", args=None, session_id="", **_kw):
     return {"action": "block", "message": reason} if reason else None
 
 
+def stop_watcher() -> None:
+    """Plugin unload / disable: stop the dashboard's outbox watcher thread (dashboard/plugin_api.py), which lives
+    in a separately imported module; the two share its state through sys.modules."""
+    import threading
+    import types
+    sh = sys.modules.get("_session_mentions_outbox_watch")
+    if sh is None:  # unloaded before any route ran: record it, so a later /ping does not start the watcher
+        sh = types.ModuleType("_session_mentions_outbox_watch")
+        sh.thread, sh.stop = None, threading.Event()
+        sys.modules["_session_mentions_outbox_watch"] = sh
+    sh.disabled = True
+    sh.stop.set()
+
+
 def register(ctx) -> None:
+    sh = sys.modules.get("_session_mentions_outbox_watch")
+    if sh is not None:  # registered again after an unload: the next /ping or /outbox may start the watcher
+        sh.disabled = False
+    on_unload = getattr(ctx, "on_unload", None)
+    if callable(on_unload):
+        on_unload(stop_watcher)
     ctx.register_tool(name="cross_session", toolset=TOOLSET, schema=SCHEMA, handler=handle, emoji="🔗",
                       description="List/read/message sessions on any Desktop-connected gateway")
     ctx.register_tool(name="cross_task", toolset=TOOLSET, schema=TASK_SCHEMA, handler=handle_task, emoji="🗂️",

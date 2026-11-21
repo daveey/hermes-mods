@@ -53,7 +53,8 @@ drains on the push.
 
 Contract:
 
-- **Event** `plugin.session-mentions.outbox`, payload `{feed, seq}`, or `{feed, seq, heartbeat: true}`. It is
+- **Event** `plugin.session-mentions.outbox`, payload `{feed, seq}` (a push), or `{feed, seq, heartbeat: true,
+  pending}` (a heartbeat). It is
   a notice only and never carries requests: the courier still claims them with `GET /outbox`, so the claim rule,
   routing and home-courier gate are unchanged. `feed` is `<host>:<12 hex of the outbox root path>`. It names the
   gateway's outbox, not a process, so every serve process of a gateway and its turn-isolation child share it.
@@ -63,10 +64,24 @@ Contract:
   client (`hermes gateway run`, cron, a worker) or with no core it does nothing. A watcher thread in the process
   that serves the Desktop, started by its first `/ping` or `/outbox`, stats the outbox directory every 1 s. It
   pushes when the directory changed and holds a request, which covers writers that never emit themselves
-  (user-terminal, coach, out-of-process turns). It also sends a heartbeat every 20 s.
-- **Feed to connection.** `/outbox` and `/ping` replies carry `feed`, and the Desktop maps each feed to the
-  connections that answered with it.
-- **Push-live connection.** A connection is push-live when a push or heartbeat from its feed arrived within 60 s.
+  (user-terminal, coach, out-of-process turns). The watcher finds new requests by name from the directory
+  listing. It trusts an unchanged directory stat only once the directory is 2 s old (`DIR_SETTLE_SECONDS`), because
+  a temp-file create and its rename in one timestamp tick can leave the stat unchanged.
+- **Lost pushes.** A push can be lost, for example in a socket reconnect. While an unclaimed request is younger than
+  30 s, the watcher re-pushes every 5 s. Every 20 s it sends a heartbeat whose `pending` field says whether any
+  unclaimed request waits; a heartbeat with `pending` makes the courier drain. A request is therefore drained within
+  about 5 s of a lost push, inside the 15 s / 30 s pickup timeouts.
+- **Stopping.** Plugin unload (`on_unload`, `__init__.stop_watcher`) stops the watcher thread. A `/ping` or
+  `/outbox` doesn't restart it until the plugin registers again. The first failed push in a process is logged at
+  warning, later ones at debug.
+- **Feed to connection.** The Desktop tags each event with the `connectionId` of the socket that delivered it, and
+  that tag is used when present. An untagged event (the primary/local socket, or an older shell) is matched by
+  `feed` against the `feed` each connection's `/outbox` and `/ping` replies carry. `feed` is per outbox (host + path
+  hash) so the serve processes and turn-isolation child of one gateway share it, but two gateways cloned from one
+  image can share it too. An untagged event whose feed maps to more than one connection drains them all, since a
+  spare drain claims nothing it shouldn't. It marks none of them push-live, so each keeps its 3 s drain instead of
+  trusting pushes that may belong to the other gateway.
+- **Push-live connection.** A connection is push-live when a push or heartbeat attributed to it arrived within 60 s.
   A push makes the courier drain that connection immediately, with at most one drain in flight per connection:
   pushes that arrive during a drain fold into one more drain after it. The courier also runs a safety drain every
   60 s, and between drains it sends `/ping?courier=…` (the drain's parameters) every 8 s. That ping refreshes
@@ -76,20 +91,25 @@ Contract:
 - **Other connections.** These are backends without the push, or connections whose pushes don't reach this window,
   for example because the window has no open socket to that gateway. They keep the 3 s drain. An event that never
   arrives is covered by that drain or by the 60 s safety drain, so the pickup timeouts (15 s / 30 s) stay valid.
-- **Home beat.** `POST /result {id: home-courier}` to this Mac's own gateway now goes every 8 s with a 5 s timeout,
+- **Home beat.** `POST /result {id: home-courier}` to this Mac's own gateway now goes every 8 s (every 9 s on the
+  3 s tick) with a 5 s timeout,
   instead of every 5 s. The server's home window is 20 s (`HOME_FRESH_SECONDS`), and 8 s keeps one failed beat
   plus its retry inside it.
 - The tick itself stays on a dedicated worker (3 s) so a hidden, throttled window keeps its ping, home beat and
   fallback cadence. Pushes are socket events, not timers, so a hidden window gets them too.
 
-Rate with three connections, all push-live: about 3 safety drains, 22.5 pings and 7.5 home beats a minute, plus one
-drain per real request. That is about 33 a minute, down from about 72. Connections without pushes cost what they did
+Rate with three connections, all push-live: the 8 s ping and home beat land every 9 s on the 3 s tick, so about 3
+safety drains, 20 pings and 6.7 home beats a minute, plus one drain per real request (two or three if its push was
+lost and re-sent). That is about 30 a minute, down from about 72. Connections without pushes cost what they did
 before.
 
 Tests: `tests/test_outbox_push.py` covers the enqueue and tool writes emitting, an emit failure or missing core not
-breaking the write, the watcher pushing for an out-of-process write and heartbeating, and `/ping` refreshing
-liveness without claiming. `tests/outbox-push.test.mjs` covers a push draining the right connection, burst
-coalescing, the safety drain, ping and fallback cadences, retry of a failed push drain, and the `register()`
+breaking the write (logged once at warning), the watcher pushing for an out-of-process write, re-pushing a young
+unclaimed request every 5 s and not an old one, heartbeating with `pending`, listing an unsettled directory whose
+stat did not change, stopping on unload until the plugin registers again, and `/ping` refreshing liveness without
+claiming. `tests/outbox-push.test.mjs` covers a push draining the right connection (by `connectionId` tag, and by feed,
+including two gateways sharing a feed), a lost push drained within 15 s by the re-push, a `pending` heartbeat
+draining, burst coalescing, the safety drain, ping and fallback cadences, retry of a failed push drain, and the `register()`
 subscription. `tests/courier-liveness.test.mjs` pins both cadences inside the 20 s windows. Delivery of the event
 through a running Desktop's socket is untested here.
 

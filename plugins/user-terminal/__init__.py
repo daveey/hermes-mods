@@ -3133,7 +3133,7 @@ def withdraw_relayed(request_id: str, gateway: str, reason: str, job_id: str = "
 # may be another person or nobody, so the tool refuses rather than open a window on the owner's Mac.
 OWNER_SURFACES = frozenset({"desktop", "api_server", "tui", "cli", "local"})
 COURIER_FRESH_S = 20.0
-PICKUP_S = 15.0       # couriers drain every ~3 s
+PICKUP_S = 15.0       # couriers drain on the outbox push (re-sent every 5 s), else every ~3 s
 START_RESULT_S = 60.0  # the Mac opens the window and answers
 POLL_S = 20            # each status request waits this long on the Mac
 
