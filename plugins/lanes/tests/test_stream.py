@@ -17,7 +17,6 @@ def test_stream_status_change_heartbeat_and_disconnect(monkeypatch):
     monkeypatch.setattr(api, 'lane_view', lambda *args: {'status': state['status'], 'args': list(args)}, raising=False)
     monkeypatch.setattr(api, 'HEARTBEAT_S', .15, raising=False)
     monkeypatch.setattr(api, 'WATCH_S', .02, raising=False)
-    monkeypatch.setattr(api, 'DEBOUNCE_S', .02, raising=False)
     app = FastAPI()
     app.include_router(api.router)
     with TestClient(app) as client:
@@ -65,7 +64,6 @@ def test_changed_cursor_with_identical_view_does_not_push(monkeypatch):
     monkeypatch.setattr(api, 'change_cursor', lambda: state['cursor'])
     monkeypatch.setattr(api, 'lane_view', lambda *args: {'configured': False})
     monkeypatch.setattr(api, 'WATCH_S', .01)
-    monkeypatch.setattr(api, 'DEBOUNCE_S', .01)
     monkeypatch.setattr(api, 'HEARTBEAT_S', .1)
     app = FastAPI()
     app.include_router(api.router)
