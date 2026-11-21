@@ -142,20 +142,32 @@ def _commands(cmd: str, cwd: str, segments: Optional[list] = None):
 
 def _git_calls(cmd: str, cwd: str):
     """Yield (repo dir, subcommand, args) for each git invocation, following `cd` and `git -C`."""
+    for repo, sub, args, _ in _git_calls_cfg(cmd, cwd):
+        yield repo, sub, args
+
+
+def _git_calls_cfg(cmd: str, cwd: str):
+    """Like _git_calls, plus a 4th item (overrides, repointed): the `-c key=value` options, and whether
+    --git-dir/--work-tree re-pointed git at a repository the guard did not resolve."""
     for cwd, words in _commands(cmd, cwd):
         if os.path.basename(words[0]) != "git":
             continue
-        repo, i = cwd, 1
+        repo, i, conf, repointed = cwd, 1, [], False
         while i < len(words) and words[i].startswith("-"):
             if words[i] == "-C" and i + 1 < len(words):
                 repo = _resolve(words[i + 1], repo)
                 i += 2
-            elif words[i] in ("-c", "--git-dir", "--work-tree") and i + 1 < len(words):
+            elif words[i] == "-c" and i + 1 < len(words):
+                conf.append(words[i + 1])
+                i += 2
+            elif words[i] in ("--git-dir", "--work-tree") and i + 1 < len(words):
+                repointed = True
                 i += 2
             else:
+                repointed = repointed or words[i].startswith(("--git-dir=", "--work-tree="))
                 i += 1
         if i < len(words):
-            yield repo, words[i], words[i + 1:]
+            yield repo, words[i], words[i + 1:], (conf, repointed)
 
 
 VALUE_OPTS = {"-o", "--push-option", "--repo", "--receive-pack", "--exec"}
@@ -944,16 +956,26 @@ def check_custody_push(cmd: str, cwd: str) -> Optional[str]:
     mirror, and a `*` refspec on the command line or in the remote's push config. Applies to every remote, with
     or without a configured guard, and PUSH_GUARD=off does not skip it. This is a second fence: core's own
     publisher refuses the same argv."""
-    for repo, sub, args in _git_calls(cmd, cwd):
+    for repo, sub, args, (conf, repointed) in _git_calls_cfg(cmd, cwd):
         if sub != "push":
             continue
-        pos, mirror, i = [], False, 0
+
+        def cfg(*a: str) -> Optional[str]:  # real git config view, including this command's `-c` overrides
+            return _git(repo, *[x for kv in conf for x in ("-c", kv)], "config", *a)
+
+        pos, mirror, repo_opt, i = [], False, None, 0
         while i < len(args):
             a = args[i]
-            if a in VALUE_OPTS:
+            if a == "--repo" and i + 1 < len(args):
+                repo_opt = args[i + 1]
                 i += 2
                 continue
-            if a == "--mirror":
+            if a.startswith("--repo="):
+                repo_opt = a[7:]
+            elif a in VALUE_OPTS:
+                i += 2
+                continue
+            elif a == "--mirror":
                 mirror = True
             elif not a.startswith("-"):
                 pos.append(a)
@@ -962,22 +984,26 @@ def check_custody_push(cmd: str, cwd: str) -> Optional[str]:
         for s in specs:
             if any(_custody_side(side) for side in s.split(":", 1) if side):
                 return f"`git push ... {s[:80]}` names the source-custody namespace {CUSTODY_NS}"
-        if _git(repo, "for-each-ref", "--count=1", "--format=%(refname)", CUSTODY_NS) in (None, ""):
-            continue  # no custody refs here (or not a readable repo): a broad push cannot carry any
+        held = None if repointed else _git(repo, "for-each-ref", "--count=1", "--format=%(refname)", CUSTODY_NS)
+        if held == "":
+            continue  # provably no custody refs here: a broad push cannot carry any
+        # otherwise refs exist, or the repo is unreadable / re-pointed (unproved): assume they exist
         if mirror:
             return f"`git push --mirror` would publish this repo's source-custody refs ({CUSTODY_NS})"
         if any("*" in s and not _heads_or_tags_only(s) for s in specs):
             return f"a `*` refspec would publish this repo's source-custody refs ({CUSTODY_NS})"
-        if not specs:
-            cur = _git(repo, "symbolic-ref", "-q", "--short", "HEAD") or "HEAD"
-            remote = pos[0] if pos else (_git(repo, "config", f"branch.{cur}.remote") or "origin")
-            conf = _git(repo, "config", "--get-regexp", rf"^remote\.{re.escape(remote)}\.(mirror|push)$") or ""
-            for line in conf.splitlines():
-                key, _, value = line.partition(" ")
-                if key.endswith(".mirror") and value.strip().lower() not in _GIT_FALSE:
-                    return f"remote {remote} is a mirror: a push would publish source-custody refs ({CUSTODY_NS})"
-                if key.endswith(".push") and ("*" in value and not _heads_or_tags_only(value)
-                                              or _custody_side(value.lstrip("+").split(":", 1)[0])):
+        cur = _git(repo, "symbolic-ref", "-q", "--short", "HEAD") or "HEAD"
+        remote = (pos[0] if pos else repo_opt) or cfg(f"branch.{cur}.pushRemote") or cfg("remote.pushDefault") \
+            or cfg(f"branch.{cur}.remote") or "origin"
+        conf_lines = cfg("--get-regexp", rf"^remote\.{re.escape(remote)}\.(mirror|push)$") or ""
+        for line in conf_lines.splitlines():
+            key, _, value = line.partition(" ")
+            if key.endswith(".mirror") and value.strip().lower() not in _GIT_FALSE:
+                # git itself rejects a mirror remote combined with refspecs, but do not rely on that
+                return f"remote {remote} is a mirror: a push would publish source-custody refs ({CUSTODY_NS})"
+            if key.endswith(".push") and not specs:  # explicit refspecs replace the configured ones
+                sides = [x for x in value.lstrip("+").split(":", 1) if x]
+                if "*" in value and not _heads_or_tags_only(value) or any(_custody_side(x) for x in sides):
                     return (f"remote {remote} push config `{value.strip()[:80]}` would publish source-custody "
                             f"refs ({CUSTODY_NS})")
     return None

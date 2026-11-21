@@ -428,3 +428,79 @@ def test_configured_mirror_or_broad_push_refspec_is_blocked_for_a_bare_push(repo
     assert got and "is a mirror" in got["message"]
     git("config", "remote.origin.mirror", "false", cwd=repo)
     assert block("terminal", bare_push) is None
+
+
+# Core's native source publisher pushes with exactly this argv (hermes_cli/kanban_source_publish._push): the scanned
+# sha to the task branch, by URL, with a lease. The guard must neither block it nor miss it when it names custody refs.
+def native_publisher_argv(url, refspec, branch="feat"):
+    return (f"git -c push.default=nothing -c credential.helper= push --no-verify --porcelain "
+            f"--force-with-lease=refs/heads/{branch}: {url} {refspec}")
+
+
+def test_native_publisher_argv_for_a_task_branch_is_not_blocked_while_custody_refs_exist(repo, tmp_path):
+    hold_custody_ref(repo)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    url = str(tmp_path / "someone" / "else.git")
+    cmd = native_publisher_argv(url, f"{head}:refs/heads/feat")
+    assert block("terminal", {"command": cmd, "workdir": str(repo)}) is None
+
+
+@pytest.mark.parametrize("refspec", [f"HEAD:{NS}/x", f"+{NS}/*:{NS}/*", f":{NS}/x"])
+def test_native_publisher_argv_naming_custody_refs_is_blocked(repo, tmp_path, refspec):
+    url = str(tmp_path / "someone" / "else.git")
+    got = block("terminal", {"command": native_publisher_argv(url, refspec), "workdir": str(repo)})
+    assert got and got["action"] == "block" and NS in got["message"], refspec
+
+
+# --- custody: git config the parser used to drop ---------------------------------------------------------------
+
+def _blocked(repo, cmd):
+    got = block("terminal", {"command": cmd, "workdir": str(repo)})
+    return bool(got and got["action"] == "block" and NS in got["message"])
+
+
+@pytest.mark.parametrize("cmd", [
+    "git -c remote.origin.mirror=true push origin",
+    "git -c remote.origin.mirror=true push origin feat",  # explicit specs do not make a mirror remote safe
+    "git -c remote.origin.push='refs/*:refs/*' push origin",
+    f"git -c remote.origin.push=refs/heads/feat:{NS}/x push origin",  # destination side only
+    "git -c remote.pushDefault=origin -c remote.origin.mirror=true push",
+    "git -c remote.origin.mirror=true push --repo=origin",
+])
+def test_dash_c_config_that_turns_a_push_into_a_custody_leak_is_blocked(repo, cmd):
+    assert not _blocked(repo, "git push origin feat")
+    hold_custody_ref(repo)
+    assert _blocked(repo, cmd), cmd
+
+
+def test_configured_push_destination_in_the_custody_namespace_is_blocked(repo):
+    hold_custody_ref(repo)
+    git("config", "remote.origin.push", f"refs/heads/feat:{NS}/x", cwd=repo)
+    assert _blocked(repo, "git push origin")
+    assert not _blocked(repo, "git push origin feat")  # explicit refspec replaces the configured one
+
+
+def test_configured_mirror_remote_with_explicit_refspecs_is_blocked(repo):
+    hold_custody_ref(repo)
+    git("config", "remote.origin.mirror", "true", cwd=repo)
+    assert _blocked(repo, "git push origin feat")
+
+
+def test_unprovable_custody_state_does_not_count_as_absence(repo, tmp_path):
+    hold_custody_ref(repo)
+    gd = subprocess.run(["git", "rev-parse", "--absolute-git-dir"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    # --git-dir re-points git away from the repo the guard inspected; unreadable cwd is likewise unproved
+    assert _blocked(elsewhere, f"git --git-dir={gd} push --mirror origin")
+    assert _blocked(elsewhere, "git push --mirror origin")
+    assert _blocked(elsewhere, f"git --git-dir={gd} -c remote.origin.mirror=true push origin")
+
+
+
+def test_native_publisher_dash_c_options_still_allowed_with_custody_refs(repo, tmp_path):
+    hold_custody_ref(repo)
+    url = str(tmp_path / "someone" / "else.git")
+    cmd = native_publisher_argv(url, "HEAD:refs/heads/feat")
+    assert not _blocked(repo, cmd)
+    assert not _blocked(repo, "git -c push.default=nothing -c credential.helper= push origin feat")
