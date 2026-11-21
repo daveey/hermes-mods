@@ -31,6 +31,13 @@ Use it two ways:
 - **Diagnose one chat** the user points at: run the scanner (below), read the finding's evidence, apply the
   section's fix. No finding but the chat is clearly stuck? Collect the evidence and add a pattern (last section).
 - **Act on the repair chat's findings**: each finding names its section; follow "Safe automatic fix" or "Fix card".
+- **Panel says "needs you" / blocked on the user, but no one asked anything**: check what core says before
+  touching the card. Core's verdict is the session feed's `wait_state`/`waiting_on` (`hermes_cli.kanban_session_activity.session_tasks`)
+  and, for scheduled cards, `kanban_wake_summary.wakes(conn, task)["blocks_for_human"]`. If core says agent-owned
+  or external while the panel says human, the fault is in the panel, not the card. Panels re-derive "needs you"
+  from the raw `block_kind`, but core keeps `block_kind` on purpose after an unblock or resolved ask, so it records
+  past blocks, not the current wait. Fix the client so it uses core's verdict, and add the card as a regression
+  fixture. Never clear `block_kind` by hand.
 
 ```sh
 # read-only; on the hub (where the boards live), with core's Python. Prints {findings: [...], errors: [...]}
