@@ -72,7 +72,7 @@ class DesktopPluginCI(unittest.TestCase):
         files = list(ROOT.glob('desktop-plugins/*/test/*.mjs'))
         files += ROOT.glob('desktop-plugins/*/tests/*.test.mjs')
         files += ROOT.glob('plugins/*/tests/*.test.mjs')
-        self.assertIn(ROOT / 'desktop-plugins/session-panel/test/producer-composed.test.mjs', files)
+        self.assertIn(ROOT / 'desktop-plugins/session-panel/test/hub-model.test.mjs', files)
         self.assertIn(ROOT / 'desktop-plugins/runners/tests/fleet.test.mjs', files)
         # Agent-plugin dirs carry node suites for their desktop half; CI once collected none of them.
         self.assertIn(ROOT / 'plugins/session-mentions/tests/user-terminal.test.mjs', files)
