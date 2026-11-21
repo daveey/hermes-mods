@@ -1273,6 +1273,7 @@ const courierInflight = new Set()
 const drainAgain = new Set() // connectionId: a push arrived while its drain was in flight; run once more after it
 const pingInflight = new Set()
 const feedConns = new Map() // gateway outbox feed id -> Set of connectionIds (learned from /outbox and /ping replies)
+const connFeed = new Map() // connectionId -> the feed its own /outbox or /ping reply named
 const pushAt = new Map() // connectionId -> when its last push or heartbeat arrived
 const lastDrainAt = new Map() // connectionId -> last successful drain
 const lastPingAt = new Map() // connectionId -> last successful drain or courier ping (both refresh liveness)
@@ -1632,30 +1633,46 @@ export function pushLive(connectionId, now = Date.now()) {
   return at != null && now - at <= PUSH_STALE_MS
 }
 
+/** Record the feed a connection's OWN /outbox or /ping reply named. Never called from an event. */
 function learnFeed(feed, connectionId) {
   if (typeof feed !== 'string' || !feed) return
   for (const [f, ids] of feedConns) if (f !== feed) ids.delete(connectionId) // one feed per connection
   if (!feedConns.has(feed)) feedConns.set(feed, new Set())
   feedConns.get(feed).add(connectionId)
+  connFeed.set(connectionId, feed)
 }
 
 /** `plugin.session-mentions.outbox` {feed, seq[, heartbeat, pending]}: find the connection(s) it came from, mark
- *  them push-live and, for a push or a heartbeat with `pending`, drain them now.
- *  Attribution: the Desktop tags an event with the `connectionId` whose socket delivered it, and that is exact.
- *  An untagged event (the primary/local socket, or an older shell) is matched by `feed` against the feeds the
- *  connections answered with. `feed` names a gateway's outbox (host + path hash), so two gateways cloned from
- *  one image can share it: an untagged event whose feed maps to more than one connection drains them all (a spare
- *  drain claims nothing it shouldn't) but marks none push-live, so each keeps its 3 s fallback drain rather than
- *  trusting pushes that may be another gateway's. A feed no drain has answered with yet is ignored: the fallback
- *  drain is due within COURIER_INTERVAL_MS anyway. */
+ *  them push-live when that is certain and, for a push or a heartbeat with `pending`, drain them now.
+ *  Attribution: `feed` names a gateway's outbox (host + path hash) and is checked against the feed each connection's
+ *  OWN /outbox or /ping reply named (an event never teaches a mapping). The event's `connectionId` tag is trusted
+ *  only when it agrees with that: core stamps primary-socket events with the ACTIVE connection's id, so while a hub
+ *  chat is active this Mac's own gateway pushes arrive tagged `hub`; believing the tag would drain hub and leave the
+ *  local request sitting past the pickup timeouts.
+ *   - tag whose own feed equals `feed`: that connection, push-live;
+ *   - otherwise by `feed`: one connection -> it, push-live; several (gateways cloned from one image share a feed) ->
+ *     drain them all (a spare drain claims nothing it shouldn't) but mark none push-live, so each keeps its 3 s
+ *     fallback drain rather than trusting pushes that may be another gateway's;
+ *   - no connection has answered with `feed`, but the tag names a connection whose feed is not known yet: drain that
+ *     one, not push-live (its fallback drain learns the feed within COURIER_INTERVAL_MS);
+ *   - nothing matches: ignored; the fallback drain is due within COURIER_INTERVAL_MS anyway. */
+export function attributeOutboxEvent(ev) {
+  const p = ev?.payload
+  const feed = typeof p?.feed === 'string' ? p.feed : ''
+  const tag = typeof ev?.connectionId === 'string' && ev.connectionId ? ev.connectionId : ''
+  if (tag && feed && connFeed.get(tag) === feed) return { ids: new Set([tag]), live: true }
+  const byFeed = feed ? feedConns.get(feed) : null
+  if (byFeed?.size) return { ids: new Set(byFeed), live: byFeed.size === 1 }
+  if (tag && !connFeed.has(tag)) return { ids: new Set([tag]), live: false }
+  return { ids: new Set(), live: false }
+}
+
 export async function onOutboxEvent(ev) {
   const p = ev?.payload
   if (!p || typeof p !== 'object') return
-  const tagged = typeof ev.connectionId === 'string' && ev.connectionId ? ev.connectionId : ''
-  if (tagged) learnFeed(p.feed, tagged)
-  const ids = tagged ? new Set([tagged]) : typeof p.feed === 'string' ? feedConns.get(p.feed) : null
-  if (!ids?.size) return
-  if (tagged || ids.size === 1) {
+  const { ids, live } = attributeOutboxEvent(ev)
+  if (!ids.size) return
+  if (live) {
     const now = Date.now()
     for (const id of ids) pushAt.set(id, now)
   }
@@ -1761,6 +1778,7 @@ export default {
     courierState.clear()
     drainAgain.clear()
     feedConns.clear()
+    connFeed.clear()
     pushAt.clear()
     lastDrainAt.clear()
     lastPingAt.clear()

@@ -74,13 +74,15 @@ Contract:
 - **Stopping.** Plugin unload (`on_unload`, `__init__.stop_watcher`) stops the watcher thread. A `/ping` or
   `/outbox` doesn't restart it until the plugin registers again. The first failed push in a process is logged at
   warning, later ones at debug.
-- **Feed to connection.** The Desktop tags each event with the `connectionId` of the socket that delivered it, and
-  that tag is used when present. An untagged event (the primary/local socket, or an older shell) is matched by
-  `feed` against the `feed` each connection's `/outbox` and `/ping` replies carry. `feed` is per outbox (host + path
-  hash) so the serve processes and turn-isolation child of one gateway share it, but two gateways cloned from one
-  image can share it too. An untagged event whose feed maps to more than one connection drains them all, since a
-  spare drain claims nothing it shouldn't. It marks none of them push-live, so each keeps its 3 s drain instead of
-  trusting pushes that may belong to the other gateway.
+- **Feed to connection.** Each connection's own `/outbox` and `/ping` replies carry `feed`, and only those replies
+  teach the Desktop which feed belongs to which connection; an event never does. The Desktop tags each event with a
+  `connectionId`, but core stamps primary-socket events with the *active* connection's id, so this Mac's own gateway
+  pushes arrive tagged `hub` while a hub chat is open. The tag is therefore trusted only when that connection's own
+  feed equals the event's `feed`. Otherwise the event goes by `feed`: one connection gets the drain and becomes
+  push-live. Several connections sharing a feed (gateways cloned from one image) are all drained, but none becomes
+  push-live, so each keeps its 3 s drain instead of trusting pushes that may be another gateway's. A tag naming a
+  connection whose feed isn't known yet is drained but not marked push-live. `feed` is per outbox (host + path
+  hash), so the serve processes and turn-isolation child of one gateway share it.
 - **Push-live connection.** A connection is push-live when a push or heartbeat attributed to it arrived within 60 s.
   A push makes the courier drain that connection immediately, with at most one drain in flight per connection:
   pushes that arrive during a drain fold into one more drain after it. The courier also runs a safety drain every
@@ -107,8 +109,9 @@ Tests: `tests/test_outbox_push.py` covers the enqueue and tool writes emitting, 
 breaking the write (logged once at warning), the watcher pushing for an out-of-process write, re-pushing a young
 unclaimed request every 5 s and not an old one, heartbeating with `pending`, listing an unsettled directory whose
 stat did not change, stopping on unload until the plugin registers again, and `/ping` refreshing liveness without
-claiming. `tests/outbox-push.test.mjs` covers a push draining the right connection (by `connectionId` tag, and by feed,
-including two gateways sharing a feed), a lost push drained within 15 s by the re-push, a `pending` heartbeat
+claiming. `tests/outbox-push.test.mjs` covers a push draining the right connection (by feed; a `connectionId` tag only when it
+agrees with that connection's own feed; a local push mis-tagged with the active hub connection still drains local;
+two gateways sharing a feed), a lost push drained within 15 s by the re-push, a `pending` heartbeat
 draining, burst coalescing, the safety drain, ping and fallback cadences, retry of a failed push drain, and the `register()`
 subscription. `tests/courier-liveness.test.mjs` pins both cadences inside the 20 s windows. Delivery of the event
 through a running Desktop's socket is untested here.

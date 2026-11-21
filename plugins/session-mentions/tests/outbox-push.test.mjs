@@ -260,14 +260,38 @@ test('a heartbeat with pending drains; one without does not', async () => {
   assert.equal(calls.outbox.local, 1)
 })
 
-test('an event tagged with the delivering connectionId goes to that connection, whatever its feed says', async () => {
+test('a tag that agrees with the connection\'s own feed is exact', async () => {
+  const { api, calls } = backend()
+  const m = await load(api)
+  await m.courierTick()
+  await m.onOutboxEvent({ connectionId: 'hub', payload: { feed: FEEDS.hub, seq: 1 } })
+  assert.deepEqual(calls.outbox, { local: 1, hub: 2 })
+  assert.equal(m.pushLive('hub'), true)
+  assert.equal(m.pushLive('local'), false)
+})
+
+test('mis-tagged: core stamps the local gateway push with the ACTIVE (hub) connection id; feed wins', async () => {
   const { api, calls } = backend()
   const m = await load(api)
   await m.courierTick()
   await m.onOutboxEvent({ connectionId: 'hub', payload: { feed: FEEDS.local, seq: 1 } })
-  assert.deepEqual(calls.outbox, { local: 1, hub: 2 })
-  assert.equal(m.pushLive('hub'), true)
-  assert.equal(m.pushLive('local'), false)
+  assert.deepEqual(calls.outbox, { local: 2, hub: 1 }) // local drained, hub not
+  assert.equal(m.pushLive('local'), true)
+  assert.equal(m.pushLive('hub'), false)
+  // The event taught nothing: hub still answers for its own feed.
+  await m.onOutboxEvent({ payload: { feed: FEEDS.hub, seq: 2 } })
+  assert.deepEqual(calls.outbox, { local: 2, hub: 2 })
+  // A pending heartbeat mis-tagged the same way also goes to local.
+  await m.onOutboxEvent({ connectionId: 'hub', payload: { feed: FEEDS.local, seq: 3, heartbeat: true, pending: true } })
+  assert.deepEqual(calls.outbox, { local: 3, hub: 2 })
+})
+
+test('a tag naming a connection whose feed is not known yet drains it but does not mark it push-live', async () => {
+  const { api, calls } = backend()
+  const m = await load(api)
+  await m.onOutboxEvent({ connectionId: 'hub', payload: { feed: FEEDS.hub, seq: 1 } }) // before any drain answered
+  assert.equal(calls.outbox.hub, 1)
+  assert.equal(m.pushLive('hub'), false)
 })
 
 test('two gateways sharing a feed id (cloned image): an untagged event drains both and marks neither push-live', async () => {
@@ -280,6 +304,6 @@ test('two gateways sharing a feed id (cloned image): an untagged event drains bo
   assert.equal(m.pushLive('local'), false) // both keep their 3 s fallback drain
   assert.equal(m.pushLive('hub'), false)
   await m.onOutboxEvent({ connectionId: 'hub', payload: { feed: shared, seq: 2, heartbeat: true } })
-  assert.equal(m.pushLive('hub'), true) // a tagged event is exact
+  assert.equal(m.pushLive('hub'), true) // a tag that agrees with its own feed is exact
   assert.equal(m.pushLive('local'), false)
 })
