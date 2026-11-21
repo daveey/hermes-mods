@@ -80,7 +80,7 @@ workers can create or remove evidence. Reconcile every group in the machine-read
 notification's truncated list. Separate creation rate, retained inventory and actual leaks; a burst alone does
 not prove failed cleanup.
 
-When counts or file ages suggest a failure, read `references/metric-interpretation.md` (transcript compaction, duplicate delivery and filesystem timestamps).
+When counts or file ages suggest a failure, read `references/metric-interpretation.md` (transcript compaction, duplicate delivery, filesystem timestamps and synced Kanban event order).
 
 ### 2. Ask why, one causal step at a time
 

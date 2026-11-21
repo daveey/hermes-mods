@@ -33,3 +33,9 @@ metadata-change time, not creation time, and Git activity makes old worktrees lo
 files/worktrees" count. Treat `%W = 0` as unknown, not a recent birth. Use a fixed report-time
 cutoff when checking the original alert, and label later measurements separately rather than claiming they
 reconstruct a changing inventory exactly.
+
+For Kanban `task_events` on a board that imports other hosts' events (the hub's board, a Board replica), `id` is
+local arrival order while `created_at` is the writing host's clock, so a worker's claim that synced in after a hub
+event can carry the earlier timestamp. Pair cause and effect by `id` order inside a few-second `created_at` window
+(`c.id > h.id AND c.created_at BETWEEN h.created_at - 5 AND h.created_at + 5`), never by `created_at` order alone,
+which drops exactly the cross-host races; count the board's `sync_rejected` events as a second signal.
