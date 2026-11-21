@@ -54,7 +54,8 @@ Historical incidents require live or preserved renderer state for exact attribut
 |---|---|---|
 | you | red | a card blocked on a person: a valid `human_request` (core's `needs_human`: action, why_human, interaction, scope, evidence), a park awaiting a person, untimed with a person block kind, or a retired ask whose card is still blocked; shows the ask (wrapped, never cut) |
 | external | pink | a park on a CI run, a deploy, an external/resource producer, a probe, or a timer; shows time left or how late |
-| worker slot | grey | ready with no worker free (its `queue_note`/`capacity_note`), triage nobody works, a review with no reviewer running, a todo not yet promoted, an agent-owned block (an agent kind, or a needs_input/capability block without a valid ask) |
+| spend hold | amber | [daveey 2026-11-21] "worker slot is not it, show the real reason". The card's spend budget stopped it (`spend_budget_triaged`, newest of the stop/`promoted_manual`/`archived` marks in core's `_event_order`, as `kanban_spend_decision.pending`). No worker, unblock or triage sweep releases it: its chat must re-scope and `kanban promote` it, or archive it. Shows what was used (runs or cache-read tokens, cost). When the decision notice names a supervisor card instead of chats, the chain continues to that card |
+| worker slot | grey | ready with no worker free (its `queue_note`/`capacity_note`), triage nobody works (and no spend stop), a review with no reviewer running, a todo not yet promoted, an agent-owned block (an agent kind, or a needs_input/capability block without a valid ask) |
 | running | blue | the chain reaches work in progress (a running card, a running review) |
 | finished | green | the blocker is done: the waiting card should resume |
 | unknown | dashed | a card could not be read, a cycle, more than six cards, a park with no wake, a stale row: never a guess |

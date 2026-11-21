@@ -1318,8 +1318,10 @@ const WAIT_CSS = `[data-wait-row]{border-radius:5px}[data-wait-row]:hover{backgr
 // from its owner route, cached) to a leaf: `you` (red), `external` (pink), `slot` (grey), plus `running` (blue: the
 // chain ends on work in progress), `done` (its blocker finished; the waiter should resume) and `unknown` (dashed:
 // a card could not be read, a cycle, or the walk ran past MAX_HOPS). Never a guess.
+// `hold` (amber): a spend-budget stop. Only its owning chat's recorded re-scope + promote, or an archive, ends it.
 export const LEAF = {
   you: { color: '#f85149', text: '#ffb3ad', tint: 'rgba(248,81,73,0.08)', label: 'you' },
+  hold: { color: '#d29922', text: '#f0c674', tint: 'rgba(210,153,34,0.08)', label: 'spend hold' },
   external: { color: '#db61a2', text: '#f2b6d6', tint: 'rgba(219,97,162,0.08)', label: 'external' },
   slot: { color: '#8b949e', text: 'var(--foreground)', tint: 'rgba(139,148,158,0.10)', label: 'worker slot' },
   running: { color: '#3b82f6', text: 'var(--foreground)', tint: 'rgba(59,130,246,0.08)', label: 'running' },
@@ -1362,6 +1364,36 @@ function readyPacing(chip, nowMs, info, fallback) {
   return leaf?.pacing ? { ...leaf, text: `${leaf.text}${read.state === 'stale' ? ' (not re-read)' : ''}` } : null
 }
 
+/** A card read's pending spend-budget stop, as core's kanban_spend_decision.pending reads it: the newest of
+ *  spend_budget_triaged / promoted_manual / archived (core's _event_order: second, then a consistent UUIDv7 uid's
+ *  millisecond, then the local id) is the stop itself. A status change alone never releases it. The stop's decision
+ *  notice (same episode: the stop's uid, else its id) names who decides: its chats, or a supervisor card the walk
+ *  follows. */
+const SPEND_MARKS = new Set(['spend_budget_triaged', 'promoted_manual', 'archived'])
+// kanban_shared_blocker_fence.consistent_uid_milliseconds: a v7 uid's millisecond, only inside the row's own second
+// (or up to UID_STRADDLE_MS past it); a backfilled or non-v7 uid orders by arrival (the local id) instead.
+const uidMs = (uid, sec) => {
+  const h = str(uid).toLowerCase().replace(/-/g, '')
+  if (!/^[0-9a-f]{32}$/.test(h) || h[12] !== '7' || !'89ab'.includes(h[16])) return null
+  const ms = parseInt(h.slice(0, 12), 16)
+  return ms >= sec * 1000 && ms < (sec + 1) * 1000 + 1000 ? ms : null
+}
+const evOrder = e => { const sec = Math.trunc(Number(e?.created_at) || 0); return [sec, uidMs(e?.uid, sec) ?? sec * 1000, Number(e?.id) || 0] }
+const later = (a, b) => { const x = evOrder(a), y = evOrder(b); for (let k = 0; k < 3; k++) if (x[k] !== y[k]) return x[k] > y[k]; return true }
+export function spendHold(detail) {
+  const evs = Array.isArray(detail?.events) ? detail.events : []
+  let stop = null
+  for (const e of evs) if (SPEND_MARKS.has(str(e?.kind)) && (!stop || later(e, stop))) stop = e
+  if (!stop || str(stop.kind) !== 'spend_budget_triaged') return null
+  const p = payloadOf(stop), episode = str(stop.uid) || str(stop.id)
+  const notices = evs.filter(e => str(e?.kind) === 'spend_budget_decision_ready')
+  const notice = notices.find(e => str(payloadOf(e).episode) === episode) || notices.filter(e => later(e, stop)).slice(-1)[0]
+  const producer = notice ? payloadOf(notice).producer : null
+  const cost = Number(p.cost_usd) || 0
+  const used = str(p.limit) === 'cache_read_tokens' ? `${((Number(p.tokens?.cache_read_tokens) || 0) / 1e6).toFixed(1)}M cache-read tokens` : `${Number(p.runs) || 0} runs`
+  return { supervisor: producer?.kind === 'supervisor' ? str(producer.task_id) : '', sub: `${used} without a hand-off${cost > 0 ? ` · ~$${cost.toFixed(2)}` : ''}` }
+}
+
 /** What a card read (`/api/plugins/kanban/tasks/<id>`) says its card waits on next: `{ ref: { id, status } }` (another
  *  card) or `{ leaf: { kind, text, sub } }`. The same states core reads: a person ask, a dependency's open parent, the
  *  scheduled park (parkFromDetail), a ready card's queue/capacity note, triage, review, running. */
@@ -1374,6 +1406,10 @@ export function nextHop(detail, nowMs = Date.now()) {
   if (!status) return { leaf: { kind: 'unknown', text: 'status unknown' } }
   if (!OPEN(status)) return { leaf: { kind: 'done', text: `${status} · the waiting card should resume` } }
   if (status === 'running') return { leaf: { kind: 'running', text: `running${machine ? ` on ${machine}` : ''}` } }
+  // [daveey 2026-11-21] "worker slot is not it, show the real reason": a spend-stopped card sat in triage as
+  // "needs triage · worker slot" for days, but no worker, unblock or triage sweep can release it.
+  const hold = spendHold(detail)
+  if (hold) return hold.supervisor ? { ref: { id: hold.supervisor, status: '' } } : { leaf: { kind: 'hold', text: 'spend budget hit: its chat must re-scope and promote it, or archive it', sub: hold.sub } }
   if (status === 'blocked') {
     if (validHumanRequest(hr, t.block_kind)) return { leaf: { kind: 'you', text: str(hr.action), ask: true } }
     if (str(t.block_kind) === 'dependency' && openParent) return { ref: openParent }
@@ -1604,7 +1640,7 @@ const GRID = { display: 'grid', gridTemplateColumns: 'minmax(0,1fr) minmax(0,42%
 const CELL = { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
 const GUIDE = { marginLeft: 4, paddingLeft: 16, borderLeft: '1px solid color-mix(in srgb, var(--border) 90%, transparent)' }
 const leafBox = k => (LEAF[k]?.dashed ? { width: 9, height: 9, borderRadius: 2, boxSizing: 'border-box', flex: 'none', border: `1.5px dashed ${LEAF[k].color}` } : { width: 9, height: 9, borderRadius: 2, flex: 'none', background: LEAF[k]?.color })
-const summaryText = ch => `${ch.leaf.kind === 'unknown' ? shortLeaf(ch.leaf.text) : `waiting on ${ch.leaf.kind === 'you' ? 'you' : ch.leaf.kind === 'slot' ? 'a worker slot' : ch.leaf.kind === 'running' ? 'running work' : ch.leaf.kind === 'done' ? 'a finished card' : shortLeaf(ch.leaf.text)}`} · ${hops(ch)} ${hops(ch) === 1 ? 'hop' : 'hops'}`
+const summaryText = ch => `${ch.leaf.kind === 'unknown' ? shortLeaf(ch.leaf.text) : `waiting on ${ch.leaf.kind === 'you' ? 'you' : ch.leaf.kind === 'hold' ? 'a spend decision' : ch.leaf.kind === 'slot' ? 'a worker slot' : ch.leaf.kind === 'running' ? 'running work' : ch.leaf.kind === 'done' ? 'a finished card' : shortLeaf(ch.leaf.text)}`} · ${hops(ch)} ${hops(ch) === 1 ? 'hop' : 'hops'}`
 const shortLeaf = t => { const x = str(t).replace(/^CI: /, 'CI ').split(/[:(·]/)[0].trim(); return x.length > 28 ? `${x.slice(0, 27).trimEnd()}…` : x || 'something external' }
 
 /** One waiting card of this chat and its chain: the root line (box · title, its disclosure · root cause and hops ·
@@ -1698,7 +1734,7 @@ export function causeBreakdown(rows, now = Date.now(), local = new Map()) {
   const n = {}
   // A chain still being read is not counted yet (it would flash as "unknown").
   for (const i of rows || []) { const ch = chainFor(i, now, { local }); if (ch.loading) continue; const kk = ch.leaf.kind; n[kk] = (n[kk] || 0) + 1 }
-  return ['you', 'external', 'slot', 'running', 'done', 'unknown'].filter(kk => n[kk]).map(kk => ({ kind: kk, count: n[kk], label: LEAF[kk].label }))
+  return ['you', 'hold', 'external', 'slot', 'running', 'done', 'unknown'].filter(kk => n[kk]).map(kk => ({ kind: kk, count: n[kk], label: LEAF[kk].label }))
 }
 
 // ── running rows ───────────────────────────────────────────────────────────

@@ -151,3 +151,65 @@ test('review nits: strict row fallback, the full ask check, a stale root, one re
     assert.deepEqual([ci.state, ci.info.title, calls.length], ['ok', 'P', 1])
   } finally { delete globalThis.window }
 })
+
+// [daveey 2026-11-21] "worker slot is not it, show the real reason": t_01a1dff72ec562a6 sat in triage for days as
+// "needs triage · worker slot" while core held it on spend_budget_triaged until its chat promotes or archives it.
+const stop = { id: 7, kind: 'spend_budget_triaged', created_at: S - 3600, payload: { limit: 'runs', runs: 2, cost_usd: 2.69, reason: 'Spend budget: 2 runs since 2026-11-19T01:54Z without a completion or review hand-off' } }
+const chats = { id: 8, kind: 'spend_budget_decision_ready', created_at: S - 3600, payload: { episode: '7', producer: { kind: 'chats' } } }
+const held = (events, task = {}) => d({ status: 'triage', block_kind: 'dependency', ...task }, { events, links: { parents: ['t_p'] }, link_tasks: [{ id: 't_p', status: 'done' }] })
+const HOLD = { kind: 'hold', text: 'spend budget hit: its chat must re-scope and promote it, or archive it', sub: '2 runs without a hand-off · ~$2.69' }
+
+test('nextHop: a spend-budget stop is a spend hold for its chat, never a worker slot', () => {
+  assert.deepEqual(m.nextHop(held([stop, chats]), NOW).leaf, HOLD)
+  // Before its decision notice lands, and after a manual status change (core: only promote or archive releases it).
+  assert.deepEqual(m.nextHop(held([stop]), NOW).leaf, HOLD)
+  for (const status of ['todo', 'ready', 'blocked', 'scheduled']) assert.equal(m.nextHop(held([stop, chats], { status }), NOW).leaf.kind, 'hold', status)
+  assert.equal(m.nextHop(held([stop, chats], { status: 'running' }), NOW).leaf.kind, 'running')
+  assert.equal(m.nextHop(held([stop, chats], { status: 'archived' }), NOW).leaf.kind, 'done')
+  // A string payload (older reads), a cache-read token stop, no cost.
+  const tok = { ...stop, payload: JSON.stringify({ limit: 'cache_read_tokens', runs: 1, tokens: { cache_read_tokens: 31_400_000 }, cost_usd: 0 }) }
+  assert.equal(m.nextHop(held([tok]), NOW).leaf.sub, '31.4M cache-read tokens without a hand-off')
+  // No chat owns the decision: core opened a supervisor card, and the walk goes on to it.
+  const sup = { ...chats, payload: JSON.stringify({ episode: '7', producer: { kind: 'supervisor', task_id: 't_01a1f0000000abcd' } }) }
+  assert.deepEqual(m.nextHop(held([stop, sup]), NOW), { ref: { id: 't_01a1f0000000abcd', status: '' } })
+  // A later promotion or archive ends the hold (same second: the higher id is newer); an earlier one does not.
+  const promoted = (at, id = 9) => ({ id, kind: 'promoted_manual', created_at: at, payload: { reason: 're-scoped' } })
+  assert.deepEqual(m.nextHop(held([stop, chats, promoted(S - 60)]), NOW).leaf, { kind: 'slot', text: 'needs triage: nobody is working it' })
+  assert.equal(m.nextHop(held([stop, chats, promoted(S - 3600)]), NOW).leaf.kind, 'slot')
+  assert.equal(m.nextHop(held([stop, chats, promoted(S - 3600, 5)]), NOW).leaf.kind, 'hold')
+  assert.equal(m.nextHop(held([promoted(S - 7200), stop, chats]), NOW).leaf.kind, 'hold')
+  assert.equal(m.nextHop(held([stop, { id: 10, kind: 'archived', created_at: S - 30, payload: {} }]), NOW).leaf.kind, 'slot')
+  // No spend events: the plain triage leaf is unchanged.
+  assert.equal(m.spendHold(held([])), null)
+})
+
+test('spendHold: same-second marks order like core _event_order (consistent v7 uid ms, then local id)', () => {
+  // Real shape (t_01a1dff72ec562a6, 2026-11-19): the stop and its notice share a second; episode = the stop's uid.
+  const sec = 1795068991, v7 = ms => `${ms.toString(16).padStart(12, '0').replace(/^(.{8})(.{4})$/, '$1-$2')}-7c4f-9166-db7eda4bdad0`
+  const realStop = { id: 1757619, uid: v7(sec * 1000 + 100), kind: 'spend_budget_triaged', created_at: sec, payload: { limit: 'runs', runs: 2, cost_usd: 2.69 } }
+  const realNotice = { id: 1757621, uid: v7(sec * 1000 + 101), kind: 'spend_budget_decision_ready', created_at: sec, payload: { episode: realStop.uid, producer: { kind: 'chats' } } }
+  assert.equal(m.spendHold(held([realStop, realNotice])).sub, '2 runs without a hand-off · ~$2.69')
+  // Verdicts below are core's own (_event_order run on these exact rows, 2026-11-21).
+  // A promotion delivered out of order in the same second: its uid ms (minted later) wins over its lower local id.
+  const promo = (ms, id) => ({ id, uid: v7(ms), kind: 'promoted_manual', created_at: sec, payload: {} })
+  assert.equal(m.spendHold(held([realStop, promo(sec * 1000 + 500, 1757000)])), null)
+  assert.notEqual(m.spendHold(held([realStop, promo(sec * 1000 + 50, 1757999)])), null)
+  // A backfilled uid far outside its second, or a non-v7 uid, has no millisecond: it sorts at the second's start,
+  // before the stop's consistent uid, whatever its local id.
+  const v4 = id => ({ id, uid: '9b2f0c1e-4a7d-4c3b-8e5f-0a1b2c3d4e5f', kind: 'promoted_manual', created_at: sec, payload: {} })
+  for (const p of [promo((sec + 90) * 1000, 1757000), promo((sec + 90) * 1000, 1757999), v4(1757000), v4(1757999)]) assert.notEqual(m.spendHold(held([realStop, p])), null, p.uid)
+  // Neither has a usable millisecond: arrival order (the local id) decides.
+  const bare = { ...realStop, uid: null }
+  assert.notEqual(m.spendHold(held([bare, promo((sec + 90) * 1000, 1757000)])), null)
+  assert.equal(m.spendHold(held([bare, promo((sec + 90) * 1000, 1757999)])), null)
+  assert.notEqual(m.spendHold(held([bare, v4(1757000)])), null)
+  assert.equal(m.spendHold(held([bare, v4(1757999)])), null)
+})
+
+test('chainFor: a card waiting behind a spend-held card ends on the amber spend hold', () => {
+  const info = (chip, id) => ({ state: 'ok', info: { id, status: 'triage', title: 'Held', hop: m.nextHop(held([stop, chats]), NOW) } })
+  const root = { key: 'kb:t_r', kind: 'kanban', label: 't_r', chip: { id: 't_r', state: 'scheduled', look: 'waiting', waitingOn: 'card t_a0a0a0', connectionId: 'C1', profile: 'default' } }
+  const ch = m.chainFor(root, NOW, { info, local: new Map() })
+  assert.deepEqual(ch.leaf, HOLD)
+  assert.deepEqual([m.LEAF.hold.label, m.LEAF.hold.color], ['spend hold', '#d29922'])
+})
