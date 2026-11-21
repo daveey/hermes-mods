@@ -504,3 +504,79 @@ def test_native_publisher_dash_c_options_still_allowed_with_custody_refs(repo, t
     cmd = native_publisher_argv(url, "HEAD:refs/heads/feat")
     assert not _blocked(repo, cmd)
     assert not _blocked(repo, "git -c push.default=nothing -c credential.helper= push origin feat")
+
+
+# --- custody: the effective git view (--git-dir / GIT_DIR / --config-env / GIT_CONFIG_*) --------------------------
+
+def _held_view(repo, tmp_path):
+    hold_custody_ref(repo)
+    gd = subprocess.run(["git", "rev-parse", "--absolute-git-dir"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    elsewhere = tmp_path / "clean-unrelated"
+    elsewhere.mkdir()
+    return gd, elsewhere
+
+
+def test_git_dir_view_reads_the_held_repos_mirror_config_from_a_clean_cwd(repo, tmp_path):
+    gd, elsewhere = _held_view(repo, tmp_path)
+    git("config", "remote.origin.mirror", "true", cwd=repo)
+    for cmd in (f"git --git-dir={gd} push origin", f"git --git-dir {gd} push origin",
+                f"git --git-dir={gd} --work-tree={repo} push origin", f"GIT_DIR={gd} git push origin",
+                f"env GIT_DIR={gd} git push origin", f"export GIT_DIR={gd}; git push origin",
+                f"GIT_DIR={gd}\ngit push origin", f"git --git-dir={gd} push --repo=origin"):
+        assert _blocked(elsewhere, cmd), cmd
+
+
+def test_git_dir_view_allows_explicit_branch_pushes_when_not_a_mirror(repo, tmp_path):
+    gd, elsewhere = _held_view(repo, tmp_path)
+    for cmd in (f"git --git-dir={gd} push origin feat", f"GIT_DIR={gd} git push origin feat",
+                f"git --git-dir={gd} push origin HEAD:refs/heads/feat", f"GIT_DIR={gd} git push -u origin feat",
+                f"git --git-dir={gd} push origin refs/heads/*:refs/heads/*"):
+        assert not _blocked(elsewhere, cmd), cmd
+    # a view proved to hold no custody refs is also fine for a broad push
+    clean = tmp_path / "clean-repo"
+    clean.mkdir()
+    git("init", "-q", "-b", "main", cwd=clean)
+    git("remote", "add", "origin", str(tmp_path / "owner" / "repo.git"), cwd=clean)
+    assert not _blocked(elsewhere, f"git --git-dir={clean}/.git push --mirror origin")
+
+
+def test_git_dir_env_keeps_routing_for_mirror_flag_and_assigned_remote(repo, tmp_path):
+    gd, elsewhere = _held_view(repo, tmp_path)
+    assert _blocked(elsewhere, f"GIT_DIR={gd} git push --mirror origin")
+    assert _blocked(elsewhere, f"GIT_DIR={gd} git push --mirror")
+    git("config", "remote.up.url", str(tmp_path / "owner" / "repo.git"), cwd=repo)
+    git("config", "remote.up.mirror", "true", cwd=repo)
+    git("config", "remote.pushDefault", "up", cwd=repo)
+    assert _blocked(elsewhere, f"GIT_DIR={gd} git push")
+    assert not _blocked(elsewhere, f"GIT_DIR={gd} git push origin feat")
+
+
+@pytest.mark.parametrize("form", [
+    "MIRROR=true git --config-env=remote.origin.mirror=MIRROR push origin",
+    "MIRROR=true git --config-env remote.origin.mirror=MIRROR push origin",
+    "env MIRROR=true git --config-env=remote.origin.mirror=MIRROR push origin",
+    "export MIRROR=true; git --config-env=remote.origin.mirror=MIRROR push origin",
+    "MIRROR=true git --config-env=remote.origin.mirror=MIRROR push origin feat",
+    "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.mirror GIT_CONFIG_VALUE_0=true git push origin",
+    "GIT_CONFIG_PARAMETERS=\"'remote.origin.mirror=true'\" git push origin",
+])
+def test_config_env_and_git_config_env_overrides_are_applied(repo, form):
+    hold_custody_ref(repo)
+    assert _blocked(repo, form), form
+
+
+def test_config_env_override_can_also_switch_mirror_off(repo):
+    hold_custody_ref(repo)
+    git("config", "remote.origin.mirror", "true", cwd=repo)
+    assert _blocked(repo, "git push origin")
+    assert not _blocked(repo, "MIRROR=false git --config-env=remote.origin.mirror=MIRROR push origin")
+
+
+def test_unresolvable_view_inputs_fail_closed_but_url_pushes_with_refspecs_pass(repo, tmp_path):
+    gd, elsewhere = _held_view(repo, tmp_path)
+    url = str(tmp_path / "someone" / "else.git")
+    for cmd in ("git --git-dir=$HOLD push origin feat", "GIT_DIR=$(pwd)/.git git push origin feat",
+                "git --config-env=remote.origin.mirror=NOT_SET_ANYWHERE_XYZ push origin feat",
+                "git -C $WHERE push origin feat"):
+        assert _blocked(elsewhere, cmd), cmd
+    assert not _blocked(elsewhere, f"git --git-dir=$HOLD push {url} feat")

@@ -114,15 +114,29 @@ def _remote_matches(url: str, remote: str) -> bool:
 def _commands(cmd: str, cwd: str, segments: Optional[list] = None):
     """Yield (cwd, words) per simple command, following `cd` and stripping env/sudo/token-broker wrappers.
     `segments` overrides the plain separator split (the cancel guard passes a quote-aware one)."""
+    for cwd, words, _ in _commands_env(cmd, cwd, segments):
+        yield cwd, words
+
+
+_ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.S)
+
+
+def _commands_env(cmd: str, cwd: str, segments: Optional[list] = None):
+    """Like _commands, plus a 3rd item: the environment assignments in effect for that command (earlier
+    `export X=1` / `X=1;` segments and the command's own `X=1 git ...` / `env X=1 git ...` prefixes)."""
+    shell_env: dict = {}
     for seg in (SEPARATORS.split(cmd or "") if segments is None else segments):
         try:
             words = shlex.split(seg, comments=True)
         except ValueError:
             words = seg.split()
+        own: dict = {}
         changed = True
         while changed and words:
             changed = False
-            while words and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]):
+            while words and _ASSIGN.match(words[0]):
+                k, _, v = words[0].partition("=")
+                own[k] = v
                 words, changed = words[1:], True
             if words and words[0] in PREFIXES:
                 words, changed = words[1:], True
@@ -133,11 +147,22 @@ def _commands(cmd: str, cwd: str, segments: Optional[list] = None):
             if words and os.path.basename(words[0]) == "token-broker" and "--" in words:
                 words, changed = words[words.index("--") + 1:], True
         if not words:
+            shell_env.update(own)  # bare `X=1`: sticks for the rest of the command line
+            continue
+        if words[0] in ("export", "declare", "typeset", "local", "readonly") and len(words) > 1:
+            for w in words[1:]:
+                m = _ASSIGN.match(w)
+                if m:
+                    shell_env[m.group(1)] = m.group(2)
+            continue
+        if words[0] == "unset":
+            for w in words[1:]:
+                shell_env[w] = None
             continue
         if words[0] in ("cd", "pushd") and len(words) > 1:
             cwd = _resolve(words[1], cwd)
             continue
-        yield cwd, words
+        yield cwd, words, {**shell_env, **own}
 
 
 def _git_calls(cmd: str, cwd: str):
@@ -146,28 +171,77 @@ def _git_calls(cmd: str, cwd: str):
         yield repo, sub, args
 
 
+class GitView:
+    """The git a command line would actually run: cwd/-C plus --git-dir, --work-tree, -c, --config-env and
+    GIT_* environment assignments. Queries run real git with those same inputs, so what the guard reads is
+    what the push would see. `unresolved` is True when any input needs shell expansion (or an environment
+    variable) the guard cannot see: the view is then unproved and callers must fail closed."""
+
+    def __init__(self, repo: str, env: Optional[dict] = None):
+        self.repo, self.env, self.opts, self.unresolved, self.repointed = repo, dict(env or {}), [], False, False
+        for v in self.env.values():
+            if v is not None and re.search(r"[$`]", v):
+                self.unresolved = True
+
+    def add(self, *opt: str) -> None:
+        self.opts.extend(opt)
+        if any(re.search(r"[$`]", o) for o in opt):
+            self.unresolved = True
+
+    def config_env(self, spec: str) -> None:
+        self.add("--config-env=" + spec)
+        _, _, var = spec.partition("=")
+        if var not in os.environ and self.env.get(var) is None:
+            self.unresolved = True  # git would fail or read a value the guard cannot see
+
+    def run(self, *args: str) -> Optional[str]:
+        env = dict(os.environ)
+        for k, v in self.env.items():
+            if v is None:
+                env.pop(k, None)
+            else:
+                env[k] = v
+        try:
+            r = subprocess.run(["git", "-C", self.repo, *self.opts, *args], capture_output=True, text=True,
+                               timeout=15, env=env)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return r.stdout.strip() if r.returncode == 0 else None
+
+
 def _git_calls_cfg(cmd: str, cwd: str):
-    """Like _git_calls, plus a 4th item (overrides, repointed): the `-c key=value` options, and whether
-    --git-dir/--work-tree re-pointed git at a repository the guard did not resolve."""
-    for cwd, words in _commands(cmd, cwd):
+    """Like _git_calls, plus a 4th item: the GitView the command would run in (see GitView)."""
+    for cwd, words, env in _commands_env(cmd, cwd):
         if os.path.basename(words[0]) != "git":
             continue
-        repo, i, conf, repointed = cwd, 1, [], False
+        repo, i = cwd, 1
+        view = GitView(repo, env)
         while i < len(words) and words[i].startswith("-"):
-            if words[i] == "-C" and i + 1 < len(words):
+            w = words[i]
+            if w == "-C" and i + 1 < len(words):
+                if re.search(r"[$`]", words[i + 1]):
+                    view.unresolved = True
                 repo = _resolve(words[i + 1], repo)
+                view.repo = repo
                 i += 2
-            elif words[i] == "-c" and i + 1 < len(words):
-                conf.append(words[i + 1])
+            elif w == "-c" and i + 1 < len(words):
+                view.add("-c", words[i + 1])
                 i += 2
-            elif words[i] in ("--git-dir", "--work-tree") and i + 1 < len(words):
-                repointed = True
+            elif w == "--config-env" and i + 1 < len(words):
+                view.config_env(words[i + 1])
+                i += 2
+            elif w.startswith("--config-env="):
+                view.config_env(w[13:])
+                i += 1
+            elif w in ("--git-dir", "--work-tree", "--namespace") and i + 1 < len(words):
+                view.add(w, words[i + 1])
                 i += 2
             else:
-                repointed = repointed or words[i].startswith(("--git-dir=", "--work-tree="))
+                if w.startswith(("--git-dir=", "--work-tree=", "--namespace=")):
+                    view.add(w)
                 i += 1
         if i < len(words):
-            yield repo, words[i], words[i + 1:], (conf, repointed)
+            yield repo, words[i], words[i + 1:], view
 
 
 VALUE_OPTS = {"-o", "--push-option", "--repo", "--receive-pack", "--exec"}
@@ -956,12 +1030,12 @@ def check_custody_push(cmd: str, cwd: str) -> Optional[str]:
     mirror, and a `*` refspec on the command line or in the remote's push config. Applies to every remote, with
     or without a configured guard, and PUSH_GUARD=off does not skip it. This is a second fence: core's own
     publisher refuses the same argv."""
-    for repo, sub, args, (conf, repointed) in _git_calls_cfg(cmd, cwd):
+    for repo, sub, args, view in _git_calls_cfg(cmd, cwd):
         if sub != "push":
             continue
 
-        def cfg(*a: str) -> Optional[str]:  # real git config view, including this command's `-c` overrides
-            return _git(repo, *[x for kv in conf for x in ("-c", kv)], "config", *a)
+        def cfg(*a: str) -> Optional[str]:  # real git config view: -c/--config-env/--git-dir/GIT_* included
+            return view.run("config", *a)
 
         pos, mirror, repo_opt, i = [], False, None, 0
         while i < len(args):
@@ -984,7 +1058,7 @@ def check_custody_push(cmd: str, cwd: str) -> Optional[str]:
         for s in specs:
             if any(_custody_side(side) for side in s.split(":", 1) if side):
                 return f"`git push ... {s[:80]}` names the source-custody namespace {CUSTODY_NS}"
-        held = None if repointed else _git(repo, "for-each-ref", "--count=1", "--format=%(refname)", CUSTODY_NS)
+        held = None if view.unresolved else view.run("for-each-ref", "--count=1", "--format=%(refname)", CUSTODY_NS)
         if held == "":
             continue  # provably no custody refs here: a broad push cannot carry any
         # otherwise refs exist, or the repo is unreadable / re-pointed (unproved): assume they exist
@@ -992,11 +1066,18 @@ def check_custody_push(cmd: str, cwd: str) -> Optional[str]:
             return f"`git push --mirror` would publish this repo's source-custody refs ({CUSTODY_NS})"
         if any("*" in s and not _heads_or_tags_only(s) for s in specs):
             return f"a `*` refspec would publish this repo's source-custody refs ({CUSTODY_NS})"
-        cur = _git(repo, "symbolic-ref", "-q", "--short", "HEAD") or "HEAD"
+        if view.unresolved and not (specs and pos and re.search(r"[/:@]", pos[0])):
+            # the effective repository/config depends on shell expansion the guard cannot see; only a push by URL
+            # with explicit refspecs is independent of remote.<name>.mirror/push config
+            return (f"this `git push` runs in a git view the guard cannot resolve (unexpanded shell variable or "
+                    f"missing environment); it might publish source-custody refs ({CUSTODY_NS})")
+        cur = view.run("symbolic-ref", "-q", "--short", "HEAD") or "HEAD"
         remote = (pos[0] if pos else repo_opt) or cfg(f"branch.{cur}.pushRemote") or cfg("remote.pushDefault") \
             or cfg(f"branch.{cur}.remote") or "origin"
         conf_lines = cfg("--get-regexp", rf"^remote\.{re.escape(remote)}\.(mirror|push)$") or ""
-        for line in conf_lines.splitlines():
+        lines = conf_lines.splitlines()
+        last_mirror = [l for l in lines if l.partition(" ")[0].endswith(".mirror")][-1:]  # last value wins
+        for line in [l for l in lines if not l.partition(" ")[0].endswith(".mirror")] + last_mirror:
             key, _, value = line.partition(" ")
             if key.endswith(".mirror") and value.strip().lower() not in _GIT_FALSE:
                 # git itself rejects a mirror remote combined with refspecs, but do not rely on that
