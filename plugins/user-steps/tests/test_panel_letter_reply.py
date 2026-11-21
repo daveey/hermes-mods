@@ -237,8 +237,35 @@ def test_pre_llm_call_contains_mapping_failure_and_keeps_decisions(tmp_path, mon
 def test_python_letter_order_still_matches_the_desktop_panel():
     """_panel_rows mirrors plugin.js; if the panel's lettering or order changes, update both together."""
     js = (ROOT.parents[1] / "desktop-plugins" / "user-steps" / "plugin.js").read_text()
-    assert "const letter = i => String.fromCharCode(65 + i)" in js
+    assert "const letters = panelLetters(ordered.map(c => c.label), extraRows)" in js
+    assert "const extraRows = 1 + (presentation?.other === true ? 1 : 0)" in js
+    assert "const OWN_LETTER = /^\\s*(?:option\\s+)?\\(?([A-Za-z])(?:\\)|:|\\.(?=\\s)|\\s+[-\\u2013\\u2014](?=\\s))\\s*/i" in js
     assert "const ordered = recommended ? [recommended, ...shown.filter(c => c !== recommended)] : shown" in js
     assert "questionRow('skip', ordered.length, 'Skip'" in js
     assert "questionRow('answer-text', ordered.length + 1, 'Other (type your answer)'" in js
     assert "presentation?.kind === 'kanban-question'" in js
+
+
+def test_own_option_letters_survive_recommended_first_order(tmp_path, monkeypatch):
+    """A card whose choices are labelled "C: …" / "A: …" keeps C and A, recommended first; Skip/Other follow."""
+    plugin = _plugin("panel_letter_own", tmp_path, monkeypatch)
+    request = {
+        "requestId": "33333333-3333-4333-8333-333333333333", "title": "Pick a route",
+        "choices": [{"id": "card-0", "label": "C: test Slack on the live version (recommended)", "effect": "answer"},
+                    {"id": "card-1", "label": "A: fund the full proof", "effect": "answer"}],
+        "presentation": {"kind": "kanban-question", "question": "Pick", "details": "d",
+                         "recommendedChoiceId": "card-0", "other": True},
+    }
+    rows = plugin._panel_rows(request)
+    assert plugin._panel_letters(rows, 2) == ["C", "A", "D", "E"]
+    hint = plugin._panel_letter_hint("c", [request])
+    assert 'C = "C: test Slack on the live version"' in hint and 'A = "A: fund the full proof"' in hint
+    assert 'D = "Skip"' in hint
+    assert plugin._panel_letter_hint("b", [request]) == ""
+
+
+def test_mixed_or_duplicate_own_letters_fall_back_to_position(tmp_path, monkeypatch):
+    plugin = _plugin("panel_letter_mixed", tmp_path, monkeypatch)
+    assert plugin._panel_letters(["A only (cadence)", "Go: A+B+C", "Skip"], 1) == ["A", "B", "C"]
+    assert plugin._panel_letters(["A: one", "two", "Skip"], 1) == ["A", "B", "C"]
+    assert plugin._panel_letters(["A: one", "A) two", "Skip"], 1) == ["A", "B", "C"]

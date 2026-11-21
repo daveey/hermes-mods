@@ -304,6 +304,23 @@ def _panel_rows(request: dict) -> list[str]:
     return rows
 
 
+# A choice label's own option letter ("C: …", "(C) …", "Option C - …"); same rule as OWN_LETTER in plugin.js.
+_OWN_LETTER = re.compile(r"^\s*(?:option\s+)?\(?([A-Za-z])(?:\)|:|\.(?=\s)|\s+[-\u2013\u2014](?=\s))\s*", re.I)
+
+
+def _panel_letters(rows: list[str], extra: int) -> list[str]:
+    """The badge letter of each _panel_rows row, mirroring plugin.js panelLetters.
+
+    Choices whose labels all carry distinct own letters keep them (the card's brief calls them that), and the last
+    `extra` rows (Skip, Other) take the letters after the highest; otherwise rows are lettered A, B, C... in order."""
+    choices = rows[:len(rows) - extra]
+    own = [(m.group(1).upper() if (m := _OWN_LETTER.match(label)) else "") for label in choices]
+    top = max((ord(c) for c in own if c), default=0)
+    if not own or not all(own) or len(set(own)) != len(own) or top + extra > 90:
+        return [chr(65 + i) for i in range(len(rows))]
+    return own + [chr(top + 1 + i) for i in range(extra)]
+
+
 def _panel_letter_hint(message: str, requests: list) -> str:
     """Context line mapping a typed option letter to the decision panel's lettered option (empty when none applies).
 
@@ -316,10 +333,12 @@ def _panel_letter_hint(message: str, requests: list) -> str:
     hits = []
     for r in requests or []:
         rows = _panel_rows(r)
-        i = ord(code) - 65
-        if 0 <= i < len(rows):
+        p = r.get("presentation") if isinstance(r, dict) else None
+        extra = 1 + (1 if isinstance(p, dict) and p.get("other") is True else 0)
+        letters = _panel_letters(rows, extra) if rows else []
+        if code in letters:
             title = str(r.get("title") or "")[:INDEX_TITLE_CHARS]
-            table = ", ".join(f'{chr(65 + j)} = {json.dumps(label, ensure_ascii=False)}' for j, label in enumerate(rows))
+            table = ", ".join(f'{letter} = {json.dumps(label, ensure_ascii=False)}' for letter, label in zip(letters, rows))
             hits.append(f'"{title}" (requestId {str(r.get("requestId") or "")[:8]}): {table}')
     if not hits:
         return ""

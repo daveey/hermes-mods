@@ -39,7 +39,8 @@ test('card question has lettered ordered rows, hidden details and unchanged choi
  assert.match(visible.textContent, /2\/3 — Which color should we use\?/)
  assert.match(visible.textContent, /Pick one/)
  assert.deepEqual([...el().querySelectorAll('[data-choice-letter]')].map(n => n.textContent), ['A','B','C','D','E'])
- assert.deepEqual([...el().querySelectorAll('[data-option-label]')].map(n => n.textContent), ['Green (recommended)','Red','Blue','Skip','Other (type your answer)'])
+ assert.deepEqual([...el().querySelectorAll('[data-option-label]')].map(n => n.textContent), ['Green','Red','Blue','Skip','Other (type your answer)'])
+ assert.deepEqual([...el().querySelectorAll('[data-recommended-row] [data-option-label]')].map(n => n.textContent), ['Green'])
  await click('card-1')
  const post = calls.find(([,o]) => o.method === 'POST')
  assert.equal(post[0], `/api/plugins/user-steps/requests/${r.requestId}/decisions`)
@@ -121,4 +122,30 @@ test('a decision whose POST fails does not force a refresh (nothing changed)', a
   await React.act(async () => { await flush(); await flush() })
   assert.deepEqual(forced, [])
  } finally { delete window.__blockedPanel }
+})
+
+// The generate-unblock-card brief (Situation / lettered Options / Recommend / Only you can) renders as tiles, and a
+// choice labelled "C: …" keeps its own letter instead of being re-lettered A by display order.
+test('card brief renders own letters, option details, the recommendation reason and the only-you line', async () => {
+ const details = [
+  "Pick how to get the Slack test unblocked. Unblock = C; archive = shelve both.",
+  "Tried: 5 build windows. Only you can: approve that budget and permission scope, or drop this proof requirement.",
+  "Situation: The safety proof stalled after ~13 runs; a review says finishing needs 18-30 more runs plus a throwaway VM.\nOptions:\nA) Fund the full proof: ~$35-60 in runs plus a VM under $25.\nC) Test Slack on live version: park the proof, run the end-to-end test now; ~$5; reversible.\nRecommend: C - a cheap real test tells us if the fix is needed.",
+  "**Estimate:** very low confidence"].join('\n\n')
+ const r = request({ choices: [{ id: 'card-0', label: 'C: test Slack on the live version (recommended)', effect: 'answer' }, { id: 'card-1', label: 'A: fund the full proof (~$60 + VM)', effect: 'answer' }],
+  presentation: { kind: 'kanban-question', question: 'Pick how to get the Slack test unblocked.', details, recommendedChoiceId: 'card-0', other: true } })
+ await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call: async () => ({ request: r }) }))
+ assert.deepEqual([...el().querySelectorAll('[data-choice-letter]')].map(n => n.textContent), ['C','A','D','E'])
+ assert.deepEqual([...el().querySelectorAll('[data-option-label]')].map(n => n.textContent), ['Test Slack on the live version','Fund the full proof (~$60 + VM)','Skip','Other (type your answer)'])
+ assert.deepEqual([...el().querySelectorAll('[data-option-detail]')].map(n => n.textContent), ['Park the proof, run the end-to-end test now; ~$5; reversible.','~$35-60 in runs plus a VM under $25.'])
+ assert.equal(el().querySelector('[data-recommended-row] [data-option-reason]')?.textContent, 'Why: a cheap real test tells us if the fix is needed.')
+ assert.match(el().querySelector('[data-ask-situation]')?.textContent || '', /^The safety proof stalled/)
+ assert.equal(el().querySelector('[data-ask-only-you]')?.textContent, 'Only you can: approve that budget and permission scope, or drop this proof requirement.')
+})
+
+test('panelLetters keeps own letters only when every choice has a distinct one', () => {
+ assert.deepEqual(m.panelLetters(['C: x', 'A: y'], 2), ['C','A','D','E'])
+ assert.deepEqual(m.panelLetters(['C: x', 'plain'], 1), ['A','B','C'])
+ assert.deepEqual(m.panelLetters(['A: x', 'A) y'], 1), ['A','B','C'])
+ assert.deepEqual(m.panelLetters(['Red','Green'], 2), ['A','B','C','D'])
 })

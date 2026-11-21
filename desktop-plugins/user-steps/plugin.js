@@ -739,6 +739,44 @@ const currentRoute = route => routeKey(route) === routeKey(decisionRoute())
 const operations = new Map() // authoritative readbacks shared by mounted tiles
 const INTENT_PREFIX = 'hermes.actionIntent.v2:'
 // Persist only retry intent, NOT authorization or delivery success. Every recovery queries the owner.
+// Card-ask option letters. A choice labelled "C: …" keeps its own letter (the card's brief calls it C), so the badge
+// never reads "A  C: …"; Skip and Other take the letters after the highest one. Without own letters on every choice
+// (or with duplicates) the rows are lettered A, B, C… in display order. Mirrored by _panel_letters in
+// plugins/user-steps/__init__.py, which maps a typed letter to the same option: change both together.
+const OWN_LETTER = /^\s*(?:option\s+)?\(?([A-Za-z])(?:\)|:|\.(?=\s)|\s+[-\u2013\u2014](?=\s))\s*/i
+export function panelLetters(labels, extra) {
+  const own = labels.map(l => OWN_LETTER.exec(str(l))?.[1]?.toUpperCase() || '')
+  const top = own.length ? Math.max(...own.map(l => (l ? l.charCodeAt(0) : 0))) : 0
+  if (!own.length || !own.every(Boolean) || new Set(own).size !== own.length || top + extra > 90)
+    return Array.from({ length: labels.length + extra }, (_, i) => String.fromCharCode(65 + i))
+  return [...own, ...Array.from({ length: extra }, (_, i) => String.fromCharCode(top + 1 + i))]
+}
+/** A choice label for its lettered row: no "(recommended)" suffix, no own-letter prefix when the badge shows it. */
+export function optionName(label, ownLetters) {
+  const t = str(label).replace(/\s*\(recommended\)\s*$/i, '')
+  const n = ownLetters ? t.replace(OWN_LETTER, '') : t
+  return n ? n[0].toUpperCase() + n.slice(1) : t
+}
+/** The generate-unblock-card brief inside a card ask's details: Situation, per-letter option detail, the
+ *  recommendation's reason and the "Only you can: …" line. Missing parts are empty; nothing here is required. */
+export function cardBrief(details) {
+  const t = str(details).replace(/\r\n?/g, '\n')
+  const sec = name => (new RegExp(`(?:^|\\n)[ \\t]*(?:[-*][ \\t]*)?(?:\\*\\*)?${name}(?:\\*\\*)?[ \\t]*:(?:\\*\\*)?[ \\t]*([\\s\\S]*?)(?=\\n[ \\t]*(?:[-*][ \\t]*)?(?:\\*\\*)?(?:Situation|Options?|Recommend(?:ation|ed)?)(?:\\*\\*)?[ \\t]*:|\\n[ \\t]*\\n|$)`, 'i').exec(t)?.[1] || '').trim()
+  const options = {}
+  for (const raw of sec('Options?').split('\n')) {
+    const line = raw.replace(/^\s*[-*]\s*/, '').replace(/\*\*/g, '')
+    const m = OWN_LETTER.exec(line)
+    if (!m) continue
+    const rest = line.slice(m[0].length), sep = /:\s|\s[-\u2013\u2014]\s/.exec(rest)
+    const detail = (sep && sep.index > 0 && sep.index <= 80 ? rest.slice(sep.index + sep[0].length) : '').trim()
+    options[m[1].toUpperCase()] = detail ? detail[0].toUpperCase() + detail.slice(1) : ''
+  }
+  const recText = sec('Recommend(?:ation|ed)?')
+  const rec = /^(?:option\s+)?\(?([A-Za-z])\)?(?=[\s:,.\u2013\u2014-]|$)\s*(?:[-\u2013\u2014:,]|because)?\s*/i.exec(recText)
+  const only = /\bonly you can\s*:\s*([^\n]+)/i.exec(t)
+  return { situation: sec('Situation').replace(/\s+/g, ' '), options, recommendLetter: rec ? rec[1].toUpperCase() : '',
+    reason: rec ? recText.slice(rec[0].length).replace(/^because\s+/i, '').trim() : '', onlyYou: only ? only[1].trim() : '' }
+}
 const cardPresentation = r => r?.presentation?.kind === 'kanban-question' && typeof r.presentation.question === 'string' && typeof r.presentation.details === 'string' ? r.presentation : null
 function recoverIntent(key, request) {
   try {
@@ -1185,8 +1223,22 @@ export function DecisionRow({ request, route, call = api, unavailable = false, p
   const limitsView = !!r.limits?.length && jsxs('div', { 'data-action-limits': '', children: [jsx('strong', { children: 'Limits' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20, ...planStyle }, children: r.limits.map((l,i) => jsx('li', { children: `${l.key}: ${l.value}${permissionNote(l.permissionRequired)}` }, i)) })] })
   const exclusionsView = !!r.exclusions?.length && jsxs('div', { style: planStyle, children: [jsx('strong', { children: 'Not included' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20 }, children: r.exclusions.map((text,i) => jsx('li', { children: text }, i)) })] })
   const fold = (label, children) => jsxs('details', { 'data-action-fold': '', children: [jsx('summary', { style: { cursor: 'pointer', fontSize: 12, color: 'var(--muted-foreground)', minHeight: 28, display: 'flex', alignItems: 'center' }, children: label }), ...children] })
-  const letter = i => String.fromCharCode(65 + i)
-  const questionRow = (id, index, label, onClick, disabled, isRecommended = false) => jsxs('button', { type: 'button', 'data-clarify-row': id, 'data-decision-option': id, disabled, onClick, style: { width: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '6px 8px', minHeight: 32, border: 0, borderRadius: 4, textAlign: 'left', font: 'inherit', fontSize: 13, color: 'var(--foreground)', cursor: 'pointer', background: isRecommended ? 'color-mix(in srgb, var(--primary) 12%, transparent)' : 'transparent' }, children: [jsx('span', { 'data-choice-letter': '', 'aria-hidden': true, style: { fontSize: 11, minWidth: 18, textAlign: 'center', border: '1px solid var(--border)', borderRadius: 3, color: 'var(--muted-foreground)' }, children: letter(index) }), jsx('span', { 'data-option-label': '', children: label })] }, id)
+  const brief = presentation ? cardBrief(presentation.details) : null
+  const extraRows = 1 + (presentation?.other === true ? 1 : 0)
+  const letters = panelLetters(ordered.map(c => c.label), extraRows)
+  const ownLetters = ordered.length > 0 && ordered.every((c, i) => OWN_LETTER.exec(str(c.label))?.[1]?.toUpperCase() === letters[i])
+  const letter = i => letters[i]
+  const questionRow = (id, index, label, onClick, disabled, isRecommended = false, detail = '', reason = '') => jsxs('button', { type: 'button', 'data-clarify-row': id, 'data-decision-option': id, ...(isRecommended ? { 'data-recommended-row': '' } : {}), disabled, onClick, style: { width: '100%', display: 'grid', gridTemplateColumns: '22px minmax(0,1fr)', columnGap: 10, alignItems: 'start', padding: '7px 9px', minHeight: 32, border: `1px solid ${isRecommended ? 'color-mix(in srgb, var(--primary, var(--accent)) 55%, transparent)' : 'transparent'}`, borderRadius: 6, marginBottom: 2, textAlign: 'left', font: 'inherit', fontSize: 13, color: 'var(--foreground)', cursor: 'pointer', background: isRecommended ? 'color-mix(in srgb, var(--primary, var(--accent)) 10%, transparent)' : 'transparent' }, children: [
+    jsx('span', { 'data-choice-letter': '', 'aria-hidden': true, style: { width: 22, height: 22, borderRadius: 999, display: 'grid', placeItems: 'center', fontSize: 11.5, fontWeight: 700, background: isRecommended ? 'var(--primary, var(--accent))' : 'color-mix(in srgb, var(--foreground) 12%, transparent)', color: isRecommended ? 'var(--primary-foreground, #fff)' : 'var(--foreground)' }, children: letter(index) }),
+    jsxs('span', { style: { display: 'block', minWidth: 0, lineHeight: '22px' }, children: [
+      jsxs('span', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', columnGap: 6 }, children: [
+        jsx('span', { 'data-option-label': '', style: { fontWeight: detail || isRecommended ? 600 : 400, overflowWrap: 'anywhere' }, children: label }),
+        isRecommended && jsx('span', { 'data-recommended': '', style: { ...recommendedPill, lineHeight: 1.5 }, children: 'Recommended' })
+      ] }),
+      detail && jsx('span', { 'data-option-detail': '', style: { display: 'block', fontSize: 12, lineHeight: 1.45, color: 'var(--muted-foreground)', marginTop: 1, overflowWrap: 'anywhere' }, children: detail }),
+      isRecommended && reason && jsx('span', { 'data-option-reason': '', style: { display: 'block', fontSize: 12, lineHeight: 1.45, marginTop: 3, color: 'var(--primary, var(--accent))', overflowWrap: 'anywhere' }, children: `Why: ${reason}` })
+    ] })
+  ] }, id)
   return jsxs('article', { ref: article, 'data-action-request': requestKey(r), 'data-decision-audience': agentPending(r) ? 'agent' : 'human', tabIndex: -1, 'aria-label': presentation?.question || r.title, style: { ...rowStyle, minWidth: 0 }, children: [
     !presentation && jsxs('div', { 'data-action-meta': '', style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', columnGap: 6, rowGap: 2, fontSize: 11, color: 'var(--muted-foreground)', marginTop: 4 }, children: [
       jsx('span', { 'data-action-kind': r.kind, style: { padding: '0 6px', borderRadius: 4, color: r.kind === 'approval' ? AMBER : 'var(--muted-foreground)', background: `color-mix(in srgb, ${r.kind === 'approval' ? AMBER : 'var(--muted-foreground)'} 14%, transparent)` }, children: kindLabel }),
@@ -1195,11 +1247,13 @@ export function DecisionRow({ request, route, call = api, unavailable = false, p
     !presentation && jsx('h3', { style: { margin: '2px 0 4px', fontSize: 14, fontWeight: 600, lineHeight: 1.4, overflowWrap: 'anywhere', minWidth: 0 }, children: r.title }),
     presentation && jsx('div', { 'data-action-card-title': '', style: { fontWeight: 600, fontSize: 13, overflowWrap: 'anywhere' }, children: r.title }),
     presentation && jsxs('div', { 'data-clarify-question': '', style: { display: 'flex', alignItems: 'baseline', gap: 8, margin: '8px 0 4px', fontSize: 13, lineHeight: 1.5 }, children: [jsx('p', { style: { margin: 0, flex: 1, overflowWrap: 'anywhere' }, children: `${position}/${total} — ${presentation.question}` }), jsx('span', { style: { flex: 'none', color: 'var(--muted-foreground)', fontSize: 10 }, children: 'Pick one' })] }),
+    presentation && brief.situation && jsx('div', { 'data-ask-situation': '', title: brief.situation, style: { fontSize: 12.5, lineHeight: 1.5, margin: '0 0 6px', overflowWrap: 'anywhere', display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical', overflow: 'hidden' }, children: brief.situation }),
     !locked && presentation && jsx('div', { role: 'group', 'aria-label': 'Options', children: [
-      ...ordered.map((c, i) => questionRow(c.id, i, `${c.label.replace(/\s*\(recommended\)\s*$/i, '')}${c === recommended ? ' (recommended)' : ''}`, () => void send(c), choiceDisabled(c), c === recommended)),
+      ...ordered.map((c, i) => { const code = letter(i); return questionRow(c.id, i, optionName(c.label, ownLetters), () => void send(c), choiceDisabled(c), c === recommended, ownLetters ? brief.options[code] || '' : '', ownLetters && brief.recommendLetter && brief.recommendLetter !== code ? '' : brief.reason) }),
       questionRow('skip', ordered.length, 'Skip', () => dismissRequest(r), unavailable || dismissal.busy),
       presentation.other === true && questionRow('answer-text', ordered.length + 1, 'Other (type your answer)', e => { trigger.current = e.currentTarget; setEditing({ id: 'answer-text', label: 'Other (type your answer)', effect: 'answer' }) }, choiceDisabled({ effect: 'answer' }))
     ] }),
+    !locked && presentation && brief.onlyYou && jsx('div', { 'data-ask-only-you': '', style: { fontSize: 12, lineHeight: 1.45, color: 'var(--muted-foreground)', margin: '4px 0', overflowWrap: 'anywhere' }, children: `Only you can: ${brief.onlyYou}` }),
     !locked && presentation && fold('Details', [jsx('div', { 'data-action-scope': '', style: { ...planStyle, whiteSpace: 'pre-wrap' }, children: presentation.details }), limitsView, exclusionsView]),
     !locked && !presentation && (explained.length
       ? fold(r.kind === 'approval' ? 'Full plan and limits' : 'Full question', [scopeView, limitsView, exclusionsView])
