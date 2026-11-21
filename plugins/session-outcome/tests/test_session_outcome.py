@@ -813,7 +813,7 @@ def test_register_wires_tool_gate_provider_and_judge(plugin, fake):
     assert ctx.tools["session_outcome"]["check_fn"] is plugin.check_fn
     assert ctx.hooks["pre_final_gate"] is plugin.pre_final_gate
     assert plugin.pre_final_gate.needs_buffer is True
-    assert set(fake.providers) == {"user-steps"} and fake.judges == [plugin.judge]
+    assert set(fake.providers) == {"user-steps", "person-dependencies"} and fake.judges == [plugin.judge]
 
 
 # ---- held draft: the reply after this gate's hold must still carry the answer ----------------------------------
@@ -978,8 +978,8 @@ def test_decide_blank_why_not_default_does_not_override(plugin, fake, home):
 
 # ---- external person vs passive watch ----------------------------------------------------------------------
 
-PERSON = {"kind": "person", "contact": "Slack @Eve", "channel": "slack", "thread": "C0EXAMPLE/1700000000.000100",
-          "response": "confirm the staging key is rotated", "next_step": "run the staging checks once she answers"}
+PERSON = {"kind": "person", "contact": "Slack @Eve", "channel": "slack", "thread": "https://example.com/C0EXAMPLE/1700000000.000100",
+          "request_id": "request-staging-key", "response": "confirm the staging key is rotated", "next_step": "run the staging checks once she answers"}
 
 
 def test_passive_watch_still_lets_done_show_done_with_watch(plugin, fake, monkeypatch):
@@ -994,7 +994,7 @@ def test_requested_slack_reply_is_a_visible_waiting_outcome(plugin, fake):
     assert out["ok"] and out["declared"]
     item = fake.stored["S1"]["on"][0]
     assert fake.stored["S1"]["kind"] == "waiting" and item["state"] == "waiting"
-    assert item["id"] == "person:slack:Slack @Eve:C0EXAMPLE/1700000000.000100"
+    assert item["id"] == plugin.person_wait_id(PERSON['channel'], PERSON['contact'], PERSON['thread'], PERSON['request_id'])
     for needle in ("Slack @Eve", "slack", "C0EXAMPLE/1700000000.000100", "confirm the staging key is rotated",
                    "run the staging checks once she answers"):
         assert needle in item["label"]
@@ -1012,7 +1012,7 @@ def test_done_refused_while_person_reply_is_outstanding_even_with_a_watch(plugin
     call(plugin, {"kind": "wait", "on": [PERSON]})
     _fake_ksa(monkeypatch, [])  # the parked staging task is a watch: invisible to session_tasks
     out = call(plugin, {"kind": "done", "summary": "Staging check parked."})
-    assert not out["ok"] and "named person" in out["error"] and "person:slack:Slack @Eve" in out["error"]
+    assert not out["ok"] and "named person" in out["error"] and "Slack @Eve" in out["error"]
     assert fake.stored["S1"]["kind"] == "waiting"  # still shown waiting
 
 
@@ -1033,7 +1033,7 @@ def test_completion_after_verification_is_done(plugin, fake, monkeypatch):
     call(plugin, {"kind": "wait", "on": [{**PERSON, "state": "verifying", "evidence": "her reply in the thread"}]})
     wid = fake.stored["S1"]["on"][0]["id"]
     out = call(plugin, {"kind": "done", "summary": "Staging verified after her reply.",
-                        "closes_person_waits": [{"id": wid, "evidence": "staging checks green"}]})
+                        "closes_person_waits": [{"id": wid, "evidence": "staging checks green", "verified": True}]})
     assert out["ok"], out
     assert fake.declared[-1][1] == {"kind": "done", "summary": "Staging verified after her reply."}
     assert fake.stored["S1"]["kind"] == "done"
@@ -1052,3 +1052,50 @@ def test_cannot_close_a_person_wait_that_never_got_a_reply(plugin, fake):
 def test_person_wait_is_unaffected_for_other_wait_kinds(plugin, fake):
     assert call(plugin, {"kind": "wait", "on": [{"kind": "card", "id": "t_1"}]})["ok"]
     assert call(plugin, {"kind": "done", "summary": "ok after card wait"})["ok"]
+
+
+def test_person_schema_accepts_payload_without_core_id(plugin):
+    import jsonschema
+    payload = {'kind': 'wait', 'on': [PERSON]}
+    jsonschema.validate(payload, plugin.SCHEMA['parameters'])
+    assert call(plugin, payload)['ok']
+
+
+def test_two_requests_same_thread_survive_competing_declarations_and_reload(plugin, fake):
+    second = {**PERSON, 'request_id': 'request-deploy', 'response': 'deploy the example build'}
+    assert call(plugin, {'kind': 'wait', 'on': [PERSON, second]})['ok']
+    original = plugin._people().read('S1')
+    assert len({r['id'] for r in original}) == 2
+    assert call(plugin, {'kind': 'wait', 'on': [{'kind': 'time', 'id': 'tomorrow'}]})['ok']
+    assert call(plugin, {'kind': 'decide', 'items': [{'question': 'Which color?', 'choices': [
+        {'label': 'Blue', 'value': 'blue'}, {'label': 'Red', 'value': 'red'}]}]})['ok']
+    reloaded = _load()
+    assert {r['id'] for r in reloaded._open_person_waits('S1')} == {r['id'] for r in original}
+    assert not call(plugin, {'kind': 'done', 'summary': 'watching'})['ok']
+    assert len(plugin.person_provider('S1')['waiting_on']) == 2
+
+
+def test_person_scope_immutable_and_full_receipts_kept(plugin, fake, monkeypatch):
+    _fake_ksa(monkeypatch, [])
+    person = {**PERSON, 'response': 'x' * 2000}
+    assert call(plugin, {'kind': 'wait', 'on': [person]})['ok']
+    record = plugin._people().read('S1')[0]
+    assert record['response'] == person['response']
+    assert not call(plugin, {'kind': 'wait', 'on': [{**person, 'response': 'different scope'}]})['ok']
+    assert call(plugin, {'kind': 'wait', 'on': [{**person, 'state': 'verifying', 'evidence': 'https://example.com/reply'}]})['ok']
+    close = {'id': record['id'], 'evidence': 'https://example.com/test/green'}
+    assert not call(plugin, {'kind': 'done', 'summary': 'not verified', 'closes_person_waits': [close]})['ok']
+    assert call(plugin, {'kind': 'done', 'summary': 'verified', 'closes_person_waits': [{**close, 'verified': True}]})['ok']
+    closed = plugin._people().read('S1')[0]
+    assert closed['state'] == 'closed'
+    assert closed['reply_receipt']['ref'] == 'https://example.com/reply'
+    assert closed['closure_receipt']['ref'] == close['evidence']
+    assert not plugin.person_provider('S1')['waiting_on']
+    assert not call(plugin, {'kind': 'done', 'summary': 'again', 'closes_person_waits': [{**close, 'verified': True}]})['ok']
+
+
+def test_person_read_failure_does_not_allow_done(plugin, monkeypatch):
+    call(plugin, {'kind': 'wait', 'on': [PERSON]})
+    plugin._people().path('S1').write_text('{broken')
+    assert not call(plugin, {'kind': 'done', 'summary': 'cannot know'})['ok']
+    assert plugin.person_provider('S1')['waiting_on'][0]['id'] == 'person:ledger-unreadable'
