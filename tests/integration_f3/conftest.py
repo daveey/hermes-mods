@@ -71,7 +71,8 @@ def harness(tmp_path, monkeypatch, request):
         "auxiliary:\n  title_generation:\n    enabled: false\n",
         encoding="utf-8")
     mods = Path(__file__).resolve().parents[2]
-    for name in ("ask-gate", "user-steps"):
+    # ask-gate imports the shared session-panel brief parser at load time.
+    for name in ("ask-gate", "user-steps", "session-panel"):
         shutil.copytree(mods / "plugins" / name, home / "plugins" / name,
                         ignore=shutil.ignore_patterns("__pycache__", "tests"))
     token = set_hermes_home_override(home)
