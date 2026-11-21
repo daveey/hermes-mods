@@ -1,0 +1,167 @@
+From 878b99dcc264f8181a0652a3007da68a7a000bbc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 06:40:27 +0000
+Subject: [PATCH] perf(plugins): reuse offline recall decoding within discovery
+ [daveey]
+
+Profile found repeat catalog decoding at each plugin gate on worker boot. Memoize removal entries only for one discovery sweep with both file generations checked on every lookup, copied results, bounded storage, and exception-safe scope restoration. Ordinary enable and reload checks remain fresh. Canonical RED observed20 decodes versus1; GREEN120 tests, full scripts/check21 checks green. Worker-a1 cache absent microbenchmark13.36ms to2.14ms for46 lookups; hub full-cache gain not yet verified. This is not whole-card latency acceptance.
+---
+ hermes_cli/plugin_catalog.py                  | 46 ++++++++++--
+ hermes_cli/plugins.py                         |  4 +-
+ .../hermes_cli/test_plugin_discovery_reads.py | 71 +++++++++++++++++++
+ 3 files changed, 116 insertions(+), 5 deletions(-)
+ create mode 100644 tests/hermes_cli/test_plugin_discovery_reads.py
+
+diff --git a/hermes_cli/plugin_catalog.py b/hermes_cli/plugin_catalog.py
+index d94376b2bf..94abf9a101 100644
+--- a/hermes_cli/plugin_catalog.py
++++ b/hermes_cli/plugin_catalog.py
+@@ -317,11 +317,49 @@ def resolved_removed_entries() -> list[RemovedEntry]:
+     return load_removed_list() + live_removed_list()
+ 
+ 
++# [daveey] Discovery gates every plugin against the same two offline files. Keep only a
++# sweep-local memo: other homes/threads, force reloads and ordinary enable checks stay fresh.
++from contextlib import contextmanager
++from contextvars import ContextVar
++
++_removal_reads: ContextVar[Optional[dict]] = ContextVar("plugin_removal_reads", default=None)
++
++
++@contextmanager
++def removal_read_scope():
++    token = _removal_reads.set({})
++    try:
++        yield
++    finally:
++        _removal_reads.reset(token)
++
++
++def _removal_version(path: Path):
++    from utils import file_cache_version
++    try:
++        return file_cache_version(path)
++    except OSError:
++        return None
++
++
+ def cached_removed_entries() -> list[RemovedEntry]:
+-    """In-tree list UNION the last fetched live copy, with NO network round-trip — for the load-time and
+-    ``enable`` checks that run in every process and must never block on a dead catalog host."""
+-    cached = _stale_live_cache(_live_cache_path()) or {}
+-    return load_removed_list() + _removed_from_list(cached.get("removed"))
++    """Offline kill list; reuse decoding during discovery, never a stale recall verdict.
++
++    Revalidate both files on every call, including replacement, deletion and profile changes.
++    Values copied out of the memo cannot mutate another plugin's removal decision.
++    """
++    memo = _removal_reads.get()
++    live, tree = _live_cache_path(), get_catalog_dir() / "removed.yaml"
++    key = (live, _removal_version(live), tree, _removal_version(tree)) if memo is not None else None
++    saved = memo.get(key) if memo is not None else None
++    if saved is not None:
++        return [RemovedEntry(*row) for row in saved]
++    cached = _stale_live_cache(live) or {}
++    entries = load_removed_list() + _removed_from_list(cached.get("removed"))
++    if memo is not None:
++        memo.clear()  # bounded even when another process rewrites the catalog during a sweep
++        memo[key] = tuple((e.name, e.repo, e.reason, e.date) for e in entries)
++    return entries
+ 
+ 
+ def match_removed(
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index 526c0cd9b7..650c9a6872 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -440,7 +440,9 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
+             # — callers swallow the exception and would be stranded on the early return above.
+             self._discovered = True
+             try:
+-                self._discover_and_load_inner()
++                from hermes_cli.plugin_catalog import removal_read_scope
++                with removal_read_scope():
++                    self._discover_and_load_inner()
+                 # Now that plugins have had their chance to re-register, dispose the ones whose plugin did
+                 # not come back (disabled, removed, or omitted from this discovery pass) so e.g. a disabled
+                 # auth plugin's provider does not stay live process-wide until restart. See #91701.
+diff --git a/tests/hermes_cli/test_plugin_discovery_reads.py b/tests/hermes_cli/test_plugin_discovery_reads.py
+new file mode 100644
+index 0000000000..666d5cb0d2
+--- /dev/null
++++ b/tests/hermes_cli/test_plugin_discovery_reads.py
+@@ -0,0 +1,71 @@
++"""Startup must not decode the same catalog/config once per enabled plugin."""
++from hermes_cli import plugin_catalog as catalog
++from hermes_cli import plugins
++
++
++def test_discovery_resolves_offline_removals_once(monkeypatch):
++    manager = plugins.PluginManager()
++    reads = []
++    monkeypatch.setattr(catalog, '_stale_live_cache', lambda path: reads.append(path) or {'removed': []})
++    monkeypatch.setattr(catalog, 'load_removed_list', list)
++    monkeypatch.setattr(manager, '_refresh_secret_sources_after_discovery', lambda: None)
++    monkeypatch.setattr(manager, '_discover_and_load_inner', lambda: [catalog.cached_removed_entries() for _ in range(20)])
++    manager.discover_and_load()
++    assert len(reads) == 1
++    manager.discover_and_load(force=True)
++    assert len(reads) == 2
++
++
++def test_scope_file_changes_and_copy_isolation(tmp_path, monkeypatch):
++    import json
++    import os
++    live = tmp_path / 'live.json'
++    tree = tmp_path / 'tree'
++    tree.mkdir()
++    removed = tree / 'removed.yaml'
++    removed.write_text('removed: [{name: tree-old}]')
++    live.write_text(json.dumps({'removed': [{'name': 'live-old'}]}))
++    monkeypatch.setattr(catalog, '_live_cache_path', lambda: live)
++    monkeypatch.setattr(catalog, 'get_catalog_dir', lambda: tree)
++
++    def names():
++        return [e.name for e in catalog.cached_removed_entries()]
++
++    with catalog.removal_read_scope():
++        assert names() == ['tree-old', 'live-old']
++        catalog.cached_removed_entries()[0].name = 'corrupted'
++        assert names() == ['tree-old', 'live-old']
++        old_time = live.stat().st_mtime_ns
++        replacement = tmp_path / 'next.json'
++        replacement.write_text(json.dumps({'removed': [{'name': 'live-new'}]}))
++        os.utime(replacement, ns=(old_time, old_time))
++        replacement.replace(live)
++        assert names() == ['tree-old', 'live-new']
++        removed.write_text('removed: [{name: tree-new}]')
++        assert names() == ['tree-new', 'live-new']
++        live.unlink()
++        assert names() == ['tree-new']
++        live.write_text(json.dumps({'removed': [{'name': 'live-added'}]}))
++        assert names() == ['tree-new', 'live-added']
++
++
++def test_scope_restores_on_exception_and_nested_profiles(tmp_path, monkeypatch):
++    import pytest
++    root = [tmp_path / 'one']
++    other = tmp_path / 'two'
++    for directory, name in ((root[0], 'one'), (other, 'two')):
++        directory.mkdir()
++        (directory / 'removed.yaml').write_text('removed: [{name: ' + name + '}]')
++    monkeypatch.setattr(catalog, 'get_catalog_dir', lambda: root[0])
++    monkeypatch.setattr(catalog, '_live_cache_path', lambda: root[0] / 'missing.json')
++    with pytest.raises(RuntimeError, match='broken sweep'):
++        with catalog.removal_read_scope():
++            assert catalog.cached_removed_entries()[0].name == 'one'
++            with catalog.removal_read_scope():
++                root[0] = other
++                assert catalog.cached_removed_entries()[0].name == 'two'
++            assert catalog.cached_removed_entries()[0].name == 'two'
++            raise RuntimeError('broken sweep')
++    assert catalog._removal_reads.get() is None
++    (other / 'removed.yaml').write_text('removed: [{name: fresh}]')
++    assert catalog.cached_removed_entries()[0].name == 'fresh'
+-- 
+2.43.0
+

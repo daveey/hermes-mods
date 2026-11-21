@@ -1,0 +1,236 @@
+From a8cfc759937b0581489dc0065c88cc39bf173594 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 06:26:40 +0000
+Subject: [PATCH] [daveey] Keep exact terminal releases across transport
+ freshness gaps
+
+Problem: an acked worker review stayed in a chat's Waiting list. The link
+producer was not skipped: hub logs show default reconciliation every minute.
+Live replay at epoch 1795241817 (last_ok age 160s) released the exact link;
+at 1795241857 (same last_ok, age 200s) it demanded released=0 again.
+
+Why 1: Waiting returned because reconciliation re-armed terminal chat links.
+Why 2: the legacy projection turned done into unknown at transport age 180s.
+Why 3: replacement discarded its previous release of the identical owner record.
+Root (happened): transport freshness was incorrectly negative completion evidence.
+Root (not caught): terminal tests covered fresh/stale reads independently, not
+fresh -> stale through the actual links-pass producer and durable snapshot.
+Recurrence: owner-silence release was fixed previously; global transport age
+remained an independent re-arming path. The mail poller takes 3-5 minutes per
+run plus a 60s cadence, exceeding the projection's 180s freshness window.
+The ledger projection's created_at is projection time, not first-release time;
+the original 47-minute one-way-lag inference is not established.
+
+Preserve only a previously observed, verified terminal release with the same
+validated raw owner-observation hash and full owner/chat identity. A changed,
+reopened, tampered, unverified, cold stale or old tokenless record still waits.
+The existing fresh-evidence gate for first release is unchanged. No ack policy,
+SQLite schema, task lifecycle gate or replica freshness threshold is relaxed.
+
+Proof: full reconcile_links regression is RED on parent (release 1 -> 0 at
++181s), GREEN with this patch. Regression includes real notice-ledger ack,
+one-pass done release, restart persistence, identity and changed-proof controls.
+Six focused consumer files passed 105 tests before the expanded identity matrix.
+
+hotspot: hermes_cli/kanban_session_activity.py (two-line delegated call only).
+---
+ hermes_cli/kanban_replica_projection.py       |   4 +-
+ hermes_cli/kanban_session_activity.py         |   2 +
+ .../kanban_terminal_release_snapshot.py       |  34 ++++++
+ ...t_kanban_terminal_release_transport_age.py | 114 ++++++++++++++++++
+ 4 files changed, 153 insertions(+), 1 deletion(-)
+ create mode 100644 hermes_cli/kanban_terminal_release_snapshot.py
+ create mode 100644 tests/hermes_cli/test_kanban_terminal_release_transport_age.py
+
+diff --git a/hermes_cli/kanban_replica_projection.py b/hermes_cli/kanban_replica_projection.py
+index 29e2e215cd..38de8aee24 100644
+--- a/hermes_cli/kanban_replica_projection.py
++++ b/hermes_cli/kanban_replica_projection.py
+@@ -54,8 +54,10 @@ def linked_sessions(task: dict[str, Any], me: str, origin_profile: str) -> tuple
+ 
+ def historical_fields(raw: dict[str, Any], tkey: tuple) -> dict[str, Any]:
+     from hermes_cli.kanban_completion_receipt_projection import remote_fields
++    from hermes_cli.kanban_terminal_release_snapshot import observation
+     gw, owner_profile, board, tid = tkey
+-    return remote_fields(raw, gateway=gw, profile=owner_profile, board=board, task_id=tid)
++    return {**remote_fields(raw, gateway=gw, profile=owner_profile, board=board, task_id=tid),
++            **observation(raw, tkey)}
+ 
+ 
+ def card_rows(tkey: tuple, t: dict[str, Any], *, sids, closed: bool, synced, stale: bool, me: str,
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 409e13277b..bead83366b 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -1105,6 +1105,8 @@ def _legacy_remote_links() -> list[dict[str, Any]]:
+             return []
+         _log.warning("hermes-hub replica read failed, keeping last known remote cards (stale): %s", exc)
+         return reconcile_carry([{**c, "stale": True} for c in previous])
++    from hermes_cli.kanban_terminal_release_snapshot import preserve
++    cards = preserve(cards, previous)
+     # A folded legacy alias (``legacy_key``) is present under its qualified key: its last-known
+     # unqualified row must not be resurrected as a stale obligation.
+     present = {(c["session"], k) for c in cards for k in (c["key"], c.get("legacy_key")) if k}
+diff --git a/hermes_cli/kanban_terminal_release_snapshot.py b/hermes_cli/kanban_terminal_release_snapshot.py
+new file mode 100644
+index 0000000000..a2ea252913
+--- /dev/null
++++ b/hermes_cli/kanban_terminal_release_snapshot.py
+@@ -0,0 +1,34 @@
++"""Keep a proven terminal release across transport age, never across owner changes. [daveey]"""
++from hermes_cli.kanban_origin_ledger import _owner_evidence
++
++_IDENTITY = ('key', 'session', 'gateway', 'profile', 'board', 'id', 'origin_gateway', 'origin_profile', 'via')
++
++
++def observation(task: dict, key: tuple) -> dict:
++    """A snapshot token only for an exactly qualified, hash-verified terminal publication."""
++    profile = key[1]
++    evidence = _owner_evidence(task)
++    if (profile is None or task.get('status') not in ('done', 'archived')
++            or any(task.get(k) != v for k, v in zip(('gateway', 'profile', 'board', 'id'), key))
++            or evidence.get('verified') is not True):
++        return {}
++    return {'_release_observation': evidence['task_hash']}
++
++
++def preserve(cards: list[dict], previous: list[dict] | None) -> list[dict]:
++    """Staleness cannot undo the SAME observed release. New/unproven/reopened records still wait.
++
++    The token is computed from the raw owner record before projection changes its status to unknown.
++    Persisted origin-work snapshots carry it across process restarts; old snapshots without it prove nothing.
++    """
++    released = {tuple(c.get(k) for k in _IDENTITY): c for c in previous or ()
++                if c.get('released') is True and c.get('status') in ('done', 'archived')
++                and c.get('_release_observation')}
++    out = []
++    for card in cards:
++        prior = released.get(tuple(card.get(k) for k in _IDENTITY))
++        if (card.get('stale') and prior is not None
++                and card.get('_release_observation') == prior['_release_observation']):
++            card = {**card, 'status': prior['status'], 'released': True, 'unfinished': False}
++        out.append(card)
++    return out
+diff --git a/tests/hermes_cli/test_kanban_terminal_release_transport_age.py b/tests/hermes_cli/test_kanban_terminal_release_transport_age.py
+new file mode 100644
+index 0000000000..68514844b9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_terminal_release_transport_age.py
+@@ -0,0 +1,114 @@
++"""A transport freshness timeout is not a new owner observation. [daveey]"""
++import pytest
++
++from hermes_cli import kanban_chat_links as links
++from hermes_cli import kanban_db_connect as connect
++from hermes_cli import kanban_session_activity as activity
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli import test_kanban_remote_terminal_release as records
++
++
++@pytest.fixture
++def world(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    monkeypatch.setattr(activity, '_remote_last', None)
++    monkeypatch.setattr(activity, '_snapshot_saved', None)
++    monkeypatch.setattr(activity, '_remote_scope', None)
++    now = [records.NOW]
++    path = records.replica(tmp_path, [('default/default/t_1', records.observed(records.card('running')))])
++    monkeypatch.setattr(activity, '_hub_db_path', lambda: path)
++    real_read = activity._read_remote_links
++    monkeypatch.setattr(activity, '_read_remote_links', lambda p, **kw: real_read(p, now=now[0], **kw))
++    monkeypatch.setattr(activity, '_remote_links', lambda stale_ok=False: activity._legacy_remote_links())
++    live = connect.connect(home / 'kanban.db')
++    client.ensure_identity(live, 'default', 'origin')
++    uid = links.link_uid('t_1', 'origin', 'default', 's1', 'shepherd')
++
++    def run_pass():
++        client.reconcile_links([('default', home / 'kanban.db')], 'origin', skip_unchanged=True)
++        return live.execute('SELECT released FROM task_chat_links WHERE uid=?', (uid,)).fetchone()[0]
++
++    try:
++        yield path, now, run_pass
++    finally:
++        live.close()
++        activity._reset_cache_for_tests()
++
++
++def test_done_releases_in_one_pass_and_transport_age_cannot_rearm_it(world):
++    path, now, run_pass = world
++    assert run_pass() == 0
++    done = records.observed(records.card('done'))
++    done['origin_observation']['verified'] = True
++    records.update(path, 'default/default/t_1', done)
++    # The consumer has persisted its notice; ack the real delivery ledger before the links pass.
++    from tui_gateway.kanban_remote_notices import ack
++    assert ack({'session': 's1', 'ref': 'owner/default/default/t_1', 'state': 'done@10000',
++                'notice_key': 'terminal-release-test'}, ledger=path.parent / 'notices.db')
++    assert run_pass() == 1
++    now[0] += activity.HUB_STALE_AFTER_S + 1
++    assert run_pass() == 1, 'the same owner-attested completion must not become Waiting again'
++
++
++def _done(path):
++    task = records.observed(records.card('done'))
++    task['origin_observation']['verified'] = True
++    records.update(path, 'default/default/t_1', task)
++    return task
++
++
++def test_release_survives_restart_from_the_durable_snapshot(world, monkeypatch):
++    path, now, run_pass = world
++    _done(path)
++    assert run_pass() == 1
++    monkeypatch.setattr(activity, '_remote_last', None)
++    now[0] += activity.HUB_STALE_AFTER_S + 1
++    assert run_pass() == 1
++
++
++@pytest.mark.parametrize('change', ['reopen', 'new completion', 'tampered', 'unverified', 'missing evidence'])
++def test_new_owner_record_cannot_borrow_the_previous_release(world, change):
++    path, now, run_pass = world
++    done = _done(path)
++    assert run_pass() == 1
++    now[0] += activity.HUB_STALE_AFTER_S + 1
++    newer = records.observed(records.card('done', completed_at=12345))
++    newer['origin_observation']['verified'] = True
++    task = {
++        'reopen': records.observed(records.card('running')),
++        'new completion': newer,
++        'tampered': {**done, 'title': 'modified after signing'},
++        'unverified': {**done, 'origin_observation': {**done['origin_observation'], 'verified': False}},
++        'missing evidence': {k: v for k, v in done.items() if k != 'origin_observation'},
++    }[change]
++    records.update(path, 'default/default/t_1', task)
++    assert run_pass() == 0
++
++
++def test_cold_stale_completion_does_not_acquire_a_release(world):
++    path, now, run_pass = world
++    _done(path)
++    now[0] += activity.HUB_STALE_AFTER_S + 1
++    assert run_pass() == 0
++
++
++@pytest.mark.parametrize('field', ['key', 'session', 'gateway', 'profile', 'board', 'id',
++                                  'origin_gateway', 'origin_profile', 'via'])
++def test_snapshot_release_never_crosses_identity(field):
++    from hermes_cli.kanban_terminal_release_snapshot import preserve
++    prior = {'key': 'owner/default/default/t_1', 'session': 's1', 'gateway': 'owner', 'profile': 'default',
++             'board': 'default', 'id': 't_1', 'origin_gateway': 'origin', 'origin_profile': 'default',
++             'via': 'shepherd', '_release_observation': 'a' * 64, 'released': True, 'status': 'done'}
++    current = {**prior, field: 'different', 'stale': True, 'status': 'unknown', 'released': False}
++    assert preserve([current], [prior]) == [current]
++
++
++@pytest.mark.parametrize('field,value', [('released', False), ('status', 'running'),
++                                        ('_release_observation', None)])
++def test_old_or_unreleased_snapshot_is_not_completion_proof(field, value):
++    from hermes_cli.kanban_terminal_release_snapshot import preserve
++    prior = {'_release_observation': 'a' * 64, 'released': True, 'status': 'done'}
++    current = {**prior, 'stale': True, 'status': 'unknown', 'released': False}
++    assert preserve([current], [{**prior, field: value}]) == [current]
+-- 
+2.43.0
+

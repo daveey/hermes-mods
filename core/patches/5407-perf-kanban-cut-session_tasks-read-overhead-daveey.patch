@@ -1,0 +1,668 @@
+From cf5f15390515b6fd131b94e4b6243b9e00feae8b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 22:07:56 -0800
+Subject: [PATCH] perf(kanban): cut session_tasks read overhead [daveey]
+
+Profiling 12 session_tasks calls on hermes-hub: most CPU went to opening and
+closing read-only sqlite connections through kanban_lockguard, not to queries.
+
+- kanban_origin.gateway_name: memoize this gateway's own name for 10 min,
+  keyed on hub.db's file identity (path, dev, inode) and the mail config
+  signature, never on the WAL/mtime the hub writes continuously. Gateways are
+  never renamed in place; re-enrollment replaces hub.db (new inode) and busts
+  it. gateway_names (the known set) keeps its 5 s memo.
+- kanban_ro_batch: inside session_tasks and the links projection, every
+  kanban_origin._ro of the same file borrows one shared read-only connection,
+  closed when the call ends. A borrow's close rolls back and resets
+  row_factory; a file already borrowed, or a batch inherited from another
+  thread, gets a private connection, so semantics match a fresh open.
+- preserve_origin_obligations: run the cheap released/unfinished/gateway
+  filters before the five-field check; same result (equivalence test against
+  the old filter).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_origin.py                   |  49 +++-
+ hermes_cli/kanban_origin_obligations.py       |  10 +-
+ hermes_cli/kanban_ro_batch.py                 | 116 ++++++++
+ hermes_cli/kanban_session_activity.py         |   3 +
+ .../test_kanban_gateway_name_read.py          |  64 ++++-
+ .../test_kanban_session_tasks_reads.py        | 268 ++++++++++++++++++
+ 6 files changed, 492 insertions(+), 18 deletions(-)
+ create mode 100644 hermes_cli/kanban_ro_batch.py
+ create mode 100644 tests/hermes_cli/test_kanban_session_tasks_reads.py
+
+diff --git a/hermes_cli/kanban_origin.py b/hermes_cli/kanban_origin.py
+index 3cad516119..696bbb1e2c 100644
+--- a/hermes_cli/kanban_origin.py
++++ b/hermes_cli/kanban_origin.py
+@@ -20,6 +20,7 @@ Binding is not handoff: the result says ``readback: pending`` until gateway A ha
+ from __future__ import annotations
+ 
+ from hermes_cli import kanban_lockguard as _kanban_lockguard
++from hermes_cli import kanban_ro_batch as _kanban_ro_batch
+ import json
+ import os
+ import re
+@@ -87,6 +88,11 @@ def _hub_db() -> Optional[Path]:
+ 
+ 
+ def _ro(path: Path) -> sqlite3.Connection:
++    """A read-only connection to ``path``; inside ``kanban_ro_batch.batch()`` a borrow of the pass's shared one."""
++    return _kanban_ro_batch.open_ro(path, _open_ro)
++
++
++def _open_ro(path: Path) -> sqlite3.Connection:
+     try:
+         conn = _kanban_lockguard.connect(f"file:{path}?mode=ro", uri=True, timeout=0.5)
+         conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+@@ -100,6 +106,8 @@ def _ro(path: Path) -> sqlite3.Connection:
+ _NAMES_MAX_AGE_S = 5.0
+ _NAMES_RACY_NS = 100_000_000
+ _names_memo: Optional[tuple[tuple, float, str, frozenset]] = None
++_NAME_MAX_AGE_S = 600.0  # ``gateway_name``'s own memo: see its docstring
++_name_memo: Optional[tuple[tuple, float, str]] = None
+ 
+ 
+ def _stat_sig(path: Path) -> Optional[tuple[int, int, int]]:
+@@ -139,14 +147,43 @@ def gateway_names() -> tuple[str, set[str]]:
+ def gateway_name() -> str:
+     """This gateway's own name: exactly ``gateway_names()[0]``, without the known-gateway set.
+ 
+-    A still-valid ``gateway_names`` memo answers; otherwise only the hub.db ``meta`` row (a primary-key lookup) and
+-    the mail config are read, never the ``replica`` scan whose cost grows with replica rows. Not memoized itself:
+-    the hub writes hub.db's WAL continuously, so a memo keyed on it would almost never be kept. [daveey]"""
++    A still-valid ``gateway_names`` memo answers first. Otherwise the name is remembered for ``_NAME_MAX_AGE_S``
++    (10 min), keyed on hub.db's identity (path, device, inode) and the mail config's signature, never on hub.db's
++    WAL or mtime: the hub writes those continuously, so a memo keyed on them would almost never be kept, and every
++    card in a task list asked again (an open + close of hub.db each, 70% of ``session_tasks`` CPU on the hub,
++    2026-11-20). Gateways are never renamed in place; re-enrolling replaces hub.db (a new inode), which busts the
++    memo, as does any change to the mail config. A miss reads only the hub.db ``meta`` row (a primary-key lookup)
++    and the mail config, never the ``replica`` scan. ``gateway_names`` (the known set, which does change) keeps its
++    short memo. [daveey]"""
++    global _name_memo
+     path, cfg = _hub_db(), _mail_config()
+-    memo = _names_memo
+-    if memo is not None and time.monotonic() - memo[1] < _NAMES_MAX_AGE_S and memo[0] == _names_key(path, cfg):
++    memo, now = _names_memo, time.monotonic()
++    if memo is not None and now - memo[1] < _NAMES_MAX_AGE_S and memo[0] == _names_key(path, cfg):
+         return memo[2]
+-    return _read_gateway_names(path, cfg, names=False)[0]
++    key = _name_key(path, cfg)
++    own = _name_memo
++    if own is not None and own[0] == key and now - own[1] < _NAME_MAX_AGE_S:
++        return own[2]
++    failed: list[sqlite3.Error] = []
++    me = _read_gateway_names(path, cfg, failed, names=False)[0]
++    # A failed hub.db read (locked, mid-replace) or a mail config written within the timestamp granularity is
++    # not kept: the next caller reads again.
++    cfg_sig = key[-1]
++    racy = isinstance(cfg_sig, tuple) and cfg_sig[1] >= time.time_ns() - _NAMES_RACY_NS
++    _name_memo = None if failed or racy else (key, now, me)
++    return me
++
++
++def _name_key(path: Optional[Path], cfg: Path) -> tuple:
++    """Identity of ``gateway_name``'s inputs: hub.db's file identity (not its contents) and the mail config."""
++    ident = None
++    if path is not None:
++        try:
++            st = path.stat()
++            ident = (st.st_dev, st.st_ino)
++        except OSError:
++            ident = None
++    return str(path), ident, str(cfg), _stat_sig(cfg)
+ 
+ 
+ def _names_key(path: Optional[Path], cfg: Path) -> tuple:
+diff --git a/hermes_cli/kanban_origin_obligations.py b/hermes_cli/kanban_origin_obligations.py
+index bbe55829d2..3e2b5d66ed 100644
+--- a/hermes_cli/kanban_origin_obligations.py
++++ b/hermes_cli/kanban_origin_obligations.py
+@@ -35,14 +35,16 @@ def preserve_origin_obligations(selected: list[dict[str, Any]], ledger: Iterable
+ 
+     out = list(selected)
+     seen = {(c.get("session"), c.get("gateway"), c.get("profile"), c.get("board"), c.get("id")) for c in out}
++    fields = ("session", "gateway", "profile", "board", "id")
+     for card in ledger:
+-        if card.get("origin_gateway") != gateway or card.get("origin_profile") != profile:
++        # Cheapest, most selective filters first: most ledger rows are released or finished, and the five-field
++        # check below cost ~20 ms a call on the hub (~3.5k rows) when it ran for all of them. Every filter is a pure
++        # ``continue``, so their order does not change the result.
++        if (card.get("origin_gateway") != gateway or card.get("origin_profile") != profile
++                or card.get("released") or not card.get("unfinished") or card.get("gateway") == gateway):
+             continue
+-        fields = ("session", "gateway", "profile", "board", "id")
+         if not all(isinstance(card.get(k), str) and card[k].strip() for k in fields):
+             continue
+-        if card["gateway"] == gateway or card.get("released") or not card.get("unfinished"):
+-            continue
+         if ids is not None and card["session"] not in ids and card.get("origin_session") not in ids:
+             continue
+         if card.get("status") not in statuses and card.get("status") != "unknown":
+diff --git a/hermes_cli/kanban_ro_batch.py b/hermes_cli/kanban_ro_batch.py
+new file mode 100644
+index 0000000000..d110d9ab4e
+--- /dev/null
++++ b/hermes_cli/kanban_ro_batch.py
+@@ -0,0 +1,116 @@
++"""One read-only connection per file for the length of one read pass (``kanban_origin._ro``). [daveey]
++
++A Desktop task-list read (``session_tasks``) asks about every card it lists, and each question opened its own
++read-only connection through ``kanban_lockguard`` (lifecycle lock, recovery probe, WAL guard, fd scan) and closed
++it again: ~195 opens of the same few files per 12 calls on the hub, about 1 s of CPU (2026-11-20). Inside
++``batch()`` the first ``_ro(path)`` opens the file and later ones borrow that same connection; the batch closes it
++when the pass ends.
++
++A borrow behaves like a fresh connection to its user: ``close()`` ends the borrow (rolls back a transaction the
++borrower left open, resets ``row_factory``) instead of closing the file. A second ``_ro`` of a file whose
++connection is still borrowed (a nested reader, or another thread that inherited the context) gets its own private
++connection, exactly as without a batch, so one borrower's ``BEGIN``/``close`` never touches another's snapshot.
++An autocommit reader holds no snapshot between statements, so a shared connection reads what a fresh one would.
++"""
++from __future__ import annotations
++
++import contextlib
++import contextvars
++import sqlite3
++import threading
++from typing import Any, Callable, Iterator, Optional
++
++_active: contextvars.ContextVar[Optional[_Batch]] = contextvars.ContextVar("kanban_ro_batch", default=None)
++
++
++class _Batch:
++    def __init__(self) -> None:
++        self.thread = threading.get_ident()
++        self.conns: dict[str, sqlite3.Connection] = {}
++        self.borrowed: set[str] = set()
++
++    def close(self) -> None:
++        conns, self.conns = self.conns, {}
++        for conn in conns.values():
++            try:
++                conn.close()
++            except sqlite3.Error:
++                pass
++
++
++class _Borrowed:
++    """A borrow of a batch's connection; every attribute but ``close`` is the connection's own."""
++
++    __slots__ = ("_batch", "_conn", "_key")
++
++    def __init__(self, conn: sqlite3.Connection, batch: _Batch, key: str) -> None:
++        object.__setattr__(self, "_conn", conn)
++        object.__setattr__(self, "_batch", batch)
++        object.__setattr__(self, "_key", key)
++
++    def __getattr__(self, name: str) -> Any:
++        return getattr(object.__getattribute__(self, "_conn"), name)
++
++    def __setattr__(self, name: str, value: Any) -> None:
++        setattr(object.__getattribute__(self, "_conn"), name, value)
++
++    def __enter__(self) -> _Borrowed:
++        self._conn.__enter__()
++        return self
++
++    def __exit__(self, *exc: object) -> Any:
++        return self._conn.__exit__(*exc)
++
++    def close(self) -> None:
++        batch = object.__getattribute__(self, "_batch")
++        if batch is None:
++            return
++        object.__setattr__(self, "_batch", None)
++        conn, key = self._conn, self._key
++        try:
++            if conn.in_transaction:
++                conn.rollback()
++            conn.row_factory = None
++        except sqlite3.Error:
++            # A connection that cannot be returned clean is not shared again.
++            if batch.conns.get(key) is conn:
++                del batch.conns[key]
++            try:
++                conn.close()
++            except sqlite3.Error:
++                pass
++        batch.borrowed.discard(key)
++
++
++@contextlib.contextmanager
++def batch() -> Iterator[None]:
++    """Share one read-only connection per file among ``_ro`` calls in this block; nested blocks join the outer.
++
++    A batch inherited from another thread (a background refresh started with ``copy_context()`` inside a batched
++    read) is not joined: its connections belong to that thread. This block opens its own."""
++    outer = _active.get()
++    if outer is not None and outer.thread == threading.get_ident():
++        yield
++        return
++    current = _Batch()
++    token = _active.set(current)
++    try:
++        yield
++    finally:
++        _active.reset(token)
++        current.close()
++
++
++def open_ro(path: Any, opener: Callable[[Any], sqlite3.Connection]) -> sqlite3.Connection:
++    """``opener(path)``, or a borrow of this batch's connection to ``path`` (opened by ``opener`` once)."""
++    current = _active.get()
++    if current is None or current.thread != threading.get_ident():
++        return opener(path)
++    key = str(path)
++    if key in current.borrowed:
++        return opener(path)
++    conn = current.conns.get(key)
++    if conn is None:
++        conn = current.conns[key] = opener(path)
++    current.borrowed.add(key)
++    return _Borrowed(conn, current, key)  # type: ignore[return-value]
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 08756f36ff..409e13277b 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -15,6 +15,7 @@ seconds because the sidebar polls.
+ from __future__ import annotations
+ 
+ from hermes_cli import kanban_lockguard as _kanban_lockguard
++from hermes_cli.kanban_ro_batch import batch as _ro_batch
+ from hermes_cli import kanban_activity_identity as _identity
+ from hermes_cli import kanban_annotation_disk as _annotation_copy
+ from hermes_cli import kanban_annotation_host as _host_copy
+@@ -994,6 +995,7 @@ def _refresh_links_scope(scope: tuple) -> None:
+ _links_refresher = ScopeRefresher(lambda scope: _refresh_links_scope(scope), _LINKS_SCOPE_CAP)
+ 
+ 
++@_ro_batch()
+ def _project_remote_links() -> list[dict[str, Any]]:
+     from hermes_constants import get_hermes_home
+     from hermes_cli.kanban_origin_adapter import _gateway
+@@ -1609,6 +1611,7 @@ def _remote_cards(ids: list[str] | None, statuses: tuple[str, ...], stale_ok: bo
+     return _remote_links(stale_ok=True) if stale_ok else _remote_links()
+ 
+ 
++@_ro_batch()  # one read-only connection per file for the whole list, not one per card
+ def session_tasks(session_ids: Iterable[str], statuses: tuple[str, ...] = LISTED_STATUSES, *,
+                   stale_ok: bool = False) -> list[dict[str, Any]]:
+     """Every open/blocked/review task across all boards that the given session
+diff --git a/tests/hermes_cli/test_kanban_gateway_name_read.py b/tests/hermes_cli/test_kanban_gateway_name_read.py
+index 79336d780e..9c58c3207b 100644
+--- a/tests/hermes_cli/test_kanban_gateway_name_read.py
++++ b/tests/hermes_cli/test_kanban_gateway_name_read.py
+@@ -23,6 +23,7 @@ def hub(tmp_path, monkeypatch):
+     monkeypatch.setenv("HERMES_HUB_STATE", str(state))
+     monkeypatch.setenv("HERMES_MAIL_CONFIG", str(tmp_path / "mail.json"))
+     monkeypatch.setattr(kanban_origin, "_names_memo", None)
++    monkeypatch.setattr(kanban_origin, "_name_memo", None)
+     monkeypatch.setattr(kanban_db_sync, "sync_config", dict)  # no kanban.sync.gateway: the hub path is live
+     db = sqlite3.connect(state / "hub.db")
+     db.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)")
+@@ -67,6 +68,7 @@ def test_gateway_name_matches_gateway_names_in_every_branch(hub, monkeypatch):
+ 
+     def both():
+         monkeypatch.setattr(kanban_origin, "_names_memo", None)
++        monkeypatch.setattr(kanban_origin, "_name_memo", None)
+         name = kanban_origin.gateway_name()
+         monkeypatch.setattr(kanban_origin, "_names_memo", None)
+         return name, kanban_origin.gateway_names()[0]
+@@ -105,24 +107,70 @@ def test_a_valid_gateway_names_memo_answers_without_a_read(hub, monkeypatch):
+     assert seen == []
+ 
+ 
+-def test_a_meta_change_is_seen_on_the_next_call(hub, monkeypatch):
++def test_the_name_is_kept_across_hub_db_writes_and_dropped_when_hub_db_is_replaced(hub, monkeypatch):
++    """Gateways are never renamed in place: the WAL/mtime the hub writes all the time must not bust the memo, and a
++    re-enrollment (a new hub.db file) must."""
+     db, state, _ = hub
+-    kanban_origin.gateway_names()  # a remembered answer for the old inputs
+     assert kanban_origin.gateway_name() == "hub"
+-    db.execute("UPDATE meta SET v = 'renamed' WHERE k = 'gateway'")
++    seen = _statements(monkeypatch)
++    for i in range(20):  # the hub's continuous writes: WAL and main file change size/mtime
++        db.execute("INSERT INTO replica VALUES ('mini', 'tasks', ?)", (f"w{i}",))
++        db.commit()
++    db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
++    db.execute("UPDATE meta SET v = 'in-place' WHERE k = 'gateway'")
++    db.commit()
++    _settle(state / "hub.db", state / "hub.db-wal")
++    assert kanban_origin.gateway_name() == "hub"
++    assert seen == [], "hub.db was reopened although its file identity did not change"
++    db.close()
++    fresh = state / "hub.db.new"  # re-enrollment: a new file renamed over the old one (a new inode)
++    new = sqlite3.connect(fresh)
++    new.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)")
++    new.execute("INSERT INTO meta VALUES ('gateway', 're-enrolled')")
++    new.commit()
++    new.close()
++    os.replace(fresh, state / "hub.db")
++    _settle(state / "hub.db")
++    assert kanban_origin.gateway_name() == "re-enrolled"
++
++
++def test_a_mail_config_change_is_seen_on_the_next_call(hub, monkeypatch):
++    db, _state, mail = hub
++    db.execute("DELETE FROM meta")
+     db.commit()
+-    _settle(state / "hub.db", state / "hub.db-wal")  # even a settled write changes the size/identity key
+-    assert kanban_origin.gateway_name() == "renamed"
++    mail.write_text(json.dumps({"gateway": "one"}), encoding="utf-8")
++    _settle(mail)
++    assert kanban_origin.gateway_name() == "one"
++    mail.write_text(json.dumps({"gateway": "two!"}), encoding="utf-8")
++    _settle(mail)
++    assert kanban_origin.gateway_name() == "two!"
+ 
+ 
+-def test_unchanged_inputs_are_reread_once_the_age_bound_passes(hub, monkeypatch):
++def test_unchanged_inputs_are_reread_once_the_ten_minute_bound_passes(hub, monkeypatch):
+     clock = [1000.0]
+     monkeypatch.setattr(kanban_origin.time, "monotonic", lambda: clock[0])
+-    kanban_origin.gateway_names()
++    assert kanban_origin._NAME_MAX_AGE_S == 600.0
++    kanban_origin.gateway_name()
+     seen = _statements(monkeypatch)
+-    clock[0] += kanban_origin._NAMES_MAX_AGE_S - 0.1
++    clock[0] += kanban_origin._NAME_MAX_AGE_S - 0.1
+     kanban_origin.gateway_name()
+     assert seen == [], "re-read before the age bound"
+     clock[0] += 0.2  # time alone, no input change
+     kanban_origin.gateway_name()
+     assert seen, "not re-read after the age bound"
++
++
++def test_a_failed_hub_db_read_is_not_remembered(hub, monkeypatch):
++    real, calls = kanban_origin._ro, []
++
++    def flaky(path):
++        calls.append(str(path))
++        if len(calls) == 1:
++            raise sqlite3.OperationalError("database is locked")
++        return real(path)
++
++    monkeypatch.setattr(kanban_origin, "_ro", flaky)
++    assert kanban_origin.gateway_name() == ""  # no mail config to fall back on
++    assert kanban_origin.gateway_name() == "hub"
++    assert kanban_origin.gateway_name() == "hub"
++    assert len(calls) == 2
+diff --git a/tests/hermes_cli/test_kanban_session_tasks_reads.py b/tests/hermes_cli/test_kanban_session_tasks_reads.py
+new file mode 100644
+index 0000000000..62a44715fa
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_session_tasks_reads.py
+@@ -0,0 +1,268 @@
++"""What one ``session_tasks`` call reads: each read-only file opened once per call, and the origin-obligation filter
++unchanged. [daveey]
++
++On the hub, 12 task-list reads opened ~195 read-only connections (one per card-scope question, most of them hub.db)
++and spent most of their CPU there (2026-11-20).
++"""
++import os
++import random
++import sqlite3
++import threading
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db_sync, kanban_origin, kanban_origin_obligations as obligations
++from hermes_cli import kanban_ro_batch as ro_batch
++from hermes_cli import kanban_session_activity as ksa
++from tests.hermes_cli.test_kanban_session_activity import _make_board
++
++
++def _settle(*paths):
++    old = time.time() - 60
++    for p in paths:
++        os.utime(p, (old, old))
++
++
++# --- one connection per file per session_tasks call -----------------------------------------------------------------
++
++
++@pytest.fixture
++def two_boards_and_a_hub(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    state = tmp_path / "hub-state"
++    state.mkdir()
++    monkeypatch.setenv("HERMES_HUB_STATE", str(state))
++    monkeypatch.setenv("HERMES_MAIL_CONFIG", str(tmp_path / "absent.json"))
++    hub = sqlite3.connect(state / "hub.db")
++    hub.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)")
++    hub.execute("CREATE TABLE replica (gw TEXT, coll TEXT, key TEXT)")
++    hub.execute("INSERT INTO meta VALUES ('gateway', 'hub')")
++    hub.commit()
++    hub.close()
++    _make_board(tmp_path / "kanban.db", [("t_a1", "running", "s1"), ("t_a2", "ready", "s1")])
++    _make_board(tmp_path / "kanban" / "boards" / "ops" / "kanban.db", [("t_b1", "todo", "s1")])
++    # Every card-scope question reaches hub.db: no memo may answer it, so only the batch can share the open.
++    monkeypatch.setattr(kanban_origin, "_NAME_MAX_AGE_S", 0.0)
++    monkeypatch.setattr(kanban_origin, "_NAMES_MAX_AGE_S", 0.0)
++    monkeypatch.setattr(kanban_origin, "_name_memo", None)
++    monkeypatch.setattr(kanban_origin, "_names_memo", None)
++    monkeypatch.setattr(kanban_db_sync, "sync_config", dict)
++    monkeypatch.setattr(ksa, "_legacy_remote_links", list)
++    ksa._reset_cache_for_tests()
++    yield state / "hub.db"
++    ksa._reset_cache_for_tests()
++
++
++def _count_opens(monkeypatch):
++    real_open, real_borrow = kanban_origin._open_ro, ro_batch.open_ro
++    opened, asked = [], []
++
++    def counted_open(path):
++        conn = real_open(path)
++        opened.append((str(path), conn))
++        return conn
++
++    def counted_borrow(path, opener):
++        asked.append(str(path))
++        return real_borrow(path, opener)
++
++    monkeypatch.setattr(kanban_origin, "_open_ro", counted_open)
++    monkeypatch.setattr(ro_batch, "open_ro", counted_borrow)
++    return opened, asked
++
++
++def test_one_session_tasks_call_opens_hub_db_once_and_closes_it(two_boards_and_a_hub, monkeypatch):
++    hub_db = str(two_boards_and_a_hub)
++    opened, asked = _count_opens(monkeypatch)
++    cards = ksa.session_tasks(["s1"])
++    assert sorted(c["id"] for c in cards) == ["t_a1", "t_a2", "t_b1"]
++    assert asked.count(hub_db) >= 2, "the fixture no longer asks hub.db once per board: the test proves nothing"
++    assert [p for p, _ in opened].count(hub_db) == 1
++    for _, conn in opened:
++        with pytest.raises(sqlite3.ProgrammingError):
++            conn.execute("SELECT 1")  # the call's connections do not outlive it
++    opened.clear()
++    ksa.session_tasks(["s1"])
++    assert [p for p, _ in opened].count(hub_db) == 1, "a connection was kept across calls"
++
++
++def test_session_tasks_rows_are_the_same_with_and_without_sharing(two_boards_and_a_hub, monkeypatch):
++    def rows(cards):
++        return sorted(({k: v for k, v in c.items() if k != "execution_observations"} for c in cards),
++                      key=lambda r: r["key"])
++
++    def states(cards):
++        return sorted((c["key"], [(o.get("source"), o.get("state")) for o in c.get("execution_observations") or []])
++                      for c in cards)
++
++    shared = ksa.session_tasks(["s1"])
++    ksa._reset_cache_for_tests()
++    monkeypatch.setattr(ro_batch, "open_ro", lambda path, opener: opener(path))  # every _ro its own connection
++    private = ksa.session_tasks(["s1"])
++    assert rows(shared) == rows(private)
++    assert states(shared) == states(private)
++
++
++# --- borrow semantics -------------------------------------------------------------------------------------------------
++
++
++@pytest.fixture
++def db_file(tmp_path):
++    path = tmp_path / "x.db"
++    conn = sqlite3.connect(path)
++    conn.execute("PRAGMA journal_mode=WAL")
++    conn.execute("CREATE TABLE t (v INTEGER)")
++    conn.execute("INSERT INTO t VALUES (1)")
++    conn.commit()
++    conn.close()
++    return path
++
++
++def test_a_borrow_behaves_like_a_fresh_connection(db_file):
++    with ro_batch.batch():
++        first = kanban_origin._ro(db_file)
++        first.row_factory = sqlite3.Row
++        first.execute("BEGIN")
++        assert first.execute("SELECT v FROM t").fetchone()["v"] == 1
++        first.close()
++        second = kanban_origin._ro(db_file)
++        assert object.__getattribute__(second, "_conn") is object.__getattribute__(first, "_conn")
++        assert second.row_factory is None
++        assert not second.in_transaction
++        writer = sqlite3.connect(db_file)
++        writer.execute("INSERT INTO t VALUES (2)")
++        writer.commit()
++        writer.close()
++        assert second.execute("SELECT count(*) FROM t").fetchone()[0] == 2  # no snapshot pinned by the borrow
++        with pytest.raises(sqlite3.OperationalError):
++            second.execute("INSERT INTO t VALUES (3)")  # still read-only
++        second.close()
++        second.close()  # idempotent
++
++
++def test_a_file_still_borrowed_gets_a_private_connection(db_file):
++    with ro_batch.batch():
++        outer = kanban_origin._ro(db_file)
++        outer.execute("BEGIN")
++        outer.execute("SELECT * FROM t").fetchall()
++        inner = kanban_origin._ro(db_file)
++        assert not isinstance(inner, ro_batch._Borrowed)
++        inner.close()
++        assert outer.in_transaction, "the nested reader's close touched the outer reader's transaction"
++        outer.close()
++
++
++def test_nested_batches_share_and_the_outer_one_closes(db_file):
++    with ro_batch.batch():
++        with ro_batch.batch():
++            a = kanban_origin._ro(db_file)
++            a.close()
++        b = kanban_origin._ro(db_file)
++        shared = object.__getattribute__(b, "_conn")
++        assert shared is object.__getattribute__(a, "_conn")
++        b.close()
++        shared.execute("SELECT 1")  # the inner block did not close it
++    with pytest.raises(sqlite3.ProgrammingError):
++        shared.execute("SELECT 1")
++
++
++def test_another_thread_never_uses_this_threads_connections(db_file):
++    import contextvars
++    results = {}
++    with ro_batch.batch():
++        mine = kanban_origin._ro(db_file)
++        mine.close()
++        ctx = contextvars.copy_context()  # a background refresh started inside the batch
++
++        def other():
++            conn = kanban_origin._ro(db_file)
++            results["plain"] = not isinstance(conn, ro_batch._Borrowed)
++            results["value"] = conn.execute("SELECT v FROM t").fetchone()[0]
++            conn.close()
++            with ro_batch.batch():  # its own batch, not the inherited one
++                a = kanban_origin._ro(db_file)
++                a.close()
++                b = kanban_origin._ro(db_file)
++                results["own_batch_shares"] = object.__getattribute__(a, "_conn") is object.__getattribute__(b, "_conn")
++                results["not_mine"] = object.__getattribute__(b, "_conn") is not object.__getattribute__(mine, "_conn")
++                b.close()
++
++        t = threading.Thread(target=ctx.run, args=(other,))
++        t.start()
++        t.join()
++    assert results == {"plain": True, "value": 1, "own_batch_shares": True, "not_mine": True}
++
++
++def test_without_a_batch_every_ro_is_its_own_connection(db_file):
++    a, b = kanban_origin._ro(db_file), kanban_origin._ro(db_file)
++    assert not isinstance(a, ro_batch._Borrowed) and a is not b
++    a.close()
++    b.execute("SELECT 1")
++    b.close()
++
++
++# --- origin obligations -----------------------------------------------------------------------------------------------
++
++
++def _reference(selected, ledger, *, gateway, profile, ids, statuses, placeholder, machine):
++    """The filter as it was before the reorder (hermes-agent d912ee96), with the same predicates."""
++    out = list(selected)
++    seen = {(c.get("session"), c.get("gateway"), c.get("profile"), c.get("board"), c.get("id")) for c in out}
++    for card in ledger:
++        if card.get("origin_gateway") != gateway or card.get("origin_profile") != profile:
++            continue
++        fields = ("session", "gateway", "profile", "board", "id")
++        if not all(isinstance(card.get(k), str) and card[k].strip() for k in fields):
++            continue
++        if card["gateway"] == gateway or card.get("released") or not card.get("unfinished"):
++            continue
++        if ids is not None and card["session"] not in ids and card.get("origin_session") not in ids:
++            continue
++        if card.get("status") not in statuses and card.get("status") != "unknown":
++            continue
++        identity = tuple(card[k] for k in fields)
++        if identity in seen:
++            continue
++        if placeholder(card["session"]) or machine(gateway, card["session"], local_gateway=gateway,
++                                                   profile=card.get("origin_profile")):
++            continue
++        seen.add(identity)
++        out.append({**card, "session_id": card["session"], "remote": True, "source": "origin-obligation"})
++    return out
++
++
++def test_preserve_origin_obligations_returns_what_the_old_filter_did(monkeypatch):
++    from hermes_cli import kanban_db_notify, kanban_placement
++
++    def placeholder(session):
++        return session.startswith("ph")
++
++    def machine(gateway, session, *, local_gateway, profile):
++        return session.startswith("m")
++
++    monkeypatch.setattr(kanban_placement, "is_placeholder_session", placeholder)
++    monkeypatch.setattr(kanban_db_notify, "is_machine_session", machine)
++    rnd = random.Random(20261120)
++    pick = rnd.choice
++    ledger = []
++    for i in range(4000):
++        card = {"origin_gateway": pick(["me", "me", "other"]), "origin_profile": pick(["default", "default", "p2"]),
++                "session": pick(["s1", "s2", "ph1", "m1", "", "  ", None, 7]),
++                "gateway": pick(["me", "far", "far2", "", None]), "profile": pick(["default", "x", " "]),
++                "board": pick(["default", "ops", ""]), "id": pick([f"t{i % 50}", "", None]),
++                "status": pick(["running", "done", "unknown", "blocked", None]),
++                "origin_session": pick(["s1", "s3", None])}
++        for key, values in (("released", [True, False, 0, 1, None]), ("unfinished", [True, False, None, 1])):
++            if rnd.random() < 0.8:
++                card[key] = pick(values)
++        ledger.append(card)
++    selected = [{"session": "s1", "gateway": "far", "profile": "default", "board": "default", "id": "t1"}]
++    for ids in (None, ["s1"], ["s2", "s3"], []):
++        for statuses in (("running", "blocked"), ("done",)):
++            kw = dict(gateway="me", profile="default", ids=ids, statuses=statuses)
++            got = obligations.preserve_origin_obligations(selected, ledger, **kw)
++            want = _reference(selected, ledger, placeholder=placeholder, machine=machine, **kw)
++            assert got == want
++            assert len(want) > len(selected) or ids == [] or statuses == ("done",)
+-- 
+2.43.0
+

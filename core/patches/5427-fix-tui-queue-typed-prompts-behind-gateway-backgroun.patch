@@ -1,0 +1,1414 @@
+From 52868898a47e7fbec264e6b22a37b5f621a7846a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 22:36:59 -0800
+Subject: [PATCH] fix(tui): queue typed prompts behind gateway background
+ turns; prompt wake after holds
+
+Three hub findings from 2026-11-21 (core d912ee96dd38), plus one Desktop tagging fix:
+
+1. Typing into a chat held by the gateway's own Kanban notice / close-out turn no
+   longer takes it over (which killed that turn with session_turn_lease_lost: chats
+   39be4c, 8d8534, a30b). When the only other holder (durable turn lease and registry
+   leases) is the live default gateway and the newest turn is automated, prompt.submit
+   forwards the prompt into that gateway's FIFO (RT-37 owner_forward) and answers the
+   queued, forwarded receipt the Desktop already renders as a queued row. Any other
+   holder, an unforwardable message or a forward that queued nothing keeps auto take-over;
+   an unconfirmed forward is never taken over. A Stop gesture on such a chat takes it
+   over (session.take_over on a worker thread), which ends the background turn.
+2. A notice wake refused only by the core update's admission hold charges no attempt,
+   is stamped closeout.hold_wait, is due (no grace) the moment the hold lifts, and a
+   watcher (notice_hold_wait) runs the guarantee pass within 2 s of the lift, then every
+   5 s while wakes wait for a slot (wake slots bound the rate). The sweep's passive rows
+   for such wakes carry the same stamp; other busy refusals keep their backoff.
+3. A retiring backend (host_loop_lease.retire_host_loops: code skew, superseded) now
+   publishes run/host-loops/retiring/<pid>.json. A wake refused "has another live owner"
+   whose every other holder is retiring re-claims the slot each 1 s for 15 s, then
+   answers busy (transient) instead of refused. The slot claim stays the only way in.
+4. Desktop: primary-socket events are tagged with the primary's own connection id
+   (store/gateway-primary-socket.ts), not the foregrounded secondary's, so plugins
+   filtering by connectionId stop attributing primary pushes to e.g. hermes-hub.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/app/gateway/hooks/use-gateway-boot.ts |   6 +-
+ .../store/gateway-connection-scope.test.ts    |  29 ++
+ .../src/store/gateway-primary-socket.ts       |  11 +
+ apps/shared/src/gateway-contract.generated.ts |   2 +
+ apps/shared/src/gateway-contract.openrpc.json |  24 ++
+ hermes_cli/host_loop_lease.py                 |  43 +++
+ .../test_host_loop_retiring_marker.py         |  63 ++++
+ .../tui_gateway/test_background_turn_queue.py | 289 ++++++++++++++++++
+ tests/tui_gateway/test_notice_hold_wait.py    | 161 ++++++++++
+ tui_gateway/contracts/prompt_voice.py         |   3 +
+ tui_gateway/contracts/sessions.py             |   2 +
+ tui_gateway/gateway_background_holder.py      | 149 +++++++++
+ tui_gateway/kanban_unloaded.py                |  29 +-
+ tui_gateway/kanban_unloaded_gates.py          |   3 +
+ tui_gateway/methods_prompt.py                 |  34 +++
+ tui_gateway/methods_session_interrupt.py      |  39 +++
+ tui_gateway/notice_guarantee.py               |  32 +-
+ tui_gateway/notice_hold_wait.py               | 118 +++++++
+ tui_gateway/owner_forward.py                  |   5 +
+ tui_gateway/session_notifications.py          |   7 +-
+ 20 files changed, 1041 insertions(+), 8 deletions(-)
+ create mode 100644 apps/desktop/src/store/gateway-primary-socket.ts
+ create mode 100644 tests/hermes_cli/test_host_loop_retiring_marker.py
+ create mode 100644 tests/tui_gateway/test_background_turn_queue.py
+ create mode 100644 tests/tui_gateway/test_notice_hold_wait.py
+ create mode 100644 tui_gateway/gateway_background_holder.py
+ create mode 100644 tui_gateway/notice_hold_wait.py
+
+diff --git a/apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts b/apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts
+index 07ab8ec9f3..580efdea88 100644
+--- a/apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts
++++ b/apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts
+@@ -41,7 +41,6 @@ import { noteBackendDrop, noteBackendExited } from '@/store/desktop-metrics'
+ import {
+   $gateway,
+   activeGateway,
+-  activeGatewayConnectionId,
+   closeLegacySecondaryGateways,
+   closeSecondaryGateways,
+   configureGatewayRegistry,
+@@ -60,6 +59,7 @@ import {
+   setPrimaryGatewayConnection
+ } from '@/store/gateway'
+ import { $primaryGatewayRoute } from '@/store/gateway-primary-route'
++import { primarySocketConnectionId } from '@/store/gateway-primary-socket'
+ import { type GatewayReconnectOptions, reconnectGateway, registerGatewayReconnect } from '@/store/gateway-reconnect'
+ import {
+   $gatewaySwitching,
+@@ -1257,7 +1257,9 @@ export function useGatewayBoot({
+         recordConnectionWire(primaryWireSource($primaryGatewayRoute.get(), $connection.get()), gateway.sessionWire)
+       }
+ 
+-      const connectionId = activeGatewayConnectionId()
++      // The primary socket's own source, never the foregrounded one: a secondary in front made
++      // primary plugin pushes look like they came from that secondary.
++      const connectionId = primarySocketConnectionId()
+       const sourceProfile = canonicalOwnerProfile(event) ?? sourceProfileNow()
+ 
+       const scopedEvent = {
+diff --git a/apps/desktop/src/store/gateway-connection-scope.test.ts b/apps/desktop/src/store/gateway-connection-scope.test.ts
+index b49b52ed47..e86a562ca8 100644
+--- a/apps/desktop/src/store/gateway-connection-scope.test.ts
++++ b/apps/desktop/src/store/gateway-connection-scope.test.ts
+@@ -55,6 +55,7 @@ const {
+ } = await import('./gateway')
+ 
+ const { setApiRequestConnection } = await import('@/hermes')
++const { primarySocketConnectionId } = await import('./gateway-primary-socket')
+ 
+ function installDesktop(): void {
+   ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = {
+@@ -153,6 +154,34 @@ describe('primary gateway registry scope', () => {
+     expect(activeGatewayConnectionId()).toBe('local')
+     expect(setApiRequestConnection).toHaveBeenLastCalledWith('local')
+   })
++
++  // [daveey] Events read off the PRIMARY socket are tagged with the primary's own source: with a secondary
++  // (hermes-hub) in front, the active id named the hub, so plugins filtering by connectionId took the primary
++  // gateway's pushes for the hub's.
++  it('names the primary socket by its own connection while a secondary is foregrounded', async () => {
++    setPrimaryGateway({ connectionState: 'open' } as never, 'default')
++    setPrimaryGatewayConnectionId('primary-vps')
++
++    await expect(ensureGatewayForAgent('hermes-hub', 'default')).resolves.toBe(true)
++
++    expect(activeGatewayConnectionId()).toBe('hermes-hub')
++    expect(primarySocketConnectionId()).toBe('primary-vps')
++
++    await ensureGatewayForProfile('default')
++    expect(primarySocketConnectionId()).toBe('primary-vps')
++  })
++
++  it('leaves primary events untagged only when the primary has no connection of its own', async () => {
++    configureGatewayRegistry({ activeConnectionId: () => 'electron-active', onEvent: vi.fn() })
++    setPrimaryGateway({ connectionState: 'open' } as never, 'default')
++
++    // Unrecorded primary route, primary in front: Electron's active descriptor is the primary's.
++    expect(primarySocketConnectionId()).toBe('electron-active')
++
++    // A secondary in front: the active descriptor is no longer the primary's, so nothing is borrowed.
++    await expect(ensureGatewayForAgent('hermes-hub', 'default')).resolves.toBe(true)
++    expect(primarySocketConnectionId()).toBeNull()
++  })
+ })
+ 
+ describe('pruneSecondaryGateways with registry-scoped entries', () => {
+diff --git a/apps/desktop/src/store/gateway-primary-socket.ts b/apps/desktop/src/store/gateway-primary-socket.ts
+new file mode 100644
+index 0000000000..34e00627e1
+--- /dev/null
++++ b/apps/desktop/src/store/gateway-primary-socket.ts
+@@ -0,0 +1,11 @@
++import { activeGatewayConnectionId, isActivePrimary, pinnedPrimaryGatewayConnectionId } from './gateway'
++
++/**
++ * [daveey] The registry connection the PRIMARY socket itself serves, whichever route is foregrounded: the tag for
++ * events read off that socket. `activeGatewayConnectionId()` names the foreground source, so with a secondary
++ * (e.g. hermes-hub) active it stamped the primary's own plugin pushes as the hub's. Before the primary's route is
++ * recorded, Electron's active descriptor names it only while the primary is foregrounded; otherwise null (untagged).
++ */
++export function primarySocketConnectionId(): null | string {
++  return pinnedPrimaryGatewayConnectionId() ?? (isActivePrimary() ? activeGatewayConnectionId() : null)
++}
+diff --git a/apps/shared/src/gateway-contract.generated.ts b/apps/shared/src/gateway-contract.generated.ts
+index ecc9628dca..91b6a61782 100644
+--- a/apps/shared/src/gateway-contract.generated.ts
++++ b/apps/shared/src/gateway-contract.generated.ts
+@@ -2924,6 +2924,7 @@ export interface PromptSubmitResult {
+   turn_isolation?: boolean | null
+   admission_id?: string | null
+   forwarded?: boolean | null
++  queued_behind?: string | null
+   queued_reason?: QueuedReason | null
+   queued_started_at?: number | null
+ }
+@@ -3819,6 +3820,7 @@ export interface SessionInterruptResult {
+   status: InterruptStatus
+   interrupted?: boolean | null
+   turn_isolation?: boolean | null
++  background_turn?: boolean | null
+ }
+ export type InterruptStatus = 'interrupted' | 'not_interrupted'
+ export interface SessionTakeOverResult {
+diff --git a/apps/shared/src/gateway-contract.openrpc.json b/apps/shared/src/gateway-contract.openrpc.json
+index dfebe251ac..9b0e192e17 100644
+--- a/apps/shared/src/gateway-contract.openrpc.json
++++ b/apps/shared/src/gateway-contract.openrpc.json
+@@ -34602,6 +34602,18 @@
+             "default": null,
+             "title": "Forwarded"
+           },
++          "queued_behind": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "title": "Queued Behind"
++          },
+           "queued_reason": {
+             "anyOf": [
+               {
+@@ -40023,6 +40035,18 @@
+             ],
+             "default": null,
+             "title": "Turn Isolation"
++          },
++          "background_turn": {
++            "anyOf": [
++              {
++                "type": "boolean"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "title": "Background Turn"
+           }
+         },
+         "required": [
+diff --git a/hermes_cli/host_loop_lease.py b/hermes_cli/host_loop_lease.py
+index a02212af9b..652e74f3ee 100644
+--- a/hermes_cli/host_loop_lease.py
++++ b/hermes_cli/host_loop_lease.py
+@@ -112,6 +112,7 @@ def retire_host_loops(key: str, reason: str) -> bool:
+     with _RETIRE_MU:
+         first = not _RETIRED
+         _RETIRED[key] = reason
++    _publish_retiring(reason)
+     if not first:
+         return False
+     logger.warning("host loops retired in this process (%s): releasing every host-loop lease and starting no "
+@@ -141,10 +142,52 @@ def resume_host_loops(key: str) -> bool:
+         had = _RETIRED.pop(key, None) is not None
+         left = not _RETIRED
+     if had and left:
++        _withdraw_retiring()
+         logger.info("host loops resumed in this process (%s cleared)", key)
+     return left
+ 
+ 
++# [daveey] Retirement is in-process state, but another process deciding what to do about a chat this one still
++# holds needs it too: a waker refused "has another live owner" by a backend that is about to restart (code skew,
++# superseded) used the long refused backoff (chat-closeout, hub 2026-11-21) although the chat frees within seconds.
++# A retiring process therefore publishes ``<lease_dir>/retiring/<pid>.json`` (pid, start time, reason) and removes it
++# when it resumes; a crashed one leaves a record that :func:`retiring_reason` ignores (dead or recycled pid).
++def _retiring_path(pid: int, home: str | Path | None = None) -> Path:
++    return lease_dir(home) / "retiring" / f"{int(pid)}.json"
++
++
++def _publish_retiring(reason: str) -> None:
++    pid = os.getpid()
++    try:
++        path = _retiring_path(pid)
++        path.parent.mkdir(parents=True, exist_ok=True)
++        tmp = path.with_name(f".{pid}.{threading.get_ident()}.tmp")
++        tmp.write_text(json.dumps({"pid": pid, "start": _start_of(pid), "reason": str(reason)[:300], "at": time.time()}),
++                       encoding="utf-8")
++        os.replace(tmp, path)
++    except OSError:
++        logger.warning("could not publish this process's host-loop retirement", exc_info=True)
++
++
++def _withdraw_retiring() -> None:
++    try:
++        _retiring_path(os.getpid()).unlink(missing_ok=True)
++    except OSError:
++        logger.warning("could not withdraw this process's host-loop retirement record", exc_info=True)
++
++
++def retiring_reason(pid, home: str | Path | None = None) -> str | None:
++    """Why the LIVE process ``pid`` is retiring (being replaced), or None: no record, an unreadable one, or one left
++    by a process that is gone (dead, or the pid recycled with another start time). Never raises."""
++    try:
++        record = _read_json(_retiring_path(int(pid), home))
++    except (TypeError, ValueError, OverflowError):
++        return None
++    if not record or record.get("pid") != int(pid) or not _alive(pid, record.get("start")):
++        return None
++    return str(record.get("reason") or "retiring")
++
++
+ def lease_dir(home: str | Path | None = None) -> Path:
+     """``<realpath(root home)>/run/host-loops``: one directory per install, shared by its profiles."""
+     from hermes_constants import get_default_hermes_root
+diff --git a/tests/hermes_cli/test_host_loop_retiring_marker.py b/tests/hermes_cli/test_host_loop_retiring_marker.py
+new file mode 100644
+index 0000000000..a29f619dcc
+--- /dev/null
++++ b/tests/hermes_cli/test_host_loop_retiring_marker.py
+@@ -0,0 +1,63 @@
++"""A retiring backend publishes its retirement so another process can tell a stale owner from a live one. [daveey]
++
++A wake refused "has another live owner" by a Desktop backend about to restart on new code waited out the waker's
++long refused backoff (hub 2026-11-21). ``retire_host_loops`` now writes ``run/host-loops/retiring/<pid>.json``;
++``retiring_reason(pid)`` reads it for a live pid only, and ``resume_host_loops`` withdraws it.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++import sys
++
++import pytest
++
++from hermes_cli import host_loop_lease as hll
++
++
++@pytest.fixture(autouse=True)
++def _clean(tmp_path, monkeypatch):
++    monkeypatch.setattr(hll, "lease_dir", lambda home=None: tmp_path / "host-loops")
++    monkeypatch.setattr(hll, "_handoff_replays", lambda: None)
++    with hll._RETIRE_MU:
++        hll._RETIRED.clear()
++    yield
++    with hll._RETIRE_MU:
++        hll._RETIRED.clear()
++
++
++def test_retiring_is_published_and_withdrawn():
++    me = os.getpid()
++    assert hll.retiring_reason(me) is None
++
++    hll.retire_host_loops("code-skew", "boot abc behind def")
++    assert hll.retiring_reason(me) == "boot abc behind def"
++
++    hll.retire_host_loops("always-on-superseded", "superseded")  # a second reason keeps it retiring
++    assert hll.retiring_reason(me) == "superseded"
++    assert hll.resume_host_loops("code-skew") is False
++    assert hll.retiring_reason(me) == "superseded"
++
++    assert hll.resume_host_loops("always-on-superseded") is True
++    assert hll.retiring_reason(me) is None
++
++
++def test_a_record_left_by_a_dead_process_is_ignored(tmp_path):
++    child = subprocess.Popen([sys.executable, "-c", "pass"])
++    child.wait()
++    path = tmp_path / "host-loops" / "retiring" / f"{child.pid}.json"
++    path.parent.mkdir(parents=True)
++    path.write_text(json.dumps({"pid": child.pid, "start": None, "reason": "code-skew"}), encoding="utf-8")
++
++    assert hll.retiring_reason(child.pid) is None
++
++
++def test_garbage_answers_none(tmp_path):
++    path = tmp_path / "host-loops" / "retiring" / f"{os.getpid()}.json"
++    path.parent.mkdir(parents=True)
++    path.write_text("{torn", encoding="utf-8")
++    assert hll.retiring_reason(os.getpid()) is None
++    assert hll.retiring_reason("not-a-pid") is None
++    assert hll.retiring_reason(-1) is None
+diff --git a/tests/tui_gateway/test_background_turn_queue.py b/tests/tui_gateway/test_background_turn_queue.py
+new file mode 100644
+index 0000000000..91f36f2aac
+--- /dev/null
++++ b/tests/tui_gateway/test_background_turn_queue.py
+@@ -0,0 +1,289 @@
++"""Typing into a chat the gateway holds for its own background turn queues the prompt; Stop still ends that turn;
++a wake refused by a backend that is being replaced retries in seconds. [daveey]
++
++Hub 2026-11-21: chats 39be4c, 8d8534 and a30b were held by the gateway's own Kanban close-out / notice turns. The
++user typed into each; the Desktop took the chat over (``auto_take_over``) and the gateway's turn died with
++``session_turn_lease_lost``. Now a prompt for a chat whose ONLY other holder is the live gateway goes to that
++gateway's FIFO (the RT-37 forward), and any other holder keeps the takeover.
++"""
++
++from __future__ import annotations
++
++import threading
++
++import pytest
++
++from hermes_cli.active_sessions import SESSION_NOT_OWNED, ActiveSessionRefusal
++from tui_gateway import gateway_background_holder as gbh
++from tui_gateway import owner_forward
++from tui_gateway import server
++
++KEY = "20261112_002413_39be4c"
++GATEWAY = 2786221
++DESKTOP = 2801475
++
++
++def _owner(pid):
++    return {"holder": f"pid={pid}:pidns=4026531836:turn=t1:platform=tui", "conversation_id": KEY, "acquired_at": 1.0}
++
++
++def _entry(pid, key=KEY):
++    return {"session_id": key, "pid": pid, "lease_id": f"lease-{pid}"}
++
++
++# -- who holds the chat ------------------------------------------------------------------------------------------
++
++
++def test_the_gateway_alone_holding_the_chat_is_named():
++    session = {"session_key": KEY}
++    assert gbh.gateway_background_holder(session, foreign_owner=lambda s: _owner(GATEWAY),
++                                         registry=lambda: [_entry(GATEWAY), _entry(99, "other-chat")],
++                                         gateway_pid=lambda: GATEWAY) == GATEWAY
++    # The registry lease alone (between the notice's admission and its turn lease) proves it too.
++    assert gbh.gateway_background_holder(session, foreign_owner=lambda s: None, registry=lambda: [_entry(GATEWAY)],
++                                         gateway_pid=lambda: GATEWAY) == GATEWAY
++
++
++@pytest.mark.parametrize("owner, entries, live", [
++    (_owner(DESKTOP), [], GATEWAY),                      # another Desktop backend writes the turn
++    (_owner(GATEWAY), [_entry(DESKTOP)], GATEWAY),       # the gateway AND another window hold it
++    (_owner(GATEWAY), [], None),                         # no verified live gateway
++    ({"holder": "legacy-holder"}, [], GATEWAY),          # an unreadable holder string
++    (None, [], GATEWAY),                                 # nobody else holds it
++])
++def test_any_other_holder_keeps_the_takeover(owner, entries, live):
++    assert gbh.gateway_background_holder({"session_key": KEY}, foreign_owner=lambda s: owner,
++                                         registry=lambda: entries, gateway_pid=lambda: live) is None
++
++
++def test_an_unreadable_holder_keeps_the_takeover():
++    def broken(_session):
++        raise OSError("state.db is locked")
++
++    assert gbh.gateway_background_holder({"session_key": KEY}, foreign_owner=broken, registry=list,
++                                         gateway_pid=lambda: GATEWAY) is None
++    assert gbh.gateway_background_holder({"session_key": ""}, foreign_owner=lambda s: _owner(GATEWAY),
++                                         registry=list, gateway_pid=lambda: GATEWAY) is None
++
++
++# -- prompt.submit -----------------------------------------------------------------------------------------------
++
++
++def _refusal():
++    return ActiveSessionRefusal("This chat is active in another Hermes window/terminal.", SESSION_NOT_OWNED)
++
++
++@pytest.fixture
++def background(monkeypatch):
++    """A chat whose newest turn is a Kanban close-out, held by the live gateway; forwards are recorded."""
++    sent = []
++    state = {"holder": GATEWAY, "receipt": {"status": "queued", "admission_id": "adm-1"}, "raise": None}
++    monkeypatch.setattr(server, "_automation_holder_kind", lambda session: "kanban_notice")
++    monkeypatch.setattr(gbh, "gateway_background_holder", lambda session, **kw: state["holder"])
++
++    def forward(sid, session, text, **kw):
++        sent.append((sid, text))
++        if state["raise"] is not None:
++            raise state["raise"]
++        return state["receipt"]
++
++    monkeypatch.setattr(owner_forward, "forward_prompt", forward)
++    state["sent"] = sent
++    return state
++
++
++def test_a_typed_prompt_is_queued_behind_the_gateways_background_turn(background):
++    resp = server._slot_refusal("r", "s", {"session_key": KEY}, "typed here", {}, _refusal(), False)
++
++    assert resp["result"] == {"status": "queued", "admission_id": "adm-1", "forwarded": True,
++                              "queued_behind": "kanban_notice"}
++    assert background["sent"] == [("s", "typed here")]
++
++
++def test_an_unconfirmed_forward_is_never_taken_over(background):
++    background["raise"] = owner_forward.OwnerUnconfirmed("no receipt")
++    resp = server._slot_refusal("r", "s", {"session_key": KEY}, "typed here", {}, _refusal(), False)
++
++    assert resp["error"]["code"] == 4090
++    assert resp["error"]["data"] == {"reason": "SESSION_OWNER_UNCONFIRMED"}  # no auto_take_over: it may be queued
++
++
++@pytest.mark.parametrize("exc", [owner_forward.OwnerNotRunning("stopped"), owner_forward.OwnerUnavailable("no"),
++                                 ConnectionRefusedError("dial failed")])
++def test_a_forward_that_queued_nothing_falls_back_to_the_takeover(background, exc):
++    background["raise"] = exc
++    resp = server._slot_refusal("r", "s", {"session_key": KEY}, "typed here", {}, _refusal(), False)
++
++    assert resp["error"]["data"] == {"reason": SESSION_NOT_OWNED, "auto_take_over": True,
++                                     "holder_turn_kind": "kanban_notice"}
++
++
++def test_another_holder_keeps_the_takeover_and_forwards_nothing(background):
++    background["holder"] = None
++    resp = server._slot_refusal("r", "s", {"session_key": KEY}, "typed here", {}, _refusal(), False)
++
++    assert resp["error"]["data"]["auto_take_over"] is True and background["sent"] == []
++
++
++@pytest.mark.parametrize("session_extra, params", [
++    ({"attached_images": ["/tmp/a.png"]}, {}),
++    ({}, {"truncate_before_user_ordinal": 2}),
++])
++def test_a_message_the_fifo_cannot_take_keeps_the_takeover(background, session_extra, params):
++    session = {"session_key": KEY, **session_extra}
++    resp = server._slot_refusal("r", "s", session, "typed here", params, _refusal(), False)
++
++    assert resp["error"]["data"]["auto_take_over"] is True and background["sent"] == []
++
++
++def test_prompt_submit_answers_the_queued_receipt(background, monkeypatch):
++    sid = "rt-background-queue"
++    monkeypatch.setitem(server._sessions, sid, {
++        "session_key": KEY, "history": [], "history_lock": threading.RLock(), "running": False,
++        "attached_images": [], "profile_home": None, "transport": None})
++    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *a, **k: _refusal())
++
++    resp = server.handle_request({"id": "r1", "method": "prompt.submit",
++                                  "params": {"session_id": sid, "text": "typed here"}})
++
++    assert resp["result"]["forwarded"] is True and resp["result"]["status"] == "queued"
++    assert background["sent"] == [(sid, "typed here")]
++
++
++# -- Stop ----------------------------------------------------------------------------------------------------------
++
++
++@pytest.fixture
++def idle_chat(monkeypatch):
++    sid = "rt-background-stop"
++    session = {"agent": None, "agent_ready": threading.Event(), "session_key": KEY, "history": [],
++               "history_lock": threading.RLock(), "running": False}
++    monkeypatch.setitem(server._sessions, sid, session)
++    calls, done = [], threading.Event()
++
++    def take_over(rid, params):
++        calls.append(params)
++        done.set()
++        return {"result": {"status": "taken_over"}}
++
++    monkeypatch.setitem(server._methods, "session.take_over", take_over)
++    monkeypatch.setattr(server, "_automation_holder_kind", lambda session: "kanban_notice")
++    monkeypatch.setattr(gbh, "gateway_background_holder", lambda session, **kw: GATEWAY)
++    return sid, session, calls, done
++
++
++def _stop(sid, origin):
++    params = {"session_id": sid, **({"origin": origin} if origin else {})}
++    return server.handle_request({"id": "1", "method": "session.interrupt", "params": params})
++
++
++def test_stop_takes_the_chat_over_from_the_gateways_background_turn(idle_chat):
++    sid, _session, calls, done = idle_chat
++    resp = _stop(sid, "stop_button")
++
++    assert resp["result"] == {"status": "interrupted", "background_turn": True}
++    assert done.wait(5) and calls == [{"session_id": sid}]
++
++
++@pytest.mark.parametrize("origin", ["delete", "rewind", "plugin:x", None])
++def test_other_interrupts_never_end_the_background_turn(idle_chat, origin):
++    sid, _session, calls, done = idle_chat
++    resp = _stop(sid, origin)
++
++    assert resp["result"].get("background_turn") is None
++    assert not done.wait(0.2) and calls == []
++
++
++def test_stop_of_this_backends_own_turn_is_the_ordinary_stop(idle_chat, monkeypatch):
++    sid, session, calls, done = idle_chat
++    session["running"] = True
++    monkeypatch.setattr(server, "_interrupt_session_turn", lambda *a, **k: None)
++    resp = _stop(sid, "stop_button")
++
++    assert resp["result"].get("background_turn") is None and not done.wait(0.2) and calls == []
++
++
++def test_stop_with_another_holder_is_the_ordinary_stop(idle_chat, monkeypatch):
++    sid, _session, calls, _done = idle_chat
++    monkeypatch.setattr(gbh, "gateway_background_holder", lambda session, **kw: None)
++    resp = _stop(sid, "stop_button")
++
++    assert resp["result"].get("background_turn") is None and calls == []
++
++
++# -- a wake refused by a backend that is being replaced ------------------------------------------------------------
++
++
++@pytest.mark.parametrize("reasons, expected", [
++    ({DESKTOP: "code-skew: boot abc behind def"}, "code-skew: boot abc behind def"),
++    ({DESKTOP: "superseded", GATEWAY: None}, None),  # the gateway is a real owner
++    ({}, None),
++])
++def test_retiring_owner_reason_needs_every_other_holder_retiring(reasons, expected):
++    entries = [_entry(pid) for pid in reasons]
++    got = gbh.retiring_owner_reason({"session_key": KEY}, foreign_owner=lambda s: None, registry=lambda: entries,
++                                    reason_of=reasons.get)
++    assert got == expected
++
++
++@pytest.fixture
++def wake(monkeypatch):
++    session = {"session_key": KEY}
++    state = {"free_after": 2, "tries": 0, "reason": "code-skew", "claims": 0, "releases": 0}
++    monkeypatch.setattr(gbh, "retiring_owner_reason", lambda s, **kw: state["reason"])
++    clock = {"t": 0.0}
++
++    def claim_slot(sid, s, **kw):
++        state["tries"] += 1
++        return None if state["tries"] >= state["free_after"] else _refusal()
++
++    def run():
++        return gbh.wake_past_retiring_owner(
++            "s", session, "chat-closeout", KEY,
++            claim_turn=lambda s: state.__setitem__("claims", state["claims"] + 1) or True,
++            release_turn=lambda s: state.__setitem__("releases", state["releases"] + 1),
++            claim_slot=claim_slot, foreign_owner=lambda s: None,
++            sleep=lambda dt: clock.__setitem__("t", clock["t"] + dt), monotonic=lambda: clock["t"])
++
++    return run, state, clock
++
++
++def test_a_wake_waits_out_a_retiring_owner_and_claims_the_chat(wake):
++    run, state, clock = wake
++    assert run() is None
++    assert state["tries"] == 2 and state["claims"] == 2 and state["releases"] == 1  # the last claim is kept
++    assert clock["t"] == 2 * gbh.RETIRING_OWNER_POLL_S
++
++
++def test_a_retiring_owner_that_never_lets_go_is_busy_not_refused(wake):
++    run, state, clock = wake
++    state["free_after"] = 10 ** 9
++    assert run() == "busy"
++    assert clock["t"] <= gbh.RETIRING_OWNER_WAIT_S + gbh.RETIRING_OWNER_POLL_S and state["claims"] == state["releases"]
++
++
++def test_a_live_owner_is_still_refused(wake):
++    run, state, _clock = wake
++    state["reason"] = None
++    assert run() == "refused"
++    assert state["tries"] == 0
++
++
++def test_the_wake_path_uses_the_retiring_owner_wait(monkeypatch):
++    """``_wake_session_turn`` hands a refused slot claim to ``wake_past_retiring_owner`` and returns its verdict."""
++    session = {"session_key": KEY}
++    import tui_gateway.automation_replay as ar
++    import tui_gateway.wake_profiles as wp
++    monkeypatch.setattr(ar, "retiring_backend_refuses", lambda label, key: False)
++    monkeypatch.setattr(wp, "live_for_profiles", lambda key, profiles: ("s", session))
++    monkeypatch.setattr(server, "_restart_completed_failed_agent_build", lambda *a: None)
++    monkeypatch.setattr(server, "_start_agent_build", lambda *a: None)
++    monkeypatch.setattr(server, "_wait_agent", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_notif_claim_turn", lambda s: True)
++    monkeypatch.setattr(server, "_notif_release_turn", lambda s: None)
++    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *a, **k: _refusal())
++    seen = []
++    monkeypatch.setattr(gbh, "wake_past_retiring_owner", lambda *a, **k: seen.append(a[3]) or "busy")
++
++    assert server._wake_session_turn(KEY, "notice", label="chat-closeout") == "busy"
++    assert seen == [KEY]
+diff --git a/tests/tui_gateway/test_notice_hold_wait.py b/tests/tui_gateway/test_notice_hold_wait.py
+new file mode 100644
+index 0000000000..f04e91b135
+--- /dev/null
++++ b/tests/tui_gateway/test_notice_hold_wait.py
+@@ -0,0 +1,161 @@
++"""A Kanban notice refused only by the core update's admission hold wakes within seconds of the hold lifting. [daveey]
++
++Hub 2026-11-21: notices refused "busy" while "Hermes update admission is paused or busy" were written as passive rows
++and the notice guarantee offered them again only after its 300 s grace, then ``BUSY_RETRY_S`` doubling. Now such a
++wake is stamped ``hold_wait``, charges no attempt, is due the moment the hold lifts, and a watcher runs the pass
++within ``POLL_S`` of that; every other busy refusal keeps the backoff.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import json
++import time
++
++import pytest
++
++import hermes_state_outcome as so
++from hermes_cli import kanban_session_activity as ksa
++from hermes_state import SessionDB
++from tui_gateway import kanban_unloaded as ku
++from tui_gateway import notice_guarantee as ng
++from tui_gateway import notice_hold_wait as hw
++
++CHAT = "20261121_050000_holdwt"
++
++
++@pytest.fixture
++def hold(monkeypatch):
++    state = {"held": True, "noted": 0}
++    monkeypatch.setattr(hw, "update_hold_active", lambda home=None: state["held"])
++
++    def note(**kw):
++        state["noted"] += 1
++        return True
++
++    monkeypatch.setattr(hw, "note_waiting", note)
++    return state
++
++
++@pytest.fixture
++def db(tmp_path):
++    so._reset_hooks_for_tests()
++    ksa._reset_cache_for_tests()
++    ng._reset_refreshed_for_tests()
++    handle = SessionDB(tmp_path / "state.db")
++    handle.create_session(CHAT, "desktop")
++    handle.append_message(CHAT, "user", "run the deploy card")
++    handle.append_message(CHAT, "assistant", "Started the deploy card.")
++    yield handle
++    handle.close()
++    so._reset_hooks_for_tests()
++
++
++def _notice(db, text, *, age=600.0, **meta):
++    row = db.append_kanban_notice(CHAT, text, {"notice_id": f"n:{text}:{time.time()}", "display_text": text, **meta})
++    db._write_rowcount("UPDATE messages SET timestamp = ? WHERE id = ?", (time.time() - age, row))
++    return row
++
++
++def _run(db, verdict="started", now=None):
++    calls = []
++
++    def wake(sid, msg_id):
++        calls.append((sid, msg_id))
++        return verdict
++
++    @contextlib.contextmanager
++    def opener(chat_id):
++        yield db, db.get_compression_tip(chat_id) or chat_id
++
++    out = ng.guarantee_pass(now=now, stores=lambda: iter([db]), holders=list, session_db=opener, wake=wake,
++                            spawn=lambda job: job())
++    return out, calls
++
++
++def _closeout(db, row):
++    raw = db._read_one("SELECT display_metadata FROM messages WHERE id = ?", (row,))[0]
++    return json.loads(raw).get("closeout") or {}
++
++
++def test_a_hold_refused_closeout_charges_nothing_and_wakes_when_the_hold_lifts(db, hold):
++    row = _notice(db, "✔ Kanban t_aaa done — deploy card")
++    now = time.time()
++
++    _out, calls = _run(db, verdict="busy", now=now)
++
++    closeout = _closeout(db, row)
++    assert calls == [(CHAT, row)] and closeout["state"] == "deferred" and closeout["hold_wait"] is True
++    assert closeout.get("attempts", 0) == 0 and closeout.get("busy_attempts", 0) == 0  # nothing charged
++    assert hold["noted"] == 1  # the watcher was started
++    assert _run(db, now=now + 30) == ([], [])  # the hold is still on: not due
++
++    hold["held"] = False
++    _out, calls = _run(db, verdict="started", now=now + 30)  # long before retry_at / BUSY_RETRY_S
++
++    assert calls == [(CHAT, row)] and _closeout(db, row)["state"] == "started"
++
++
++def test_a_young_hold_refused_row_skips_the_grace_window(db, hold):
++    row = _notice(db, "✔ Kanban t_bbb done", age=5.0, closeout=hw.hold_wait_closeout())
++    assert _run(db) == ([], [])  # held
++
++    hold["held"] = False
++    _out, calls = _run(db)
++    assert calls == [(CHAT, row)]
++
++
++def test_an_ordinary_busy_wake_keeps_its_backoff(db, hold):
++    hold["held"] = False
++    row = _notice(db, "✔ Kanban t_ccc done")
++    now = time.time()
++
++    _run(db, verdict="busy", now=now)
++
++    closeout = _closeout(db, row)
++    assert closeout["state"] == "deferred" and not closeout.get("hold_wait")
++    assert closeout["busy_attempts"] == 1 and closeout["retry_at"] >= now + ng.BUSY_RETRY_S
++    assert hold["noted"] == 0
++    assert _run(db, now=now + 30) == ([], [])
++
++
++def test_the_sweeps_passive_row_carries_the_hold_wait_stamp(hold):
++    meta = {"notice_id": "n1"}
++    stamped = ku._hold_wait_metadata("busy", meta)
++    assert hw.is_hold_wait(stamped) and "closeout" not in meta
++
++    assert ku._hold_wait_metadata("refused", meta) is meta
++    assert ku._hold_wait_metadata("busy", {"closeout": {"state": "self"}}) == {"closeout": {"state": "self"}}
++    hold["held"] = False
++    assert ku._hold_wait_metadata("busy", meta) is meta
++
++
++def test_the_watcher_runs_passes_after_the_lift_until_no_wake_waits_for_a_slot(monkeypatch):
++    hw._reset_for_tests()
++    held = iter([True, True, False])
++    results = iter([[{"result": "dispatched"}] * 8 + [{"result": "skipped:slots"}] * 3,
++                    [{"result": "dispatched"}] * 3])
++    sleeps, passes = [], []
++
++    def run_pass():
++        passes.append(1)
++        return next(results)
++
++    monkeypatch.setattr(hw, "update_hold_active", lambda home=None: next(held, False))
++    jobs = []
++    assert hw.note_waiting(run_pass=run_pass, held=lambda: next(held, False), sleep=sleeps.append,
++                           spawn=jobs.append) is True
++    assert hw.note_waiting(run_pass=run_pass, spawn=jobs.append) is False  # one watcher at a time
++    jobs[0]()
++
++    assert len(passes) == 2
++    assert sleeps == [hw.POLL_S, hw.POLL_S, hw.PASS_EVERY_S]  # polled the hold, then one slot-wait pass gap
++    assert hw.note_waiting(run_pass=run_pass, held=lambda: False, sleep=sleeps.append, spawn=jobs.append) is True
++
++
++def test_the_drain_stops_after_its_window():
++    hw._reset_for_tests()
++    clock = iter(range(0, 10_000, 50))
++    passes = hw.watch(run_pass=lambda: [{"result": "skipped:slots"}], held=lambda: False, sleep=lambda s: None,
++                      monotonic=lambda: next(clock))
++    assert 1 < passes <= hw.DRAIN_S / 50 + 2
+diff --git a/tui_gateway/contracts/prompt_voice.py b/tui_gateway/contracts/prompt_voice.py
+index 313fa9784d..82c1d58325 100644
+--- a/tui_gateway/contracts/prompt_voice.py
++++ b/tui_gateway/contracts/prompt_voice.py
+@@ -78,6 +78,9 @@ class PromptSubmitResult(Result):
+     # the OWNER's FIFO (``status: queued``) and runs there after the current turn; nothing runs here.
+     admission_id: str | None = None
+     forwarded: bool | None = None
++    # [daveey] Set with ``forwarded``: the chat's only other holder was this host's gateway running a turn Hermes
++    # started (its display kind, e.g. ``kanban_notice``); the prompt waits behind that turn instead of a take-over.
++    queued_behind: str | None = None
+     # An idle send refused only by the core-update admission hold is queued here and runs once it lifts
+     # (``session_auto_continue._queue_submit_behind_update_hold``). ``queued_started_at``: when that hold
+     # was set (Unix seconds, its marker's mtime), null when unreadable. Both absent on any other reply.
+diff --git a/tui_gateway/contracts/sessions.py b/tui_gateway/contracts/sessions.py
+index c5e3b34e9e..fa52315f86 100644
+--- a/tui_gateway/contracts/sessions.py
++++ b/tui_gateway/contracts/sessions.py
+@@ -701,6 +701,8 @@ class SessionInterruptResult(Result):
+     status: InterruptStatus
+     interrupted: bool | None = None
+     turn_isolation: bool | None = None
++    # [daveey] The Stop took the chat over from this host's gateway, ending the turn Hermes started there.
++    background_turn: bool | None = None
+ 
+ 
+ method("session.interrupt", params=SessionInterruptParams, result=SessionInterruptResult,
+diff --git a/tui_gateway/gateway_background_holder.py b/tui_gateway/gateway_background_holder.py
+new file mode 100644
+index 0000000000..71f7211e50
+--- /dev/null
++++ b/tui_gateway/gateway_background_holder.py
+@@ -0,0 +1,149 @@
++"""Who else holds a chat: this host's gateway running a turn Hermes started, or a backend being replaced. [daveey]
++
++On the hub, 2026-11-21, the gateway's own Kanban close-out / notice turns held three Desktop chats (39be4c 06:02Z,
++8d8534 05:13Z, a30b 05:14Z). The user typed into each one; the Desktop backend's ``prompt.submit`` was refused
++``SESSION_NOT_OWNED`` with ``auto_take_over`` (the newest turn was automated), the Desktop took the chat over, and
++the gateway's turn died with ``session_turn_lease_lost`` mid model call. The holder was no other interactive window:
++it was the gateway serving this home, whose FIFO already queues a typed send behind a running turn (RT-37,
++``owner_forward``). So such a send is queued there instead (``methods_prompt._queue_behind_background_turn``), and
++an explicit Stop takes the chat over, which ends that turn (``methods_session_interrupt``). A holder this module
++cannot prove is the gateway (another Desktop backend, a CLI, an unreadable registry) keeps today's takeover.
++
++:func:`retiring_owner_reason` answers the other question a waker asks when it is refused "has another live owner":
++is that owner a backend about to restart (its core out of date, superseded)? Then the refusal is transient.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++import time
++from typing import Any, Callable, Iterable, Optional
++
++logger = logging.getLogger(__name__)
++
++
++def _holder_pid(holder: Any) -> Optional[int]:
++    """The pid of a ``pid=<n>:...`` durable turn-lease holder, else None."""
++    head = str(holder or "").split(":", 1)[0]
++    if not head.startswith("pid="):
++        return None
++    digits = head[4:]
++    return int(digits) if digits.isdigit() else None
++
++
++def holder_pids(key: str, foreign_owner: Optional[dict], registry: Iterable[dict], me: int) -> set[int]:
++    """Every OTHER process holding chat ``key``: the durable turn-lease writer and the registry leases. An entry
++    whose pid cannot be read counts as pid 0, which no gateway has, so it keeps the takeover."""
++    pids: set[int] = set()
++    if foreign_owner:
++        pid = _holder_pid(foreign_owner.get("holder"))
++        pids.add(pid if pid is not None else 0)
++    for entry in registry or ():
++        if str(entry.get("session_id") or "") != key:
++            continue
++        try:
++            pid = int(entry.get("pid") or 0)
++        except (TypeError, ValueError):
++            pid = 0
++        if pid != me:
++            pids.add(pid)
++    return pids
++
++
++def gateway_background_holder(session: dict, *, foreign_owner: Callable[[dict], Optional[dict]],
++                              registry: Optional[Callable[[], list]] = None,
++                              gateway_pid: Optional[Callable[[], Optional[int]]] = None) -> Optional[int]:
++    """The live gateway's pid when it is the ONLY other holder of this chat, else None.
++
++    The caller has already established that the chat's newest turn is one Hermes started (``_automation_holder_kind``).
++    Every read failure answers None: an unprovable holder keeps the existing takeover behaviour."""
++    key = str(session.get("session_key") or "")
++    if not key:
++        return None
++    try:
++        owner = foreign_owner(session)
++        if registry is None:
++            from hermes_cli.active_sessions import active_session_registry_snapshot
++            entries = active_session_registry_snapshot(session.get("profile_home"))
++        else:
++            entries = registry()
++        pids = holder_pids(key, owner, entries, os.getpid())
++        if not pids:
++            return None
++        if gateway_pid is None:
++            from hermes_cli.gateway_multiplex_served import live_default_gateway_pid
++            live = live_default_gateway_pid()
++        else:
++            live = gateway_pid()
++    except Exception:  # health: allow BLE001 -- an unprovable holder keeps the takeover; logged with traceback
++        logger.warning("could not tell who holds chat %s", key, exc_info=True)
++        return None
++    if live is None or pids != {int(live)}:
++        return None
++    return int(live)
++
++
++def retiring_owner_reason(session: dict, *, foreign_owner: Callable[[dict], Optional[dict]],
++                          registry: Optional[Callable[[], list]] = None,
++                          reason_of: Optional[Callable[[int], Optional[str]]] = None) -> Optional[str]:
++    """Why every OTHER holder of this chat is a backend being replaced (``host_loop_lease.retiring_reason``: code
++    skew, superseded), else None. One holder that is not retiring (or cannot be read) is a real owner: None.
++
++    A wake refused by such a holder is transient: the backend restarts within seconds and lets the chat go
++    (:func:`wake_past_retiring_owner`). Never raises."""
++    key = str(session.get("session_key") or "")
++    if not key:
++        return None
++    try:
++        owner = foreign_owner(session)
++        if registry is None:
++            from hermes_cli.active_sessions import active_session_registry_snapshot
++            entries = active_session_registry_snapshot(session.get("profile_home"))
++        else:
++            entries = registry()
++        pids = holder_pids(key, owner, entries, os.getpid())
++        if reason_of is None:
++            from hermes_cli.host_loop_lease import retiring_reason as reason_of
++        reasons = [reason_of(pid) if pid > 0 else None for pid in sorted(pids)]
++    except Exception:  # health: allow BLE001 -- an unreadable owner is a real owner; logged with traceback
++        logger.warning("could not tell whether chat %s is held by a retiring backend", key, exc_info=True)
++        return None
++    if not reasons or any(r is None for r in reasons):
++        return None
++    return "; ".join(sorted(set(reasons)))
++
++
++# A wake refused by a backend that is being replaced retries this long, this often: the backend restarts within
++# seconds and lets the chat go, where "refused" sent the waker (chat-closeout) to its long backoff.
++RETIRING_OWNER_WAIT_S = 15.0
++RETIRING_OWNER_POLL_S = 1.0
++
++
++def wake_past_retiring_owner(sid: str, session: dict, label: str, key: str, *, claim_turn: Callable[[dict], bool],
++                             release_turn: Callable[[dict], Any], claim_slot: Callable[..., Any],
++                             foreign_owner: Callable[[dict], Optional[dict]],
++                             sleep: Callable[[float], None] = time.sleep,
++                             monotonic: Callable[[], float] = time.monotonic) -> Optional[str]:
++    """``session_notifications._wake_session_turn`` after its slot claim was refused (its notice claim released):
++    None once the slot is claimed (the notice claim is held again, as on the ordinary path), else the verdict.
++    Every other holder retiring (:func:`retiring_owner_reason`): re-claim each ``RETIRING_OWNER_POLL_S`` for
++    ``RETIRING_OWNER_WAIT_S``, then ``"busy"`` (transient: retry soon). The slot claim stays the only way in, so the
++    restarting backend and this one never write at once. Any other owner: ``"refused"``, as before."""
++    reason = retiring_owner_reason(session, foreign_owner=foreign_owner)
++    if reason is None:
++        logger.info("%s: %s has another live owner; not waking it here", label, key)
++        return "refused"
++    logger.info("%s: %s is held by a backend being replaced (%s); retrying for up to %.0fs",
++                label, key, reason, RETIRING_OWNER_WAIT_S)
++    deadline = monotonic() + RETIRING_OWNER_WAIT_S
++    while monotonic() < deadline:
++        sleep(RETIRING_OWNER_POLL_S)
++        if session.get("_finalized") or not claim_turn(session):
++            return "busy"
++        if claim_slot(sid, session) is None:
++            logger.info("%s: %s came free from the retiring backend", label, key)
++            return None
++        release_turn(session)
++    logger.info("%s: %s is still held by the retiring backend; busy (retry soon)", label, key)
++    return "busy"
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index 512aa00e31..49b08f651c 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -296,6 +296,24 @@ def _spawn_thread(job: Callable[[], str]) -> str:
+     return "dispatched"
+ 
+ 
++def _hold_wait_metadata(verdict: str, metadata: dict) -> dict:
++    """[daveey] The passive row's metadata: a wake refused ``"busy"`` only because the core update holds admission
++    is stamped to wake as soon as the hold lifts (``notice_hold_wait``), not after the guarantee's 300 s grace."""
++    from tui_gateway.notice_hold_wait import hold_wait_closeout, update_hold_active
++    if verdict != "busy" or "closeout" in metadata or not update_hold_active():
++        return metadata
++    return {**metadata, "closeout": hold_wait_closeout()}
++
++
++def _note_hold_wait(metadata: dict) -> None:
++    from tui_gateway.notice_hold_wait import is_hold_wait, note_waiting
++    if is_hold_wait(metadata):
++        try:
++            note_waiting()
++        except Exception:  # health: allow BLE001 -- the row is durable; the sweeper's pass wakes it, just later
++            logger.warning("could not start the notice hold-wait watcher", exc_info=True)
++
++
+ def _wake_job(wake, session_db, slug, ident, tip, text, metadata, old, new, now) -> str:
+     """Run on a worker: the wake, then (unless it started) the passive row on a fresh board connection."""
+     try:
+@@ -315,6 +333,7 @@ def _wake_job(wake, session_db, slug, ident, tip, text, metadata, old, new, now)
+         else:
+             from hermes_cli import kanban_db_connect as _kbc
+             from hermes_cli import kanban_db_notify as _kbn
++            metadata = _hold_wait_metadata(verdict, metadata)
+             with contextlib.closing(_kbc.connect(board=slug)) as conn:
+                 if metadata.get("event_kind") == "decision_requested":
+                     _kbn.rewind_notify_cursor(conn, claimed_cursor=new, old_cursor=old, **ident)
+@@ -322,6 +341,7 @@ def _wake_job(wake, session_db, slug, ident, tip, text, metadata, old, new, now)
+                 if not _persist_notice(conn, _kbn, session_db, ident, tip, text, metadata, old, new):
+                     return "deferred"
+                 _kbn.ack_notify_claim(conn, upto=new, from_cursor=old, **ident)
++            _note_hold_wait(metadata)
+         logger.info("kanban sweep wake of %s for %s/%s: %s", tip, slug, ident["task_id"],
+                     "turn started" if verdict == "started" else f"{verdict}, notice row written")
+         return verdict
+@@ -696,8 +716,15 @@ class _RemoteWaker:
+                     started()
+                     outcome = "turn started"
+                 else:
++                    # [daveey] ``persist`` writes this same metadata dict: a hold-refused wake is stamped in place.
++                    stamped = _hold_wait_metadata(verdict, metadata)
++                    if stamped is not metadata:
++                        metadata["closeout"] = stamped["closeout"]
+                     # [daveey] Only a written row says so: persist() hands a busy chat's claim back (False).
+-                    outcome = f"{verdict}, notice row written" if persist() else f"{verdict}, deferred"
++                    written = persist()
++                    if written:
++                        _note_hold_wait(metadata)
++                    outcome = f"{verdict}, notice row written" if written else f"{verdict}, deferred"
+                 logger.info("remote kanban notice for %s (task=%s): %s", tip, task.get("id"), outcome)
+                 return verdict
+             except Exception:
+diff --git a/tui_gateway/kanban_unloaded_gates.py b/tui_gateway/kanban_unloaded_gates.py
+index f49744809a..1e38fdeae2 100644
+--- a/tui_gateway/kanban_unloaded_gates.py
++++ b/tui_gateway/kanban_unloaded_gates.py
+@@ -243,6 +243,9 @@ def _guarantee() -> Inputs:
+                     # Admission can recover without a database revision.
+                     if closeout.get('busy_attempts'):
+                         return Inputs()
++                    # [daveey] An update-hold wait is due when the hold lifts, a clock no write marks either.
++                    if closeout.get('hold_wait') is True:
++                        return Inputs()
+                     # Match the consumer's code-change recovery deadline; a
+                     # persisted wall backoff can shorten after a new build.
+                     from tui_gateway.notice_retry import effective_due
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index e500382b61..da68d2b94f 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -813,10 +813,44 @@ def _slot_refusal(rid, sid, session, text, params, refusal, internal_hosted_subm
+         # [daveey] Another window's backend holds this chat only for a turn Hermes started itself: the
+         # Desktop takes it over and re-sends at once (its "Take over here" flow) instead of a card.
+         if (kind := _automation_holder_kind(session)) is not None:
++            if (queued := _queue_behind_background_turn(rid, sid, session, text, params, kind)) is not None:
++                return queued
+             data.update(auto_take_over=True, holder_turn_kind=kind)
+     return _err(rid, 4090, str(refusal), data)
+ 
+ 
++def _queue_behind_background_turn(rid, sid, session, text, params, kind):
++    """[daveey] The chat is held only by this host's gateway, for a turn Hermes started there (a Kanban notice or
++    close-out, ``gateway_background_holder``): queue the typed prompt in that gateway's FIFO to run right after the
++    turn, instead of the Desktop taking the chat over and killing it (``session_turn_lease_lost``, three hub chats on
++    2026-11-21). The answer is the RT-37 forwarded receipt, which the Desktop shows as a queued row. None (any other
++    holder, a message the FIFO cannot take, an owner that took nothing): the caller keeps the auto take-over."""
++    from tui_gateway import owner_forward
++    from tui_gateway.gateway_background_holder import gateway_background_holder
++    if not owner_forward.prompt_forwardable(session, text, params):
++        return None
++    if gateway_background_holder(session, foreign_owner=_foreign_turn_owner) is None:
++        return None
++    key = session.get("session_key") or sid
++    try:
++        receipt = owner_forward.forward_prompt(sid, session, text)
++    except owner_forward.OwnerUnconfirmed:
++        # It may already be queued there: a take-over plus a resend could run it twice.
++        return _err(rid, 4090, "The gateway is running a turn in this chat and did not confirm your message"
++                    " in time. It may already be queued there: check the chat before sending it again.",
++                    {"reason": SESSION_OWNER_UNCONFIRMED})
++    except Exception as exc:  # refused before its write, or never sent: nothing queued, take over as before
++        logger.info("queueing the typed prompt for %s behind the gateway's %s turn failed (%s); taking over instead",
++                    key, kind, exc, exc_info=True)
++        return None
++    if receipt.get("voice_stopped") is True:
++        return _ok(rid, {"voice_stopped": True})
++    logger.info("queued the typed prompt for %s behind the gateway's %s turn: admission=%s",
++                key, kind, receipt.get("admission_id"))
++    return _ok(rid, {"status": "queued", "admission_id": receipt.get("admission_id"), "forwarded": True,
++                     "queued_behind": kind})
++
++
+ def _submit_to_ledger_owner(rid, sid, session, text, params, refusal) -> dict:
+     """The gateway's durable ledger holds work for this session (#140385, RT-37): one owner, one FIFO.
+     Work that ends on its own (a running or queued gateway turn) gets this prompt queued behind it in
+diff --git a/tui_gateway/methods_session_interrupt.py b/tui_gateway/methods_session_interrupt.py
+index c512a94b8d..88ed55f6b6 100644
+--- a/tui_gateway/methods_session_interrupt.py
++++ b/tui_gateway/methods_session_interrupt.py
+@@ -76,6 +76,43 @@ def _stop_origin(params: dict) -> str | None:
+ _HELD_QUEUE_KEEPING_ORIGINS = frozenset({None, "stop_button", "esc", "tile", "tile:esc", "slash", "transcript"})
+ 
+ 
++# [daveey] A Stop gesture (never ``delete``, a rewind, a plugin or an origin-less close) on a chat whose only holder
++# is this host's gateway running a turn Hermes started (``gateway_background_holder``): a typed send there is queued
++# behind that turn (``methods_prompt._queue_behind_background_turn``), so Stop is how the user ends the turn sooner.
++_BACKGROUND_STOP_ORIGINS = frozenset({"stop_button", "esc", "tile", "tile:esc", "slash", "transcript"})
++
++
++def _stop_gateway_background_turn(rid, sid: str, session: dict) -> bool:
++    """Take the chat over from the gateway's background turn (``session.take_over``, which ends that turn), on a
++    worker thread so Stop answers at once. True when the take-over was started; False leaves the ordinary Stop."""
++    with session["history_lock"]:
++        if session.get("running"):
++            return False
++    if _automation_holder_kind(session) is None:
++        return False
++    from tui_gateway.gateway_background_holder import gateway_background_holder
++    if gateway_background_holder(session, foreign_owner=_foreign_turn_owner) is None:
++        return False
++    handler = _methods.get("session.take_over")
++    if handler is None:
++        return False
++    key = session.get("session_key") or sid
++
++    def run() -> None:
++        try:
++            answer = handler(f"{rid}-background-stop", {"session_id": sid}) or {}
++        except Exception:  # health: allow BLE001 -- worker thread boundary: logged with traceback
++            logger.warning("Stop could not take %s over from the gateway's background turn", key, exc_info=True)
++            return
++        error = answer.get("error") if isinstance(answer, dict) else None
++        logger.info("Stop of the gateway's background turn in %s: %s", key, error or "taken over")
++
++    from agent.memory_provider import spawn_context_thread
++    spawn_context_thread(run, name=f"background-stop-{str(key)[:24]}").start()
++    logger.info("Stop in %s: taking the chat over from the gateway's background turn", key)
++    return True
++
++
+ def _note_stop_issuer(sid: str, session: dict, transport, origin: str | None = None) -> None:
+     """Remember who stopped the running turn (and with which gesture) and log it; an idle session queues
+     nothing. A Stop without an origin clears an earlier one, so a gesture never labels a later Stop."""
+@@ -204,6 +241,8 @@ def _(rid, params: dict) -> dict:
+         keep_held = origin in _HELD_QUEUE_KEEPING_ORIGINS
+         _note_user_input(session)
+         _note_stop_issuer(sid, session, current_transport(), origin)
++        if origin in _BACKGROUND_STOP_ORIGINS and _stop_gateway_background_turn(rid, sid, session):
++            return _ok(rid, {"status": "interrupted", "background_turn": True})
+         if _session_uses_compute_host(session):
+             with session["history_lock"]:
+                 inflight_at_interrupt = session.get("inflight_turn")
+diff --git a/tui_gateway/notice_guarantee.py b/tui_gateway/notice_guarantee.py
+index 390b400002..be80478fe9 100644
+--- a/tui_gateway/notice_guarantee.py
++++ b/tui_gateway/notice_guarantee.py
+@@ -38,6 +38,10 @@ unloaded sweeper's loop therefore looks, in every profile store, for chats whose
+   final: a notice that landed while a hub core update held admission for 30 min stayed ``unresolved{notice_tail}``
+   after the hold lifted (two hub chats, 2026-11-12). A ``busy`` stamp without ``busy_attempts`` (that older core's)
+   within ``LOOKBACK_S`` is offered again as busy wake 2, so those rows resolve once this ships. [daveey]
++- a busy wake refused only because the core update holds admission charges no attempt: the row is stamped
++  ``closeout = {state: "deferred", hold_wait: true}``, due (without ``GRACE_S``) the moment the hold lifts, and
++  ``notice_hold_wait``'s watcher runs a pass within seconds of that. The sweep's passive rows for such wakes carry the
++  same stamp. [daveey]
+ 
+ Ownership follows the unloaded sweeper's: a chat another live backend holds is that backend's (its own pass
+ handles it); a chat with a live turn is skipped. The close-out prompt row is itself a notice, stamped as claimed,
+@@ -163,6 +167,13 @@ def candidates(db: Any, now: float, only: Optional[set[str]] = None) -> list[dic
+         rows = candidate_rows(db, sql)
+     out = []
+     from tui_gateway.notice_history import preceding_candidate, settled_notice, whole_row_settled
++    from tui_gateway.notice_hold_wait import is_hold_wait, update_hold_active
++    hold: list = []  # read once per call, only when a hold-wait row is seen
++
++    def hold_lifted() -> bool:
++        if not hold:
++            hold.append(update_hold_active())
++        return not hold[0]
+ 
+     for row in rows:
+         # Expire the effective obligation, not a settled physical tail: an older
+@@ -170,13 +181,15 @@ def candidates(db: Any, now: float, only: Optional[set[str]] = None) -> list[dic
+         row = preceding_candidate(db, row)
+         # Cache structure, not age: a notice can become due (or expire) without a commit.
+         meta = _decode(row["display_metadata"])
+-        deferred_due = _deferred_due(meta, now)
++        # [daveey] A notice refused only by the update hold is due the moment the hold is gone (notice_hold_wait).
++        lifted = is_hold_wait(meta) and hold_lifted()
++        deferred_due = lifted or _deferred_due(meta, now)
+         # Discovery lookback must not expire a durable retry during a long quota reset.
+         if row["last_active"] is None or (row["last_active"] < now - LOOKBACK_S and not deferred_due):
+             continue
+         if not isinstance(row["timestamp"], (int, float)):
+             continue
+-        if row["timestamp"] > now - GRACE_S:
++        if row["timestamp"] > now - GRACE_S and not lifted:
+             continue
+         cand = {"sid": str(row["sid"]), "msg_id": int(row["msg_id"]), "content": str(row["content"] or ""),
+                 "meta": meta, "raw_meta": row["display_metadata"]}
+@@ -378,7 +391,15 @@ def _closeout_job(session_db, wake, sid: str, msg_id: int, attempts: int = 1,
+         extra: dict = {}
+         if verdict == "error" and early_recheck:
+             attempts -= 1  # Speculative successor failure must leave the reset-time budget intact.
+-        if verdict == "busy":
++        if verdict == "busy" and _held_by_update():
++            # [daveey] Refused only by the core update's admission hold: no busy attempt and no failed-wake attempt
++            # is charged; the row is due as soon as the hold lifts and the watcher wakes it then (notice_hold_wait).
++            from tui_gateway.notice_hold_wait import hold_wait_closeout, note_waiting
++            extra = {**hold_wait_closeout(), "attempts": max(0, attempts - 1), "busy_attempts": busy_attempts}
++            verdict = "deferred"
++            with contextlib.suppress(Exception):
++                note_waiting()
++        elif verdict == "busy":
+             busy_attempts += 1
+             extra = {"busy_attempts": busy_attempts}
+             if busy_attempts < MAX_BUSY_ATTEMPTS:
+@@ -406,6 +427,11 @@ def _closeout_job(session_db, wake, sid: str, msg_id: int, attempts: int = 1,
+         _wake_slots.release()
+ 
+ 
++def _held_by_update() -> bool:
++    from tui_gateway.notice_hold_wait import update_hold_active
++    return update_hold_active()
++
++
+ def _refresh_key(db: Any, cand: dict, branch: str) -> tuple[str, str, int, str]:
+     return (str(getattr(db, "db_path", id(db))), cand["sid"], cand["msg_id"], branch)
+ 
+diff --git a/tui_gateway/notice_hold_wait.py b/tui_gateway/notice_hold_wait.py
+new file mode 100644
+index 0000000000..7066cb3572
+--- /dev/null
++++ b/tui_gateway/notice_hold_wait.py
+@@ -0,0 +1,118 @@
++"""Kanban notices refused only by the core update's admission hold wake promptly once it lifts. [daveey]
++
++A notice wake that finds the chat ``"busy"`` because a core update holds admission (``admission_fence``,
++``holds/hermes-sync``) is not a busy chat: nothing will be running there once the hold lifts. Before this, the sweep
++wrote the passive row ("busy, notice row written") and the notice guarantee offered it again only after ``GRACE_S``
++(300 s) and then ``BUSY_RETRY_S`` doubling, so notices kept waiting minutes after the update was done (hub,
++2026-11-21). Now such a row is stamped ``closeout = {state: "deferred", hold_wait: true}`` (``hold_wait_closeout``),
++which the guarantee treats as due as soon as the hold is gone (no grace, no busy attempt charged), and a watcher
++thread polls the hold every ``POLL_S`` while such rows exist: within ``POLL_S`` of the hold lifting it runs the
++guarantee pass, then again every ``PASS_EVERY_S`` while wakes were left waiting for a slot, for at most
++``DRAIN_S``. The pass's wake slots (``wake_slots``: 8 for the host-loop holder) bound the rate; every other
++refusal keeps its backoff.
++"""
++
++from __future__ import annotations
++
++import logging
++import threading
++import time
++from typing import Any, Callable, Optional
++
++logger = logging.getLogger(__name__)
++
++POLL_S = 2.0
++PASS_EVERY_S = 5.0
++DRAIN_S = 120.0
++# The durable fallback when no watcher survives (this backend restarted): the row is due by time anyway.
++FALLBACK_RETRY_S = 300.0
++
++_mu = threading.Lock()
++_state: dict[str, Any] = {"waiting": False, "thread": None}
++
++
++def update_hold_active(home=None) -> bool:
++    """True while the install's core update holds admission (the marker ``admission_fence.reserve`` refuses on).
++    An unreadable marker answers False: the caller then keeps its ordinary busy backoff."""
++    try:
++        from hermes_constants import get_default_hermes_root, get_hermes_home
++        from hermes_cli.admission_fence import is_held
++        return bool(is_held(get_default_hermes_root(home=home or get_hermes_home()) / "core-update"))
++    except Exception:  # health: allow BLE001 -- unknown is "not held": today's backoff applies; logged with traceback
++        logger.debug("update admission hold unreadable", exc_info=True)
++        return False
++
++
++def hold_wait_closeout(now: Optional[float] = None) -> dict:
++    """The ``closeout`` stamp of a notice refused only by the update hold."""
++    now = time.time() if now is None else now
++    return {"state": "deferred", "hold_wait": True, "retry_at": now + FALLBACK_RETRY_S, "at": now}
++
++
++def is_hold_wait(meta: Any) -> bool:
++    closeout = meta.get("closeout") if isinstance(meta, dict) else None
++    return isinstance(closeout, dict) and closeout.get("state") == "deferred" and closeout.get("hold_wait") is True
++
++
++def _default_pass() -> list:
++    from tui_gateway.notice_guarantee import guarantee_pass
++    return guarantee_pass()
++
++
++def note_waiting(*, run_pass: Optional[Callable[[], list]] = None, held: Callable[[], bool] = update_hold_active,
++                 sleep: Callable[[float], None] = time.sleep, spawn: Optional[Callable[[Callable], Any]] = None) -> bool:
++    """A notice now waits for the hold: make sure the watcher runs. True when this call started it."""
++    with _mu:
++        _state["waiting"] = True
++        if _state["thread"] is not None:
++            return False
++        _state["thread"] = True
++
++    def job() -> None:
++        try:
++            watch(run_pass=run_pass or _default_pass, held=held, sleep=sleep)
++        finally:
++            with _mu:
++                _state["thread"] = None
++
++    if spawn is None:
++        from agent.memory_provider import spawn_context_thread
++        spawn_context_thread(job, name="notice-hold-wait").start()
++    else:
++        spawn(job)
++    return True
++
++
++def watch(*, run_pass: Callable[[], list], held: Callable[[], bool], sleep: Callable[[float], None],
++          monotonic: Callable[[], float] = time.monotonic) -> int:
++    """Wait for the hold to lift, then run guarantee passes until nothing waits for a slot. Returns the pass count."""
++    passes = 0
++    while True:
++        while held():
++            sleep(POLL_S)
++        with _mu:
++            _state["waiting"] = False
++        started = monotonic()
++        while True:
++            try:
++                results = run_pass() or []
++            except Exception:  # health: allow BLE001 -- watcher thread boundary; the sweeper's pass retries
++                logger.warning("notice hold-wait pass failed", exc_info=True)
++                results = []
++            passes += 1
++            waiting_slots = sum(1 for r in results if isinstance(r, dict) and r.get("result") == "skipped:slots")
++            logger.info("notice hold-wait: update hold lifted; pass %d woke %d, %d still waiting for a slot", passes,
++                        sum(1 for r in results if isinstance(r, dict) and r.get("result") == "dispatched"),
++                        waiting_slots)
++            if not waiting_slots or monotonic() - started >= DRAIN_S or held():
++                break
++            sleep(PASS_EVERY_S)
++        with _mu:
++            if not _state["waiting"]:
++                return passes
++        # Another notice was refused by a new hold meanwhile: watch again.
++
++
++def _reset_for_tests() -> None:
++    with _mu:
++        _state.update(waiting=False, thread=None)
+diff --git a/tui_gateway/owner_forward.py b/tui_gateway/owner_forward.py
+index cbb05714e0..b9b8944f4a 100644
+--- a/tui_gateway/owner_forward.py
++++ b/tui_gateway/owner_forward.py
+@@ -100,6 +100,11 @@ def forwardable(refusal: Any, session: dict, text: Any, params: dict) -> bool:
+     """Whether a ledger refusal of this ``prompt.submit`` can go to the owner instead."""
+     if getattr(refusal, "ledger_status", None) not in FORWARDABLE_LEDGER_STATES:
+         return False
++    return prompt_forwardable(session, text, params)
++
++
++def prompt_forwardable(session: dict, text: Any, params: dict) -> bool:
++    """Whether this ``prompt.submit`` can join an owner's FIFO at all: plain text, no staged image, no rewind."""
+     return (isinstance(text, str) and bool(text.strip()) and not session.get("attached_images")
+             and not any(params.get(key) is not None for key in (
+                 "truncate_before_user_ordinal", "truncate_before_row_id", "truncate_before_message_id")))
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 49a8acbf43..7bdb44d614 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -1765,8 +1765,11 @@ def _wake_session_turn(session_key: str, text: str, *, display_kind: str | None
+         session["last_active"] = time.time()
+         if _ensure_active_session_slot(sid, session) is not None:
+             _notif_release_turn(session)
+-            logger.info("%s: %s has another live owner; not waking it here", label, key)
+-            return "refused"
++            from tui_gateway.gateway_background_holder import wake_past_retiring_owner
++            if (verdict := wake_past_retiring_owner(
++                    sid, session, label, key, claim_turn=_notif_claim_turn, release_turn=_notif_release_turn,
++                    claim_slot=_ensure_active_session_slot, foreign_owner=_foreign_turn_owner)) is not None:
++                return verdict
+         kwargs = {k: v for k, v in (("display_kind", display_kind), ("display_metadata", display_metadata)) if v}
+         if replay_delivery is not None:
+             accepted = replay_delivery.submit(rid, sid, session, text, display_kind, display_metadata, label)
+-- 
+2.43.0
+

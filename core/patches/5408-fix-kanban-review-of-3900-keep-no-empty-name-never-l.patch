@@ -1,0 +1,233 @@
+From 6d093859645a240b2baefa661daeec323509a273 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 06:29:51 +0000
+Subject: [PATCH] fix(kanban): review of #3900: keep no empty name, never lend
+ a closed reader [daveey]
+
+- gateway_name: an empty name is not memoized (hermes-hub writes
+  meta.gateway only after its first sync); the docstring says the name may
+  lag gateway_names()[0] for up to 10 min after an in-place meta change.
+- kanban_ro_batch: a shared connection closed behind the batch (opening
+  another handle runs kanban_generation.recover, which closes idle handles
+  on a replaced WAL/SHM generation) is reopened instead of lent; a closed
+  batch is never lent or joined from a context copied inside it and run
+  later on the same thread.
+- Tests for both, plus: the batch closes when session_tasks raises, and the
+  links projection opens each file once.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_origin.py                   | 10 ++-
+ hermes_cli/kanban_ro_batch.py                 | 20 ++++-
+ .../test_kanban_gateway_name_read.py          | 14 +++
+ .../test_kanban_session_tasks_reads.py        | 90 +++++++++++++++++++
+ 4 files changed, 128 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_origin.py b/hermes_cli/kanban_origin.py
+index 696bbb1e2c..f60a7f637b 100644
+--- a/hermes_cli/kanban_origin.py
++++ b/hermes_cli/kanban_origin.py
+@@ -154,7 +154,9 @@ def gateway_name() -> str:
+     2026-11-20). Gateways are never renamed in place; re-enrolling replaces hub.db (a new inode), which busts the
+     memo, as does any change to the mail config. A miss reads only the hub.db ``meta`` row (a primary-key lookup)
+     and the mail config, never the ``replica`` scan. ``gateway_names`` (the known set, which does change) keeps its
+-    short memo. [daveey]"""
++    short memo. So after an in-place ``meta.gateway`` change (never done on purpose) ``gateway_name()`` may lag
++    ``gateway_names()[0]`` for up to 10 min; that is intended. An empty name is never kept: hermes-hub writes
++    ``meta.gateway`` only after its first sync, and an empty answer must not stick for 10 min. [daveey]"""
+     global _name_memo
+     path, cfg = _hub_db(), _mail_config()
+     memo, now = _names_memo, time.monotonic()
+@@ -166,11 +168,11 @@ def gateway_name() -> str:
+         return own[2]
+     failed: list[sqlite3.Error] = []
+     me = _read_gateway_names(path, cfg, failed, names=False)[0]
+-    # A failed hub.db read (locked, mid-replace) or a mail config written within the timestamp granularity is
+-    # not kept: the next caller reads again.
++    # A failed hub.db read (locked, mid-replace), an empty name (hub not synced yet) or a mail config written
++    # within the timestamp granularity is not kept: the next caller reads again.
+     cfg_sig = key[-1]
+     racy = isinstance(cfg_sig, tuple) and cfg_sig[1] >= time.time_ns() - _NAMES_RACY_NS
+-    _name_memo = None if failed or racy else (key, now, me)
++    _name_memo = None if failed or racy or not me else (key, now, me)
+     return me
+ 
+ 
+diff --git a/hermes_cli/kanban_ro_batch.py b/hermes_cli/kanban_ro_batch.py
+index d110d9ab4e..99a1e8e5e8 100644
+--- a/hermes_cli/kanban_ro_batch.py
++++ b/hermes_cli/kanban_ro_batch.py
+@@ -28,8 +28,10 @@ class _Batch:
+         self.thread = threading.get_ident()
+         self.conns: dict[str, sqlite3.Connection] = {}
+         self.borrowed: set[str] = set()
++        self.closed = False
+ 
+     def close(self) -> None:
++        self.closed = True  # a context copied inside the batch and run later on this thread must not reuse it
+         conns, self.conns = self.conns, {}
+         for conn in conns.values():
+             try:
+@@ -89,7 +91,7 @@ def batch() -> Iterator[None]:
+     A batch inherited from another thread (a background refresh started with ``copy_context()`` inside a batched
+     read) is not joined: its connections belong to that thread. This block opens its own."""
+     outer = _active.get()
+-    if outer is not None and outer.thread == threading.get_ident():
++    if outer is not None and not outer.closed and outer.thread == threading.get_ident():
+         yield
+         return
+     current = _Batch()
+@@ -101,15 +103,29 @@ def batch() -> Iterator[None]:
+         current.close()
+ 
+ 
++def _usable(conn: sqlite3.Connection) -> bool:
++    """False once something closed the idle shared connection behind the batch's back: opening another handle to
++    the same board runs ``kanban_generation.recover``, which closes this process's handles on a replaced WAL/SHM
++    generation."""
++    try:
++        _ = conn.total_changes  # raises ProgrammingError on a closed connection
++    except sqlite3.ProgrammingError:
++        return False
++    return True
++
++
+ def open_ro(path: Any, opener: Callable[[Any], sqlite3.Connection]) -> sqlite3.Connection:
+     """``opener(path)``, or a borrow of this batch's connection to ``path`` (opened by ``opener`` once)."""
+     current = _active.get()
+-    if current is None or current.thread != threading.get_ident():
++    if current is None or current.closed or current.thread != threading.get_ident():
+         return opener(path)
+     key = str(path)
+     if key in current.borrowed:
+         return opener(path)
+     conn = current.conns.get(key)
++    if conn is not None and not _usable(conn):
++        del current.conns[key]
++        conn = None
+     if conn is None:
+         conn = current.conns[key] = opener(path)
+     current.borrowed.add(key)
+diff --git a/tests/hermes_cli/test_kanban_gateway_name_read.py b/tests/hermes_cli/test_kanban_gateway_name_read.py
+index 9c58c3207b..861e4238c9 100644
+--- a/tests/hermes_cli/test_kanban_gateway_name_read.py
++++ b/tests/hermes_cli/test_kanban_gateway_name_read.py
+@@ -174,3 +174,17 @@ def test_a_failed_hub_db_read_is_not_remembered(hub, monkeypatch):
+     assert kanban_origin.gateway_name() == "hub"
+     assert kanban_origin.gateway_name() == "hub"
+     assert len(calls) == 2
++
++
++def test_an_empty_name_is_not_remembered(hub, monkeypatch):
++    """hermes-hub writes meta.gateway only after its first sync: an empty answer must not stick for 10 min."""
++    db, state, _ = hub
++    db.execute("UPDATE meta SET v = '' WHERE k = 'gateway'")  # an empty meta row (and no mail config)
++    db.commit()
++    _settle(state / "hub.db", state / "hub.db-wal")
++    assert kanban_origin.gateway_name() == ""
++    assert kanban_origin._name_memo is None
++    db.execute("UPDATE meta SET v = 'hub' WHERE k = 'gateway'")  # the first sync lands, same hub.db file
++    db.commit()
++    _settle(state / "hub.db", state / "hub.db-wal")
++    assert kanban_origin.gateway_name() == "hub"
+diff --git a/tests/hermes_cli/test_kanban_session_tasks_reads.py b/tests/hermes_cli/test_kanban_session_tasks_reads.py
+index 62a44715fa..9eb8f854e1 100644
+--- a/tests/hermes_cli/test_kanban_session_tasks_reads.py
++++ b/tests/hermes_cli/test_kanban_session_tasks_reads.py
+@@ -266,3 +266,93 @@ def test_preserve_origin_obligations_returns_what_the_old_filter_did(monkeypatch
+             want = _reference(selected, ledger, placeholder=placeholder, machine=machine, **kw)
+             assert got == want
+             assert len(want) > len(selected) or ids == [] or statuses == ("done",)
++
++
++def test_a_shared_connection_closed_behind_the_batch_is_reopened(db_file):
++    """Opening another handle to a board can run ``kanban_generation.recover``, which closes this process's idle
++    handles on a replaced WAL/SHM generation; the next borrow must not hand out the closed one."""
++    with ro_batch.batch():
++        first = kanban_origin._ro(db_file)
++        stale = object.__getattribute__(first, "_conn")
++        first.close()
++        stale.close()  # what recover() does to an idle handle
++        second = kanban_origin._ro(db_file)
++        fresh = object.__getattribute__(second, "_conn")
++        assert fresh is not stale
++        assert second.execute("SELECT v FROM t").fetchone()[0] == 1
++        second.close()
++        third = kanban_origin._ro(db_file)
++        assert object.__getattribute__(third, "_conn") is fresh  # the reopened one is shared again
++        third.close()
++    with pytest.raises(sqlite3.ProgrammingError):
++        fresh.execute("SELECT 1")
++
++
++def test_a_closed_batch_is_never_lent_from_a_context_run_later(db_file):
++    import contextvars
++    with ro_batch.batch():
++        ctx = contextvars.copy_context()  # e.g. a callback scheduled inside the batch, run after it ended
++    results = {}
++
++    def later():
++        conn = kanban_origin._ro(db_file)
++        results["plain"] = not isinstance(conn, ro_batch._Borrowed)
++        results["value"] = conn.execute("SELECT v FROM t").fetchone()[0]
++        conn.close()
++        with ro_batch.batch():  # a new block does not join the closed batch
++            a = kanban_origin._ro(db_file)
++            results["own_batch"] = isinstance(a, ro_batch._Borrowed)
++            a.close()
++
++    ctx.run(later)
++    assert results == {"plain": True, "value": 1, "own_batch": True}
++
++
++def test_the_batch_closes_when_session_tasks_raises(two_boards_and_a_hub, monkeypatch):
++    from hermes_cli import kanban_session_outcome_tasks as outcome
++    hub_db = str(two_boards_and_a_hub)
++    opened, _asked = _count_opens(monkeypatch)
++
++    def boom(*args, **kwargs):
++        raise RuntimeError("remote cards failed")
++
++    monkeypatch.setattr(outcome, "append_remote_listed_cards", boom)
++    with pytest.raises(RuntimeError):
++        ksa.session_tasks(["s1"])
++    assert [p for p, _ in opened].count(hub_db) == 1, "the local boards never asked hub.db: the test proves nothing"
++    for _, conn in opened:
++        with pytest.raises(sqlite3.ProgrammingError):
++            conn.execute("SELECT 1")
++    assert ro_batch._active.get() is None
++
++
++def test_the_links_projection_opens_each_file_once(tmp_path, monkeypatch, db_file):
++    import hermes_constants
++    from hermes_cli import kanban_origin_adapter as adapter, kanban_origin_ledger as ledger, profiles
++    (tmp_path / "kanban").mkdir()
++    (tmp_path / "kanban" / "origin-ledger.db").touch()
++    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
++    monkeypatch.setattr(adapter, "_gateway", lambda _: "origin")
++    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
++    monkeypatch.setattr(ksa, "_hub_db_path", lambda: None)
++    monkeypatch.setattr(ksa, "_board_db_paths", list)
++    monkeypatch.setattr(ksa, "_legacy_remote_links", list)
++    reads = []
++
++    def project(*args, **kwargs):  # one read per ledger card, as observe_local_binding does
++        for _ in range(5):
++            conn = kanban_origin._ro(db_file)
++            reads.append(conn.execute("SELECT v FROM t").fetchone()[0])
++            conn.close()
++        return []
++
++    monkeypatch.setattr(ledger, "project", project)
++    opened, asked = _count_opens(monkeypatch)
++    ksa._reset_cache_for_tests()
++    ksa._project_remote_links()
++    assert reads == [1] * 5
++    assert asked.count(str(db_file)) == 5
++    assert [p for p, _ in opened].count(str(db_file)) == 1
++    for _, conn in opened:
++        with pytest.raises(sqlite3.ProgrammingError):
++            conn.execute("SELECT 1")
+-- 
+2.43.0
+

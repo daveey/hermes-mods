@@ -1,0 +1,930 @@
+From b5a4828c2156cd2b0d13679ed2fec9e27dea041b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 23:29:01 -0800
+Subject: [PATCH] fix(tui+agent): Stop ends exactly the holder's automated
+ turn; bounded retiring retries
+
+Round-2 review of #3908:
+- Stop no longer blocks the RPC reader: only cheap checks run inline (no local turn,
+  automated newest turn, ledger state); holder discovery and the end run on a worker
+  and report by error events.
+- Targeted end instead of the registry take-over: automated turns stamp their kind in
+  the durable lease holder (``:auto=<kind>``, agent/turn_facade_lease.lease_holder);
+  SessionDB.request_turn_end records an end request only while that exact holder holds
+  the lease (compare-and-set into session_turn_end_requests); the holding process's
+  DurableTurnLease tick honours it with the agent's ordinary interrupt (no lease loss),
+  so the lease is released as usual and a queued forwarded admission runs once. Used
+  whether or not a prompt is queued. A gateway without turn-end-request-v1 keeps the
+  take-over only when its ledger is empty; with a prompt queued the chat is told the
+  message runs when the background turn ends. Gateway FIFO notice turns carry the same
+  holder stamp, so the request is fenced to that exact turn generation.
+- _retiring_busy records (retry_at, written_at); a record older than 30 s is ignored.
+- Retiring-owner short retries stop after 10 per notice row; then ordinary busy.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/turn_end_request.py                     |  41 +++++
+ agent/turn_facade.py                          |   2 +-
+ agent/turn_facade_lease.py                    |  46 +++++-
+ gateway/run_runtime.py                        |   5 +-
+ hermes_state_common.py                        |   9 +
+ hermes_state_compression.py                   |  28 ++++
+ tests/agent/test_turn_end_request.py          | 127 ++++++++++++++
+ .../tui_gateway/test_background_turn_queue.py | 156 +++++++++++++-----
+ tests/tui_gateway/test_notice_hold_wait.py    |  31 +++-
+ tui_gateway/gateway_background_holder.py      |  18 +-
+ tui_gateway/methods_session_interrupt.py      | 125 ++++++++------
+ tui_gateway/notice_guarantee.py               |  19 ++-
+ 12 files changed, 496 insertions(+), 111 deletions(-)
+ create mode 100644 agent/turn_end_request.py
+ create mode 100644 tests/agent/test_turn_end_request.py
+
+diff --git a/agent/turn_end_request.py b/agent/turn_end_request.py
+new file mode 100644
+index 0000000000..be25fc7df1
+--- /dev/null
++++ b/agent/turn_end_request.py
+@@ -0,0 +1,41 @@
++"""Ask exactly one running turn to end, by its durable turn-lease holder. [daveey]
++
++A Stop typed in one window for a turn Hermes started itself in ANOTHER process (the gateway's Kanban notice or
++close-out turn) used to take the chat over: the registry hand-off made that turn's lease watcher hard-cancel it as
++``session_turn_lease_lost``. Instead the asking process records an end request for the exact holder string
++(``SessionDB.request_turn_end``: a compare-and-set against ``session_turn_leases``, so it can only name the turn
++that holds the lease now), and the holding process's ``DurableTurnLease`` tick sees it and calls the agent's
++ordinary interrupt. The turn ends like a Stop in its own window: no lease loss, the lease is released as usual,
++and a prompt queued behind it in the gateway's FIFO runs next, once.
++
++Only automated turns are targeted. The turn's holder string names its kind (``:auto=<display kind>``, see
++:func:`auto_token`), so the asker never ends a turn somebody typed. A gateway that honours requests says so with
++``CAPABILITY`` in its runtime identity; with an older gateway the caller keeps its fallback.
++"""
++
++from __future__ import annotations
++
++import re
++from typing import Any, Optional
++
++from agent.context_compressor_turns import TURN_STARTING_NOTICE_KINDS
++
++#: The runtime-identity capability of a gateway whose turns honour end requests.
++CAPABILITY = "turn-end-request-v1"
++#: Turns Hermes starts on its own (``tui_gateway.session_lifecycle.AUTOMATED_TURN_KINDS``): the turn-starting
++#: notices (not a /loop tick the user started) and a paused turn continuing after an update.
++AUTO_KINDS = frozenset((TURN_STARTING_NOTICE_KINDS - {"loop_tick"}) | {"auto_continue"})
++#: What the ending turn reports as its interrupt message.
++END_MESSAGE = "Stopped from another Hermes window."
++_AUTO_RE = re.compile(r":auto=([a-z_]+)(?::|$)")
++
++
++def auto_token(display_kind: Any) -> str:
++    """The ``:auto=<kind>`` fragment for a turn whose user row is an automated kind, else ``""``."""
++    return f":auto={display_kind}" if isinstance(display_kind, str) and display_kind in AUTO_KINDS else ""
++
++
++def holder_auto_kind(holder: Any) -> Optional[str]:
++    """The automated kind a durable holder string names, else None (a typed turn, or an older holder)."""
++    match = _AUTO_RE.search(str(holder or ""))
++    return match.group(1) if match and match.group(1) in AUTO_KINDS else None
+diff --git a/agent/turn_facade.py b/agent/turn_facade.py
+index 7ad5d1750b..031249f656 100644
+--- a/agent/turn_facade.py
++++ b/agent/turn_facade.py
+@@ -82,7 +82,7 @@ class TurnFacadeMixin:
+             _review_queue.note_turn_started()
+             admission = admit_durable_turn_lease(
+                 self, session_id=session_id, relay_turn_id=relay_turn_id, task_context=task_context,
+-                conversation_history=conversation_history,
++                conversation_history=conversation_history, auto_kind=persist_user_display_kind,
+             )
+             if admission.early_result is not None:
+                 carry_unadmitted_user_message(
+diff --git a/agent/turn_facade_lease.py b/agent/turn_facade_lease.py
+index 22897747a4..a55eee20ab 100644
+--- a/agent/turn_facade_lease.py
++++ b/agent/turn_facade_lease.py
+@@ -97,6 +97,7 @@ class DurableTurnLease:
+         self.refresh_interval = float(getattr(agent, "_session_turn_lease_refresh_interval", 60.0))
+         self._lock = threading.Lock()
+         self.turn_active = False
++        self._end_request_honoured = False
+         self.interrupt_message: Optional[str] = None
+         self.watchdog = None  # TurnLivenessWatchdog when configured
+         self.timer_handles: list = []  # periodic_scheduler handles, cancelled in join_threads
+@@ -153,8 +154,37 @@ class DurableTurnLease:
+         if find_takeover_of(self.holder, registry_home=Path(self.db.db_path).parent):
+             self._interrupt_turn("This chat was taken over by another Hermes window.", taken_over=True)
+             return False
++        if self._end_requested():
++            self._end_on_request()
+         return None
+ 
++    def _end_requested(self) -> bool:
++        """[daveey] An end request for this exact holder (agent/turn_end_request.py). Only an automated turn's
++        holder can be named, and a read error is "no": the turn keeps running."""
++        from agent.turn_end_request import holder_auto_kind
++        if self._end_request_honoured or holder_auto_kind(self.holder) is None:
++            return False
++        checker = getattr(self.db, "turn_end_requested", None)
++        try:
++            return bool(checker(self._current_session_id(), self.holder)) if callable(checker) else False
++        except Exception:
++            logger.debug("turn end request read failed", exc_info=True)
++            return False
++
++    def _end_on_request(self) -> None:
++        """End the turn with the agent's ordinary interrupt: a Stop, not a lease loss. The lease stays held and
++        renewed until the turn unwinds and releases it, so a prompt queued behind it runs next."""
++        from agent.turn_end_request import END_MESSAGE
++        with self._lock:
++            if self.stop.is_set() or not self.turn_active or self._end_request_honoured:
++                return
++            self._end_request_honoured = True
++        logger.info("Ending turn %s on another window's Stop", self._current_session_id())
++        try:
++            self.agent.interrupt(END_MESSAGE)
++        except Exception:
++            logger.warning("turn end request: interrupt failed", exc_info=True)
++
+     def stop_refresher(self) -> None:
+         """Stop renewal and deactivate the turn. Also the watchdog's deactivate callback: a wedge the
+         hard interrupt cannot unwind must not keep the lease alive forever; TTL expiry lets
+@@ -494,9 +524,18 @@ def refuses_held_lease_at_once(agent, platform) -> bool:
+     return not getattr(agent, "_gateway_session_key", None)
+ 
+ 
++def lease_holder(relay_turn_id: str, platform: Any, auto_kind: Optional[str] = None) -> str:
++    """The durable holder string of one turn. pidns stamp: see hermes_state_pidns. ``:auto=<kind>`` (before
++    ``:platform=``, which readers take as the string's tail) marks a turn Hermes started itself, the only kind
++    another window's Stop may ask to end (agent/turn_end_request.py)."""
++    from agent.turn_end_request import auto_token
++    return (f"pid={os.getpid()}{holder_namespace_token()}:turn={relay_turn_id}{auto_token(auto_kind)}"
++            f":platform={platform or 'unknown'}")
++
++
+ def admit_durable_turn_lease(
+     agent, *, session_id: str, relay_turn_id: str, task_context: dict[str, Any],
+-    conversation_history: Optional[list[dict[str, Any]]],
++    conversation_history: Optional[list[dict[str, Any]]], auto_kind: Optional[str] = None,
+ ) -> TurnLeaseAdmission:
+     """Acquire the session turn lease (the row need not exist yet); build (not start) its threads.
+ 
+@@ -530,10 +569,7 @@ def admit_durable_turn_lease(
+     # process-unique, and the first turn creates the row mid-turn, so a second writer would
+     # otherwise find the row, take an unheld lease and interleave its turn into this one.
+     # pidns stamp: see hermes_state_pidns.
+-    holder = (
+-        f"pid={os.getpid()}{holder_namespace_token()}:turn={relay_turn_id}"
+-        f":platform={task_context['platform'] or 'unknown'}"
+-    )
++    holder = lease_holder(relay_turn_id, task_context['platform'], auto_kind)
+     reload_needed = announced = False
+ 
+     def _on_contended() -> None:
+diff --git a/gateway/run_runtime.py b/gateway/run_runtime.py
+index be83c23a2f..df15fd0d89 100644
+--- a/gateway/run_runtime.py
++++ b/gateway/run_runtime.py
+@@ -747,8 +747,11 @@ def publish_gateway_runtime_ready(runner):
+     # [daveey] kanban-capsule-transport-v1: this core holds the capsule owner gates
+     # (gateway.session_kanban_capsule); a capsule card's submitter refuses any owner without it.
+     from hermes_cli.kanban_capsule_owner import CAPABILITY as _CAPSULE_CAPABILITY
++    # [daveey] turn-end-request-v1: this core's turns honour another window's Stop (agent/turn_end_request.py).
++    from agent.turn_end_request import CAPABILITY as _TURN_END_CAPABILITY
+     descriptor.update(state='ready', capabilities=[
+-        'session-authority-v1', 'durable-admission-v1', 'event-replay-v1', _CAPSULE_CAPABILITY])
++        'session-authority-v1', 'durable-admission-v1', 'event-replay-v1', _CAPSULE_CAPABILITY,
++        _TURN_END_CAPABILITY])
+     from gateway.session_hosted_service import start_ready_hosted_services
+     start_ready_hosted_services(runner)
+ 
+diff --git a/hermes_state_common.py b/hermes_state_common.py
+index 418a36db56..4351352dd5 100644
+--- a/hermes_state_common.py
++++ b/hermes_state_common.py
+@@ -759,6 +759,15 @@ CREATE TABLE IF NOT EXISTS session_turn_leases (
+     expires_at REAL NOT NULL
+ );
+ 
++-- [daveey] One end request per conversation, naming the exact turn-lease holder it is for
++-- (agent/turn_end_request.py): the holding process ends that turn with an ordinary interrupt.
++CREATE TABLE IF NOT EXISTS session_turn_end_requests (
++    conversation_id TEXT PRIMARY KEY,
++    holder TEXT NOT NULL,
++    requested_at REAL NOT NULL,
++    reason TEXT
++);
++
+ CREATE TABLE IF NOT EXISTS async_delegations (
+     delegation_id TEXT PRIMARY KEY,
+     origin_session TEXT NOT NULL,
+diff --git a/hermes_state_compression.py b/hermes_state_compression.py
+index 063f5b3ef1..2cdb7b399a 100644
+--- a/hermes_state_compression.py
++++ b/hermes_state_compression.py
+@@ -870,6 +870,34 @@ class SessionCompressionMixin:
+         # not mistake expiry for acknowledgement.
+         return dict(row)
+ 
++    def request_turn_end(self, session_id: str, holder: str, *, reason: str = "") -> bool:
++        """[daveey] Ask the turn holding this session's lease AS ``holder`` to end (agent/turn_end_request.py).
++        Compare-and-set: recorded only while ``holder`` holds the lease row, so it can never reach another turn;
++        True when recorded. One request per conversation (a later one replaces it)."""
++        if not session_id or not holder:
++            return False
++
++        def _do(conn):
++            key = self._session_turn_lease_key_on_conn(conn, session_id)
++            return conn.execute(
++                "INSERT OR REPLACE INTO session_turn_end_requests (conversation_id, holder, requested_at, reason) "
++                "SELECT conversation_id, holder, ?, ? FROM session_turn_leases WHERE conversation_id = ? AND holder = ?",
++                (time.time(), str(reason or "")[:200], key, holder)).rowcount > 0
++        return bool(self._execute_write(_do))
++
++    def turn_end_requested(self, session_id: str, holder: str) -> bool:
++        """Whether an end request names ``holder`` for this session. A store without the table answers False."""
++        if not session_id or not holder:
++            return False
++        try:
++            with self._read_ctx() as conn:
++                row = conn.execute(
++                    "SELECT 1 FROM session_turn_end_requests WHERE conversation_id = ? AND holder = ?",
++                    (self._session_turn_lease_key_on_conn(conn, session_id), holder)).fetchone()
++        except sqlite3.OperationalError:
++            return False
++        return row is not None
++
+     def session_turn_lease_expires_at(self, session_id: str, holder: str) -> Optional[float]:
+         """Committed ``expires_at`` of ``holder``'s turn lease, or None when it does not hold it."""
+         if not session_id or not holder:
+diff --git a/tests/agent/test_turn_end_request.py b/tests/agent/test_turn_end_request.py
+new file mode 100644
+index 0000000000..ee32ef7f33
+--- /dev/null
++++ b/tests/agent/test_turn_end_request.py
+@@ -0,0 +1,127 @@
++"""Another window's Stop ends exactly one automated turn, with an ordinary interrupt. [daveey]
++
++The asker records an end request for the exact durable holder (compare-and-set against ``session_turn_leases``);
++the holding process's ``DurableTurnLease`` tick sees it and interrupts its agent the ordinary way, so the turn is
++not a lease loss and the lease is released as usual (a prompt queued behind it then runs once).
++"""
++
++from __future__ import annotations
++
++import os
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from agent.turn_end_request import AUTO_KINDS, END_MESSAGE, auto_token, holder_auto_kind
++from agent.turn_facade_lease import DurableTurnLease, lease_holder
++from hermes_state import SessionDB
++
++KEY = "20261121_060000_endreq"
++
++
++@pytest.fixture
++def db(tmp_path):
++    handle = SessionDB(tmp_path / "state.db")
++    handle.create_session(KEY, "desktop")
++    yield handle
++    handle.close()
++
++
++def test_holder_names_only_automated_turns():
++    auto = lease_holder("sid:task:abc", "tui", "kanban_notice")
++    typed = lease_holder("sid:task:abc", "tui", None)
++    assert holder_auto_kind(auto) == "kanban_notice" and auto.endswith(":platform=tui")
++    assert auto.rsplit(":platform=", 1)[-1] == "tui"  # readers that take the surface from the tail still work
++    assert holder_auto_kind(typed) is None and ":auto=" not in typed
++    assert auto_token("loop_tick") == "" and auto_token("hidden") == "" and auto_token(None) == ""
++    assert {"kanban_notice", "auto_continue", "process_complete"} <= AUTO_KINDS and "loop_tick" not in AUTO_KINDS
++
++
++def test_request_turn_end_is_a_compare_and_set_on_the_exact_holder(db):
++    holder = lease_holder("t1", "tui", "kanban_notice")
++    other = lease_holder("t2", "tui", "kanban_notice")
++    assert db.request_turn_end(KEY, holder) is False  # nobody holds the lease
++    assert db.acquire_session_turn_lease(KEY, holder, ttl_seconds=60, wait_seconds=0)
++
++    assert db.request_turn_end(KEY, other) is False  # not the turn that holds it now
++    assert db.turn_end_requested(KEY, holder) is False
++    assert db.request_turn_end(KEY, holder, reason="stop") is True
++    assert db.turn_end_requested(KEY, holder) is True and db.turn_end_requested(KEY, other) is False
++
++    db.release_session_turn_lease(KEY, holder)
++    assert db.acquire_session_turn_lease(KEY, other, ttl_seconds=60, wait_seconds=0)
++    assert db.turn_end_requested(KEY, other) is False  # an old request never reaches the next turn
++
++
++class _Agent:
++    def __init__(self):
++        self.interrupts = []
++        self.session_id = KEY
++        self._session_turn_lease_refresh_interval = 60.0
++        self._execution_thread_id = None
++
++    def interrupt(self, message=None, **kwargs):
++        self.interrupts.append((message, kwargs))
++
++
++def _lease(db, holder):
++    lease = DurableTurnLease(_Agent(), db, KEY, holder)
++    with lease._lock:
++        lease.turn_active = True
++    return lease
++
++
++def test_the_holding_turn_ends_with_an_ordinary_interrupt_and_keeps_its_lease(db):
++    holder = lease_holder("t1", "tui", "kanban_notice")
++    assert db.acquire_session_turn_lease(KEY, holder, ttl_seconds=60, wait_seconds=0)
++    lease = _lease(db, holder)
++
++    assert lease.takeover_tick() is None and lease.agent.interrupts == []  # no request yet
++    assert db.request_turn_end(KEY, holder)
++    assert lease.takeover_tick() is None  # keeps ticking: the turn unwinds, then releases
++    assert lease.takeover_tick() is None
++
++    assert lease.agent.interrupts == [(END_MESSAGE, {})]  # once, no hard cancel, no lease-lost reason
++    assert db.session_turn_lease_owner(KEY)["holder"] == holder  # the lease was not taken away
++
++
++def test_a_typed_turn_never_honours_a_request(db):
++    holder = lease_holder("t1", "tui", None)
++    assert db.acquire_session_turn_lease(KEY, holder, ttl_seconds=60, wait_seconds=0)
++    assert db.request_turn_end(KEY, holder)  # even if one were recorded for it
++    lease = _lease(db, holder)
++
++    lease.takeover_tick()
++    assert lease.agent.interrupts == []
++
++
++def test_a_queued_turn_runs_once_after_the_ended_turn_releases(db):
++    """The request ends the background turn; its normal release lets the forwarded turn waiting for the lease take
++    it, exactly once."""
++    background = f"pid={os.getpid()}:turn=closeout:auto=kanban_notice:platform=tui"
++    forwarded = f"pid={os.getpid()}:turn=forwarded:platform=tui"
++    assert db.acquire_session_turn_lease(KEY, background, ttl_seconds=60, wait_seconds=0)
++    lease = _lease(db, background)
++    got, waiting = [], threading.Event()
++    worker = threading.Thread(target=lambda: got.append(db.acquire_session_turn_lease(
++        KEY, forwarded, ttl_seconds=60, wait_seconds=10, poll_interval_seconds=0.02,
++        on_wait=lambda elapsed: waiting.set())))
++    worker.start()
++    assert waiting.wait(5)
++
++    assert db.request_turn_end(KEY, background)
++    lease.takeover_tick()
++    assert lease.agent.interrupts  # the turn was asked to stop ...
++    lease.release()  # ... unwinds, and releases as usual
++    worker.join(10)
++
++    assert got == [True] and db.session_turn_lease_owner(KEY)["holder"] == forwarded
++
++
++def test_a_store_without_the_table_reads_no_request(tmp_path):
++    store = SimpleNamespace(turn_end_requested=lambda *a: (_ for _ in ()).throw(RuntimeError("old store")))
++    lease = DurableTurnLease(_Agent(), store, KEY, "pid=1:turn=t:auto=kanban_notice:platform=tui")
++    with lease._lock:
++        lease.turn_active = True
++    assert lease._end_requested() is False
+diff --git a/tests/tui_gateway/test_background_turn_queue.py b/tests/tui_gateway/test_background_turn_queue.py
+index 8134bb3761..d6403bbe06 100644
+--- a/tests/tui_gateway/test_background_turn_queue.py
++++ b/tests/tui_gateway/test_background_turn_queue.py
+@@ -192,30 +192,62 @@ def test_prompt_submit_answers_the_queued_receipt(background, monkeypatch):
+ 
+ # -- Stop ----------------------------------------------------------------------------------------------------------
+ 
++AUTO_HOLDER = f"pid={GATEWAY}:pidns=4026531836:turn=t1:auto=kanban_notice:platform=tui"
++
++
++class _Endpoint:
++    def __init__(self, capable=True):
++        from agent.turn_end_request import CAPABILITY
++        self.capabilities = frozenset({"session-authority-v1", *([CAPABILITY] if capable else [])})
++
++
++class _DB:
++    def __init__(self, state):
++        self.state = state
++
++    def request_turn_end(self, key, holder, reason=""):
++        self.state["requests"].append((key, holder))
++        return self.state["recorded"]
++
+ 
+ @pytest.fixture
+ def idle_chat(monkeypatch):
++    import contextlib
+     sid = "rt-background-stop"
+     session = {"agent": None, "agent_ready": threading.Event(), "session_key": KEY, "history": [],
+                "history_lock": threading.RLock(), "running": False}
+     monkeypatch.setitem(server._sessions, sid, session)
+-    state = {"calls": [], "done": threading.Event(), "answer": {"result": {"status": "taken_over"}}, "gate": None,
+-             "events": []}
++    state = {"calls": [], "requests": [], "recorded": True, "events": [], "workers": [], "capable": True,
++             "holder": AUTO_HOLDER, "answer": {"result": {"status": "taken_over"}}}
+ 
+     def take_over(rid, params):
+         state["calls"].append(params)
+-        if state["gate"] is not None:
+-            state["gate"].wait(5)  # a slow take-over: held until the test has the Stop's answer
+-        state["done"].set()
+         return state["answer"]
+ 
++    @contextlib.contextmanager
++    def session_db(s):
++        yield _DB(state)
++
+     monkeypatch.setitem(server._methods, "session.take_over", take_over)
+     monkeypatch.setattr(server, "_automation_holder_kind", lambda session: "kanban_notice")
+     monkeypatch.setattr(server, "_canonical_ledger_refusal", lambda session: None)
+-    monkeypatch.setattr(gbh, "gateway_background_holder", lambda session, **kw: gbh.DialedGateway(GATEWAY, "ep"))
++    monkeypatch.setattr(server, "_foreign_turn_owner", lambda session: {"holder": state["holder"]})
++    monkeypatch.setattr(server, "_session_db", session_db)
++    monkeypatch.setattr(gbh, "gateway_background_holder",
++                        lambda session, **kw: gbh.DialedGateway(GATEWAY, _Endpoint(state["capable"])))
+     real_emit = server._emit
+     monkeypatch.setattr(server, "_emit", lambda kind, s, payload=None: state["events"].append((kind, s, payload))
+                         if kind == "error" else real_emit(kind, s, payload))
++    import agent.memory_provider as mp
++
++    class _Deferred:  # the worker runs when the test says so: Stop must answer without it
++        def __init__(self, target, name=None):
++            self.target = target
++
++        def start(self):
++            state["workers"].append(self.target)
++
++    monkeypatch.setattr(mp, "spawn_context_thread", lambda target, name=None: _Deferred(target, name))
+     return sid, session, state
+ 
+ 
+@@ -224,74 +256,113 @@ def _stop(sid, origin):
+     return server.handle_request({"id": "1", "method": "session.interrupt", "params": params})
+ 
+ 
+-def test_stop_takes_the_chat_over_from_the_gateways_background_turn(idle_chat):
++def _run_workers(state):
++    return [job() for job in state.pop("workers")]
++
++
++def test_stop_answers_at_once_and_asks_exactly_the_holders_turn_to_end(idle_chat):
+     sid, _session, state = idle_chat
+     resp = _stop(sid, "stop_button")
+ 
+     assert resp["result"] == {"status": "interrupted", "background_turn": True}
+-    assert state["done"].is_set() and state["calls"] == [{"session_id": sid}]  # answered after the take-over
++    assert state["requests"] == [] and len(state["workers"]) == 1  # nothing discovered on the RPC thread
++    assert _run_workers(state) == ["end_requested"]
++    assert state["requests"] == [(KEY, AUTO_HOLDER)] and state["calls"] == [] and state["events"] == []
+ 
+ 
+-def test_a_failed_takeover_fails_the_stop(idle_chat):
++def test_stop_asks_for_the_end_even_with_a_prompt_queued(idle_chat, monkeypatch):
+     sid, _session, state = idle_chat
+-    state["answer"] = {"error": {"code": 4090, "message": "The other writer has not released this chat.",
+-                                 "data": {"reason": "SESSION_NOT_OWNED"}}}
+-    resp = _stop(sid, "stop_button")
++    monkeypatch.setattr(server, "_canonical_ledger_refusal", lambda session: object())
++    _stop(sid, "stop_button")
+ 
+-    assert resp["error"]["code"] == 4090 and "not released" in resp["error"]["message"]
+-    assert resp["error"]["data"] == {"reason": "SESSION_NOT_OWNED"}
++    assert _run_workers(state) == ["end_requested"] and state["calls"] == []
+ 
+ 
+-def test_a_takeover_that_fails_after_the_ack_window_shows_an_error(idle_chat, monkeypatch):
++def test_a_lost_compare_and_set_is_told_to_the_chat(idle_chat):
+     sid, _session, state = idle_chat
+-    from tests.waiting import wait_until
+-    monkeypatch.setattr(server, "BACKGROUND_STOP_ACK_S", 0.05)
+-    state["gate"] = threading.Event()
++    state["recorded"] = False  # the holder changed between discovery and the request
++    _stop(sid, "stop_button")
++
++    assert _run_workers(state) == ["end_request_failed"]
++    assert state["events"] and state["events"][0][0] == "error" and state["calls"] == []
++
++
++def test_an_older_gateway_with_nothing_queued_is_taken_over(idle_chat):
++    sid, _session, state = idle_chat
++    state["capable"] = False
++    _stop(sid, "stop_button")
++
++    assert _run_workers(state) == ["taken_over"]
++    assert state["calls"] == [{"session_id": sid}] and state["requests"] == []
++
++
++def test_an_older_gateway_takeover_failure_is_told_to_the_chat(idle_chat):
++    sid, _session, state = idle_chat
++    state["capable"] = False
+     state["answer"] = {"error": {"code": 4090, "message": "writer busy"}}
+-    resp = _stop(sid, "stop_button")
++    _stop(sid, "stop_button")
+ 
+-    assert resp["result"] == {"status": "interrupted", "background_turn": True}  # still running when it answered
+-    state["gate"].set()
+-    wait_until(lambda: state["events"], timeout=5)
+-    assert state["events"] and state["events"][0][0] == "error" and state["events"][0][1] == sid
++    assert _run_workers(state) == ["takeover_failed"]
+     assert "writer busy" in state["events"][0][2]["message"]
+ 
+ 
+-def test_stop_racing_a_queued_forwarded_admission_never_takes_over(idle_chat, monkeypatch):
+-    """The user's typed prompt already waits in the gateway's FIFO (its ledger holds work): a take-over now would
+-    race that queue, so Stop is the ordinary one."""
++def test_stop_racing_a_queued_forwarded_admission_on_an_older_gateway_never_takes_over(idle_chat, monkeypatch):
++    """The typed prompt already waits in an older gateway's FIFO: a take-over would race that queue, so nothing is
++    ended and the chat is told the message runs when the background turn ends."""
+     sid, _session, state = idle_chat
+-    refusal = ActiveSessionRefusal("pending work in the gateway's durable queue", SESSION_NOT_OWNED)
+-    refusal.ledger_status = "queued"
+-    monkeypatch.setattr(server, "_canonical_ledger_refusal", lambda session: refusal)
+-    resp = _stop(sid, "stop_button")
++    state["capable"] = False
++    monkeypatch.setattr(server, "_canonical_ledger_refusal", lambda session: object())
++    _stop(sid, "stop_button")
++
++    assert _run_workers(state) == ["queued_not_interrupted"]
++    assert state["calls"] == [] and state["requests"] == []
++    assert state["events"][0][2]["message"] == server.BACKGROUND_STOP_QUEUED_MESSAGE
++
++
++def test_a_typed_holder_is_never_asked_to_end(idle_chat):
++    sid, _session, state = idle_chat
++    state["holder"] = f"pid={GATEWAY}:pidns=4026531836:turn=t1:platform=tui"  # no :auto=: an older or typed turn
++    _stop(sid, "stop_button")
+ 
+-    assert resp["result"].get("background_turn") is None and state["calls"] == []
++    assert _run_workers(state) == ["taken_over"] and state["requests"] == []  # the older-gateway fallback
++
++
++def test_no_gateway_holder_ends_nothing(idle_chat, monkeypatch):
++    sid, _session, state = idle_chat
++    monkeypatch.setattr(gbh, "gateway_background_holder", lambda session, **kw: None)
++    _stop(sid, "stop_button")
++
++    assert _run_workers(state) == ["no_holder"] and state["calls"] == state["requests"] == []
+ 
+ 
+ @pytest.mark.parametrize("origin", ["delete", "rewind", "plugin:x", None])
+-def test_other_interrupts_never_end_the_background_turn(idle_chat, origin):
++def test_other_interrupts_run_the_ordinary_stop(idle_chat, monkeypatch, origin):
+     sid, _session, state = idle_chat
++    ordinary = []
++    monkeypatch.setattr(server, "_interrupt_session_turn", lambda *a, **k: ordinary.append(a[0]))
+     resp = _stop(sid, origin)
+ 
+-    assert resp["result"].get("background_turn") is None and state["calls"] == []
++    assert resp["result"] == {"status": "interrupted"} and ordinary == [sid] and state["workers"] == []
+ 
+ 
+ def test_stop_of_this_backends_own_turn_is_the_ordinary_stop(idle_chat, monkeypatch):
+     sid, session, state = idle_chat
+     session["running"] = True
+-    monkeypatch.setattr(server, "_interrupt_session_turn", lambda *a, **k: None)
++    ordinary = []
++    monkeypatch.setattr(server, "_interrupt_session_turn", lambda *a, **k: ordinary.append(a[0]))
+     resp = _stop(sid, "stop_button")
+ 
+-    assert resp["result"].get("background_turn") is None and state["calls"] == []
++    assert resp["result"] == {"status": "interrupted"} and ordinary == [sid] and state["workers"] == []
+ 
+ 
+-def test_stop_with_another_holder_is_the_ordinary_stop(idle_chat, monkeypatch):
++def test_stop_on_a_chat_whose_newest_turn_was_typed_is_the_ordinary_stop(idle_chat, monkeypatch):
+     sid, _session, state = idle_chat
+-    monkeypatch.setattr(gbh, "gateway_background_holder", lambda session, **kw: None)
++    monkeypatch.setattr(server, "_automation_holder_kind", lambda session: None)
++    ordinary = []
++    monkeypatch.setattr(server, "_interrupt_session_turn", lambda *a, **k: ordinary.append(a[0]))
+     resp = _stop(sid, "stop_button")
+ 
+-    assert resp["result"].get("background_turn") is None and state["calls"] == []
++    assert resp["result"] == {"status": "interrupted"} and ordinary == [sid] and state["workers"] == []
+ 
+ 
+ # -- the forwarded prompt's turn waits for the background turn's lease ---------------------------------------------
+@@ -351,10 +422,17 @@ def test_a_retiring_owner_answers_busy_at_once_with_a_short_retry(monkeypatch):
+     assert gbh.wake_past_retiring_owner("s", {"session_key": KEY}, "chat-closeout", KEY,
+                                         foreign_owner=lambda s: None, now=lambda: 1000.0) == "busy"
+     assert time.monotonic() - started < 1  # never sleeps inside the caller's wake slot
+-    assert gbh.retiring_retry_at(KEY) == 1000.0 + gbh.RETIRING_OWNER_RETRY_S
++    assert gbh.retiring_retry_at(KEY, now=lambda: 1001.0) == 1000.0 + gbh.RETIRING_OWNER_RETRY_S
+     assert gbh.retiring_retry_at(KEY) is None  # consumed
+ 
+ 
++def test_a_stale_retiring_record_is_ignored(monkeypatch):
++    monkeypatch.setattr(gbh, "retiring_owner_reason", lambda s, **kw: "code-skew")
++    gbh.wake_past_retiring_owner("s", {"session_key": KEY}, "chat-closeout", KEY, foreign_owner=lambda s: None,
++                                 now=lambda: 1000.0)
++    assert gbh.retiring_retry_at(KEY, now=lambda: 1000.0 + gbh.RETIRING_RECORD_MAX_AGE_S + 1) is None
++
++
+ def test_a_live_owner_is_still_refused(monkeypatch):
+     monkeypatch.setattr(gbh, "retiring_owner_reason", lambda s, **kw: None)
+     assert gbh.wake_past_retiring_owner("s", {"session_key": KEY}, "chat-closeout", KEY,
+diff --git a/tests/tui_gateway/test_notice_hold_wait.py b/tests/tui_gateway/test_notice_hold_wait.py
+index da02a4e11b..1c534d56de 100644
+--- a/tests/tui_gateway/test_notice_hold_wait.py
++++ b/tests/tui_gateway/test_notice_hold_wait.py
+@@ -184,7 +184,7 @@ def test_a_busy_wake_held_by_a_retiring_backend_retries_soon_and_charges_nothing
+ 
+     def wake(sid, msg_id):
+         with gbh._retiring_mu:
+-            gbh._retiring_busy[sid] = now + gbh.RETIRING_OWNER_RETRY_S
++            gbh._retiring_busy[sid] = (now + gbh.RETIRING_OWNER_RETRY_S, time.time())
+         return "busy"
+ 
+     @contextlib.contextmanager
+@@ -219,3 +219,32 @@ def test_a_notice_refused_while_the_watcher_decides_to_stop_is_not_lost():
+     assert len(passes) == 2 and len(jobs) == 1  # watched again for the late notice, no second thread
+     assert hw._state["thread"] is None
+     assert hw.note_waiting(run_pass=run_pass, held=lambda: False, sleep=lambda s: None, spawn=jobs.append) is True
++
++
++def test_retiring_retries_stop_at_their_ceiling_then_count_as_busy(db, hold):
++    from tui_gateway import gateway_background_holder as gbh
++    hold["held"] = False
++    row = _notice(db, "✔ Kanban t_fff done")
++    now = time.time()
++
++    def wake(sid, msg_id):
++        with gbh._retiring_mu:
++            gbh._retiring_busy[sid] = (time.time() + gbh.RETIRING_OWNER_RETRY_S, time.time())
++        return "busy"
++
++    @contextlib.contextmanager
++    def opener(chat_id):
++        yield db, chat_id
++
++    wakes = 0
++    for _ in range(ng.MAX_RETIRING_RETRIES + 1):
++        out = ng.guarantee_pass(now=now, stores=lambda: iter([db]), holders=list, session_db=opener, wake=wake,
++                                spawn=lambda job: job())
++        wakes += len(out)
++        now = max(now, _closeout(db, row)["retry_at"]) + 1
++
++    closeout = _closeout(db, row)
++    assert wakes == ng.MAX_RETIRING_RETRIES + 1
++    assert closeout["retiring_attempts"] == ng.MAX_RETIRING_RETRIES  # the short retries were capped ...
++    assert closeout["busy_attempts"] == 1  # ... and the next busy wake was ordinary busy accounting
++    assert closeout["retry_at"] >= time.time() + ng.BUSY_RETRY_S - 5
+diff --git a/tui_gateway/gateway_background_holder.py b/tui_gateway/gateway_background_holder.py
+index 92a1b8d9f6..a5b13a6130 100644
+--- a/tui_gateway/gateway_background_holder.py
++++ b/tui_gateway/gateway_background_holder.py
+@@ -162,7 +162,9 @@ def retiring_owner_reason(session: dict, *, foreign_owner: Callable[[dict], Opti
+ # lets the chat go, where "refused" sent the waker (chat-closeout) to its long backoff. The wake answers "busy" at
+ # once (it never sleeps inside a caller's wake slot) and :func:`retiring_retry_at` gives the short retry time.
+ RETIRING_OWNER_RETRY_S = 15.0
+-_retiring_busy: dict[str, float] = {}  # chat key -> retry time (Unix seconds) of its last retiring-owner refusal
++# A recorded retry older than this is from an earlier wake (its caller never asked): ignored, never reused.
++RETIRING_RECORD_MAX_AGE_S = 30.0
++_retiring_busy: dict[str, tuple[float, float]] = {}  # chat key -> (retry_at, written_at) of its last refusal
+ _retiring_mu = threading.Lock()
+ 
+ 
+@@ -177,15 +179,19 @@ def wake_past_retiring_owner(sid: str, session: dict, label: str, key: str, *,
+     if reason is None:
+         logger.info("%s: %s has another live owner; not waking it here", label, key)
+         return "refused"
+-    retry_at = now() + RETIRING_OWNER_RETRY_S
++    written = now()
+     with _retiring_mu:
+-        _retiring_busy[str(key)] = retry_at
++        _retiring_busy[str(key)] = (written + RETIRING_OWNER_RETRY_S, written)
+     logger.info("%s: %s is held by a backend being replaced (%s); busy, retry in %.0fs",
+                 label, key, reason, RETIRING_OWNER_RETRY_S)
+     return "busy"
+ 
+ 
+-def retiring_retry_at(key: str) -> Optional[float]:
+-    """The short retry time of ``key``'s latest busy-because-retiring wake (consumed: one answer per wake)."""
++def retiring_retry_at(key: str, *, now: Callable[[], float] = time.time) -> Optional[float]:
++    """The short retry time of ``key``'s latest busy-because-retiring wake, consumed (one answer per wake); None
++    when there is none or it was written more than ``RETIRING_RECORD_MAX_AGE_S`` ago (another wake's)."""
+     with _retiring_mu:
+-        return _retiring_busy.pop(str(key), None)
++        record = _retiring_busy.pop(str(key), None)
++    if record is None or now() - record[1] > RETIRING_RECORD_MAX_AGE_S:
++        return None
++    return record[0]
+diff --git a/tui_gateway/methods_session_interrupt.py b/tui_gateway/methods_session_interrupt.py
+index f85ecb956d..68875ff1d0 100644
+--- a/tui_gateway/methods_session_interrupt.py
++++ b/tui_gateway/methods_session_interrupt.py
+@@ -82,59 +82,83 @@ _HELD_QUEUE_KEEPING_ORIGINS = frozenset({None, "stop_button", "esc", "tile", "ti
+ _BACKGROUND_STOP_ORIGINS = frozenset({"stop_button", "esc", "tile", "tile:esc", "slash", "transcript"})
+ 
+ 
+-#: How long Stop waits for the take-over's answer before it reports; a later failure is still shown (an error event).
+-BACKGROUND_STOP_ACK_S = 5.0
++BACKGROUND_STOP_QUEUED_MESSAGE = ("The background turn in this chat could not be stopped from here (the gateway "
++                                  "running it is older). Your message runs when that turn ends.")
+ 
+ 
+-def _stop_gateway_background_turn(rid, sid: str, session: dict):
+-    """Take the chat over from the gateway's background turn (``session.take_over``, which ends that turn).
+-
+-    Returns None to leave the ordinary Stop (this backend runs the turn, another holder, or the gateway's durable
+-    ledger holds work for the chat: a typed prompt already queued there, whose FIFO a take-over must not race),
+-    True when the take-over succeeded or is still running after ``BACKGROUND_STOP_ACK_S`` (a later failure then
+-    emits an ``error`` event the Desktop shows), or the take-over's error dict when it failed within that time."""
+-    import threading
++def _stop_gateway_background_turn(rid, sid: str, session: dict) -> bool:
++    """A Stop on a chat whose turn Hermes started in ANOTHER process. Only cheap checks run here (this backend runs
++    no turn, the chat's newest turn is automated); the holder discovery and the end itself run on a worker
++    (``_end_background_turn``) and report by events, so Stop never blocks the RPC reader. True when the worker
++    was started; False leaves the ordinary Stop."""
+     with session["history_lock"]:
+         if session.get("running"):
+-            return None
+-    if _automation_holder_kind(session) is None or _canonical_ledger_refusal(session) is not None:
+-        return None
+-    from tui_gateway.gateway_background_holder import gateway_background_holder
+-    if gateway_background_holder(session, foreign_owner=_foreign_turn_owner) is None:
+-        return None
+-    handler = _methods.get("session.take_over")
+-    if handler is None:
+-        return None
++            return False
++    if _automation_holder_kind(session) is None:
++        return False
++    queued = _canonical_ledger_refusal(session) is not None  # a typed prompt already waits in the gateway's FIFO
++    from agent.memory_provider import spawn_context_thread
+     key = session.get("session_key") or sid
+-    outcome: dict = {}
+-    mu, done = threading.Lock(), threading.Event()
+-
+-    def run() -> None:
+-        error = None
++    spawn_context_thread(lambda: _end_background_turn(rid, sid, session, queued),
++                         name=f"background-stop-{str(key)[:24]}").start()
++    logger.info("Stop in %s: ending the gateway's background turn off the RPC thread", key)
++    return True
++
++
++def _end_background_turn(rid, sid: str, session: dict, queued: bool) -> str:
++    """Worker: end exactly the holder's turn. Returns what it did (tests); every failure reaches the chat as an
++    ``error`` event.
++
++    - The holder is the gateway the chat's forward dials, running an automated turn (``:auto=`` holder), and that
++      gateway honours end requests (``turn_end_request.CAPABILITY``): record the request for that exact holder
++      (``SessionDB.request_turn_end``, compare-and-set). Its turn ends with an ordinary interrupt and releases
++      the lease, so a prompt queued behind it runs next, once. Whether or not a prompt is queued.
++    - An older gateway: with nothing queued, ``session.take_over`` (as before); with a prompt queued in its FIFO
++      a take-over would race that queue, so the chat is told the message runs when the turn ends.
++    - Anything else (no such holder any more, another holder): nothing is ended."""
++    from agent.turn_end_request import CAPABILITY, holder_auto_kind
++    from tui_gateway.gateway_background_holder import gateway_background_holder
++    key = str(session.get("session_key") or sid)
++    try:
++        gateway = gateway_background_holder(session, foreign_owner=_foreign_turn_owner)
++        owner = _foreign_turn_owner(session) if gateway is not None else None
++    except Exception:  # health: allow BLE001 -- worker thread boundary: logged with traceback, told to the chat
++        logger.warning("Stop: could not find who runs %s", key, exc_info=True)
++        gateway = owner = None
++    holder = str((owner or {}).get("holder") or "")
++    if gateway is None or not holder:
++        logger.info("Stop in %s: no background turn of this host's gateway holds it now; nothing to end", key)
++        return "no_holder"
++    capable = CAPABILITY in (getattr(gateway.endpoint, "capabilities", None) or ())
++    if capable and holder_auto_kind(holder) is not None:
+         try:
+-            answer = handler(f"{rid}-background-stop", {"session_id": sid}) or {}
+-            error = answer.get("error") if isinstance(answer, dict) else None
+-        except Exception as exc:  # health: allow BLE001 -- worker thread boundary: logged with traceback
+-            logger.warning("Stop could not take %s over from the gateway's background turn", key, exc_info=True)
+-            error = {"message": f"Stop could not end the background turn: {type(exc).__name__}"}
+-        logger.info("Stop of the gateway's background turn in %s: %s", key, error or "taken over")
+-        with mu:
+-            outcome["error"] = error
+-            late = outcome.get("late", False)
+-            done.set()
+-        if late and error:
+-            message = (error.get("message") if isinstance(error, dict) else None) or str(error)
+-            _emit("error", sid, {"message": f"Stop could not end the background turn in this chat: {message}"})
+-
+-    from agent.memory_provider import spawn_context_thread
+-    spawn_context_thread(run, name=f"background-stop-{str(key)[:24]}").start()
+-    logger.info("Stop in %s: taking the chat over from the gateway's background turn", key)
+-    done.wait(BACKGROUND_STOP_ACK_S)
+-    with mu:
+-        if not done.is_set():
+-            outcome["late"] = True
+-            return True
+-    return outcome.get("error") or True
++            with _session_db(session) as db:
++                recorded = bool(db.request_turn_end(key, holder, reason="stop"))
++        except Exception:  # health: allow BLE001 -- worker thread boundary: logged with traceback, told to the chat
++            logger.warning("Stop: could not record the end request for %s", key, exc_info=True)
++            recorded = False
++        if recorded:
++            logger.info("Stop in %s: asked the gateway's background turn to end (holder %s)", key, holder)
++            return "end_requested"
++        _emit("error", sid, {"message": "Stop could not reach the background turn in this chat; it may have "
++                                        "just ended. Try Stop again if it is still running."})
++        return "end_request_failed"
++    if queued:
++        _emit("error", sid, {"message": BACKGROUND_STOP_QUEUED_MESSAGE})
++        return "queued_not_interrupted"
++    handler = _methods.get("session.take_over")
++    try:
++        answer = handler(f"{rid}-background-stop", {"session_id": sid}) if handler else None
++    except Exception:  # health: allow BLE001 -- worker thread boundary: logged with traceback, told to the chat
++        logger.warning("Stop could not take %s over from the gateway's background turn", key, exc_info=True)
++        answer = {"error": {"message": "the take-over failed"}}
++    error = answer.get("error") if isinstance(answer, dict) else {"message": "no take-over handler"}
++    if error:
++        message = (error.get("message") if isinstance(error, dict) else None) or str(error)
++        _emit("error", sid, {"message": f"Stop could not end the background turn in this chat: {message}"})
++        return "takeover_failed"
++    logger.info("Stop in %s: took the chat over from an older gateway's background turn", key)
++    return "taken_over"
+ 
+ 
+ def _note_stop_issuer(sid: str, session: dict, transport, origin: str | None = None) -> None:
+@@ -265,11 +289,8 @@ def _(rid, params: dict) -> dict:
+         keep_held = origin in _HELD_QUEUE_KEEPING_ORIGINS
+         _note_user_input(session)
+         _note_stop_issuer(sid, session, current_transport(), origin)
+-        if origin in _BACKGROUND_STOP_ORIGINS and (stopped := _stop_gateway_background_turn(rid, sid, session)):
+-            if isinstance(stopped, dict):
+-                data = stopped.get("data") if isinstance(stopped.get("data"), dict) else None
+-                return _err(rid, 4090, str(stopped.get("message") or "Stop could not end the background turn"),
+-                            data)
++        if origin in _BACKGROUND_STOP_ORIGINS and _stop_gateway_background_turn(rid, sid, session):
++            # Requested, not yet done: the outcome reaches the chat as events (the turn's own end, or an error).
+             return _ok(rid, {"status": "interrupted", "background_turn": True})
+         if _session_uses_compute_host(session):
+             with session["history_lock"]:
+diff --git a/tui_gateway/notice_guarantee.py b/tui_gateway/notice_guarantee.py
+index 616712dfdb..20a865567e 100644
+--- a/tui_gateway/notice_guarantee.py
++++ b/tui_gateway/notice_guarantee.py
+@@ -86,6 +86,8 @@ DEFER_SLACK_S = 600.0
+ BUSY_RETRY_S = 300.0
+ BUSY_RETRY_MAX_S = 3600.0
+ MAX_BUSY_ATTEMPTS = 8
++# [daveey] Short retries of a wake whose chat a backend being replaced holds; past them, ordinary busy accounting.
++MAX_RETIRING_RETRIES = 10
+ LOOKBACK_S = 3 * 86400.0
+ MAX_PARALLEL_WAKES = 2
+ CLOSEOUT_TEXT = (
+@@ -235,9 +237,11 @@ def _busy_attempts(meta: Any) -> int:
+ 
+ def _claim(db: Any, cand: dict, now: float) -> bool:
+     busy = _busy_attempts(cand["meta"])
++    retiring = _attempts(cand["meta"], "retiring_attempts")
+     meta = {**cand["meta"], "closeout": {"state": "claimed", "at": now, "pid": os.getpid(),
+                                          "attempts": _attempts(cand["meta"]) + 1,
+-                                         **({"busy_attempts": busy} if busy else {})}}
++                                         **({"busy_attempts": busy} if busy else {}),
++                                         **({"retiring_attempts": retiring} if retiring else {})}}
+     with notice_writer(db) as wdb:
+         return wdb._write_rowcount("UPDATE messages SET display_metadata = ? WHERE id = ? AND display_metadata IS ?",
+                                    (json.dumps(meta, ensure_ascii=False), cand["msg_id"], cand["raw_meta"])) == 1
+@@ -379,7 +383,7 @@ def _retry_at(sid: str, now: float) -> float:
+ 
+ def _closeout_job(session_db, wake, sid: str, msg_id: int, attempts: int = 1,
+                   retry_at: Optional[Callable[[str, float], float]] = None, busy_attempts: int = 0,
+-                  early_recheck: bool = False) -> str:
++                  early_recheck: bool = False, retiring_attempts: int = 0) -> str:
+     """Worker: the wake, then the verdict on the claimed row; a wake that did not start refreshes the outcome.
+     A failed (``"error"``) or busy wake with attempts left is stamped ``deferred`` for a later pass (module doc)."""
+     try:
+@@ -399,10 +403,12 @@ def _closeout_job(session_db, wake, sid: str, msg_id: int, attempts: int = 1,
+             verdict = "deferred"
+             with contextlib.suppress(Exception):
+                 note_waiting()
+-        elif verdict == "busy" and (soon := _retiring_retry_at(sid)) is not None:
++        elif (verdict == "busy" and (soon := _retiring_retry_at(sid)) is not None
++              and retiring_attempts < MAX_RETIRING_RETRIES):
+             # [daveey] The chat's owner is a backend being replaced: it lets go within seconds. A short retry, and no
+-            # attempt charged (gateway_background_holder.wake_past_retiring_owner).
+-            extra = {"retry_at": soon, "attempts": max(0, attempts - 1), "busy_attempts": busy_attempts}
++            # attempt charged (gateway_background_holder.wake_past_retiring_owner), up to MAX_RETIRING_RETRIES.
++            extra = {"retry_at": soon, "attempts": max(0, attempts - 1), "busy_attempts": busy_attempts,
++                     "retiring_attempts": retiring_attempts + 1}
+             verdict = "deferred"
+         elif verdict == "busy":
+             busy_attempts += 1
+@@ -503,8 +509,9 @@ def _handle(db, cand: dict, now: float, *, holders, session_db, wake, spawn, see
+         busy = _busy_attempts(cand["meta"])
+         from tui_gateway.notice_retry import early_recheck
+         early = early_recheck(cand["meta"], now)
++        retiring = _attempts(cand["meta"], "retiring_attempts")
+         spawn(lambda: _closeout_job(session_db, wake, sid, cand["msg_id"], attempts=attempts,
+-                                   busy_attempts=busy, early_recheck=early))
++                                   busy_attempts=busy, early_recheck=early, retiring_attempts=retiring))
+     except Exception:
+         _wake_slots.release()
+         _stamp(db, cand["msg_id"], "error")
+-- 
+2.43.0
+

@@ -1,0 +1,109 @@
+From 47ae2ab1570c23856d21f8314b72ac12f13bbb57 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 06:49:20 +0000
+Subject: [PATCH] [daveey] Reuse decoded owner evidence for release snapshot
+ tokens
+
+Why: CI test_unchanged_replica_is_not_decoded_again caught new repeated owner-evidence hashes on the explicit-clock projection path. Pass the already verified decoder evidence to historical fields in both projectors instead of rehashing each unchanged owner record. Proof: canonical runner passes 55 tests in four focused files; full scripts/check passes. Release and identity gates remain unchanged.
+---
+ hermes_cli/kanban_replica_projection.py        | 8 +++++---
+ hermes_cli/kanban_session_activity.py          | 4 +++-
+ hermes_cli/kanban_terminal_release_snapshot.py | 6 ++----
+ 3 files changed, 10 insertions(+), 8 deletions(-)
+
+diff --git a/hermes_cli/kanban_replica_projection.py b/hermes_cli/kanban_replica_projection.py
+index 38de8aee24..689f123e27 100644
+--- a/hermes_cli/kanban_replica_projection.py
++++ b/hermes_cli/kanban_replica_projection.py
+@@ -52,12 +52,12 @@ def linked_sessions(task: dict[str, Any], me: str, origin_profile: str) -> tuple
+                          and link.get('profile') == origin_profile and link.get('rel') in LINK_RELS}))
+ 
+ 
+-def historical_fields(raw: dict[str, Any], tkey: tuple) -> dict[str, Any]:
++def historical_fields(raw: dict[str, Any], tkey: tuple, evidence: dict) -> dict[str, Any]:
+     from hermes_cli.kanban_completion_receipt_projection import remote_fields
+     from hermes_cli.kanban_terminal_release_snapshot import observation
+     gw, owner_profile, board, tid = tkey
+     return {**remote_fields(raw, gateway=gw, profile=owner_profile, board=board, task_id=tid),
+-            **observation(raw, tkey)}
++            **observation(raw, tkey, evidence)}
+ 
+ 
+ def card_rows(tkey: tuple, t: dict[str, Any], *, sids, closed: bool, synced, stale: bool, me: str,
+@@ -100,6 +100,7 @@ class _Stage:
+         'attest',
+         'cards',
+         'error',
++        'evidence',
+         'historical',
+         'legacy',
+         'links',
+@@ -171,6 +172,7 @@ def _stage(row: tuple, me: str, origin_profile: str, shared: dict | None = None)
+         return st
+     gw = str(gw)
+     st.tkey = (gw, owner_profile, board, tid)
++    st.evidence = evidence
+     st.sids = linked_sessions(t, me, origin_profile)
+     st.links = link_targets(t)
+     # [daveey] Release evidence reads the whole record (``record_attests_terminal`` reads origin_bindings and
+@@ -495,7 +497,7 @@ def _emit(s: _State, me: str, origin_profile: str, last_ok, stale: bool, fresh:
+         record, t = _whole(st, s.tasks[tk], t)  # only a slim twin a legacy alias folded links into decodes here
+         if st.historical is None:
+             stats["historical"] += 1
+-            st.historical = historical_fields(record, tk)
++            st.historical = historical_fields(record, tk, st.evidence)
+         owner_seen = aggregates['seen'].get(gw) or None
+         synced = min(owner_seen, last_ok) if (owner_seen and last_ok) else (owner_seen or last_ok)
+         inputs = (t, sids, tk in s.released, synced, stale, me, origin_profile)
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index bead83366b..64a893d534 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -695,6 +695,7 @@ def _project_replica(path: Path, now: float, me: str, rows: list, info_rows: lis
+     released: set[tuple[str, str | None, str, str]] = set()
+     seen_at: dict[str, float] = {}
+     legacy_records: dict[tuple, dict] = {}
++    observations: dict[tuple, dict] = {}
+     global _replica_decoded
+     previous_decoded, decoded = _replica_decoded, {}
+     # (gw, key) order, which ``kanban_replica_rows`` also keeps: the answer's order never depends on the scan.
+@@ -720,6 +721,7 @@ def _project_replica(path: Path, now: float, me: str, rows: list, info_rows: lis
+                 raise ValueError('replica task identity mismatch')
+             key = (str(gw), owner_profile, board, tid)
+             raw[key] = t
++            observations[key] = evidence
+             if _owner_attests_terminal(t, str(gw), owner_profile, board, heartbeats, now, stale, evidence,
+                                        published_at=(updated or 0) / 1000.0):
+                 released.add(key)
+@@ -767,7 +769,7 @@ def _project_replica(path: Path, now: float, me: str, rows: list, info_rows: lis
+         key = (gw, owner_profile, board, tid)
+         found.update(card_rows(key, t, sids=sids, closed=key in released, synced=synced, stale=stale, me=me,
+                                origin_profile=origin_profile, legacy_record=legacy_records.get(key),
+-                               historical=historical_fields(raw[key], key)))
++                               historical=historical_fields(raw[key], key, observations[key])))
+     return list(found.values())
+ 
+ 
+diff --git a/hermes_cli/kanban_terminal_release_snapshot.py b/hermes_cli/kanban_terminal_release_snapshot.py
+index a2ea252913..2938197903 100644
+--- a/hermes_cli/kanban_terminal_release_snapshot.py
++++ b/hermes_cli/kanban_terminal_release_snapshot.py
+@@ -1,13 +1,11 @@
+ """Keep a proven terminal release across transport age, never across owner changes. [daveey]"""
+-from hermes_cli.kanban_origin_ledger import _owner_evidence
+-
+ _IDENTITY = ('key', 'session', 'gateway', 'profile', 'board', 'id', 'origin_gateway', 'origin_profile', 'via')
+ 
+ 
+-def observation(task: dict, key: tuple) -> dict:
++def observation(task: dict, key: tuple, evidence: dict) -> dict:
+     """A snapshot token only for an exactly qualified, hash-verified terminal publication."""
+     profile = key[1]
+-    evidence = _owner_evidence(task)
++
+     if (profile is None or task.get('status') not in ('done', 'archived')
+             or any(task.get(k) != v for k, v in zip(('gateway', 'profile', 'board', 'id'), key))
+             or evidence.get('verified') is not True):
+-- 
+2.43.0
+

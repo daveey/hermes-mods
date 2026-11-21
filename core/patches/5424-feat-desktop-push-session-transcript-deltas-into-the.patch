@@ -1,0 +1,2242 @@
+From ead31c699bd4717eb21059f1d7fe2a8ec54ec8e0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 22:59:51 -0800
+Subject: [PATCH] feat(desktop): push session transcript deltas into the tail
+ cache (sessions.moved) [daveey]
+
+The background prefetcher learned a session moved from the 5 s hub listing poll,
+whose activity/message_count the hub holds for up to 30 s, and then refetched the
+latest page at most once per 30 s: an open found newer messages than its cache
+paint in 11 of 16 opens.
+
+Gateway: a new global `sessions.moved` change-watcher event, at most once a
+second and only when message rows were added, naming each moved session
+{id, profile, message_count, activity, last_message_id, parent_session_id}.
+Its signature is each watched store's MAX(messages.id) behind the kept
+observer's commit key (one PRAGMA while idle); the payload reads the id range
+since the last frame, so a floored window loses nothing. Added to the gateway
+contract (events.py, regenerated TS/OpenRPC).
+
+REST: `GET /api/sessions/{id}/messages?after_id=N[&limit]` returns the live
+display rows after row N (bounded, default 200, max 500) plus
+delta.{anchor_found, has_more, transcript_revision}, read revision-first.
+
+Desktop: the renderer forwards every socket's sessions.moved to main
+(store/transcript-push.ts); the prefetcher fetches only the rows after each
+tracked session's cached tail, one fetch in flight + one queued per session,
+no 30 s throttle, and falls back to the latest page when the delta does not
+line up (anchor row gone, gap, rotation, in-place rewrite since the last full
+page, cache moved under the delta, older core without the route). The listing
+pass becomes a 60 s safety net for a gateway that pushes (5 s otherwise); an
+unknown moved session asks for an early listing pass.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ apps/desktop/electron/preload.ts              |   5 +-
+ .../electron/transcript-cache-client.ts       |   4 +-
+ .../electron/transcript-cache-host.test.ts    |  65 +++
+ .../desktop/electron/transcript-cache-host.ts |  40 +-
+ .../desktop/electron/transcript-cache.test.ts |  33 +-
+ apps/desktop/electron/transcript-cache.ts     |  34 ++
+ .../electron/transcript-prefetch-push.test.ts | 492 ++++++++++++++++++
+ apps/desktop/electron/transcript-prefetch.ts  | 413 ++++++++++++++-
+ apps/desktop/src/global.d.ts                  |   2 +
+ apps/desktop/src/main.tsx                     |   2 +
+ .../desktop/src/store/transcript-push.test.ts |  51 ++
+ apps/desktop/src/store/transcript-push.ts     |  52 ++
+ apps/shared/src/gateway-contract.generated.ts |  18 +
+ apps/shared/src/gateway-contract.openrpc.json |  91 ++++
+ hermes_cli/web_routers/sessions.py            |  47 +-
+ hermes_state_stored_reads.py                  |  31 ++
+ .../hermes_cli/test_session_messages_after.py | 150 ++++++
+ .../test_change_watcher_sessions_moved.py     | 148 ++++++
+ tui_gateway/change_watcher.py                 | 100 +++-
+ tui_gateway/contracts/events.py               |  29 ++
+ 20 files changed, 1790 insertions(+), 17 deletions(-)
+ create mode 100644 apps/desktop/electron/transcript-prefetch-push.test.ts
+ create mode 100644 apps/desktop/src/store/transcript-push.test.ts
+ create mode 100644 apps/desktop/src/store/transcript-push.ts
+ create mode 100644 tests/hermes_cli/test_session_messages_after.py
+ create mode 100644 tests/tui_gateway/test_change_watcher_sessions_moved.py
+
+diff --git a/apps/desktop/electron/preload.ts b/apps/desktop/electron/preload.ts
+index 709e95aec4..555dc64943 100644
+--- a/apps/desktop/electron/preload.ts
++++ b/apps/desktop/electron/preload.ts
+@@ -76,7 +76,10 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
+     clear: () => ipcRenderer.send('hermes:transcript-cache:clear'),
+     stats: () => ipcRenderer.invoke('hermes:transcript-cache:stats'),
+     // [daveey] Fire-and-forget: warm an `@session`-referenced session before it is clicked.
+-    prefetch: key => ipcRenderer.send('hermes:transcript-cache:prefetch', key)
++    prefetch: key => ipcRenderer.send('hermes:transcript-cache:prefetch', key),
++    // [daveey] Fire-and-forget: a gateway socket's `sessions.moved` push, for main's background prefetcher.
++    sessionsMoved: (connectionId, sessions) =>
++      ipcRenderer.send('hermes:transcript-cache:sessions-moved', { connectionId, sessions })
+   },
+   getGatewayWsUrl: profile => ipcRenderer.invoke('hermes:gateway:ws-url', profile),
+   // Registry-scoped fresh WS URL: { connectionId, profile } → result shape of
+diff --git a/apps/desktop/electron/transcript-cache-client.ts b/apps/desktop/electron/transcript-cache-client.ts
+index 4416851b38..46b3392f5c 100644
+--- a/apps/desktop/electron/transcript-cache-client.ts
++++ b/apps/desktop/electron/transcript-cache-client.ts
+@@ -24,11 +24,13 @@ export const STORE_OPS = [
+   'meta',
+   'metaMany',
+   'migrateProfile',
++  'putAfter',
+   'putLatest',
+   'putOlder',
+   'read',
+   'setMeta',
+-  'stats'
++  'stats',
++  'tailId'
+ ] as const
+ 
+ export type StoreOp = (typeof STORE_OPS)[number]
+diff --git a/apps/desktop/electron/transcript-cache-host.test.ts b/apps/desktop/electron/transcript-cache-host.test.ts
+index 573f092c83..4f4f9aaa77 100644
+--- a/apps/desktop/electron/transcript-cache-host.test.ts
++++ b/apps/desktop/electron/transcript-cache-host.test.ts
+@@ -209,3 +209,68 @@ describe('[daveey] open Inbox cards in prefetch', () => {
+     expect(fetched[0]).toBe('card')
+   })
+ })
++
++describe('[daveey] sessions.moved push in the host', () => {
++  it('reads `?after_id=` deltas into the cache and falls back to the page on a gateway without the route', async () => {
++    const { getJson, host, on } = install()
++    let deltaRoute = false
++
++    getJson.mockImplementation(async (descriptor: any, requestPath: string) => {
++      if (requestPath.startsWith('/api/plugins/hub-sync/sessions')) {
++        return { sessions: [{ activity: 2, gateway: 'mini', id: 'm1', message_count: 1, profile: 'default' }] }
++      }
++
++      if (requestPath === '/api/plugins/hub-sync/status') {
++        return { gateway: descriptor.connectionId === 'local' ? 'macbook' : 'mini' }
++      }
++
++      if (requestPath.includes('after_id=') && deltaRoute) {
++        return {
++          delta: { anchor_found: true, has_more: false, transcript_revision: 4 },
++          messages: [{ content: 'two', id: 2, role: 'assistant' }],
++          session_id: 'm1'
++        }
++      }
++
++      return { messages: [{ content: 'one', id: 1, role: 'user' }] }
++    })
++
++    const key = { connectionId: 'mac-mini', profile: 'default', sessionId: 'm1' }
++
++    try {
++      await host.prefetcher.tick()
++      const moved = [{ activity: 3, id: 'm1', last_message_id: 2, message_count: 2, profile: 'default' }]
++
++      // Older core: no `delta` block in the answer, so the latest page is read and the route is not asked again.
++      await host.prefetcher.sessionsMoved('mac-mini', moved)
++      expect(getJson).toHaveBeenCalledWith(
++        { connectionId: 'mac-mini' },
++        '/api/sessions/m1/messages?after_id=1&limit=200&profile=default',
++        { timeoutMs: 30_000 }
++      )
++      expect(host.prefetcher.pushStats.full).toBe(1)
++
++      // A current core on a fresh host: first push learns the revision, the next applies the delta.
++      const fresh = install()
++      fresh.getJson.mockImplementation(getJson.getMockImplementation()!)
++      deltaRoute = true
++
++      try {
++        await fresh.host.prefetcher.tick()
++        await fresh.host.prefetcher.sessionsMoved('mac-mini', moved)
++        await fresh.host.prefetcher.sessionsMoved('mac-mini', [{ ...moved[0], last_message_id: 3 }])
++        expect(fresh.host.prefetcher.pushStats).toMatchObject({ delta: 1, full: 1 })
++        expect((await fresh.host.client.call<any>('read', [key])).messages.map((row: any) => row.id)).toEqual([1, 2])
++      } finally {
++        fresh.host.stop()
++      }
++
++      // The renderer's IPC lands on the prefetcher; '' names the registry primary.
++      const spy = vi.spyOn(host.prefetcher, 'sessionsMoved').mockResolvedValue()
++      on.get('hermes:transcript-cache:sessions-moved')!({}, { connectionId: '', sessions: moved })
++      expect(spy).toHaveBeenCalledWith('local', moved)
++    } finally {
++      host.stop()
++    }
++  })
++})
+diff --git a/apps/desktop/electron/transcript-cache-host.ts b/apps/desktop/electron/transcript-cache-host.ts
+index 8a35b08c67..775ead920e 100644
+--- a/apps/desktop/electron/transcript-cache-host.ts
++++ b/apps/desktop/electron/transcript-cache-host.ts
+@@ -17,6 +17,7 @@
+  *   hermes:transcript-cache:clear            send
+  *   hermes:transcript-cache:stats            invoke    -> {bytes, sessions}
+  *   hermes:transcript-cache:prefetch         send      {connectionId, profile, sessionId}  ([daveey] @session ref warm-up)
++ *   hermes:transcript-cache:sessions-moved   send      {connectionId, sessions}  ([daveey] a gateway's `sessions.moved` push)
+  */
+ import path from 'node:path'
+ 
+@@ -31,7 +32,7 @@ import {
+   type TranscriptCacheClient,
+   workerClient
+ } from './transcript-cache-client'
+-import { type HubSessionRecord, TranscriptPrefetcher } from './transcript-prefetch'
++import { type DeltaPage, type HubSessionRecord, TranscriptPrefetcher } from './transcript-prefetch'
+ 
+ export interface TranscriptCacheHostDeps {
+   /** Resolve the backend descriptor of a registry connection's default profile. */
+@@ -291,6 +292,32 @@ export function installTranscriptCache(deps: TranscriptCacheHostDeps) {
+   const prefetcher = new TranscriptPrefetcher({
+     connectionForGateway,
+     paused: deps.prefetchPaused,
++    // [daveey] Push delta: the rows after the cached tail. A gateway without the route answers a plain page with no
++    // `delta` block (an older core ignores the unknown query param): null, and the prefetcher stops asking it.
++    fetchAfter: async (key, afterId, limit): Promise<DeltaPage | null> => {
++      const descriptor = await deps.backendFor(key.connectionId, dialOptions(key.connectionId))
++      const query = new URLSearchParams({ after_id: String(afterId), limit: String(limit), profile: key.profile })
++
++      const page = await deps.getJson(
++        descriptor,
++        `/api/sessions/${encodeURIComponent(key.sessionId)}/messages?${query.toString()}`,
++        { timeoutMs: 30_000 }
++      )
++
++      const delta = page?.delta
++
++      if (!delta || typeof delta !== 'object' || !Array.isArray(page?.messages)) {
++        return null
++      }
++
++      return {
++        anchorFound: delta.anchor_found === true,
++        hasMore: delta.has_more === true,
++        messages: page.messages,
++        sessionId: typeof page.session_id === 'string' ? page.session_id : key.sessionId,
++        transcriptRevision: typeof delta.transcript_revision === 'number' ? delta.transcript_revision : null
++      }
++    },
+     fetchLatest: async (key, limit) => {
+       const descriptor = await deps.backendFor(key.connectionId, dialOptions(key.connectionId))
+ 
+@@ -333,7 +360,9 @@ export function installTranscriptCache(deps: TranscriptCacheHostDeps) {
+     store: {
+       meta: key => client.call('meta', [key]),
+       metaMany: keys => client.call('metaMany', [keys]),
+-      putLatest: (key, latest, meta) => client.call<boolean>('putLatest', [key, latest, meta])
++      putAfter: (key, anchorId, rows, meta) => client.call<boolean>('putAfter', [key, anchorId, rows, meta]),
++      putLatest: (key, latest, meta) => client.call<boolean>('putLatest', [key, latest, meta]),
++      tailId: key => client.call<null | number>('tailId', [key])
+     }
+   })
+ 
+@@ -346,6 +375,13 @@ export function installTranscriptCache(deps: TranscriptCacheHostDeps) {
+     }
+   })
+ 
++  // [daveey] A renderer forwards each gateway socket's `sessions.moved` frame; '' names the registry primary.
++  deps.ipcMain.on('hermes:transcript-cache:sessions-moved', (_event, payload) => {
++    const connectionId = String(payload?.connectionId ?? '').trim() || deps.registry().primary || 'local'
++
++    void prefetcher.sessionsMoved(connectionId, payload?.sessions)
++  })
++
+   return {
+     client,
+     prefetcher,
+diff --git a/apps/desktop/electron/transcript-cache.test.ts b/apps/desktop/electron/transcript-cache.test.ts
+index 45ba41a929..3b52ba3a22 100644
+--- a/apps/desktop/electron/transcript-cache.test.ts
++++ b/apps/desktop/electron/transcript-cache.test.ts
+@@ -5,7 +5,7 @@ import { DatabaseSync } from 'node:sqlite'
+ 
+ import { afterEach, describe, expect, it } from 'vitest'
+ 
+-import { LATEST_ROWS, mergeLatest, mergeOlder, TranscriptCacheStore } from './transcript-cache'
++import { LATEST_ROWS, mergeLatest, mergeOlder, tailRowId, TranscriptCacheStore } from './transcript-cache'
+ 
+ const rows = (from: number, to: number) =>
+   Array.from({ length: to - from + 1 }, (_, index) => ({
+@@ -286,3 +286,34 @@ describe('transcript cache: metadata never reads bodies', () => {
+     expect(store.meta(key('full'))).toBeNull()
+   })
+ })
++
++describe('[daveey] push deltas (putAfter)', () => {
++  it('extends the run past its tail, keeping the loaded older pages, and moves the meta', () => {
++    const store = new TranscriptCacheStore(':memory:')
++    store.putLatest(key('s'), rows(201, 400))
++    store.putOlder(key('s'), rows(101, 200))
++
++    expect(store.tailId(key('s'))).toBe(400)
++    expect(store.putAfter(key('s'), 400, rows(401, 403), { activity: 9, messageCount: 403 })).toBe(true)
++
++    const entry = store.read(key('s'))!
++    expect(entry.messages.map(row => (row as { id: number }).id)).toEqual(rows(101, 403).map(row => row.id))
++    expect(entry).toMatchObject({ activity: 9, messageCount: 403 })
++  })
++
++  it('refuses a delta whose anchor is no longer the tail, and a session with no run', () => {
++    const store = new TranscriptCacheStore(':memory:')
++    store.putLatest(key('s'), rows(1, 5))
++
++    expect(store.putAfter(key('s'), 4, rows(6, 6))).toBe(false)
++    expect(store.putAfter(key('none'), 4, rows(6, 6))).toBe(false)
++    expect(store.tailId(key('none'))).toBeNull()
++    expect(store.read(key('s'))!.messages).toHaveLength(5)
++  })
++
++  it('anchors only on a server row id', () => {
++    expect(tailRowId([{ id: 3 }, { id: '7' }])).toBe(7)
++    expect(tailRowId([{ id: 3 }, { role: 'user' }])).toBeNull()
++    expect(tailRowId([])).toBeNull()
++  })
++})
+diff --git a/apps/desktop/electron/transcript-cache.ts b/apps/desktop/electron/transcript-cache.ts
+index 4bed5e6308..05ed5dbf89 100644
+--- a/apps/desktop/electron/transcript-cache.ts
++++ b/apps/desktop/electron/transcript-cache.ts
+@@ -104,6 +104,15 @@ export function mergeLatest(cached: readonly unknown[], latest: readonly unknown
+   return at > 0 ? [...cached.slice(0, at), ...latest] : [...latest]
+ }
+ 
++/** [daveey] The server row id of a cached run's last row: the anchor a push delta (`?after_id=`) extends. Null when
++ *  the last row has no numeric id (a client-side row): such a run is only ever replaced by a latest page. */
++export function tailRowId(messages: readonly unknown[]): null | number {
++  const last = messages.at(-1) as Record<string, unknown> | undefined
++  const id = typeof last?.id === 'number' ? last.id : typeof last?.id === 'string' ? Number(last.id) : NaN
++
++  return Number.isSafeInteger(id) ? id : null
++}
++
+ /** An older page loaded above the cached run: prepend what the run does not already hold. */
+ export function mergeOlder(cached: readonly unknown[], older: readonly unknown[]): unknown[] {
+   if (cached.length === 0) {
+@@ -246,6 +255,31 @@ export class TranscriptCacheStore {
+     return this.write(key, mergeLatest(cached, latest.slice(-LATEST_ROWS)), meta)
+   }
+ 
++  /** [daveey] The cached run's last server row id (see tailRowId), or null when there is no run or no anchor. */
++  tailId(key: TranscriptCacheKey): null | number {
++    const current = this.read(key, { touch: false })
++
++    return current ? tailRowId(current.messages) : null
++  }
++
++  /**
++   * [daveey] Append a push delta: the rows the server holds after `anchorId`. Applies only while the cached run
++   * still ends at that row (another write since the delta was asked for, an open's latest page, means the delta
++   * no longer lines up: false, and the caller refetches the latest page). The meta moves to the delta's.
++   */
++  putAfter(key: TranscriptCacheKey, anchorId: number, rows: readonly unknown[], meta: TranscriptCacheMeta = {}): boolean {
++    const current = this.read(key, { touch: false })
++
++    if (!current || tailRowId(current.messages) !== anchorId || !Array.isArray(rows)) {
++      return false
++    }
++
++    const held = new Set(current.messages.map(messageIdentity))
++    const fresh = rows.filter(row => !held.has(messageIdentity(row)))
++
++    return this.write(key, [...current.messages, ...fresh], meta)
++  }
++
+   /** Store an older page the user loaded ("Show earlier"). Ignored without a cached run to extend. */
+   putOlder(key: TranscriptCacheKey, older: readonly unknown[]): boolean {
+     const current = this.read(key, { touch: false })
+diff --git a/apps/desktop/electron/transcript-prefetch-push.test.ts b/apps/desktop/electron/transcript-prefetch-push.test.ts
+new file mode 100644
+index 0000000000..417731faf6
+--- /dev/null
++++ b/apps/desktop/electron/transcript-prefetch-push.test.ts
+@@ -0,0 +1,492 @@
++/**
++ * [daveey] Push-driven transcript prefetch (`sessions.moved`): delta merge, fallbacks, coalescing, the listing
++ * safety-net cadence and older gateways. Runs against the real SQLite cache store (in memory) and a fake gateway
++ * that serves the same rows the REST routes would.
++ */
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++import { type TranscriptCacheKey, TranscriptCacheStore } from './transcript-cache'
++import {
++  type DeltaPage,
++  EARLY_PASS_MIN_MS,
++  type HubSessionRecord,
++  type MovedSession,
++  type PrefetchDeps,
++  PUSH_LIVE_MS,
++  SAFETY_NET_MS,
++  TranscriptPrefetcher
++} from './transcript-prefetch'
++
++interface Row {
++  content: string
++  id: number
++  role: string
++}
++
++/** One gateway's sessions as the REST routes serve them. */
++class FakeGateway {
++  rows = new Map<string, Row[]>()
++  revision = new Map<string, number>()
++  /** A session whose reads resolve to another stored id (a compression rotation). */
++  resolve = new Map<string, string>()
++  nextId = 1
++  latestCalls: string[] = []
++  afterCalls: { afterId: number; sessionId: string }[] = []
++  rowsServed = 0
++  afterSupported = true
++  gate: null | Promise<void> = null
++
++  append(sessionId: string, count = 1): MovedSession {
++    const rows = this.rows.get(sessionId) ?? []
++
++    for (let index = 0; index < count; index += 1) {
++      rows.push({ content: `${sessionId} #${this.nextId}`, id: this.nextId++, role: 'assistant' })
++    }
++
++    this.rows.set(sessionId, rows)
++
++    return this.moved(sessionId)
++  }
++
++  moved(sessionId: string, extra: Partial<MovedSession> = {}): MovedSession {
++    const rows = this.rows.get(sessionId) ?? []
++
++    return {
++      activity: rows.length,
++      id: sessionId,
++      last_message_id: rows.at(-1)?.id ?? null,
++      message_count: rows.length,
++      profile: 'default',
++      ...extra
++    }
++  }
++
++  // Both reads snapshot the store when the request arrives; `gate` holds only the reply (a slow link).
++  async fetchLatest(key: TranscriptCacheKey, limit: number): Promise<unknown[]> {
++    this.latestCalls.push(key.sessionId)
++    const rows = (this.rows.get(this.resolve.get(key.sessionId) ?? key.sessionId) ?? []).slice(-limit)
++    this.rowsServed += rows.length
++    await this.gate
++
++    return rows.map(row => ({ ...row }))
++  }
++
++  async fetchAfter(key: TranscriptCacheKey, afterId: number, limit: number): Promise<DeltaPage | null> {
++    this.afterCalls.push({ afterId, sessionId: key.sessionId })
++
++    if (!this.afterSupported) {
++      await this.gate
++
++      return null
++    }
++
++    const sessionId = this.resolve.get(key.sessionId) ?? key.sessionId
++    const rows = this.rows.get(sessionId) ?? []
++    const anchorFound = rows.some(row => row.id === afterId)
++    const after = anchorFound ? rows.filter(row => row.id > afterId) : []
++    const page = after.slice(0, limit)
++    this.rowsServed += page.length
++    const revision = this.revision.get(sessionId) ?? 0
++    await this.gate
++
++    return {
++      anchorFound,
++      hasMore: after.length > limit,
++      messages: page.map(row => ({ ...row })),
++      sessionId,
++      transcriptRevision: revision
++    }
++  }
++}
++
++const CONNECTION = 'hermes-hub'
++const keyFor = (sessionId: string): TranscriptCacheKey => ({ connectionId: CONNECTION, profile: 'default', sessionId })
++
++function setup(options: { records?: () => HubSessionRecord[] | null; withDelta?: boolean } = {}) {
++  let now = 1_000_000
++  const gateway = new FakeGateway()
++  const store = new TranscriptCacheStore(':memory:', { now: () => now })
++  const listings: number[] = []
++
++  const deps: PrefetchDeps = {
++    connectionForGateway: name => (name === 'hub' ? CONNECTION : undefined),
++    fetchLatest: (key, limit) => gateway.fetchLatest(key, limit),
++    listHubSessions: async () => {
++      listings.push(now)
++
++      return options.records?.() ?? []
++    },
++    now: () => now,
++    store: {
++      meta: key => store.meta(key),
++      metaMany: keys => keys.map(key => store.meta(key)),
++      putAfter: (key, anchorId, rows, meta) => store.putAfter(key, anchorId, rows, meta),
++      putLatest: (key, rows, meta) => store.putLatest(key, rows, meta),
++      tailId: key => store.tailId(key)
++    }
++  }
++
++  if (options.withDelta !== false) {
++    deps.fetchAfter = (key, afterId, limit) => gateway.fetchAfter(key, afterId, limit)
++  }
++
++  const prefetcher = new TranscriptPrefetcher(deps)
++
++  return {
++    advance: (ms: number) => {
++      now += ms
++    },
++    cachedIds: (sessionId: string) =>
++      (store.read(keyFor(sessionId))?.messages ?? []).map(message => (message as Row).id),
++    gateway,
++    listings,
++    now: () => now,
++    prefetcher,
++    push: (...sessions: MovedSession[]) => prefetcher.sessionsMoved(CONNECTION, sessions),
++    store
++  }
++}
++
++/** Seed a cached session whose revision the prefetcher has learnt (its first push refetched the page). */
++async function warm(env: ReturnType<typeof setup>, sessionId: string, rows = 3) {
++  env.gateway.append(sessionId, rows)
++  env.store.putLatest(keyFor(sessionId), await env.gateway.fetchLatest(keyFor(sessionId), 200))
++  await env.push(env.gateway.append(sessionId))
++  env.gateway.latestCalls.length = 0
++  env.gateway.afterCalls.length = 0
++}
++
++afterEach(() => {
++  vi.useRealTimers()
++})
++
++describe('push delta merge', () => {
++  it('appends only the rows after the cached tail, with no latest-page fetch', async () => {
++    const env = setup()
++    await warm(env, 'chat')
++    const before = env.cachedIds('chat')
++
++    await env.push(env.gateway.append('chat', 2))
++
++    expect(env.gateway.latestCalls).toEqual([])
++    expect(env.gateway.afterCalls).toEqual([{ afterId: before.at(-1), sessionId: 'chat' }])
++    expect(env.cachedIds('chat')).toEqual((env.gateway.rows.get('chat') ?? []).map(row => row.id))
++    expect(env.store.meta(keyFor('chat'))).toMatchObject({ messageCount: 6 })
++    expect(env.prefetcher.pushStats.delta).toBe(1)
++  })
++
++  it('learns the revision on the first push of a cached session and refetches that once', async () => {
++    const env = setup()
++    env.gateway.append('chat', 3)
++    env.store.putLatest(keyFor('chat'), await env.gateway.fetchLatest(keyFor('chat'), 200))
++    env.gateway.latestCalls.length = 0
++
++    await env.push(env.gateway.append('chat'))
++    await env.push(env.gateway.append('chat'))
++
++    // The cache predates anything the prefetcher saw: one latest page, then deltas.
++    expect(env.gateway.latestCalls).toEqual(['chat'])
++    expect(env.prefetcher.pushStats).toMatchObject({ delta: 1, full: 1 })
++    expect(env.cachedIds('chat')).toEqual((env.gateway.rows.get('chat') ?? []).map(row => row.id))
++  })
++
++  it('skips a push whose rows the cache already holds', async () => {
++    const env = setup()
++    await warm(env, 'chat')
++
++    await env.push(env.gateway.moved('chat'))
++
++    expect(env.gateway.afterCalls).toEqual([])
++    expect(env.prefetcher.pushStats.current).toBe(1)
++  })
++})
++
++describe('push fallbacks to the latest page', () => {
++  it.each([
++    [
++      'an in-place edit (revision moved)',
++      (gateway: FakeGateway) => {
++        gateway.rows.get('chat')![0].content = 'edited'
++        gateway.revision.set('chat', 1)
++      }
++    ],
++    [
++      'a compaction or rewind (the anchor row is gone)',
++      (gateway: FakeGateway) => {
++        gateway.rows.set('chat', gateway.rows.get('chat')!.slice(0, -1))
++      }
++    ],
++    [
++      'a gap (more rows than one page)',
++      (gateway: FakeGateway) => {
++        gateway.append('chat', 250)
++      }
++    ],
++    [
++      'a rotation to a new stored id',
++      (gateway: FakeGateway) => {
++        gateway.rows.set('chat-child', [{ content: 'continued', id: gateway.nextId++, role: 'user' }])
++        gateway.resolve.set('chat', 'chat-child')
++      }
++    ]
++  ])('%s', async (_name, change) => {
++    const env = setup()
++    await warm(env, 'chat')
++
++    change(env.gateway)
++    await env.push(env.gateway.moved('chat', { last_message_id: env.gateway.nextId }))
++
++    expect(env.gateway.latestCalls).toEqual(['chat'])
++    expect(env.prefetcher.pushStats.full).toBe(2) // the warm-up's first page, then this fallback
++    const served = await env.gateway.fetchLatest(keyFor('chat'), 200)
++    expect(env.store.read(keyFor('chat'))?.messages).toEqual(served)
++  })
++
++  it('a cache rewritten under the delta (an open stored a newer page) refetches instead of stitching', async () => {
++    const env = setup()
++    await warm(env, 'chat')
++    const moved = env.gateway.append('chat')
++    const original = env.store.putAfter.bind(env.store)
++
++    // The open's latest page lands between the delta read and its apply.
++    env.store.putAfter = (key, anchor, rows, meta) => {
++      env.store.putLatest(key, [{ content: 'local', id: 'client-row', role: 'user' }])
++
++      return original(key, anchor, rows, meta)
++    }
++
++    await env.push(moved)
++
++    expect(env.gateway.latestCalls).toEqual(['chat'])
++  })
++})
++
++describe('push coalescing', () => {
++  it('keeps one fetch in flight and one queued per session, the queued one the newest', async () => {
++    const env = setup()
++    await warm(env, 'chat')
++    let release!: () => void
++    env.gateway.gate = new Promise(resolve => (release = resolve))
++
++    const first = env.push(env.gateway.append('chat'))
++    await vi.waitFor(() => expect(env.gateway.afterCalls).toHaveLength(1)) // its read is on the wire
++    const pushes = [first, ...[2, 3, 4, 5].map(() => env.push(env.gateway.append('chat')))]
++    await new Promise(resolve => setTimeout(resolve, 0))
++    release()
++    env.gateway.gate = null
++    await Promise.all(pushes)
++
++    expect(env.gateway.afterCalls).toHaveLength(2)
++    expect(env.prefetcher.pushStats.coalesced).toBe(3)
++    expect(env.cachedIds('chat')).toEqual((env.gateway.rows.get('chat') ?? []).map(row => row.id))
++  })
++
++  it('runs different sessions side by side', async () => {
++    const env = setup()
++    await warm(env, 'a')
++    await warm(env, 'b')
++
++    await env.push(env.gateway.append('a'), env.gateway.append('b'))
++
++    expect(env.gateway.afterCalls.map(call => call.sessionId).sort()).toEqual(['a', 'b'])
++  })
++})
++
++describe('tracked set', () => {
++  it('ignores an unknown session but lists early (at most every EARLY_PASS_MIN_MS) so it is fetched', async () => {
++    vi.useFakeTimers()
++    const env = setup()
++    env.prefetcher.start(5_000)
++    await vi.advanceTimersByTimeAsync(0)
++    const listingsBefore = env.listings.length
++
++    await env.push(env.gateway.append('stranger'))
++    await env.push(env.gateway.append('stranger'))
++
++    expect(env.gateway.afterCalls).toEqual([])
++    expect(env.prefetcher.pushStats.unknown).toBe(2)
++    await vi.advanceTimersByTimeAsync(EARLY_PASS_MIN_MS)
++    expect(env.prefetcher.pushStats.earlyPasses).toBe(1)
++    expect(env.listings.length).toBeGreaterThan(listingsBefore)
++    env.prefetcher.stop()
++  })
++
++  it('treats a compression child of a cached session as tracked', async () => {
++    const env = setup()
++    await warm(env, 'chat')
++    env.gateway.rows.set('chat-child', [{ content: 'continued', id: env.gateway.nextId++, role: 'user' }])
++
++    await env.push(env.gateway.moved('chat-child', { parent_session_id: 'chat' }))
++
++    expect(env.gateway.latestCalls).toEqual(['chat-child'])
++    expect(env.cachedIds('chat-child')).toHaveLength(1)
++  })
++
++  it('tracks a listing target that is not cached yet', async () => {
++    const env = setup({ records: () => [{ activity: 1, gateway: 'hub', id: 'listed', message_count: 1 }] })
++    env.gateway.append('listed')
++    await env.prefetcher.tick()
++    env.store.drop(keyFor('listed')) // (fetched by the pass; dropped to prove the target set alone tracks it)
++    env.gateway.latestCalls.length = 0
++
++    await env.push(env.gateway.append('listed'))
++
++    expect(env.gateway.latestCalls).toEqual(['listed'])
++  })
++})
++
++describe('listing safety-net cadence', () => {
++  const records = () => [{ activity: 1, gateway: 'hub', id: 'chat', message_count: 1 }] as HubSessionRecord[]
++
++  it('lists every tick for a gateway that never pushes (older core)', async () => {
++    const env = setup({ records })
++
++    for (let tick = 0; tick < 12; tick += 1) {
++      await env.prefetcher.tick()
++      env.advance(5_000)
++    }
++
++    expect(env.listings).toHaveLength(12)
++  })
++
++  it('drops to one listing per SAFETY_NET_MS while the gateway pushes, and back to every tick when pushes stop', async () => {
++    const env = setup({ records })
++    env.gateway.append('chat')
++    await env.prefetcher.tick() // caches 'chat'
++    await env.push(env.gateway.append('chat'))
++    const start = env.listings.length
++
++    // Two minutes of 5 s ticks while pushes keep arriving.
++    for (let tick = 0; tick < 24; tick += 1) {
++      env.advance(5_000)
++      await env.push(env.gateway.append('chat'))
++      await env.prefetcher.tick()
++    }
++
++    expect(env.listings.length - start).toBe(2) // 120 s / SAFETY_NET_MS
++
++    // Pushes stop: once the connection is no longer push-live, every tick lists again.
++    env.advance(PUSH_LIVE_MS)
++    const quiet = env.listings.length
++
++    for (let tick = 0; tick < 4; tick += 1) {
++      await env.prefetcher.tick()
++      env.advance(5_000)
++    }
++
++    expect(env.listings.length - quiet).toBe(4)
++    expect(SAFETY_NET_MS).toBe(60_000)
++  })
++
++  it('still fetches a never-cached target of a push-live gateway on a pass between safety nets', async () => {
++    let list: HubSessionRecord[] = [{ activity: 1, gateway: 'hub', id: 'old', message_count: 1 }]
++    const env = setup({ records: () => list })
++    env.gateway.append('old')
++    await env.prefetcher.tick()
++    await env.push(env.gateway.append('old'))
++    env.gateway.latestCalls.length = 0
++
++    env.gateway.append('new')
++    list = [...list, { activity: 2, gateway: 'hub', id: 'new', message_count: 1 }]
++    env.advance(5_000)
++    await env.prefetcher.tick({ force: true }) // the early pass an unknown push asks for
++
++    expect(env.gateway.latestCalls).toEqual(['new'])
++  })
++})
++
++describe('older gateway', () => {
++  it('without the after_id route a push refetches the latest page and stops asking for deltas', async () => {
++    const env = setup()
++    env.gateway.afterSupported = false
++    env.gateway.append('chat', 2)
++    env.store.putLatest(keyFor('chat'), await env.gateway.fetchLatest(keyFor('chat'), 200))
++    env.gateway.latestCalls.length = 0
++
++    await env.push(env.gateway.append('chat'))
++    await env.push(env.gateway.append('chat'))
++
++    expect(env.gateway.afterCalls).toHaveLength(1)
++    expect(env.gateway.latestCalls).toEqual(['chat', 'chat'])
++    expect(env.cachedIds('chat')).toEqual((env.gateway.rows.get('chat') ?? []).map(row => row.id))
++  })
++
++  it('a renderer with no delta dep at all (older main wiring) still refetches pages', async () => {
++    const env = setup({ withDelta: false })
++    await warm(env, 'chat')
++
++    await env.push(env.gateway.append('chat'))
++
++    expect(env.gateway.latestCalls).toEqual(['chat'])
++  })
++})
++
++describe('measurement: one streaming turn', () => {
++  /**
++   * A 60 s turn appends a row every 500 ms. Before: the 5 s listing pass sees the hub's (held, up to 30 s behind)
++   * activity move and refetches the latest page at most once per MIN_REFETCH_MS. After: the gateway pushes once
++   * a second and the cache takes each delta. Counts fetches, rows transferred and how far the cache trailed.
++   */
++  async function simulate(push: boolean) {
++    const HUB_HOLD_MS = 30_000
++    let hubSeen = { activity: 0, at: 0, count: 0 }
++
++    const env = setup({
++      records: () => [{ activity: hubSeen.activity, gateway: 'hub', id: 'turn', message_count: hubSeen.count }]
++    })
++
++    env.gateway.append('turn', 20)
++    hubSeen = { activity: 20, at: env.now(), count: 20 }
++    await env.prefetcher.tick()
++
++    if (push) {
++      await env.push(env.gateway.append('turn')) // first push: learns the revision (one page)
++    }
++
++    env.gateway.latestCalls.length = 0
++    env.gateway.afterCalls.length = 0
++    env.gateway.rowsServed = 0
++    let maxLag = 0
++    const start = env.now()
++
++    for (let ms = 500; ms <= 60_000; ms += 500) {
++      env.advance(500)
++      const moved = env.gateway.append('turn')
++
++      // The hub replica publishes a liveness move at most once per hold window.
++      if (env.now() - hubSeen.at >= HUB_HOLD_MS) {
++        hubSeen = { activity: moved.activity ?? 0, at: env.now(), count: moved.message_count ?? 0 }
++      }
++
++      if (push && ms % 1_000 === 0) {
++        await env.push(moved)
++      }
++
++      if ((env.now() - start) % 5_000 === 0) {
++        await env.prefetcher.tick()
++      }
++
++      const served = env.gateway.rows.get('turn')!.length
++      const cached = env.cachedIds('turn').length
++      maxLag = Math.max(maxLag, served - cached)
++    }
++
++    return {
++      deltaFetches: env.gateway.afterCalls.length,
++      latestPageFetches: env.gateway.latestCalls.length,
++      maxRowsBehind: maxLag,
++      rowsTransferred: env.gateway.rowsServed
++    }
++  }
++
++  it('reports fetches before/after and keeps the cache within a second of the turn', async () => {
++    const before = await simulate(false)
++    const after = await simulate(true)
++    console.log(`[transcript-push measurement] 60 s turn, 1 row / 500 ms: before=${JSON.stringify(before)} after=${JSON.stringify(after)}`)
++
++    expect(after.latestPageFetches).toBe(0)
++    expect(after.maxRowsBehind).toBeLessThanOrEqual(2) // at most one push window (1 s = 2 rows)
++    expect(before.maxRowsBehind).toBeGreaterThan(after.maxRowsBehind)
++    expect(after.rowsTransferred).toBeLessThan(before.rowsTransferred)
++  })
++})
+diff --git a/apps/desktop/electron/transcript-prefetch.ts b/apps/desktop/electron/transcript-prefetch.ts
+index 2b29ed9ed0..19459967e7 100644
+--- a/apps/desktop/electron/transcript-prefetch.ts
++++ b/apps/desktop/electron/transcript-prefetch.ts
+@@ -8,6 +8,16 @@
+  * was taken against a different activity/message_count. So a click on any of them
+  * paints from the local cache, and a session that moved is refetched on the next
+  * tick. All I/O is injected; electron/main.ts wires it to ensureRegistryBackend.
++ *
++ * Push (`sessions.moved`, the gateway's change watcher): a renderer forwards each frame
++ * here (sessionsMoved). Every named session this prefetcher tracks (a listing target, or
++ * already cached) fetches only the rows after its cached tail (`?after_id=`), at once and
++ * with no MIN_REFETCH_MS throttle: one fetch in flight and one queued per session. A delta
++ * that does not line up (anchor row gone, a gap, a rotation, an in-place rewrite since the
++ * last full page) refetches the latest page instead. While a gateway pushes, the listing
++ * pass is only a SAFETY_NET_MS backstop for it; a gateway that never pushes (older core,
++ * no socket open) keeps the 5 s pass. A moved session the prefetcher does not know asks
++ * for an early listing pass.
+  */
+ import { LATEST_ROWS, type TranscriptCacheKey, type TranscriptCacheMeta } from './transcript-cache'
+ 
+@@ -23,6 +33,14 @@ export const DEMAND_QUEUE_MAX = 50
+ /** [daveey] A cached session the hub listing does not cover is refetched on demand at most this often. */
+ export const UNLISTED_REFETCH_MS = 10 * 60_000
+ const DEMAND_MISSED_MAX = 500
++/** [daveey] A connection that delivered `sessions.moved` within this long is push-live: its listing pass is a backstop. */
++export const PUSH_LIVE_MS = 5 * 60_000
++/** [daveey] How often the listing pass still refreshes a push-live gateway's cached sessions. */
++export const SAFETY_NET_MS = 60_000
++/** [daveey] A pushed session the prefetcher does not know triggers a listing pass, at most this often. */
++export const EARLY_PASS_MIN_MS = 5_000
++/** [daveey] Transcript revisions remembered (one per pushed session), oldest forgotten first. */
++const REVISIONS_MAX = 2_000
+ 
+ export interface HubSessionRecord {
+   activity?: null | number
+@@ -49,6 +67,28 @@ export interface PrefetchTarget {
+ type CachedMeta = { activity: null | number; messageCount: null | number; savedAt: number } | null
+ type MaybePromise<T> = Promise<T> | T
+ 
++/** [daveey] One `sessions.moved` entry (gateway contract SessionsMovedEntry). */
++export interface MovedSession {
++  activity?: null | number
++  id: string
++  last_message_id?: null | number
++  message_count?: null | number
++  parent_session_id?: null | string
++  profile?: null | string
++}
++
++/** [daveey] `GET /api/sessions/{id}/messages?after_id=` as the prefetcher reads it. */
++export interface DeltaPage {
++  anchorFound: boolean
++  hasMore: boolean
++  messages: unknown[]
++  sessionId: string
++  transcriptRevision: null | number
++}
++
++/** What one push-triggered fetch did. */
++export type PushOutcome = 'backoff' | 'current' | 'delta' | 'empty' | 'failed' | 'full'
++
+ /**
+  * The cache as the prefetcher sees it. Every call may be asynchronous: Desktop runs the SQLite store on a worker
+  * thread (transcript-cache-client.ts), because a write that waits on the disk froze Electron's main loop for
+@@ -57,12 +97,23 @@ type MaybePromise<T> = Promise<T> | T
+ export interface PrefetchStore {
+   meta(key: TranscriptCacheKey): MaybePromise<CachedMeta>
+   metaMany?(keys: readonly TranscriptCacheKey[]): MaybePromise<CachedMeta[]>
++  /** [daveey] Append a push delta after `anchorId` (false: the cached run no longer ends there). */
++  putAfter?(
++    key: TranscriptCacheKey,
++    anchorId: number,
++    rows: readonly unknown[],
++    meta?: TranscriptCacheMeta
++  ): MaybePromise<boolean>
+   putLatest(key: TranscriptCacheKey, latest: readonly unknown[], meta?: TranscriptCacheMeta): MaybePromise<boolean>
++  /** [daveey] The cached run's last server row id, or null (no run / no anchor). */
++  tailId?(key: TranscriptCacheKey): MaybePromise<null | number>
+ }
+ 
+ export interface PrefetchDeps {
+   /** Registry connection id of a hub gateway name, or undefined (unregistered gateway). */
+   connectionForGateway: (gateway: string) => Promise<string | undefined> | string | undefined
++  /** [daveey] The rows after `afterId` (push delta), or null when the gateway has no such route (older core). */
++  fetchAfter?: (key: TranscriptCacheKey, afterId: number, limit: number) => Promise<DeltaPage | null>
+   /** Latest `limit` raw display rows of one session (chronological). */
+   fetchLatest: (key: TranscriptCacheKey, limit: number) => Promise<unknown[]>
+   listHubSessions: () => Promise<HubSessionRecord[] | null>
+@@ -190,15 +241,36 @@ export class TranscriptPrefetcher {
+   private running: null | Promise<PrefetchTickResult> = null
+   private timer: null | ReturnType<typeof setTimeout> = null
+   private stopped = true
++  /** [daveey] Push state: when each connection last pushed, when its safety-net pass last ran. */
++  private readonly pushSeenAt = new Map<string, number>()
++  private readonly safetyNetAt = new Map<string, number>()
++  /** Connections the last listing pass mapped a gateway to. */
++  private readonly listedConnections = new Set<string>()
++  /** keyString of every target of the last listing pass (the tracked set, with the cache). */
++  private readonly targetKeys = new Set<string>()
++  /** Per session: the push fetch in flight and the newest entry queued behind it. */
++  private readonly pushLanes = new Map<string, { done: Promise<void>; queued: MovedSession | null }>()
++  /** Transcript revision each session's cached run was last made whole at (a latest page or a clean delta). */
++  private readonly revisions = new Map<string, null | number>()
++  /** Connections whose gateway has no `after_id` route: pushes there refetch the latest page. */
++  private readonly deltaUnsupported = new Set<string>()
++  private lastListingAt = Number.NEGATIVE_INFINITY
++  private earlyPassTimer: null | ReturnType<typeof setTimeout> = null
++  /** [daveey] Push work counted for logs and measurement. */
++  readonly pushStats = { coalesced: 0, current: 0, delta: 0, earlyPasses: 0, failed: 0, full: 0, unknown: 0 }
+ 
+   constructor(deps: PrefetchDeps) {
+     this.deps = deps
+   }
+ 
+-  /** One pass; concurrent calls share the pass in flight. */
+-  tick(): Promise<PrefetchTickResult> {
++  private now(): number {
++    return this.deps.now?.() ?? Date.now()
++  }
++
++  /** One pass; concurrent calls share the pass in flight. `force` lists even while every gateway pushes. */
++  tick(options: { force?: boolean } = {}): Promise<PrefetchTickResult> {
+     if (!this.running) {
+-      this.running = this.pass().finally(() => {
++      this.running = this.pass(Boolean(options.force)).finally(() => {
+         this.running = null
+       })
+     }
+@@ -206,6 +278,237 @@ export class TranscriptPrefetcher {
+     return this.running
+   }
+ 
++  /** [daveey] Whether `connectionId` pushed `sessions.moved` recently enough to trust its pushes. */
++  isPushLive(connectionId: string, now: number = this.now()): boolean {
++    return now - (this.pushSeenAt.get(connectionId) ?? Number.NEGATIVE_INFINITY) < PUSH_LIVE_MS
++  }
++
++  /**
++   * [daveey] A `sessions.moved` frame from `connectionId`'s gateway. Each named session this prefetcher tracks
++   * fetches the rows after its cached tail now; an unknown one asks for an early listing pass. Resolves when the
++   * fetches it started (or queued behind) are done. Never throws.
++   */
++  async sessionsMoved(connectionId: string, sessions: unknown): Promise<void> {
++    try {
++      await this.handleMoved(String(connectionId ?? '').trim(), sessions)
++    } catch (error) {
++      this.deps.log?.(`transcript push skipped: ${(error as Error)?.message || error}`)
++    }
++  }
++
++  private async handleMoved(connectionId: string, sessions: unknown): Promise<void> {
++    if (!connectionId || !Array.isArray(sessions)) {
++      return
++    }
++
++    this.pushSeenAt.set(connectionId, this.now())
++
++    const entries = sessions.filter(
++      (entry): entry is MovedSession => typeof entry?.id === 'string' && entry.id.trim() !== ''
++    )
++
++    if (entries.length === 0) {
++      return
++    }
++
++    const keyOf = (sessionId: string, profile: unknown): TranscriptCacheKey => ({
++      connectionId,
++      profile: profileOf(profile),
++      sessionId
++    })
++
++    const keys = entries.map(entry => keyOf(entry.id, entry.profile))
++    // A compression child continues its parent: it is tracked when the parent is.
++    const parents = entries.map(entry => (entry.parent_session_id ? keyOf(entry.parent_session_id, entry.profile) : null))
++    const lookups = [...keys, ...parents.filter((key): key is TranscriptCacheKey => key !== null)]
++    const { store } = this.deps
++
++    const metas = store.metaMany
++      ? await store.metaMany(lookups)
++      : await Promise.all(lookups.map(key => store.meta(key)))
++
++    const cached = new Set(lookups.filter((_key, index) => metas[index]).map(keyString))
++    const tracked = (key: null | TranscriptCacheKey) => Boolean(key) && (cached.has(keyString(key!)) || this.targetKeys.has(keyString(key!)))
++    const work: Promise<void>[] = []
++    let unknown = false
++
++    entries.forEach((entry, index) => {
++      if (tracked(keys[index]) || tracked(parents[index])) {
++        work.push(this.enqueuePush(keys[index], entry))
++      } else {
++        unknown = true
++        this.pushStats.unknown += 1
++      }
++    })
++
++    if (unknown) {
++      this.requestEarlyPass()
++    }
++
++    await Promise.all(work)
++  }
++
++  /** One fetch in flight per session and the newest entry queued behind it (older queued entries are superseded). */
++  private enqueuePush(key: TranscriptCacheKey, entry: MovedSession): Promise<void> {
++    const id = keyString(key)
++    const lane = this.pushLanes.get(id)
++
++    if (lane) {
++      if (lane.queued) {
++        this.pushStats.coalesced += 1
++      }
++
++      lane.queued = entry
++
++      return lane.done
++    }
++
++    const fresh: { done: Promise<void>; queued: MovedSession | null } = { done: Promise.resolve(), queued: null }
++
++    fresh.done = (async () => {
++      let next: MovedSession | null = entry
++
++      try {
++        while (next) {
++          const current: MovedSession = next
++          fresh.queued = null
++          const outcome = await this.applyPush(key, current)
++          this.pushStats[outcome === 'empty' || outcome === 'backoff' ? 'failed' : outcome] += 1
++          next = fresh.queued
++        }
++      } finally {
++        this.pushLanes.delete(id)
++      }
++    })()
++
++    this.pushLanes.set(id, fresh)
++
++    return fresh.done
++  }
++
++  private rememberRevision(id: string, revision: null | number | undefined): void {
++    this.revisions.delete(id)
++
++    if (revision === undefined) {
++      return
++    }
++
++    this.revisions.set(id, revision)
++
++    for (const stale of this.revisions.keys()) {
++      if (this.revisions.size <= REVISIONS_MAX) {
++        break
++      }
++
++      this.revisions.delete(stale)
++    }
++  }
++
++  /**
++   * Bring one session's cached run up to `entry`: the rows after its tail when they line up, else the latest page.
++   * The delta read also learns the session's transcript revision BEFORE any latest page is read, so a later delta
++   * can tell an in-place rewrite of a row it already holds (it refetches the page then).
++   */
++  private async applyPush(key: TranscriptCacheKey, entry: MovedSession): Promise<PushOutcome> {
++    const { connectionId } = key
++
++    if ((this.downUntil.get(connectionId) ?? 0) > this.now()) {
++      return 'backoff'
++    }
++
++    const meta = { activity: entry.activity ?? null, messageCount: entry.message_count ?? null }
++
++    try {
++      const delta = await this.tryDelta(key, entry, meta)
++
++      return delta.outcome ?? (await this.refetchLatest(key, meta, delta.revision, delta.reason))
++    } catch (error) {
++      if (isGatewayFailure(error)) {
++        this.downUntil.set(connectionId, this.now() + GATEWAY_BACKOFF_MS)
++        this.deps.log?.(`transcript push: ${connectionId} unreachable (${(error as Error)?.message || error}); backing off`)
++      }
++
++      this.rememberRevision(keyString(key), undefined)
++
++      return 'failed'
++    }
++  }
++
++  /** The delta half of applyPush: an outcome when it settled the push, else why the latest page is needed. */
++  private async tryDelta(
++    key: TranscriptCacheKey,
++    entry: MovedSession,
++    meta: TranscriptCacheMeta
++  ): Promise<{ outcome?: PushOutcome; reason: string; revision?: null | number }> {
++    const { fetchAfter, store } = this.deps
++
++    if (!fetchAfter || !store.tailId || !store.putAfter || this.deltaUnsupported.has(key.connectionId)) {
++      return { reason: 'no delta route' }
++    }
++
++    const anchor = await store.tailId(key)
++
++    if (anchor !== null && typeof entry.last_message_id === 'number' && entry.last_message_id <= anchor) {
++      return { outcome: 'current', reason: '' } // this run already holds the pushed rows (a page read past them)
++    }
++
++    // No cached anchor: after_id=0 matches no row, so the read only learns the revision.
++    const page = await fetchAfter(key, anchor ?? 0, LATEST_ROWS)
++
++    if (page === null) {
++      this.deltaUnsupported.add(key.connectionId)
++
++      return { reason: 'no delta route' }
++    }
++
++    const id = keyString(key)
++    const reason = deltaMismatch(anchor, page, key.sessionId, this.revisions.has(id) ? this.revisions.get(id) : undefined)
++
++    if (!reason && anchor !== null && (await store.putAfter(key, anchor, page.messages, meta))) {
++      this.rememberRevision(id, page.transcriptRevision)
++
++      return { outcome: 'delta', reason: '' }
++    }
++
++    return { reason: reason || 'cache moved under the delta', revision: page.transcriptRevision }
++  }
++
++  private async refetchLatest(
++    key: TranscriptCacheKey,
++    meta: TranscriptCacheMeta,
++    revision: null | number | undefined,
++    reason: string
++  ): Promise<PushOutcome> {
++    const rows = await this.deps.fetchLatest(key, LATEST_ROWS)
++
++    if (rows.length === 0 || !(await this.deps.store.putLatest(key, rows, meta))) {
++      return 'empty'
++    }
++
++    this.rememberRevision(keyString(key), revision)
++    this.deps.log?.(`transcript push: ${key.connectionId}/${key.profile}/${key.sessionId} latest page (${reason})`)
++
++    return 'full'
++  }
++
++  /** A pushed session no pass has listed yet: list soon (at most every EARLY_PASS_MIN_MS) so it is fetched. */
++  private requestEarlyPass(): void {
++    if (this.stopped || this.earlyPassTimer) {
++      return
++    }
++
++    const wait = Math.max(0, this.lastListingAt + EARLY_PASS_MIN_MS - this.now())
++
++    this.earlyPassTimer = setTimeout(() => {
++      this.earlyPassTimer = null
++      this.pushStats.earlyPasses += 1
++      void this.tick({ force: true }).catch(error =>
++        this.deps.log?.(`transcript prefetch early pass failed: ${(error as Error)?.message || error}`)
++      )
++    }, wait)
++    this.earlyPassTimer.unref?.()
++  }
++
+   /**
+    * [daveey] Warm one session the renderer is about to open (an `@session` ref chip rendered or was hovered).
+    * Such refs mostly point at old sessions outside the PER_GATEWAY window, so without this the first click waited
+@@ -394,11 +697,74 @@ export class TranscriptPrefetcher {
+       clearTimeout(this.timer)
+       this.timer = null
+     }
++
++    if (this.earlyPassTimer) {
++      clearTimeout(this.earlyPassTimer)
++      this.earlyPassTimer = null
++    }
+   }
+ 
+-  private async pass(): Promise<PrefetchTickResult> {
++  /** [daveey] A push-live connection whose safety-net window has not elapsed: its cached sessions wait for pushes. */
++  private netHeld(connectionId: string, now: number): boolean {
++    return (
++      this.isPushLive(connectionId, now) &&
++      now - (this.safetyNetAt.get(connectionId) ?? Number.NEGATIVE_INFINITY) < SAFETY_NET_MS
++    )
++  }
++
++  private listingHeld(now: number): boolean {
++    return (
++      this.listedConnections.size > 0 &&
++      [...this.listedConnections].every(connectionId => this.netHeld(connectionId, now))
++    )
++  }
++
++  /**
++   * [daveey] Remember a pass's targets as the tracked set and return the push-live connections it is NOT the safety
++   * net for (their cached sessions wait for pushes); the rest of the push-live ones restart their window now.
++   */
++  private trackTargets(targets: readonly PrefetchTarget[], now: number): Set<string> {
++    this.listedConnections.clear()
++    this.targetKeys.clear()
++
++    for (const target of targets) {
++      this.listedConnections.add(target.key.connectionId)
++      this.targetKeys.add(keyString(target.key))
++    }
++
++    const held = new Set([...this.listedConnections].filter(connectionId => this.netHeld(connectionId, now)))
++
++    for (const connectionId of this.listedConnections) {
++      if (!held.has(connectionId) && this.isPushLive(connectionId, now)) {
++        this.safetyNetAt.set(connectionId, now)
++      }
++    }
++
++    return held
++  }
++
++  /** A target this pass fetches: moved per the listing, unless its gateway pushes it (a never-cached one is fetched
++   *  regardless: nothing pushes a session in). */
++  private passDue(target: PrefetchTarget, cached: CachedMeta, held: ReadonlySet<string>, now: number): boolean {
++    if (cached && held.has(target.key.connectionId)) {
++      return false
++    }
++
++    return needsRefresh(cached ?? this.unstored.get(keyString(target.key)) ?? null, target, now)
++  }
++
++  private async pass(force = false): Promise<PrefetchTickResult> {
+     const now = this.deps.now?.() ?? Date.now()
+     const result: PrefetchTickResult = { failed: 0, fetched: 0, skipped: 0, targets: 0 }
++
++    // [daveey] Every gateway the last listing saw pushes and none is due its safety net: nothing to list for.
++    if (!force && this.listingHeld(now)) {
++      result.listed = false
++
++      return result
++    }
++
++    this.lastListingAt = now
+     const records = await this.deps.listHubSessions()
+ 
+     if (!records) {
+@@ -420,6 +786,8 @@ export class TranscriptPrefetcher {
+     const targets = selectPrefetchTargets(records, gateway => names.get(gateway))
+     result.targets = targets.length
+ 
++    const held = this.trackTargets(targets, now)
++
+     // [daveey] Every listed session's hub meta (not just the targets), for on-demand freshness checks.
+     this.listed.clear()
+ 
+@@ -449,9 +817,7 @@ export class TranscriptPrefetcher {
+     const { store } = this.deps
+     const cached = store.metaMany ? await store.metaMany(keys) : await Promise.all(keys.map(key => store.meta(key)))
+ 
+-    const due = targets.filter((target, index) =>
+-      needsRefresh(cached[index] ?? this.unstored.get(keyOf(target)) ?? null, target, now)
+-    )
++    const due = targets.filter((target, index) => this.passDue(target, cached[index] ?? null, held, now))
+ 
+     result.skipped = targets.length - due.length
+ 
+@@ -523,10 +889,43 @@ export class TranscriptPrefetcher {
+ export interface PrefetchTickResult {
+   failed: number
+   fetched: number
++  /** [daveey] False when the pass skipped the listing: every gateway pushes and none is due its safety net. */
++  listed?: boolean
+   skipped: number
+   targets: number
+ }
+ 
++/** [daveey] Why a delta page cannot extend the cached run ending at `anchor`, or '' when it can. `known` is the
++ *  transcript revision the run was last made whole at (undefined: never seen, so an older rewrite may be missed). */
++export function deltaMismatch(
++  anchor: null | number,
++  page: DeltaPage,
++  sessionId: string,
++  known: null | number | undefined
++): string {
++  if (anchor === null) {
++    return 'nothing cached'
++  }
++
++  if (!page.anchorFound) {
++    return 'anchor row gone'
++  }
++
++  if (page.hasMore) {
++    return 'gap'
++  }
++
++  if (page.sessionId !== sessionId) {
++    return `rotated to ${page.sessionId}`
++  }
++
++  if (known === undefined) {
++    return 'revision unknown'
++  }
++
++  return known === page.transcriptRevision ? '' : 'rewritten in place'
++}
++
+ /** A 404 is one missing session; anything without an HTTP status is the route itself. */
+ function isGatewayFailure(error: unknown): boolean {
+   const status = Number((error as { status?: unknown; statusCode?: unknown })?.status ?? (error as any)?.statusCode)
+diff --git a/apps/desktop/src/global.d.ts b/apps/desktop/src/global.d.ts
+index cc677ab2d4..d8a3d37aa4 100644
+--- a/apps/desktop/src/global.d.ts
++++ b/apps/desktop/src/global.d.ts
+@@ -126,6 +126,8 @@ declare global {
+         stats: () => Promise<{ bytes: number; sessions: number }>
+         /** [daveey] Warm a session's latest page in main (fire-and-forget; main dedupes and backs off). */
+         prefetch?: (key: TranscriptCacheBridgeKey) => void
++        /** [daveey] Forward a gateway socket's `sessions.moved` push to main's prefetcher ('' = registry primary). */
++        sessionsMoved?: (connectionId: string, sessions: unknown[]) => void
+       }
+       getGatewayWsUrl: (profile?: null | string) => Promise<GatewayWsUrlResult>
+       // Browser host only: before a pick routes `profile`, re-read the served
+diff --git a/apps/desktop/src/main.tsx b/apps/desktop/src/main.tsx
+index 1870a9bd7f..2ffa9b7a99 100644
+--- a/apps/desktop/src/main.tsx
++++ b/apps/desktop/src/main.tsx
+@@ -16,6 +16,8 @@ import './store/chat-text-scale'
+ // Side-effect: mirrors the keep-awake mode to main and listens for main's
+ // one-time keep-awake offer. Settings loads lazily, too late for the offer.
+ import './store/keep-awake'
++// [daveey] Side-effect: forwards each gateway socket's `sessions.moved` push to main's transcript prefetcher.
++import './store/transcript-push'
+ // Dev-only render/state churn counters. MUST precede the `react-dom` import
+ // below: react-dom captures the devtools hook at module init, so bippy has to
+ // install during THIS import's evaluation or every commit goes unseen
+diff --git a/apps/desktop/src/store/transcript-push.test.ts b/apps/desktop/src/store/transcript-push.test.ts
+new file mode 100644
+index 0000000000..c468a20c56
+--- /dev/null
++++ b/apps/desktop/src/store/transcript-push.test.ts
+@@ -0,0 +1,51 @@
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++import { emitGatewayEvent } from '@/contrib/events'
++
++import { installTranscriptPushForwarder, sessionsMovedForward } from './transcript-push'
++
++const moved = (payload: unknown, extra: Record<string, unknown> = {}) =>
++  ({ payload, type: 'sessions.moved', ...extra }) as unknown as Parameters<typeof emitGatewayEvent>[0]
++
++describe('[daveey] sessions.moved forwarder', () => {
++  let dispose: () => void = () => {}
++
++  afterEach(() => dispose())
++
++  it('forwards each socket frame to main with the connection that socket stamped', () => {
++    const forward = vi.fn()
++    dispose = installTranscriptPushForwarder(forward)
++    const sessions = [{ id: 'a', last_message_id: 7, profile: 'default' }]
++
++    emitGatewayEvent(moved({ sessions }, { connectionId: 'hermes-hub' }))
++    emitGatewayEvent(moved({ sessions }, { connectionId: 'mac-mini' }))
++
++    expect(forward.mock.calls).toEqual([
++      ['hermes-hub', sessions],
++      ['mac-mini', sessions]
++    ])
++  })
++
++  it("names the registry primary ('') for an unstamped legacy-primary frame", () => {
++    expect(sessionsMovedForward(moved({ sessions: [{ id: 'a' }] }))).toEqual({
++      connectionId: '',
++      sessions: [{ id: 'a' }]
++    })
++  })
++
++  it('drops empty or malformed frames and other event types', () => {
++    const forward = vi.fn()
++    dispose = installTranscriptPushForwarder(forward)
++
++    emitGatewayEvent(moved({ sessions: [] }, { connectionId: 'x' }))
++    emitGatewayEvent(moved(null, { connectionId: 'x' }))
++    emitGatewayEvent({ payload: { sessions: [{ id: 'a' }] }, type: 'sessions.changed' } as never)
++
++    expect(forward).not.toHaveBeenCalled()
++  })
++
++  it('is a no-op without the Electron bridge (browser host)', () => {
++    dispose = installTranscriptPushForwarder(undefined)
++    expect(() => emitGatewayEvent(moved({ sessions: [{ id: 'a' }] }))).not.toThrow()
++  })
++})
+diff --git a/apps/desktop/src/store/transcript-push.ts b/apps/desktop/src/store/transcript-push.ts
+new file mode 100644
+index 0000000000..9c515263c7
+--- /dev/null
++++ b/apps/desktop/src/store/transcript-push.ts
+@@ -0,0 +1,52 @@
++/**
++ * [daveey] Forward every gateway socket's `sessions.moved` push to Electron main.
++ *
++ * The gateway's change watcher names the sessions that got new message rows, at most once
++ * a second (`sessions.moved`). Main's background prefetcher (electron/transcript-prefetch.ts)
++ * owns the durable transcript cache, so it fetches just the rows after each cached tail the
++ * moment they land, instead of the next hub listing pass noticing (up to 30 s + the hub's own
++ * hold). Every socket this window holds (the primary and each registry secondary) reaches the
++ * plugin event tap stamped with its `connectionId`; an unstamped event (a legacy primary)
++ * names the registry primary (''). Main coalesces per session, so the same frame arriving
++ * over two sockets or from two windows costs one fetch.
++ */
++import type { GatewayEvent } from '@hermes/shared'
++
++import { onGatewayEvent } from '@/contrib/events'
++
++type Forward = (connectionId: string, sessions: unknown[]) => void
++
++/** The connection a frame came over and its session list, or null for a frame not worth forwarding. */
++export function sessionsMovedForward(event: GatewayEvent): null | { connectionId: string; sessions: unknown[] } {
++  const payload = event.payload as { sessions?: unknown } | undefined
++  const sessions = Array.isArray(payload?.sessions) ? payload.sessions : []
++
++  if (sessions.length === 0) {
++    return null
++  }
++
++  const connectionId = (event as { connectionId?: unknown }).connectionId
++
++  return { connectionId: typeof connectionId === 'string' ? connectionId.trim() : '', sessions }
++}
++
++/** Subscribe the forwarder; returns its disposer. No bridge (browser host, tests without one): nothing to do. */
++export function installTranscriptPushForwarder(
++  forward: Forward | undefined = window.hermesDesktop?.transcriptCache?.sessionsMoved
++): () => void {
++  if (typeof forward !== 'function') {
++    return () => {}
++  }
++
++  return onGatewayEvent('sessions.moved', event => {
++    const message = sessionsMovedForward(event)
++
++    if (message) {
++      forward(message.connectionId, message.sessions)
++    }
++  })
++}
++
++if (typeof window !== 'undefined') {
++  installTranscriptPushForwarder()
++}
+diff --git a/apps/shared/src/gateway-contract.generated.ts b/apps/shared/src/gateway-contract.generated.ts
+index 5184b0ddf4..ecc9628dca 100644
+--- a/apps/shared/src/gateway-contract.generated.ts
++++ b/apps/shared/src/gateway-contract.generated.ts
+@@ -6484,6 +6484,21 @@ export interface GroupsChangedPayload {
+   broadcast_id?: string | null
+   [key: string]: unknown
+ }
++/** ``change_watcher._sessions_moved_payload``: at most once per second, only when message rows were added, newest mover first (at most ``SESSIONS_MOVED_MAX``). Absent on older backends: keep polling. */
++export interface SessionsMovedPayload {
++  sessions: SessionsMovedEntry[]
++  [key: string]: unknown
++}
++/** One session ``change_watcher._moved_sessions`` saw new message rows for. ``activity`` is the hub listing's ``COALESCE(last_activity_at, started_at)``; ``last_message_id`` its newest row id (the Desktop's cached tail fetches the rows after its own last id); ``parent_session_id`` lets a client treat a compression child of a session it caches as its continuation; ``profile`` the store's owner profile. */
++export interface SessionsMovedEntry {
++  id: string
++  profile: string
++  message_count?: number | null
++  activity?: number | null
++  last_message_id: number
++  parent_session_id?: string | null
++  [key: string]: unknown
++}
+ export type ConnectorErrorReason = 'INVALID_PARAMS' | 'NOT_OWNER' | 'UNSUPPORTED_RUNTIME' | 'CONNECTOR_REQUEST_FAILED' | 'INVALID_CONNECTOR_RESPONSE' | 'UNKNOWN_TARGET' | 'LINK_STILL_VALID' | 'REISSUE_REFUSED' | 'UNKNOWN_OPERATION' | 'INVALID_ANSWER' | 'NEEDS_NOUS_AUTH' | 'CONNECTOR_NOT_FOUND' | 'TOOLS_UNAVAILABLE' | 'CONNECTORS_UNAVAILABLE' | 'CATALOG_UNAVAILABLE' | 'ACCOUNTS_UNAVAILABLE' | 'CONNECTION_NOT_FOUND' | 'POLICY_UNAVAILABLE' | 'POLICY_CONFLICT' | 'FORBIDDEN_SCOPE' | 'ORG_REQUIRED' | 'ORG_ACCESS_DENIED' | 'INVALID_POLICY' | 'ALIAS_TAKEN'
+ 
+ // ── Client→server methods ──
+@@ -7628,6 +7643,8 @@ export interface BackendGatewayEventMap {
+   'session.usage': SessionUsagePayload
+   /** state.db moved; refetch the session list. */
+   'sessions.changed': ChangeSignalPayload
++  /** Message rows were added to these sessions; a transcript cache fetches the rows after its cached tail. */
++  'sessions.moved': SessionsMovedPayload
+   /** The free-tier bootstrap finished (broadcast); the desktop's setup gate reads the record. */
+   'setup.ready': SetupReadyPayload
+   /** A skill root moved (installed/removed elsewhere); refetch commands.catalog from the gateway. */
+@@ -7735,6 +7752,7 @@ export const GATEWAY_EVENT_TYPES = [
+   'session.title',
+   'session.usage',
+   'sessions.changed',
++  'sessions.moved',
+   'setup.ready',
+   'skills.changed',
+   'skin.changed',
+diff --git a/apps/shared/src/gateway-contract.openrpc.json b/apps/shared/src/gateway-contract.openrpc.json
+index 39a6d770d2..dfebe251ac 100644
+--- a/apps/shared/src/gateway-contract.openrpc.json
++++ b/apps/shared/src/gateway-contract.openrpc.json
+@@ -42483,6 +42483,85 @@
+         "title": "SessionWorkspaceMoveResult",
+         "type": "object"
+       },
++      "SessionsMovedEntry": {
++        "additionalProperties": true,
++        "description": "One session ``change_watcher._moved_sessions`` saw new message rows for. ``activity`` is the hub\nlisting's ``COALESCE(last_activity_at, started_at)``; ``last_message_id`` its newest row id (the Desktop's\ncached tail fetches the rows after its own last id); ``parent_session_id`` lets a client treat a compression\nchild of a session it caches as its continuation; ``profile`` the store's owner profile.",
++        "properties": {
++          "id": {
++            "title": "Id",
++            "type": "string"
++          },
++          "profile": {
++            "title": "Profile",
++            "type": "string"
++          },
++          "message_count": {
++            "anyOf": [
++              {
++                "type": "integer"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "title": "Message Count"
++          },
++          "activity": {
++            "anyOf": [
++              {
++                "type": "number"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "title": "Activity"
++          },
++          "last_message_id": {
++            "title": "Last Message Id",
++            "type": "integer"
++          },
++          "parent_session_id": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "title": "Parent Session Id"
++          }
++        },
++        "required": [
++          "id",
++          "profile",
++          "last_message_id"
++        ],
++        "title": "SessionsMovedEntry",
++        "type": "object"
++      },
++      "SessionsMovedPayload": {
++        "additionalProperties": true,
++        "description": "``change_watcher._sessions_moved_payload``: at most once per second, only when message rows were added,\nnewest mover first (at most ``SESSIONS_MOVED_MAX``). Absent on older backends: keep polling.",
++        "properties": {
++          "sessions": {
++            "items": {
++              "$ref": "#/components/schemas/SessionsMovedEntry"
++            },
++            "title": "Sessions",
++            "type": "array"
++          }
++        },
++        "required": [
++          "sessions"
++        ],
++        "title": "SessionsMovedPayload",
++        "type": "object"
++      },
+       "SetupBeat": {
+         "enum": [
+           "name",
+@@ -53322,6 +53401,18 @@
+         }
+       ]
+     },
++    {
++      "name": "sessions.moved",
++      "summary": "Message rows were added to these sessions; a transcript cache fetches the rows after its cached tail.",
++      "params": [
++        {
++          "name": "payload",
++          "schema": {
++            "$ref": "#/components/schemas/SessionsMovedPayload"
++          }
++        }
++      ]
++    },
+     {
+       "name": "setup.ready",
+       "summary": "The free-tier bootstrap finished (broadcast); the desktop's setup gate reads the record.",
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index c68b331591..a7bd7b425b 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -891,9 +891,12 @@ async def get_session_messages(
+     request: Request,
+     session_id: str, profile: Optional[str] = None, limit: Optional[int] = Query(None, ge=0),
+     offset: int = Query(0, ge=0), order: Optional[str] = Query(None),
+-    include_compacted: bool = Query(False), inline_images: bool = Query(True)):
++    include_compacted: bool = Query(False), inline_images: bool = Query(True),
++    after_id: Optional[int] = Query(None, ge=0)):
+     if order not in (None, "oldest", "latest"):
+         raise HTTPException(status_code=400, detail="order must be one of: oldest, latest")
++    if after_id is not None:
++        return await _session_messages_after(request, session_id, profile, after_id, limit, inline_images)
+ 
+     def _read(db):
+         sid = _resolve_session_id(db, session_id)
+@@ -938,6 +941,48 @@ async def get_session_messages(
+     return _display_transcript_response(request, body) if display else body
+ 
+ 
++# [daveey] Push-driven transcript deltas (``sessions.moved``): one page after a cached tail's last row.
++SESSION_MESSAGES_AFTER_DEFAULT_LIMIT = 200
++
++
++async def _session_messages_after(request: Request, session_id: str, profile: Optional[str], after_id: int,
++                                  limit: Optional[int], inline_images: bool):
++    """``GET /api/sessions/{id}/messages?after_id=N``: the live display rows of the stored session that holds
++    the messages (the same ``resolve_resume_session_id`` redirect the latest page uses) after row ``N``.
++
++    ``delta.anchor_found`` False (row N is not a live row of that session: rewind, compaction, rotation) and
++    ``delta.has_more`` True (more than ``limit`` rows: a gap) both tell the Desktop its cached run cannot be
++    extended cleanly; it refetches the latest page instead. ``session_id`` names the session read, so a caller
++    whose key resolved elsewhere (a compression rotation) refetches too. ``delta.transcript_revision`` moves on
++    an in-place rewrite of an older row. Bounded like every page: at most 500 rows."""
++    _limit = SESSION_MESSAGES_AFTER_DEFAULT_LIMIT if limit is None else min(limit, 500)
++
++    def _read(db):
++        sid = _resolve_session_id(db, session_id)
++        if not sid:
++            return None
++        sid = db.resolve_resume_session_id(sid)
++        return sid, db.get_display_messages_after(sid, after_id, _limit + 1)
++
++    result = await asyncio.to_thread(_with_db, profile, _read, read_only=True)
++    if result is None:
++        raise HTTPException(status_code=404, detail=_NOT_FOUND)
++    sid, page = result
++    rows = page["messages"]
++    has_more = len(rows) > _limit
++    projected = await asyncio.to_thread(
++        _project_for_display, rows[:_limit], home=_history_profile_home(profile), inline_images=inline_images)
++    if request.headers.get(DISPLAY_TRANSCRIPT_HEADER) == "1":
++        projected = _slim_for_display(projected)
++    return {
++        "session_id": sid,
++        "profile": _serving_profile(profile),
++        "messages": projected,
++        "delta": {"after_id": after_id, "anchor_found": bool(page["anchor_found"]), "has_more": has_more,
++                  "transcript_revision": page["transcript_revision"], "limit": _limit,
++                  "returned": len(projected)}}
++
++
+ def _timeline_session_id(db, session_id: str, owner: str) -> str:
+     # Durable jump addresses are exact ids, never title/prefix guesses. A NULL
+     # legacy owner belongs to this profile's store, just like /messages pages.
+diff --git a/hermes_state_stored_reads.py b/hermes_state_stored_reads.py
+index 668796d570..0c45d3a3bf 100644
+--- a/hermes_state_stored_reads.py
++++ b/hermes_state_stored_reads.py
+@@ -460,3 +460,34 @@ class SessionStoredReadsMixin:
+             f"{_sql_json_extract('model_config', '$.' + marker_key)} = ? ORDER BY started_at DESC, id DESC",
+             (subagent_id,))
+         return [row["id"] for row in rows]
++
++    def get_display_messages_after(self, session_id: str, after_id: int, limit: int) -> dict[str, Any]:
++        """[daveey] The live display rows of ONE stored session after ``after_id`` (a cached tail's last row id),
++        for the Desktop's push-driven transcript delta (``sessions.moved``). ``anchor_found`` is False when that
++        row is no longer a live row of this session (rewind, in-session compaction, a rotation moved new rows to a
++        child): the caller's cached run cannot be extended and it refetches the latest page. ``transcript_revision``
++        is read FIRST (an in-place rewrite of an older row bumps it; ``messages_*_revision_update`` triggers), so a
++        caller that remembers the revision of its last full page can tell a rewrite it would otherwise miss. Rows
++        are chronological, model-only rows hidden like every display read; at most ``limit`` (the caller asks one
++        more than it applies to learn whether the page was cut).
++
++        Storage interface: port as ``display_rows_after``."""
++        from hermes_state_messages import DISPLAY_VISIBLE_SQL
++
++        def read(conn) -> dict[str, Any]:
++            columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
++            revision = None
++            if "transcript_revision" in columns:
++                found = conn.execute("SELECT transcript_revision FROM sessions WHERE id = ?", (session_id,)).fetchone()
++                revision = int(found[0] or 0) if found is not None else None
++            anchor = conn.execute("SELECT 1 FROM messages WHERE id = ? AND session_id = ? AND active = 1 LIMIT 1",
++                                  (after_id, session_id)).fetchone() is not None
++            rows = conn.execute(
++                f"SELECT * FROM messages WHERE session_id = ? AND id > ? AND active = 1{DISPLAY_VISIBLE_SQL} "
++                "ORDER BY id ASC LIMIT ?", (session_id, after_id, max(0, int(limit)))).fetchall() if anchor else []
++            return {"anchor_found": anchor, "transcript_revision": revision, "rows": rows}
++
++        result = self._read_retrying_ioerr(read)
++        result["messages"] = [self._row_to_message_dict(row, warn_context="get_display_messages_after",
++                                                        summary_flag=True) for row in result.pop("rows")]
++        return result
+diff --git a/tests/hermes_cli/test_session_messages_after.py b/tests/hermes_cli/test_session_messages_after.py
+new file mode 100644
+index 0000000000..532320bccf
+--- /dev/null
++++ b/tests/hermes_cli/test_session_messages_after.py
+@@ -0,0 +1,150 @@
++"""[daveey] ``GET /api/sessions/{id}/messages?after_id=N``: the push-driven transcript delta (``sessions.moved``).
++
++The Desktop's transcript cache extends its cached tail with the rows after its last row id instead of refetching the
++latest page. The route must return exactly the rows the latest page would show after that row, and say when the
++cached run cannot be extended cleanly (the anchor row is gone, a gap, a rotation, an in-place rewrite) so the
++Desktop refetches the page instead.
++"""
++
++import sqlite3
++from pathlib import Path
++
++import pytest
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++
++@pytest.fixture
++def env(tmp_path, monkeypatch):
++    from hermes_state import SessionDB
++
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    home = tmp_path / ".hermes"
++    home.mkdir(parents=True)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr("hermes_state.DEFAULT_DB_PATH", home / "state.db")
++
++    db = SessionDB(home / "state.db")
++    try:
++        db.create_session(session_id="chat", source="desktop")
++        db.append_messages_batch("chat", [
++            {"role": "user", "content": "one"},
++            {"role": "assistant", "content": "two"},
++        ])
++    finally:
++        db.close()
++
++    from hermes_cli.web_routers.sessions import manage_router
++
++    app = FastAPI()
++    app.include_router(manage_router)
++    with TestClient(app) as client:
++        yield client, home / "state.db"
++
++
++def _latest(client, sid="chat"):
++    resp = client.get(f"/api/sessions/{sid}/messages?limit=200&order=latest&include_compacted=true")
++    assert resp.status_code == 200, resp.text
++    return resp.json()
++
++
++def _after(client, after_id, sid="chat", **params):
++    query = "&".join([f"after_id={after_id}", *(f"{k}={v}" for k, v in params.items())])
++    resp = client.get(f"/api/sessions/{sid}/messages?{query}")
++    assert resp.status_code == 200, resp.text
++    return resp.json()
++
++
++def _append(db_path, *contents, sid="chat"):
++    from hermes_state import SessionDB
++
++    db = SessionDB(db_path)
++    try:
++        db.append_messages_batch(sid, [{"role": "assistant", "content": text} for text in contents])
++    finally:
++        db.close()
++
++
++def test_delta_after_the_tail_is_empty_and_clean(env):
++    client, _db = env
++    tail = _latest(client)["messages"][-1]["id"]
++
++    page = _after(client, tail)
++
++    assert page["session_id"] == "chat"
++    assert page["messages"] == []
++    assert page["delta"]["anchor_found"] is True and page["delta"]["has_more"] is False
++    assert isinstance(page["delta"]["transcript_revision"], int)
++
++
++def test_delta_returns_exactly_the_rows_the_latest_page_shows_after_the_anchor(env):
++    client, db = env
++    before = _latest(client)["messages"]
++    tail = before[-1]["id"]
++
++    _append(db, "three", "four")
++    delta = _after(client, tail)
++    after = _latest(client)["messages"]
++
++    assert [m["content"] for m in delta["messages"]] == ["three", "four"]
++    # Cached run + delta == the fresh latest page, row for row.
++    assert [m["id"] for m in before] + [m["id"] for m in delta["messages"]] == [m["id"] for m in after]
++    assert [m["content"] for m in before + delta["messages"]] == [m["content"] for m in after]
++    assert delta["delta"] == {**delta["delta"], "anchor_found": True, "has_more": False, "returned": 2}
++
++
++def test_more_rows_than_the_limit_reports_a_gap(env):
++    client, db = env
++    tail = _latest(client)["messages"][-1]["id"]
++    _append(db, *[f"row {n}" for n in range(5)])
++
++    page = _after(client, tail, limit=3)
++
++    assert [m["content"] for m in page["messages"]] == ["row 0", "row 1", "row 2"]
++    assert page["delta"]["has_more"] is True
++
++
++def test_a_rewound_anchor_is_not_found(env):
++    client, db = env
++    tail = _latest(client)["messages"][-1]["id"]
++    with sqlite3.connect(db) as conn:
++        conn.execute("UPDATE messages SET active = 0 WHERE id = ?", (tail,))
++    _append(db, "retry")
++
++    page = _after(client, tail)
++
++    assert page["delta"]["anchor_found"] is False
++    assert page["messages"] == []
++
++
++def test_an_in_place_rewrite_moves_the_transcript_revision(env):
++    client, db = env
++    messages = _latest(client)["messages"]
++    revision = _after(client, messages[-1]["id"])["delta"]["transcript_revision"]
++    with sqlite3.connect(db) as conn:
++        conn.execute("UPDATE messages SET content = 'edited' WHERE id = ?", (messages[0]["id"],))
++
++    assert _after(client, messages[-1]["id"])["delta"]["transcript_revision"] == revision + 1
++
++
++def test_a_compression_rotation_reads_the_child_and_misses_the_anchor(env):
++    from hermes_state import SessionDB
++
++    client, db_path = env
++    tail = _latest(client)["messages"][-1]["id"]
++    db = SessionDB(db_path)
++    try:
++        db.create_session(session_id="chat-child", source="desktop", parent_session_id="chat")
++        db.append_messages_batch("chat-child", [{"role": "user", "content": "continued"}])
++    finally:
++        db.close()
++
++    page = _after(client, tail)
++
++    assert page["session_id"] == "chat-child"
++    assert page["delta"]["anchor_found"] is False
++
++
++def test_unknown_session_is_404(env):
++    client, _db = env
++    assert client.get("/api/sessions/nope/messages?after_id=1").status_code == 404
+diff --git a/tests/tui_gateway/test_change_watcher_sessions_moved.py b/tests/tui_gateway/test_change_watcher_sessions_moved.py
+new file mode 100644
+index 0000000000..f6d83d95cc
+--- /dev/null
++++ b/tests/tui_gateway/test_change_watcher_sessions_moved.py
+@@ -0,0 +1,148 @@
++"""[daveey] ``sessions.moved``: the change watcher names the sessions that got new message rows.
++
++The Desktop's transcript cache fetches only the rows after its cached tail for each named session, instead of
++polling the hub listing and refetching whole pages. Exercised against a real temp state.db written through
++SessionDB: only moved sessions are named, a burst inside the 1 s floor is one trailing frame that loses no rows,
++an idle store (or a session-row-only write) sends nothing, and the payload matches the gateway contract.
++"""
++
++import sqlite3
++
++import pytest
++
++from tui_gateway import server
++
++
++@pytest.fixture()
++def watcher(tmp_path, monkeypatch):
++    from hermes_state import SessionDB
++
++    monkeypatch.setattr(server, "SESSION_DIGEST_MIN_S", 0.0)
++    (tmp_path / "config.yaml").write_text("display: {}\n")
++    (tmp_path / "cron").mkdir()
++    monkeypatch.setattr(server, "_hermes_home", str(tmp_path))
++    monkeypatch.setattr(server, "_cfg_cache", None)
++    monkeypatch.setattr(server, "_change_sigs", {})
++    monkeypatch.setattr(server, "_change_checked_at", {})
++    monkeypatch.setattr(server, "_change_broadcast_at", {})
++    monkeypatch.setattr(server, "_bot_relay_outbox_seen", 0)
++    monkeypatch.setattr(server, "_pairing_roots_cache", None, raising=False)
++    monkeypatch.setattr(server, "_sessions_db_sig_cache", {})
++    monkeypatch.setattr(server, "_sessions_moved_cursor_cache", {})
++
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session(session_id="busy", source="desktop")
++    db.create_session(session_id="quiet", source="desktop")
++    db.append_messages_batch("busy", [{"role": "user", "content": "hi"}])
++    db.append_messages_batch("quiet", [{"role": "user", "content": "hello"}])
++
++    events = []
++    monkeypatch.setattr(server, "_broadcast_global_event", lambda ev, payload=None: events.append((ev, payload)))
++    yield tmp_path, db, events
++    db.close()
++
++
++def _moved(events):
++    return [payload for event, payload in events if event == "sessions.moved"]
++
++
++def _max_id(home, session_id):
++    with sqlite3.connect(home / "state.db") as conn:
++        return conn.execute("SELECT MAX(id) FROM messages WHERE session_id = ?", (session_id,)).fetchone()[0]
++
++
++def test_only_sessions_with_new_rows_are_named(watcher):
++    home, db, events = watcher
++    server._broadcast_watched_changes(now=0.0)  # seeds every cursor silently
++    assert _moved(events) == []
++
++    db.append_messages_batch("busy", [{"role": "assistant", "content": "a"}, {"role": "assistant", "content": "b"}])
++    server._broadcast_watched_changes(now=10.0)
++
++    [payload] = _moved(events)
++    [entry] = payload["sessions"]
++    assert entry["id"] == "busy"
++    assert entry["last_message_id"] == _max_id(home, "busy")
++    assert entry["message_count"] == 3
++    assert entry["profile"] == "default"
++    assert entry["activity"] is not None
++    assert entry["parent_session_id"] is None
++
++
++def test_a_burst_inside_the_floor_is_one_trailing_frame(watcher):
++    home, db, events = watcher
++    server._broadcast_watched_changes(now=0.0)
++
++    db.append_messages_batch("busy", [{"role": "assistant", "content": "1"}])
++    server._broadcast_watched_changes(now=10.0)
++    assert [p["sessions"][0]["id"] for p in _moved(events)] == ["busy"]
++
++    # Two more writes 0.5 s apart: both inside the 1 s floor of the first frame.
++    db.append_messages_batch("quiet", [{"role": "assistant", "content": "2"}])
++    server._broadcast_watched_changes(now=10.5)
++    db.append_messages_batch("busy", [{"role": "assistant", "content": "3"}])
++    server._broadcast_watched_changes(now=10.75)
++    assert len(_moved(events)) == 1
++
++    # The window opens: one frame carries every row the floored passes saw, newest mover first.
++    server._broadcast_watched_changes(now=11.0)
++    frames = _moved(events)
++    assert len(frames) == 2
++    assert [(e["id"], e["last_message_id"]) for e in frames[1]["sessions"]] == [
++        ("busy", _max_id(home, "busy")), ("quiet", _max_id(home, "quiet"))]
++
++
++def test_an_idle_store_sends_nothing(watcher):
++    _home, _db, events = watcher
++    for tick in range(20):
++        server._broadcast_watched_changes(now=float(tick))
++    assert _moved(events) == []
++
++
++def test_a_session_row_write_without_messages_sends_no_moved_frame(watcher):
++    _home, db, events = watcher
++    server._broadcast_watched_changes(now=0.0)
++
++    db.set_session_title("quiet", "renamed")
++    server._broadcast_watched_changes(now=10.0)
++
++    assert ("sessions.changed", {}) in events  # the list still refreshes
++    assert _moved(events) == []
++
++
++def test_a_new_child_names_its_parent(watcher):
++    _home, db, events = watcher
++    server._broadcast_watched_changes(now=0.0)
++
++    db.create_session(session_id="busy-child", source="desktop", parent_session_id="busy")
++    db.append_messages_batch("busy-child", [{"role": "user", "content": "continued"}])
++    server._broadcast_watched_changes(now=10.0)
++
++    [payload] = _moved(events)
++    assert [(e["id"], e["parent_session_id"]) for e in payload["sessions"]] == [("busy-child", "busy")]
++
++
++def test_payload_matches_the_gateway_contract(watcher):
++    from tui_gateway.contracts.events import SessionsMovedPayload
++    from tui_gateway.contracts.registry import EVENTS
++
++    _home, db, events = watcher
++    server._broadcast_watched_changes(now=0.0)
++    db.append_messages_batch("busy", [{"role": "assistant", "content": "x"}])
++    server._broadcast_watched_changes(now=10.0)
++
++    [payload] = _moved(events)
++    assert SessionsMovedPayload.model_validate(payload).sessions[0].id == "busy"
++    assert "sessions.moved" in EVENTS
++
++
++def test_a_non_sqlite_store_neither_raises_nor_sends(watcher, tmp_path, monkeypatch):
++    other = tmp_path / "other"
++    other.mkdir()
++    (other / "state.db").write_text("x")
++    monkeypatch.setattr(server, "_hermes_home", str(other))
++    events = watcher[2]
++    server._broadcast_watched_changes(now=0.0)
++    (other / "state.db").write_text("xy")
++    server._broadcast_watched_changes(now=10.0)
++    assert _moved(events) == []
+diff --git a/tui_gateway/change_watcher.py b/tui_gateway/change_watcher.py
+index ef61ee6096..7901a1fa03 100644
+--- a/tui_gateway/change_watcher.py
++++ b/tui_gateway/change_watcher.py
+@@ -517,6 +517,91 @@ def _groups_changed_payload(before: dict, after: dict) -> dict:
+     return {**scope, "broadcast_id": f"{replay_epoch()}:{next(_groups_broadcast_count)}"}
+ 
+ 
++# [daveey] ``sessions.moved``: which sessions got new message rows, so the Desktop extends its cached transcript
++# tails by push instead of polling the hub listing. The signature is each watched store's highest message id (one
++# indexed MAX behind the kept observer's commit key: an unchanged store costs one PRAGMA); the payload reads the
++# rows between the last broadcast's cursor and this one, so a floored window loses nothing.
++_sessions_moved_cursor_cache: dict[str, tuple[object, object, bool]] = {}
++# One frame names at most this many sessions (the newest movers); a longer burst is the listing's job.
++SESSIONS_MOVED_MAX = 500
++
++
++def _messages_cursor(conn, _key):
++    row = conn.execute("SELECT MAX(id) FROM messages").fetchone()
++    return int(row[0] or 0) if row is not None else 0, False
++
++
++def _sessions_moved_sig() -> tuple:
++    """``((home, highest message id | None), ...)`` across the watched stores."""
++    return tuple((str(root), _db_content_sig(root / "state.db", _sessions_moved_cursor_cache, _messages_cursor))
++                 for root in _watched_homes())
++
++
++def _home_profile_name(home: Path) -> str:
++    with contextlib.suppress(Exception):  # health: allow BLE001 -- a profile probe must not cost the frame
++        from gateway.host_attach import profile_name_for_home
++        return profile_name_for_home(home)
++    return home.name if home.parent.name == "profiles" else "default"
++
++
++def _moved_sessions(home: Path, start: int, end: int) -> list[dict]:
++    """The sessions of ``home``'s store with message rows in ``(start, end]``, newest mover first:
++    ``{id, profile, message_count, activity, last_message_id, parent_session_id}``. ``activity`` is the hub
++    listing's own definition (``COALESCE(last_activity_at, started_at)``) so a cache stamped from a push and the
++    listing agree."""
++    from tui_gateway import watch_store
++    with watch_store.observed(home / "state.db") as (_key, conn):
++        conn.execute("BEGIN")
++        try:
++            moved = conn.execute(
++                "SELECT session_id, MAX(id) AS last_id FROM messages WHERE id > ? AND id <= ? "
++                "GROUP BY session_id ORDER BY last_id DESC LIMIT ?", (start, end, SESSIONS_MOVED_MAX)).fetchall()
++            if not moved:
++                return []
++            have = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
++
++            def pick(col: str, alt: str = "NULL") -> str:
++                return col if col in have else alt
++            activity = ("COALESCE(last_activity_at, started_at)" if {"last_activity_at", "started_at"} <= have
++                        else pick("started_at"))
++            ids = [row[0] for row in moved]
++            rows = {row[0]: row for row in conn.execute(
++                f"SELECT id, {pick('message_count')}, {activity}, {pick('profile_name')}, "
++                f"{pick('parent_session_id')} FROM sessions WHERE id IN ({', '.join('?' for _ in ids)})", ids)}
++        finally:
++            conn.execute("COMMIT")
++    fallback_profile = _home_profile_name(home)
++    out = []
++    for session_id, last_id in moved:
++        row = rows.get(session_id)
++        out.append({
++            "id": session_id, "profile": (row[3] if row is not None and row[3] else fallback_profile),
++            "message_count": row[1] if row is not None else None,
++            "activity": row[2] if row is not None else None,
++            "last_message_id": int(last_id),
++            "parent_session_id": row[4] if row is not None else None})
++    return out
++
++
++def _sessions_moved_payload(before: tuple, after: tuple) -> dict | None:
++    """``{"sessions": [...]}`` for every store whose cursor advanced; None (no frame) when none did (a store
++    seen for the first time, replaced or restored to a lower id seeds its cursor silently)."""
++    prior = dict(before or ())
++    moved: list[dict] = []
++    for home, cursor in after:
++        start = prior.get(home)
++        if start is None or cursor is None or cursor <= start:
++            continue
++        try:
++            moved += _moved_sessions(Path(home), start, cursor)
++        except Exception:  # health: allow BLE001 -- a busy/foreign store skips this frame; the Desktop's listing poll is the backstop
++            logger.debug("sessions.moved read failed home=%s", home, exc_info=True)
++    if not moved:
++        return None
++    moved.sort(key=lambda entry: entry["last_message_id"], reverse=True)
++    return {"sessions": moved[:SESSIONS_MOVED_MAX]}
++
++
+ def _skills_sig():
+     """The skill roots' stat signature for every scope a session resolved commands in (each profile
+     home and session repo, not only the launch one: ``agent.skill_commands.published_scopes_signature``):
+@@ -546,12 +631,16 @@ _CHANGE_WATCHES: dict[str, tuple[float, Any, Any] | tuple[float, Any, Any, Any]]
+     "bot_relay.outbox.pending": (1.0, _bot_relay_outbox_sig, dict),
+     # An open room view re-reads its log delta + status on this; its slow poll is only the backstop.
+     # Its payload names what moved: an optional 4th slot, ``fn(previous broadcast signature, current one)``.
+-    "groups.changed": (0.5, _groups_sig, dict, _groups_changed_payload)}
++    "groups.changed": (0.5, _groups_sig, dict, _groups_changed_payload),
++    # The sessions whose message rows moved since the last frame (ids, counts, newest row id): the Desktop's
++    # transcript cache fetches just those rows. A 4th-slot payload of None sends nothing.
++    "sessions.moved": (0.5, _sessions_moved_sig, dict, _sessions_moved_payload)}
+ 
+ # state.db moves on every append of a streaming turn and gateway_state.json on
+ # in-flight bookkeeping; the floor coalesces bursts to one broadcast per window,
+ # trailing edge included (a floored change keeps its old signature, re-fires later).
+-_CHANGE_BROADCAST_FLOOR_S = {"sessions.changed": 2.0, "platforms.changed": 5.0, "groups.changed": 1.0}
++_CHANGE_BROADCAST_FLOOR_S = {"sessions.changed": 2.0, "platforms.changed": 5.0, "groups.changed": 1.0,
++                             "sessions.moved": 1.0}
+ 
+ _change_sigs: dict[str, Any] = {}
+ _change_checked_at: dict[str, float] = {}
+@@ -582,9 +671,12 @@ def _broadcast_watched_changes(now: float | None = None) -> None:
+         if floor and now - _change_broadcast_at.get(event, -floor) < floor:
+             continue  # floored: old signature stays so it re-fires when the window opens
+         before, _change_sigs[event] = _change_sigs[event], sig
+-        _change_broadcast_at[event] = now
+         with contextlib.suppress(Exception):
+-            _broadcast_global_event(event, diff_fn[0](before, sig) if diff_fn else payload_fn())
++            payload = diff_fn[0](before, sig) if diff_fn else payload_fn()
++            if payload is None:
++                continue  # the move carried nothing to tell (sessions.moved: no rows in range)
++            _change_broadcast_at[event] = now
++            _broadcast_global_event(event, payload)
+ 
+ 
+ _skin_watcher_started = False
+diff --git a/tui_gateway/contracts/events.py b/tui_gateway/contracts/events.py
+index be67e25607..63a9fe418d 100644
+--- a/tui_gateway/contracts/events.py
++++ b/tui_gateway/contracts/events.py
+@@ -917,6 +917,34 @@ event("groups.changed", GroupsChangedPayload,
+       doc="A Group Chat log, task or live status moved; an open room re-reads its log delta and groups.state.")
+ 
+ 
++# ── sessions.moved (names the sessions whose message rows moved) ──────────────────────────────
++
++
++class SessionsMovedEntry(OpenPayload):
++    """One session ``change_watcher._moved_sessions`` saw new message rows for. ``activity`` is the hub
++    listing's ``COALESCE(last_activity_at, started_at)``; ``last_message_id`` its newest row id (the Desktop's
++    cached tail fetches the rows after its own last id); ``parent_session_id`` lets a client treat a compression
++    child of a session it caches as its continuation; ``profile`` the store's owner profile."""
++
++    id: str
++    profile: str
++    message_count: int | None = None
++    activity: float | None = None
++    last_message_id: int
++    parent_session_id: str | None = None
++
++
++class SessionsMovedPayload(OpenPayload):
++    """``change_watcher._sessions_moved_payload``: at most once per second, only when message rows were added,
++    newest mover first (at most ``SESSIONS_MOVED_MAX``). Absent on older backends: keep polling."""
++
++    sessions: list[SessionsMovedEntry]
++
++
++event("sessions.moved", SessionsMovedPayload,
++      doc="Message rows were added to these sessions; a transcript cache fetches the rows after its cached tail.")
++
++
+ __all__ = [
+     "BillingBlock", "BillingStepUpVerificationPayload", "BrowserProgressPayload", "ChangeSignalPayload", "ErrorPayload",
+     "ErrorSurface", "FreeTierChallengePayload", "GatewayReadyPayload", "GroupsChangedPayload",
+@@ -927,6 +955,7 @@ __all__ = [
+     "PreviewOpenPayload", "PreviewRestartProgressPayload", "ReactionPayload", "ResumePhaseStatus",
+     "ReviewSummaryPayload", "SessionControlSnapshot", "SessionControlUpdatePayload",
+     "SessionReclaimedPayload", "SessionResumeProgressPayload", "SessionTitlePayload", "SessionUsagePayload",
++    "SessionsMovedEntry", "SessionsMovedPayload",
+     "SetupReadyPayload", "SideAgentCompletePayload", "SkinPayload", "StatusUpdatePayload",
+     "StreamDeltaPayload", "SubagentEventPayload", "SubagentOutputTailEntry", "TerminalClosePayload",
+     "TerminalOutputPayload", "TipShowPayload", "TodoUpdatedPayload", "ToolCompletePayload",
+-- 
+2.43.0
+

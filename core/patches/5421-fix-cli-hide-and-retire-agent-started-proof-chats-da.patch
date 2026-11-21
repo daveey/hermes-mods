@@ -1,0 +1,562 @@
+From 8566e2cd5d8da0871ffda4b1c99028907099dd28 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 06:11:05 +0000
+Subject: [PATCH] fix(cli): hide and retire agent-started proof chats [daveey]
+
+Problem: agent-started interactive CLI proof chats appeared in human session lists.
+Why 1: CLI source labels describe surface, not authorship.
+Why 2: start-time agent ancestry (including forwarded LC_HERMES_AGENT) was
+already detected for comment attribution but not consulted on session create.
+Why 3: canonical hidden was applied after commit and excluded from create
+receipt identity, so creation did not have one durable visibility contract.
+Root (happened): CLI authorship was not propagated across the create boundary.
+Root (not caught): ancestry and row creation were tested separately, without
+a marked-process create-to-row regression or independent retirement coverage.
+Recurrence: websocket agent clients were already hidden; CLI callers were not.
+
+Countermeasures:
+- Classify start-time ancestry, not main's own advertised runtime environment.
+- Freeze hidden/agent_cli in create receipts; set hidden atomically with the row.
+- Retain CLI surface and all owner/terminal authorization gates.
+- --visible / HERMES_CHAT_VISIBLE=1 explicitly preserve sidebar visibility.
+- Archive ended/done proofs or 24h-idle proofs independently of auto_archive.
+- Leave human, manually hidden, and explicitly visible chats untouched.
+
+Proof: focused ancestry, real parent-environment subprocess, create/retry and
+retirement tests pass. Initial new create test failed invalid_params on
+params.agent_cli; CLI tests failed missing hidden and unknown --visible;
+retirement tests failed to archive ended and idle proof rows before the fix.
+
+Owner: t_01a1fcab8cf71167
+---
+ gateway/session_controls.py                   |  5 +-
+ gateway/session_policy.py                     |  5 +-
+ hermes_cli/_parser.py                         |  1 +
+ hermes_cli/chat_visibility.py                 | 26 +++++++
+ hermes_cli/cli_commands_mixin.py              |  8 +-
+ hermes_cli/cli_session_mixin.py               |  2 +
+ hermes_cli/gateway_chat.py                    |  2 +
+ hermes_cli/gateway_session_store.py           |  2 +
+ hermes_cli/main.py                            |  6 +-
+ hermes_state_agent_cli.py                     | 23 ++++++
+ hermes_state_local.py                         |  6 +-
+ hermes_state_maintenance.py                   |  6 +-
+ tests/gateway/test_agent_cli_visibility.py    | 38 ++++++++++
+ tests/hermes_cli/test_agent_cli_visibility.py | 75 +++++++++++++++++++
+ tests/hermes_cli/test_gateway_chat.py         | 12 +--
+ .../hermes_state/test_agent_cli_retirement.py | 48 ++++++++++++
+ tui_gateway/contracts/canonical_sessions.py   |  2 +
+ 17 files changed, 246 insertions(+), 21 deletions(-)
+ create mode 100644 hermes_cli/chat_visibility.py
+ create mode 100644 hermes_state_agent_cli.py
+ create mode 100644 tests/gateway/test_agent_cli_visibility.py
+ create mode 100644 tests/hermes_cli/test_agent_cli_visibility.py
+ create mode 100644 tests/hermes_state/test_agent_cli_retirement.py
+
+diff --git a/gateway/session_controls.py b/gateway/session_controls.py
+index 4a4b5fcec3..2f2222fe7e 100644
+--- a/gateway/session_controls.py
++++ b/gateway/session_controls.py
+@@ -538,7 +538,7 @@ class AuthorityConnection:
+         from hermes_state_local import commit_local_session
+         # Bot Mode's forever-chat mint: born hidden from the sidebar. `follow_profile_config` stays in
+         # the frozen request: the policy re-reads the profile's current route every turn.
+-        hidden = params.pop('hidden', False)
++        hidden = params.get('hidden', False)
+         if type(hidden) is not bool:
+             raise RuntimeStoreError('invalid_params', field='hidden', detail='must be a boolean')
+         ref = title and resolve_titled_session(self.authority, self.actor, title, missing_ok=True)
+@@ -579,8 +579,7 @@ class AuthorityConnection:
+                 await asyncio.to_thread(accept_launch_hooks, policy)
+             if title:
+                 await tracked_write(self.authority, partial(title_new_session, self.authority, ref, title))
+-            if hidden:
+-                await tracked_write(self.authority, partial(self.authority.db.set_session_hidden, ref.session_id, True))
++
+         return await self.resume(ref, {})
+ 
+     async def ping(self, ref, params):
+diff --git a/gateway/session_policy.py b/gateway/session_policy.py
+index d12640e5b9..11a08b4f61 100644
+--- a/gateway/session_policy.py
++++ b/gateway/session_policy.py
+@@ -17,7 +17,7 @@ CREATE_FIELDS = frozenset({'request_id', 'source', 'cwd', 'model', 'toolsets',
+                            'yolo', 'safe_mode', 'ignore_user_config',
+                            'skills', 'checkpoints', 'accept_hooks', 'pass_session_id', 'follow_profile_config',
+                            'service_tier', 'cwd_explicit', 'run_budget', 'verbose', 'row_cwd', 'client_env',
+-                           'client'})
++                           'client', 'hidden', 'agent_cli'})
+ # Sections a ``follow_profile_config`` session re-reads from the owning profile's CURRENT config each
+ # turn (main's Bot Chat row), credentials included: a frozen key never crosses a profile route change.
+ FOLLOW_MODEL_SECTIONS = ('model', 'providers', 'custom_providers', 'fallback_providers', 'fallback_model', 'model_aliases')
+@@ -479,6 +479,9 @@ def build_policy(params, config, *, private_secrets=None, profile_terminal=True,
+     if bad_bypass:
+         _refuse(bad_bypass, 'must be a boolean')
+     safe_mode = params.get('safe_mode', False)
++    for flag in ('hidden', 'agent_cli'):
++        if flag in params and type(params[flag]) is not bool:
++            _refuse(flag, 'must be a boolean')
+     ignore_user_config = safe_mode or params.get('ignore_user_config', False)
+     if 'api_key' in params and (not isinstance(params['api_key'], str) or not params['api_key'].strip()):
+         _refuse('api_key', 'must be a non-empty string')
+diff --git a/hermes_cli/_parser.py b/hermes_cli/_parser.py
+index 9bea5c3b62..c0ff543dd3 100644
+--- a/hermes_cli/_parser.py
++++ b/hermes_cli/_parser.py
+@@ -319,6 +319,7 @@ def _build_chat_parser(subparsers) -> argparse.ArgumentParser:
+               help="Skip auto-injection of AGENTS.md, SOUL.md, .cursorrules, memory, and preloaded skills. Combine with --ignore-user-config for a fully isolated run.")
+     inherited(chat_parser, "--safe-mode", action="store_true", default=SUPPRESS,
+               help="Troubleshooting mode: disable ALL customizations — user config, AGENTS.md/memory injection, plugins, and MCP servers (implies --ignore-user-config and --ignore-rules). Use to isolate whether a problem comes from your setup or from Hermes itself.")
++    add("--visible", action="store_true", help="Keep an agent-started chat visible in session lists (or HERMES_CHAT_VISIBLE=1)")
+     add("--source", default=None,
+         help="Session source tag (default: cli). Use 'tool' for third-party integrations that should not appear in user session lists; any other lowercase tag (e.g. 'peer-mail') runs as 'tool' and is stored under its own name for --source filters and sessions.sidebar_exclude_sources. Messaging platform names are refused.")
+     add("--origin-session", default=None,
+diff --git a/hermes_cli/chat_visibility.py b/hermes_cli/chat_visibility.py
+new file mode 100644
+index 0000000000..6b0e85f8c6
+--- /dev/null
++++ b/hermes_cli/chat_visibility.py
+@@ -0,0 +1,26 @@
++"""CLI proof-chat visibility; authorship does not grant terminal or owner authority."""
++import os
++
++
++def creation_visibility(*, visible=False):
++    """Start-time ancestry only: main's own advertised HERMES_AGENT is not evidence."""
++    from hermes_cli.kanban_comment_writer import Inconclusive, agent_ancestor
++    try:
++        agent = agent_ancestor() is not None
++    except Inconclusive:
++        agent = False
++    # health: allow HX002 -- explicit CLI opt-out required for proof-chat visibility, not a credential
++    return {'agent_cli': agent, 'hidden': agent and not (visible or os.getenv('HERMES_CHAT_VISIBLE') == '1')}
++
++
++def hide_classic_session(db, session_id):
++    """Classic in-process creates retain provenance for the ungated retirement sweep."""
++    from hermes_cli.gateway_session_store import GatewaySessionStore
++    if isinstance(db, GatewaySessionStore):
++        return  # gateway create already committed the visibility with its immutable receipt
++    flags = creation_visibility()
++    if flags['agent_cli']:
++        db.patch_session_model_config(session_id, {'_agent_cli': True})
++    if flags['hidden']:
++        db.set_session_hidden(session_id, True)
++
+diff --git a/hermes_cli/cli_commands_mixin.py b/hermes_cli/cli_commands_mixin.py
+index 38a5f05a38..3a33191882 100644
+--- a/hermes_cli/cli_commands_mixin.py
++++ b/hermes_cli/cli_commands_mixin.py
+@@ -919,10 +919,8 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
+         _, branch_name = parse_branch_args(_command_arg(cmd_original))
+         now = datetime.now()
+         from tools.approval_yolo import transfer_session_yolo, with_session_yolo
+-        # Create the child BEFORE ending the parent: a failed create_session or gateway branch (or its /yolo
+-        # carry) must leave the session the user is still on open, not ended "branched" with no branch (#11030).
+-        # The stable ``_branched_from`` marker keeps the branch visible in /resume + /sessions even after the
+-        # parent is re-ended with a different end_reason; with_session_yolo keeps a live /yolo on the branch.
++        # Create BEFORE ending the parent: failure must leave the original open (#11030).
++        # ``_branched_from`` keeps /resume visibility; with_session_yolo carries the live /yolo.
+         # The child sends the parent's exact system prompt: a row without one makes the branch's first turn
+         # rebuild (re-probing the workspace), losing the copied transcript's warm cache if the repo moved since.
+         try:
+@@ -939,6 +937,8 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
+                 model=self.model, parent_session_id=parent_session_id, system_prompt=parent_prompt or None,
+                 model_config=with_session_yolo({"max_iterations": self.max_turns, "reasoning_config":
+                                                 self.reasoning_config, "_branched_from": parent_session_id}, parent_session_id))
++            from hermes_cli.chat_visibility import hide_classic_session
++            hide_classic_session(self._session_db, new_session_id)
+         except Exception as e:
+             return _cp(f"  {_gt('branch.create_failed', error=e)}")
+         _end_current_session(self, "branched")
+diff --git a/hermes_cli/cli_session_mixin.py b/hermes_cli/cli_session_mixin.py
+index 15c5f83de9..f840e410ce 100644
+--- a/hermes_cli/cli_session_mixin.py
++++ b/hermes_cli/cli_session_mixin.py
+@@ -638,6 +638,8 @@ class CLISessionMixin:
+                             "max_iterations": self.max_turns, "reasoning_config": self.reasoning_config,
+                         })
+                     self.agent._session_db_created = True
++                    from hermes_cli.chat_visibility import hide_classic_session
++                    hide_classic_session(self._session_db, self.session_id)
+                 if title:
+                     title = _apply_new_session_title(self, title)
+             # Tell memory providers the session_id rotated (reset=True flushes per-session
+diff --git a/hermes_cli/gateway_chat.py b/hermes_cli/gateway_chat.py
+index 7fb5119d38..a97b7ae481 100644
+--- a/hermes_cli/gateway_chat.py
++++ b/hermes_cli/gateway_chat.py
+@@ -278,6 +278,8 @@ async def _open_session(client, args, oneshot, oneshot_prompt, *, request_id=Non
+         if create_if_missing:
+             policy["title"] = title
+         policy.update(env_launch_flags())
++        from hermes_cli.chat_visibility import creation_visibility
++        policy.update(creation_visibility(visible=getattr(args, 'visible', False)))
+         policy.update(client_env_policy(parameters))
+         cwd = await asyncio.to_thread(_caller_cwd, args)
+         if "cwd" in parameters:
+diff --git a/hermes_cli/gateway_session_store.py b/hermes_cli/gateway_session_store.py
+index e61ec61abd..da53131167 100644
+--- a/hermes_cli/gateway_session_store.py
++++ b/hermes_cli/gateway_session_store.py
+@@ -197,6 +197,8 @@ class GatewaySessionStore:
+             # older code, a job it started) made every descendant ``hermes chat`` fail before sending.
+             source = ONESHOT_SOURCE if get_session_env("HERMES_SINGLE_QUERY_SESSION", "") == "1" else "cli"
+         params["source"] = create_surface(source)
++        from hermes_cli.chat_visibility import creation_visibility
++        params.update(creation_visibility())
+         # Main's row stamp (run_agent._launch_cwd_for_session): this process's cwd (``-w`` never
+         # chdirs, so the repo root), only for a CLI-family label on a local terminal backend.
+         local = (os.getenv("TERMINAL_ENV") or "local").strip().lower() in ("", "local")
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 61243c9ba8..bfcafc1c50 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -1526,6 +1526,8 @@ _CHAT_PASSTHROUGH = (
+ 
+ def cmd_chat(args):
+     """Run interactive chat CLI."""
++    if getattr(args, 'visible', False):  # health: allow HX002 -- CLI flag also applies to classic /new and /branch
++        os.environ['HERMES_CHAT_VISIBLE'] = '1'  # health: allow HX002 -- launch-only visibility opt-out
+     from hermes_cli.stream_json import stream_json_requested
+     # stream-json and the --safe-mode / --ignore-user-config bypass keep the transport client; the
+     # classic CLI (interactive, -q/-Q) is main's HermesCLI with a gateway-backed agent (gateway_agent.py).
+@@ -1558,11 +1560,9 @@ def cmd_chat(args):
+     # callers that invoke cmd_chat directly (e.g. subcommand dispatch).
+     if getattr(args, "yolo", False):
+         os.environ["HERMES_YOLO_MODE"] = "1"
+-    # --ignore-rules: skip AGENTS.md/SOUL.md/.cursorrules injection, memory
+-    # entries and preloaded skills (AIAgent(skip_context_files, skip_memory)).
++    # --ignore-rules skips project rules, memory and preloaded skills.
+     if getattr(args, "ignore_rules", False):
+         os.environ["HERMES_IGNORE_RULES"] = "1"
+-    # --source: tag session source for filtering (e.g. 'tool' for integrations)
+     if getattr(args, "source", None):
+         os.environ["HERMES_SESSION_SOURCE"] = args.source
+         # Explicit, not inherited: one-shot runs keep it (agent.session_source.session_source_for).
+diff --git a/hermes_state_agent_cli.py b/hermes_state_agent_cli.py
+new file mode 100644
+index 0000000000..84eb903f01
+--- /dev/null
++++ b/hermes_state_agent_cli.py
+@@ -0,0 +1,23 @@
++"""Ungated retirement of explicitly attributed, hidden CLI proof chats."""
++import time
++
++from hermes_state_common import _sql_session_last_active
++
++
++def archive_agent_cli(db):
++    """Archive completed proofs or abandoned proofs idle >24h; never infer authorship from hidden alone."""
++    rows = db._read_all(f"""SELECT s.id FROM sessions s
++        WHERE s.archived = 0 AND s.hidden = 1
++          AND s.created_source IN ('cli', 'tui', 'oneshot')
++          AND NOT EXISTS (SELECT 1 FROM sessions child WHERE child.parent_session_id = s.id
++                          AND s.end_reason = 'compression')
++          AND CASE WHEN json_valid(s.model_config) THEN json_extract(s.model_config, '$._agent_cli') END = 1
++          AND (s.ended_at IS NOT NULL
++               OR CASE WHEN json_valid(s.outcome_json) THEN json_extract(s.outcome_json, '$.kind') END = 'done'
++               OR {_sql_session_last_active('s')} < ?)""", (time.time() - 86400,))
++    ids = {row['id'] for row in rows}
++    if not ids:
++        return 0
++    with db._read_ctx() as conn:
++        ids -= db._guarded_ids(conn, ids)
++    return sum(bool(db._auto_archive_lineage(sid)) for sid in sorted(ids))
+diff --git a/hermes_state_local.py b/hermes_state_local.py
+index 02e0689920..3276fe59ff 100644
+--- a/hermes_state_local.py
++++ b/hermes_state_local.py
+@@ -66,12 +66,14 @@ def commit_local_session(db, *, epoch, receipt):
+         # creates with the policy label gui.
+         from gateway.session_policy import created_surface
+         created = created_surface(policy['source'])
++        creation = json.loads(policy['request_json'])
+         conn.execute('''INSERT INTO sessions(id,source,created_source,user_id,session_key,chat_id,chat_type,
+-            model,cwd,profile_name,origin_json,started_at) VALUES(?,?,?,?,?,?,'dm',?,?,?,?,?)
++            model,cwd,profile_name,origin_json,started_at,hidden,model_config) VALUES(?,?,?,?,?,?,'dm',?,?,?,?,?,?,?)
+             ON CONFLICT(id) DO NOTHING''',
+             (sid, policy['source'], created, receipt['principal_id'], route,
+              entry['origin']['chat_id'], policy['model'], _row_cwd(policy), db._own_profile_name(),
+-             _json(entry['origin']), started))
++             _json(entry['origin']), started, int(creation.get('hidden', False)),
++             _json({'_agent_cli': True}) if creation.get('agent_cli') is True else None))
+         conn.execute("INSERT INTO gateway_routing(scope,session_key,entry_json,updated_at) VALUES('',?,?,?)",
+                      (route, _json(entry), started))
+         conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)', (key, encoded))
+diff --git a/hermes_state_maintenance.py b/hermes_state_maintenance.py
+index 1ab05a80b6..a4e4628f91 100644
+--- a/hermes_state_maintenance.py
++++ b/hermes_state_maintenance.py
+@@ -489,14 +489,16 @@ class SessionMaintenanceMixin:
+         """:meth:`archive_empty_drafts` at most once per ``DRAFT_SWEEP_INTERVAL_S`` after a sweep
+         that archived rows (state_meta ``last_draft_archive``; an empty sweep is read-only). Runs whatever ``sessions.auto_archive`` says. Never raises."""
+         try:
++            from hermes_state_agent_cli import archive_agent_cli
++            agent_count = archive_agent_cli(self)
+             now = time.time()
+             since = _seconds_since(now, self.get_meta("last_draft_archive"))
+             if since is not None and since < self.DRAFT_SWEEP_INTERVAL_S:
+-                return 0
++                return agent_count
+             count = self.archive_empty_drafts()
+             if count:  # a sweep that found nothing writes nothing: GET /api/sessions polls reach here
+                 self.set_meta("last_draft_archive", str(now))
+-            return count
++            return count + agent_count
+         except Exception:  # health: allow BLE001 -- a maintenance chore must never break its tick; logged
+             logger.warning("state.db empty-draft archive failed", exc_info=True)
+             return 0
+diff --git a/tests/gateway/test_agent_cli_visibility.py b/tests/gateway/test_agent_cli_visibility.py
+new file mode 100644
+index 0000000000..1589eb5ef7
+--- /dev/null
++++ b/tests/gateway/test_agent_cli_visibility.py
+@@ -0,0 +1,38 @@
++"""Agent CLI visibility is frozen at creation, not inferred from the gateway's environment."""
++import json
++
++import pytest
++
++from tests.gateway.test_session_row_cwd import _authority_fixture
++
++
++@pytest.mark.parametrize('marker,visible', [('LC_HERMES_AGENT', False), ('HERMES_AGENT', False),
++                                          (None, False), ('HERMES_AGENT', True)])
++@pytest.mark.asyncio
++async def test_agent_hidden_create_is_atomic_and_retry_bound(tmp_path, monkeypatch, marker, visible):
++    from gateway.session_authority import initialize_session_authority
++    from gateway.session_controls import AuthorityConnection
++    from gateway.session_local import create_local_session
++    from hermes_state_runtime import RuntimeStoreError
++    from hermes_cli import kanban_comment_writer as ancestry
++    from hermes_cli.chat_visibility import creation_visibility
++    monkeypatch.setattr(ancestry.os, 'getpid', lambda: 999)
++    monkeypatch.setattr(ancestry, '_read_proc', lambda pid: (998, {}) if pid == 999 else
++                        (0, {marker: 'parent'} if marker else {}))
++    monkeypatch.delenv('HERMES_CHAT_VISIBLE', raising=False)
++
++    store, runner = _authority_fixture(tmp_path, monkeypatch)
++    authority = await initialize_session_authority(runner, profile_id='fixture', instance_id='owner')
++    actor = AuthorityConnection(authority, object(), {'user_id': 'human', 'profile_id': 'fixture'}).actor
++    params = dict(request_id='agent', source='cli', cwd=str(tmp_path), model='m', toolsets=[],
++                  **creation_visibility(visible=visible))
++    try:
++        ref = create_local_session(authority, actor, params)
++        row = authority.db.get_session(ref.session_id)
++        assert bool(row['hidden']) is (marker is not None and not visible)
++        assert json.loads(row['model_config'] or '{}').get('_agent_cli', False) is (marker is not None)
++        assert create_local_session(authority, actor, params).session_id == ref.session_id
++        with pytest.raises(RuntimeStoreError, match='invalid_params'):
++            create_local_session(authority, actor, {**params, 'hidden': not params['hidden']})
++    finally:
++        store.close_all_db_handles()
+diff --git a/tests/hermes_cli/test_agent_cli_visibility.py b/tests/hermes_cli/test_agent_cli_visibility.py
+new file mode 100644
+index 0000000000..118d95803b
+--- /dev/null
++++ b/tests/hermes_cli/test_agent_cli_visibility.py
+@@ -0,0 +1,75 @@
++"""CLI create carries ancestry visibility, without treating its own advertised env as ancestry."""
++import pytest
++
++from contextlib import asynccontextmanager
++from tests.hermes_cli.test_gateway_session_store import FakeClient
++
++
++@pytest.fixture
++def store():
++    from hermes_cli.gateway_connection import GatewayConnection
++    from hermes_cli.gateway_session_store import GatewaySessionStore
++    client = FakeClient()
++    @asynccontextmanager
++    async def connect():
++        yield client
++    connection = GatewayConnection(connect=connect)
++    connection.start(5)
++    yield GatewaySessionStore(connection), client
++    connection.close()
++
++
++@pytest.mark.parametrize('marker,visible,expected', [
++    ('LC_HERMES_AGENT', False, True), ('HERMES_AGENT', False, True),
++    (None, False, False), ('HERMES_AGENT', True, False),
++])
++def test_create_carries_start_time_ancestry(store, monkeypatch, marker, visible, expected):
++    from hermes_cli import kanban_comment_writer as ancestry
++    monkeypatch.setattr(ancestry.os, 'getpid', lambda: 999)
++    monkeypatch.setattr(ancestry, '_read_proc', lambda pid: (998, {}) if pid == 999 else
++                        (0, {marker: 'parent'} if marker else {}))
++    monkeypatch.setenv('HERMES_AGENT', '1')  # main's setdefault must not hide a human CLI
++    monkeypatch.setenv('HERMES_CHAT_VISIBLE', '1' if visible else '0')
++    db, client = store
++    db.create()
++    params = client.calls[-1][1]
++    assert params.get('hidden', False) is expected
++    assert params.get('agent_cli', False) is (marker is not None)
++
++
++def test_inconclusive_ancestry_stays_visible(store, monkeypatch):
++    from hermes_cli import kanban_comment_writer as ancestry
++    def unreadable(*args, **kwargs):
++        raise ancestry.Inconclusive('unreadable')
++    monkeypatch.setattr(ancestry, 'agent_ancestor', unreadable)
++    db, client = store
++    db.create()
++    assert client.calls[-1][1].get('hidden', False) is False
++
++
++def test_visible_chat_flag_is_parsed():
++    import argparse
++    from hermes_cli._parser import _build_chat_parser
++    parser = argparse.ArgumentParser()
++    _build_chat_parser(parser.add_subparsers())
++    assert parser.parse_args(['chat', '--visible']).visible is True
++
++
++@pytest.mark.parametrize('marker', ['LC_HERMES_AGENT', 'HERMES_AGENT'])
++def test_real_parent_start_environment_is_detected(tmp_path, marker):
++    import json
++    import os
++    import subprocess
++    import sys
++    child = tmp_path / 'visibility_child.py'
++    child.write_text('import json; from hermes_cli.chat_visibility import creation_visibility; '
++                     'print(json.dumps(creation_visibility()))')
++    parent = tmp_path / 'visibility_parent.py'
++    parent.write_text('import os, subprocess, sys; env=dict(os.environ); '
++                      'env.pop(sys.argv[1], None); '
++                      'subprocess.run([sys.executable, sys.argv[2]], env=env, check=True)')
++    env = {k: v for k, v in os.environ.items() if not k.startswith(('HERMES_', 'LC_HERMES_'))}
++    env.update({marker: 'proof-parent', 'PYTHONPATH': os.getcwd()})
++    result = subprocess.run([sys.executable, str(parent), marker, str(child)], env=env,
++                            capture_output=True, text=True, timeout=15, check=True)
++    assert json.loads(result.stdout) == {'agent_cli': True, 'hidden': True}
+diff --git a/tests/hermes_cli/test_gateway_chat.py b/tests/hermes_cli/test_gateway_chat.py
+index f608d11277..f7d157ce55 100644
+--- a/tests/hermes_cli/test_gateway_chat.py
++++ b/tests/hermes_cli/test_gateway_chat.py
+@@ -69,7 +69,7 @@ async def test_creation_preserves_advertised_cwd_model_and_toolsets(monkeypatch,
+         async def rpc(self, method, **params):
+             calls.append((method, params))
+             if method == "runtime.describe":
+-                return {"session_create": {"sources": ["cli"], "parameters": [
++                return {"session_create": {"sources": ["cli"], "parameters": ["agent_cli", "hidden",
+                     "cwd", "model", "toolsets", "request_id", "source", "skills", "checkpoints", "accept_hooks",
+                     "pass_session_id"]}}
+             return {"stored_session_id": "stored"}
+@@ -112,7 +112,7 @@ async def test_finite_runs_create_oneshot_sessions_and_explicit_source_wins(monk
+     class Peer:
+         async def rpc(self, method, **params):
+             if method == "runtime.describe":
+-                return {"session_create": {"sources": sources, "parameters": ["cwd", "request_id", "source"]}}
++                return {"session_create": {"sources": sources, "parameters": ["agent_cli", "hidden", "cwd", "request_id", "source"]}}
+             created.append(params["source"])
+             return {"stored_session_id": "stored"}
+ 
+@@ -216,7 +216,7 @@ async def test_documented_env_opt_ins_ride_the_classic_create_and_bypass_needs_a
+     class Peer:
+         async def rpc(self, method, **params):
+             if method == "runtime.describe":
+-                return {"session_create": {"sources": ["cli"], "parameters": [
++                return {"session_create": {"sources": ["cli"], "parameters": ["agent_cli", "hidden",
+                     "cwd", "model", "request_id", "source", *flags]}}
+             created.append(params)
+             return {"stored_session_id": "stored"}
+@@ -262,7 +262,7 @@ async def test_launch_key_flags_are_never_silently_dropped(monkeypatch, tmp_path
+         async def rpc(self, method, **params):
+             calls.append((method, params))
+             if method == "runtime.describe":
+-                return {"session_create": {"sources": ["cli"], "parameters": ["cwd", "model", "api_key", "source"]}}
++                return {"session_create": {"sources": ["cli"], "parameters": ["agent_cli", "hidden", "cwd", "model", "api_key", "source"]}}
+             if method == "session.info":
+                 return {"launch_request": {"source": "cli", "model": "m"}, "cwd": str(tmp_path)}
+             return {"stored_session_id": "stored", "execution_generation": 0,
+@@ -300,7 +300,7 @@ async def test_new_and_branch_move_the_terminal_continue_pointer(monkeypatch, tm
+     class Peer:
+         async def rpc(self, method, **params):
+             if method == "runtime.describe":
+-                return {"session_create": {"sources": ["cli"], "parameters": ["cwd", "source"]}}
++                return {"session_create": {"sources": ["cli"], "parameters": ["agent_cli", "hidden", "cwd", "source"]}}
+             if method == "session.info":
+                 return {"launch_request": {"source": "cli"}, "cwd": str(tmp_path)}
+             if method == "session.mutate":
+@@ -332,7 +332,7 @@ async def test_oneshot_z_writes_no_session_lines_to_stderr_like_main(monkeypatch
+     class Peer:
+         async def rpc(self, method, **params):
+             if method == "runtime.describe":
+-                return {"session_create": {"sources": ["cli", "oneshot"], "parameters": ["cwd", "request_id", "source"]}}
++                return {"session_create": {"sources": ["cli", "oneshot"], "parameters": ["agent_cli", "hidden", "cwd", "request_id", "source"]}}
+             return {"stored_session_id": "stored-z"}
+ 
+     @asynccontextmanager
+diff --git a/tests/hermes_state/test_agent_cli_retirement.py b/tests/hermes_state/test_agent_cli_retirement.py
+new file mode 100644
+index 0000000000..486c4acae5
+--- /dev/null
++++ b/tests/hermes_state/test_agent_cli_retirement.py
+@@ -0,0 +1,48 @@
++"""Hidden proof CLI chats retire independently of human auto-archive preferences."""
++import time
++
++import pytest
++
++from hermes_state import SessionDB
++
++
++@pytest.mark.parametrize('state', ['ended', 'done', 'idle', 'fresh'])
++def test_agent_cli_retirement_does_not_archive_human_chats(tmp_path, state):
++    db = SessionDB(tmp_path / 'state.db')
++    try:
++        for sid, agent, hidden in [('agent', True, True), ('human', False, False),
++                                   ('manual-hidden', False, True), ('visible-agent', True, False)]:
++            db.create_session(sid, 'cli', model_config={'_agent_cli': agent})
++            db.set_session_hidden(sid, hidden)
++            db.append_message(sid, 'user', 'proof')
++            if state == 'ended':
++                db.end_session(sid, 'done')
++            elif state == 'done':
++                db._write_sql('UPDATE sessions SET outcome_json=? WHERE id=?', ('{"kind":"done"}', sid))
++            elif state == 'idle':
++                then = time.time() - 90000
++                db._write_sql('UPDATE sessions SET started_at=?, last_activity_at=? WHERE id=?', (then, then, sid))
++                db._write_sql('UPDATE messages SET timestamp=? WHERE session_id=?', (then, sid))
++        db.maybe_archive_empty_drafts()  # ungated maintenance entrypoint
++        assert bool(db.get_session('agent')['archived']) is (state != 'fresh')
++        for sid in ('human', 'manual-hidden', 'visible-agent'):
++            assert not db.get_session(sid)['archived']
++    finally:
++        db.close()
++
++
++def test_classic_create_visibility(tmp_path, monkeypatch):
++    from hermes_cli import chat_visibility
++    from hermes_cli import kanban_comment_writer as ancestry
++    monkeypatch.setattr(ancestry, 'agent_ancestor', lambda: '42:LC_HERMES_AGENT')
++    monkeypatch.delenv('HERMES_CHAT_VISIBLE', raising=False)
++    db = SessionDB(tmp_path / 'state.db')
++    try:
++        db.create_session('proof', 'cli')
++        chat_visibility.hide_classic_session(db, 'proof')
++        assert db.get_session('proof')['hidden'] == 1
++        db.end_session('proof', 'done')
++        db.maybe_archive_empty_drafts()
++        assert db.get_session('proof')['archived'] == 1
++    finally:
++        db.close()
+diff --git a/tui_gateway/contracts/canonical_sessions.py b/tui_gateway/contracts/canonical_sessions.py
+index 1e02ef23aa..1e71cddcc2 100644
+--- a/tui_gateway/contracts/canonical_sessions.py
++++ b/tui_gateway/contracts/canonical_sessions.py
+@@ -54,6 +54,8 @@ class CanonicalCreateParams(ProfileParams):
+     editor: dict[str, JsonValue] | None = None
+     title: str | None = None
+     hidden: bool = False
++    # CLI ancestry attribution, not an authorization or source override.
++    agent_cli: bool = False
+     follow_profile_config: bool | None = None
+     service_tier: str | None = None
+     cwd_explicit: bool | None = None
+-- 
+2.43.0
+

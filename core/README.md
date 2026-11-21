@@ -17,10 +17,10 @@ The last public/private series reconciliation (what was already equivalent, what
 [Hostname normalization](hostname-normalization.md) documents the subsequent privacy
 repair, regex policy rules, fingerprint re-pins and successful 1923-entry replay.
 The [2253 regex escape repair](hostname-escape-repair.md) is a **mandatory post-replay
-overlay** in the Applying recipe below, re-bound to snapshot 5406 by `repair_hostname_escapes_5406.py` (snapshot 5039: `repair_hostname_escapes_5039.py`) (snapshot 5011: `repair_hostname_escapes_5011.py`) (snapshot 4059: `repair_hostname_escapes_4059.py`) (snapshot 3727: `repair_hostname_escapes_3727.py`) (snapshot 3713: `repair_hostname_escapes_3713.py`; snapshot 3689: `repair_hostname_escapes_3689.py`; snapshot 3652: `repair_hostname_escapes_3652.py`; snapshot 3622: `repair_hostname_escapes_3622.py`; snapshot 3577: `repair_hostname_escapes_3577.py`; snapshot 3555: `repair_hostname_escapes_3555.py`; snapshot 3529: `repair_hostname_escapes_3529.py`; snapshot 3501: `repair_hostname_escapes_3501.py`; snapshot 3491: `repair_hostname_escapes_3491.py`; snapshot 3473: `repair_hostname_escapes_3473.py`; snapshot 3423: `repair_hostname_escapes_3423.py`; snapshot 2926: `repair_hostname_escapes_2926.py`; snapshot 2678: `repair_hostname_escapes_2678.py`; snapshot 2563: `repair_hostname_escapes_2563.py`; snapshot 2491: `repair_hostname_escapes_2491.py`; snapshot 2409: `repair_hostname_escapes_2409.py`). The immutable mails alone retain two invalid
+overlay** in the Applying recipe below, re-bound to snapshot 5437 by `repair_hostname_escapes_5437.py` (snapshot 5406: `repair_hostname_escapes_5406.py`) (snapshot 5039: `repair_hostname_escapes_5039.py`) (snapshot 5011: `repair_hostname_escapes_5011.py`) (snapshot 4059: `repair_hostname_escapes_4059.py`) (snapshot 3727: `repair_hostname_escapes_3727.py`) (snapshot 3713: `repair_hostname_escapes_3713.py`; snapshot 3689: `repair_hostname_escapes_3689.py`; snapshot 3652: `repair_hostname_escapes_3652.py`; snapshot 3622: `repair_hostname_escapes_3622.py`; snapshot 3577: `repair_hostname_escapes_3577.py`; snapshot 3555: `repair_hostname_escapes_3555.py`; snapshot 3529: `repair_hostname_escapes_3529.py`; snapshot 3501: `repair_hostname_escapes_3501.py`; snapshot 3491: `repair_hostname_escapes_3491.py`; snapshot 3473: `repair_hostname_escapes_3473.py`; snapshot 3423: `repair_hostname_escapes_3423.py`; snapshot 2926: `repair_hostname_escapes_2926.py`; snapshot 2678: `repair_hostname_escapes_2678.py`; snapshot 2563: `repair_hostname_escapes_2563.py`; snapshot 2491: `repair_hostname_escapes_2491.py`; snapshot 2409: `repair_hostname_escapes_2409.py`). The immutable mails alone retain two invalid
 placement regexes; the original verifier proves historical fidelity, not regex validity.
 
-5406 patches, one entry per non-merge source commit through `e0a99816ec0fa3a1f01aebf20d1a161e51b0ddd3`.
+5437 patches, one entry per non-merge source commit through `a61ed2bc32bef9f4cb2bf8fde409093776fb7505`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -39,6 +39,44 @@ The 4353–5011 append adds two source-derived bridges before entries 4353 and 4
 
 
 The 5040–5406 append retains 51 bridges and three ancestry-only markers. Its one feature-branch merge is tree-identical to the automatic merge, so no new bridge is required. Snapshot policy: [mirror-policy-5406.json](mirror-policy-5406.json); replay plan: [mirror-replay-5406.json](mirror-replay-5406.json); acceptance evidence: [mirror-5406-verification.md](mirror-5406-verification.md).
+
+## Mirror 5407–5437
+
+Frozen source `a61ed2bc32bef9f4cb2bf8fde409093776fb7505`. Feature tests below describe source coverage, not execution in this mirror pass.
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Kanban session_tasks read overhead and gateway-name memo](mirror-5437-a-session-tasks-read-overhead.md) | 5407 | perf(kanban): cut session_tasks read overhead [daveey] |
+| [Kanban session_tasks read overhead and gateway-name memo](mirror-5437-a-session-tasks-read-overhead.md) | 5408 | fix(kanban): review of #3900: keep no empty name, never lend a closed reader [daveey] |
+| [Agent-owned orchestrator decisions and Board alarm provenance](mirror-5437-a-orchestrator-decision-alarm-provenance.md) | 5409 | [daveey] Keep unanswered orchestrator decisions agent-owned |
+| [Agent-owned orchestrator decisions and Board alarm provenance](mirror-5437-a-orchestrator-decision-alarm-provenance.md) | 5410 | [daveey] retain Board alarm provenance across rehome |
+| [Agent-owned orchestrator decisions and Board alarm provenance](mirror-5437-a-orchestrator-decision-alarm-provenance.md) | 5411 | [daveey] align source-exclusion fixture with synced task schema |
+| [Agent-owned orchestrator decisions and Board alarm provenance](mirror-5437-a-orchestrator-decision-alarm-provenance.md) | 5412 | [daveey] preserve pre-migration alarm filtering |
+| [Silent deferral of automatic turns, ownership-card evidence and per-schedule dispatch isolation](mirror-5437-a-silent-deferral-dispatch-concurrency.md) | 5413 | [daveey] Defer automatic turns silently behind the gateway queue |
+| [Silent deferral of automatic turns, ownership-card evidence and per-schedule dispatch isolation](mirror-5437-a-silent-deferral-dispatch-concurrency.md) | 5414 | [daveey] Log structured evidence for every emitted ownership card |
+| [Silent deferral of automatic turns, ownership-card evidence and per-schedule dispatch isolation](mirror-5437-a-silent-deferral-dispatch-concurrency.md) | 5415 | [daveey] Align real-ledger notification integration with silent deferral |
+| [Silent deferral of automatic turns, ownership-card evidence and per-schedule dispatch isolation](mirror-5437-a-silent-deferral-dispatch-concurrency.md) | 5416 | [daveey] Isolate state dispatch concurrency by cron schedule |
+| [Exact terminal releases and reused owner evidence for release snapshot tokens](mirror-5437-a-release-snapshot-evidence.md) | 5417 | [daveey] Keep exact terminal releases across transport freshness gaps |
+| [Exact terminal releases and reused owner evidence for release snapshot tokens](mirror-5437-a-release-snapshot-evidence.md) | 5418 | [daveey] Reuse decoded owner evidence for release snapshot tokens |
+| [Display annotation: recover fresh completed-card snapshots during bounded refresh](mirror-5437-a-completed-card-host-peek.md) | 5419 | fix(sidebar): recover fresh completed-card observations during slow refresh [daveey] |
+| [Display annotation: recover fresh completed-card snapshots during bounded refresh](mirror-5437-a-completed-card-host-peek.md) | 5420 | fix(sidebar): preserve newer restart seed over host peek [daveey] |
+| [Hide and retire agent-started proof chats, keep provenance owner-only](mirror-5437-a-agent-proof-chats.md) | 5421 | fix(cli): hide and retire agent-started proof chats [daveey] |
+| [Hide and retire agent-started proof chats, keep provenance owner-only](mirror-5437-a-agent-proof-chats.md) | 5422 | fix(cli): keep proof provenance owner-only and refresh contracts [daveey] |
+| [Hide and retire agent-started proof chats, keep provenance owner-only](mirror-5437-a-agent-proof-chats.md) | 5423 | fix(sessions): preserve agent proof identity through compression [daveey] |
+| [Push session transcript deltas into the Desktop tail cache](mirror-5437-a-transcript-deltas.md) | 5424 | feat(desktop): push session transcript deltas into the tail cache (sessions.moved) [daveey] |
+| [Push session transcript deltas into the Desktop tail cache](mirror-5437-a-transcript-deltas.md) | 5425 | fix(desktop): review of #3912: deltas equal a fresh page, quieter early passes [daveey] |
+| [Hideable Desktop status-bar controls, versions off by default](mirror-5437-a-status-bar-controls.md) | 5426 | fix(desktop): make status-bar controls hideable and default versions off [daveey] |
+| [Queue typed prompts behind gateway background turns; Stop ends exactly the holder turn](mirror-5437-a-tui-queue-stop.md) | 5427 | fix(tui): queue typed prompts behind gateway background turns; prompt wake after holds |
+| [Queue typed prompts behind gateway background turns; Stop ends exactly the holder turn](mirror-5437-a-tui-queue-stop.md) | 5428 | fix(tui): review of #3908: bounded Stop ack, no sleep in wake slots, holder identity |
+| [Queue typed prompts behind gateway background turns; Stop ends exactly the holder turn](mirror-5437-a-tui-queue-stop.md) | 5429 | fix(tui+agent): Stop ends exactly the holder's automated turn; bounded retiring retries |
+| [Queue typed prompts behind gateway background turns; Stop ends exactly the holder turn](mirror-5437-a-tui-queue-stop.md) | 5430 | fix(tui): Stop never takes over a typed turn; ordinary Stop always runs; anchored :auto= |
+| [Queue typed prompts behind gateway background turns; Stop ends exactly the holder turn](mirror-5437-a-tui-queue-stop.md) | 5431 | fix(tui): reword the Stop notice for an unstamped running turn |
+| [Plugin discovery: reuse and retry offline recall and tree metadata reads](mirror-5437-a-plugin-discovery-offline-recall.md) | 5432 | perf(plugins): reuse offline recall decoding within discovery [daveey] |
+| [Plugin discovery: reuse and retry offline recall and tree metadata reads](mirror-5437-a-plugin-discovery-offline-recall.md) | 5433 | fix(plugins): retry failed offline recall reads during discovery [daveey] |
+| [Plugin discovery: reuse and retry offline recall and tree metadata reads](mirror-5437-a-plugin-discovery-offline-recall.md) | 5434 | fix(plugins): retry suppressed tree metadata failures during discovery [daveey] |
+| [Desktop Update hands off to hermes-sync on managed hosts](mirror-5437-a-desktop-sync-handoff.md) | 5435 | fix(desktop): hand Update to hermes-sync on hosts it manages instead of an idle-only update [daveey] |
+| [Desktop Update hands off to hermes-sync on managed hosts](mirror-5437-a-desktop-sync-handoff.md) | 5436 | fix(desktop): dismiss the toast and show preparing before the backend hermes-sync hand-off [daveey] |
+| [Desktop Update hands off to hermes-sync on managed hosts](mirror-5437-a-desktop-sync-handoff.md) | 5437 | fix(desktop): register the hermes-sync hand-off strings in the i18n key catalog and overlay gaps [daveey] |
 
 ## Mirror 5040–5406
 
@@ -4203,18 +4241,20 @@ not something the public fixture CI can perform without the source repository.
 | [runtime-safety-followups.md](runtime-safety-followups.md) | 0272 0280 0283, 0284, 0285 | Portable wake cleanup, disabled-MCP diagnostics, fail-closed delegated lineage and Git-guard PATH isolation |
 | [session-start-requests.md](session-start-requests.md) | 0287 | Durable plugin-authorized session start identity, at-most-once first-turn dispatch and owner-local reconciliation |
 
+The 5407–5437 append retains 51 bridges and three ancestry-only markers and adds no merge content. Snapshot policy: [mirror-policy-5437.json](mirror-policy-5437.json); replay plan: [mirror-replay-5437.json](mirror-replay-5437.json); acceptance evidence: [mirror-5437-verification.md](mirror-5437-verification.md).
+
 ## Applying
 
-For the current **5406-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply fifty-one bridges and three ancestry-only markers from `mirror-replay-5406.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
+For the current **5437-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply fifty-one bridges and three ancestry-only markers from `mirror-replay-5437.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
 
 ```bash
 set -e
 SOURCE=$(pwd)
 python3 -B "$MODS/core/verify_mirror.py" --source-repo "$SOURCE" \
-  --source-tip e0a99816ec0fa3a1f01aebf20d1a161e51b0ddd3 \
+  --source-tip a61ed2bc32bef9f4cb2bf8fde409093776fb7505 \
   --base ea405e49a5e281558b3eeb3a13af66c6116cd0f2 \
-  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-5406.json" \
-  --replay-plan "$MODS/core/mirror-replay-5406.json"
+  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-5437.json" \
+  --replay-plan "$MODS/core/mirror-replay-5437.json"
 git worktree add --detach ../hermes-mods-test 831637fe8d58f050e9aa776b621bb2c7b614dcd1
 cd ../hermes-mods-test
 patches=("$MODS"/core/patches/*.patch)
@@ -4376,12 +4416,12 @@ git commit -m 'Explicit upstream integration bridge before 4353'
 git am -3 --empty=keep "${patches[@]:4352:145}"
 git apply --index --3way "$MODS/core/bridges/mirror-5011-before-4498.diff"
 git commit -m 'Explicit redaction resolution bridge before 4498'
-git am -3 --empty=keep "${patches[@]:4497:909}"
+git am -3 --empty=keep "${patches[@]:4497:940}"
 # Mandatory additive repair: historical mails intentionally remain immutable.
-python3 -B "$MODS/core/repair_hostname_escapes_5406.py" --tree "$PWD"
+python3 -B "$MODS/core/repair_hostname_escapes_5437.py" --tree "$PWD"
 git add hermes_cli/kanban_placement.py
 git commit -m 'Repair historical hostname regex word boundaries'
-python3 -B "$MODS/core/repair_hostname_escapes_5406.py" --source-repo "$SOURCE" --applied "$(git rev-parse HEAD)"
+python3 -B "$MODS/core/repair_hostname_escapes_5437.py" --source-repo "$SOURCE" --applied "$(git rev-parse HEAD)"
 ```
 
 The source object store must contain historical patch-index blobs (see verification prerequisites above). Use Git 2.51 or newer for the replay: Git 2.43's three-way merge conflicts on patch 0032 (`apps/shared/src/gateway-contract.openrpc.json`), which later Git versions merge cleanly. Run the full verifier with its policy and replay plan to check final source equivalence; successful application alone is insufficient. Intermediate trees and standalone feature-patch application are not certified. Remove the throwaway worktree when finished.

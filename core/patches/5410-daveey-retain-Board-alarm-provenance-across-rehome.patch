@@ -1,0 +1,219 @@
+From e2ef93b3b8f6d252eb97bb2d1b9968963c836f6c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 05:44:41 +0000
+Subject: [PATCH] [daveey] retain Board alarm provenance across rehome
+
+Read server-owned alarm_source independently of operational created_on; preserve NULL legacy fallback and explicit empty refusal. Pull the field but never capture it; include it in the local prefilter and repin reader. Board counterpart: daveey/hermes-hub#179. No historical backfill or scalar tuning.
+
+Proof: test-first identity/repin 6 failures, sync 2 missing-field failures, prefilter 1 provenance failure, fake Board 1 missing stamp. Canonical focused and consumer suites and scripts/check passed. Deployment is gated on owner Q2 rollout decision; this commit alone has no warm-upgrade refill.
+---
+ hermes_cli/kanban_db_sync.py                  |  3 +-
+ hermes_cli/kanban_pickup_alarm_identity.py    | 12 ++++---
+ hermes_cli/kanban_pickup_stall_repin.py       |  8 +++--
+ hermes_cli/kanban_worker_node.py              |  2 +-
+ tests/hermes_cli/kanban_sync_fake_board.py    |  2 ++
+ tests/hermes_cli/test_kanban_alarm_source.py  | 33 +++++++++++++++++++
+ .../test_kanban_pickup_alarm_placement.py     |  1 +
+ tests/hermes_cli/test_kanban_sync_apply.py    | 33 +++++++++++++++++++
+ 8 files changed, 86 insertions(+), 8 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_alarm_source.py
+
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index fda0eba0f7..75cf91c1ee 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -99,7 +99,7 @@ LOCAL_COLUMNS: dict[str, frozenset[str]] = {
+ # ``ready_since``: when the card last became ready (ms), for the Board's ``home_grace`` placement rule.
+ # ``workspace_source``/``workspace_custody``: Board-written only (``publish_source``, custody hooks); a push is refused.
+ SERVER_COLUMNS: dict[str, frozenset[str]] = {
+-    "tasks": frozenset({"created_on", "ready_since", "workspace_source", "workspace_custody", "containment_episode"})}
++    "tasks": frozenset({"created_on", "alarm_source", "ready_since", "workspace_source", "workspace_custody", "containment_episode"})}
+ JSON_SERVER_COLUMNS: dict[str, frozenset[str]] = {"tasks": frozenset({"workspace_source", "workspace_custody"})}
+ # Old columns an ADD-first rename migration keeps (``kanban_db_connect._RENAMED_TASK_COLUMNS``: the new column is
+ # added and filled from the old one, which stays). Every board older than the rename holds them; only
+@@ -253,6 +253,7 @@ _SYNC_COLUMN_DDL = (
+     ("tasks", "lease_expires", "lease_expires INTEGER"),
+     ("tasks", "lease_version", "lease_version INTEGER"),
+     ("tasks", "created_on", "created_on TEXT"),
++    ("tasks", "alarm_source", "alarm_source TEXT"),
+     ("tasks", "ready_since", "ready_since INTEGER"),
+     # Placement (RFC "Placement"): JSON list of labels the claiming machine must all carry; NULL = default.
+     ("tasks", "runs_on", "runs_on TEXT"),
+diff --git a/hermes_cli/kanban_pickup_alarm_identity.py b/hermes_cli/kanban_pickup_alarm_identity.py
+index 2380b4ac5b..56653d07f3 100644
+--- a/hermes_cli/kanban_pickup_alarm_identity.py
++++ b/hermes_cli/kanban_pickup_alarm_identity.py
+@@ -1,8 +1,9 @@
+ """Pickup alarm source exclusion, matching the Board's pickup_alarm.ts contract. [daveey]
+ 
+-The Board stamps created_on from the authenticated gateway and fences changes to
+-these detector identity fields. No caller-supplied list of excluded machines is used.
+-Before that authoritative creation is pulled, missing provenance fails closed.
++The Board stamps alarm_source from the authenticated gateway and fences changes to
++these detector identity fields. Legacy NULL falls back to created_on; an empty
++source is an explicit refusal. Ownership may change without changing provenance.
++No caller-supplied list of excluded machines is used.
+ """
+ from __future__ import annotations
+ 
+@@ -31,6 +32,9 @@ def refusal(card: Mapping[str, Any], machine: str) -> str | None:
+         return None
+     match = _KEY.fullmatch(key) if isinstance(key, str) else None
+     source = (match[1] or match[2]) if match else None
+-    if not detector or source is None or source != card.get("created_on"):
++    provenance = card.get("alarm_source")
++    if provenance is None:
++        provenance = card.get("created_on")
++    if not detector or source is None or source != provenance:
+         return "pickup_stall_provenance"
+     return "pickup_stall_source" if source == machine else None
+diff --git a/hermes_cli/kanban_pickup_stall_repin.py b/hermes_cli/kanban_pickup_stall_repin.py
+index 898e58411c..68df07aaae 100644
+--- a/hermes_cli/kanban_pickup_stall_repin.py
++++ b/hermes_cli/kanban_pickup_stall_repin.py
+@@ -9,7 +9,8 @@ re-placed them by hand.
+ The grant (:func:`refusal`) is the alarm's own run moving one target with ``kanban_move(task_id=<target>,
+ runs_on=["pool:worker"], reason=...)``. Every condition must hold, each read on the board the move would write:
+ 
+-* the caller is an open alarm the detector filed: ``created_by`` the detector, ``created_on`` M, idempotency key
++* the caller is an open alarm the detector filed: ``created_by`` the detector, immutable ``alarm_source`` M
++  (legacy NULL falls back to ``created_on``), idempotency key
+   ``pickup-stall:<M>:...`` (M is read from the key, never from the arguments);
+ * the target is one the alarm lists: the card its per-card key names, or a ``- <id> (`` line in its body or in a
+   detector comment (``_refresh_targets``);
+@@ -84,7 +85,10 @@ def alarm_own(alarm: Any) -> Optional[str]:
+     if not key.startswith(kps.KEY_PREFIX):
+         return None
+     own = key[len(kps.KEY_PREFIX):].split(":", 1)[0]
+-    if not own or ("created_on" in _cols(alarm) and alarm["created_on"] != own):
++    provenance = _stored(alarm, "alarm_source")
++    if provenance is None:
++        provenance = _stored(alarm, "created_on")
++    if not own or (("created_on" in _cols(alarm) or provenance is not None) and provenance != own):
+         return None
+     return own
+ 
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index 48e6a4e1d7..1a2fa8d1d8 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -442,7 +442,7 @@ def local_refusals(conn: sqlite3.Connection, status: str) -> dict[str, str]:
+         return out
+     own = _own(conn)
+     rows = conn.execute(
+-        "SELECT id, runs_on, created_on, created_by, idempotency_key, workspace_kind FROM tasks "
++        "SELECT id, runs_on, created_on, alarm_source, created_by, idempotency_key, workspace_kind FROM tasks "
+         "WHERE status = ? AND claim_lock IS NULL "
+         "AND (runs_on IS NOT NULL OR (created_on IS NOT NULL AND created_on != ?) "
+         "OR created_by = 'pickup-stall-detector' OR idempotency_key LIKE 'pickup-stall:%' "
+diff --git a/tests/hermes_cli/kanban_sync_fake_board.py b/tests/hermes_cli/kanban_sync_fake_board.py
+index c997365d06..6a58e4a3ed 100644
+--- a/tests/hermes_cli/kanban_sync_fake_board.py
++++ b/tests/hermes_cli/kanban_sync_fake_board.py
+@@ -223,6 +223,8 @@ class FakeService:
+             cur = rows.get(uid)
+             if cur is None:
+                 clocks = {k: op["hlc"] for k in f}
++                if f.get("created_by") == "pickup-stall-detector":
++                    f["alarm_source"] = gw
+                 return {"status": "applied", "row": self._put(b, table, uid, {"id": uid, **f, "created_on": gw,
+                                                                                 "field_hlc": clocks}, gw, op["client_op_id"], op["hlc"])}
+             if op.get("import") and cur.get("created_on") not in (None, gw):
+diff --git a/tests/hermes_cli/test_kanban_alarm_source.py b/tests/hermes_cli/test_kanban_alarm_source.py
+new file mode 100644
+index 0000000000..c8c9deaf94
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_alarm_source.py
+@@ -0,0 +1,33 @@
++"""Board-stamped alarm source survives ownership changes. [daveey]"""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli.kanban_pickup_alarm_identity import refusal
++from hermes_cli.kanban_pickup_stall_repin import alarm_own
++
++
++@pytest.mark.parametrize("prefix", ["pickup-stall:source:queue-full", "worker-resources-unknown:source"])
++@pytest.mark.parametrize("stamp,home,expected", [
++    (None, "source", "pickup_stall_source"),
++    (None, "new-owner", "pickup_stall_provenance"),
++    ("source", "new-owner", "pickup_stall_source"),
++    ("", "source", "pickup_stall_provenance"),
++])
++def test_board_parity(prefix, stamp, home, expected):
++    row = {"created_by": "pickup-stall-detector", "idempotency_key": f"{prefix}:1",
++           "created_on": home, "alarm_source": stamp}
++    assert refusal(row, "source") == expected
++    assert refusal(row, "executor") == (None if expected == "pickup_stall_source" else expected)
++    assert refusal({"created_by": "default", "alarm_source": stamp}, "source") is None
++
++
++@pytest.mark.parametrize("stamp,home,expected", [
++    (None, "source", "source"), (None, "new-owner", None),
++    ("source", "new-owner", "source"), ("", "source", None),
++])
++def test_repin_uses_immutable_source(stamp, home, expected):
++    row = {"created_by": "pickup-stall-detector", "status": "ready",
++           "idempotency_key": "pickup-stall:source:queue-full:1", "created_on": home, "alarm_source": stamp}
++    assert alarm_own(row) == expected
++    assert alarm_own({**row, "status": "archived"}) is None
+diff --git a/tests/hermes_cli/test_kanban_pickup_alarm_placement.py b/tests/hermes_cli/test_kanban_pickup_alarm_placement.py
+index a6df3adac5..3fe706f134 100644
+--- a/tests/hermes_cli/test_kanban_pickup_alarm_placement.py
++++ b/tests/hermes_cli/test_kanban_pickup_alarm_placement.py
+@@ -115,6 +115,7 @@ def test_another_worker_claims_the_alarm_after_the_source_regains_capacity(tmp_p
+         worker.round()
+         row = svc.board(support.BOARD)["rows"]["tasks"][alarm]
+         assert row["created_by"] == kps.DETECTOR and row["created_on"] == WORKER
++        assert row.get("alarm_source") == WORKER
+         assert row["idempotency_key"].startswith(f"pickup-stall:{WORKER}:")
+         monkeypatch.setitem(support.MACHINES, WORKER, _worker(WORKER, metrics={"active_card_runs": 0}))
+         worker.enter()
+diff --git a/tests/hermes_cli/test_kanban_sync_apply.py b/tests/hermes_cli/test_kanban_sync_apply.py
+index 8eb5090113..f0c04f5162 100644
+--- a/tests/hermes_cli/test_kanban_sync_apply.py
++++ b/tests/hermes_cli/test_kanban_sync_apply.py
+@@ -53,6 +53,39 @@ def captured_hooks():
+         mgr._hooks = saved
+ 
+ 
++@pytest.mark.parametrize("stamp", ["source", ""])
++def test_alarm_source_is_pulled_but_never_pushed(synced_conn, stamp):
++    conn = synced_conn
++    tid = "t_remote000000099"
++    sync.apply_remote_changes(conn, [_ch(1, "tasks", tid, _task_fields(alarm_source=stamp))], new_cursor=1)
++    row = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++    assert row.get("alarm_source") == stamp
++    before = _outbox_count(conn)
++    conn.execute("UPDATE tasks SET alarm_source=? WHERE id=?", ("local-forgery", tid))
++    assert _outbox_count(conn) == before
++    conn.execute("UPDATE tasks SET title='changed' WHERE id=?", (tid,))
++    assert all("alarm_source" not in op["fields"] for op in sync.outbox(conn))
++    assert "alarm_source" not in sync.captured_columns(conn, "tasks")
++
++
++def test_alarm_source_reaches_local_prefilter(synced_conn, monkeypatch):
++    from hermes_cli import kanban_worker_node as worker
++    from hermes_cli import kanban_worker_placement as placement
++
++    conn = synced_conn
++    tid = "t_remote000000098"
++    sync.apply_remote_changes(conn, [_ch(1, "tasks", tid, _task_fields(
++        created_by="pickup-stall-detector", idempotency_key="pickup-stall:source:queue-full:1",
++        created_on="new-owner", alarm_source="source"))], new_cursor=1)
++    monkeypatch.setattr(sync, "board_mode", lambda conn: "primary")
++    monkeypatch.setattr(worker, "_own", lambda conn: "executor")
++    monkeypatch.setattr(worker, "registry", lambda: None)
++    monkeypatch.setattr(placement, "local_refusals", lambda conn, status: {})
++    assert tid not in worker.local_refusals(conn, "ready")
++    monkeypatch.setattr(worker, "_own", lambda conn: "source")
++    assert worker.local_refusals(conn, "ready")[tid] == "pickup_stall_source"
++
++
+ def test_remote_changes_are_not_echoed_into_the_outbox(synced_conn):
+     conn = synced_conn
+     before = _outbox_count(conn)
+-- 
+2.43.0
+

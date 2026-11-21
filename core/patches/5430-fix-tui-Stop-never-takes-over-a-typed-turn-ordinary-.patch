@@ -1,0 +1,257 @@
+From 622143eb1a4a43cc6fc60af7d42ff3991631756d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 23:43:16 -0800
+Subject: [PATCH] fix(tui): Stop never takes over a typed turn; ordinary Stop
+ always runs; anchored :auto=
+
+Round-3 review of #3908:
+- _end_background_turn: on a turn-end-request-v1 gateway an unstamped holder is a typed
+  turn: nothing is ended or taken over, and the chat is told so. session.take_over is
+  only for an older (not capable) gateway with nothing queued.
+- session.interrupt always runs the ordinary idle Stop (automation replays, post-turn
+  review) and starts the background worker in addition; background_turn is a hint.
+- holder_auto_kind reads only the segment right before the last :platform=, so a
+  client-chosen session/task id cannot fake the stamp.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/turn_end_request.py                     |  7 +++-
+ tests/agent/test_turn_end_request.py          |  5 +++
+ .../tui_gateway/test_background_turn_queue.py | 37 ++++++++++++-------
+ tui_gateway/methods_session_interrupt.py      | 34 +++++++++++------
+ 4 files changed, 55 insertions(+), 28 deletions(-)
+
+diff --git a/agent/turn_end_request.py b/agent/turn_end_request.py
+index be25fc7df1..59bbd2d0f5 100644
+--- a/agent/turn_end_request.py
++++ b/agent/turn_end_request.py
+@@ -27,7 +27,9 @@ CAPABILITY = "turn-end-request-v1"
+ AUTO_KINDS = frozenset((TURN_STARTING_NOTICE_KINDS - {"loop_tick"}) | {"auto_continue"})
+ #: What the ending turn reports as its interrupt message.
+ END_MESSAGE = "Stopped from another Hermes window."
+-_AUTO_RE = re.compile(r":auto=([a-z_]+)(?::|$)")
++# Only the segment right before the LAST ``:platform=``: ``lease_holder`` puts it there, after the turn id, whose
++# session/task parts a client may choose (an ``:auto=`` inside them must not count).
++_AUTO_RE = re.compile(r":auto=([a-z_]+)$")
+ 
+ 
+ def auto_token(display_kind: Any) -> str:
+@@ -37,5 +39,6 @@ def auto_token(display_kind: Any) -> str:
+ 
+ def holder_auto_kind(holder: Any) -> Optional[str]:
+     """The automated kind a durable holder string names, else None (a typed turn, or an older holder)."""
+-    match = _AUTO_RE.search(str(holder or ""))
++    head, sep, _platform = str(holder or "").rpartition(":platform=")
++    match = _AUTO_RE.search(head) if sep else None
+     return match.group(1) if match and match.group(1) in AUTO_KINDS else None
+diff --git a/tests/agent/test_turn_end_request.py b/tests/agent/test_turn_end_request.py
+index ee32ef7f33..cc8130ceb2 100644
+--- a/tests/agent/test_turn_end_request.py
++++ b/tests/agent/test_turn_end_request.py
+@@ -35,6 +35,11 @@ def test_holder_names_only_automated_turns():
+     assert auto.rsplit(":platform=", 1)[-1] == "tui"  # readers that take the surface from the tail still work
+     assert holder_auto_kind(typed) is None and ":auto=" not in typed
+     assert auto_token("loop_tick") == "" and auto_token("hidden") == "" and auto_token(None) == ""
++    # A client-chosen session/task id cannot fake the stamp: only the segment before the last :platform= counts.
++    assert holder_auto_kind(lease_holder("sid:task:auto=kanban_notice:x", "tui", None)) is None
++    # relay ids are ``<session>:<task>:<8 hex>`` (agent/turn_facade.py): a chosen task id never ends the turn id
++    assert holder_auto_kind(lease_holder("sid:auto=kanban_notice:1a2b3c4d", "tui", None)) is None
++    assert holder_auto_kind("pid=1:turn=t:auto=kanban_notice") is None  # no :platform= tail
+     assert {"kanban_notice", "auto_continue", "process_complete"} <= AUTO_KINDS and "loop_tick" not in AUTO_KINDS
+ 
+ 
+diff --git a/tests/tui_gateway/test_background_turn_queue.py b/tests/tui_gateway/test_background_turn_queue.py
+index d6403bbe06..3132fdcf0a 100644
+--- a/tests/tui_gateway/test_background_turn_queue.py
++++ b/tests/tui_gateway/test_background_turn_queue.py
+@@ -218,7 +218,8 @@ def idle_chat(monkeypatch):
+                "history_lock": threading.RLock(), "running": False}
+     monkeypatch.setitem(server._sessions, sid, session)
+     state = {"calls": [], "requests": [], "recorded": True, "events": [], "workers": [], "capable": True,
+-             "holder": AUTO_HOLDER, "answer": {"result": {"status": "taken_over"}}}
++             "holder": AUTO_HOLDER, "answer": {"result": {"status": "taken_over"}}, "ordinary": []}
++    monkeypatch.setattr(server, "_interrupt_session_turn", lambda *a, **k: state["ordinary"].append(a[0]))
+ 
+     def take_over(rid, params):
+         state["calls"].append(params)
+@@ -265,6 +266,7 @@ def test_stop_answers_at_once_and_asks_exactly_the_holders_turn_to_end(idle_chat
+     resp = _stop(sid, "stop_button")
+ 
+     assert resp["result"] == {"status": "interrupted", "background_turn": True}
++    assert state["ordinary"] == [sid]  # the ordinary idle Stop ran too (automation replays, post-turn review)
+     assert state["requests"] == [] and len(state["workers"]) == 1  # nothing discovered on the RPC thread
+     assert _run_workers(state) == ["end_requested"]
+     assert state["requests"] == [(KEY, AUTO_HOLDER)] and state["calls"] == [] and state["events"] == []
+@@ -320,11 +322,24 @@ def test_stop_racing_a_queued_forwarded_admission_on_an_older_gateway_never_take
+ 
+ 
+ def test_a_typed_holder_is_never_asked_to_end(idle_chat):
++    """A capable gateway stamps every automated turn: an unstamped one was typed, and is neither asked to end nor
++    taken over."""
+     sid, _session, state = idle_chat
+-    state["holder"] = f"pid={GATEWAY}:pidns=4026531836:turn=t1:platform=tui"  # no :auto=: an older or typed turn
++    state["holder"] = f"pid={GATEWAY}:pidns=4026531836:turn=t1:platform=tui"
+     _stop(sid, "stop_button")
+ 
+-    assert _run_workers(state) == ["taken_over"] and state["requests"] == []  # the older-gateway fallback
++    assert _run_workers(state) == ["typed_turn"]
++    assert state["requests"] == [] and state["calls"] == []
++    assert state["events"][0][2]["message"] == server.BACKGROUND_STOP_TYPED_MESSAGE
++
++
++def test_an_unstamped_turn_on_an_older_gateway_is_taken_over_as_before(idle_chat):
++    sid, _session, state = idle_chat
++    state["capable"] = False
++    state["holder"] = f"pid={GATEWAY}:pidns=4026531836:turn=t1:platform=tui"  # an older core stamps nothing
++    _stop(sid, "stop_button")
++
++    assert _run_workers(state) == ["taken_over"] and state["requests"] == []
+ 
+ 
+ def test_no_gateway_holder_ends_nothing(idle_chat, monkeypatch):
+@@ -336,33 +351,27 @@ def test_no_gateway_holder_ends_nothing(idle_chat, monkeypatch):
+ 
+ 
+ @pytest.mark.parametrize("origin", ["delete", "rewind", "plugin:x", None])
+-def test_other_interrupts_run_the_ordinary_stop(idle_chat, monkeypatch, origin):
++def test_other_interrupts_run_the_ordinary_stop(idle_chat, origin):
+     sid, _session, state = idle_chat
+-    ordinary = []
+-    monkeypatch.setattr(server, "_interrupt_session_turn", lambda *a, **k: ordinary.append(a[0]))
+     resp = _stop(sid, origin)
+ 
+-    assert resp["result"] == {"status": "interrupted"} and ordinary == [sid] and state["workers"] == []
++    assert resp["result"] == {"status": "interrupted"} and state["ordinary"] == [sid] and state["workers"] == []
+ 
+ 
+-def test_stop_of_this_backends_own_turn_is_the_ordinary_stop(idle_chat, monkeypatch):
++def test_stop_of_this_backends_own_turn_is_the_ordinary_stop(idle_chat):
+     sid, session, state = idle_chat
+     session["running"] = True
+-    ordinary = []
+-    monkeypatch.setattr(server, "_interrupt_session_turn", lambda *a, **k: ordinary.append(a[0]))
+     resp = _stop(sid, "stop_button")
+ 
+-    assert resp["result"] == {"status": "interrupted"} and ordinary == [sid] and state["workers"] == []
++    assert resp["result"] == {"status": "interrupted"} and state["ordinary"] == [sid] and state["workers"] == []
+ 
+ 
+ def test_stop_on_a_chat_whose_newest_turn_was_typed_is_the_ordinary_stop(idle_chat, monkeypatch):
+     sid, _session, state = idle_chat
+     monkeypatch.setattr(server, "_automation_holder_kind", lambda session: None)
+-    ordinary = []
+-    monkeypatch.setattr(server, "_interrupt_session_turn", lambda *a, **k: ordinary.append(a[0]))
+     resp = _stop(sid, "stop_button")
+ 
+-    assert resp["result"] == {"status": "interrupted"} and ordinary == [sid] and state["workers"] == []
++    assert resp["result"] == {"status": "interrupted"} and state["ordinary"] == [sid] and state["workers"] == []
+ 
+ 
+ # -- the forwarded prompt's turn waits for the background turn's lease ---------------------------------------------
+diff --git a/tui_gateway/methods_session_interrupt.py b/tui_gateway/methods_session_interrupt.py
+index 68875ff1d0..a7a9278961 100644
+--- a/tui_gateway/methods_session_interrupt.py
++++ b/tui_gateway/methods_session_interrupt.py
+@@ -82,6 +82,8 @@ _HELD_QUEUE_KEEPING_ORIGINS = frozenset({None, "stop_button", "esc", "tile", "ti
+ _BACKGROUND_STOP_ORIGINS = frozenset({"stop_button", "esc", "tile", "tile:esc", "slash", "transcript"})
+ 
+ 
++BACKGROUND_STOP_TYPED_MESSAGE = ("The turn running in this chat in another window was not started by Hermes, so "
++                                 "Stop here does not end it. Stop it in that window.")
+ BACKGROUND_STOP_QUEUED_MESSAGE = ("The background turn in this chat could not be stopped from here (the gateway "
+                                   "running it is older). Your message runs when that turn ends.")
+ 
+@@ -89,8 +91,8 @@ BACKGROUND_STOP_QUEUED_MESSAGE = ("The background turn in this chat could not be
+ def _stop_gateway_background_turn(rid, sid: str, session: dict) -> bool:
+     """A Stop on a chat whose turn Hermes started in ANOTHER process. Only cheap checks run here (this backend runs
+     no turn, the chat's newest turn is automated); the holder discovery and the end itself run on a worker
+-    (``_end_background_turn``) and report by events, so Stop never blocks the RPC reader. True when the worker
+-    was started; False leaves the ordinary Stop."""
++    (``_end_background_turn``) and report by events, so Stop never blocks the RPC reader. The ordinary Stop runs
++    either way; True only says the worker was started."""
+     with session["history_lock"]:
+         if session.get("running"):
+             return False
+@@ -113,8 +115,9 @@ def _end_background_turn(rid, sid: str, session: dict, queued: bool) -> str:
+       gateway honours end requests (``turn_end_request.CAPABILITY``): record the request for that exact holder
+       (``SessionDB.request_turn_end``, compare-and-set). Its turn ends with an ordinary interrupt and releases
+       the lease, so a prompt queued behind it runs next, once. Whether or not a prompt is queued.
+-    - An older gateway: with nothing queued, ``session.take_over`` (as before); with a prompt queued in its FIFO
+-      a take-over would race that queue, so the chat is told the message runs when the turn ends.
++    - A capable gateway running an UNSTAMPED turn: somebody typed it; nothing is ended, the chat is told so.
++    - An older gateway (not capable): with nothing queued, ``session.take_over`` (as before); with a prompt queued
++      in its FIFO a take-over would race that queue, so the chat is told the message runs when the turn ends.
+     - Anything else (no such holder any more, another holder): nothing is ended."""
+     from agent.turn_end_request import CAPABILITY, holder_auto_kind
+     from tui_gateway.gateway_background_holder import gateway_background_holder
+@@ -127,10 +130,15 @@ def _end_background_turn(rid, sid: str, session: dict, queued: bool) -> str:
+         gateway = owner = None
+     holder = str((owner or {}).get("holder") or "")
+     if gateway is None or not holder:
++        # The ordinary Stop already ran for this chat; there is no background turn left to end.
+         logger.info("Stop in %s: no background turn of this host's gateway holds it now; nothing to end", key)
+         return "no_holder"
+     capable = CAPABILITY in (getattr(gateway.endpoint, "capabilities", None) or ())
+-    if capable and holder_auto_kind(holder) is not None:
++    if capable and holder_auto_kind(holder) is None:
++        # A gateway that stamps automated turns ran this one unstamped: somebody typed it. Never ended from here.
++        _emit("error", sid, {"message": BACKGROUND_STOP_TYPED_MESSAGE})
++        return "typed_turn"
++    if capable:
+         try:
+             with _session_db(session) as db:
+                 recorded = bool(db.request_turn_end(key, holder, reason="stop"))
+@@ -143,7 +151,7 @@ def _end_background_turn(rid, sid: str, session: dict, queued: bool) -> str:
+         _emit("error", sid, {"message": "Stop could not reach the background turn in this chat; it may have "
+                                         "just ended. Try Stop again if it is still running."})
+         return "end_request_failed"
+-    if queued:
++    if queued:  # only an older (not capable) gateway reaches here
+         _emit("error", sid, {"message": BACKGROUND_STOP_QUEUED_MESSAGE})
+         return "queued_not_interrupted"
+     handler = _methods.get("session.take_over")
+@@ -289,9 +297,11 @@ def _(rid, params: dict) -> dict:
+         keep_held = origin in _HELD_QUEUE_KEEPING_ORIGINS
+         _note_user_input(session)
+         _note_stop_issuer(sid, session, current_transport(), origin)
+-        if origin in _BACKGROUND_STOP_ORIGINS and _stop_gateway_background_turn(rid, sid, session):
+-            # Requested, not yet done: the outcome reaches the chat as events (the turn's own end, or an error).
+-            return _ok(rid, {"status": "interrupted", "background_turn": True})
++        # [daveey] An ADDITION to the ordinary Stop below (which still cancels this chat's automation replays and
++        # post-turn review): a worker ends the gateway's background turn and reports by events. ``background_turn``
++        # in the answer is only a hint that it was started.
++        hint = ({"background_turn": True} if origin in _BACKGROUND_STOP_ORIGINS
++                and _stop_gateway_background_turn(rid, sid, session) else {})
+         if _session_uses_compute_host(session):
+             with session["history_lock"]:
+                 inflight_at_interrupt = session.get("inflight_turn")
+@@ -303,7 +313,7 @@ def _(rid, params: dict) -> dict:
+                 logger.warning("session.interrupt: compute-host interrupt failed for %s: %s", sid, exc)
+                 _recover_unreachable_compute_host_turn(sid, session, inflight_at_interrupt,
+                                                        bool(outcome.get("kept_update_held_queue")))
+-            return _ok(rid, {"status": "interrupted", "turn_isolation": True})
++            return _ok(rid, {"status": "interrupted", "turn_isolation": True, **hint})
+         # No agent wait: a turn parked on the deferred build already honors _turn_cancel_requested. Waiting here
+         # failed Stop with 5032 once the build failed or outlived 30s (and started a build for a lazy session), so
+         # the Desktop, which interrupts before session.close, could not delete such a session (#133262).
+@@ -318,7 +328,7 @@ def _(rid, params: dict) -> dict:
+             stale_key = str(outcome.get("stale_marker_key") or "")
+             if stale_key and stale_key != str(session.get("session_key") or ""):
+                 clear_turn_marker(_session_home(session), stale_key)
+-            return _ok(rid, {"status": "interrupted"})
++            return _ok(rid, {"status": "interrupted", **hint})
+         # Retire the crash-recovery marker NOW: until the run thread's finally, a backend exit looks like a crash
+         # and session.resume auto-continues the turn the user just stopped (the extra key covers compression
+         # rotating session_key mid-turn).
+@@ -327,7 +337,7 @@ def _(rid, params: dict) -> dict:
+         with session["history_lock"]:
+             active_marker_key = str(session.pop("_active_turn_marker_key", "") or "")
+         _retire_turn_marker(session, active_marker_key)
+-        return _ok(rid, {"status": "interrupted"})
++        return _ok(rid, {"status": "interrupted", **hint})
+     finally:
+         if resume_wake:
+             try:
+-- 
+2.43.0
+

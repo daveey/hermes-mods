@@ -1,0 +1,968 @@
+From e1d0a99a55364c08fe1dcc034283c83a7ae1b82e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 23:11:21 -0800
+Subject: [PATCH] fix(tui): review of #3908: bounded Stop ack, no sleep in wake
+ slots, holder identity
+
+- Stop: skip the take-over when the gateway's durable ledger holds work for the chat
+  (a typed prompt already queued there); wait up to 5 s for session.take_over and
+  return its error, or, when it fails later, emit an error event the Desktop shows.
+- A wake refused by a retiring backend answers "busy" at once (never sleeps inside a
+  wake slot); the notice guarantee reads the short retry (15 s) and charges nothing.
+- notice_hold_wait: the watcher clears its thread marker in the same locked section
+  that decides to return, so a notice refused meanwhile starts a new watcher.
+- host_loop_lease: publish and withdraw the retiring record under _RETIRE_MU; withdraw
+  it at exit too.
+- gateway_background_holder: count a durable holder only in this pid namespace and a
+  registry lease only for this host's live process with its recorded start time; the
+  gateway must be the very one owner_forward dials for the chat's profile home (its
+  endpoint is passed to forward_prompt), else the take-over stays.
+- Tests: hold-wait across a lift then an ordinary busy; a forwarded gateway-hosted turn
+  waits for the background turn's lease and runs once after; Stop racing a queued
+  forwarded admission; failed and late-failing Stops; retire/resume race.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/host_loop_lease.py                 |  13 +-
+ .../test_host_loop_retiring_marker.py         |  36 +++
+ .../tui_gateway/test_background_turn_queue.py | 232 ++++++++++++------
+ tests/tui_gateway/test_notice_hold_wait.py    |  60 +++++
+ tui_gateway/gateway_background_holder.py      | 138 +++++++----
+ tui_gateway/methods_prompt.py                 |   4 +-
+ tui_gateway/methods_session_interrupt.py      |  54 +++-
+ tui_gateway/notice_guarantee.py               |  12 +-
+ tui_gateway/notice_hold_wait.py               |   8 +-
+ tui_gateway/owner_forward.py                  |   8 +-
+ tui_gateway/session_notifications.py          |   5 +-
+ 11 files changed, 426 insertions(+), 144 deletions(-)
+
+diff --git a/hermes_cli/host_loop_lease.py b/hermes_cli/host_loop_lease.py
+index 652e74f3ee..501e59184e 100644
+--- a/hermes_cli/host_loop_lease.py
++++ b/hermes_cli/host_loop_lease.py
+@@ -112,7 +112,7 @@ def retire_host_loops(key: str, reason: str) -> bool:
+     with _RETIRE_MU:
+         first = not _RETIRED
+         _RETIRED[key] = reason
+-    _publish_retiring(reason)
++        _publish_retiring(reason)  # under the lock: a racing resume never leaves a record behind
+     if not first:
+         return False
+     logger.warning("host loops retired in this process (%s): releasing every host-loop lease and starting no "
+@@ -141,8 +141,9 @@ def resume_host_loops(key: str) -> bool:
+     with _RETIRE_MU:
+         had = _RETIRED.pop(key, None) is not None
+         left = not _RETIRED
++        if had and left:
++            _withdraw_retiring()  # under the lock: a racing retire publishes after this, never before
+     if had and left:
+-        _withdraw_retiring()
+         logger.info("host loops resumed in this process (%s cleared)", key)
+     return left
+ 
+@@ -156,8 +157,16 @@ def _retiring_path(pid: int, home: str | Path | None = None) -> Path:
+     return lease_dir(home) / "retiring" / f"{int(pid)}.json"
+ 
+ 
++_EXIT_HOOK: list = []
++
++
+ def _publish_retiring(reason: str) -> None:
++    """Caller holds ``_RETIRE_MU``. The record is also withdrawn when the process exits cleanly."""
+     pid = os.getpid()
++    if not _EXIT_HOOK:
++        import atexit
++        atexit.register(_withdraw_retiring)
++        _EXIT_HOOK.append(True)
+     try:
+         path = _retiring_path(pid)
+         path.parent.mkdir(parents=True, exist_ok=True)
+diff --git a/tests/hermes_cli/test_host_loop_retiring_marker.py b/tests/hermes_cli/test_host_loop_retiring_marker.py
+index a29f619dcc..4a49b34667 100644
+--- a/tests/hermes_cli/test_host_loop_retiring_marker.py
++++ b/tests/hermes_cli/test_host_loop_retiring_marker.py
+@@ -61,3 +61,39 @@ def test_garbage_answers_none(tmp_path):
+     assert hll.retiring_reason(os.getpid()) is None
+     assert hll.retiring_reason("not-a-pid") is None
+     assert hll.retiring_reason(-1) is None
++
++
++def test_racing_retire_and_resume_leave_the_record_consistent():
++    """Publish and withdraw run under the retirement lock: whatever the interleaving, the record exists exactly
++    while some retirement reason is left."""
++    import threading
++
++    me = os.getpid()
++    barrier = threading.Barrier(8)
++
++    def churn(n):
++        barrier.wait()
++        for i in range(60):
++            key = f"k{n}"
++            if i % 2 == 0:
++                hll.retire_host_loops(key, f"r{n}")
++            else:
++                hll.resume_host_loops(key)
++
++    threads = [threading.Thread(target=churn, args=(n,)) for n in range(8)]
++    for t in threads:
++        t.start()
++    for t in threads:
++        t.join()
++
++    assert (hll.retiring_reason(me) is not None) == (hll.host_loops_retired() is not None)
++    for n in range(8):
++        hll.resume_host_loops(f"k{n}")
++    assert hll.host_loops_retired() is None and hll.retiring_reason(me) is None
++
++
++def test_the_record_is_withdrawn_when_the_process_exits():
++    hll.retire_host_loops("code-skew", "boot behind")
++    assert hll._EXIT_HOOK  # atexit.register(_withdraw_retiring) is in place
++    hll._withdraw_retiring()  # what the exit hook runs
++    assert hll.retiring_reason(os.getpid()) is None
+diff --git a/tests/tui_gateway/test_background_turn_queue.py b/tests/tui_gateway/test_background_turn_queue.py
+index 91f36f2aac..8134bb3761 100644
+--- a/tests/tui_gateway/test_background_turn_queue.py
++++ b/tests/tui_gateway/test_background_turn_queue.py
+@@ -10,6 +10,7 @@ gateway's FIFO (the RT-37 forward), and any other holder keeps the takeover.
+ from __future__ import annotations
+ 
+ import threading
++import time
+ 
+ import pytest
+ 
+@@ -31,29 +32,42 @@ def _entry(pid, key=KEY):
+     return {"session_id": key, "pid": pid, "lease_id": f"lease-{pid}"}
+ 
+ 
++def _plain_pids(key, owner, entries, me):
++    """``holder_pids`` with every identity taken at face value (the identity checks have their own tests)."""
++    return gbh.holder_pids(key, owner, entries, me, durable_pid=lambda h: gbh._holder_pid(h) or 0,
++                           registry_pid=lambda e: int(e.get("pid") or 0))
++
++
++def _dialed(pid):
++    return lambda session: gbh.DialedGateway(pid, "endpoint") if pid else None
++
++
+ # -- who holds the chat ------------------------------------------------------------------------------------------
+ 
+ 
+ def test_the_gateway_alone_holding_the_chat_is_named():
+     session = {"session_key": KEY}
+-    assert gbh.gateway_background_holder(session, foreign_owner=lambda s: _owner(GATEWAY),
+-                                         registry=lambda: [_entry(GATEWAY), _entry(99, "other-chat")],
+-                                         gateway_pid=lambda: GATEWAY) == GATEWAY
++    found = gbh.gateway_background_holder(session, foreign_owner=lambda s: _owner(GATEWAY),
++                                          registry=lambda: [_entry(GATEWAY), _entry(99, "other-chat")],
++                                          dialed=_dialed(GATEWAY), holders=_plain_pids)
++    assert found == gbh.DialedGateway(GATEWAY, "endpoint")
+     # The registry lease alone (between the notice's admission and its turn lease) proves it too.
+     assert gbh.gateway_background_holder(session, foreign_owner=lambda s: None, registry=lambda: [_entry(GATEWAY)],
+-                                         gateway_pid=lambda: GATEWAY) == GATEWAY
++                                         dialed=_dialed(GATEWAY), holders=_plain_pids) is not None
+ 
+ 
+-@pytest.mark.parametrize("owner, entries, live", [
++@pytest.mark.parametrize("owner, entries, dialed_pid", [
+     (_owner(DESKTOP), [], GATEWAY),                      # another Desktop backend writes the turn
+     (_owner(GATEWAY), [_entry(DESKTOP)], GATEWAY),       # the gateway AND another window hold it
+-    (_owner(GATEWAY), [], None),                         # no verified live gateway
++    (_owner(GATEWAY), [], None),                         # no ready gateway for this chat's profile
++    (_owner(GATEWAY), [], 4242),                         # the forward would dial ANOTHER gateway
+     ({"holder": "legacy-holder"}, [], GATEWAY),          # an unreadable holder string
+     (None, [], GATEWAY),                                 # nobody else holds it
+ ])
+-def test_any_other_holder_keeps_the_takeover(owner, entries, live):
++def test_any_other_holder_keeps_the_takeover(owner, entries, dialed_pid):
+     assert gbh.gateway_background_holder({"session_key": KEY}, foreign_owner=lambda s: owner,
+-                                         registry=lambda: entries, gateway_pid=lambda: live) is None
++                                         registry=lambda: entries, dialed=_dialed(dialed_pid),
++                                         holders=_plain_pids) is None
+ 
+ 
+ def test_an_unreadable_holder_keeps_the_takeover():
+@@ -61,9 +75,32 @@ def test_an_unreadable_holder_keeps_the_takeover():
+         raise OSError("state.db is locked")
+ 
+     assert gbh.gateway_background_holder({"session_key": KEY}, foreign_owner=broken, registry=list,
+-                                         gateway_pid=lambda: GATEWAY) is None
++                                         dialed=_dialed(GATEWAY), holders=_plain_pids) is None
+     assert gbh.gateway_background_holder({"session_key": ""}, foreign_owner=lambda s: _owner(GATEWAY),
+-                                         registry=list, gateway_pid=lambda: GATEWAY) is None
++                                         registry=list, dialed=_dialed(GATEWAY), holders=_plain_pids) is None
++
++
++def test_a_durable_holder_from_another_pid_namespace_is_not_that_process(monkeypatch):
++    import hermes_state_pidns
++    monkeypatch.setattr(hermes_state_pidns, "holder_pid_checkable", lambda holder: False)
++    assert gbh._durable_holder_pid(_owner(GATEWAY)["holder"]) == 0
++    monkeypatch.setattr(hermes_state_pidns, "holder_pid_checkable", lambda holder: True)
++    assert gbh._durable_holder_pid(_owner(GATEWAY)["holder"]) == GATEWAY
++    assert gbh._durable_holder_pid("legacy-holder") == 0
++
++
++def test_a_registry_lease_counts_only_for_this_hosts_live_process(monkeypatch):
++    import os
++
++    import hermes_cli.active_sessions as act
++    me = os.getpid()
++    here = act.owner_host()
++    start = act._own_start_time()
++    assert gbh._registry_pid({"pid": me, "host": here, "process_start_time": start}) == me
++    assert gbh._registry_pid({"pid": me, "host": "another-host", "process_start_time": start}) == 0
++    monkeypatch.setattr(act, "_pid_liveness", lambda pid, start=None, **kw: False)  # dead, or the pid was reused
++    assert gbh._registry_pid({"pid": me, "host": here, "process_start_time": 1.0}) == 0
++    assert gbh._registry_pid({"pid": "x"}) == 0
+ 
+ 
+ # -- prompt.submit -----------------------------------------------------------------------------------------------
+@@ -79,10 +116,12 @@ def background(monkeypatch):
+     sent = []
+     state = {"holder": GATEWAY, "receipt": {"status": "queued", "admission_id": "adm-1"}, "raise": None}
+     monkeypatch.setattr(server, "_automation_holder_kind", lambda session: "kanban_notice")
+-    monkeypatch.setattr(gbh, "gateway_background_holder", lambda session, **kw: state["holder"])
++    monkeypatch.setattr(gbh, "gateway_background_holder",
++                        lambda session, **kw: state["holder"] and gbh.DialedGateway(state["holder"], "endpoint"))
+ 
+     def forward(sid, session, text, **kw):
+         sent.append((sid, text))
++        state["endpoint"] = kw.get("endpoint")
+         if state["raise"] is not None:
+             raise state["raise"]
+         return state["receipt"]
+@@ -98,6 +137,7 @@ def test_a_typed_prompt_is_queued_behind_the_gateways_background_turn(background
+     assert resp["result"] == {"status": "queued", "admission_id": "adm-1", "forwarded": True,
+                               "queued_behind": "kanban_notice"}
+     assert background["sent"] == [("s", "typed here")]
++    assert background["endpoint"] == "endpoint"  # the very gateway proved to hold the chat is dialled
+ 
+ 
+ def test_an_unconfirmed_forward_is_never_taken_over(background):
+@@ -159,17 +199,24 @@ def idle_chat(monkeypatch):
+     session = {"agent": None, "agent_ready": threading.Event(), "session_key": KEY, "history": [],
+                "history_lock": threading.RLock(), "running": False}
+     monkeypatch.setitem(server._sessions, sid, session)
+-    calls, done = [], threading.Event()
++    state = {"calls": [], "done": threading.Event(), "answer": {"result": {"status": "taken_over"}}, "gate": None,
++             "events": []}
+ 
+     def take_over(rid, params):
+-        calls.append(params)
+-        done.set()
+-        return {"result": {"status": "taken_over"}}
++        state["calls"].append(params)
++        if state["gate"] is not None:
++            state["gate"].wait(5)  # a slow take-over: held until the test has the Stop's answer
++        state["done"].set()
++        return state["answer"]
+ 
+     monkeypatch.setitem(server._methods, "session.take_over", take_over)
+     monkeypatch.setattr(server, "_automation_holder_kind", lambda session: "kanban_notice")
+-    monkeypatch.setattr(gbh, "gateway_background_holder", lambda session, **kw: GATEWAY)
+-    return sid, session, calls, done
++    monkeypatch.setattr(server, "_canonical_ledger_refusal", lambda session: None)
++    monkeypatch.setattr(gbh, "gateway_background_holder", lambda session, **kw: gbh.DialedGateway(GATEWAY, "ep"))
++    real_emit = server._emit
++    monkeypatch.setattr(server, "_emit", lambda kind, s, payload=None: state["events"].append((kind, s, payload))
++                        if kind == "error" else real_emit(kind, s, payload))
++    return sid, session, state
+ 
+ 
+ def _stop(sid, origin):
+@@ -178,37 +225,109 @@ def _stop(sid, origin):
+ 
+ 
+ def test_stop_takes_the_chat_over_from_the_gateways_background_turn(idle_chat):
+-    sid, _session, calls, done = idle_chat
++    sid, _session, state = idle_chat
+     resp = _stop(sid, "stop_button")
+ 
+     assert resp["result"] == {"status": "interrupted", "background_turn": True}
+-    assert done.wait(5) and calls == [{"session_id": sid}]
++    assert state["done"].is_set() and state["calls"] == [{"session_id": sid}]  # answered after the take-over
++
++
++def test_a_failed_takeover_fails_the_stop(idle_chat):
++    sid, _session, state = idle_chat
++    state["answer"] = {"error": {"code": 4090, "message": "The other writer has not released this chat.",
++                                 "data": {"reason": "SESSION_NOT_OWNED"}}}
++    resp = _stop(sid, "stop_button")
++
++    assert resp["error"]["code"] == 4090 and "not released" in resp["error"]["message"]
++    assert resp["error"]["data"] == {"reason": "SESSION_NOT_OWNED"}
++
++
++def test_a_takeover_that_fails_after_the_ack_window_shows_an_error(idle_chat, monkeypatch):
++    sid, _session, state = idle_chat
++    from tests.waiting import wait_until
++    monkeypatch.setattr(server, "BACKGROUND_STOP_ACK_S", 0.05)
++    state["gate"] = threading.Event()
++    state["answer"] = {"error": {"code": 4090, "message": "writer busy"}}
++    resp = _stop(sid, "stop_button")
++
++    assert resp["result"] == {"status": "interrupted", "background_turn": True}  # still running when it answered
++    state["gate"].set()
++    wait_until(lambda: state["events"], timeout=5)
++    assert state["events"] and state["events"][0][0] == "error" and state["events"][0][1] == sid
++    assert "writer busy" in state["events"][0][2]["message"]
++
++
++def test_stop_racing_a_queued_forwarded_admission_never_takes_over(idle_chat, monkeypatch):
++    """The user's typed prompt already waits in the gateway's FIFO (its ledger holds work): a take-over now would
++    race that queue, so Stop is the ordinary one."""
++    sid, _session, state = idle_chat
++    refusal = ActiveSessionRefusal("pending work in the gateway's durable queue", SESSION_NOT_OWNED)
++    refusal.ledger_status = "queued"
++    monkeypatch.setattr(server, "_canonical_ledger_refusal", lambda session: refusal)
++    resp = _stop(sid, "stop_button")
++
++    assert resp["result"].get("background_turn") is None and state["calls"] == []
+ 
+ 
+ @pytest.mark.parametrize("origin", ["delete", "rewind", "plugin:x", None])
+ def test_other_interrupts_never_end_the_background_turn(idle_chat, origin):
+-    sid, _session, calls, done = idle_chat
++    sid, _session, state = idle_chat
+     resp = _stop(sid, origin)
+ 
+-    assert resp["result"].get("background_turn") is None
+-    assert not done.wait(0.2) and calls == []
++    assert resp["result"].get("background_turn") is None and state["calls"] == []
+ 
+ 
+ def test_stop_of_this_backends_own_turn_is_the_ordinary_stop(idle_chat, monkeypatch):
+-    sid, session, calls, done = idle_chat
++    sid, session, state = idle_chat
+     session["running"] = True
+     monkeypatch.setattr(server, "_interrupt_session_turn", lambda *a, **k: None)
+     resp = _stop(sid, "stop_button")
+ 
+-    assert resp["result"].get("background_turn") is None and not done.wait(0.2) and calls == []
++    assert resp["result"].get("background_turn") is None and state["calls"] == []
+ 
+ 
+ def test_stop_with_another_holder_is_the_ordinary_stop(idle_chat, monkeypatch):
+-    sid, _session, calls, _done = idle_chat
++    sid, _session, state = idle_chat
+     monkeypatch.setattr(gbh, "gateway_background_holder", lambda session, **kw: None)
+     resp = _stop(sid, "stop_button")
+ 
+-    assert resp["result"].get("background_turn") is None and calls == []
++    assert resp["result"].get("background_turn") is None and state["calls"] == []
++
++
++# -- the forwarded prompt's turn waits for the background turn's lease ---------------------------------------------
++
++
++def test_a_forwarded_turn_waits_for_the_background_turns_lease_and_runs_once_after(tmp_path):
++    """The gateway runs a forwarded prompt as a gateway-hosted turn: it WAITS for a held turn lease
++    (``refuses_held_lease_at_once`` is False with ``_gateway_session_key``) instead of failing, and gets the lease
++    exactly once, right after the background turn releases it."""
++    import os
++    from types import SimpleNamespace
++
++    from agent.turn_facade_lease import refuses_held_lease_at_once
++    from hermes_state import SessionDB
++
++    assert refuses_held_lease_at_once(SimpleNamespace(_gateway_session_key="agent:main:tui"), "tui") is False
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session(KEY, "desktop")
++    background = f"pid={os.getpid()}:turn=closeout:platform=tui"
++    forwarded = f"pid={os.getpid()}:turn=forwarded:platform=tui"
++    assert db.acquire_session_turn_lease(KEY, background, ttl_seconds=60, wait_seconds=0)
++    got, waiting = [], threading.Event()
++
++    def forwarded_turn():
++        got.append(db.acquire_session_turn_lease(KEY, forwarded, ttl_seconds=60, wait_seconds=10,
++                                                 poll_interval_seconds=0.02, on_wait=lambda elapsed: waiting.set()))
++
++    worker = threading.Thread(target=forwarded_turn)
++    worker.start()
++    assert waiting.wait(5)  # it found the background turn holding the lease and waits for it
++    assert got == []
++    db.release_session_turn_lease(KEY, background)
++    worker.join(10)
++
++    assert got == [True] and db.session_turn_lease_owner(KEY)["holder"] == forwarded
++    db.close()
+ 
+ 
+ # -- a wake refused by a backend that is being replaced ------------------------------------------------------------
+@@ -222,54 +341,28 @@ def test_stop_with_another_holder_is_the_ordinary_stop(idle_chat, monkeypatch):
+ def test_retiring_owner_reason_needs_every_other_holder_retiring(reasons, expected):
+     entries = [_entry(pid) for pid in reasons]
+     got = gbh.retiring_owner_reason({"session_key": KEY}, foreign_owner=lambda s: None, registry=lambda: entries,
+-                                    reason_of=reasons.get)
++                                    reason_of=reasons.get, holders=_plain_pids)
+     assert got == expected
+ 
+ 
+-@pytest.fixture
+-def wake(monkeypatch):
+-    session = {"session_key": KEY}
+-    state = {"free_after": 2, "tries": 0, "reason": "code-skew", "claims": 0, "releases": 0}
+-    monkeypatch.setattr(gbh, "retiring_owner_reason", lambda s, **kw: state["reason"])
+-    clock = {"t": 0.0}
+-
+-    def claim_slot(sid, s, **kw):
+-        state["tries"] += 1
+-        return None if state["tries"] >= state["free_after"] else _refusal()
+-
+-    def run():
+-        return gbh.wake_past_retiring_owner(
+-            "s", session, "chat-closeout", KEY,
+-            claim_turn=lambda s: state.__setitem__("claims", state["claims"] + 1) or True,
+-            release_turn=lambda s: state.__setitem__("releases", state["releases"] + 1),
+-            claim_slot=claim_slot, foreign_owner=lambda s: None,
+-            sleep=lambda dt: clock.__setitem__("t", clock["t"] + dt), monotonic=lambda: clock["t"])
+-
+-    return run, state, clock
+-
+-
+-def test_a_wake_waits_out_a_retiring_owner_and_claims_the_chat(wake):
+-    run, state, clock = wake
+-    assert run() is None
+-    assert state["tries"] == 2 and state["claims"] == 2 and state["releases"] == 1  # the last claim is kept
+-    assert clock["t"] == 2 * gbh.RETIRING_OWNER_POLL_S
+-
+-
+-def test_a_retiring_owner_that_never_lets_go_is_busy_not_refused(wake):
+-    run, state, clock = wake
+-    state["free_after"] = 10 ** 9
+-    assert run() == "busy"
+-    assert clock["t"] <= gbh.RETIRING_OWNER_WAIT_S + gbh.RETIRING_OWNER_POLL_S and state["claims"] == state["releases"]
++def test_a_retiring_owner_answers_busy_at_once_with_a_short_retry(monkeypatch):
++    monkeypatch.setattr(gbh, "retiring_owner_reason", lambda s, **kw: "code-skew")
++    started = time.monotonic()
++    assert gbh.wake_past_retiring_owner("s", {"session_key": KEY}, "chat-closeout", KEY,
++                                        foreign_owner=lambda s: None, now=lambda: 1000.0) == "busy"
++    assert time.monotonic() - started < 1  # never sleeps inside the caller's wake slot
++    assert gbh.retiring_retry_at(KEY) == 1000.0 + gbh.RETIRING_OWNER_RETRY_S
++    assert gbh.retiring_retry_at(KEY) is None  # consumed
+ 
+ 
+-def test_a_live_owner_is_still_refused(wake):
+-    run, state, _clock = wake
+-    state["reason"] = None
+-    assert run() == "refused"
+-    assert state["tries"] == 0
++def test_a_live_owner_is_still_refused(monkeypatch):
++    monkeypatch.setattr(gbh, "retiring_owner_reason", lambda s, **kw: None)
++    assert gbh.wake_past_retiring_owner("s", {"session_key": KEY}, "chat-closeout", KEY,
++                                        foreign_owner=lambda s: None) == "refused"
++    assert gbh.retiring_retry_at(KEY) is None
+ 
+ 
+-def test_the_wake_path_uses_the_retiring_owner_wait(monkeypatch):
++def test_the_wake_path_answers_with_the_retiring_owner_verdict(monkeypatch):
+     """``_wake_session_turn`` hands a refused slot claim to ``wake_past_retiring_owner`` and returns its verdict."""
+     session = {"session_key": KEY}
+     import tui_gateway.automation_replay as ar
+@@ -280,10 +373,11 @@ def test_the_wake_path_uses_the_retiring_owner_wait(monkeypatch):
+     monkeypatch.setattr(server, "_start_agent_build", lambda *a: None)
+     monkeypatch.setattr(server, "_wait_agent", lambda *a, **k: None)
+     monkeypatch.setattr(server, "_notif_claim_turn", lambda s: True)
+-    monkeypatch.setattr(server, "_notif_release_turn", lambda s: None)
++    released = []
++    monkeypatch.setattr(server, "_notif_release_turn", lambda s: released.append(1))
+     monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *a, **k: _refusal())
+     seen = []
+     monkeypatch.setattr(gbh, "wake_past_retiring_owner", lambda *a, **k: seen.append(a[3]) or "busy")
+ 
+     assert server._wake_session_turn(KEY, "notice", label="chat-closeout") == "busy"
+-    assert seen == [KEY]
++    assert seen == [KEY] and released == [1]
+diff --git a/tests/tui_gateway/test_notice_hold_wait.py b/tests/tui_gateway/test_notice_hold_wait.py
+index f04e91b135..da02a4e11b 100644
+--- a/tests/tui_gateway/test_notice_hold_wait.py
++++ b/tests/tui_gateway/test_notice_hold_wait.py
+@@ -159,3 +159,63 @@ def test_the_drain_stops_after_its_window():
+     passes = hw.watch(run_pass=lambda: [{"result": "skipped:slots"}], held=lambda: False, sleep=lambda s: None,
+                       monotonic=lambda: next(clock))
+     assert 1 < passes <= hw.DRAIN_S / 50 + 2
++
++
++def test_a_hold_wait_followed_by_an_ordinary_busy_keeps_the_normal_backoff(db, hold):
++    row = _notice(db, "✔ Kanban t_ddd done")
++    now = time.time()
++    _run(db, verdict="busy", now=now)  # refused by the hold
++    assert _closeout(db, row)["hold_wait"] is True
++
++    hold["held"] = False
++    _out, calls = _run(db, verdict="busy", now=now + 30)  # the hold lifted, the chat is busy for another reason
++
++    closeout = _closeout(db, row)
++    assert calls == [(CHAT, row)] and closeout["state"] == "deferred" and not closeout.get("hold_wait")
++    assert closeout["busy_attempts"] == 1 and closeout["retry_at"] >= now + ng.BUSY_RETRY_S  # stamped off the wall clock
++    assert _run(db, now=now + 90) == ([], [])  # not due again before its backoff
++
++
++def test_a_busy_wake_held_by_a_retiring_backend_retries_soon_and_charges_nothing(db, hold, monkeypatch):
++    from tui_gateway import gateway_background_holder as gbh
++    hold["held"] = False
++    row = _notice(db, "✔ Kanban t_eee done")
++    now = time.time()
++
++    def wake(sid, msg_id):
++        with gbh._retiring_mu:
++            gbh._retiring_busy[sid] = now + gbh.RETIRING_OWNER_RETRY_S
++        return "busy"
++
++    @contextlib.contextmanager
++    def opener(chat_id):
++        yield db, chat_id
++
++    ng.guarantee_pass(now=now, stores=lambda: iter([db]), holders=list, session_db=opener, wake=wake,
++                      spawn=lambda job: job())
++
++    closeout = _closeout(db, row)
++    assert closeout["state"] == "deferred" and closeout["retry_at"] == now + gbh.RETIRING_OWNER_RETRY_S
++    assert closeout.get("attempts", 0) == 0 and closeout.get("busy_attempts", 0) == 0
++    _out, calls = _run(db, now=now + gbh.RETIRING_OWNER_RETRY_S + 1)
++    assert calls == [(CHAT, row)]
++
++
++def test_a_notice_refused_while_the_watcher_decides_to_stop_is_not_lost():
++    """``note_waiting`` during the watcher's last pass makes it watch again; once it returns, ``thread`` is already
++    clear (in the same locked section), so the next ``note_waiting`` starts a new watcher."""
++    hw._reset_for_tests()
++    jobs, passes = [], []
++
++    def run_pass():
++        passes.append(1)
++        if len(passes) == 1:
++            assert hw.note_waiting(run_pass=run_pass, spawn=jobs.append) is False  # the live watcher takes it
++        return []
++
++    assert hw.note_waiting(run_pass=run_pass, held=lambda: False, sleep=lambda s: None, spawn=jobs.append)
++    jobs[0]()
++
++    assert len(passes) == 2 and len(jobs) == 1  # watched again for the late notice, no second thread
++    assert hw._state["thread"] is None
++    assert hw.note_waiting(run_pass=run_pass, held=lambda: False, sleep=lambda s: None, spawn=jobs.append) is True
+diff --git a/tui_gateway/gateway_background_holder.py b/tui_gateway/gateway_background_holder.py
+index 71f7211e50..92a1b8d9f6 100644
+--- a/tui_gateway/gateway_background_holder.py
++++ b/tui_gateway/gateway_background_holder.py
+@@ -17,8 +17,9 @@ from __future__ import annotations
+ 
+ import logging
+ import os
++import threading
+ import time
+-from typing import Any, Callable, Iterable, Optional
++from typing import Any, Callable, Iterable, NamedTuple, Optional
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -32,32 +33,78 @@ def _holder_pid(holder: Any) -> Optional[int]:
+     return int(digits) if digits.isdigit() else None
+ 
+ 
+-def holder_pids(key: str, foreign_owner: Optional[dict], registry: Iterable[dict], me: int) -> set[int]:
+-    """Every OTHER process holding chat ``key``: the durable turn-lease writer and the registry leases. An entry
+-    whose pid cannot be read counts as pid 0, which no gateway has, so it keeps the takeover."""
++def _durable_holder_pid(holder: Any) -> int:
++    """The durable writer's pid when it names a process in THIS pid namespace (``hermes_state_pidns``), else 0:
++    the same number in another namespace (a container, a VM's shared store) is not that process here."""
++    pid = _holder_pid(holder)
++    if pid is None:
++        return 0
++    from hermes_state_pidns import holder_pid_checkable
++    return pid if holder_pid_checkable(str(holder)) else 0
++
++
++def _registry_pid(entry: dict) -> int:
++    """A registry lease's pid when it is this host's live process with the recorded start time, else 0 (a lease
++    from another host, a dead process, or a reused pid is not that process)."""
++    try:
++        pid = int(entry.get("pid") or 0)
++    except (TypeError, ValueError):
++        return 0
++    from hermes_cli.active_sessions import _pid_liveness, owner_host
++    host = entry.get("host")
++    if pid <= 0 or (host not in (None, "") and str(host) != owner_host()):
++        return 0
++    return pid if _pid_liveness(pid, entry.get("process_start_time")) is True else 0
++
++
++def holder_pids(key: str, foreign_owner: Optional[dict], registry: Iterable[dict], me: int, *,
++                durable_pid: Callable[[Any], int] = _durable_holder_pid,
++                registry_pid: Callable[[dict], int] = _registry_pid) -> set[int]:
++    """Every OTHER process holding chat ``key``: the durable turn-lease writer and the registry leases. A holder
++    whose identity cannot be proved here counts as pid 0, which no gateway has, so it keeps the takeover."""
+     pids: set[int] = set()
+     if foreign_owner:
+-        pid = _holder_pid(foreign_owner.get("holder"))
+-        pids.add(pid if pid is not None else 0)
++        pids.add(durable_pid(foreign_owner.get("holder")))
+     for entry in registry or ():
+         if str(entry.get("session_id") or "") != key:
+             continue
+-        try:
+-            pid = int(entry.get("pid") or 0)
+-        except (TypeError, ValueError):
+-            pid = 0
++        pid = registry_pid(entry)
+         if pid != me:
+             pids.add(pid)
+     return pids
+ 
+ 
++class DialedGateway(NamedTuple):
++    """The gateway ``owner_forward`` dials for a chat: its endpoint and its verified live pid."""
++    pid: int
++    endpoint: Any
++
++
++def dialed_gateway(session: dict) -> Optional[DialedGateway]:
++    """The ready gateway serving the chat's profile home (``owner_forward.discover_owner``, which follows a named
++    profile to the multiplexer that serves it) and the pid of the process answering on its control home, else
++    None. Discovery only: never starts one."""
++    from pathlib import Path
++    from gateway.status import live_gateway_pid_for_home
++    from hermes_cli.gateway_runtime import discover_gateway_endpoint
++    from tui_gateway import server
++    home = Path(session.get("profile_home") or server._hermes_home).resolve()
++    discovery = discover_gateway_endpoint(home, timeout=5)
++    if discovery.state != "ready" or discovery.endpoint is None:
++        return None
++    pid = live_gateway_pid_for_home(Path(discovery.endpoint.control_home or home))
++    return DialedGateway(int(pid), discovery.endpoint) if pid else None
++
++
+ def gateway_background_holder(session: dict, *, foreign_owner: Callable[[dict], Optional[dict]],
+                               registry: Optional[Callable[[], list]] = None,
+-                              gateway_pid: Optional[Callable[[], Optional[int]]] = None) -> Optional[int]:
+-    """The live gateway's pid when it is the ONLY other holder of this chat, else None.
++                              dialed: Optional[Callable[[dict], Optional[DialedGateway]]] = None,
++                              holders: Callable[..., set] = holder_pids) -> Optional[DialedGateway]:
++    """The gateway a forward would dial, when that very process is the ONLY other holder of this chat, else None.
+ 
+     The caller has already established that the chat's newest turn is one Hermes started (``_automation_holder_kind``).
+-    Every read failure answers None: an unprovable holder keeps the existing takeover behaviour."""
++    A holder that is another process, unprovable here, or a gateway other than the one the forward dials (another
++    profile's, a restarted one) keeps the takeover. Every read failure answers None."""
+     key = str(session.get("session_key") or "")
+     if not key:
+         return None
+@@ -68,25 +115,22 @@ def gateway_background_holder(session: dict, *, foreign_owner: Callable[[dict],
+             entries = active_session_registry_snapshot(session.get("profile_home"))
+         else:
+             entries = registry()
+-        pids = holder_pids(key, owner, entries, os.getpid())
+-        if not pids:
++        pids = holders(key, owner, entries, os.getpid())
++        if not pids or 0 in pids or len(pids) != 1:
+             return None
+-        if gateway_pid is None:
+-            from hermes_cli.gateway_multiplex_served import live_default_gateway_pid
+-            live = live_default_gateway_pid()
+-        else:
+-            live = gateway_pid()
++        gateway = (dialed or dialed_gateway)(session)
+     except Exception:  # health: allow BLE001 -- an unprovable holder keeps the takeover; logged with traceback
+         logger.warning("could not tell who holds chat %s", key, exc_info=True)
+         return None
+-    if live is None or pids != {int(live)}:
++    if gateway is None or pids != {gateway.pid}:
+         return None
+-    return int(live)
++    return gateway
+ 
+ 
+ def retiring_owner_reason(session: dict, *, foreign_owner: Callable[[dict], Optional[dict]],
+                           registry: Optional[Callable[[], list]] = None,
+-                          reason_of: Optional[Callable[[int], Optional[str]]] = None) -> Optional[str]:
++                          reason_of: Optional[Callable[[int], Optional[str]]] = None,
++                          holders: Callable[..., set] = holder_pids) -> Optional[str]:
+     """Why every OTHER holder of this chat is a backend being replaced (``host_loop_lease.retiring_reason``: code
+     skew, superseded), else None. One holder that is not retiring (or cannot be read) is a real owner: None.
+ 
+@@ -102,7 +146,7 @@ def retiring_owner_reason(session: dict, *, foreign_owner: Callable[[dict], Opti
+             entries = active_session_registry_snapshot(session.get("profile_home"))
+         else:
+             entries = registry()
+-        pids = holder_pids(key, owner, entries, os.getpid())
++        pids = holders(key, owner, entries, os.getpid())
+         if reason_of is None:
+             from hermes_cli.host_loop_lease import retiring_reason as reason_of
+         reasons = [reason_of(pid) if pid > 0 else None for pid in sorted(pids)]
+@@ -114,36 +158,34 @@ def retiring_owner_reason(session: dict, *, foreign_owner: Callable[[dict], Opti
+     return "; ".join(sorted(set(reasons)))
+ 
+ 
+-# A wake refused by a backend that is being replaced retries this long, this often: the backend restarts within
+-# seconds and lets the chat go, where "refused" sent the waker (chat-closeout) to its long backoff.
+-RETIRING_OWNER_WAIT_S = 15.0
+-RETIRING_OWNER_POLL_S = 1.0
++# A wake refused by a backend that is being replaced is retried this soon: the backend restarts within seconds and
++# lets the chat go, where "refused" sent the waker (chat-closeout) to its long backoff. The wake answers "busy" at
++# once (it never sleeps inside a caller's wake slot) and :func:`retiring_retry_at` gives the short retry time.
++RETIRING_OWNER_RETRY_S = 15.0
++_retiring_busy: dict[str, float] = {}  # chat key -> retry time (Unix seconds) of its last retiring-owner refusal
++_retiring_mu = threading.Lock()
+ 
+ 
+-def wake_past_retiring_owner(sid: str, session: dict, label: str, key: str, *, claim_turn: Callable[[dict], bool],
+-                             release_turn: Callable[[dict], Any], claim_slot: Callable[..., Any],
++def wake_past_retiring_owner(sid: str, session: dict, label: str, key: str, *,
+                              foreign_owner: Callable[[dict], Optional[dict]],
+-                             sleep: Callable[[float], None] = time.sleep,
+-                             monotonic: Callable[[], float] = time.monotonic) -> Optional[str]:
++                             now: Callable[[], float] = time.time) -> str:
+     """``session_notifications._wake_session_turn`` after its slot claim was refused (its notice claim released):
+-    None once the slot is claimed (the notice claim is held again, as on the ordinary path), else the verdict.
+-    Every other holder retiring (:func:`retiring_owner_reason`): re-claim each ``RETIRING_OWNER_POLL_S`` for
+-    ``RETIRING_OWNER_WAIT_S``, then ``"busy"`` (transient: retry soon). The slot claim stays the only way in, so the
+-    restarting backend and this one never write at once. Any other owner: ``"refused"``, as before."""
++    ``"busy"`` (transient, retry in ``RETIRING_OWNER_RETRY_S``, see :func:`retiring_retry_at`) when every other
++    holder is a backend being replaced (:func:`retiring_owner_reason`), else ``"refused"`` as before. Nothing is
++    claimed here, so the restarting backend and this one never write at once."""
+     reason = retiring_owner_reason(session, foreign_owner=foreign_owner)
+     if reason is None:
+         logger.info("%s: %s has another live owner; not waking it here", label, key)
+         return "refused"
+-    logger.info("%s: %s is held by a backend being replaced (%s); retrying for up to %.0fs",
+-                label, key, reason, RETIRING_OWNER_WAIT_S)
+-    deadline = monotonic() + RETIRING_OWNER_WAIT_S
+-    while monotonic() < deadline:
+-        sleep(RETIRING_OWNER_POLL_S)
+-        if session.get("_finalized") or not claim_turn(session):
+-            return "busy"
+-        if claim_slot(sid, session) is None:
+-            logger.info("%s: %s came free from the retiring backend", label, key)
+-            return None
+-        release_turn(session)
+-    logger.info("%s: %s is still held by the retiring backend; busy (retry soon)", label, key)
++    retry_at = now() + RETIRING_OWNER_RETRY_S
++    with _retiring_mu:
++        _retiring_busy[str(key)] = retry_at
++    logger.info("%s: %s is held by a backend being replaced (%s); busy, retry in %.0fs",
++                label, key, reason, RETIRING_OWNER_RETRY_S)
+     return "busy"
++
++
++def retiring_retry_at(key: str) -> Optional[float]:
++    """The short retry time of ``key``'s latest busy-because-retiring wake (consumed: one answer per wake)."""
++    with _retiring_mu:
++        return _retiring_busy.pop(str(key), None)
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index da68d2b94f..ec17526582 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -829,11 +829,11 @@ def _queue_behind_background_turn(rid, sid, session, text, params, kind):
+     from tui_gateway.gateway_background_holder import gateway_background_holder
+     if not owner_forward.prompt_forwardable(session, text, params):
+         return None
+-    if gateway_background_holder(session, foreign_owner=_foreign_turn_owner) is None:
++    if (gateway := gateway_background_holder(session, foreign_owner=_foreign_turn_owner)) is None:
+         return None
+     key = session.get("session_key") or sid
+     try:
+-        receipt = owner_forward.forward_prompt(sid, session, text)
++        receipt = owner_forward.forward_prompt(sid, session, text, endpoint=gateway.endpoint)
+     except owner_forward.OwnerUnconfirmed:
+         # It may already be queued there: a take-over plus a resend could run it twice.
+         return _err(rid, 4090, "The gateway is running a turn in this chat and did not confirm your message"
+diff --git a/tui_gateway/methods_session_interrupt.py b/tui_gateway/methods_session_interrupt.py
+index 88ed55f6b6..f85ecb956d 100644
+--- a/tui_gateway/methods_session_interrupt.py
++++ b/tui_gateway/methods_session_interrupt.py
+@@ -82,35 +82,59 @@ _HELD_QUEUE_KEEPING_ORIGINS = frozenset({None, "stop_button", "esc", "tile", "ti
+ _BACKGROUND_STOP_ORIGINS = frozenset({"stop_button", "esc", "tile", "tile:esc", "slash", "transcript"})
+ 
+ 
+-def _stop_gateway_background_turn(rid, sid: str, session: dict) -> bool:
+-    """Take the chat over from the gateway's background turn (``session.take_over``, which ends that turn), on a
+-    worker thread so Stop answers at once. True when the take-over was started; False leaves the ordinary Stop."""
++#: How long Stop waits for the take-over's answer before it reports; a later failure is still shown (an error event).
++BACKGROUND_STOP_ACK_S = 5.0
++
++
++def _stop_gateway_background_turn(rid, sid: str, session: dict):
++    """Take the chat over from the gateway's background turn (``session.take_over``, which ends that turn).
++
++    Returns None to leave the ordinary Stop (this backend runs the turn, another holder, or the gateway's durable
++    ledger holds work for the chat: a typed prompt already queued there, whose FIFO a take-over must not race),
++    True when the take-over succeeded or is still running after ``BACKGROUND_STOP_ACK_S`` (a later failure then
++    emits an ``error`` event the Desktop shows), or the take-over's error dict when it failed within that time."""
++    import threading
+     with session["history_lock"]:
+         if session.get("running"):
+-            return False
+-    if _automation_holder_kind(session) is None:
+-        return False
++            return None
++    if _automation_holder_kind(session) is None or _canonical_ledger_refusal(session) is not None:
++        return None
+     from tui_gateway.gateway_background_holder import gateway_background_holder
+     if gateway_background_holder(session, foreign_owner=_foreign_turn_owner) is None:
+-        return False
++        return None
+     handler = _methods.get("session.take_over")
+     if handler is None:
+-        return False
++        return None
+     key = session.get("session_key") or sid
++    outcome: dict = {}
++    mu, done = threading.Lock(), threading.Event()
+ 
+     def run() -> None:
++        error = None
+         try:
+             answer = handler(f"{rid}-background-stop", {"session_id": sid}) or {}
+-        except Exception:  # health: allow BLE001 -- worker thread boundary: logged with traceback
++            error = answer.get("error") if isinstance(answer, dict) else None
++        except Exception as exc:  # health: allow BLE001 -- worker thread boundary: logged with traceback
+             logger.warning("Stop could not take %s over from the gateway's background turn", key, exc_info=True)
+-            return
+-        error = answer.get("error") if isinstance(answer, dict) else None
++            error = {"message": f"Stop could not end the background turn: {type(exc).__name__}"}
+         logger.info("Stop of the gateway's background turn in %s: %s", key, error or "taken over")
++        with mu:
++            outcome["error"] = error
++            late = outcome.get("late", False)
++            done.set()
++        if late and error:
++            message = (error.get("message") if isinstance(error, dict) else None) or str(error)
++            _emit("error", sid, {"message": f"Stop could not end the background turn in this chat: {message}"})
+ 
+     from agent.memory_provider import spawn_context_thread
+     spawn_context_thread(run, name=f"background-stop-{str(key)[:24]}").start()
+     logger.info("Stop in %s: taking the chat over from the gateway's background turn", key)
+-    return True
++    done.wait(BACKGROUND_STOP_ACK_S)
++    with mu:
++        if not done.is_set():
++            outcome["late"] = True
++            return True
++    return outcome.get("error") or True
+ 
+ 
+ def _note_stop_issuer(sid: str, session: dict, transport, origin: str | None = None) -> None:
+@@ -241,7 +265,11 @@ def _(rid, params: dict) -> dict:
+         keep_held = origin in _HELD_QUEUE_KEEPING_ORIGINS
+         _note_user_input(session)
+         _note_stop_issuer(sid, session, current_transport(), origin)
+-        if origin in _BACKGROUND_STOP_ORIGINS and _stop_gateway_background_turn(rid, sid, session):
++        if origin in _BACKGROUND_STOP_ORIGINS and (stopped := _stop_gateway_background_turn(rid, sid, session)):
++            if isinstance(stopped, dict):
++                data = stopped.get("data") if isinstance(stopped.get("data"), dict) else None
++                return _err(rid, 4090, str(stopped.get("message") or "Stop could not end the background turn"),
++                            data)
+             return _ok(rid, {"status": "interrupted", "background_turn": True})
+         if _session_uses_compute_host(session):
+             with session["history_lock"]:
+diff --git a/tui_gateway/notice_guarantee.py b/tui_gateway/notice_guarantee.py
+index be80478fe9..616712dfdb 100644
+--- a/tui_gateway/notice_guarantee.py
++++ b/tui_gateway/notice_guarantee.py
+@@ -41,7 +41,7 @@ unloaded sweeper's loop therefore looks, in every profile store, for chats whose
+ - a busy wake refused only because the core update holds admission charges no attempt: the row is stamped
+   ``closeout = {state: "deferred", hold_wait: true}``, due (without ``GRACE_S``) the moment the hold lifts, and
+   ``notice_hold_wait``'s watcher runs a pass within seconds of that. The sweep's passive rows for such wakes carry the
+-  same stamp. [daveey]
++  same stamp. A busy wake whose chat is held by a backend being replaced retries in 15 s, also uncharged. [daveey]
+ 
+ Ownership follows the unloaded sweeper's: a chat another live backend holds is that backend's (its own pass
+ handles it); a chat with a live turn is skipped. The close-out prompt row is itself a notice, stamped as claimed,
+@@ -399,6 +399,11 @@ def _closeout_job(session_db, wake, sid: str, msg_id: int, attempts: int = 1,
+             verdict = "deferred"
+             with contextlib.suppress(Exception):
+                 note_waiting()
++        elif verdict == "busy" and (soon := _retiring_retry_at(sid)) is not None:
++            # [daveey] The chat's owner is a backend being replaced: it lets go within seconds. A short retry, and no
++            # attempt charged (gateway_background_holder.wake_past_retiring_owner).
++            extra = {"retry_at": soon, "attempts": max(0, attempts - 1), "busy_attempts": busy_attempts}
++            verdict = "deferred"
+         elif verdict == "busy":
+             busy_attempts += 1
+             extra = {"busy_attempts": busy_attempts}
+@@ -427,6 +432,11 @@ def _closeout_job(session_db, wake, sid: str, msg_id: int, attempts: int = 1,
+         _wake_slots.release()
+ 
+ 
++def _retiring_retry_at(sid: str) -> Optional[float]:
++    from tui_gateway.gateway_background_holder import retiring_retry_at
++    return retiring_retry_at(sid)
++
++
+ def _held_by_update() -> bool:
+     from tui_gateway.notice_hold_wait import update_hold_active
+     return update_hold_active()
+diff --git a/tui_gateway/notice_hold_wait.py b/tui_gateway/notice_hold_wait.py
+index 7066cb3572..8b16053345 100644
+--- a/tui_gateway/notice_hold_wait.py
++++ b/tui_gateway/notice_hold_wait.py
+@@ -71,9 +71,10 @@ def note_waiting(*, run_pass: Optional[Callable[[], list]] = None, held: Callabl
+     def job() -> None:
+         try:
+             watch(run_pass=run_pass or _default_pass, held=held, sleep=sleep)
+-        finally:
+-            with _mu:
++        except BaseException:
++            with _mu:  # a normal return already cleared it, under the lock that decided to return
+                 _state["thread"] = None
++            raise
+ 
+     if spawn is None:
+         from agent.memory_provider import spawn_context_thread
+@@ -109,6 +110,9 @@ def watch(*, run_pass: Callable[[], list], held: Callable[[], bool], sleep: Call
+             sleep(PASS_EVERY_S)
+         with _mu:
+             if not _state["waiting"]:
++                # Cleared in the same locked section that decides to return: a ``note_waiting`` after this
++                # starts a new watcher, one before it sets ``waiting`` and this one watches again.
++                _state["thread"] = None
+                 return passes
+         # Another notice was refused by a new hold meanwhile: watch again.
+ 
+diff --git a/tui_gateway/owner_forward.py b/tui_gateway/owner_forward.py
+index b9b8944f4a..0cf001e87a 100644
+--- a/tui_gateway/owner_forward.py
++++ b/tui_gateway/owner_forward.py
+@@ -245,8 +245,10 @@ def forward_rpc(home: Path, endpoint, method: str, params: dict) -> Any:
+     return asyncio.run(call())
+ 
+ 
+-def forward_prompt(sid: str, session: dict, text: str, *, emit=None, home: Path | None = None) -> dict:
+-    """Admit ``text`` into the owner's FIFO for this session; the owner's receipt.
++def forward_prompt(sid: str, session: dict, text: str, *, emit=None, home: Path | None = None,
++                   endpoint=None) -> dict:
++    """Admit ``text`` into the owner's FIFO for this session; the owner's receipt. ``endpoint``: the owner the
++    caller already discovered (and proved, e.g. ``gateway_background_holder``), dialled instead of a new lookup.
+ 
+     Raises ``OwnerNotRunning`` when no gateway serves the home, ``OwnerUnavailable`` (or the
+     client's refusal) when the owner did not take it, and ``OwnerUnconfirmed`` when the prompt may
+@@ -257,7 +259,7 @@ def forward_prompt(sid: str, session: dict, text: str, *, emit=None, home: Path
+     if not key:
+         raise OwnerUnavailable("the chat has no stored session yet")
+     home = Path(home or session.get("profile_home") or server._hermes_home).resolve()
+-    relay = _Relay(sid, session, key, home, discover_owner(home), text, emit or server._emit)
++    relay = _Relay(sid, session, key, home, endpoint or discover_owner(home), text, emit or server._emit)
+     from agent.memory_provider import spawn_context_thread
+     spawn_context_thread(relay.run, name=f"owner-forward-{key[:24]}").start()
+     try:
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 7bdb44d614..94e4c81780 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -1766,10 +1766,7 @@ def _wake_session_turn(session_key: str, text: str, *, display_kind: str | None
+         if _ensure_active_session_slot(sid, session) is not None:
+             _notif_release_turn(session)
+             from tui_gateway.gateway_background_holder import wake_past_retiring_owner
+-            if (verdict := wake_past_retiring_owner(
+-                    sid, session, label, key, claim_turn=_notif_claim_turn, release_turn=_notif_release_turn,
+-                    claim_slot=_ensure_active_session_slot, foreign_owner=_foreign_turn_owner)) is not None:
+-                return verdict
++            return wake_past_retiring_owner(sid, session, label, key, foreign_owner=_foreign_turn_owner)
+         kwargs = {k: v for k, v in (("display_kind", display_kind), ("display_metadata", display_metadata)) if v}
+         if replay_delivery is not None:
+             accepted = replay_delivery.submit(rid, sid, session, text, display_kind, display_metadata, label)
+-- 
+2.43.0
+

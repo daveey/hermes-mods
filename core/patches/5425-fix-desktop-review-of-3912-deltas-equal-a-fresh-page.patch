@@ -1,0 +1,806 @@
+From 1b68f41e538b8cb6517098a10b4afd4fd8a3d753 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 23:24:33 -0800
+Subject: [PATCH] fix(desktop): review of #3912: deltas equal a fresh page,
+ quieter early passes [daveey]
+
+- Route: a direct call keeps Query() defaults; only an int after_id takes the
+  delta path (the red tests/hermes_cli/test_history_commentary_display.py shard).
+- state.db: a new messages_visibility_revision_update trigger bumps
+  transcript_revision when a row's active/compacted flag changes (queued-prompt
+  drain, model-switch pivot, rewind, compaction), so a cached tail extended by
+  deltas refetches instead of keeping a row a fresh page hides.
+- Delta read: one snapshot (transcript_read_snapshot) for revision, anchor and
+  rows; the revision sums the resume lineage (ancestor rewrites count); a new row
+  the latest page would fold (same display identity, later archived-tool copy)
+  reports fold_conflict and the Desktop refetches the page.
+- Delta responses over 16 KiB use the latest page's gzip path.
+- change_watcher: a failed cursor or row read keeps the old cursor for that store
+  (retried next pass, no floor started); sessions the listings never show
+  (hidden, tool, subagent, delegate children) are not pushed.
+- Prefetcher: an untracked mover asks for an early listing pass only when its
+  (connection, profile) is listed, and one a forced pass did not pick up is
+  ignored for 10 min; a gateway without the after_id route is probed again after
+  10 min.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../desktop/electron/transcript-cache-host.ts |   1 +
+ .../electron/transcript-prefetch-push.test.ts |  67 +++++++-
+ apps/desktop/electron/transcript-prefetch.ts  |  77 ++++++++-
+ hermes_cli/web_routers/sessions.py            |  27 +++-
+ hermes_state_common.py                        |  11 ++
+ hermes_state_stored_reads.py                  |  54 +++++--
+ .../hermes_cli/test_session_messages_after.py | 152 ++++++++++++++++++
+ .../test_change_watcher_sessions_moved.py     |  58 +++++++
+ tui_gateway/change_watcher.py                 |  50 ++++--
+ 9 files changed, 460 insertions(+), 37 deletions(-)
+
+diff --git a/apps/desktop/electron/transcript-cache-host.ts b/apps/desktop/electron/transcript-cache-host.ts
+index 775ead920e..b7b8979b3e 100644
+--- a/apps/desktop/electron/transcript-cache-host.ts
++++ b/apps/desktop/electron/transcript-cache-host.ts
+@@ -312,6 +312,7 @@ export function installTranscriptCache(deps: TranscriptCacheHostDeps) {
+ 
+       return {
+         anchorFound: delta.anchor_found === true,
++        foldConflict: delta.fold_conflict === true,
+         hasMore: delta.has_more === true,
+         messages: page.messages,
+         sessionId: typeof page.session_id === 'string' ? page.session_id : key.sessionId,
+diff --git a/apps/desktop/electron/transcript-prefetch-push.test.ts b/apps/desktop/electron/transcript-prefetch-push.test.ts
+index 417731faf6..3f0ae38fea 100644
+--- a/apps/desktop/electron/transcript-prefetch-push.test.ts
++++ b/apps/desktop/electron/transcript-prefetch-push.test.ts
+@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
+ 
+ import { type TranscriptCacheKey, TranscriptCacheStore } from './transcript-cache'
+ import {
++  DELTA_REPROBE_MS,
+   type DeltaPage,
+   EARLY_PASS_MIN_MS,
+   type HubSessionRecord,
+@@ -14,7 +15,8 @@ import {
+   type PrefetchDeps,
+   PUSH_LIVE_MS,
+   SAFETY_NET_MS,
+-  TranscriptPrefetcher
++  TranscriptPrefetcher,
++  UNKNOWN_IGNORE_MS
+ } from './transcript-prefetch'
+ 
+ interface Row {
+@@ -34,6 +36,7 @@ class FakeGateway {
+   afterCalls: { afterId: number; sessionId: string }[] = []
+   rowsServed = 0
+   afterSupported = true
++  foldConflict = false
+   gate: null | Promise<void> = null
+ 
+   append(sessionId: string, count = 1): MovedSession {
+@@ -91,6 +94,7 @@ class FakeGateway {
+ 
+     return {
+       anchorFound,
++      foldConflict: this.foldConflict,
+       hasMore: after.length > limit,
+       messages: page.map(row => ({ ...row })),
+       sessionId,
+@@ -222,6 +226,13 @@ describe('push fallbacks to the latest page', () => {
+         gateway.append('chat', 250)
+       }
+     ],
++    [
++      'a row the page would fold into an earlier slot',
++      (gateway: FakeGateway) => {
++        gateway.append('chat')
++        gateway.foldConflict = true
++      }
++    ],
+     [
+       'a rotation to a new stored id',
+       (gateway: FakeGateway) => {
+@@ -293,9 +304,11 @@ describe('push coalescing', () => {
+ })
+ 
+ describe('tracked set', () => {
++  const covering = () => [{ activity: 1, gateway: 'hub', id: 'listed', message_count: 1 }] as HubSessionRecord[]
++
+   it('ignores an unknown session but lists early (at most every EARLY_PASS_MIN_MS) so it is fetched', async () => {
+     vi.useFakeTimers()
+-    const env = setup()
++    const env = setup({ records: covering })
+     env.prefetcher.start(5_000)
+     await vi.advanceTimersByTimeAsync(0)
+     const listingsBefore = env.listings.length
+@@ -311,6 +324,40 @@ describe('tracked set', () => {
+     env.prefetcher.stop()
+   })
+ 
++  it('asks no early pass for a mover outside every listed (connection, profile) scope', async () => {
++    vi.useFakeTimers()
++    const env = setup({ records: covering })
++    env.prefetcher.start(5_000)
++    await vi.advanceTimersByTimeAsync(0)
++
++    await env.push({ ...env.gateway.append('bot'), profile: 'alpha' }) // no listed session is on profile alpha
++
++    await vi.advanceTimersByTimeAsync(EARLY_PASS_MIN_MS)
++    expect(env.prefetcher.pushStats.earlyPasses).toBe(0)
++    env.prefetcher.stop()
++  })
++
++  it('a mover an early pass did not pick up asks for no further early pass for UNKNOWN_IGNORE_MS', async () => {
++    vi.useFakeTimers()
++    const env = setup({ records: covering })
++    env.prefetcher.start(60_000)
++    await vi.advanceTimersByTimeAsync(0)
++
++    // An automation past the listing window: every push used to re-arm an early pass on a busy hub.
++    await env.push(env.gateway.append('automation'))
++    await vi.advanceTimersByTimeAsync(EARLY_PASS_MIN_MS)
++    expect(env.prefetcher.pushStats.earlyPasses).toBe(1)
++
++    for (let index = 0; index < 5; index += 1) {
++      await env.push(env.gateway.append('automation'))
++      await vi.advanceTimersByTimeAsync(EARLY_PASS_MIN_MS)
++    }
++
++    expect(env.prefetcher.pushStats.earlyPasses).toBe(1)
++    env.prefetcher.stop()
++    expect(UNKNOWN_IGNORE_MS).toBe(600_000)
++  })
++
+   it('treats a compression child of a cached session as tracked', async () => {
+     const env = setup()
+     await warm(env, 'chat')
+@@ -411,6 +458,22 @@ describe('older gateway', () => {
+     expect(env.cachedIds('chat')).toEqual((env.gateway.rows.get('chat') ?? []).map(row => row.id))
+   })
+ 
++  it('asks a gateway without the route again after DELTA_REPROBE_MS (an upgrade mid-session gets deltas)', async () => {
++    const env = setup()
++    env.gateway.afterSupported = false
++    await warm(env, 'chat')
++    await env.push(env.gateway.append('chat'))
++    expect(env.gateway.afterCalls).toHaveLength(0) // still within the window the warm-up's probe opened
++
++    env.gateway.afterSupported = true
++    env.advance(DELTA_REPROBE_MS)
++    await env.push(env.gateway.append('chat')) // probes again: learns the revision (page)
++    await env.push(env.gateway.append('chat'))
++
++    expect(env.prefetcher.pushStats.delta).toBe(1)
++    expect(env.cachedIds('chat')).toEqual((env.gateway.rows.get('chat') ?? []).map(row => row.id))
++  })
++
+   it('a renderer with no delta dep at all (older main wiring) still refetches pages', async () => {
+     const env = setup({ withDelta: false })
+     await warm(env, 'chat')
+diff --git a/apps/desktop/electron/transcript-prefetch.ts b/apps/desktop/electron/transcript-prefetch.ts
+index 19459967e7..73c78affe0 100644
+--- a/apps/desktop/electron/transcript-prefetch.ts
++++ b/apps/desktop/electron/transcript-prefetch.ts
+@@ -41,6 +41,11 @@ export const SAFETY_NET_MS = 60_000
+ export const EARLY_PASS_MIN_MS = 5_000
+ /** [daveey] Transcript revisions remembered (one per pushed session), oldest forgotten first. */
+ const REVISIONS_MAX = 2_000
++/** [daveey] A gateway that answered without the `after_id` route is asked again after this long (it may update). */
++export const DELTA_REPROBE_MS = 10 * 60_000
++/** [daveey] A pushed session an early listing pass did not pick up asks for no further early pass for this long. */
++export const UNKNOWN_IGNORE_MS = 10 * 60_000
++const UNKNOWN_IGNORED_MAX = 2_000
+ 
+ export interface HubSessionRecord {
+   activity?: null | number
+@@ -80,6 +85,8 @@ export interface MovedSession {
+ /** [daveey] `GET /api/sessions/{id}/messages?after_id=` as the prefetcher reads it. */
+ export interface DeltaPage {
+   anchorFound: boolean
++  /** A new row the latest page would fold into an earlier slot (a display-identity or archived tool copy). */
++  foldConflict?: boolean
+   hasMore: boolean
+   messages: unknown[]
+   sessionId: string
+@@ -252,8 +259,13 @@ export class TranscriptPrefetcher {
+   private readonly pushLanes = new Map<string, { done: Promise<void>; queued: MovedSession | null }>()
+   /** Transcript revision each session's cached run was last made whole at (a latest page or a clean delta). */
+   private readonly revisions = new Map<string, null | number>()
+-  /** Connections whose gateway has no `after_id` route: pushes there refetch the latest page. */
+-  private readonly deltaUnsupported = new Set<string>()
++  /** Connections whose gateway had no `after_id` route, until when: pushes there refetch the latest page. */
++  private readonly deltaUnsupported = new Map<string, number>()
++  /** (connection, profile) scopes the last listing covered: only their unknown movers ask for an early pass. */
++  private readonly listedScopes = new Set<string>()
++  /** Unknown movers an early pass was asked for, and those a pass did not pick up (ignored until the time). */
++  private readonly unknownPending = new Set<string>()
++  private readonly unknownIgnored = new Map<string, number>()
+   private lastListingAt = Number.NEGATIVE_INFINITY
+   private earlyPassTimer: null | ReturnType<typeof setTimeout> = null
+   /** [daveey] Push work counted for logs and measurement. */
+@@ -336,8 +348,8 @@ export class TranscriptPrefetcher {
+       if (tracked(keys[index]) || tracked(parents[index])) {
+         work.push(this.enqueuePush(keys[index], entry))
+       } else {
+-        unknown = true
+         this.pushStats.unknown += 1
++        unknown = this.noteUnknown(keys[index]) || unknown
+       }
+     })
+ 
+@@ -348,6 +360,49 @@ export class TranscriptPrefetcher {
+     await Promise.all(work)
+   }
+ 
++  /**
++   * [daveey] Whether an untracked mover is worth an early listing pass: its (connection, profile) is one the
++   * listing covers (else no pass would pick it up), and no recent pass already left it out. A busy hub moves many
++   * sessions the listing never targets (automations past the window); without this every push re-armed a pass.
++   */
++  private noteUnknown(key: TranscriptCacheKey): boolean {
++    const id = keyString(key)
++
++    if (!this.listedScopes.has(`${key.connectionId}\u0000${key.profile}`)) {
++      return false
++    }
++
++    if ((this.unknownIgnored.get(id) ?? 0) > this.now()) {
++      return false
++    }
++
++    this.unknownPending.add(id)
++
++    return true
++  }
++
++  /** After an early pass: the movers it did not pick up are ignored for UNKNOWN_IGNORE_MS. */
++  private settleUnknown(): void {
++    const until = this.now() + UNKNOWN_IGNORE_MS
++
++    for (const id of this.unknownPending) {
++      if (!this.targetKeys.has(id)) {
++        this.unknownIgnored.delete(id)
++        this.unknownIgnored.set(id, until)
++      }
++    }
++
++    this.unknownPending.clear()
++
++    for (const stale of this.unknownIgnored.keys()) {
++      if (this.unknownIgnored.size <= UNKNOWN_IGNORED_MAX) {
++        break
++      }
++
++      this.unknownIgnored.delete(stale)
++    }
++  }
++
+   /** One fetch in flight per session and the newest entry queued behind it (older queued entries are superseded). */
+   private enqueuePush(key: TranscriptCacheKey, entry: MovedSession): Promise<void> {
+     const id = keyString(key)
+@@ -442,7 +497,7 @@ export class TranscriptPrefetcher {
+   ): Promise<{ outcome?: PushOutcome; reason: string; revision?: null | number }> {
+     const { fetchAfter, store } = this.deps
+ 
+-    if (!fetchAfter || !store.tailId || !store.putAfter || this.deltaUnsupported.has(key.connectionId)) {
++    if (!fetchAfter || !store.tailId || !store.putAfter || (this.deltaUnsupported.get(key.connectionId) ?? 0) > this.now()) {
+       return { reason: 'no delta route' }
+     }
+ 
+@@ -456,7 +511,7 @@ export class TranscriptPrefetcher {
+     const page = await fetchAfter(key, anchor ?? 0, LATEST_ROWS)
+ 
+     if (page === null) {
+-      this.deltaUnsupported.add(key.connectionId)
++      this.deltaUnsupported.set(key.connectionId, this.now() + DELTA_REPROBE_MS)
+ 
+       return { reason: 'no delta route' }
+     }
+@@ -502,9 +557,9 @@ export class TranscriptPrefetcher {
+     this.earlyPassTimer = setTimeout(() => {
+       this.earlyPassTimer = null
+       this.pushStats.earlyPasses += 1
+-      void this.tick({ force: true }).catch(error =>
+-        this.deps.log?.(`transcript prefetch early pass failed: ${(error as Error)?.message || error}`)
+-      )
++      void this.tick({ force: true })
++        .then(() => this.settleUnknown())
++        .catch(error => this.deps.log?.(`transcript prefetch early pass failed: ${(error as Error)?.message || error}`))
+     }, wait)
+     this.earlyPassTimer.unref?.()
+   }
+@@ -790,11 +845,13 @@ export class TranscriptPrefetcher {
+ 
+     // [daveey] Every listed session's hub meta (not just the targets), for on-demand freshness checks.
+     this.listed.clear()
++    this.listedScopes.clear()
+ 
+     for (const record of records) {
+       const connectionId = record?.id && record.gateway ? names.get(record.gateway) : undefined
+ 
+       if (connectionId) {
++        this.listedScopes.add(`${connectionId}\u0000${profileOf(record.profile)}`)
+         this.listed.set(keyString({ connectionId, profile: profileOf(record.profile), sessionId: record.id }), {
+           activity: record.activity ?? null,
+           messageCount: record.message_count ?? null
+@@ -915,6 +972,10 @@ export function deltaMismatch(
+     return 'gap'
+   }
+ 
++  if (page.foldConflict) {
++    return 'display fold'
++  }
++
+   if (page.sessionId !== sessionId) {
+     return `rotated to ${page.sessionId}`
+   }
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index a7bd7b425b..eafbca4eef 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -895,8 +895,10 @@ async def get_session_messages(
+     after_id: Optional[int] = Query(None, ge=0)):
+     if order not in (None, "oldest", "latest"):
+         raise HTTPException(status_code=400, detail="order must be one of: oldest, latest")
+-    if after_id is not None:
+-        return await _session_messages_after(request, session_id, profile, after_id, limit, inline_images)
++    # A direct call (not through FastAPI) leaves the Query() defaults in place: only a real int is a delta ask.
++    if isinstance(after_id, int) and not isinstance(after_id, bool):
++        return await _session_messages_after(request, session_id, profile, after_id,
++                                             limit if isinstance(limit, int) else None, inline_images)
+ 
+     def _read(db):
+         sid = _resolve_session_id(db, session_id)
+@@ -974,13 +976,30 @@ async def _session_messages_after(request: Request, session_id: str, profile: Op
+         _project_for_display, rows[:_limit], home=_history_profile_home(profile), inline_images=inline_images)
+     if request.headers.get(DISPLAY_TRANSCRIPT_HEADER) == "1":
+         projected = _slim_for_display(projected)
+-    return {
++    body = {
+         "session_id": sid,
+         "profile": _serving_profile(profile),
+         "messages": projected,
+-        "delta": {"after_id": after_id, "anchor_found": bool(page["anchor_found"]), "has_more": has_more,
++        "delta": {"after_id": after_id, "anchor_found": bool(page["anchor_found"]),
++                  "fold_conflict": bool(page.get("fold_conflict")), "has_more": has_more,
+                   "transcript_revision": page["transcript_revision"], "limit": _limit,
+                   "returned": len(projected)}}
++    return _delta_response(request, body)
++
++
++# A delta this small is cheaper sent as is than gzipped (most pushes carry a row or two).
++DELTA_GZIP_MIN_BYTES = 16 * 1024
++
++
++def _delta_response(request: Request, body: dict):
++    """The latest page's gzip path (``_display_transcript_response``) for a delta big enough to gain from it."""
++    if "gzip" not in (request.headers.get("accept-encoding") or "").lower():
++        return body
++    raw = json.dumps(jsonable_encoder(body), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
++    if len(raw) < DELTA_GZIP_MIN_BYTES:
++        from fastapi.responses import Response
++        return Response(content=raw, media_type="application/json")
++    return _display_transcript_response(request, body)
+ 
+ 
+ def _timeline_session_id(db, session_id: str, owner: str) -> str:
+diff --git a/hermes_state_common.py b/hermes_state_common.py
+index c295c26e62..418a36db56 100644
+--- a/hermes_state_common.py
++++ b/hermes_state_common.py
+@@ -860,6 +860,17 @@ BEGIN
+     -- cache keys on (conversation_revision). Whoever wrote the row, old builds included.
+     UPDATE sessions SET transcript_revision = transcript_revision + 1 WHERE id = new.session_id;
+ END;
++DROP TRIGGER IF EXISTS messages_visibility_revision_update;
++CREATE TRIGGER IF NOT EXISTS messages_visibility_revision_update
++AFTER UPDATE OF active, compacted ON messages
++WHEN old.active IS NOT new.active OR old.compacted IS NOT new.compacted
++BEGIN
++    -- [daveey] A row hidden or archived in place (a queued-prompt drain, a model-switch pivot, a rewind,
++    -- compaction) changes what a display page shows without moving the highest id: a cached transcript tail
++    -- extended by `?after_id=` deltas keys on this revision to know it must refetch. Its own name, like the
++    -- trigger below, so an older build's open leaves it in place.
++    UPDATE sessions SET transcript_revision = transcript_revision + 1 WHERE id = new.session_id;
++END;
+ DROP TRIGGER IF EXISTS messages_display_revision_update;
+ CREATE TRIGGER IF NOT EXISTS messages_display_revision_update
+ AFTER UPDATE OF codex_reasoning_items, codex_message_items, display_kind, display_metadata ON messages
+diff --git a/hermes_state_stored_reads.py b/hermes_state_stored_reads.py
+index 0c45d3a3bf..0ac37f0fd8 100644
+--- a/hermes_state_stored_reads.py
++++ b/hermes_state_stored_reads.py
+@@ -463,31 +463,57 @@ class SessionStoredReadsMixin:
+ 
+     def get_display_messages_after(self, session_id: str, after_id: int, limit: int) -> dict[str, Any]:
+         """[daveey] The live display rows of ONE stored session after ``after_id`` (a cached tail's last row id),
+-        for the Desktop's push-driven transcript delta (``sessions.moved``). ``anchor_found`` is False when that
+-        row is no longer a live row of this session (rewind, in-session compaction, a rotation moved new rows to a
+-        child): the caller's cached run cannot be extended and it refetches the latest page. ``transcript_revision``
+-        is read FIRST (an in-place rewrite of an older row bumps it; ``messages_*_revision_update`` triggers), so a
+-        caller that remembers the revision of its last full page can tell a rewrite it would otherwise miss. Rows
+-        are chronological, model-only rows hidden like every display read; at most ``limit`` (the caller asks one
+-        more than it applies to learn whether the page was cut).
++        for the Desktop's push-driven transcript delta (``sessions.moved``). Read in one snapshot
++        (``transcript_read_snapshot``; a read that cannot prove one generation reports ``anchor_found`` False).
++
++        ``anchor_found`` False: that row is no longer a live row of this session (rewind, in-session compaction, a
++        rotation moved new rows to a child), so the caller's cached run cannot be extended; it refetches the latest
++        page. ``fold_conflict`` True: a new row is one the latest page would fold into an earlier slot (its display
++        identity is already shown, or it is a later copy of an archived tool result), so appending it would differ
++        from a fresh page; the caller refetches too. ``transcript_revision`` sums the resume lineage's revisions
++        (an ancestor's rewrite or (de)activation moves it as well as the tip's; ``messages_*_revision_update``
++        triggers), so a caller that remembers the revision of its last full page can tell a change it would
++        otherwise miss. Rows are chronological, model-only rows hidden like every display read; at most ``limit``
++        (the caller asks one more than it applies to learn whether the page was cut).
+ 
+         Storage interface: port as ``display_rows_after``."""
++        from hermes_state_compaction_display import not_a_later_tool_copy_sql
+         from hermes_state_messages import DISPLAY_VISIBLE_SQL
+ 
++        visible = f" AND m.active = 1{DISPLAY_VISIBLE_SQL}"
++        lineage = list(dict.fromkeys([*self._resume_lineage_ids(session_id), session_id]))
++        marks = _placeholders(lineage)
++        fold_sql = (
++            f"SELECT 1 FROM messages AS m WHERE m.session_id = ? AND m.id > ?{visible} AND ("
++            "(m.display_identity IS NOT NULL AND EXISTS (SELECT 1 FROM messages AS o WHERE o.session_id IN "
++            f"({marks}) AND o.display_identity = m.display_identity AND o.id <> m.id AND (o.active = 1 OR o.compacted = 1)))"
++            f" OR NOT (1 = 1{not_a_later_tool_copy_sql('m')})) LIMIT 1")
++
+         def read(conn) -> dict[str, Any]:
+             columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+             revision = None
+             if "transcript_revision" in columns:
+-                found = conn.execute("SELECT transcript_revision FROM sessions WHERE id = ?", (session_id,)).fetchone()
+-                revision = int(found[0] or 0) if found is not None else None
++                found = conn.execute(f"SELECT COUNT(*), COALESCE(SUM(transcript_revision), 0) FROM sessions "
++                                     f"WHERE id IN ({marks})", lineage).fetchone()
++                revision = int(found[1] or 0) if found and found[0] else None
+             anchor = conn.execute("SELECT 1 FROM messages WHERE id = ? AND session_id = ? AND active = 1 LIMIT 1",
+                                   (after_id, session_id)).fetchone() is not None
++            if not anchor:
++                return {"anchor_found": False, "fold_conflict": False, "transcript_revision": revision, "rows": []}
++            fold = conn.execute(fold_sql, (session_id, after_id, *lineage)).fetchone() is not None
+             rows = conn.execute(
+-                f"SELECT * FROM messages WHERE session_id = ? AND id > ? AND active = 1{DISPLAY_VISIBLE_SQL} "
+-                "ORDER BY id ASC LIMIT ?", (session_id, after_id, max(0, int(limit)))).fetchall() if anchor else []
+-            return {"anchor_found": anchor, "transcript_revision": revision, "rows": rows}
+-
+-        result = self._read_retrying_ioerr(read)
++                f"SELECT * FROM messages AS m WHERE m.session_id = ? AND m.id > ?{visible} ORDER BY m.id ASC LIMIT ?",
++                (session_id, after_id, max(0, int(limit)))).fetchall()
++            return {"anchor_found": True, "fold_conflict": fold, "transcript_revision": revision, "rows": rows}
++
++        result = None
++        for _attempt in range(2):
++            with self.transcript_read_snapshot() as consistent:
++                result = self._read_retrying_ioerr(read)
++                if consistent():
++                    break
++        else:
++            result = {**result, "anchor_found": False, "rows": []}  # no proven generation: the caller refetches
+         result["messages"] = [self._row_to_message_dict(row, warn_context="get_display_messages_after",
+                                                         summary_flag=True) for row in result.pop("rows")]
+         return result
+diff --git a/tests/hermes_cli/test_session_messages_after.py b/tests/hermes_cli/test_session_messages_after.py
+index 532320bccf..5bcbfe64dd 100644
+--- a/tests/hermes_cli/test_session_messages_after.py
++++ b/tests/hermes_cli/test_session_messages_after.py
+@@ -148,3 +148,155 @@ def test_a_compression_rotation_reads_the_child_and_misses_the_anchor(env):
+ def test_unknown_session_is_404(env):
+     client, _db = env
+     assert client.get("/api/sessions/nope/messages?after_id=1").status_code == 404
++
++
++# ── review of #3912: a delta the client applies must equal a fresh page ──────────────────────────────
++
++
++def _db(db_path):
++    from hermes_state import SessionDB
++
++    return SessionDB(db_path)
++
++
++def _client_view(client, cached, revision, sid="chat"):
++    """What the Desktop's prefetcher ends up holding: cached + delta when the delta is clean and the revision held,
++    else (it refetches) the fresh latest page. Returns (view, applied_delta)."""
++    page = _after(client, cached[-1]["id"], sid=sid)
++    delta = page["delta"]
++    clean = (delta["anchor_found"] and not delta["has_more"] and not delta["fold_conflict"]
++             and page["session_id"] == sid and delta["transcript_revision"] == revision)
++    if clean:
++        return cached + page["messages"], True
++    return _latest(client, sid)["messages"], False
++
++
++def _ids_contents(messages):
++    return [(m["id"], m["content"]) for m in messages]
++
++
++def _revision(client, sid="chat"):
++    return _after(client, _latest(client, sid)["messages"][-1]["id"], sid=sid)["delta"]["transcript_revision"]
++
++
++def test_queued_prompt_drain_moves_the_revision_so_the_merge_never_differs(env):
++    client, db_path = env
++    db = _db(db_path)
++    try:
++        queued = db.append_message("chat", "user", "queued while busy")
++        db.append_message("chat", "assistant", "reply to one")
++        cached, revision = _latest(client)["messages"], _revision(client)
++        # The drain hides the early copy and re-appends it at the end (deactivate_message).
++        db.deactivate_message("chat", queued)
++        db.append_message("chat", "user", "queued while busy")
++    finally:
++        db.close()
++
++    view, applied = _client_view(client, cached, revision)
++
++    assert not applied  # the hidden mid-transcript row bumped the revision
++    assert _ids_contents(view) == _ids_contents(_latest(client)["messages"])
++
++
++def test_model_switch_pivot_moves_the_revision_so_the_merge_never_differs(env):
++    client, db_path = env
++    db = _db(db_path)
++    try:
++        db.replace_display_kind_row("chat", "model_switch", "switched to A")
++        db.append_message("chat", "assistant", "answer under A")
++        cached, revision = _latest(client)["messages"], _revision(client)
++        db.replace_display_kind_row("chat", "model_switch", "switched to B")
++    finally:
++        db.close()
++
++    view, applied = _client_view(client, cached, revision)
++
++    assert not applied
++    assert _ids_contents(view) == _ids_contents(_latest(client)["messages"])
++
++
++def test_plain_appends_still_apply_as_a_delta(env):
++    client, db = env
++    cached, revision = _latest(client)["messages"], _revision(client)
++    _append(db, "three")
++
++    view, applied = _client_view(client, cached, revision)
++
++    assert applied
++    assert _ids_contents(view) == _ids_contents(_latest(client)["messages"])
++
++
++def test_a_row_the_page_would_fold_is_a_fold_conflict(env):
++    client, db_path = env
++    tail = _latest(client)["messages"][-1]["id"]
++    with sqlite3.connect(db_path) as conn:
++        first = conn.execute("SELECT MIN(id) FROM messages WHERE session_id = 'chat'").fetchone()[0]
++        assert conn.execute("SELECT display_identity FROM messages WHERE id = ?", (first,)).fetchone()[0] is not None
++        # A re-sequenced copy of an earlier row (what an in-place compaction clone leaves): same display identity.
++        conn.execute(
++            "INSERT INTO messages (session_id, role, content, timestamp, display_identity, active) "
++            "SELECT session_id, role, content, timestamp, display_identity, 1 FROM messages WHERE id = ?", (first,))
++
++    assert _after(client, tail)["delta"]["fold_conflict"] is True
++
++
++def test_an_ancestor_rewrite_moves_the_revision_the_tip_reports(env):
++    client, db_path = env
++    db = _db(db_path)
++    try:
++        root_rows = db.get_messages("chat")
++        db.end_session("chat", "compression")
++        db.create_session("chat-tip", source="desktop", parent_session_id="chat")
++        db.append_message("chat-tip", root_rows[-1]["role"], root_rows[-1]["content"],
++                          timestamp=root_rows[-1]["timestamp"])
++        db.append_message("chat-tip", "user", "after rotation")
++        assert db._resume_lineage_ids("chat-tip") == ["chat", "chat-tip"]
++    finally:
++        db.close()
++    before = _revision(client, "chat-tip")
++    with sqlite3.connect(db_path) as conn:
++        conn.execute("UPDATE messages SET content = 'redacted' WHERE id = ?", (root_rows[0]["id"],))
++
++    assert _revision(client, "chat-tip") == before + 1
++
++
++def test_a_direct_call_without_after_id_reads_the_latest_page(monkeypatch):
++    """FastAPI is not in the loop (tests and in-process callers): ``after_id``/``limit`` keep their ``Query()``
++    defaults, which are not None, and must still read the latest page, never the delta."""
++    import asyncio
++
++    from starlette.requests import Request
++
++    from hermes_cli.web_routers import sessions
++
++    class FakeDB:
++        def resolve_resume_session_id(self, sid):
++            return sid
++
++        def get_messages(self, sid, **kwargs):
++            return [{"id": 1, "role": "user", "content": "hi", "timestamp": 1.0}]
++
++        def get_display_messages_after(self, *args):  # pragma: no cover - the bug this test guards
++            raise AssertionError("delta path taken for a direct call")
++
++    monkeypatch.setattr(sessions, "_with_db", lambda profile, fn, read_only: fn(FakeDB()))
++    monkeypatch.setattr(sessions, "_resolve_session_id", lambda db, sid: sid)
++    request = Request({"type": "http", "method": "GET", "path": "/", "headers": [], "query_string": b""})
++
++    page = asyncio.run(sessions.get_session_messages(
++        request, "chat", limit=10, offset=0, order="latest", include_compacted=True, inline_images=True))
++
++    assert "delta" not in page and page["messages"][0]["content"] == "hi"
++
++
++def test_a_large_delta_is_gzipped_and_a_small_one_is_not(env):
++    client, db = env
++    tail = _latest(client)["messages"][-1]["id"]
++    _append(db, "small")
++    small = client.get(f"/api/sessions/chat/messages?after_id={tail}", headers={"Accept-Encoding": "gzip"})
++    assert small.headers.get("content-encoding") != "gzip"
++
++    _append(db, *["x" * 4000 for _ in range(8)])
++    big = client.get(f"/api/sessions/chat/messages?after_id={tail}", headers={"Accept-Encoding": "gzip"})
++    assert big.headers["content-encoding"] == "gzip"
++    assert big.json()["delta"]["returned"] == 9
+diff --git a/tests/tui_gateway/test_change_watcher_sessions_moved.py b/tests/tui_gateway/test_change_watcher_sessions_moved.py
+index f6d83d95cc..600e6b6068 100644
+--- a/tests/tui_gateway/test_change_watcher_sessions_moved.py
++++ b/tests/tui_gateway/test_change_watcher_sessions_moved.py
+@@ -146,3 +146,61 @@ def test_a_non_sqlite_store_neither_raises_nor_sends(watcher, tmp_path, monkeypa
+     (other / "state.db").write_text("xy")
+     server._broadcast_watched_changes(now=10.0)
+     assert _moved(events) == []
++
++
++# ── review of #3912 ──────────────────────────────────────────────────────────────────────────────
++
++
++def test_a_failed_row_read_keeps_the_range_for_the_next_pass(watcher, monkeypatch):
++    home, db, events = watcher
++    server._broadcast_watched_changes(now=0.0)
++    db.append_messages_batch("busy", [{"role": "assistant", "content": "lost?"}])
++
++    real = server._moved_sessions
++    monkeypatch.setattr(server, "_moved_sessions", lambda *args: (_ for _ in ()).throw(sqlite3.OperationalError("busy")))
++    server._broadcast_watched_changes(now=10.0)
++    assert _moved(events) == []  # nothing sent, and no floor started
++
++    monkeypatch.setattr(server, "_moved_sessions", real)
++    server._broadcast_watched_changes(now=10.5)
++    [payload] = _moved(events)
++    assert [(e["id"], e["last_message_id"]) for e in payload["sessions"]] == [("busy", _max_id(home, "busy"))]
++
++
++def test_an_unreadable_cursor_keeps_the_range_for_the_next_pass(watcher, monkeypatch):
++    _home, db, events = watcher
++    server._broadcast_watched_changes(now=0.0)
++    db.append_messages_batch("quiet", [{"role": "assistant", "content": "x"}])
++
++    real = server._sessions_moved_sig
++    monkeypatch.setattr(server, "_sessions_moved_sig", lambda: tuple((h, None) for h, _c in real()))
++    monkeypatch.setitem(server._CHANGE_WATCHES, "sessions.moved",
++                        (0.5, server._sessions_moved_sig, dict, server._sessions_moved_payload))
++    server._broadcast_watched_changes(now=10.0)
++    assert _moved(events) == []
++
++    monkeypatch.setitem(server._CHANGE_WATCHES, "sessions.moved",
++                        (0.5, real, dict, server._sessions_moved_payload))
++    server._broadcast_watched_changes(now=10.5)
++    [payload] = _moved(events)
++    assert [e["id"] for e in payload["sessions"]] == ["quiet"]
++
++
++@pytest.mark.parametrize("make", [
++    lambda db: db.create_session(session_id="t", source="tool"),
++    lambda db: db.create_session(session_id="t", source="subagent"),
++    lambda db: db.create_session(session_id="t", source="desktop", model_config={"_delegate_from": "busy"}),
++    lambda db: (db.create_session(session_id="t", source="desktop"),
++                sqlite3.connect(db.db_path).execute("UPDATE sessions SET hidden = 1 WHERE id = 't'").connection.commit()),
++], ids=["tool", "subagent", "delegate-child", "hidden"])
++def test_sessions_the_listing_never_shows_are_not_pushed(watcher, make):
++    _home, db, events = watcher
++    make(db)
++    server._broadcast_watched_changes(now=0.0)
++
++    db.append_messages_batch("t", [{"role": "assistant", "content": "internal"}])
++    db.append_messages_batch("busy", [{"role": "assistant", "content": "visible"}])
++    server._broadcast_watched_changes(now=10.0)
++
++    [payload] = _moved(events)
++    assert [e["id"] for e in payload["sessions"]] == ["busy"]
+diff --git a/tui_gateway/change_watcher.py b/tui_gateway/change_watcher.py
+index 7901a1fa03..c69715ca72 100644
+--- a/tui_gateway/change_watcher.py
++++ b/tui_gateway/change_watcher.py
+@@ -564,16 +564,21 @@ def _moved_sessions(home: Path, start: int, end: int) -> list[dict]:
+                 return col if col in have else alt
+             activity = ("COALESCE(last_activity_at, started_at)" if {"last_activity_at", "started_at"} <= have
+                         else pick("started_at"))
++            internal = ("json_extract(CASE WHEN json_valid(model_config) THEN model_config END, '$._delegate_from') "
++                        "IS NOT NULL" if "model_config" in have else "0")
+             ids = [row[0] for row in moved]
+             rows = {row[0]: row for row in conn.execute(
+                 f"SELECT id, {pick('message_count')}, {activity}, {pick('profile_name')}, "
+-                f"{pick('parent_session_id')} FROM sessions WHERE id IN ({', '.join('?' for _ in ids)})", ids)}
++                f"{pick('parent_session_id')}, {pick('hidden', '0')}, LOWER(COALESCE({pick('source')}, '')), "
++                f"{internal} FROM sessions WHERE id IN ({', '.join('?' for _ in ids)})", ids)}
+         finally:
+             conn.execute("COMMIT")
+     fallback_profile = _home_profile_name(home)
+     out = []
+     for session_id, last_id in moved:
+         row = rows.get(session_id)
++        if row is None or _not_listed(row):
++            continue
+         out.append({
+             "id": session_id, "profile": (row[3] if row is not None and row[3] else fallback_profile),
+             "message_count": row[1] if row is not None else None,
+@@ -583,23 +588,48 @@ def _moved_sessions(home: Path, start: int, end: int) -> list[dict]:
+     return out
+ 
+ 
+-def _sessions_moved_payload(before: tuple, after: tuple) -> dict | None:
+-    """``{"sessions": [...]}`` for every store whose cursor advanced; None (no frame) when none did (a store
+-    seen for the first time, replaced or restored to a lower id seeds its cursor silently)."""
++# Sources the session listings never show (a tool-run or subagent transcript): a push about one widens the
++# broadcast past what any client lists. Hidden rows and delegate children are dropped the same way.
++_UNLISTED_SOURCES = frozenset({"tool", "subagent"})
++
++
++def _not_listed(row) -> bool:
++    return bool(row[5]) or row[6] in _UNLISTED_SOURCES or bool(row[7])
++
++
++class _SettledSig:
++    """A 4th-slot result that also names the signature to remember: a part it could not read stays at its old
++    value, so the next pass reads that range again instead of skipping it."""
++
++    __slots__ = ("payload", "sig")
++
++    def __init__(self, payload, sig):
++        self.payload, self.sig = payload, sig
++
++
++def _sessions_moved_payload(before: tuple, after: tuple) -> _SettledSig:
++    """``{"sessions": [...]}`` for every store whose cursor advanced (None payload, no frame, when none did; a
++    store seen for the first time, replaced or restored to a lower id seeds its cursor silently). A store whose
++    cursor read or row read failed keeps its previous cursor in the settled signature, so its rows go out on a
++    later pass rather than never."""
+     prior = dict(before or ())
+     moved: list[dict] = []
++    settled = []
+     for home, cursor in after:
+         start = prior.get(home)
+-        if start is None or cursor is None or cursor <= start:
++        if start is not None and cursor is None:
++            settled.append((home, start))  # unreadable now: keep the range for the next pass
++            continue
++        settled.append((home, cursor))
++        if start is None or cursor <= start:
+             continue
+         try:
+             moved += _moved_sessions(Path(home), start, cursor)
+-        except Exception:  # health: allow BLE001 -- a busy/foreign store skips this frame; the Desktop's listing poll is the backstop
++        except Exception:  # health: allow BLE001 -- busy/foreign store: retried from the same cursor next pass
+             logger.debug("sessions.moved read failed home=%s", home, exc_info=True)
+-    if not moved:
+-        return None
++            settled[-1] = (home, start)
+     moved.sort(key=lambda entry: entry["last_message_id"], reverse=True)
+-    return {"sessions": moved[:SESSIONS_MOVED_MAX]}
++    return _SettledSig({"sessions": moved[:SESSIONS_MOVED_MAX]} if moved else None, tuple(settled))
+ 
+ 
+ def _skills_sig():
+@@ -673,6 +703,8 @@ def _broadcast_watched_changes(now: float | None = None) -> None:
+         before, _change_sigs[event] = _change_sigs[event], sig
+         with contextlib.suppress(Exception):
+             payload = diff_fn[0](before, sig) if diff_fn else payload_fn()
++            if isinstance(payload, _SettledSig):
++                _change_sigs[event], payload = payload.sig, payload.payload
+             if payload is None:
+                 continue  # the move carried nothing to tell (sessions.moved: no rows in range)
+             _change_broadcast_at[event] = now
+-- 
+2.43.0
+

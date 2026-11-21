@@ -1,0 +1,248 @@
+From f72b294e3308596e5f259aab7e067d3434b13486 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 05:46:30 +0000
+Subject: [PATCH] [daveey] Defer automatic turns silently behind the gateway
+ queue
+
+Automatic Desktop turns refused by a forwardable canonical ledger keep the
+owner-refusal signal but do not emit the misleading takeover error card.
+Carry the ledger status through both admission and notification preflight,
+keeping gateway-busy retries at 30 seconds rather than doubling to 300.
+Unknown ledger state, foreign legacy leases, coordination failures, and the
+typed-prompt forwarding path retain their existing behavior.
+
+Five whys:
+Problem: a red "This chat is open somewhere else" card appears with no foreign
+user. Why 1: an automatic Desktop backend turn was refused SESSION_NOT_OWNED.
+Why 2: the same host's gateway durable ledger held started kanban-wake work.
+Why 3: gateway FIFO events and Desktop automatic notices reach the same chat
+through two runtimes; collisions are expected and resolve when the turn ends.
+Why 4: admission surfaced the same terminal error for self-resolving ledger
+contention and genuine foreign ownership; typed prompts already forward.
+Root (happened): surfacing was keyed on refusal code, not user actionability.
+Root (not caught): the prior owner-backoff tests prevented card spam but did
+not establish whether even the first card was warranted for ledger contention.
+Recurrence: the 2026-10-28 fix reduced 139 refusal cards in 110 seconds to one
+per streak, leaving this misleading first card. A takeover interrupting the
+gateway's legitimate turn is consistent with lease-lost logs, not established
+causation. Gateway-FIFO routing for synthesized events and button relabeling
+remain out of scope.
+
+Proof:
+Canonical runner: new ledger-card tests failed 4 cases before suppression;
+fixed-retry tests then failed 4 cases before status-aware backoff. All 19
+focused cases pass, including every forwardable ledger state, unknown state,
+legacy leases, coordination errors, fixed repeated retries, and admission
+resumption when the ledger clears. Full consumers/check gates run before ship.
+---
+ .../test_automatic_ledger_defer.py            | 98 +++++++++++++++++++
+ tui_gateway/prompt_turn.py                    |  9 +-
+ tui_gateway/session_notifications.py          | 20 ++--
+ 3 files changed, 120 insertions(+), 7 deletions(-)
+ create mode 100644 tests/tui_gateway/test_automatic_ledger_defer.py
+
+diff --git a/tests/tui_gateway/test_automatic_ledger_defer.py b/tests/tui_gateway/test_automatic_ledger_defer.py
+new file mode 100644
+index 0000000000..cd5b796389
+--- /dev/null
++++ b/tests/tui_gateway/test_automatic_ledger_defer.py
+@@ -0,0 +1,98 @@
++"""Gateway queue contention is a silent automatic retry, not a takeover request."""
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from tui_gateway import server
++
++
++@pytest.fixture
++def admission(monkeypatch):
++    state = SimpleNamespace(refusal=None, errors=[], starts=[], now=100.0)
++    session = {"session_key": "ledger-busy", "history_lock": threading.RLock(),
++               "history": [], "running": True, "agent": SimpleNamespace(clear_interrupt=lambda: None),
++               "attached_images": []}
++    monkeypatch.setattr(server, "_session_moved_refusal", lambda _: None)
++    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *args: state.refusal)
++    monkeypatch.setattr(server, "_emit_terminal_turn_error", lambda *a, **k: state.errors.append(k))
++    monkeypatch.setattr(server, "_start_inflight_turn", lambda *a, **k: state.starts.append(a))
++    monkeypatch.setattr(server, "admit_synthesized_turn", lambda _: True)
++    monkeypatch.setattr(server, "time", SimpleNamespace(monotonic=lambda: state.now))
++    state.session = session
++    return state
++
++
++def _admit(state):
++    state.session["running"] = True
++    return server._admit_prompt_turn("live", state.session, "notice", None, None, None, None)
++
++
++@pytest.mark.parametrize("status", ["queued", "started", "registered", "running"])
++def test_automatic_ledger_busy_is_silent(admission, status, caplog):
++    admission.session["_synthesized_turn"] = True
++    admission.refusal = SimpleNamespace(reason="SESSION_NOT_OWNED", ledger_status=status)
++    with caplog.at_level("INFO"):
++        assert _admit(admission) is None
++    assert admission.session["_turn_owner_refusal"] == "SESSION_NOT_OWNED"
++    assert admission.errors == []
++    assert admission.starts == []
++    assert f"gateway queue holds {status} work" in caplog.text
++
++
++@pytest.mark.parametrize("reason", ["SESSION_NOT_OWNED", "SESSION_COORDINATION_UNAVAILABLE"])
++@pytest.mark.parametrize("status", ["unknown", None])
++@pytest.mark.parametrize("synthesized", [True, False])
++def test_actionable_owner_refusal_still_surfaces(admission, status, synthesized, reason):
++    admission.session["_synthesized_turn"] = synthesized
++    admission.refusal = SimpleNamespace(reason=reason)
++    if status is not None:
++        admission.refusal.ledger_status = status
++    assert _admit(admission) is None
++    assert len(admission.errors) == 1
++    assert admission.errors[0]["error_surface"]["code"] == reason
++
++
++@pytest.mark.parametrize("status", ["queued", "started", "registered", "running"])
++def test_ledger_retry_stays_at_30_seconds_and_runs_when_clear(admission, status, monkeypatch):
++    session = admission.session
++    admission.refusal = SimpleNamespace(reason="SESSION_NOT_OWNED", ledger_status=status)
++    turns = []
++
++    def submit(rid, sid, record, text, **kwargs):
++        admitted = _admit(admission)
++        if admitted is None:
++            return False
++        turns.append(text)
++        return True
++
++    monkeypatch.setattr(server, "_run_prompt_submit", submit)
++    for _ in range(6):
++        assert server._notif_run_submit("rid", "live", session, "notice") is False
++        assert session["_notif_owner_refused_until"] == admission.now + 30
++        assert session["_notif_owner_refusal_delay"] == 30
++        assert server._notif_owner_refused(session)
++        admission.now += 30
++        assert not server._notif_owner_refused(session)
++    assert turns == [] and admission.errors == []
++    admission.refusal = None
++    assert server._notif_run_submit("rid", "live", session, "notice") is True
++    assert turns == ["notice"]
++    assert not server._notif_owner_refused(session)
++    assert "_notif_owner_refusal_delay" not in session
++    assert "_turn_owner_refusal" not in session
++
++
++@pytest.mark.parametrize("status", ["unknown", None])
++def test_actionable_refusal_keeps_exponential_backoff(admission, status):
++    admission.refusal = SimpleNamespace(reason="SESSION_NOT_OWNED", ledger_status=status)
++    admission.session["_notif_owner_refusal_delay"] = 60
++    assert not server._notif_owner_preflight("live", admission.session)
++    assert admission.session["_notif_owner_refused_until"] == admission.now + 60
++    assert admission.session["_notif_owner_refusal_delay"] == 120
++
++
++def test_typed_ledger_refusal_is_not_silenced(admission):
++    admission.refusal = SimpleNamespace(reason="SESSION_NOT_OWNED", ledger_status="queued")
++    assert _admit(admission) is None
++    assert len(admission.errors) == 1
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 7553df1082..d9046380c0 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -137,6 +137,7 @@ def _admit_prompt_turn(
+     """Ownership + liveness gate every turn source must cross; ``(images, agent)`` or None.
+     Synthesized turns (auto-continue, wake-ups) call ``_run_prompt_submit`` directly — the
+     bypass that once let a second backend run a duplicate turn."""
++    from tui_gateway import owner_forward
+     from tui_gateway.turn_admission import live_turn_holds, mark_live_turn, note_refusal, owns
+     note_refusal(spared_live_turn=False)
+     with session["history_lock"]:
+@@ -167,10 +168,15 @@ def _admit_prompt_turn(
+         # [daveey] Read by the notification poller (_notif_after_submit): a synthesized turn refused for
+         # ownership backs off instead of re-running every poll (139 refusal cards in 110 s, 2026-10-28).
+         session["_turn_owner_refusal"] = reason
++        session["_turn_owner_refusal_ledger_status"] = getattr(ownership_refusal, "ledger_status", None)
+         note_refusal(spared_live_turn=spared)
+         if spared:
+             logger.info("Refused submit for session %s left the live turn's state alone",
+                         session.get("session_key") or sid)
++        elif session.get("_synthesized_turn") and (
++                getattr(ownership_refusal, "ledger_status", None) in owner_forward.FORWARDABLE_LEDGER_STATES):
++            logger.info("automatic turn for %s deferred: gateway queue holds %s work",
++                        session.get("session_key") or sid, ownership_refusal.ledger_status)
+         elif report_ownership_refusal:
+             # [daveey] retire_marker=False: this submit wrote no marker; the one on disk is a live turn's.
+             _emit_terminal_turn_error(
+@@ -181,7 +187,8 @@ def _admit_prompt_turn(
+         if not owns(session):
+             return None
+         # This process owns the chat again: any notification refusal backoff is over. [daveey]
+-        for key in ("_turn_owner_refusal", "_notif_owner_refused_until", "_notif_owner_refusal_delay"):
++        for key in ("_turn_owner_refusal", "_turn_owner_refusal_ledger_status",
++                    "_notif_owner_refused_until", "_notif_owner_refusal_delay"):
+             session.pop(key, None)
+         if session.get("_closing") or (
+             queued_prompt_generation is not None
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 55ad719832..49a8acbf43 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -286,7 +286,8 @@ def _notif_log_failure(what: str, exc: BaseException) -> None:
+ # deterministic until that owner lets go, so the poller waits (doubling backoff) instead of re-running the turn
+ # on its next pass. Before, a refused completion went straight back on the queue and the poller re-ran it every
+ # ~0.8 s, painting a "Your message was not answered" card each time (139 in 110 s on 2026-10-28). The first
+-# refusal of a streak shows its card; later probes in the streak are silent.
++# refusal of a foreign-owner streak shows its card; later probes in the streak are silent. Gateway
++# ledger contention never shows a takeover card and retries every 30 s instead of doubling.
+ _OWNER_REFUSAL_BACKOFF_S = 30.0
+ _OWNER_REFUSAL_BACKOFF_MAX_S = 300.0
+ _OWNER_REFUSAL_CODES = ("SESSION_NOT_OWNED", "SESSION_COORDINATION_UNAVAILABLE")
+@@ -297,9 +298,13 @@ def _notif_owner_refused(session: dict) -> bool:
+     return time.monotonic() < float(session.get("_notif_owner_refused_until") or 0)
+ 
+ 
+-def _notif_note_owner_refusal(session: dict, reason: str) -> None:
+-    delay = float(session.get("_notif_owner_refusal_delay") or _OWNER_REFUSAL_BACKOFF_S)
+-    session["_notif_owner_refusal_delay"] = min(delay * 2, _OWNER_REFUSAL_BACKOFF_MAX_S)
++def _notif_note_owner_refusal(session: dict, reason: str, *, ledger_status: str | None = None) -> None:
++    from tui_gateway.owner_forward import FORWARDABLE_LEDGER_STATES
++    queue_busy = ledger_status in FORWARDABLE_LEDGER_STATES
++    delay = (_OWNER_REFUSAL_BACKOFF_S if queue_busy else
++             float(session.get("_notif_owner_refusal_delay") or _OWNER_REFUSAL_BACKOFF_S))
++    session["_notif_owner_refusal_delay"] = (
++        _OWNER_REFUSAL_BACKOFF_S if queue_busy else min(delay * 2, _OWNER_REFUSAL_BACKOFF_MAX_S))
+     session["_notif_owner_refused_until"] = time.monotonic() + delay
+     logger.info("automatic turn for session %s refused (%s): another owner holds the chat; next try in %.0fs",
+                 session.get("session_key") or "", reason, delay)
+@@ -313,7 +318,8 @@ def _notif_owner_preflight(sid: str, session: dict) -> bool:
+     refusal = _ensure_active_session_slot(sid, session)
+     if refusal is None:
+         return True
+-    _notif_note_owner_refusal(session, str(getattr(refusal, "reason", None) or "refused"))
++    _notif_note_owner_refusal(session, str(getattr(refusal, "reason", None) or "refused"),
++                             ledger_status=getattr(refusal, "ledger_status", None))
+     return False
+ 
+ 
+@@ -327,6 +333,7 @@ def _notif_run_submit(rid, sid, session, text, **kwargs):
+         _notif_release_turn(session)
+         return False
+     session.pop("_turn_owner_refusal", None)
++    session.pop("_turn_owner_refusal_ledger_status", None)
+     session["_synthesized_turn"] = True  # [daveey] keeps a core-update-paused marker (prompt_turn)
+     try:
+         with stage(session):
+@@ -334,8 +341,9 @@ def _notif_run_submit(rid, sid, session, text, **kwargs):
+     finally:
+         session.pop("_synthesized_turn", None)
+     reason = session.pop("_turn_owner_refusal", None)
++    ledger_status = session.pop("_turn_owner_refusal_ledger_status", None)
+     if not accepted and reason in _OWNER_REFUSAL_CODES:
+-        _notif_note_owner_refusal(session, reason)
++        _notif_note_owner_refusal(session, reason, ledger_status=ledger_status)
+     return accepted
+ 
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,639 @@
+From c6b80493467f015eae634298ec6dcbe4a720f1d1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 23:11:05 -0800
+Subject: [PATCH] fix(desktop): hand Update to hermes-sync on hosts it manages
+ instead of an idle-only update [daveey]
+
+Desktop's Update / Try again ran its own detached `hermes update`, which only pauses idle gateways, so it
+failed every time a chat was busy ("Hermes couldn't finish updating ... busy or cannot acknowledge an idle
+pause", laptop-1 2026-11-20). On a host whose core updates hermes-sync applies (fresh window record), the
+client and backend Update now post hermes-sync's existing Force-update request, which pauses busy chats and
+continues them after the update, and the dialog says so ('synced' stage). Hosts hermes-sync does not manage,
+or backends too old to answer, keep the old path. POST /api/hermes/update refuses on a managed host as a
+backstop for older clients; GET /api/hermes/update/force reports `managed`.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ apps/desktop/src/api/system.ts                |   9 +-
+ .../src/app/updates-overlay.synced.test.tsx   |  41 +++++
+ apps/desktop/src/app/updates-overlay.tsx      |  41 ++++-
+ apps/desktop/src/global.d.ts                  |   2 +
+ apps/desktop/src/i18n/en_force_update.ts      |   5 +-
+ apps/desktop/src/i18n/types_force_update.ts   |   4 +
+ .../src/store/updates-sync-route.test.ts      | 145 ++++++++++++++++++
+ apps/desktop/src/store/updates.ts             |  75 ++++++++-
+ apps/desktop/src/types/hermes.ts              |   2 +
+ hermes_cli/web_routers/actions.py             |  27 +++-
+ tests/hermes_cli/test_core_update_force.py    |  47 +++++-
+ 11 files changed, 380 insertions(+), 18 deletions(-)
+ create mode 100644 apps/desktop/src/app/updates-overlay.synced.test.tsx
+ create mode 100644 apps/desktop/src/store/updates-sync-route.test.ts
+
+diff --git a/apps/desktop/src/api/system.ts b/apps/desktop/src/api/system.ts
+index 2a068a7f43..55711f5ae6 100644
+--- a/apps/desktop/src/api/system.ts
++++ b/apps/desktop/src/api/system.ts
+@@ -166,17 +166,18 @@ export function updateHermes(): Promise<ActionResponse> {
+ 
+ /** [daveey] "Force update" on the backend version pill: whether hermes-sync owes an update on the active backend's
+  *  host, how many turns forcing it would stop, and any request already pending. */
+-export function getForceUpdateState(): Promise<ForceUpdateState> {
++export function getForceUpdateState(scope?: ProfileScope): Promise<ForceUpdateState> {
+   return hermesApi<ForceUpdateState>({
+-    ...profileScoped(),
++    // A pinned host is read passively: Update must never cold-start a local backend just to ask (remote mode).
++    ...(scope ? { ...capabilityScoped(scope), passive: true } : profileScoped()),
+     path: '/api/hermes/update/force'
+   })
+ }
+ 
+ /** Ask hermes-sync to apply the pending core update now: running turns stop at their next step boundary. */
+-export function forceHermesUpdate(): Promise<ForceUpdateResponse> {
++export function forceHermesUpdate(scope?: ProfileScope): Promise<ForceUpdateResponse> {
+   return hermesApi<ForceUpdateResponse>({
+-    ...profileScoped(),
++    ...(scope ? capabilityScoped(scope) : profileScoped()),
+     path: '/api/hermes/update/force',
+     method: 'POST'
+   })
+diff --git a/apps/desktop/src/app/updates-overlay.synced.test.tsx b/apps/desktop/src/app/updates-overlay.synced.test.tsx
+new file mode 100644
+index 0000000000..1126805368
+--- /dev/null
++++ b/apps/desktop/src/app/updates-overlay.synced.test.tsx
+@@ -0,0 +1,41 @@
++import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
++import { afterEach, expect, it } from 'vitest'
++
++import { I18nProvider } from '@/i18n/context'
++import { en } from '@/i18n/en'
++import { $updateApply, $updateOverlayOpen, $updateOverlayTarget, resetUpdateApplyState } from '@/store/updates'
++
++import { UpdatesOverlay } from './updates-overlay'
++
++afterEach((): void => {
++  cleanup()
++  $updateOverlayOpen.set(false)
++  resetUpdateApplyState()
++})
++
++// [daveey] Update handed to hermes-sync: the dialog says so and closes, instead of "Restarting…" or a failure.
++it('shows the hermes-sync hand-off and closes on Done', async (): Promise<void> => {
++  const copy = en.shell.statusbar.forceUpdate
++  $updateOverlayTarget.set('client')
++  $updateOverlayOpen.set(true)
++  $updateApply.set({
++    applying: false,
++    stage: 'synced',
++    message: copy.syncedApplying,
++    percent: null,
++    error: null,
++    log: []
++  } as never)
++  await act(async (): Promise<void> => {
++    render(
++      <I18nProvider configClient={null} initialLocale="en">
++        <UpdatesOverlay />
++      </I18nProvider>
++    )
++  })
++  expect(screen.getByText(copy.syncedTitle)).toBeTruthy()
++  expect(screen.getByText(copy.syncedApplying)).toBeTruthy()
++  fireEvent.click(screen.getByText(en.updates.done))
++  expect($updateOverlayOpen.get()).toBe(false)
++  expect($updateApply.get().stage).toBe('idle')
++})
+diff --git a/apps/desktop/src/app/updates-overlay.tsx b/apps/desktop/src/app/updates-overlay.tsx
+index f7f49ab697..3548e60ca6 100644
+--- a/apps/desktop/src/app/updates-overlay.tsx
++++ b/apps/desktop/src/app/updates-overlay.tsx
+@@ -169,8 +169,11 @@ function UpdateChangeList({
+   )
+ }
+ 
+-function overlayPhase(apply: UpdateApplyState): 'idle' | 'applying' | 'manual' | 'guiSkew' | 'error' {
+-  if (apply.stage === 'manual' || apply.stage === 'guiSkew') {
++/** Terminal stages a close resets, so reopening starts from the idle view. */
++const RESET_ON_CLOSE: ReadonlySet<string> = new Set(['error', 'restart', 'manual', 'guiSkew', 'synced'])
++
++function overlayPhase(apply: UpdateApplyState): 'idle' | 'applying' | 'manual' | 'guiSkew' | 'synced' | 'error' {
++  if (apply.stage === 'manual' || apply.stage === 'guiSkew' || apply.stage === 'synced') {
+     return apply.stage
+   }
+ 
+@@ -210,6 +213,7 @@ export function UpdatesOverlay() {
+   const updateAvailable = status?.updateAvailable || behind > 0
+ 
+   const phase = overlayPhase(apply)
++  const MessageView = MESSAGE_VIEWS[phase]
+ 
+   const handleClose = (next: boolean) => {
+     if (phase === 'applying') {
+@@ -218,10 +222,7 @@ export function UpdatesOverlay() {
+ 
+     setUpdateOverlayOpen(next)
+ 
+-    if (
+-      !next &&
+-      (apply.stage === 'error' || apply.stage === 'restart' || apply.stage === 'manual' || apply.stage === 'guiSkew')
+-    ) {
++    if (!next && RESET_ON_CLOSE.has(apply.stage)) {
+       resetUpdateApplyState()
+     }
+   }
+@@ -255,7 +256,7 @@ export function UpdatesOverlay() {
+           />
+         )}
+ 
+-        {phase === 'guiSkew' && <GuiSkewView message={apply.message} onDone={() => handleClose(false)} />}
++        {MessageView && <MessageView message={apply.message} onDone={() => handleClose(false)} />}
+ 
+         {phase === 'error' ? (
+           <ErrorView
+@@ -601,6 +602,32 @@ function GuiSkewView({ message, onDone }: { message?: string; onDone: () => void
+   )
+ }
+ 
++/** [daveey] Update handed to hermes-sync, which applies it on this host while chats keep running. */
++function SyncedView({ message, onDone }: { message?: string; onDone: () => void }) {
++  const { t } = useI18n()
++  const copy = t.shell.statusbar.forceUpdate
++
++  return (
++    <div className="grid gap-5 px-6 pb-6 pt-7 pr-8">
++      <div className="flex flex-col items-center gap-3 text-center">
++        <DialogTitle className="text-center text-xl">{copy.syncedTitle}</DialogTitle>
++        <DialogDescription className="max-w-prose text-center text-sm leading-5 text-muted-foreground">
++          {message || copy.syncedApplying}
++        </DialogDescription>
++      </div>
++
++      <Button className="font-semibold" onClick={onDone} size="lg" variant="secondary">
++        {t.updates.done}
++      </Button>
++    </div>
++  )
++}
++
++/** Message-only terminal views: the dialog says what happened and closes. */
++const MESSAGE_VIEWS: Partial<
++  Record<ReturnType<typeof overlayPhase>, (props: { message?: string; onDone: () => void }) => React.ReactElement>
++> = { guiSkew: GuiSkewView, synced: SyncedView }
++
+ const BYTE_UNITS: readonly [string, number][] = [
+   ['GB', 1024 ** 3],
+   ['MB', 1024 ** 2],
+diff --git a/apps/desktop/src/global.d.ts b/apps/desktop/src/global.d.ts
+index d8a3d37aa4..d19e6844b3 100644
+--- a/apps/desktop/src/global.d.ts
++++ b/apps/desktop/src/global.d.ts
+@@ -1178,6 +1178,8 @@ export type DesktopUpdateStage =
+    *  changed — the user must update/reinstall the desktop app. Terminal,
+    *  closeable; never claims the GUI was updated. (#45205) */
+   | 'guiSkew'
++  /** [daveey] Handed to hermes-sync (it applies updates on this host): terminal, closeable; `message` says what it does. */
++  | 'synced'
+   | 'error'
+ 
+ /** The emergency state.db backup's progress: bytes copied (or cloned), then the backup check. */
+diff --git a/apps/desktop/src/i18n/en_force_update.ts b/apps/desktop/src/i18n/en_force_update.ts
+index 0e17b1dd3b..e03498e8ce 100644
+--- a/apps/desktop/src/i18n/en_force_update.ts
++++ b/apps/desktop/src/i18n/en_force_update.ts
+@@ -14,5 +14,8 @@ export const enForceUpdate: ForceUpdateCopy = {
+   confirmLabel: 'Force update',
+   cancelLabel: 'Cancel',
+   requested: 'Update requested; the backend restarts within a few minutes',
+-  failed: 'Could not force the backend update'
++  failed: 'Could not force the backend update',
++  syncedTitle: 'hermes-sync is updating Hermes',
++  syncedApplying:
++    'The update applies within a few minutes. Busy chats pause at their next step and continue on the new version; you can keep working. If it never lands, run `hermes update` in a terminal.'
+ }
+diff --git a/apps/desktop/src/i18n/types_force_update.ts b/apps/desktop/src/i18n/types_force_update.ts
+index 134f16ad7a..a06ea3bb3b 100644
+--- a/apps/desktop/src/i18n/types_force_update.ts
++++ b/apps/desktop/src/i18n/types_force_update.ts
+@@ -11,4 +11,8 @@ export interface ForceUpdateCopy {
+   requested: string
+   /** Toast title when the request (or the status read before it) failed. */
+   failed: string
++  /** [daveey] Update dialog after Update was handed to hermes-sync (it applies updates on this host). */
++  syncedTitle: string
++  /** Body when hermes-sync took the request: busy chats pause and continue after the update. */
++  syncedApplying: string
+ }
+diff --git a/apps/desktop/src/store/updates-sync-route.test.ts b/apps/desktop/src/store/updates-sync-route.test.ts
+new file mode 100644
+index 0000000000..22fb0ccf9d
+--- /dev/null
++++ b/apps/desktop/src/store/updates-sync-route.test.ts
+@@ -0,0 +1,145 @@
++// @vitest-environment jsdom
++// [daveey] On a host whose core updates hermes-sync applies, Update hands off to hermes-sync's Force-update request
++// instead of running Desktop's own idle-only `hermes update`, which failed whenever a chat was busy (laptop-1
++// 2026-11-20). Hosts hermes-sync does not manage keep the old path.
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++
++const forceStateSpy = vi.fn()
++const forceSpy = vi.fn()
++const updateHermesSpy = vi.fn()
++
++vi.mock('@/api/system', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  forceHermesUpdate: (...args: unknown[]) => forceSpy(...args),
++  getForceUpdateState: (...args: unknown[]) => forceStateSpy(...args)
++}))
++vi.mock('@/hermes', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  checkHermesUpdate: vi.fn(),
++  getActionStatus: vi.fn(),
++  getHermesUpdateProgress: vi.fn().mockResolvedValue({ progress: null }),
++  updateHermes: (...args: unknown[]) => updateHermesSpy(...args)
++}))
++vi.mock('@/store/notifications', () => ({ dismissNotification: vi.fn(), notify: vi.fn() }))
++
++const updates = await import('./updates')
++
++const bridgeApply = vi.fn()
++
++beforeEach(() => {
++  vi.clearAllMocks()
++  bridgeApply.mockResolvedValue({ ok: true })
++  window.hermesDesktop = { updates: { apply: bridgeApply, check: vi.fn(), onProgress: () => () => {} } } as never
++  updates.resetUpdateApplyState()
++  updates.$updateStatus.set({ supported: true, mechanism: 'posix-handoff' } as never)
++})
++
++const managed = { available: true, managed: true, pending: null, running_turns: 2 }
++
++describe('Update on a host hermes-sync manages', () => {
++  it('asks hermes-sync for the local host and never runs the detached updater', async () => {
++    forceStateSpy.mockResolvedValue(managed)
++    forceSpy.mockResolvedValue({ ok: true })
++
++    const result = await updates.applyUpdates()
++
++    expect(forceStateSpy).toHaveBeenCalledWith({ connectionId: 'local' })
++    expect(forceSpy).toHaveBeenCalledWith({ connectionId: 'local' })
++    expect(bridgeApply).not.toHaveBeenCalled()
++    expect(result.ok).toBe(true)
++    expect(updates.$updateApply.get()).toMatchObject({ applying: false, stage: 'synced' })
++  })
++
++  it('says hermes-sync has nothing pending instead of updating on its own', async () => {
++    forceStateSpy.mockResolvedValue({ ...managed, available: false, message: 'hermes-sync applies Hermes updates' })
++
++    const result = await updates.applyUpdates()
++
++    expect(forceSpy).not.toHaveBeenCalled()
++    expect(bridgeApply).not.toHaveBeenCalled()
++    expect(result).toMatchObject({ ok: false, error: 'managed-by-hermes-sync' })
++    expect(updates.$updateApply.get()).toMatchObject({
++      stage: 'synced',
++      message: 'hermes-sync applies Hermes updates'
++    })
++  })
++
++  it('shows an error when the force request fails', async () => {
++    forceStateSpy.mockResolvedValue(managed)
++    forceSpy.mockRejectedValue(new Error('409 nothing pending'))
++
++    const result = await updates.applyUpdates()
++
++    expect(bridgeApply).not.toHaveBeenCalled()
++    expect(result).toMatchObject({ ok: false, error: 'force-request-failed' })
++    expect(updates.$updateApply.get()).toMatchObject({ stage: 'error', message: '409 nothing pending' })
++  })
++
++  it('says nothing is pending when the owed update lands between the read and the request (409)', async () => {
++    forceStateSpy
++      .mockResolvedValueOnce(managed)
++      .mockResolvedValueOnce({ ...managed, available: false, message: 'hermes-sync applies Hermes updates' })
++    forceSpy.mockRejectedValue(new Error('409 nothing pending'))
++
++    const result = await updates.applyUpdates()
++
++    expect(result).toMatchObject({ ok: false, error: 'managed-by-hermes-sync' })
++    expect(updates.$updateApply.get()).toMatchObject({ stage: 'synced' })
++  })
++
++  it('leaves a packaged Desktop on its own bundle update', async () => {
++    updates.$updateStatus.set({ supported: true, mechanism: 'electron-updater' } as never)
++    forceStateSpy.mockResolvedValue(managed)
++
++    await updates.applyUpdates()
++
++    expect(forceStateSpy).not.toHaveBeenCalled()
++    expect(forceSpy).not.toHaveBeenCalled()
++    expect(bridgeApply).toHaveBeenCalledOnce()
++  })
++
++  it('hands the backend Update to hermes-sync without starting hermes update', async () => {
++    forceStateSpy.mockResolvedValue(managed)
++    forceSpy.mockResolvedValue({ ok: true })
++
++    const result = await updates.applyBackendUpdate()
++
++    expect(forceSpy).toHaveBeenCalledWith(undefined)
++    expect(updateHermesSpy).not.toHaveBeenCalled()
++    expect(result.ok).toBe(true)
++    expect(updates.$backendUpdateApply.get()).toMatchObject({ applying: false, stage: 'synced' })
++    // The in-flight guard cleared: a second click runs again instead of joining a stale promise.
++    await updates.applyBackendUpdate()
++    expect(forceSpy).toHaveBeenCalledTimes(2)
++  })
++
++  it('routes the backend pill to the active backend host', async () => {
++    forceStateSpy.mockResolvedValue(managed)
++    forceSpy.mockResolvedValue({ ok: true })
++
++    await updates.routeUpdateToHermesSync('backend')
++
++    expect(forceStateSpy).toHaveBeenCalledWith(undefined)
++    expect(forceSpy).toHaveBeenCalledWith(undefined)
++    expect(updates.$backendUpdateApply.get()).toMatchObject({ stage: 'synced' })
++  })
++})
++
++describe('Update on a host hermes-sync does not manage', () => {
++  it('keeps the detached updater when the backend says unmanaged', async () => {
++    forceStateSpy.mockResolvedValue({ available: false, pending: null, running_turns: 0 })
++
++    await updates.applyUpdates()
++
++    expect(forceSpy).not.toHaveBeenCalled()
++    expect(bridgeApply).toHaveBeenCalledOnce()
++  })
++
++  it('keeps the detached updater when the force state cannot be read (older backend)', async () => {
++    forceStateSpy.mockRejectedValue(new Error('404'))
++
++    await updates.applyUpdates()
++
++    expect(bridgeApply).toHaveBeenCalledOnce()
++  })
++})
+diff --git a/apps/desktop/src/store/updates.ts b/apps/desktop/src/store/updates.ts
+index 422739d19f..0fcbbfd373 100644
+--- a/apps/desktop/src/store/updates.ts
++++ b/apps/desktop/src/store/updates.ts
+@@ -8,6 +8,7 @@ import { atom } from 'nanostores'
+ 
+ import { CANONICAL_GATEWAY_PROTOCOL } from '@/api/canonical-protocol'
+ import { $apiRequestScope, connectionScoped, profileScoped } from '@/api/client'
++import { forceHermesUpdate, getForceUpdateState } from '@/api/system'
+ import type {
+   DesktopUpdateApplyOptions,
+   DesktopUpdateApplyResult,
+@@ -755,6 +756,64 @@ export async function setUpdateChannel(channel: SourceUpdateChannel): Promise<De
+ 
+ const CLOUD_OWNED: DesktopUpdateApplyResult = { ok: false, error: 'cloud-managed' }
+ 
++/** [daveey] On a host whose core updates hermes-sync applies, Desktop's own update (`hermes update` via the detached
++ *  handoff, or the backend's POST /api/hermes/update) only pauses idle gateways and so failed whenever a chat was busy
++ *  ("Hermes couldn't finish updating ... busy or cannot acknowledge an idle pause", laptop-1 2026-11-20). Hand the
++ *  update to hermes-sync's Force-update request instead: it pauses busy chats and continues them after the update.
++ *  Null (the caller keeps its own path) when hermes-sync does not manage the host or its state cannot be read. */
++export async function routeUpdateToHermesSync(target: UpdateTarget): Promise<DesktopUpdateApplyResult | null> {
++  // The client pill hands off only where its own update is `hermes update` on this checkout: a packaged Desktop
++  // (app-installer, electron-updater, store) updates its bundle, which hermes-sync's core update does not do.
++  if (target === 'client' && $updateStatus.get()?.mechanism !== 'posix-handoff') {
++    return null
++  }
++
++  const scope = target === 'client' ? { connectionId: 'local' } : undefined
++  const apply = target === 'client' ? $updateApply : $backendUpdateApply
++  let state: Awaited<ReturnType<typeof getForceUpdateState>>
++
++  try {
++    state = await getForceUpdateState(scope)
++  } catch {
++    return null
++  }
++
++  if (!state.managed) {
++    return null
++  }
++
++  if (!state.available) {
++    const message = state.message || translateNow('shell.statusbar.forceUpdate.syncedApplying')
++    apply.set({ ...IDLE, applying: false, stage: 'synced', message })
++
++    return { ok: false, error: 'managed-by-hermes-sync', message }
++  }
++
++  try {
++    await forceHermesUpdate(scope)
++  } catch (error) {
++    // The owed update can land between the read and the request (409): say so rather than fail.
++    const after = await getForceUpdateState(scope).catch(() => null)
++
++    if (after?.managed && !after.available) {
++      const message = after.message || translateNow('shell.statusbar.forceUpdate.syncedApplying')
++      apply.set({ ...IDLE, applying: false, stage: 'synced', message })
++
++      return { ok: false, error: 'managed-by-hermes-sync', message }
++    }
++
++    const message = error instanceof Error ? error.message : String(error)
++    apply.set({ ...IDLE, applying: false, stage: 'error', message })
++
++    return { ok: false, error: 'force-request-failed', message }
++  }
++
++  const message = translateNow('shell.statusbar.forceUpdate.syncedApplying')
++  apply.set({ ...IDLE, applying: false, stage: 'synced', message })
++
++  return { ok: true, message }
++}
++
+ export async function applyUpdates(opts: DesktopUpdateApplyOptions = {}): Promise<DesktopUpdateApplyResult> {
+   if (cloudOwnsUpdates('client')) {
+     return CLOUD_OWNED
+@@ -775,6 +834,15 @@ export async function applyUpdates(opts: DesktopUpdateApplyOptions = {}): Promis
+   dismissNotification(UPDATE_TOAST_ID)
+   $updateApply.set({ ...IDLE, applying: true, stage: 'prepare', message: 'Starting update…' })
+ 
++  return (await routeUpdateToHermesSync('client')) ?? applyOwnUpdate(bridge, opts)
++}
++
++/** Desktop's own update (the detached `hermes update` handoff or a bundle swap): hosts hermes-sync does not manage. */
++async function applyOwnUpdate(
++  bridge: NonNullable<NonNullable<typeof window.hermesDesktop>['updates']>,
++  opts: DesktopUpdateApplyOptions
++): Promise<DesktopUpdateApplyResult> {
++
+   try {
+     const result = await bridge.apply(opts)
+ 
+@@ -1036,6 +1104,11 @@ function legacyBackendReachedTarget(
+ 
+ let backendUpdateInFlight: Promise<DesktopUpdateApplyResult> | null = null
+ 
++/** hermes-sync's Force update on a backend it manages, else the backend's own `POST /api/hermes/update`. */
++async function routeOrRunBackendUpdate(): Promise<DesktopUpdateApplyResult> {
++  return (await routeUpdateToHermesSync('backend')) ?? runBackendUpdate()
++}
++
+ async function runBackendUpdate(): Promise<DesktopUpdateApplyResult> {
+   dismissNotification(UPDATE_TOAST_ID)
+   $backendUpdateApply.set({
+@@ -1174,7 +1247,7 @@ export function applyBackendUpdate(): Promise<DesktopUpdateApplyResult> {
+     return backendUpdateInFlight
+   }
+ 
+-  backendUpdateInFlight = runBackendUpdate().finally(() => {
++  backendUpdateInFlight = routeOrRunBackendUpdate().finally(() => {
+     backendUpdateInFlight = null
+   })
+ 
+diff --git a/apps/desktop/src/types/hermes.ts b/apps/desktop/src/types/hermes.ts
+index 1bcb708f3b..c8ba9fcb07 100644
+--- a/apps/desktop/src/types/hermes.ts
++++ b/apps/desktop/src/types/hermes.ts
+@@ -1545,6 +1545,8 @@ export interface ForceUpdateState {
+   pending: ForceUpdateRequest | null
+   /** Why it is unavailable (only when `available` is false). */
+   message?: string
++  /** [daveey] hermes-sync applies core updates on this host: Desktop's Update hands off to it. Absent on older backends. */
++  managed?: boolean
+ }
+ 
+ /** `POST /api/hermes/update/force` (a 409 with `detail` when no update is owed). */
+diff --git a/hermes_cli/web_routers/actions.py b/hermes_cli/web_routers/actions.py
+index 627e50e6e0..12b8a745e1 100644
+--- a/hermes_cli/web_routers/actions.py
++++ b/hermes_cli/web_routers/actions.py
+@@ -262,6 +262,12 @@ async def update_hermes():
+         record_refusal_receipt(refusal)
+         return response
+ 
++    if await asyncio.to_thread(_hermes_sync_manages_host):
++        # [daveey] A Desktop that predates the hand-off: its own update would only defer on a busy chat.
++        return _update_refused("managed_by_hermes_sync", _SYNC_MANAGED_MESSAGE
++                               + " This Desktop predates the hand-off: update it, or wait for hermes-sync.",
++                               "hermes update")
++
+     existing = _ACTION_PROCS.get("hermes-update")
+     if existing is not None and existing.poll() is None:
+         response = {"ok": True, "pid": existing.pid, "name": "hermes-update", "already_running": True}
+@@ -298,6 +304,22 @@ async def hermes_update_progress():
+ 
+ _FORCE_UNAVAILABLE_MESSAGE = ("No background core update is pending on this host, so there is nothing to force. "
+                                "Force update only applies to an update hermes-sync is waiting to apply here.")
++_SYNC_MANAGED_MESSAGE = ("hermes-sync applies Hermes updates on this host. It has no update pending yet; it checks "
++                         "for new commits every few minutes and applies them while chats keep running. If it seems "
++                         "stuck, `hermes update` in a terminal still updates by hand.")
++
++
++def _hermes_sync_manages_host() -> bool:
++    """[daveey] hermes-sync applies core updates here: it publishes a fresh window record for this host
++    (``kanban_deploy_window.read_window``). Desktop then hands updates to its Force-update request instead of
++    running its own idle-only ``hermes update``, which fails whenever a chat is busy (laptop-1 2026-11-20)."""
++    from hermes_cli.kanban_deploy_window import read_window
++
++    try:
++        return read_window(int(time.time())) is not None
++    except Exception:  # health: allow BLE001 -- an unreadable record means "not managed": the old path stays
++        _log.debug("hermes-sync window record unreadable", exc_info=True)
++        return False
+ 
+ 
+ def _force_update_state() -> dict[str, Any]:
+@@ -310,10 +332,11 @@ def _force_update_state() -> dict[str, Any]:
+     root = get_default_hermes_root()
+     available = read_progress() is not None
+     # Every profile's turns under this root; None when a state.db is unreadable (the dialog says "unknown").
++    managed = _hermes_sync_manages_host()
+     state: dict[str, Any] = {"available": available, "running_turns": running_turn_count(root),
+-                             "pending": read_force_request(root)}
++                             "pending": read_force_request(root), "managed": managed}
+     if not available:
+-        state["message"] = _FORCE_UNAVAILABLE_MESSAGE
++        state["message"] = _SYNC_MANAGED_MESSAGE if managed else _FORCE_UNAVAILABLE_MESSAGE
+     return state
+ 
+ 
+diff --git a/tests/hermes_cli/test_core_update_force.py b/tests/hermes_cli/test_core_update_force.py
+index dc79cbf44f..c20b60d913 100644
+--- a/tests/hermes_cli/test_core_update_force.py
++++ b/tests/hermes_cli/test_core_update_force.py
+@@ -128,6 +128,14 @@ def _owe_update(root):
+         state="draining", state_since=now - 300, drain_bound_s=7200, last_update_at=now - 5000, writer="drainer")))
+ 
+ 
++def _sync_idle(root):
++    """hermes-sync runs here (fresh window record) but owes no update."""
++    now = int(time.time())
++    (root / "cache" / "core-update" / "window.json").write_text(json.dumps(dict(
++        version=1, host=socket.gethostname().split(".")[0], observed_at=now - 5, window_at=now + 3600,
++        state="idle", state_since=now - 300, drain_bound_s=7200, last_update_at=now - 5000, writer="drainer")))
++
++
+ def _request(principal=None):
+     state = types.SimpleNamespace()
+     if principal:
+@@ -150,7 +158,7 @@ def test_routes_when_hermes_sync_owes_an_update(root):
+     _owe_update(root)
+     _live_turn(root)
+     state = asyncio.run(actions.hermes_update_force_state())
+-    assert state == {"available": True, "running_turns": 1, "pending": None}
++    assert state == {"available": True, "running_turns": 1, "pending": None, "managed": True}
+ 
+     result = asyncio.run(actions.hermes_update_force(_request("token:desktop")))
+     assert result["ok"] is True and result["running_turns"] == 1
+@@ -168,7 +176,7 @@ def test_routes_when_no_update_is_owed(root):
+ 
+     state = asyncio.run(actions.hermes_update_force_state())
+     assert state["available"] is False and state["running_turns"] == 0 and state["pending"] is None
+-    assert "nothing to force" in state["message"]
++    assert state["managed"] is False and "nothing to force" in state["message"]
+ 
+     response = asyncio.run(actions.hermes_update_force(_request("token:desktop")))
+     assert response.status_code == 409
+@@ -219,7 +227,40 @@ def test_app_routes_report_write_and_refuse(client, root):
+     _owe_update(root)
+     _live_turn(root)
+     assert client.get("/api/hermes/update/force", headers=AUTH).json() == {
+-        "available": True, "running_turns": 1, "pending": None}
++        "available": True, "running_turns": 1, "pending": None, "managed": True}
+     posted = client.post("/api/hermes/update/force", headers=AUTH)
+     assert posted.status_code == 200 and posted.json()["ok"] is True and posted.json()["running_turns"] == 1
+     assert client.get("/api/hermes/update/force", headers=AUTH).json()["pending"]["by"] == "dashboard"
++
++
++# ── [daveey] Desktop hands Update to hermes-sync on a host it manages ───────────────────────────────────
++
++
++def test_a_host_hermes_sync_manages_but_owes_nothing_says_so(root):
++    from hermes_cli.web_routers import actions
++
++    _sync_idle(root)
++    state = asyncio.run(actions.hermes_update_force_state())
++    assert state["managed"] is True and state["available"] is False
++    assert "hermes-sync applies Hermes updates on this host" in state["message"]
++
++
++def test_a_stale_window_record_is_not_managed(root):
++    from hermes_cli.web_routers import actions
++
++    _sync_idle(root)
++    path = root / "cache" / "core-update" / "window.json"
++    body = json.loads(path.read_text())
++    body["observed_at"] -= 3600  # older than kanban_deploy_window.FRESH_SECONDS: hermes-sync stopped publishing
++    path.write_text(json.dumps(body))
++    assert asyncio.run(actions.hermes_update_force_state())["managed"] is False
++
++
++def test_desktops_own_update_is_refused_on_a_managed_host(root):
++    from hermes_cli.web_routers import actions
++
++    _sync_idle(root)
++    refused = asyncio.run(actions.update_hermes())
++    assert refused["ok"] is False and refused["error"] == "managed_by_hermes_sync"
++    assert refused["update_command"] == "hermes update"  # the manual way out when hermes-sync is stuck
++    assert "hermes-sync applies Hermes updates on this host" in refused["message"]
+-- 
+2.43.0
+

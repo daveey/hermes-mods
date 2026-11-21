@@ -1,0 +1,157 @@
+From 6dea1bf53ba5708197b3a5a973f79a1f7ce59678 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 07:18:28 +0000
+Subject: [PATCH] fix(plugins): retry failed offline recall reads during
+ discovery [daveey]
+
+Independent review found transient live JSON and tree YAML failures were cached as successful empty recall lists. Retain failed tree-read status and only memoize successfully read or known-missing inputs with valid stat evidence. Ordinary reads retain existing behavior. Proof: both recovery cases fail on parent and pass after; focused 4-file suite green; all five new memo guards mutation-killed; full scripts/check green. Broader consumers:752 pass,3 skip, one historical Git promisor missing-object failure in catalog confinement (not runtime code). Whole-card latency remains unverified.
+---
+ hermes_cli/plugin_catalog.py                  | 29 ++++++--
+ .../hermes_cli/test_plugin_discovery_reads.py | 70 +++++++++++++++++++
+ 2 files changed, 92 insertions(+), 7 deletions(-)
+
+diff --git a/hermes_cli/plugin_catalog.py b/hermes_cli/plugin_catalog.py
+index 94abf9a101..2fc0efc5bf 100644
+--- a/hermes_cli/plugin_catalog.py
++++ b/hermes_cli/plugin_catalog.py
+@@ -248,13 +248,22 @@ def load_catalog(catalog_dir: Optional[Path] = None) -> list[PluginCatalogEntry]
+     return entries
+ 
+ 
+-def load_removed_list(catalog_dir: Optional[Path] = None) -> list[RemovedEntry]:
+-    """``removed.yaml``'s ``removed:`` list; missing/malformed → empty."""
++def _read_removed_list(catalog_dir: Optional[Path] = None) -> Optional[list[RemovedEntry]]:
++    """Keep failed reads distinct from a successfully empty or missing tree list."""
+     path = (catalog_dir or get_catalog_dir()) / "removed.yaml"
+-    data = _read_yaml(path) if path.is_file() else None
++    if not path.is_file():
++        return []
++    data = _read_yaml(path)
++    if data is None:
++        return None
+     return _removed_from_list(data.get("removed")) if isinstance(data, dict) else []
+ 
+ 
++def load_removed_list(catalog_dir: Optional[Path] = None) -> list[RemovedEntry]:
++    """``removed.yaml``'s ``removed:`` list; missing/malformed → empty."""
++    return _read_removed_list(catalog_dir) or []
++
++
+ def get_catalog_entry(name: str, catalog_dir: Optional[Path] = None) -> Optional[PluginCatalogEntry]:
+     return next((e for e in load_catalog(catalog_dir) if e.name == name), None)
+ 
+@@ -338,6 +347,8 @@ def _removal_version(path: Path):
+     from utils import file_cache_version
+     try:
+         return file_cache_version(path)
++    except FileNotFoundError:
++        return ()
+     except OSError:
+         return None
+ 
+@@ -354,11 +365,15 @@ def cached_removed_entries() -> list[RemovedEntry]:
+     saved = memo.get(key) if memo is not None else None
+     if saved is not None:
+         return [RemovedEntry(*row) for row in saved]
+-    cached = _stale_live_cache(live) or {}
+-    entries = load_removed_list() + _removed_from_list(cached.get("removed"))
+-    if memo is not None:
++    cached = _stale_live_cache(live)
++    tree_entries = _read_removed_list() if memo is not None else load_removed_list()
++    entries = (tree_entries or []) + _removed_from_list((cached or {}).get("removed"))
++    if memo is not None and key is not None:
+         memo.clear()  # bounded even when another process rewrites the catalog during a sweep
+-        memo[key] = tuple((e.name, e.repo, e.reason, e.date) for e in entries)
++        # A missing live file is cacheable; a failed read/stat must retry next lookup.
++        if (key[1] is not None and key[3] is not None and tree_entries is not None
++                and (cached is not None or key[1] == ())):
++            memo[key] = tuple((e.name, e.repo, e.reason, e.date) for e in entries)
+     return entries
+ 
+ 
+diff --git a/tests/hermes_cli/test_plugin_discovery_reads.py b/tests/hermes_cli/test_plugin_discovery_reads.py
+index 666d5cb0d2..48bc9ba6d5 100644
+--- a/tests/hermes_cli/test_plugin_discovery_reads.py
++++ b/tests/hermes_cli/test_plugin_discovery_reads.py
+@@ -1,4 +1,9 @@
+ """Startup must not decode the same catalog/config once per enabled plugin."""
++import json
++from pathlib import Path
++
++import pytest
++
+ from hermes_cli import plugin_catalog as catalog
+ from hermes_cli import plugins
+ 
+@@ -69,3 +74,68 @@ def test_scope_restores_on_exception_and_nested_profiles(tmp_path, monkeypatch):
+     assert catalog._removal_reads.get() is None
+     (other / 'removed.yaml').write_text('removed: [{name: fresh}]')
+     assert catalog.cached_removed_entries()[0].name == 'fresh'
++
++
++@pytest.mark.parametrize('source', ['live', 'tree'])
++def test_failed_read_retried_within_scope(tmp_path, monkeypatch, source):
++    from hermes_cli.plugins_cmd_catalog import installed_plugin_removal
++
++    tree = tmp_path / 'catalog'
++    tree.mkdir()
++    live = tmp_path / 'live.json'
++    removed = tree / 'removed.yaml'
++    live.write_text(json.dumps({'removed': [{'name': 'recalled'}] if source == 'live' else []}))
++    removed.write_text('removed: [{name: recalled}]' if source == 'tree' else 'removed: []')
++    monkeypatch.setattr(catalog, '_live_cache_path', lambda: live)
++    monkeypatch.setattr(catalog, 'get_catalog_dir', lambda: tree)
++    target = live if source == 'live' else removed
++    original = Path.read_text
++    failures = []
++
++    def flaky_read(path, *args, **kwargs):
++        if path == target and not failures:
++            failures.append(path)
++            raise OSError('transient catalog read failure')
++        return original(path, *args, **kwargs)
++
++    # Hold the generation constant: recovery need not rewrite the file.
++    monkeypatch.setattr(catalog, '_removal_version', lambda path: ('unchanged',))
++    monkeypatch.setattr(Path, 'read_text', flaky_read)
++    with catalog.removal_read_scope():
++        assert installed_plugin_removal('ordinary', tmp_path) is None
++        assert installed_plugin_removal('recalled', tmp_path) is not None
++        assert installed_plugin_removal('recalled', tmp_path) is not None
++    assert failures == [target]
++
++
++@pytest.mark.parametrize('source', ['live', 'tree'])
++def test_failed_stat_is_not_memoized(tmp_path, monkeypatch, source):
++    live = tmp_path / 'live.json'
++    tree = tmp_path / 'tree'
++    tree.mkdir()
++    live.write_text(json.dumps({'removed': []}))
++    (tree / 'removed.yaml').write_text('removed: []')
++    monkeypatch.setattr(catalog, '_live_cache_path', lambda: live)
++    monkeypatch.setattr(catalog, 'get_catalog_dir', lambda: tree)
++    target = live if source == 'live' else tree / 'removed.yaml'
++    monkeypatch.setattr(catalog, '_removal_version', lambda path: None if path == target else ('stable',))
++    with catalog.removal_read_scope():
++        assert catalog.cached_removed_entries() == []
++        assert catalog._removal_reads.get() == {}
++
++
++def test_missing_catalogs_are_memoized(tmp_path, monkeypatch):
++    monkeypatch.setattr(catalog, '_live_cache_path', lambda: tmp_path / 'missing.json')
++    monkeypatch.setattr(catalog, 'get_catalog_dir', lambda: tmp_path)
++    original = catalog._stale_live_cache
++    reads = []
++
++    def read(path):
++        reads.append(path)
++        return original(path)
++
++    monkeypatch.setattr(catalog, '_stale_live_cache', read)
++    with catalog.removal_read_scope():
++        assert catalog.cached_removed_entries() == []
++        assert catalog.cached_removed_entries() == []
++    assert len(reads) == 1
+-- 
+2.43.0
+
