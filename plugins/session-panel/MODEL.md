@@ -149,6 +149,21 @@ Order matters, matching Desktop `classify`:
   disclosure, cached title reads, nudge drafting or fold state. Existing raw
   fields remain available during cutover; actions currently encode Open/Answer.
 
+### Status-line rules (audit t_01a2001662ee259d)
+
+- Worker clocks may lead the read clock by up to `SKEW_S` (120 s): `now` is lifted to the newest observation
+  before core's projector runs; a larger lead stays core's `clock_inconsistent`.
+- A remote row whose replica placeholder has no run id (`missing_qualified_identity`; core reports
+  `invalid_requested_identity`) is a producer gap, not an unknown state: a fresh (`<=60 s` read, `<=300 s` sync)
+  running row is shown In progress with `evidence_state: "reported"` and a Details line saying so; parked
+  states show their board state. No `· board status` tail on any row.
+- Waiting text is one short phrase (`waiting on CI · PR #3881 · 2m`, `waiting on hub deploy · 15m`); URLs go to an
+  `open_url` action, the producer's wording to a `Waiting on:` Details line. Hashes never appear inline.
+- Answered-but-undelivered asks are one `decision: {request_id, text}` line on the card they unblock (own row
+  if card-less) and vanish when the request resolves; header `label` never reads "unresolved" for them.
+- Running rows without `run_model` use the current run's `run_route`, else `model_tier`, event model.
+- Titles lose emoji-presentation glyphs; Done rows carry no redundant `done` detail.
+
 ## Tests and private replay
 
 Run `scripts/test-all --no-core --exact -k plugins/session-panel -k plugins/ask-gate

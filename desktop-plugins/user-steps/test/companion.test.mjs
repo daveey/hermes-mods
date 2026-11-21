@@ -99,6 +99,31 @@ test('companion: pending delivery keeps Check status and Retry (same operation) 
  delete window.hermesDesktop
 })
 
+test('audit: a recorded decision the panel carries has no queue block; the same decision shows when the panel does not carry it', async () => {
+ m.clearFeatureCache(); m.resetCanonicalCacheForTests()
+ const before = window.__sessionPanel
+ await show(null)
+ const r = approval({ title: 'Reload the window' })
+ const resolution = { operationId: 'op-carried', choiceId: 'yes', revision: 1 }
+ const call = async (path, opts = {}) => {
+  if (path.endsWith('/ping')) return { features: [] }
+  const request = { ...r, resolution, state: 'open' }
+  if (path.includes('/operations/')) return { operation: { operationId: resolution.operationId, dispatchState: 'pending' }, request }
+  return { requests: [request] }
+ }
+ window.hermesDesktop = { api: ({ path, ...opts }) => call(path, opts) }
+ window.__sessionPanel = { active: true, showsDecision: id => id === r.requestId }
+ await m.refreshRequests(call)
+ await show(React.createElement(m.ActionQueue, { key: 'carried', embedded: true, companion: true }))
+ assert.equal(el().querySelector('[data-action-request]'), null, 'the panel row is the one status line')
+ assert.doesNotMatch(el().textContent, /Delivering to chat|Recorded choice|Check status|Retry|unresolved/)
+ window.__sessionPanel = { active: true, showsDecision: () => false }
+ await show(React.createElement(m.ActionQueue, { key: 'uncarried', embedded: true, companion: true }))
+ assert.ok(el().querySelector('[data-action-request]'), 'a decision the panel does not show still surfaces here')
+ delete window.hermesDesktop
+ if (before) window.__sessionPanel = before; else panelOff()
+})
+
 test('companion: a plan-less ask still offers Ask agent for the plan (composer draft) and draws no Approve', async () => {
  const r = approval({ title: 'No plan', scope: { complete: false, markdown: '', sourceRefs: [] } })
  drafts.length = 0

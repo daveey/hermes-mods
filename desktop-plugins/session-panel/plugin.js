@@ -4,8 +4,13 @@ import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'session-panel'
-const VERSION = 'session-panel-v15-hub-model'
+const VERSION = 'session-panel-v16-status-lines'
 const str = v => (typeof v === 'string' ? v : v == null ? '' : String(v))
+// Emoji-presentation glyphs the Desktop fonts draw as tofu (a Hermes-bug title carried "⛔"); the model strips them
+// too, this covers a cached older model.
+const EMOJI = /[\u{1F000}-\u{1FAFF}\u231a\u231b\u23e9-\u23f3\u23f8-\u23fa\u25fd\u25fe\u2614\u2615\u2648-\u2653\u267f\u2693\u26a1\u26aa\u26ab\u26bd\u26be\u26c4\u26c5\u26ce\u26d4\u26ea\u26f2\u26f3\u26f5\u26fa\u26fd\u2705\u270a\u270b\u2728\u274c\u274e\u2753-\u2755\u2757\u2795-\u2797\u27b0\u27bf\u2b1b\u2b1c\u2b50\u2b55\ufe0f\u200d\u20e3]/gu
+export const plain = v => str(v).replace(EMOJI, '').replace(/\s+/g, ' ').trim()
+let osApi = null // ctx.os, set in register()
 const log = (...a) => console.info(`[${ID}]`, ...a)
 const clamp = n => ({ display: '-webkit-box', WebkitLineClamp: n, WebkitBoxOrient: 'vertical', overflow: 'hidden' })
 const pill = color => ({ fontSize: 10, fontWeight: 700, letterSpacing: 0.4, textTransform: 'uppercase', color, border: '1px solid currentColor', borderRadius: 999, padding: '1px 6px', whiteSpace: 'nowrap' })
@@ -267,13 +272,15 @@ const STATE_LABEL = { decision: 'needs your decision', needs_input: 'needs you',
 /** Pure model -> React tree. No parsing, classification, I/O, clock or ambient state. */
 export function renderModel(model, { onChoose, onAction, decisionStatus = () => null, onCheck } = {}) {
   if (!validModel(model)) return null
+  // Spec: hidden when there is neither open work nor finished history.
+  if (!MODEL_SECTIONS.some(([section]) => model.sections[section].length)) return null
   const state = str(model.header.state)
   const alert = state === 'decision' || state === 'needs_input' || state === 'needs_user' || (model.header.counts.needs_you || 0) > 0
   const details = row => row.details?.length > 0 && jsxs('details', { 'data-ask-details': '', style: { ...modelSmall, ...muted, flex: 1, minWidth: 0 }, children: [
     jsx('summary', { style: { fontSize: 11.5 }, children: 'Details' }),
     ...row.details.map((text, i) => jsx('div', { style: { whiteSpace: 'pre-wrap', marginTop: 4, fontSize: 11.5 }, children: text }, i))
   ] })
-  const openLinks = row => row.actions.filter(action => action.kind === 'open_card').map((action, i) => jsx('button', { type: 'button', 'data-open-card': '',
+  const openLinks = row => row.actions.filter(action => action.kind === 'open_card' || (action.kind === 'open_url' && /^https?:\/\//.test(str(action.url)))).map((action, i) => jsx('button', { type: 'button', 'data-open-card': action.kind === 'open_card' ? '' : undefined, 'data-open-url': action.kind === 'open_url' ? '' : undefined,
     style: { ...askLinkBtn, fontSize: 11.5, whiteSpace: 'nowrap', cursor: onAction ? 'pointer' : 'default' }, disabled: !onAction, onClick: () => onAction?.(row, action), children: action.label }, `open${i}`))
   const askRow = row => {
     const status = decisionStatus(row)
@@ -285,7 +292,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
         jsx('span', { 'data-ask-kind': '', style: { fontSize: 10.5, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: ALERT_TEXT, whiteSpace: 'nowrap' }, children: decision ? 'Needs your decision' : 'Needs you' }),
         row.id && jsx('span', { 'data-ask-card': '', style: { ...muted, marginLeft: 'auto', fontSize: 10.5, fontFamily: 'var(--font-mono, ui-monospace, monospace)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', minWidth: 0 }, children: row.source === 'card' ? row.id : 'question' })
       ] }),
-      jsx('strong', { 'data-ask-title': '', style: { fontWeight: 600, fontSize: 14, lineHeight: 1.35, overflowWrap: 'anywhere', marginTop: -4 }, children: row.title }),
+      jsx('strong', { 'data-ask-title': '', style: { fontWeight: 600, fontSize: 14, lineHeight: 1.35, overflowWrap: 'anywhere', marginTop: -4 }, children: plain(row.title) || row.id }),
       row.detail && jsx('div', { style: { ...modelSmall, ...muted }, children: row.detail }),
       row.situation && jsx('div', { 'data-ask-situation': '', title: row.situation, style: { ...modelSmall, fontSize: 12.5, ...clamp(3) }, children: row.situation }),
       decision && jsx('div', { 'data-ask-options': '', style: { display: 'grid', gap: 6 }, children: row.options.map(option => {
@@ -318,17 +325,22 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
   // Every other section: one compact line per row — state box, title, short detail; details/open on the right.
   // In progress keeps the old one-line shape: title, then where · model · how long right-aligned beside it.
   const lineRow = (row, section) => {
-    const inline = (section === 'running' || section === 'done') && !!row.detail
+    // A finished row is already under "Done": its own `done`/`archived` label says nothing.
+    const detail = section === 'done' && /^(done|archived)$/i.test(str(row.detail).trim()) ? '' : str(row.detail)
+    const inline = (section === 'running' || section === 'done') && !!detail
+    const title = plain(row.title) || row.id
     return jsxs('article', { 'data-panel-row': row.key, 'data-line-row': '',
       style: { display: 'grid', gridTemplateColumns: '12px minmax(0,1fr) auto', columnGap: 8, alignItems: 'start', padding: '3px 4px', fontSize: 13, minWidth: 0 }, children: [
       jsx('span', { 'aria-hidden': true, 'data-row-pip': section, style: { ...box(section), justifySelf: 'center', marginTop: 5 } }),
       jsxs('div', { style: { minWidth: 0 }, children: [
         jsxs('div', { style: { display: 'flex', alignItems: 'baseline', gap: 10, minWidth: 0 }, children: [
-          jsx('strong', { 'data-ask-title': '', title: row.title, style: { flex: 1, minWidth: 0, fontWeight: 400, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: row.title }),
-          inline && jsx('span', { 'data-row-detail': '', 'data-run-meta': '', title: row.details?.join('\n') || row.detail,
-            style: { ...muted, flex: 'none', whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums', ...(row.quiet ? { color: SECTION_COLOR.stuck } : {}) }, children: row.detail })
+          jsx('strong', { 'data-ask-title': '', title, style: { flex: 1, minWidth: 0, fontWeight: 400, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: title }),
+          inline && jsx('span', { 'data-row-detail': '', 'data-run-meta': '', title: row.details?.join('\n') || detail,
+            style: { ...muted, flex: 'none', whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums', ...(row.quiet ? { color: SECTION_COLOR.stuck } : {}) }, children: detail })
         ] }),
-        !inline && row.detail && jsx('div', { 'data-row-detail': '', style: { ...muted, overflowWrap: 'anywhere', ...(section === 'stuck' ? { color: SECTION_COLOR.stuck } : {}) }, children: row.detail }),
+        !inline && detail && jsx('div', { 'data-row-detail': '', style: { ...muted, overflowWrap: 'anywhere', ...(section === 'stuck' ? { color: SECTION_COLOR.stuck } : {}) }, children: detail }),
+        // An answered ask: one status line on its own card ("Done · delivers when this turn ends"); gone once delivered.
+        row.decision?.text && jsx('div', { 'data-decision-status': row.decision.request_id || '', role: 'status', style: { ...muted, overflowWrap: 'anywhere' }, children: row.decision.text }),
         details(row)
       ] }),
       jsx('span', { style: { display: 'flex', gap: 8, paddingTop: 2 }, children: openLinks(row) })
@@ -343,7 +355,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
         jsx('span', { 'aria-hidden': true, style: { width: 7, height: 7, borderRadius: '50%', background: alert ? SECTION_COLOR.needs_you : (model.header.counts.running ? SECTION_COLOR.running : SECTION_COLOR.done) } }),
         jsx('span', { children: 'This session' })
       ] }),
-      jsx('span', { 'data-session-status': '', title: STATE_LABEL[state] || state, style: { color: alert ? ALERT_TEXT : 'var(--muted-foreground)', fontWeight: alert ? 600 : 400 }, children: model.header.state }),
+      jsx('span', { 'data-session-status': '', title: STATE_LABEL[state] || state, style: { color: alert ? ALERT_TEXT : 'var(--muted-foreground)', fontWeight: alert ? 600 : 400 }, children: str(model.header.label) || model.header.state }),
       ...model.header.pips.map((pip, i) => jsxs('span', { 'data-model-pip': pip.section, style: { display: 'inline-flex', alignItems: 'center', gap: 5, color: pip.section === 'needs_you' ? ALERT_TEXT : pip.section === 'stuck' ? SECTION_COLOR.stuck : 'var(--muted-foreground)', fontWeight: pip.section === 'needs_you' || pip.section === 'stuck' ? 600 : 400 }, children: [
         jsx('span', { 'aria-hidden': true, style: box(pip.section) }),
         `${pip.count} ${pip.label}`
@@ -441,6 +453,20 @@ export async function checkModelDecision(row, { call = modelApi } = {}) {
   } catch (e) { modelDecisions.set(key, { locked: true, text: `Outcome unknown: ${e.message}. Check status.` }) }
   modelChanged()
 }
+/** Open an http(s) link from a row (CI run, PR) with the OS handler; never a navigation of the Desktop window. */
+export async function openUrl(url) {
+  if (!/^https?:\/\//.test(str(url))) return false
+  try { if (await osApi?.openExternal?.(url)) return true } catch {}
+  try { if (typeof window !== 'undefined' && window.open?.(url, '_blank', 'noopener')) return true } catch {}
+  host.notify?.({ kind: 'error', message: `Couldn’t open ${url}` })
+  return false
+}
+/** True while the focused chat's cached hub model carries the one status line for this answered request, so the
+ *  decision queue (user-steps) stays silent about it. */
+export function showsDecision(requestId, route = panelRoute()) {
+  const model = cachedModel(route)
+  return !!requestId && !!model && MODEL_SECTIONS.some(([section]) => model.sections?.[section]?.some(row => row?.decision?.request_id === requestId))
+}
 export function Panel() {
   const [, tick] = useState(0)
   useValue(host.state.focusedStoredSessionId)
@@ -457,6 +483,7 @@ export function Panel() {
     onChoose: (row, option) => void chooseModelOption(row, option, route),
     decisionStatus: modelDecisionStatus, onCheck: row => void checkModelDecision(row),
     onAction: (row, action) => {
+      if (action.kind === 'open_url') { void openUrl(action.url); return }
       const t = action.target
       if (!t?.id) return
       const connectionId = t.gateway ? tasksBridge()?.connectionForHubGateway?.(t.gateway) : route.connectionId
@@ -470,7 +497,8 @@ export default {
   id: ID,
   name: 'Session Panel',
   register(ctx) {
-    if (typeof window !== 'undefined') window.__sessionPanel = { active: true, version: VERSION, feedVouches, feedIsLive, cachedModel }
+    osApi = ctx?.os || null
+    if (typeof window !== 'undefined') window.__sessionPanel = { active: true, version: VERSION, feedVouches, feedIsLive, cachedModel, showsDecision }
     ctx.register({ id: 'panel', area: COMPOSER_AREAS.top, order: -30, render: () => jsx(Panel, {}) })
     const subscribe = typeof ctx.onEvent === 'function' ? ctx.onEvent : host?.onEvent
     const offFeed = typeof subscribe === 'function' ? subscribe(FEED_EVENT, onFeedEvent) : null
