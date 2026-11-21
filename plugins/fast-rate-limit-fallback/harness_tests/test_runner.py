@@ -127,9 +127,9 @@ class RunnerTests(unittest.TestCase):
         # Execute the actual worker. This minimal core's bootstrap refuses, so the child fails before pytest
         # and the parent still reaps it. Without that file an interpreter that has core installed (core's own
         # venv, as CI and the hub use) imported the real bootstrap and ran a nested pytest in the shared home.
-        (self.repo / 'hermes_bootstrap.py').write_text("raise SystemExit('fixture core: no bootstrap')\n")
+        (self.repo / 'hermes_bootstrap.py').write_text('raise SystemExit(73)  # fixture core: no bootstrap\n')
         with patch.object(runner.tempfile, 'tempdir', str(self.root)), patch.object(runner, 'INSTALLED', self.repo):
-            self.assertNotEqual(runner.main(['--repo', str(self.repo)]), 0)
+            self.assertEqual(runner.main(['--repo', str(self.repo)]), 73)  # failed at the fixture, before pytest
         self.assert_clean()
 
 
