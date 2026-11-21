@@ -548,7 +548,7 @@ def test_fleet_route_gateway_section_carries_worker_events_from_the_scaler_ledge
     monkeypatch.setattr(core, 'kanban_sync_client', ksc, raising=False)
     monkeypatch.setattr(core, 'kanban_worker_node', node, raising=False)
     monkeypatch.setattr(module, '_local_cap', lambda: 4)
-    monkeypatch.setattr(module, '_waiting_cards', lambda fleet, shadow_dir: None)
+    monkeypatch.setattr(module, '_waiting_cards', lambda fleet, shadow_dir, boards=None: None)
     ledger = tmp_path / 'worker-scaler.db'
     monkeypatch.setenv('HERMES_WORKER_SCALER_LEDGER', str(ledger))
     now = time.time()
@@ -876,15 +876,15 @@ def test_waiting_policy_uses_kanban_home_and_restores_context(api, monkeypatch, 
         assert hc.get_hermes_home() == tmp_path
         return lambda name: hc.get_hermes_home() == tmp_path and name == 'default'
     monkeypatch.setattr(dispatch, '_profile_exists_fn', predicate)
-    def collect(path, allowed):
-        assert path == tmp_path / 'replicas'
+    def collect(path, allowed, boards=None):
+        assert path == tmp_path / 'replicas' and boards == {'default'}
         assert allowed('default') and not allowed('queue')
         return ['fixture']
     token = hc.set_hermes_home_override(tmp_path / 'profiles' / 'other')
     try:
-        assert module._waiting_cards(types.SimpleNamespace(waiting_cards=collect), tmp_path / 'replicas') == ['fixture']
+        assert module._waiting_cards(types.SimpleNamespace(waiting_cards=collect), tmp_path / 'replicas', {'default'}) == ['fixture']
         assert hc.get_hermes_home() == tmp_path / 'profiles' / 'other'
-        def broken(*args):
+        def broken(*args, **kwargs):
             raise RuntimeError('probe')
         with pytest.raises(RuntimeError, match='probe'):
             module._waiting_cards(types.SimpleNamespace(waiting_cards=broken), tmp_path / 'replicas')
@@ -947,3 +947,26 @@ def test_fleet_route_carries_feed_and_the_push_hash(disk_api, monkeypatch):
     pushed = pusher.step()
     assert pushed['hash'] == body['hash'] and pushed['fleet']['gateways']['machines'] == body['gateways']['machines']
     assert 'feed' not in module._fleet_cache[body['profile']]['value'], 'the cached build is never mutated'
+
+
+def test_synced_boards_reads_core_board_paths_under_kanban_home(api, monkeypatch, tmp_path):
+    module, _, _ = api
+    hc = pytest.importorskip('hermes_constants')
+    ksc = pytest.importorskip('hermes_cli.kanban_sync_client')
+    kdb = pytest.importorskip('hermes_cli.kanban_db')
+    monkeypatch.setattr(kdb, 'kanban_home', lambda: tmp_path)
+    def board_paths():
+        assert hc.get_hermes_home() == tmp_path
+        return [('default', tmp_path / 'kanban.db'), ('bb', tmp_path / 'kanban/boards/bb/kanban.db')]
+    monkeypatch.setattr(ksc, 'board_paths', board_paths)
+    token = hc.set_hermes_home_override(tmp_path / 'profiles' / 'other')
+    try:
+        assert module._synced_boards() == {'default', 'bb'}
+        assert hc.get_hermes_home() == tmp_path / 'profiles' / 'other'
+        def broken():
+            raise RuntimeError('config')
+        monkeypatch.setattr(ksc, 'board_paths', broken)
+        assert module._synced_boards() is None  # unknown: fall back to every replica, never zero
+        assert hc.get_hermes_home() == tmp_path / 'profiles' / 'other'
+    finally:
+        hc.reset_hermes_home_override(token)

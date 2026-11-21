@@ -495,3 +495,26 @@ def test_scaler_ledger_path_env_override_else_home_state(tmp_path):
     assert fleet.scaler_ledger_path({'HERMES_WORKER_SCALER_LEDGER': str(tmp_path / 'x.db')}) == tmp_path / 'x.db'
     assert fleet.scaler_ledger_path({}) == Path.home() / '.hermes' / 'state' / 'worker-scaler.db'
     assert fleet.scaler_ledger_path({'HERMES_WORKER_SCALER_LEDGER': ''}) == fleet.scaler_ledger_path({})
+
+
+def test_unsynced_board_replica_is_not_waiting_or_running(tmp_path):
+    """A board dropped from kanban.sync.boards keeps a frozen replica in the shadow dir (hub, 2026-11-21: an
+    archived askeve card still 'ready' there). Only synced boards count toward waiting and running."""
+    _shadow(tmp_path, 'default', [('t_live', 'Live', 'ready', None, None, None),
+                                  ('t_run', 'Running', 'running', 100, 'hub', NOW + MIN)])
+    _shadow(tmp_path, 'dropped', [('t_frozen', 'Frozen', 'ready', None, None, None),
+                                  ('t_ghost', 'Ghost', 'running', 100, 'hub', NOW + MIN)])
+    for board in ('default', 'dropped'):
+        db = sqlite3.connect(tmp_path / f'{board}.db')
+        db.execute('ALTER TABLE tasks ADD COLUMN assignee TEXT')
+        db.execute("UPDATE tasks SET assignee = 'default'")
+        db.commit()
+        db.close()
+    assert [w['task'] for w in fleet.waiting_cards(tmp_path, lambda p: True, boards={'default'})] == ['t_live']
+    assert [l['task'] for l in fleet.live_leases(tmp_path, NOW, boards={'default'})] == ['t_run']
+    # Unknown synced set: the old every-replica scan, never zero.
+    assert sorted(w['task'] for w in fleet.waiting_cards(tmp_path, lambda p: True)) == ['t_frozen', 't_live']
+    assert sorted(l['task'] for l in fleet.live_leases(tmp_path, NOW)) == ['t_ghost', 't_run']
+    # An unreadable replica of an unsynced board no longer blanks the count.
+    (tmp_path / 'broken.db').write_bytes(b'not a sqlite database')
+    assert [w['task'] for w in fleet.waiting_cards(tmp_path, lambda p: True, boards={'default'})] == ['t_live']
