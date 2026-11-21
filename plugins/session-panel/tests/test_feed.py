@@ -738,3 +738,22 @@ def test_restore_keeps_only_bundles_of_chats_still_watched():
     snap['interest']['S2'] = t['now'] - 1  # nobody re-registered it
     new = feedmod.Feed(r, emit=pushed.append, clock=lambda: t['now']).restore(snap)
     assert set(new.bundles) == {'S1'} and 'S2' not in new._retry and 'S2' not in new._carried
+
+
+def test_a_plugin_reload_right_after_a_restore_still_reissues_the_restored_chats():
+    old, r, pushed, t = make()
+    first = old.changes(['S1'])
+    snap = _roundtrip(old.snapshot())
+    r.cards['t_ccccccc3'] = detail('t_ccccccc3', 'done', session='S9')
+    r.events, r.stamp = [('t_ccccccc3', 'S9')], 2
+    t['now'] += 1
+    old.tick()
+    client_rev = old.rev
+    r.cards['t_ccccccc3'] = detail('t_ccccccc3', 'running', session='S9')
+    restored = feedmod.Feed(r, emit=pushed.append, clock=lambda: t['now']).restore(snap)
+    restored.stopped.set()  # a plugin reload before its first recompute
+    new = feedmod.Feed(r, emit=pushed.append, clock=lambda: t['now']).resume(restored)
+    pushed.clear()
+    new.tick()
+    out = new.changes(['S1'], since=client_rev, epoch=first['epoch'])
+    assert set(out['bundles']) == {'S1'}, 'still re-issued after the reload'

@@ -339,3 +339,43 @@ def test_a_new_process_restores_the_saved_feed_claims_it_and_saves_on_stop_and_e
         assert 'S4' in api.load_snapshot()['bundles']
     finally:
         _restore(api, original)
+
+
+def test_a_claim_that_never_reached_disk_or_a_vanished_file_does_not_block_later_saves(tmp_path, monkeypatch):
+    import json
+    import os
+    api = load('_spf_claimfail_api', HERE.parents[1] / 'dashboard' / 'plugin_api.py')
+    fakes = load('_spf_claimfail_fakes', HERE.parent / 'test_feed.py')
+    f = api._load_feed().Feed(fakes.Readers(), emit=lambda p: None)
+    f.changes(['S1'])
+    path = tmp_path / 'feed.json'
+    real_replace = os.replace
+    monkeypatch.setattr(api.os, 'replace', lambda *a: (_ for _ in ()).throw(OSError('disk full')))
+    assert api.save_snapshot(f, path, claim=True) is False
+    assert str(path) not in api._CLAIMS, 'a claim counts only once written'
+    monkeypatch.setattr(api.os, 'replace', real_replace)
+    assert api.save_snapshot(f, path) is True
+    path.unlink()  # deleted by hand, or pruned
+    assert api.save_snapshot(f, path) is True, 'a vanished file is written again'
+    assert json.loads(path.read_text().split('\n', 1)[0])['gen'] == api._CLAIMS[str(path)]
+
+
+def test_the_exit_hook_is_registered_once_and_never_waits_past_its_timeout(monkeypatch):
+    import atexit
+    import time
+    api, original = _hot(monkeypatch, 'exit')
+    registered = []
+    monkeypatch.setattr(atexit, 'register', lambda fn: registered.append(fn))
+    monkeypatch.setitem(api._LOADER.__dict__, 'atexit_registered', False)
+    monkeypatch.setattr(api, 'EXIT_SAVE_TIMEOUT_S', 0.05)
+    try:
+        f = api.feed()
+        api._save_at_exit()
+        assert registered == [api._save_running], 'registered once'
+        with f.compute_lock:  # a push stuck in flight
+            started = time.monotonic()
+            assert api._save_running() is False
+            assert time.monotonic() - started < 2, 'the exit is not held up'
+        assert api._save_running() is True
+    finally:
+        _restore(api, original)

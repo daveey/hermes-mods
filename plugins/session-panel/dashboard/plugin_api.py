@@ -628,6 +628,7 @@ SNAPSHOT_EVERY_S = 30.0        # a changed feed is saved at most this often (and
 RESTORE_MAX_AGE_S = 15 * 60.0  # an older snapshot starts a new revision space instead
 SNAPSHOT_PRUNE_S = 7 * 86400.0  # snapshots of backends not seen for this long are deleted
 WARN_EVERY_S = 600.0            # a repeated snapshot warning is logged at most this often
+EXIT_SAVE_TIMEOUT_S = 5.0       # the exit save waits at most this long for a push in flight
 _CLAIMS = _LOADER.__dict__.setdefault('snapshot_claims', {})  # snapshot path -> this process's claim generation
 _WARNED = _LOADER.__dict__.setdefault('snapshot_warned', {})  # warning key -> when last logged
 
@@ -690,9 +691,7 @@ def _prune(directory: Path, keep: Path) -> None:
     for p in directory.glob('feed-*.json'):
         with contextlib.suppress(OSError):
             if p != keep and now - p.stat().st_mtime > SNAPSHOT_PRUNE_S:
-                p.unlink()
-                with contextlib.suppress(OSError):
-                    p.with_name(p.name + '.lock').unlink()
+                p.unlink()  # its .lock stays: a process still saving to it keeps its mutual exclusion
     for p in directory.glob('.feed-*.tmp'):
         with contextlib.suppress(OSError):
             if now - p.stat().st_mtime > 86400:
@@ -717,8 +716,8 @@ def save_snapshot(f, path: Optional[Path] = None, *, claim: bool = False, timeou
             held_gen = int(held.get('gen') or 0)
             mine = _CLAIMS.get(str(path))
             if claim or mine is None:
-                mine = _CLAIMS[str(path)] = held_gen + 1
-            elif held_gen != mine:
+                mine = held_gen + 1  # recorded once it is on disk
+            elif held_gen > mine:  # generations only go up, under this lock: a newer process claimed the file
                 _warn(f'claimed:{path}', 'session-panel feed: snapshot not saved; a newer process (claim %s, pid %s) '
                       'carries this feed on', held_gen, held.get('owner_pid'))
                 return False
@@ -730,6 +729,8 @@ def save_snapshot(f, path: Optional[Path] = None, *, claim: bool = False, timeou
                 fh.write(json.dumps(head, separators=(',', ':')) + '\n' + json.dumps(snap, separators=(',', ':')))
             os.replace(tmp, path)
             tmp = None
+            # A claim counts once written. A file that vanished (or never got our claim) is simply written again.
+            _CLAIMS[str(path)] = max(mine, _CLAIMS.get(str(path), 0))
         if claim:
             _prune(path.parent, path)
         return True
@@ -838,12 +839,13 @@ def _save_at_exit() -> None:
     _LOADER.atexit_registered = True
     import atexit
     atexit.register(_save_running)
+    _LOADER.atexit_hook = _save_running  # what was registered (tests check it)
 
 
 def _save_running() -> bool:
     """The exit hook: save the running feed's last state (never hanging the exit on a stuck push)."""
     f = getattr(sys.modules.get(_FEED_KEY), 'PROCESS_FEED', None)
-    return f is not None and not f.stopped.is_set() and save_snapshot(f, timeout=5.0)
+    return f is not None and not f.stopped.is_set() and save_snapshot(f, timeout=EXIT_SAVE_TIMEOUT_S)
 
 
 class ChangesBody(BaseModel):

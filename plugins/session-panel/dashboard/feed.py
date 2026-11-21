@@ -148,6 +148,8 @@ class Feed:
             self.failures = {s: dict(f) for s, f in getattr(prev, 'failures', {}).items()}
             self._retry = set(getattr(prev, '_retry', ())) | set(bundles)  # recompute every carried chat next pass
             self._carried = set(bundles)  # ...and vouch for none of them until its new bundle is stored
+            # Restored from another process and not recomputed yet: still re-issued on its recompute.
+            self._reissue = set(getattr(prev, '_reissue', ())) & set(bundles)
             # A carried bundle never outranks a newer computation: sequence numbers continue past every held one.
             top = max((int(b['bundle'].get('computed_seq') or 0) for b in bundles.values()), default=0)
             self._seq = itertools.count(top + 1)
