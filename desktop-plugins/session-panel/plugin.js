@@ -352,9 +352,7 @@ const MODEL_SECTIONS = [
   ['waiting', 'Waiting'], ['ready', 'Ready'], ['done', 'Done']
 ]
 const modelSmall = { fontSize: 12, lineHeight: 1.5, overflowWrap: 'anywhere' }
-// P3b owns the remote courier cutover. Preserve the existing explicit draft (never send) meanwhile.
-const draftOnly = row => row.source === 'card' && !row.request_id
-export const chooseText = (row, option) => `Card ${row.id}: go with ${option.letter ? `option ${option.letter}` : 'this option'} (${option.name}).\n`
+
 export const validModel = model => model?.version === 1 && !!model.header?.counts && Array.isArray(model.header?.pips) &&
   MODEL_SECTIONS.every(([section]) => Array.isArray(model.sections?.[section]))
 
@@ -410,7 +408,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
     style: { ...askLinkBtn, fontSize: 11.5, whiteSpace: 'nowrap', cursor: onAction ? 'pointer' : 'default' }, disabled: !onAction, onClick: () => onAction?.(row, action), children: action.label }, `open${i}`))
   const askRow = row => {
     const status = decisionStatus(row)
-    const enabled = option => !!onChoose && (draftOnly(row) || (!!row.request_id && !!option.choice_id && row.actions.some(a => a.kind === 'decide' && a.owner && a.request_id === row.request_id && a.revision === row.request_revision))) && !status?.locked
+    const enabled = option => !!onChoose && !!row.request_id && !!option.choice_id && row.actions.some(a => a.kind === 'decide' && a.owner && a.request_id === row.request_id && a.revision === row.request_revision) && !status?.locked
     const decision = row.options.length > 0
     return jsxs('article', { 'data-panel-row': row.key, 'data-ask-row': row.source,
       style: { border: '1px solid var(--border)', borderLeft: `3px solid ${SECTION_COLOR.needs_you}`, borderRadius: 8, padding: '10px 12px', marginBottom: 8, minWidth: 0, display: 'grid', gap: 8 }, children: [
@@ -441,7 +439,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
         ] }, option.letter)
       }) }),
       row.only_you && jsx('div', { 'data-ask-only-you': '', style: { ...modelSmall, ...muted }, children: row.only_you }),
-      draftOnly(row) && decision && jsx('div', { style: { ...muted, fontSize: 11 }, children: 'Choosing drafts your answer; send it in the chat to decide.' }),
+      row.source === 'card' && !row.request_id && decision && jsx('div', { role: 'status', style: { ...muted, fontSize: 11 }, children: 'Answer unavailable until the exact owner ask is mirrored. Open the card for details.' }),
       status?.text && jsx('div', { role: 'status', style: { ...modelSmall, color: status.locked ? 'var(--foreground)' : ALERT_TEXT }, children: status.text }),
       status?.locked && onCheck && jsx('button', { type: 'button', style: { ...ghostBtn, justifySelf: 'start', cursor: 'pointer' }, onClick: () => onCheck(row), children: 'Check status' }),
       (row.details?.length > 0 || row.actions.some(a => a.kind === 'open_card')) && jsxs('div', { style: { display: 'flex', alignItems: 'flex-start', gap: 12, minWidth: 0 }, children: [
@@ -550,12 +548,6 @@ export async function modelRequestRoute(action, sourceRoute, call, { delays = MO
 }
 const modelApi = (path, opts) => window.hermesDesktop.api({ path, timeoutMs: 10_000, ...opts })
 export async function chooseModelOption(row, option, sourceRoute, { call = modelApi } = {}) {
-  if (draftOnly(row)) {
-    if (routeKey(panelRoute()) !== routeKey(sourceRoute)) return
-    await host.composer?.setDraft?.(sourceRoute.session, chooseText(row, option))
-    host.composer?.focus?.(sourceRoute.session)
-    return
-  }
   const action = row.actions.find(a => a.kind === 'decide')
   if (!row.request_id || !action?.owner || action.request_id !== row.request_id || action.revision !== row.request_revision || !option.choice_id) throw Error('No canonical decision binding')
   const key = modelDecisionKey(row)

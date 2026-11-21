@@ -225,20 +225,20 @@ test('Open card resolves the supplied owner target rather than the focused conne
  assert.deepEqual(opened, [{ id: 't_example', kind: 'kanban', gatewayId: 'owner-gateway', profile: 'work', board: 'board-a', connectionId: 'owner-connection' }])
  await paint(null)
 })
-test('unmirrored card choices preserve the explicit composer draft until P3b, never POST', async () => {
+test('unmirrored card choices fail closed: no composer draft and no decision POST', async () => {
  const model = structuredClone(publicCases.own_letters.model)
  const row = model.sections.needs_you[0]
  row.request_id = null; row.actions = row.actions.filter(a => a.kind !== 'decide')
  let invoked = 0
  const before = drafts.length
  await paint(m.renderModel(model, { onChoose: () => invoked++ }))
- for (const option of document.querySelectorAll('[data-choice-letter]')) assert.equal(option.disabled, false)
- assert.ok(document.body.textContent.includes('Choosing drafts your answer'))
- await m.chooseModelOption(row, row.options[0], current, { call: async () => { invoked++ } })
+ for (const option of document.querySelectorAll('[data-choice-letter]')) assert.equal(option.disabled, true)
+ assert.ok(document.body.textContent.includes('Answer unavailable until the exact owner ask is mirrored'))
+ await assert.rejects(m.chooseModelOption(row, row.options[0], current, { call: async () => { invoked++ } }), /No canonical decision binding/)
  assert.equal(invoked, 0)
- assert.deepEqual(drafts.slice(before), [[current.session, m.chooseText(row, row.options[0])]])
- await m.chooseModelOption(row, row.options[0], { ...current, session: 'stale-chat' }, { call: async () => { invoked++ } })
- assert.equal(drafts.length, before + 1)
+ assert.deepEqual(drafts.slice(before), [])
+ await assert.rejects(m.chooseModelOption(row, row.options[0], { ...current, session: 'stale-chat' }, { call: async () => { invoked++ } }), /No canonical decision binding/)
+ assert.equal(drafts.length, before)
  row.source = 'question'
  await paint(m.renderModel(model, { onChoose: () => invoked++ }))
  assert.ok([...document.querySelectorAll('[data-choice-letter]')].every(o => o.disabled))
