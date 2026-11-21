@@ -106,3 +106,50 @@ def test_kanban_worker_keeps_foreground_samplers(chat, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_x")
     hooks["pre_llm_call"](session_id="s1", user_message=DECISION, platform="desktop", parent_session_id="")
     assert _block(hooks, PY_SAMPLER) is None
+
+
+# Review (PR 322): `do` on its own line is valid shell, and the loop is just as unbounded. The first form of
+# _LOOP_SLEEP needed `do` on the header line, so these samplers summed to 5 s and both rules let them run.
+NEWLINE_DO = {"for": "for i in $(seq 1 16)\ndo\n  echo sample\n  sleep 5\ndone",
+              "while": "while ps -p 123 >/dev/null\ndo\n  echo sample\n  sleep 5\ndone",
+              "until": "cd x && until curl -sf localhost:8080/health\n\ndo\n  sleep 5\ndone"}
+
+
+class _Clock:
+    t = 1_794_460_000.0
+
+    def __call__(self):
+        return self.t
+
+
+@pytest.mark.parametrize("kind", sorted(NEWLINE_DO))
+def test_newline_before_do_sampler_is_held_before_any_reply(chat, kind):
+    store, hooks = chat
+    hooks["pre_llm_call"](session_id="s1", user_message=DECISION, platform="desktop", parent_session_id="")
+    out = _block(hooks, {"command": NEWLINE_DO[kind], "timeout": 120})
+    assert out and "long_wait_pending_reply" in out["message"], kind
+    rows = [json.loads(x) for x in (store.root / "log.jsonl").read_text().splitlines()]
+    assert [r["secs"] for r in rows if r.get("event") == "agent_block"] == [None]
+
+
+@pytest.mark.parametrize("kind", sorted(NEWLINE_DO))
+def test_newline_before_do_sampler_is_held_after_a_stale_status(chat, monkeypatch, kind):
+    _, hooks = chat
+    clock = _Clock()
+    monkeypatch.setattr(long_wait, "now", clock, raising=False)
+    hooks["pre_llm_call"](session_id="s1", user_message=DECISION, platform="desktop", parent_session_id="")
+    hooks["on_interim_message"](session_id="s1", text="Sampling the dispatcher tick now.")
+    clock.t += 400  # the status line is long stale: live_chat_sleep owns this call
+    out = _block(hooks, {"command": NEWLINE_DO[kind], "timeout": 120})
+    assert out and "live_chat_sleep" in out["message"] and "loop-with-sleep" in out["message"], kind
+
+
+def test_newline_before_do_keeps_prose_and_sleep_after_done_out():
+    for cmd in NEWLINE_DO.values():
+        assert long_wait.terminal_wait({"command": cmd}) == float("inf"), cmd
+    not_loops = ["for c in a b\ndo\n  hermes kanban assign $c\ndone\nsleep 4",
+                 "while read -r l\ndo\n  echo $l\ndone < f.txt; sleep 3",
+                 'git commit -m "notes for later\ndo the rest tomorrow" && sleep 2',
+                 'echo "waiting for CI"\ndo_check; sleep 5']
+    for cmd in not_loops:
+        assert (long_wait.terminal_wait({"command": cmd}) or 0) < 60, cmd

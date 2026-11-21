@@ -132,8 +132,10 @@ LIVE_MESSAGE = ("[coach live_chat_sleep] A person is waiting in this chat and ha
 # A real loop whose body sleeps: a shell `for|while|until ... do ... sleep N ... done` starting a command, or a Python
 # `while|for ...:` line followed by `sleep(N)`. The bare word "for" in prose (`--reason "... for rows 4-6"; sleep 2`)
 # or a sleep after `done` is no loop: replaying 3 days of hub desktop commands, the looser form flagged 41 such calls.
+# `do` may sit on the header line or open a later line (`for i in $(seq 1 16)\ndo\n  sleep 5\ndone`, PR 322 review).
 _LOOP_SLEEP = re.compile(
-    r"(?:^|[;&|({'\"]|\bdo\b|\bthen\b)\s*(?:for|while|until)\b[^\n]*?\bdo\b(?:(?!\bdone\b)[\s\S])*?\bsleep\s+\d"
+    r"(?:^|[;&|({'\"]|\bdo\b|\bthen\b)\s*(?:for|while|until)\b[^\n]*?(?:\bdo|\n\s*do)\b"
+    r"(?:(?!\bdone\b)[\s\S])*?\bsleep\s+\d"
     r"|^[ \t]*(?:while|for)\b[^\n]*:[ \t]*$[\s\S]*?\bsleep\s*\(\s*\d", re.M)
 
 
