@@ -37,7 +37,7 @@ import { useEffect, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'session-panel'
-const VERSION = 'session-panel-v13-wait-chains'
+const VERSION = 'session-panel-v14-person-waits'
 export const STUCK_CARD_S = 2 * 3600 // running card with no event this long
 export const STUCK_SUB_MS = 30 * 60_000 // sub-agent with no new tool call this long
 const DONE_POLL_MS = 30_000
@@ -1938,7 +1938,21 @@ function flushTrace(sink) {
 }
 export const resetTraceForTests = () => { if (trace) clearTimeout(trace.timer); trace = null }
 
+/** Full structured request renders independently of transient outcomes and watch cards. */
+export function PersonWaitRows({ records }) {
+  return jsx('div', { 'data-person-waits': '', children: records.map(r => {
+    let href = null
+    try { const url = new URL(r.thread); if (url.protocol === 'https:' || url.protocol === 'http:') href = url.href } catch {}
+    return jsxs('div', { 'data-person-wait': r.id, style: { padding: '4px 12px', color: 'var(--foreground)', overflowWrap: 'anywhere' }, children: [
+      r.state === 'verifying' ? 'Verifying reply from ' : 'Waiting on ',
+      href ? jsx('a', { href, target: '_blank', rel: 'noopener noreferrer', children: r.contact }) : r.contact,
+      ` · ${r.response} · Next: ${r.next_step}`
+    ] }, `${r.session || ''}:${r.id}`)
+  }) })
+}
+
 export function Panel() {
+  const [personState, setPeople] = useState({ scope: null, records: [] })
   const [tasks, setTasks] = useState(() => (typeof window !== 'undefined' ? window.__sessionTasks?.snapshot : null) || null)
   const [doneState, setDone] = useState(done)
   const [, setTick] = useState(0)
@@ -1963,6 +1977,23 @@ export function Panel() {
   useValue(host.state.profile || host.state.connectionId)
   const route = panelRoute(), scope = routeKey(route)
   const US = typeof window !== 'undefined' ? window.__userSteps : null
+  useEffect(() => {
+    let cancelled = false, pending = false
+    const refresh = async () => {
+      if (pending || !route.session || !route.connectionId || !window.hermesDesktop?.api) return
+      pending = true
+      try {
+        const ids = await window.__sessionTasks?.lineageIds?.(route.session, route.connectionId, route.profile) || [route.session]
+        if (ids?.incomplete && !ids?.unstored) return
+        const result = await window.hermesDesktop.api({ path: `/api/plugins/session-outcome/person-waits?ids=${encodeURIComponent([...ids].join(','))}`, connectionId: route.connectionId, profile: route.profile, timeoutMs: 15_000 })
+        if (!cancelled && Array.isArray(result?.records)) setPeople({ scope, records: result.records })
+      } catch { /* Keep last known dependencies on a read failure; never imply closure. */ }
+      finally { pending = false }
+    }
+    void refresh()
+    const timer = setInterval(refresh, 8000)
+    return () => { cancelled = true; clearInterval(timer) }
+  }, [scope])
   useEffect(() => {
     const st = window.__sessionTasks
     const offTasks = typeof st?.subscribe === 'function' ? st.subscribe(setTasks) : null
@@ -2029,7 +2060,8 @@ export function Panel() {
   const legacy = US?.Strip ? jsx(US.Strip, { hideCards: sorted.unasked.map(i => i.chip) }, 'legacy') : null
   // Keep finished history reachable even after the final open card closes.
   const fresh = !!(snap?.fresh && asOf === now)
-  if (!finished?.length && !US?.hasQueuePresentation?.() && !hasOpenWork(sorted, { asks, steps: US?.snapshot?.ledger?.steps, issues: US?.snapshot?.issues })) {
+  const people = personState.scope === scope ? personState.records : []
+  if (!people.length && !finished?.length && !US?.hasQueuePresentation?.() && !hasOpenWork(sorted, { asks, steps: US?.snapshot?.ledger?.steps, issues: US?.snapshot?.issues })) {
     tracePanel(route, `hidden${fresh ? ' fresh' : ''} chips${chips.length}`)
     return null
   }
@@ -2076,6 +2108,7 @@ export function Panel() {
   const trigger = 'status-section-trigger flex min-w-0 flex-1 items-center gap-1.5 px-2 py-1 text-left text-xs font-normal text-muted-foreground/92 transition-colors hover:text-foreground/90'
   return jsxs('section', { 'data-session-panel': '', 'data-slot': 'status-section', 'aria-label': 'Session status', style: { width: '100%', minWidth: 0, boxSizing: 'border-box', paddingBottom: collapsed ? 2 : 6, borderBottom: '1px solid color-mix(in srgb, var(--border) 60%, transparent)', color: 'var(--foreground)', userSelect: 'text', WebkitUserSelect: 'text' }, children: [
     jsx('style', { 'data-wait-css': '', children: WAIT_CSS }, 'wait-css'),
+    people.length > 0 && jsx(PersonWaitRows, { records: people }),
     jsx('div', { className: 'status-section-header flex items-center gap-1 pr-1', children: jsxs('button', { type: 'button', 'data-panel-toggle': '', className: trigger, 'aria-expanded': !collapsed, 'aria-label': collapsed ? 'Expand session status' : 'Collapse session status', title: collapsed ? 'Expand' : 'Collapse (reopens when something new needs you or gets stuck)', onClick: toggle, style: { background: 'transparent', border: 0, cursor: 'pointer', minWidth: 0 }, children: [
       jsx(DisclosureCaret, { className: 'shrink-0', open: !collapsed, size: '1em' }),
       jsx('span', { className: 'status-section-icon flex shrink-0 items-center', children: jsx(Codicon, { className: 'text-muted-foreground/70', name: 'pulse', size: '0.8rem' }) }),

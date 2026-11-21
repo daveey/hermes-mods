@@ -31,6 +31,47 @@ after(async () => {
   dom.window.close()
 })
 
+test('person dependency is linked and visible even without card work or with panel collapsed', async () => {
+  host.state.focusedStoredSessionId.value = 'person-chat'
+  window.localStorage.setItem('hermes.sessionPanel.collapsed.v1', '[]')
+  window.__userSteps = { openAskCount: () => 0 }
+  window.__sessionTasks = { snapshot: { stored: 'person-chat', chips: [] }, lineageIds: async s => new Set([s]) }
+  const record = { id: 'person:example', session: 'person-chat', state: 'waiting', contact: 'Slack @Eve',
+    thread: 'https://example.com/thread/123', response: 'deploy example', next_step: 'verify example staging' }
+  const paths = []
+  window.hermesDesktop = { api: async args => {
+    paths.push(args)
+    return args.path.includes('/person-waits?') ? { records: [record] } : { includes: ['done'], tasks: [] }
+  } }
+  await show(J.jsx(m.Panel, {}))
+  await React.act(async () => { await flush() })
+  const link = el().querySelector('[data-person-wait] a')
+  assert.ok(link, 'actual person link must render')
+  assert.equal(link.href, record.thread)
+  assert.equal(link.textContent, 'Slack @Eve')
+  assert.match(el().textContent, /Waiting on Slack @Eve/)
+  assert.match(el().textContent, /verify example staging/)
+  assert.ok(paths.some(p => p.path.includes('/api/plugins/session-outcome/person-waits?') && p.connectionId === 'C1' && p.profile === 'default'))
+  host.state.focusedStoredSessionId.value = 'other-chat'
+  window.__sessionTasks.snapshot.stored = 'other-chat'
+  window.hermesDesktop.api = async () => ({ includes: ['done'], tasks: [], records: [] })
+  await show(J.jsx(m.Panel, {}))
+  assert.ok(el().querySelector('[data-person-wait]') === null, 'other chat cannot inherit a wait')
+  host.state.focusedStoredSessionId.value = 'S1'
+})
+
+test('person reply renders verification rather than completion and unsafe links are inert', async () => {
+  const record = { id: 'person:example', state: 'verifying', contact: 'Slack @Eve',
+    thread: 'https://example.com/reply', response: 'deploy example', next_step: 'verify staging' }
+  await show(J.jsx(m.PersonWaitRows, { records: [record] }))
+  assert.match(el().textContent, /Verifying reply from Slack @Eve/)
+  assert.equal(el().querySelector('a').href, record.thread)
+  await show(J.jsx(m.PersonWaitRows, { records: [{ ...record, thread: 'javascript:alert(1)' }] }))
+  assert.ok(el().querySelector('a') === null)
+  await show(J.jsx(m.PersonWaitRows, { records: [] }))
+  assert.ok(el().querySelector('[data-person-wait]') === null)
+})
+
 test('finished disclosure combines done and archived and remembers expansion only per chat', async () => {
   window.localStorage.clear()
   m.resetDoneCacheForTests()
@@ -280,8 +321,9 @@ test('panel: status line, progress bar, needs you, stuck with steps, in progress
   ], cards: [{ id: 't_d1', status: 'done', title: 'Shipped A', activity_at: s - 600 }, { id: 't_d2', status: 'done', title: 'Shipped B', activity_at: s - 60 }, { id: 't_run', status: 'running' }] })
   await show(React.createElement(m.Panel, { key: 'full' }))
   await React.act(async () => { await m.refreshDone(); await flush() })
-  assert.equal(b.calls[0].path, '/api/plugins/user-steps/session-cards?ids=S1%2CS0')
-  assert.deepEqual([b.calls[0].connectionId, b.calls[0].profile], ['C1', 'default'])
+  const cardCall = b.calls.find(c => c.path.startsWith('/api/plugins/user-steps/session-cards?'))
+  assert.equal(cardCall.path, '/api/plugins/user-steps/session-cards?ids=S1%2CS0')
+  assert.deepEqual([cardCall.connectionId, cardCall.profile], ['C1', 'default'])
   assert.equal(el().querySelector('[data-session-status]').textContent, 'Idle · last activity 2 min ago')
   assert.deepEqual(el().querySelector('[data-status-summary]').textContent.split(' · '), ['1 needs you', '1 stuck', '1 running', '1 not started', '2 done'])
   // one box per counted item, in the header, no full-width bar

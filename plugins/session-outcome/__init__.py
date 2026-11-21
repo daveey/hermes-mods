@@ -38,6 +38,7 @@ import contextvars
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
 
 log = logging.getLogger("session-outcome")
 
@@ -52,9 +53,8 @@ INTERACTIVE = frozenset({"desktop", "local", "tui", "cli", "gui", "acp"})
 BACKGROUND = frozenset({"kanban", "cron", "oneshot", "subagent", "tool"})
 WAIT_KINDS = ("card", "process", "cron", "time", "capacity", "subagent", "person")
 # A ``person`` wait (an external human's reply is a prerequisite: "[Slack @Eve] answers X") is not a card, so a
-# watch=true park never stands for it. Core's outcome store only knows its own wait kinds and keeps just
-# kind/id/label/state/eta, so the structured fields are carried in the id (``person:<channel>:<contact>[:<thread>]``)
-# and the label, sent as core's existing ``goal`` kind. Lifecycle (the ``state``): waiting -> verifying (the reply
+# watch=true park never stands for it. Structured records live in person_waits.py;
+# core receives only its supported goal projection. Lifecycle (the ``state``): waiting -> verifying (the reply
 # arrived; check it) -> closed by a ``done`` that cites it in ``closes_person_waits`` with evidence.
 PERSON_PREFIX = "person:"
 PERSON_CORE_KIND = "goal"
@@ -83,7 +83,7 @@ NUDGE = (f"{TAG} Before this reply goes out, record how this chat ends with ONE 
          '{"kind": "decide", "items": [{"question": "...", "choices": [{"label": "...", "value": "..."}, ...]}]} '
          'if the user must choose (at least 2 choices each); '
          '{"kind": "wait", "on": [{"kind": "card|process|cron|time|capacity|subagent", "id": "...", "label": "..."}]} '
-         "if it waits on named work; a named person's reply is a wait on {\"kind\": \"person\", \"contact\", \"channel\", \"thread\", \"response\", \"next_step\"} "
+         "if it waits on named work; a named person's reply is a wait on {\"kind\": \"person\", \"request_id\", \"contact\", \"channel\", \"thread\": \"https permalink\", \"response\", \"next_step\"} "
          "(never hide it behind a watch). Then send the same full reply again (the user has not seen it). "
          "If none fits, just send that full reply.")
 # Safety net for the hold above: a held draft is hidden from the user but stays in the model's context, and a model
@@ -214,7 +214,10 @@ SCHEMA = {
         "scope.sourceRefs (it upgrades that tile in place); never publish a second ask for it. "
         '{"kind": "wait", "on": [{"kind": "card|process|cron|time|capacity|subagent", "id": "...", '
         '"label": "...", "eta": <unix seconds>}]} when the chat waits on named work. '
-        "The sidebar shows this outcome; without it the chat may show as unresolved."),
+        "A person wait needs kind=person, request_id (stable unique request ref), contact, channel, thread (HTTP(S) permalink), response and next_step. "
+        "Record reply arrival with the same request_id and scope, state=verifying and evidence. It remains waiting until done + "
+        "closes_person_waits [{id, verified:true, evidence:<successful follow-up verification receipt>}] (or cancelled:true with evidence). "
+        "A watch cannot hide a person dependency. The sidebar shows this outcome; without it the chat may show as unresolved."),
     "parameters": {
         "type": "object", "additionalProperties": False, "required": ["kind"],
         "properties": {
@@ -261,21 +264,23 @@ SCHEMA = {
                                                    "item is refused: pick the default yourself and proceed.")},
                                                "card_id": {"type": "string"}}}},
             "on": {"type": "array", "minItems": 1, "description": "wait: what the chat waits on.",
-                   "items": {"type": "object", "required": ["kind", "id"],
+                   "items": {"type": "object", "required": ["kind"],
                              "properties": {"kind": {"type": "string", "enum": list(WAIT_KINDS)},
-                                            "id": {"type": "string", "description": "Not needed for kind person (derived)."},
+                                            "id": {"type": "string", "description": "Required for non-person waits; person ID is derived."},
+                                            "request_id": {"type": "string", "description": "person: stable unique request/message reference; required even for two requests in one thread."},
                                             "label": {"type": "string"},
                                             "state": {"type": "string", "description": "person: waiting (default) or verifying (their reply arrived; check it)."},
                                             "eta": {"type": "number"},
                                             "contact": {"type": "string", "description": "person: who must answer, as a structured handle/name (e.g. the Slack user), never parsed from prose."},
                                             "channel": {"type": "string", "description": "person: where they answer (slack, email, ...)."},
-                                            "thread": {"type": "string", "description": "person: thread/channel/permalink the reply lands in."},
+                                            "thread": {"type": "string", "description": "person: HTTP(S) permalink to the request/thread (required, renders as a link)."},
                                             "response": {"type": "string", "description": "person: the response this chat needs from them."},
                                             "next_step": {"type": "string", "description": "person: what happens when it arrives (or the next follow-up)."},
                                             "evidence": {"type": "string", "description": "person state verifying: where their reply was seen."}}}},
             "closes_person_waits": {"type": "array", "minItems": 1, "description": "done: person waits now finished. Each must be in state verifying (their reply was seen and checked) unless cancelled.",
                                     "items": {"type": "object", "additionalProperties": False, "required": ["id", "evidence"],
                                               "properties": {"id": {"type": "string"}, "evidence": {"type": "string"},
+                                                             "verified": {"type": "boolean", "description": "True only after follow-up verification passed; evidence is its receipt."},
                                                              "cancelled": {"type": "boolean", "description": "True when the dependency is dropped (say who dropped it in evidence)."}}}},
         },
     },
@@ -353,16 +358,33 @@ def _text(value: Any) -> str:
     return " ".join(str(value).split()) if isinstance(value, str) else ""
 
 
-def person_wait_id(channel: str, contact: str, thread: str = "") -> str:
-    return PERSON_PREFIX + ":".join(p for p in (channel, contact, thread) if p)
+def _people():
+    return _load_sibling('session_outcome_people', 'session-outcome/person_waits.py')
+
+
+def person_wait_id(channel: str, contact: str, thread: str = "", request_id: str = "") -> str:
+    # Opaque hash avoids delimiter collisions; two requests in one thread remain distinct.
+    key = json.dumps(request_id, ensure_ascii=False)
+    return PERSON_PREFIX + hashlib.sha256(key.encode()).hexdigest()
+
+
+_PERSON_EDIT: ContextVar = ContextVar('person_edit', default=None)
+
+
+def _person_records(session_id):
+    active = _PERSON_EDIT.get()
+    return active[1] if active and active[0] == session_id else _people().read(session_id)
 
 
 def _validate_person(i: int, w: dict) -> dict:
-    """A person wait in the form core's store keeps (kind goal, id carries channel/contact/thread, label the rest)."""
-    fields = {k: _text(w.get(k)) for k in ("contact", "channel", "thread", "response", "next_step", "evidence")}
-    missing = [k for k in ("contact", "channel", "response", "next_step") if not fields[k]]
+    """Full canonical fields plus a bounded, core-compatible goal projection."""
+    fields = {k: _text(w.get(k)) for k in ("contact", "channel", "thread", "request_id", "response", "next_step", "evidence")}
+    missing = [k for k in ("contact", "channel", "thread", "request_id", "response", "next_step") if not fields[k]]
     if missing:
         raise ValueError(f"on[{i}] person wait needs {', '.join(missing)} (who, where, the response needed, the next step)")
+    link = urlsplit(fields['thread'])
+    if link.scheme not in ('http', 'https') or not link.netloc or link.username or link.password:
+        raise ValueError(f'on[{i}] person thread needs an HTTP(S) permalink without credentials')
     state = _text(w.get("state")) or "waiting"
     if state not in PERSON_STATES:
         raise ValueError(f"on[{i}] person state must be one of {', '.join(PERSON_STATES)}")
@@ -374,8 +396,8 @@ def _validate_person(i: int, w: dict) -> dict:
     else:
         label = (f"Verifying {fields['contact']}'s reply ({where}; seen: {fields['evidence']}): "
                  f"{fields['response']}. Next: {fields['next_step']}")
-    entry = {"kind": PERSON_CORE_KIND, "id": person_wait_id(fields["channel"], fields["contact"], fields["thread"]),
-             "label": label[:600], "state": state}
+    entry = {"kind": PERSON_CORE_KIND, "id": person_wait_id(fields["channel"], fields["contact"], fields["thread"], fields["request_id"]),
+             "label": label[:600], "state": state, "_person": {**fields, "state": state}}
     if isinstance(w.get("eta"), (int, float)) and not isinstance(w.get("eta"), bool):
         entry["eta"] = float(w["eta"])
     return entry
@@ -413,7 +435,7 @@ def _validate(args: dict) -> dict:
                 if not isinstance(c, dict) or not _text(c.get("id")) or not _text(c.get("evidence")):
                     raise ValueError(f"closes_person_waits[{i}] needs id and evidence")
                 norm.append({"id": _text(c["id"]), "evidence": _text(c["evidence"]),
-                             "cancelled": c.get("cancelled") is True})
+                             "cancelled": c.get("cancelled") is True, "verified": c.get("verified") is True})
             out_done["_closes"] = norm  # consumed by handle(); never sent to core
         return out_done
     if kind == "decide":
@@ -532,41 +554,49 @@ def _open_linked_cards(session_id: str) -> list[dict]:
 
 
 def _open_person_waits(session_id: str) -> list[dict]:
-    """Person waits in the chat's stored outcome. A watch park never covers them: a passive check needs nothing from
-    anyone, a named person's reply is a prerequisite. Fails open when the store is unreadable."""
-    try:
-        stored = _outcome_api().get_outcome(session_id)
-    except Exception:
-        log.debug("session-outcome: person-wait probe failed; allowing done", exc_info=True)
-        return []
-    if not isinstance(stored, dict) or stored.get("kind") != "waiting":
-        return []
-    return [w for w in stored.get("on") or []
-            if isinstance(w, dict) and str(w.get("id", "")).startswith(PERSON_PREFIX)]
+    """Durable records, never the transient core declaration. Read errors fail closed."""
+    return [r for r in _person_records(session_id) if r['state'] in PERSON_STATES]
 
 
 def _person_close_refusal(session_id: str, closes: list[dict]) -> Optional[str]:
     open_waits = _open_person_waits(session_id)
-    if not open_waits:
-        return None
     by_id = {c["id"]: c for c in closes}
-    problems = []
+    known = {r['id'] for r in open_waits}
+    problems = [f"{wid} is not an open person request" for wid in by_id if wid not in known]
     for w in open_waits:
         c = by_id.get(w["id"])
         if c is None:
-            problems.append(f"{w['id']} is still open ({w.get('label', '')})")
+            problems.append(f"{w['id']} is still open ({w['contact']}: {w['response']})")
         elif w.get("state") != "verifying" and not c["cancelled"]:
             problems.append(f"{w['id']} has no reply yet (state {w.get('state', 'waiting')}): declare the wait with "
                             "state verifying and evidence once their reply is seen, or cancel it")
+        elif not c['cancelled'] and not c['verified']:
+            problems.append(f"{w['id']} requires verified=true and successful verification evidence")
     if not problems:
         return None
     return ("done refused: this chat waits on a named person; a watch park does not cover that. "
             + "; ".join(problems) + ". Keep it visible with "
-            '{"kind": "wait", "on": [{"kind": "person", "contact", "channel", "thread", "response", "next_step"}]}, '
-            "or close it with done + closes_person_waits [{id, evidence}] after verifying their reply.")
+            '{"kind": "wait", "on": [{"kind": "person", "request_id", "contact", "channel", "thread", "response", "next_step"}]}, '
+            "or close it with done + closes_person_waits [{id, verified:true, evidence}] after verifying their reply.")
 
 
-def handle(args: dict, session_id: str = "", tool_call_id: str = "", **_: Any) -> str:
+def handle(args: dict, session_id: str = "", tool_call_id: str = "", **kwargs: Any) -> str:
+    if not session_id:
+        return _err('no session')
+    if not _interactive(session_id=session_id):
+        return _err('session_outcome is only for desktop, tui, cli, gui and acp chats')
+    try:
+        with _people().edit(session_id) as records:
+            token = _PERSON_EDIT.set((session_id, records))
+            try:
+                return _handle(args, session_id=session_id, tool_call_id=tool_call_id, **kwargs)
+            finally:
+                _PERSON_EDIT.reset(token)
+    except Exception as exc:
+        return _err(f'person dependency ledger unavailable; nothing closed: {exc}')
+
+
+def _handle(args: dict, session_id: str = "", tool_call_id: str = "", **_: Any) -> str:
     try:
         if not session_id:
             return _err("no session")
@@ -597,7 +627,34 @@ def handle(args: dict, session_id: str = "", tool_call_id: str = "", **_: Any) -
         if spec["kind"] == "done":
             outcome = dict(spec)
         elif spec["kind"] == "wait":
-            outcome = {"kind": "waiting", "on": spec["on"]}
+            records = _person_records(session_id)
+            # Validate the entire update before mutation. A request's scope cannot change
+            # under its stable identity and a closed request cannot silently reopen.
+            updates = []
+            for w in spec['on']:
+                if '_person' not in w:
+                    continue
+                data = w['_person']
+                previous = next((r for r in records if r['id'] == w['id']), None)
+                if previous and (previous['state'] not in PERSON_STATES or any(
+                        previous[k] != data[k] for k in ('contact', 'channel', 'thread', 'request_id', 'response', 'next_step'))):
+                    return _err('person request identity is closed or scope changed; use a new request_id')
+                if previous and previous['state'] == 'verifying' and data['state'] == 'waiting':
+                    return _err('a received reply cannot revert to waiting')
+                record = {**(previous or {}), **data, 'id': w['id'],
+                          'created_at': previous['created_at'] if previous else time.time(), 'updated_at': time.time()}
+                if data['state'] == 'verifying':
+                    record['reply_receipt'] = {'ref': data['evidence'], 'observed_at': time.time()}
+                updates.append(record)
+            if updates:
+                by_id = {r['id']: r for r in records}
+                by_id.update({r['id']: r for r in updates})
+                records[:] = list(by_id.values())
+                # Persist BEFORE declaring: even a core rejection/crash must not lose
+                # a request already sent. No dependency is closed on failure.
+                _people().save(session_id, records)
+                result['person_waits'] = updates
+            outcome = {"kind": "waiting", "on": [{k: v for k, v in w.items() if k != '_person'} for w in spec["on"]]}
         else:
             # Every item was validated above, before any write. Writes are all or nothing: a failed write or a
             # rejected declaration removes the steps this call added.
@@ -642,7 +699,18 @@ def handle(args: dict, session_id: str = "", tool_call_id: str = "", **_: Any) -
             us = _user_steps() if added else None
             if us is not None:
                 _rollback_steps(us, session_id, added)
-            return _err(f"outcome rejected (nothing kept): {exc}")
+            detail = 'durable person requests retained; nothing closed' if result.get('person_waits') else 'nothing kept'
+            return _err(f"outcome rejected ({detail}): {exc}")
+        if closes:
+            records = _person_records(session_id)
+            by_id = {c['id']: c for c in closes}
+            for r in records:
+                if r['id'] in by_id:
+                    c = by_id[r['id']]
+                    r.update(state='cancelled' if c['cancelled'] else 'closed', closed_at=time.time(),
+                             closure_receipt={'ref': c['evidence'], 'verified': c['verified'],
+                                              'cancelled': c['cancelled'], 'observed_at': time.time()})
+            _people().save(session_id, records)
         _note_call(session_id, _current_tool_call_id(tool_call_id))
         result.update(declared=True, outcome=outcome)
         if spec["kind"] == "decide" and made_steps:
@@ -803,6 +871,19 @@ def provider(session_id: str) -> Optional[dict]:
         choices = s.get("choices") or [{"label": o, "value": o} for o in s.get("options") or []]
         items.append({"id": s["id"], "question": s.get("text", ""), "choices": choices, "state": "open"})
     return {"decision_items": items, "waiting_on": []}
+
+
+def person_provider(session_id: str) -> Optional[dict]:
+    if not session_id:
+        return None
+    try:
+        records = _open_person_waits(session_id)
+        return {'decision_items': [], 'waiting_on': [_people().projection(r) for r in records]}
+    except Exception:
+        log.exception('session-outcome: person ledger unreadable')
+        # Core skips a raising provider: represent unknown as a wait, never green.
+        return {'waiting_on': [{'kind': 'goal', 'id': 'person:ledger-unreadable',
+                                'label': 'Person dependencies unreadable; check ledger before closing'}]}
 
 
 # ---- judge: is the last assistant message a closing summary? ----------------------------------------------
@@ -1201,6 +1282,7 @@ def register(ctx) -> None:
         return
     try:
         api.register_outcome_provider("user-steps", provider)
+        api.register_outcome_provider("person-dependencies", person_provider)
         api.register_outcome_judge(judge)
     except Exception:
         log.exception("session-outcome: registering provider/judge failed")

@@ -363,12 +363,119 @@ def test_person_wait_survives_real_core_store_and_blocks_done(real, tmp_path):
     finally:
         db.close()
     out = _json.loads(plugin.handle({"kind": "wait", "on": [{
-        "kind": "person", "contact": "Slack @Eve", "channel": "slack", "thread": "C0EXAMPLE/1.1",
-        "response": "confirm the key", "next_step": "run staging checks"}]}, session_id=sid))
+        "kind": "person", "contact": "Slack @Eve", "channel": "slack", "thread": "https://example.com/C0EXAMPLE/1.1",
+        "request_id": "key-request", "response": "confirm the key", "next_step": "run staging checks"}]}, session_id=sid))
     assert out["ok"] and out["declared"], out
     stored = so.get_outcome(sid)
     item = stored["on"][0]
-    assert stored["kind"] == "waiting" and item["id"].startswith("person:slack:Slack @Eve")
+    assert stored["kind"] == "waiting" and item["id"].startswith("person:")
     assert "confirm the key" in item["label"] and item["state"] == "waiting"
     refused = _json.loads(plugin.handle({"kind": "done", "summary": "parked a watch"}, session_id=sid))
     assert not refused["ok"] and "named person" in refused["error"]
+
+
+@pytest.mark.parametrize('new_kind', ['user', 'kanban_notice'])
+def test_durable_person_lifecycle_through_refresh_and_new_messages(real, tmp_path, monkeypatch, new_kind):
+    import json
+    from hermes_state import SessionDB
+    so, plugin = real
+    monkeypatch.setattr(so, '_live_turn', lambda *a: False)
+    monkeypatch.setattr(plugin, '_open_linked_cards', lambda *a: [])
+    plugin._llm = lambda *a: 'YES'
+    person = {'kind': 'person', 'contact': 'Slack @Eve', 'channel': 'slack',
+              'thread': 'https://example.com/thread/123', 'request_id': 'request-123',
+              'response': 'rotate the example key', 'next_step': 'verify example staging'}
+    def invoke(args):
+        return json.loads(plugin.handle(args, session_id='chat'))
+    sent = invoke({'kind': 'wait', 'on': [person]})
+    assert sent['ok'], sent
+    wid = sent['outcome']['on'][0]['id']
+    db = SessionDB(db_path=tmp_path / 'state.db')
+    try:
+        db.append_message('chat', role='assistant', content=SUMMARY)
+        assert so.refresh_outcome('chat', trigger='manual', db=db)['kind'] == 'waiting'
+        db.append_message('chat', role='user', content='Check the example again',
+                          **({'display_kind': new_kind} if new_kind != 'user' else {}))
+        # Core may show running/interrupted while answering the new input, but cannot
+        # permit done or discard the independent durable dependency.
+        out = so.refresh_outcome('chat', trigger='manual', db=db)
+        assert out['kind'] != 'done'
+        assert not invoke({'kind': 'done', 'summary': 'watch parked'})['ok']
+        assert plugin._open_person_waits('chat')[0]['id'] == wid
+        db.append_message('chat', role='assistant', content=SUMMARY)
+        assert so.refresh_outcome('chat', trigger='manual', db=db)['on'][0]['id'] == wid
+        with monkeypatch.context() as live:
+            live.setattr(so, '_live_turn', lambda *a: True)
+            assert so.refresh_outcome('chat', trigger='manual', db=db)['kind'] == 'running'
+            assert not invoke({'kind': 'done', 'summary': 'still waiting'})['ok']
+        assert invoke({'kind': 'wait', 'on': [{'kind': 'time', 'id': 'later'}]})['ok']
+        assert so.refresh_outcome('chat', trigger='manual', db=db)['on'][0]['id'] == wid
+        assert invoke({'kind': 'wait', 'on': [{**person, 'state': 'verifying', 'evidence': 'https://example.com/reply/456'}]})['ok']
+        checking = so.refresh_outcome('chat', trigger='manual', db=db)
+        assert checking['kind'] == 'waiting' and checking['on'][0]['state'] == 'verifying'
+        assert not invoke({'kind': 'done', 'summary': 'reply arrived'})['ok']
+        assert invoke({'kind': 'done', 'summary': SUMMARY, 'closes_person_waits': [
+            {'id': wid, 'verified': True, 'evidence': 'https://example.com/check/green'}]})['ok']
+        assert so.refresh_outcome('chat', trigger='manual', db=db)['kind'] == 'done'
+        assert plugin._people().read('chat')[0]['closure_receipt']['verified'] is True
+    finally:
+        db.close()
+
+
+def test_real_core_passive_watch_is_green_without_person_dependency(real, monkeypatch):
+    import json
+    from hermes_state import SessionDB
+    so, plugin = real
+    monkeypatch.setattr(so, '_live_turn', lambda *a: False)
+    monkeypatch.setattr(plugin, '_open_linked_cards', lambda *a: [])
+    monkeypatch.setattr(so, '_watch_items', lambda *a: [{'kind': 'card', 'id': 'watch-example'}])
+    assert json.loads(plugin.handle({'kind': 'done', 'summary': SUMMARY}, session_id='chat'))['ok']
+    with SessionDB() as db:
+        db.append_message('chat', role='assistant', content=SUMMARY)
+    out = so.refresh_outcome('chat', trigger='manual')
+    assert out['kind'] == 'done' and out['watches'][0]['id'] == 'watch-example'
+
+
+def test_compression_and_mounted_person_api_keep_same_request(real, monkeypatch):
+    import json
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from hermes_state import SessionDB
+    so, plugin = real
+    monkeypatch.setattr(plugin, '_open_linked_cards', lambda *a: [])
+    person = {'kind': 'person', 'contact': 'Slack @Eve', 'channel': 'slack',
+              'thread': 'https://example.com/thread/123', 'request_id': 'request-123',
+              'response': 'deploy example', 'next_step': 'verify example'}
+    assert json.loads(plugin.handle({'kind': 'wait', 'on': [person]}, session_id='chat'))['ok']
+    wid = plugin._open_person_waits('chat')[0]['id']
+    with SessionDB() as db:
+        db.end_session('chat', end_reason='compressed')
+        db.create_session('tip', source='desktop', parent_session_id='chat')
+        db.append_message('tip', role='user', content='Check example')
+        db.append_message('tip', role='assistant', content=SUMMARY)
+    assert plugin.person_provider('tip')['waiting_on'][0]['id'] == wid
+    assert not json.loads(plugin.handle({'kind': 'done', 'summary': SUMMARY}, session_id='tip'))['ok']
+    spec = importlib.util.spec_from_file_location('person_api_test', ROOT / 'dashboard/plugin_api.py')
+    assert spec and spec.loader
+    api = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(api)
+    app = FastAPI()
+    app.include_router(api.create_router(), prefix='/api/plugins/session-outcome')
+    with TestClient(app) as client:
+        response = client.get('/api/plugins/session-outcome/person-waits', params={'ids': 'chat,tip'})
+        assert response.status_code == 200
+        assert len(response.json()['records']) == 1
+        assert response.json()['records'][0]['thread'] == person['thread']
+        import subprocess
+        from node_pick import find_node
+        rendered = subprocess.run([find_node(), str(Path(__file__).with_name('validate_person_views.mjs'))],
+                                  input=json.dumps(response.json()['records']), capture_output=True, text=True, timeout=30)
+        assert rendered.returncode == 0, rendered.stdout + rendered.stderr
+        assert json.loads(rendered.stdout) == {'validated': 1}
+        assert client.get('/api/plugins/session-outcome/person-waits', params={'ids': ','.join(str(n) for n in range(33))}).status_code == 400
+        update = {**person, 'state': 'verifying', 'evidence': 'https://example.com/reply'}
+        assert json.loads(plugin.handle({'kind': 'wait', 'on': [update]}, session_id='tip'))['ok']
+        assert json.loads(plugin.handle({'kind': 'done', 'summary': SUMMARY, 'closes_person_waits': [
+            {'id': wid, 'verified': True, 'evidence': 'https://example.com/tests/green'}]}, session_id='tip'))['ok']
+        assert client.get('/api/plugins/session-outcome/person-waits', params={'ids': 'chat,tip'}).json() == {'records': []}
+        assert plugin._people().read('chat')[0]['state'] == 'closed'

@@ -4,6 +4,48 @@ Every non-archived chat should have exactly one stored outcome, and the sidebar 
 idleness. Core owns the storage and the derivation (`hermes_state_outcome`). This plugin lets the agent declare
 the outcome and feeds core the two things only plugins know: open user decisions and a summary judge.
 
+## Named-person dependencies versus passive watches
+
+A passive background watch with no action owed by anyone stays done (green eye).
+A required reply, deployment or access grant from a named person is different:
+
+```json
+{"kind":"wait","on":[{"kind":"person","request_id":"example-request-123","contact":"Slack @Eve","channel":"slack","thread":"https://example.com/thread/123","response":"deploy the example build","next_step":"verify example staging"}]}
+```
+
+Use a stable unique `request_id` per request, including two requests in the same
+thread, and an HTTP(S) thread/request permalink. The returned `person_waits[].id`
+identifies the durable record. Full structured fields and receipts live under the
+profile's `session-outcome/people/`, keyed by compression root, independently of
+core's transient outcome. Other wait/decide declarations, notices, new messages
+and live-turn wrappers cannot close it. The provider projects open records into
+core's supported `goal` wait kind. No arbitrary Slack prose is inferred.
+
+On reply arrival, repeat the same scope/request with `state: "verifying"` and
+`evidence` identifying the reply. This is **not completion**. After the requested
+follow-up verification passes, declare done with
+`closes_person_waits: [{"id":"<returned id>","verified":true,"evidence":"<successful verification receipt>"}]`.
+An explicit cancellation instead uses `cancelled:true` with evidence naming who
+dropped the dependency. Unknown IDs, unverified replies and changed request scopes
+are refused; closure receipts remain in history. Requests persist before the core
+declaration, so core rejection may return an error while retaining a request; it
+never closes one. Ledger read errors fail closed.
+
+The existing Session Panel reads `/api/plugins/session-outcome/person-waits` via
+the focused connection/profile, and keeps person rows visible even when folded or
+when a card is parked as a watch. The contact links to the thread; reply arrival
+changes the row to “Verifying reply from …”. The endpoint requires the enabled
+agent plugin's dashboard mount. Disk Desktop updates alone do not reload backend
+routes. This UI is status, not a message sender or reply watcher.
+
+`chat-closeout` still tracks card-result delivery/promises, not person completion:
+its watch-card exclusion is intentional and cannot retire this ledger. Tests in
+`test_session_outcome.py` cover schema/identity/receipts/competing declarations;
+`test_real_core.py` covers refresh/new message/notice/running/compression, passive
+watches and a mounted API; Session Panel's `test/panel.test.mjs` exercises actual
+anchors and focused-route isolation. These are isolated tests, not native deployed
+Desktop acceptance.
+
 ## Completion receipts
 
 An optional `completion_receipt` on `kind: done` carries v1 scoped dispositions
