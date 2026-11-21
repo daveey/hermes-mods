@@ -1787,8 +1787,10 @@ export function WaitLine({ i, now = Date.now(), k = 'waiting', local = new Map()
   const ch = chainFor(i, now, { local })
   const L = LEAF[ch.leaf.kind] || LEAF.unknown
   const age = rowWait(i, now, needsPark(i) ? parkFor(i.chip, now) : null).age
-  const via = ch.nodes.length ? ` · via ${ch.nodes.length} ${ch.nodes.length === 1 ? 'card' : 'cards'}` : ''
+  // A running chain names its last card (`dep`) in the row, so only the cards between the waiter and it are "via".
   const dep = ch.leaf.kind === 'running' && ch.nodes.length ? ch.nodes[ch.nodes.length - 1] : null
+  const between = ch.nodes.length - (dep ? 1 : 0)
+  const via = between > 0 ? ` · via ${between} ${between === 1 ? 'card' : 'cards'}` : ''
   return jsxs('div', { 'data-waiting-line': i.key, 'data-wait-line': '', title: `${str(i.chip?.title) || i.label}\n${L.label}: ${ch.leaf.text}${via}`, style: { ...GRID, padding: '3px 0', fontSize: 13 }, children: [
     jsxs('span', { style: { display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }, children: [
       jsx('span', { 'aria-hidden': true, 'data-line-pip': k, ...(onHub(i) ? { 'data-line-pip-hub': '' } : {}), style: { ...pipStyle(k, onHub(i)), display: 'inline-flex' }, children: onHub(i) ? 'H' : undefined }),
@@ -1798,7 +1800,7 @@ export function WaitLine({ i, now = Date.now(), k = 'waiting', local = new Map()
       jsx('span', { 'aria-hidden': true, style: { width: 7, height: 7, borderRadius: '50%', flex: 'none', ...(L.dashed ? { border: `1px dashed ${L.color}`, boxSizing: 'border-box' } : { background: L.color }) } }),
       // A card waiting on a running dependency says so by name: the waiter stays yellow, only the dependency's own state is blue.
       dep
-        ? jsxs('span', { 'data-wait-dependency': dep.id, style: { ...CELL, minWidth: 0 }, children: [jsx('span', { style: muted, children: `Waiting on ${dep.title || dep.id} — ` }), jsx('span', { style: { color: L.color }, children: `${ch.leaf.text}${ch.leaf.sub ? `, ${ch.leaf.sub}` : ''}` }), jsx('span', { style: muted, children: `${ch.nodes.length > 1 ? via : ''}${ch.stale ? ' · not re-read' : ''}` })] })
+        ? jsxs('span', { 'data-wait-dependency': dep.id, style: { ...CELL, minWidth: 0 }, children: [jsx('span', { style: muted, children: `Waiting on ${dep.title || dep.id} — ` }), jsx('span', { style: { color: L.color }, children: `${ch.leaf.text}${ch.leaf.sub ? `, ${ch.leaf.sub}` : ''}` }), jsx('span', { style: muted, children: `${via}${ch.stale ? ' · not re-read' : ''}` })] })
         : jsx('span', { style: { color: L.color }, children: L.label }),
       !dep && jsx('span', { style: { ...muted, ...CELL }, children: `· ${ch.leaf.text}${ch.leaf.sub ? `, ${ch.leaf.sub}` : ''}${via}${ch.stale ? ' · not re-read' : ''}` })
     ] }),
