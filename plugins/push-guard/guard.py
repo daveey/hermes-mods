@@ -469,8 +469,8 @@ class GitView:
                 self.unresolved = True
         if self.env.get(BADCWD) or self.env.get(OPAQUE):
             self.unresolved = True
-        if self.env.get(SUDO) and any(k.startswith("GIT_") for k in self.env):
-            self.unresolved = True  # sudo resets the environment: which GIT_* it keeps depends on sudoers
+        if self.env.get(SUDO):
+            self.unresolved = True  # the other user's config/environment is not this process's git view
 
     def add(self, *opt: str) -> None:
         self.opts.extend(opt)
@@ -494,6 +494,10 @@ class GitView:
         """The environment a child of this git (a `!shell` alias) would inherit."""
         env = dict(self.env)
         env.update(self.exports)
+        if self.unresolved or any(o.startswith("--config-env=") for o in self.opts):
+            # Git exports --config-env to alias children as runtime config. Do not claim that the
+            # reconstructed -c-only environment below proves that child's config or custody absence.
+            env[OPAQUE] = True
         if self.params:
             env["GIT_CONFIG_PARAMETERS"] = " ".join("'" + p + "'" for p in self.params)
         return env
@@ -1469,9 +1473,11 @@ def check_custody_push(cmd: str, cwd: str, depth: int = 0) -> Optional[str]:
             return f"`git push --mirror` would publish this repo's source-custody refs ({CUSTODY_NS})"
         if any("*" in s and not _heads_or_tags_only(s) for s in specs):
             return f"a `*` refspec would publish this repo's source-custody refs ({CUSTODY_NS})"
-        if (view.unresolved and not (specs and pos and re.search(r"[/:@]", pos[0]))) or (view.failed and not specs):
+        if (view.unresolved and not (specs and pos and (view.env.get(SUDO) or re.search(r"[/:@]", pos[0])))) \
+                or (view.failed and not specs):
             # the effective repository/config depends on shell expansion the guard cannot see; only a push by URL
-            # with explicit refspecs is independent of remote.<name>.mirror/push config
+            # with explicit refspecs is independent of remote.<name>.mirror/push config. For sudo/doas,
+            # safe explicit specs also suffice: they replace push config and Git rejects mirror + specs.
             return (f"this `git push` runs in a git view the guard cannot resolve (unexpanded shell variable or "
                     f"missing environment); it might publish source-custody refs ({CUSTODY_NS})")
         cur = view.run("symbolic-ref", "-q", "--short", "HEAD") or "HEAD"
@@ -1506,12 +1512,12 @@ def _heads_or_tags_only(spec: str) -> bool:
 def check_shell(cmd: str, cwd: Optional[str] = None, guards: Optional[list[dict]] = None) -> Optional[str]:
     guards = load_guards() if guards is None else guards
     cmd = cmd or ""
-    if "push" in cmd:
-        custody = check_custody_push(cmd, _resolve(cwd or os.getcwd()))
-        if custody:
-            return ("PUSH GUARD: blocked: " + custody + ". Custody refs hold unpushed work that was preserved "
-                    "locally and must not reach a remote: push the branches you mean by name. "
-                    + OVERRIDE + " does not skip this check.")
+    # Configured aliases can push without a literal `push` anywhere in this command.
+    custody = check_custody_push(cmd, _resolve(cwd or os.getcwd()))
+    if custody:
+        return ("PUSH GUARD: blocked: " + custody + ". Custody refs hold unpushed work that was preserved "
+                "locally and must not reach a remote: push the branches you mean by name. "
+                + OVERRIDE + " does not skip this check.")
     policy = _mods_merge(cmd, _resolve(cwd or os.getcwd())) if "merge" in cmd.lower() else None
     if policy:
         return policy
@@ -1564,8 +1570,8 @@ def check_shell(cmd: str, cwd: Optional[str] = None, guards: Optional[list[dict]
     return None
 
 
-PY_LITERAL = re.compile(r"""(?:"([^"\n]*\b(?:git\b[^"\n]*\bpush|gh\b[^"\n]*\bmerge)\b[^"\n]*)"|"""
-                        r"""'([^'\n]*\b(?:git\b[^'\n]*\bpush|gh\b[^'\n]*\bmerge)\b[^'\n]*)')""")
+PY_LITERAL = re.compile(r"""(?:"([^"\n]*\b(?:git\b|gh\b[^"\n]*\bmerge)\b[^"\n]*)"|"""
+                        r"""'([^'\n]*\b(?:git\b|gh\b[^'\n]*\bmerge)\b[^'\n]*)')""")
 
 
 PY_REST_URL = re.compile(r"""["'](https?://[^"'\s]+/repos/[^/"'\s]+/[^/"'\s]+/pulls/\d+/merge/?)["']""")
@@ -1597,7 +1603,7 @@ def check_python(code: str, cwd: Optional[str] = None, guards: Optional[list[dic
         policy = _mods_merge(code, _resolve(cwd or os.getcwd()), python=True)
         if policy:
             return policy
-    if ("push" not in code and "merge" not in code.lower()):
+    if ("git" not in code and "push" not in code and "merge" not in code.lower()):
         return None
     if OVERRIDE not in code:
         if GQL_MERGE.search(code) and GQL_CALL.search(code):
@@ -1614,7 +1620,7 @@ def check_python(code: str, cwd: Optional[str] = None, guards: Optional[list[dic
             return why
     for m in re.finditer(r"\[\s*[\"'](?:git|gh)[\"'](?:\s*,\s*[\"'][^\"']*[\"'])+\s*\]", code):
         words = re.findall(r"[\"']([^\"']*)[\"']", m.group(0))
-        if "push" in words or any(w == "merge" or REST_MERGE.match(w) for w in words):
+        if words[0] == "git" or "push" in words or any(w == "merge" or REST_MERGE.match(w) for w in words):
             why = check_shell(shlex.join(words), cwd, guards)
             if why:
                 return why

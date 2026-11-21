@@ -672,3 +672,52 @@ def test_blocked_mirror_pushes_really_would_have_reached_the_remote(held_mirror)
     subprocess.run(["git", "push", "--mir", "mir"], cwd=repo, capture_output=True,
                    env={**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null"})
     assert _leaked(mir)
+
+
+@pytest.mark.parametrize("alias", ["push --mirror", "!git push --mirror"])
+@pytest.mark.parametrize("route", ["terminal", "python-string", "python-argv", "tool_call"])
+def test_configured_alias_without_push_literal_reaches_actual_hook(held_mirror, alias, route):
+    repo, mir = held_mirror
+    git("config", "alias.p", alias, cwd=repo)
+    cmd = "git p mir"
+    args = {"command": cmd, "workdir": str(repo)}
+    tool = "terminal"
+    if route.startswith("python"):
+        tool = "execute_code"
+        payload = repr(cmd) if route == "python-string" else repr(["git", "p", "mir"])
+        args = {"code": f"import subprocess; subprocess.run({payload})", "workdir": str(repo)}
+    elif route == "tool_call":
+        tool, args = "tool_call", {"calls": [{"name": tool, "arguments": args}]}
+    assert "push" not in cmd
+    if tool == "execute_code":
+        assert "push" not in args["code"]
+    got = block(tool, args)
+    assert got and got["action"] == "block" and NS in got["message"]
+    assert not _leaked(mir)
+
+
+@pytest.mark.parametrize("option", ["--config-env=remote.origin.mirror=MIRROR",
+                                    "--config-env remote.origin.mirror=MIRROR"])
+def test_shell_alias_config_env_is_not_silently_lost(repo, option):
+    hold_custody_ref(repo)
+    git("config", "alias.p", "!git push origin", cwd=repo)
+    cmd = f"MIRROR=true git {option} p"
+    assert "push" not in cmd
+    assert _blocked(repo, cmd)
+
+
+@pytest.mark.parametrize("wrapper", ["sudo", "sudo -u root", "doas", "doas -u root"])
+def test_other_user_view_never_proves_bare_push_safe_even_without_local_refs(repo, wrapper):
+    # No custody refs or mirror config in this user's view does not prove the other user's view safe.
+    assert _blocked(repo, f"{wrapper} git push origin")
+    assert _blocked(repo, f"{wrapper} git push")
+    # Explicit safe refspecs replace configured push specs; Git rejects mirror + refspecs.
+    assert not _blocked(repo, f"{wrapper} git push origin feat")
+    assert not _blocked(repo, f"{wrapper} git push origin refs/heads/*:refs/heads/*")
+    assert _blocked(repo, f"{wrapper} git push --mirror origin")
+
+
+def test_configured_non_push_alias_without_push_literal_is_allowed(repo):
+    git("config", "alias.s", "status", cwd=repo)
+    assert block("terminal", {"command": "git s", "workdir": str(repo)}) is None
+    assert block("execute_code", {"code": "subprocess.run(['git', 's'])", "workdir": str(repo)}) is None
