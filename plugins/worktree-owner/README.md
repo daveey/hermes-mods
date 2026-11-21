@@ -26,7 +26,20 @@ Two `post_tool_call` hooks. Neither one blocks or changes a tool call, and every
    `D=$(mktemp ...); git worktree add $D ...; for i in 1 2; ...` test command claimed two trees a Claude Code session
    created in `~/code/_wt` meanwhile (via `hermes-core-wt new`, whose command text has no `worktree add`), and the
    card's teardown removed them. A tree with no such evidence stays unowned (`SKIP` line) and is left to the GC.
-2. **Teardown.** Only a successful `kanban_complete` result for the worker's own task and run can start cleanup. A writer reservation on the exact worker board protects verification and removal: the task must be `done`, its current run cleared, and its latest run must match the worker and have ended `done/completed`. Missing, failed, rejected, foreign-board/task, stale-run and review results do nothing. Markers carry the canonical board DB and run ID; ambiguous legacy markers are preserved.
+2. **Teardown.** Only a successful `kanban_complete` result for the worker's own task and run can start cleanup. A writer reservation on the exact worker board protects verification (not the removal, see "Removal is core's" below): the task must be `done`, its current run cleared, and its latest run must match the worker and have ended `done/completed`. Missing, failed, rejected, foreign-board/task, stale-run and review results do nothing. Markers carry the canonical board DB and run ID; ambiguous legacy markers are preserved.
+   **Removal is core's.** The plugin decides *whether* a tree may go; the removal itself is one call to core's
+   `hermes kanban source-custody remove --kind worktree --path <tree> --expected-owner <id>`, with
+   `task:<card>@<run>` for a card's tree and `session:<agent>/<session>` for a Claude Code or Codex tree. The id only
+   names the owner: core re-reads the marker, the tree and gitdir identity, HEAD and the branch, checks the card on
+   the board, and never forces. Exit 0 is the only "removed". Exit 3 (changed, busy, dirty, custody refused), exit 1
+   (no or foreign owner evidence), a host without that CLI, and a call that does not answer in 180 s all keep the
+   tree and log `KEEP <path> (<owner>): source-custody remove ...`. There is no `git worktree remove` fallback. The
+   board is read under a writer reservation to prove the card settled, then **the connection is closed before the
+   call**: core takes custody first and the board writer second, and its final board transaction re-reads the card,
+   so a reopen or reassignment in between keeps the tree. Three trees that used to be removed are now kept, because
+   core has no owner evidence or no force for them: a tree whose only change is a cache-named untracked symlink
+   (Git refuses without `--force`), a `dir:` workspace a chat made and handed to a card (its marker names the chat),
+   and a session tree whose marker also carries card fields.
    Active child dependencies (even before workspace assignment), open-card workspace overlaps on **every board on the host** (`kanban.db` plus `kanban/boards/*/kanban.db`; an unreadable board keeps the tree with `KEEP ... cannot read board <db>`) and live process cwd paths preserve trees. Clean, pushed trees are removed without force, retaining their branches. A tree with uncommitted/untracked changes or a HEAD on no remote is never removed by a card's cleanup, whatever it is registered to and wherever it lives (nested scratch trees included; core preserves Git-bearing scratch): it logs `KEEP ... ; mac-worktree-gc archives it after 7 idle days`. A wrong marker can therefore never cost unsaved work.
    Staged changes, git-ignored files, nested Git entries, symlinks, special files and scan uncertainty are conservatively preserved, not force-removed. Rebuildable caches are the one exception: `__pycache__`, `.pytest_cache`, `.ruff_cache`, `.mypy_cache`, `node_modules`, `*.egg-info` and any directory holding a `CACHEDIR.TAG` do not keep a tree (and the symlink scan does not descend into them); any other ignored file (`.env`, notes) still does. A host adds repo-specific build/test artifacts as globs in `<HERMES_HOME>/worktree-owner.json` `"disposable_ignored"` (matched per path component and per leading relative path, e.g. `["test_durations.json", ".hermes/bin"]`); a collapsed ignored dir counts only if every file under it matches. Symlinks committed to the repo (mode 120000) don't keep a tree either. Trees outside scratch with unsaved work remain for explicit owner cleanup or an independently verified backstop.
    **Deferred teardown (sweep).** The completion hook runs once, in the completing worker, and must decline while a
@@ -44,7 +57,7 @@ Two `post_tool_call` hooks. Neither one blocks or changes a tool call, and every
    `mac-worktree-gc.py --all-repos` also runs the sweep before its own pass (and `sweep --dry-run` under its
    `--dry-run`), so a host with few completions re-checks too; `sweep --dry-run` prints `would remove` rows and
    removes and logs nothing. Older trees belong to mac-worktree-gc. An untracked symlink named like a cache (`tests/node_modules` linked to a shared install,
-   which a `node_modules/` ignore rule does not match) does not keep a tree either: git unlinks it, never follows it.
+   which a `node_modules/` ignore rule does not match) passes the plugin's own checks, but core does not force, so such a tree is kept (see "Removal is core's").
    A tree registered by an **earlier run of the same card** on the same board is torn down too (review and retry loops finish in a later run than the one that made the tree); markers from another card's run, another board, or legacy markers without a run id are kept. Every keep decision writes a `KEEP <path> (<owner>): <reason>` log line. A tree made by `git worktree add` at a path that an open card (any board) names as its `workspace_path` is registered to **that** card, with the maker recorded as `made_by` (a recovery agent re-adding another card's working copy no longer owns it; mini 2026-11-03, self-heal kanban-9101461fb6).
 
 ### Portability and safety limits
@@ -119,7 +132,7 @@ New sessions and Kanban workers load it. Sessions that are already open keep run
 python3 -B -m unittest discover -s plugins/worktree-owner/tests
 ```
 
-Stdlib unit suite: 93 tests using disposable Git repos and boards, including a replay of the 2026-10-29 concurrent-creation misattribution and dirty/unpushed-tree preservation. On macOS run it with Python >= 3.12 and `TMPDIR` set to a non-symlinked dir (e.g. `TMPDIR=$(realpath ~/.hermes/cache/scratch)`): `/var` -> `/private/var` breaks the path assertions. Linux runs on Linux; macOS lsof semantics are exercised with subprocess fixtures, not claimed as a live macOS test.
+Stdlib unit suite: 101 tests using disposable Git repos and boards, including a replay of the 2026-10-29 concurrent-creation misattribution and dirty/unpushed-tree preservation. On macOS run it with Python >= 3.12 and `TMPDIR` set to a non-symlinked dir (e.g. `TMPDIR=$(realpath ~/.hermes/cache/scratch)`): `/var` -> `/private/var` breaks the path assertions. Linux runs on Linux; macOS lsof semantics are exercised with subprocess fixtures, not claimed as a live macOS test.
 
 Bootstrapped runtime integration (requires a core checkout with scratch preservation, and on Linux an existing noninteractive readlink grant for non-dumpable processes):
 

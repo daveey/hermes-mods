@@ -209,11 +209,15 @@ def remove_if_merged(path: str, why: str, event: str = "Stop", rec: dict | None 
         if fresh:
             base._log(f"KEEP {path} ({why}): {fresh}; the session is still running")
             return dict(path=path, action=f"kept: {fresh}")
-    # Never --force: without it git refuses a locked tree (and dirty ones), even if one appeared since the checks.
-    r = base._git(main, "worktree", "remove", path, timeout=600)
-    if r.returncode != 0:
-        base._log(f"WARN remove {path} failed: {r.stderr.strip()[:200]}")
-        return dict(path=path, action=f"kept: remove failed: {r.stderr.strip()[:120]}")
+    # Core's source-custody CLI is the only removal: it proves this session's marker, re-reads the tree's identity
+    # and HEAD under custody and never forces, so a tree that changed, was locked or went dirty since the checks
+    # above is kept. No CLI on this host keeps it too.
+    owner = f"session:{rec['agent']}/{rec['agent_session_id']}" if rec and rec.get("agent") and \
+        rec.get("agent_session_id") else None
+    kept = base.custody_remove(path, owner)
+    if kept:
+        base._log(f"KEEP {path} ({why}): {kept}")
+        return dict(path=path, action=f"kept: {kept}")
     base._log(f"REMOVED {path} ({why})")
     return dict(path=path, action="removed")
 

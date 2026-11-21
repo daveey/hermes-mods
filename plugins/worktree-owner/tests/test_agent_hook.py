@@ -17,6 +17,10 @@ def load():
     spec = importlib.util.spec_from_file_location("worktree_owner_agent_hook_t", SRC)
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import custody_double
+    custody_double.install(m.base)  # miniature fixtures cannot serve core's CLI
     return m
 
 

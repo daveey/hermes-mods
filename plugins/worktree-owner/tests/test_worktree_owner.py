@@ -114,6 +114,10 @@ def load():
     m.spawned_sweeps = []
     m._real_spawn_sweep = m._spawn_sweep
     m._spawn_sweep = lambda: m.spawned_sweeps.append(time.time())
+    # Miniature boards cannot serve core's CLI; test_custody_cli.py covers the real call.
+    m._real_custody_remove = m.custody_remove
+    import custody_double
+    custody_double.install(m)
     return m
 
 
@@ -214,8 +218,9 @@ class Owner(unittest.TestCase):
         self.assertEqual(self.m.on_tool_call("kanban_complete", {}, env={"HERMES_SESSION_ID": "chat2"}), [])
         self.assertTrue(p.exists())
 
-    def test_complete_removes_own_dir_workspace_worktree_unless_another_live_card_uses_it(self):
-        # a chat made the worktree and handed it to this card as kind=dir; the card's completion retires it
+    def test_complete_keeps_a_dir_workspace_worktree_that_a_chat_made(self):
+        # A chat made the worktree and handed it to this card as kind=dir. Its marker names the chat, not the card,
+        # and a workspace path alone is not owner evidence for core: the card asks, core refuses, the tree stays.
         ws = self.make(self.code / "proj-dir", "bdir", {"HERMES_SESSION_ID": "chat3"})
         env = {"HERMES_KANBAN_TASK": "t_eeee5555", "HERMES_KANBAN_WORKSPACE": str(ws)}
         self.live = [os.path.realpath(ws)]  # a sibling card still open on the same dir
@@ -223,7 +228,9 @@ class Owner(unittest.TestCase):
         self.assertTrue(ws.exists())
         self.live = []
         self.m.on_tool_call("kanban_complete", {}, env=env)
-        self.assertFalse(ws.exists())
+        self.assertTrue(ws.exists())
+        self.assertEqual(self.m.custody_calls[-1]["path"], os.path.realpath(ws))
+        self.assertIn("marker owner is None", self.m.LOG.read_text())
 
     def test_does_not_claim_a_concurrent_foreign_worktree(self):
         # another agent (Claude Code, a chat) creates a tree in the same seconds; its name is not in our command

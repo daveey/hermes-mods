@@ -108,16 +108,27 @@ class Lifecycle(unittest.TestCase):
             self.call(self.result)
             self.assertTrue(self.tree.exists())
 
-    def test_lock_held_through_remove(self):
-        original = self.m._remove
-        def remove(*args, **kwargs):
-            with closing(sqlite3.connect(self.db, timeout=0)) as c, c:
-                with self.assertRaises(sqlite3.OperationalError):
-                    c.execute("update tasks set status='running'")
-            return original(*args, **kwargs)
-        with patch.object(self.m, '_remove', side_effect=remove):
-            self.call(self.result)
+    def test_board_writer_is_released_before_the_custody_remove(self):
+        # Core's CLI takes custody first and the board writer second; called under our writer it could only
+        # ever answer busy. The settle read must be committed and closed before the call.
+        import custody_double
+        seen = []
+        def probe(path, owner_id, db):
+            with closing(sqlite3.connect(db, timeout=0)) as c, c:
+                c.execute('begin immediate')
+                seen.append(c.execute("select status from tasks where id='task'").fetchone()[0])
+        calls = custody_double.install(self.m, before=probe)
+        self.call(self.result)
+        self.assertEqual(seen, ['done'])
+        self.assertEqual([(c['owner'], c['db']) for c in calls], [('task:task@run', str(self.db))])
         self.assertFalse(self.tree.exists())
+
+    def test_custody_refusal_keeps_the_tree_and_is_logged(self):
+        self.m.custody_remove = lambda path, owner_id, db=None: 'source-custody remove exit 3: custody refused: busy'
+        result = self.call(self.result)
+        self.assertEqual([r['action'] for r in result], ['kept: source-custody remove exit 3: custody refused: busy'])
+        self.assertTrue(self.tree.exists())
+        self.assertIn('custody refused: busy', self.m.LOG.read_text())
 
     def test_unreadable_board_keeps_tree(self):
         self.db.unlink()
@@ -423,15 +434,18 @@ class Lifecycle(unittest.TestCase):
         (self.tree / 'tests' / name).symlink_to(target)
         return target
 
-    def test_untracked_cache_symlink_does_not_keep_tree_and_target_survives(self):
+    def test_untracked_cache_symlink_tree_is_kept_because_core_never_forces(self):
+        # The plugin used to pass --force for a tree whose only change is a cache-named symlink. Core's
+        # remove has no force, so Git refuses and the tree is kept with the reason; the target is untouched.
         self._commit_ignore(['node_modules/'])  # a dir rule: git still lists the symlink as untracked
         with closing(sqlite3.connect(self.db)) as c, c:
             c.execute("update tasks set workspace_path=''")  # outside scratch: no archive fallback
         target = self._link_node_modules()
         self.assertIn('?? tests/', git(self.tree, 'status', '--porcelain'))
         result = self.call(self.result)
-        self.assertEqual([r['action'] for r in result], ['removed'])
-        self.assertFalse(self.tree.exists())
+        self.assertEqual(len(result), 1)
+        self.assertIn('kept: source-custody remove exit 3', result[0]['action'])
+        self.assertTrue(self.tree.exists())
         self.assertEqual((target / 'pkg.js').read_text(), 'keep me')
 
     def test_other_untracked_symlink_still_keeps_tree(self):

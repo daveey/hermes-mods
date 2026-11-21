@@ -551,7 +551,48 @@ def _complex_reason(path: str) -> str | None:
     return None
 
 
-def _remove(path: str, why_owned: str) -> dict:
+CUSTODY_TIMEOUT_S = 180.0
+# The CLI selects the board from HERMES_KANBAN_DB; a worker's own pins must not redirect or refuse that read.
+_BOARD_PINS = ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK")
+
+
+def _custody_cli() -> str | None:
+    """The installed core launcher, or None when this host has none."""
+    launcher = H / ".hermes" / "hermes-agent" / ".hermes" / "bin" / "hermes"
+    if os.access(launcher, os.X_OK):
+        return str(launcher)
+    return shutil.which("hermes")
+
+
+def custody_remove(path: str, owner_id: str | None, db: str | None = None) -> str | None:
+    """Remove one linked worktree through core's `hermes kanban source-custody remove`. None when it was removed
+    (exit 0); otherwise why the tree is kept. Core re-derives the owner marker, the tree and gitdir identity,
+    HEAD and the branch itself and never forces, so this is the only removal: exit 3 (changed, busy, dirty) and
+    exit 1 (no or foreign owner evidence), a missing CLI and a timeout all keep the tree. There is no fallback."""
+    if not owner_id:
+        return "no owner evidence to remove it with"
+    cli = _custody_cli()
+    if not cli:
+        return "no installed hermes CLI for `kanban source-custody remove`"
+    env = {k: v for k, v in os.environ.items() if k not in _BOARD_PINS}
+    if db:
+        env["HERMES_KANBAN_DB"] = os.path.realpath(db)
+    argv = [cli, "kanban", "source-custody", "remove", "--kind", "worktree", "--path", os.path.realpath(path),
+            "--expected-owner", owner_id]
+    try:
+        r = subprocess.run(argv, cwd="/", env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           timeout=CUSTODY_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return f"source-custody remove gave no answer in {CUSTODY_TIMEOUT_S:.0f}s"
+    except OSError as e:
+        return f"source-custody remove could not start: {e}"
+    if r.returncode == 0:
+        return None
+    detail = (r.stderr or r.stdout or "").strip().splitlines()
+    return f"source-custody remove exit {r.returncode}: {detail[-1][:200] if detail else 'no detail'}"
+
+
+def _remove(path: str, why_owned: str, owner_id: str | None = None, db: str | None = None) -> dict:
     rp = os.path.realpath(path)
     if any(c == rp or c.startswith(rp + "/") or c == path or c.startswith(path + "/") for c in live_cwds()):
         _log(f"KEEP {path} ({why_owned}): a live process works in it")
@@ -569,13 +610,10 @@ def _remove(path: str, why_owned: str) -> dict:
         return dict(path=path, action=f"kept: {keep}")
     if _DRY:
         return dict(path=path, action="would remove")
-    common = _git(path, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
-    main = os.path.dirname(common) if common else path
-    force = ["--force"] if _untracked_links(path) else []
-    r = _git(main, "worktree", "remove", *force, path, timeout=600)
-    if r.returncode != 0:
-        _log(f"WARN remove {path} failed: {r.stderr.strip()[:200]}")
-        return dict(path=path, action=f"kept: remove failed: {r.stderr.strip()[:120]}")
+    kept = custody_remove(path, owner_id, db)
+    if kept:
+        _log(f"KEEP {path} ({why_owned}): {kept}")
+        return dict(path=path, action=f"kept: {kept}")
     _log(f"REMOVED {path} ({why_owned})")
     return dict(path=path, action="removed")
 
@@ -593,19 +631,30 @@ RUN_SETTLED = (('done', 'completed'), ('completed', 'completed'))  # worker kanb
 
 def _teardown(task_id: str, db: str, run: str | None, min_age_s: float = 0.0,
               declined: list[str] | None = None) -> list[dict]:
-    """Verify under the board writer reservation that *task_id* is settled (done, no current run, latest run
-    done/completed and equal to *run*, or any id when *run* is None, no open child), then remove its trees.
-    Every decline that has trees at stake is logged as a KEEP line; the sweep passes *declined* to get the
-    reason for the checks below, which return before any tree is looked at."""
-    # mode=rw never creates a missing board. Hold the writer reservation through
-    # filesystem removal so reopen/reassignment cannot race our authorization.
+    """Read under the board writer reservation that *task_id* is settled (done, no current run, latest run
+    done/completed and equal to *run*, or any id when *run* is None, no open child), release the board, then
+    remove its trees through core's source-custody CLI. Every decline that has trees at stake is logged as a
+    KEEP line; the sweep passes *declined* to get the reason for the checks below, which return before any tree
+    is looked at."""
+    settled = _settled(task_id, db, run, min_age_s, declined)
+    if settled is None:
+        return []
+    # The board connection is closed here. Core takes custody first and the board writer second, and its final
+    # no-retry board transaction re-reads the card (terminal, no claim, no run, same events), so a reopen or
+    # reassignment after the read above keeps the tree. Calling it under our writer would only ever end busy.
+    return _teardown_settled(task_id, *settled)
+
+
+def _settled(task_id: str, db: str, run: str | None, min_age_s: float, declined: list[str] | None):
+    """(env, workspace, live trees, run ids, unreadable boards) when the card is settled, else None."""
+    # mode=rw never creates a missing board. One writer reservation makes the reads below one snapshot.
     with closing(sqlite3.connect(Path(db).resolve().as_uri() + '?mode=rw', uri=True, timeout=10)) as c:
         c.execute('BEGIN IMMEDIATE')
         row = c.execute('select status, current_run_id, workspace_path from tasks where id=?', (task_id,)).fetchone()
         if not row or row[0] != 'done' or row[1] is not None:
             if declined is not None and row and row[0] == 'done':
                 declined.append(f'card has a current run {row[1]}')
-            return []
+            return None
         ended = c.execute('select id, status, outcome, ended_at from task_runs where task_id=? order by id desc limit 1',
                           (task_id,)).fetchone()
         if (not ended or (run is not None and str(ended[0]) != run) or tuple(ended[1:3]) not in RUN_SETTLED
@@ -613,9 +662,9 @@ def _teardown(task_id: str, db: str, run: str | None, min_age_s: float = 0.0,
             if declined is not None and ended and run is None:
                 declined.append(f'latest run {ended[0]} is {ended[1]}/{ended[2]}'
                                 + ('' if ended[3] is not None else ', not ended'))
-            return []
+            return None
         if min_age_s and time.time() - float(ended[3]) < min_age_s:
-            return []  # sweep: let the completing worker finish its own teardown first
+            return None  # sweep: let the completing worker finish its own teardown first
         # Children consume parent artifacts even before receiving a workspace.
         kids = [r[0] for r in c.execute(
             "select t.id from task_links l join tasks t on t.id=l.child_id "
@@ -624,7 +673,7 @@ def _teardown(task_id: str, db: str, run: str | None, min_age_s: float = 0.0,
             for path in _marked_paths(task_id, row[2] or ''):
                 _log(f"KEEP {path} (registered to {task_id}): open child card(s) {', '.join(kids[:5])}; "
                      "torn down when they finish")
-            return []
+            return None
         live = {_ws_key(r[0]) for r in c.execute(
             f"select workspace_path from tasks where {OPEN_SQL} and id != ?", (task_id,))}
         # ...and on every OTHER board: a card there may name this card's tree as its workspace.
@@ -634,7 +683,7 @@ def _teardown(task_id: str, db: str, run: str | None, min_age_s: float = 0.0,
         # created the tree. The completing run was just verified to be the card's latest run.
         runs = {str(r[0]) for r in c.execute('select id from task_runs where task_id=?', (task_id,))}
         env = {'HERMES_KANBAN_DB': db, 'HERMES_KANBAN_RUN_ID': str(ended[0])}
-        return _teardown_locked(task_id, env, row[2] or '', live, runs, unreadable)
+        return env, row[2] or '', live, runs, unreadable
 
 
 def _markers(extra: list[str] | None = None):
@@ -744,17 +793,19 @@ def _marker_fence(rec: dict, task_id: str, env, runs: set[str] | None) -> str | 
     return None
 
 
-def _teardown_locked(task_id: str, env, ws: str, live: set[str], runs: set[str] | None = None,
+def _teardown_settled(task_id: str, env, ws: str, live: set[str], runs: set[str] | None = None,
                      unreadable: list[str] | None = None) -> list[dict]:
     results = []
-    def remove(path, why):
+    db = env['HERMES_KANBAN_DB']
+    def remove(path, why, run):
         if unreadable:
             _log(f"KEEP {path} ({why}): cannot read board {', '.join(unreadable)}; an open card there may use it")
             return dict(path=path, action='kept: a kanban board is unreadable')
         if any(_overlap(path, other) for other in live):
             _log(f"KEEP {path} ({why}): shared with an open card")
             return dict(path=path, action='kept: shared with an open card')
-        return _remove(path, why)
+        # The id only names the owner: core proves it from the marker (or the card's workspace row) and the board.
+        return _remove(path, why, f'task:{task_id}@{run}', db)
     for gd, rec, path in _markers([ws]):
         if rec.get('task_id') != task_id or not path or not os.path.isdir(path):
             continue
@@ -765,7 +816,7 @@ def _teardown_locked(task_id: str, env, ws: str, live: set[str], runs: set[str] 
         if fence:
             _log(f"KEEP {path} (registered to {task_id}): {fence}")
             continue
-        results.append(remove(path, f"registered to {task_id}"))
+        results.append(remove(path, f"registered to {task_id}", rec['run_id']))
     # the card's own dir: workspace, when it is a linked worktree (a .git FILE) that no other open card uses
     if ws and os.path.isfile(os.path.join(ws, ".git")) and \
             not any(os.path.realpath(r["path"]) == os.path.realpath(ws) for r in results):
@@ -773,6 +824,7 @@ def _teardown_locked(task_id: str, env, ws: str, live: set[str], runs: set[str] 
         if gd.returncode:
             return results
         marker = Path(gd.stdout.strip(), MARKER)
+        run = env['HERMES_KANBAN_RUN_ID']  # no marker: core proves ownership from the card's workspace row
         if marker.exists():
             try:
                 rec = json.loads(marker.read_text())
@@ -784,7 +836,8 @@ def _teardown_locked(task_id: str, env, ws: str, live: set[str], runs: set[str] 
                 if fence:
                     _log(f"KEEP {ws} (dir workspace of {task_id}): {fence}")
                     return results  # own workspace fallback must not bypass marker fence
-        results.append(remove(ws, f"dir workspace of {task_id}"))
+                run = rec['run_id']
+        results.append(remove(ws, f"dir workspace of {task_id}", run))
     return results
 
 
