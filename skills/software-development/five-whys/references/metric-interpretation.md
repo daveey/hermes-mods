@@ -4,6 +4,8 @@ Reference for skill `five-whys`: its SKILL.md links this file from the step that
 
 ## 1. State the problem as an observed fact
 
+Before using a stored message timestamp to order a persistence failure, trace where the incident revision assigns it and whether later flushes preserve it. An in-memory staging time carried into a later insert is not a commit receipt; current row existence cannot establish that the row was durable before the error. Require a contemporaneous successful-write receipt to assert that boundary. Likewise, trace counters before treating them as execution evidence: a tool-turn count may count assistant messages containing calls, even when the pre-tool durability gate prevented dispatch. Without an execution receipt, keep that earlier gate in the hypothesis set rather than investigating only post-write hooks.
+
 For Hermes transcript-row counts in `state.db` ("notice stored twice", "duplicate row"), check `active`,
 `compacted` and `message_uid` before hunting a second writer: in-place compaction rewinds each retained tail row
 to `active=0, compacted=0` and re-inserts it as a new active row with the same `message_uid` and timestamp
