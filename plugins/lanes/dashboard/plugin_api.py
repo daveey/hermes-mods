@@ -150,14 +150,18 @@ def _pr_contexts(db, flow_module, *, evidence=None):
         pr = None if evidence is not None else flow_module._pr_snapshot(row, events, flow_module._awaiting(row, events))
         url = evidence.pr_url(row) if evidence is not None else (pr or {}).get('url')
         if url:
-            revision = 0
-            for event in events:
-                payload = flow_module._payload(dict(event))
-                meta = payload.get('metadata')
-                pr_evidence = meta if isinstance(meta, dict) else payload
-                carries_pr = any(key in pr_evidence for key in ('published_pr', 'reviewed_pr', 'pr', 'flow_pr', 'head', 'head_sha', 'headRefOid'))
-                if event['kind'] not in ('heartbeat', 'external_watch') or carries_pr:
-                    revision = max(revision, event['id'])
+            def newest(events):
+                revision = 0
+                for event in events:
+                    payload = flow_module._payload(dict(event))
+                    meta = payload.get('metadata')
+                    pr_evidence = meta if isinstance(meta, dict) else payload
+                    carries_pr = any(key in pr_evidence for key in ('published_pr', 'reviewed_pr', 'pr', 'flow_pr', 'head', 'head_sha', 'headRefOid'))
+                    if event['kind'] not in ('heartbeat', 'external_watch') or carries_pr:
+                        revision = max(revision, event['id'])
+                return revision
+            revision = (evidence.derived(row['id'], 'pr_revision', newest) if hasattr(evidence, 'derived')
+                        else newest(events))
             source = evidence.identity(row['id']) if evidence is not None and hasattr(evidence, 'identity') else identity
             groups[url].append((row['id'], row['status'], row['completion_contract'], (source, revision)))
     return {url: (identity, tuple(sorted(cards))) for url, cards in groups.items()}
@@ -189,6 +193,18 @@ def _view_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@lru_cache(maxsize=1)
+def _card_memo():
+    # Races on first use only build a spare memo; the lru_cache keeps one.
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location('lanes_card_memo', Path(__file__).with_name('card_memo.py'))
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.CardMemo()
 
 
 def _shared_views():
@@ -235,6 +251,7 @@ def _current_view(mods, hours, window, expanded):
     kbc, _, cli = mods
     try:
         with kbc.connect_closing() as conn, read_view(conn) as evidence:
+            _card_memo().bind(evidence)
             snap = cli.snapshot(conn, hours=hours, evidence=evidence)
             raw = None
             if expanded and snap.get('configured'):
@@ -341,8 +358,7 @@ async def post_admit(card: str, body: Dict[str, Any] = Body(default={})) -> Dict
     return await asyncio.to_thread(admit, card, str(body.get("reason") or "admitted from the lanes panel"))
 
 
-WATCH_S = 0.5
-DEBOUNCE_S = 1.0
+WATCH_S = 0.25  # change-cursor poll; a change is projected on the first tick that sees it
 HEARTBEAT_S = 30.0
 _seen_cursor = None
 
@@ -417,27 +433,36 @@ async def stream_lanes(ws: WebSocket):
         await ws.close(code=1008)
         return
     await ws.accept()
+    debug = ws.query_params.get('debug', 'false').lower() == 'true'
     last_hash = None
     version = 0
-    async def send_view():
+    async def send_view(timing=None):
         nonlocal last_hash, version
+        started = time.time()
         view = await asyncio.to_thread(lane_view, *params)
+        finished = time.time()
         echo = dict(zip(('hours', 'window', 'expanded'), params))
         digest = hashlib.sha256(json.dumps({'view': view, 'params': echo}, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
         if digest != last_hash:
             version += 1
-            await ws.send_json({'version': version, 'view': view, 'params': echo})
+            frame = {'version': version, 'view': view, 'params': echo}
+            if debug:
+                # Wall-clock epoch seconds per stage, for this change only; never part of the view digest.
+                frame['timing'] = {**(timing or {}), 'project_start': started, 'project_end': finished, 'sent': time.time()}
+            await ws.send_json(frame)
             last_hash = digest
     try:
         cursor = await asyncio.to_thread(change_cursor)
         _refresh_cursor(cursor)
         await send_view()
         last_heartbeat = time.monotonic()
-        dirty_at = None
+        recomputed = False
         while True:
             # wait_for cancels and joins receive on timeout. No detached poll/receive tasks.
+            # After a recompute, look at the cursor again at once: changes that landed while it ran
+            # coalesce into one follow-up instead of waiting for another tick.
             try:
-                message = await asyncio.wait_for(ws.receive(), WATCH_S)
+                message = await asyncio.wait_for(ws.receive(), 0.005 if recomputed else WATCH_S)
                 if message['type'] == 'websocket.disconnect':
                     return
                 if message.get('text'):
@@ -452,19 +477,18 @@ async def stream_lanes(ws: WebSocket):
                     await send_view()
             except TimeoutError:
                 pass
+            polled = time.time()
             current = await asyncio.to_thread(change_cursor)
-            now = time.monotonic()
-            if current != cursor:
+            recomputed = current != cursor
+            if recomputed:
+                # Leading edge: the first tick that sees a change projects it, with no fixed wait.
                 cursor = current
-                if dirty_at is None:
-                    dirty_at = now
-            if dirty_at is not None and now - dirty_at >= DEBOUNCE_S:
+                detected = time.time()
                 _refresh_cursor(cursor)
-                await send_view()
-                dirty_at = None
-            if now - last_heartbeat >= HEARTBEAT_S:
+                await send_view({'cursor_poll': polled, 'detected': detected, 'released': time.time()})
+            if time.monotonic() - last_heartbeat >= HEARTBEAT_S:
                 await ws.send_json({'type': 'heartbeat', 'version': version})
-                last_heartbeat = now
+                last_heartbeat = time.monotonic()
     except WebSocketDisconnect:
         return
     except (OSError, RuntimeError) as exc:
