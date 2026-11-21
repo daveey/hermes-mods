@@ -23,6 +23,7 @@ class GateFixture(unittest.TestCase):
         self.env = dict(os.environ, GIT_AUTHOR_NAME='fixture', GIT_AUTHOR_EMAIL='fixture@example.com',
                         GIT_COMMITTER_NAME='fixture', GIT_COMMITTER_EMAIL='fixture@example.com')
         self.env.pop('HERMES_MODS_SKIP_PUSH_SUITES', None)
+        self.env['XDG_CACHE_HOME'] = str(self.root / 'cache')
         self.env['HERMES_MODS_PYTHON'] = sys.executable
         # The hook execs `python3`; receipts bind the gate interpreter, so the
         # fixture's python3 must be the one running --prepare (CI's PATH differs).
@@ -57,6 +58,125 @@ class GateFixture(unittest.TestCase):
 
     def tip(self):
         return self.git('--git-dir', str(self.remote), 'rev-parse', 'main').stdout.strip()
+
+
+class SuiteSlots(GateFixture):
+    """Fake runner measures scheduling, not suite verdict/receipt correctness."""
+
+    def setUp(self):
+        super().setUp()
+        self.env.pop('HERMES_MODS_SUITE_SLOTS', None)
+        self.events = self.root / 'events'
+        self.env['SLOT_EVENTS'] = str(self.events)
+        (self.repo / 'scripts/test-all').write_text('''import json, os, time
+from pathlib import Path
+p = Path(os.environ['SLOT_EVENTS'])
+def record(kind):
+    with p.open('a') as f:
+        f.write(json.dumps([kind, os.getpid(), time.monotonic(), os.getpriority(os.PRIO_PROCESS, 0)]) + '\\n')
+record('start')
+if os.environ.get('SLOT_RELEASE'):
+    deadline = time.monotonic() + 12
+    while not Path(os.environ['SLOT_RELEASE']).exists() and time.monotonic() < deadline:
+        time.sleep(.02)
+else:
+    time.sleep(1.5)
+record('end')
+''')
+        self.test.write_text('def test_contract(): assert 3 == 3\n')
+        self.commit()
+
+    def start(self, prepare=True):
+        log = (self.root / f'log-{time.monotonic_ns()}').open('w+')
+        self.addCleanup(log.close)
+        cmd = [sys.executable, str(self.repo / 'scripts/pre-push-suites')]
+        p = subprocess.Popen(cmd + (['--prepare', self.base, 'HEAD'] if prepare else []),
+                             cwd=self.repo, env=self.env, stdin=subprocess.PIPE,
+                             stdout=log, stderr=log, text=True)
+        assert p.stdin is not None
+        if not prepare:
+            p.stdin.write(f'refs/heads/main {self.git("rev-parse", "HEAD").stdout.strip()} refs/heads/main {self.base}\n')
+        p.stdin.close()
+        self.addCleanup(lambda: p.poll() is None and p.kill())
+        return p, log
+
+    def records(self):
+        return [json.loads(x) for x in self.events.read_text().splitlines()] if self.events.exists() else []
+
+    def await_start(self):
+        deadline = time.monotonic() + 10
+        while not self.records() and time.monotonic() < deadline:
+            time.sleep(.02)
+        self.assertTrue(self.records(), 'fake runner did not start')
+
+    def test_concurrent_prepare_and_push_are_serial(self):
+        first, _ = self.start()
+        self.await_start()
+        # Distinct immutable range: otherwise the push correctly reuses the
+        # prepare receipt rather than executing a second suite.
+        self.test.write_text('def test_contract(): assert 4 == 4\n')
+        self.commit()
+        second, log = self.start(prepare=False)
+        self.assertEqual(first.wait(15), 0)
+        self.assertEqual(second.wait(15), 0)
+        events = self.records()
+        self.assertEqual([e[0] for e in events], ['start', 'end', 'start', 'end'], events)
+        self.assertTrue(all(e[3] >= 10 for e in events), events)
+        log.seek(0)
+        self.assertIn('waiting for suite slot held by', log.read())
+
+    def test_configured_two_slots_allow_overlap(self):
+        self.env['HERMES_MODS_SUITE_SLOTS'] = '2'
+        release = self.root / 'release'
+        self.env['SLOT_RELEASE'] = str(release)
+        first, _ = self.start()
+        self.await_start()
+        second, _ = self.start()
+        deadline = time.monotonic() + 10
+        while len(self.records()) < 2 and time.monotonic() < deadline:
+            time.sleep(.02)
+        observed = [e[0] for e in self.records()]
+        release.touch()
+        self.assertEqual(first.wait(15), 0)
+        self.assertEqual(second.wait(15), 0)
+        self.assertEqual(observed, ['start', 'start'])
+        self.assertEqual([e[0] for e in self.records()], ['start', 'start', 'end', 'end'])
+
+    def test_invalid_slot_counts_fail_closed(self):
+        for bad in ('0', '-1', 'many'):
+            self.env['HERMES_MODS_SUITE_SLOTS'] = bad
+            child, log = self.start()
+            self.assertNotEqual(child.wait(10), 0)
+            log.seek(0)
+            self.assertIn('HERMES_MODS_SUITE_SLOTS', log.read())
+        self.assertFalse(self.records())
+
+    def test_receipt_reuse_does_not_wait_for_busy_slot(self):
+        import fcntl
+        first, _ = self.start()
+        self.assertEqual(first.wait(15), 0)
+        slot = self.root / 'cache/hermes-mods-push/slots/0.lock'
+        with slot.open('a+') as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            second, log = self.start(prepare=False)
+            self.assertEqual(second.wait(5), 0)
+            log.seek(0)
+            text = log.read()
+            self.assertIn('verified local receipt', text)
+            self.assertNotIn('waiting for suite slot', text)
+        self.assertEqual([e[0] for e in self.records()], ['start', 'end'])
+
+    def test_killed_holder_releases_without_overlapping_live_suite(self):
+        first, _ = self.start()
+        self.await_start()
+        second, log = self.start()
+        time.sleep(.2)
+        first.kill()
+        first.wait(5)
+        self.assertEqual(second.wait(15), 0)
+        self.assertEqual([e[0] for e in self.records()], ['start', 'end', 'start', 'end'])
+        log.seek(0)
+        self.assertIn('waiting for suite slot held by', log.read())
 
 
 class PushGate(GateFixture):
