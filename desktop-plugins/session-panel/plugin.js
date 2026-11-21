@@ -1993,7 +1993,8 @@ export function Panel() {
   if (!Number.isFinite(honourLeft.current)) honourLeft.current = 0
   const silence = trackSubagents(chips, now, subMemory)
   noteTitles(chips)
-  const isAsked = c => !!US?.requestForSource?.({ gatewayId: c.gatewayId || c.gateway, profile: c.profile, type: 'kanban', board: c.board, id: c.id })
+  const cardSource = c => ({ gatewayId: c.gatewayId || c.gateway, profile: c.profile, type: 'kanban', board: c.board, id: c.id })
+  const isAsked = c => US?.requestsForSource ? US.requestsForSource(cardSource(c)).length > 0 : !!US?.requestForSource?.(cardSource(c))
   const presentationFor = c => US?.presentationForSource?.({ gatewayId: c.gatewayId || c.gateway, profile: c.profile, type: 'kanban', board: c.board, id: c.id })
   const sorted = classify(chips, { nowMs: now, silence, isAsked, presentationFor, evidence: c => (c.kind === 'kanban' ? chipObservation(c, chipAsOf(c, now) / 1000) : null) })
   const known = new Set(chips.filter(c => c?.kind === 'kanban' && c.id).map(c => str(c.id))) // this chat's cards

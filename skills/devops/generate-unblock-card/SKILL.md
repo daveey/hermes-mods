@@ -59,6 +59,8 @@ Answer each in your notes first:
 | `evidence` | Verbatim tool output from this turn that shows the blocker (the guard refuses paraphrase). |
 | `resolved_check` | Add when his step happens outside Hermes and a probe can see it (asking-the-user / physical asks). |
 
+Inside a Kanban worker, an `action_request` question is visible to David only through the card it is cited on. Cite each request id in the block's `human_request`, or better, use `human_request.choices`.
+
 A physical or terminal step with no real alternatives still gets `Situation:` and `Recommend:` (what to do and
 when); `Options:` may be the single step plus "Archive = drop it".
 

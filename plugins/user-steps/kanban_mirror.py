@@ -346,19 +346,68 @@ class Mirror:
             "('created','blocked','unblocked','archived','completed')",
             (task,),
         ).fetchone()[0]
-        return dict(
+        snap = dict(
             task=task,
             session=sid,
             generation=generation,
             ask=hr,
             title=row.get("title") or hr["action"],
         )
+        cited = self._citations(c, task, hr, owner)
+        if cited:
+            snap['cited_set'] = cited
+        return snap
+
+    def _citations(self, c, task, hr, owner):
+        if hr.get('choices'):
+            return []
+        event = c.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='blocked' ORDER BY id DESC LIMIT 1",
+                          (task,)).fetchone()
+        payload = json.loads(event[0] or '{}') if event else {}
+        text = '\n'.join(str(hr.get(k) or '') for k in ('action', 'scope', 'evidence'))
+        text += '\n' + str(payload.get('reason') or '')
+        ids = dict.fromkeys(re.findall(r'\b[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\b', text))
+        found = []
+        with self.store._read() as reader:
+            for rid in ids:
+                row = reader.execute('SELECT session FROM requests WHERE namespace=? AND id=?',
+                                     (self.store._ns(owner), rid)).fetchone()
+                if row is None:
+                    continue
+                request = self.store._get(reader, dict(owner, storedSessionId=row[0]), rid)
+                if request['state'] == 'open' and request['kind'] == 'choice' and request['choices']:
+                    found.append(request)
+        return found
+
+    @staticmethod
+    def _source_snapshot(snap):
+        return {k: v for k, v in snap.items() if k not in ('cited_id', 'cited_revision')}
+
+    def _matches_snapshot(self, current, frozen):
+        return encoded(current) == encoded(self._source_snapshot(json.loads(frozen)))
 
     def _read_snapshot(self, board, task, owner, *, presentation=True):
         with _kept(self._path(board)) as c:
             return self._snapshot(c, task, owner, presentation=presentation)
 
     def _request(self, owner, board, snap, incarnation=0):
+        if snap.get('cited_id'):
+            cited = next(r for r in snap['cited_set'] if r['requestId'] == snap['cited_id'])
+            identity = encoded([owner, board, self._source_snapshot(snap),
+                                snap['cited_id'], snap['cited_revision']]
+                               + ([incarnation] if incarnation else []))
+            rid = str(uuid.uuid5(uuid.NAMESPACE_URL, 'hermes:kanban-ask:' + identity))
+            ref = dict(gatewayId=owner['gatewayId'], profile=owner['profile'],
+                       type='kanban', board=board, id=snap['task'])
+            choices = [dict(id='q-' + ch['id'], label=ch['label'], effect='answer',
+                            **{k: ch[k] for k in ('explain', 'recommended') if k in ch})
+                       for ch in cited['choices']]
+            return self.core.validate_action(dict(
+                schemaVersion=2, owner=owner, requestId=rid, revision=1, kind='choice',
+                title=cited['title'], scope=dict(markdown=cited['scope']['markdown'],
+                    complete=True, sourceRefs=[ref]), limits=[], exclusions=[],
+                outcomes=dict(answer='Record the selected value on the source card.'),
+                choices=choices, aliases=[], state='open'))
         # UUID5 identity includes the exact ask, lifecycle and owner, not a fuzzy title.
         # A later incarnation re-projects the same ask after an earlier projection was
         # withdrawn/retired; incarnation 0 keeps the original identity byte for byte.
@@ -431,6 +480,14 @@ class Mirror:
             return request
         snap = json.loads(binding['snapshot'])
         hr = snap['ask']
+        if snap.get('cited_id'):
+            cited = next(r for r in snap['cited_set'] if r['requestId'] == snap['cited_id'])
+            question = re.sub(r'\b(?:t_[a-zA-Z0-9_]+|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})\b',
+                              'this question', cited['title'])
+            recommended = next(('q-' + ch['id'] for ch in cited['choices'] if ch.get('recommended')), None)
+            return dict(request, presentation=dict(kind='kanban-question', question=question,
+                        details=cited['scope']['markdown'], recommendedChoiceId=recommended,
+                        other=True, sourceRef=request['scope']['sourceRefs'][0]))
         question = re.split(r'\bUnblock\s*=', hr['action'], maxsplit=1, flags=re.I)[0].strip()
         question = question or snap['title']
         question = re.sub(r'\bt_[a-zA-Z0-9_]+\b', 'this card', question)
@@ -617,6 +674,7 @@ class Mirror:
         have = {r[1] for r in c.execute("PRAGMA table_info(tasks)")}
         cols = ", ".join(f"t.{x}" for x in ("id", "status", "idempotency_key", "human_request", "session_id", "title")
                          if x in have)
+        cols += ", (SELECT e.payload FROM task_events e WHERE e.task_id=t.id AND e.kind='blocked' ORDER BY e.id DESC LIMIT 1)"
         latest = ("(SELECT MAX(e.id) FROM task_events e WHERE e.task_id=t.id AND e.kind IN "
                   f"({','.join('?' * len(_EVENT_KINDS))}))")
         rows = [tuple(r) for r in c.execute(
@@ -660,10 +718,13 @@ class Mirror:
                 continue  # unavailable is NOT evidence to withdraw
             for snap in filter(None, snapshots):
                 try:
-                    if self._relocate(owner, board, snap):
-                        request = self._current_request(owner, board, snap)
-                        if request is not None:
-                            self._publish(owner, board, snap, request)
+                    questions = [dict(snap, cited_id=r['requestId'], cited_revision=r['revision'])
+                                 for r in snap.get('cited_set', [])] or [snap]
+                    for question in questions:
+                        if self._relocate(owner, board, question):
+                            request = self._current_request(owner, board, question)
+                            if request is not None:
+                                self._publish(owner, board, question, request)
                 except self.core.ActionError as exc:
                     clean = False
                     # A malformed legacy ask or conflicting identity must not hide
@@ -728,7 +789,7 @@ class Mirror:
         public = {k: v for k, v in request.items() if k != "resolution"}
         public["state"] = json.loads(binding["request"]).get("state")
         mismatch = encoded(public) != binding["request"]
-        if encoded(current) == binding["snapshot"] and not mismatch:
+        if self._matches_snapshot(current, binding["snapshot"]) and not mismatch:
             if not request.get("resolution") and tip != owner["storedSessionId"]:
                 self._withdraw(owner, request)
             return
@@ -861,7 +922,7 @@ class Mirror:
             encoded([op["intent"], op["decision"]]).encode()
         ).hexdigest()
         for row in c.execute(
-            "SELECT payload FROM task_events WHERE task_id=? AND kind IN ('unblocked','archived') ORDER BY id DESC",
+            "SELECT payload FROM task_events WHERE task_id=? AND kind IN ('unblocked','archived','user_steps_answer') ORDER BY id DESC",
             (binding["task"],),
         ):
             payload = json.loads(row[0] or "{}")
@@ -878,11 +939,90 @@ class Mirror:
             return receipt
         return None
 
+    def _answered_citations(self, c, binding, snap):
+        generation = _digest(self._source_snapshot(snap))
+        answered = set()
+        for row in c.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='user_steps_answer'",
+                             (binding['task'],)):
+            receipt = json.loads(row[0] or '{}').get('user_steps_projection', {})
+            if receipt.get('citation_generation') == generation:
+                answered.add((receipt.get('cited_id'), receipt.get('cited_revision')))
+        return answered
+
+    def _deliver_cited(self, c, binding, op):
+        api = self._api()
+        snap = json.loads(binding['snapshot'])
+        cited = next(r for r in snap['cited_set'] if r['requestId'] == snap['cited_id'])
+        choice_id = op['decision']['choiceId']
+        other = choice_id == 'answer-text'
+        if other:
+            if (op.get('provenance') != dict(type='kanban_other', version=1)
+                    or op['intent'].get('executionAuthorized') is not False
+                    or op['intent'].get('permissionGrants') != []):
+                raise self.core.ActionError('Bound informational answer required', 409)
+            label = op['intent']['revisionText']
+            original_id = choice_id
+        else:
+            choice = next((ch for ch in cited['choices'] if 'q-' + ch['id'] == choice_id), None)
+            if choice is None:
+                raise self.core.ActionError('Unknown card choice', 409)
+            label, original_id = choice['label'], choice['id']
+        comment = (f'Answer recorded in Desktop for "{cited["title"]}" '
+                   f'(request {snap["cited_id"]} rev {snap["cited_revision"]}): {label} [{original_id}]')
+        receipt = dict(destination='kanban_ask', board=binding['board'], task=binding['task'],
+                       operationId=op['operationId'], value=original_id, executionStarted=False,
+                       fingerprint=hashlib.sha256(encoded([op['intent'], op['decision']]).encode()).hexdigest(),
+                       citation_generation=_digest(self._source_snapshot(snap)),
+                       cited_id=snap['cited_id'], cited_revision=snap['cited_revision'])
+        required = {(r['requestId'], r['revision']) for r in snap['cited_set']}
+        this = (snap['cited_id'], snap['cited_revision'])
+
+        def fence(conn):
+            if self._receipt(conn, binding, op):
+                return 'already recorded'
+            current = self._snapshot(conn, binding['task'], op['owner'], presentation=False)
+            if not self._matches_snapshot(current, binding['snapshot']):
+                return 'changed ask'
+            return None
+
+        # Serialize the partial receipt and comment on the board, not the action
+        # store. The final answer uses core's existing atomic fenced transition.
+        with api.write_txn(c):
+            old = self._receipt(c, binding, op)
+            if old:
+                return old
+            if fence(c):
+                raise self.core.ActionError('Source card changed ask', 409)
+            if not required <= self._answered_citations(c, binding, snap) | {this}:
+                api.add_comment(c, binding['task'], 'user-steps', comment)
+                c.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?,?,?,?)",
+                          (binding['task'], 'user_steps_answer',
+                           encoded(dict(user_steps_projection=receipt)), int(time.time())))
+                return receipt
+
+        def final_fence(conn):
+            error = fence(conn)
+            if error:
+                return error
+            if not required <= self._answered_citations(conn, binding, snap) | {this}:
+                return 'missing cited answers'
+            return None
+
+        api.unblock_task(c, binding['task'], precondition=final_fence,
+                         comment=('user-steps', comment),
+                         event_extra=dict(user_steps_projection=receipt))
+        recorded = self._receipt(c, binding, op)
+        if not recorded:
+            raise self.core.ActionError('Source card ask changed or transition refused', 409)
+        return recorded
+
     def deliver(self, op):
         binding = self._bound(op)
         api = self._api()
         c = api.connect(self._path(binding["board"]))
         try:
+            if json.loads(binding['snapshot']).get('cited_id'):
+                return self._deliver_cited(c, binding, op)
             old = self._receipt(c, binding, op)
             if old:
                 return old

@@ -633,9 +633,9 @@ export function Strip({ hideCards = [] } = {}) {
   if (!focused || snap.stored !== focused || (snap.scope && snap.scope !== scope)) return null
   const requests = canonical.scope === scope ? canonical.requests : []
   const hidden = Array.isArray(hideCards) ? hideCards : []
-  const rows = projectStrip(snap.ledger, snap.kanban).filter(row => !(row.type === 'card' && hidden.some(c => sameCard(c, row.item)))).filter(row => !requestForSource(requests, row.type === 'card'
-    ? { gatewayId: row.item.gatewayId || row.item.gateway, profile: row.item.profile, type: 'kanban', board: row.item.board, id: row.item.id }
-    : { gatewayId: row.step.requestOwner?.gatewayId || row.step.gatewayId || row.step.owner?.gatewayId, profile: row.step.requestOwner?.profile || row.step.profile || row.step.owner?.profile, type: 'user_step', id: row.step.id }))
+  const rows = projectStrip(snap.ledger, snap.kanban).filter(row => !(row.type === 'card' && hidden.some(c => sameCard(c, row.item)))).filter(row => row.type === 'card'
+    ? !requestsForSource(requests, { gatewayId: row.item.gatewayId || row.item.gateway, profile: row.item.profile, type: 'kanban', board: row.item.board, id: row.item.id }).length
+    : !requestForSource(requests, { gatewayId: row.step.requestOwner?.gatewayId || row.step.gatewayId || row.step.owner?.gatewayId, profile: row.step.requestOwner?.profile || row.step.profile || row.step.owner?.profile, type: 'user_step', id: row.step.id }))
   const issues = (snap.issues || []).filter(i => !isDismissed(i))
   if (!rows.length && !issues.length) return null
   return jsxs('div', { 'data-slot': 'user-steps', style: { ...SELECTABLE, minWidth: 0, color: 'var(--foreground)' }, children: [
@@ -696,6 +696,21 @@ export function requestForSource(requests, source) {
   const live = matches.filter(r => r.state !== 'withdrawn')
   const pool = live.length ? live : matches
   return pool.length === 1 ? pool[0] : null // ambiguous provenance never suppresses another request
+}
+// Every request bound (server presentation.sourceRef) to this card, in list order. Bound requests are each
+// drawn as their own tile, so several asks on one card are all shown and the card is never also a legacy row.
+// Without a bound request this falls back to the singular alias match (ambiguous aliases still match nothing).
+export function requestsForSource(requests, source) {
+  const key = sourceKey(source)
+  if (!key) return []
+  const bound = projectRequests(requests).filter(r => {
+    const ref = cardPresentation(r)?.sourceRef
+    return ref?.type === 'kanban' && ref.gatewayId === r.owner.gatewayId && ref.profile === r.owner.profile && sourceKey(ref) === key
+  })
+  const live = bound.filter(r => r.state !== 'withdrawn')
+  if (bound.length) return live.length ? live : bound
+  const one = requestForSource(requests, source)
+  return one ? [one] : []
 }
 function decisionRoute() {
   const owner = host.state?.focusedSessionOwner?.get?.()
@@ -1253,8 +1268,8 @@ function representedInQueue(scope, r) {
 export function presentationForSource(source) {
   const scope = routeKey(decisionRoute())
   if (!decisionRoute().session || canonical.scope !== scope) return null
-  const r = requestForSource(canonical.requests, source)
-  return r ? { state: r.state, dismissed: isRequestDismissed(r), representedInQueue: representedInQueue(scope, r) } : null
+  const rs = requestsForSource(canonical.requests, source), r = rs[0]
+  return r ? { state: r.state, dismissed: rs.every(isRequestDismissed), representedInQueue: rs.some(x => representedInQueue(scope, x)), count: rs.length } : null
 }
 export function hasQueuePresentation() {
   const scope = routeKey(decisionRoute())
@@ -1381,7 +1396,7 @@ export default {
     ctx.register({ id: 'decision-list-directive', area: TRANSCRIPT_DIRECTIVE_AREA, data: { name: 'decision-list', render: props => jsx(DecisionList, props) } })
     const onVis = () => { if (typeof document !== 'undefined' && document.hidden) return; void refresh(); void refreshRequests() }
     if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVis)
-    if (typeof window !== 'undefined') window.__userSteps = { version: VERSION, ownsComposer: true, get snapshot() { return snapshot }, refresh, refreshRequests, warm, subscribe: fn => { canonicalSubs.add(fn); return () => canonicalSubs.delete(fn) }, requestForSource: source => canonical.scope === routeKey(decisionRoute()) ? requestForSource(canonical.requests, source) : null, presentationForSource, hasQueuePresentation, ActionQueue, Strip, openAskCount, openAskKeys }
+    if (typeof window !== 'undefined') window.__userSteps = { version: VERSION, ownsComposer: true, get snapshot() { return snapshot }, refresh, refreshRequests, warm, subscribe: fn => { canonicalSubs.add(fn); return () => canonicalSubs.delete(fn) }, requestForSource: source => canonical.scope === routeKey(decisionRoute()) ? requestForSource(canonical.requests, source) : null, requestsForSource: source => canonical.scope === routeKey(decisionRoute()) ? requestsForSource(canonical.requests, source) : [], presentationForSource, hasQueuePresentation, ActionQueue, Strip, openAskCount, openAskKeys }
     signalDecisionChanges()
     return () => {
       if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVis)

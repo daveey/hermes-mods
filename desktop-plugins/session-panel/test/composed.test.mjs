@@ -325,4 +325,35 @@ test('composed: recording removes red before slow delivery readback and survives
   }
 })
 
+
+test('composed: two bound requests on one card render as 1/2 and 2/2 tiles, no unasked row or strip card', async () => {
+  await React.act(async () => root.render(null))
+  const id = 't_two_questions'
+  const ref = { gatewayId: 'G1', profile: 'default', type: 'kanban', board: 'default', id }
+  const bound = (n, question) => ({ ...canonicalRequest, requestId: `00000000-0000-4000-8000-00000000010${n}`, aliases: [], title: `${TITLE} ${n}`,
+    scope: { complete: true, markdown: question, sourceRefs: [ref] },
+    choices: n === 1 ? [{ id: 'q-red', label: 'Red channel', effect: 'answer' }, { id: 'q-blue', label: 'Blue channel', effect: 'answer' }]
+      : [{ id: 'q-small', label: 'Small checks', effect: 'answer' }, { id: 'q-large', label: 'Large checks', effect: 'answer' }],
+    presentation: { kind: 'kanban-question', question, details: `Evidence ${n}`, other: false, sourceRef: ref } })
+  const requests = [bound(1, 'Pick a color.'), bound(2, 'Pick a size.')]
+  assert.equal(steps.requestForSource(requests, ref), null, 'singular lookup stays ambiguous')
+  const dispose = wire({ chips: [chip(id)], items: [item(id)], requests, ledgerSteps: [] })
+  try {
+  await render('two-bound')
+  const tiles = [...el().querySelectorAll('[data-action-request]')]
+  assert.equal(tiles.length, 2)
+  const labels = tiles.map(t => t.querySelector('[data-clarify-question] p').textContent)
+  assert.deepEqual(labels, ['1/2 — Pick a color.', '2/2 — Pick a size.'])
+  assert.match(tiles[0].textContent, /Red channel/)
+  assert.match(tiles[0].textContent, /Blue channel/)
+  assert.match(tiles[1].textContent, /Small checks/)
+  assert.match(tiles[1].textContent, /Large checks/)
+  assert.equal(unaskedRows(id).length, 0)
+  assert.equal(stripCards(id).length, 0)
+  assert.equal(el().querySelector('[data-section="needs-you"]').textContent, 'Needs you · 2')
+  } finally {
+    await React.act(async () => root.render(null)); dispose()
+  }
+})
+
 test('done', () => { root.unmount() })
