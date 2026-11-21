@@ -19,8 +19,23 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
+
+
+# Thread lanes (core ``hermes_cli.web_thread_lanes``): this plugin's Desktop-polled reads get their own thread
+# budget and a queue deadline (503 + Retry-After, never started) instead of the shared AnyIO pool, which slow
+# reads filled for ~2 h on 2026-11-21. A core without lanes keeps the shared pool, as before. [daveey]
+try:
+    from hermes_cli.web_thread_lanes import run_in_lane as _run_in_lane
+except ImportError:  # core before thread lanes
+    _run_in_lane = None
+
+
+async def _on_lane(lane, fn, *args, request=None, deadline=None, **kwargs):
+    if _run_in_lane is None:
+        return await run_in_threadpool(functools.partial(fn, *args, **kwargs))
+    return await _run_in_lane(lane, fn, *args, request=request, deadline=deadline, **kwargs)
 from pydantic import BaseModel, ConfigDict, StrictInt, StrictStr
 
 API_VERSION = 2
@@ -266,7 +281,7 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
         return out
 
     @router.get('/requests')
-    def requests(session: str, include: str = ''):
+    async def requests(request: Request, session: str, include: str = ''):
         # Withdrawn requests are omitted unless asked for: older Desktop builds reject unknown states.
         def action():
             own = owner(session)
@@ -278,7 +293,7 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
             retire_moot(st, own)
             presenter = mirror()
             return {'requests': [presenter.present(r) for r in st.views(own, include_withdrawn=include == 'withdrawn')]}
-        return run(action)
+        return await _on_lane('feed', run, action, request=request)
 
     @router.get('/requests/{request_id}')
     def request(request_id: str, session: str):
@@ -359,9 +374,9 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
         return run(lambda: {'results': store().reconcile(owner(session), delivery())})
 
     @router.get('/steps')
-    def steps(session: str = ''):
+    async def steps(request: Request, session: str = ''):
         # Compatibility read only; old callers cannot mutate through /resolve.
-        return _load('core').steps_payload(ledger(), session)
+        return await _on_lane('feed', lambda: _load('core').steps_payload(ledger(), session), request=request)
 
     @router.get('/step')
     def step(id: str, s: str = ''):
@@ -371,8 +386,7 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
                       if x.get('id') == id and x.get('session') == s), None)
         return {'root': root, 'step': _load('core').public_step(found) if found else None}
 
-    @router.get('/session-cards')
-    def session_cards(ids: str):
+    def _session_cards_read(ids: str):
         # Every card the lineage created or shepherds, finished ones included, for the Desktop session panel's
         # progress counts (core's /api/session-kanban-tasks lists only unfinished ones).
         wanted = [s.strip() for s in ids.split(',') if s.strip()][:50]
@@ -405,6 +419,10 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
                     return tasks
                 return _with_terminal_history(tasks, history, ids)
         return {'tasks': read(wanted), 'includes': ['done', 'archived']}
+
+    @router.get('/session-cards')
+    async def session_cards(request: Request, ids: str):
+        return await _on_lane('feed', _session_cards_read, ids, request=request)
 
     @router.post('/resolve')
     def resolve():
