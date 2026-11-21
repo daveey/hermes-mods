@@ -4,6 +4,8 @@ Reference for skill `five-whys`: its SKILL.md links this file from the step that
 
 ## Pitfalls
 
+- For native recovery proofs, distinguish stdio `tui_gateway.entry` from the web backend: the web lifespan starts the startup-resume sweep; a stdio restart alone does not exercise it. Test supported `session.resume` on the original stored ID for client-reconnect coverage, separately from automatic boot recovery. Internal handler parameters can be refused by the external RPC schema. Decode `record_json` before counting promises/attempts and verify that a preassigned delegation ID has a ledger row: capacity fallback can retain the ID without successful async admission.
+
 - For FIFO fixtures whose busy follow-up never admits, inspect whether live-turn policy consumed it before extending timeouts. Pin queue policy explicitly when the assertion requires separate turns, and wait for the real agent to replace its startup sentinel: a model HTTP-thread event can precede routing-visible publication. Prove the adverse published-agent ordering fails without the policy and passes with it, including descendant starvation; a passing sentinel bypass does not exercise busy routing.
 
 - For blocked-model admission fixtures, budget nested watchdogs together: progress waits must tolerate descheduling, the model-release gate must outlive admission observation, and the subprocess cap must contain the scenario. Reproduce the exact admission phase with a controlled peer SIGSTOP/SIGCONT as well as full descendant duty-cycle starvation; remove temporary signal instrumentation before shipping and preserve every FIFO/auth/delivery assertion. A larger polling budget alone can merely move failure into the model gate.
