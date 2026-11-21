@@ -346,3 +346,29 @@ def test_every_core_session_kind_is_classified(real):
     plugin._llm = lambda s, u: "NO"
     for kind in sorted(chats):
         assert plugin.judge("guard", f"{INCIDENT_REPLY} ({kind})", source=kind) is False, kind
+
+
+def test_person_wait_survives_real_core_store_and_blocks_done(real, tmp_path):
+    """Real core keeps only kind/id/label/state: the person wait must come back from get_outcome and block done."""
+    import json as _json
+
+    from hermes_state import SessionDB
+
+    so, plugin = real
+    sid = "chat-person-wait"
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(sid, source="desktop")
+        db.append_message(sid, role="user", content="Stage it once Eve confirms.")
+    finally:
+        db.close()
+    out = _json.loads(plugin.handle({"kind": "wait", "on": [{
+        "kind": "person", "contact": "Slack @Eve", "channel": "slack", "thread": "C0EXAMPLE/1.1",
+        "response": "confirm the key", "next_step": "run staging checks"}]}, session_id=sid))
+    assert out["ok"] and out["declared"], out
+    stored = so.get_outcome(sid)
+    item = stored["on"][0]
+    assert stored["kind"] == "waiting" and item["id"].startswith("person:slack:Slack @Eve")
+    assert "confirm the key" in item["label"] and item["state"] == "waiting"
+    refused = _json.loads(plugin.handle({"kind": "done", "summary": "parked a watch"}, session_id=sid))
+    assert not refused["ok"] and "named person" in refused["error"]

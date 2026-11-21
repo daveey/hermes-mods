@@ -24,12 +24,27 @@ class FakeCore(types.ModuleType):
 
     def __init__(self):
         super().__init__("hermes_state_outcome")
+        self.stored = {}
         self.declared, self.providers, self.judges, self.derived, self.derive_calls = [], {}, [], {}, []
 
     def declare_outcome(self, sid, outcome):
         if outcome.get("kind") not in ("done", "decision", "waiting", "running", "muted", "unresolved"):
             raise ValueError("bad kind")
         self.declared.append((sid, outcome))
+        self.stored[sid] = self._canonical(outcome)
+
+    CORE_WAIT_KINDS = ("card", "process", "cron", "time", "capacity", "subagent", "goal")
+
+    def _canonical(self, outcome):
+        """Mimics hermes_state_outcome: unknown wait kinds are rejected, only kind/id/label/state/eta survive."""
+        if outcome["kind"] != "waiting":
+            return dict(outcome)
+        items = []
+        for w in outcome["on"]:
+            if w.get("kind") not in self.CORE_WAIT_KINDS:
+                raise ValueError("a waiting outcome needs on[] items with a core kind")
+            items.append({k: w[k] for k in ("kind", "id", "label", "state", "eta") if k in w})
+        return {"kind": "waiting", "on": items}
 
     def derive_outcome(self, sid, *, db=None, ignore_live_turn=False, pending_reply=None):
         """Mimics core precedence: live turn, providers, then the judge (heuristic fallback) on the reply."""
@@ -52,7 +67,7 @@ class FakeCore(types.ModuleType):
         return self.derive_outcome(sid)
 
     def get_outcome(self, sid):
-        return None
+        return self.stored.get(sid)
 
     def register_outcome_provider(self, name, fn):
         self.providers[name] = fn
@@ -959,3 +974,81 @@ def test_decide_with_at_most_one_go_choice_is_unchanged(plugin, fake, home, labe
 def test_decide_blank_why_not_default_does_not_override(plugin, fake, home):
     out = call(plugin, {"kind": "decide", "items": [{**GO_TILE, "why_not_default": "   "}]})
     assert not out["ok"] and "run is settled" in out["error"]
+
+
+# ---- external person vs passive watch ----------------------------------------------------------------------
+
+PERSON = {"kind": "person", "contact": "Slack @Eve", "channel": "slack", "thread": "C0EXAMPLE/1700000000.000100",
+          "response": "confirm the staging key is rotated", "next_step": "run the staging checks once she answers"}
+
+
+def test_passive_watch_still_lets_done_show_done_with_watch(plugin, fake, monkeypatch):
+    # core's session_tasks leaves a watch=true park out; a passive green-eye check never blocks done.
+    _fake_ksa(monkeypatch, [])
+    out = call(plugin, {"kind": "done", "summary": "Merged; staging check parked as a watch."})
+    assert out["ok"] and fake.declared[-1][1]["kind"] == "done"
+
+
+def test_requested_slack_reply_is_a_visible_waiting_outcome(plugin, fake):
+    out = call(plugin, {"kind": "wait", "on": [PERSON]})
+    assert out["ok"] and out["declared"]
+    item = fake.stored["S1"]["on"][0]
+    assert fake.stored["S1"]["kind"] == "waiting" and item["state"] == "waiting"
+    assert item["id"] == "person:slack:Slack @Eve:C0EXAMPLE/1700000000.000100"
+    for needle in ("Slack @Eve", "slack", "C0EXAMPLE/1700000000.000100", "confirm the staging key is rotated",
+                   "run the staging checks once she answers"):
+        assert needle in item["label"]
+
+
+def test_person_wait_needs_structured_fields(plugin, fake):
+    for missing in ("contact", "channel", "response", "next_step"):
+        bad = {k: v for k, v in PERSON.items() if k != missing}
+        out = call(plugin, {"kind": "wait", "on": [bad]})
+        assert not out["ok"] and missing in out["error"]
+    assert fake.declared == []
+
+
+def test_done_refused_while_person_reply_is_outstanding_even_with_a_watch(plugin, fake, monkeypatch):
+    call(plugin, {"kind": "wait", "on": [PERSON]})
+    _fake_ksa(monkeypatch, [])  # the parked staging task is a watch: invisible to session_tasks
+    out = call(plugin, {"kind": "done", "summary": "Staging check parked."})
+    assert not out["ok"] and "named person" in out["error"] and "person:slack:Slack @Eve" in out["error"]
+    assert fake.stored["S1"]["kind"] == "waiting"  # still shown waiting
+
+
+def test_response_moves_to_verification_and_stays_visible(plugin, fake):
+    call(plugin, {"kind": "wait", "on": [PERSON]})
+    out = call(plugin, {"kind": "wait", "on": [{**PERSON, "state": "verifying"}]})
+    assert not out["ok"] and "evidence" in out["error"]
+    out = call(plugin, {"kind": "wait", "on": [{**PERSON, "state": "verifying", "evidence": "her reply in the thread"}]})
+    assert out["ok"]
+    item = fake.stored["S1"]["on"][0]
+    assert item["state"] == "verifying" and item["label"].startswith("Verifying Slack @Eve")
+    # verification is not completion
+    assert not call(plugin, {"kind": "done", "summary": "ok"})["ok"]
+
+
+def test_completion_after_verification_is_done(plugin, fake, monkeypatch):
+    _fake_ksa(monkeypatch, [])
+    call(plugin, {"kind": "wait", "on": [{**PERSON, "state": "verifying", "evidence": "her reply in the thread"}]})
+    wid = fake.stored["S1"]["on"][0]["id"]
+    out = call(plugin, {"kind": "done", "summary": "Staging verified after her reply.",
+                        "closes_person_waits": [{"id": wid, "evidence": "staging checks green"}]})
+    assert out["ok"], out
+    assert fake.declared[-1][1] == {"kind": "done", "summary": "Staging verified after her reply."}
+    assert fake.stored["S1"]["kind"] == "done"
+
+
+def test_cannot_close_a_person_wait_that_never_got_a_reply(plugin, fake):
+    call(plugin, {"kind": "wait", "on": [PERSON]})
+    wid = fake.stored["S1"]["on"][0]["id"]
+    out = call(plugin, {"kind": "done", "summary": "x", "closes_person_waits": [{"id": wid, "evidence": "e"}]})
+    assert not out["ok"] and "no reply yet" in out["error"]
+    out = call(plugin, {"kind": "done", "summary": "Dropped by the user.",
+                        "closes_person_waits": [{"id": wid, "evidence": "user said drop it", "cancelled": True}]})
+    assert out["ok"]
+
+
+def test_person_wait_is_unaffected_for_other_wait_kinds(plugin, fake):
+    assert call(plugin, {"kind": "wait", "on": [{"kind": "card", "id": "t_1"}]})["ok"]
+    assert call(plugin, {"kind": "done", "summary": "ok after card wait"})["ok"]
