@@ -121,7 +121,7 @@ test('warmChains walks every waiting card\'s chain to its leaf, so a switch show
   const reads = []
   const details = {
     t_aaaaaa1: { task: { id: 't_aaaaaa1', title: 'Waiting card', status: 'blocked' }, events: [] },
-    t_bbbbbb2: { task: { id: 't_bbbbbb2', title: 'Middle', status: 'todo', parents: ['t_ccccccc3'] }, parents: [{ id: 't_ccccccc3', status: 'running' }], events: [] },
+    t_bbbbbb2: { task: { id: 't_bbbbbb2', title: 'Middle', status: 'todo' }, links: { parents: ['t_ccccccc3'] }, link_tasks: [{ id: 't_ccccccc3', status: 'running' }], events: [] },
     t_ccccccc3: { task: { id: 't_ccccccc3', title: 'Leaf', status: 'running' }, events: [] }
   }
   window.hermesDesktop = { api: async ({ path }) => { const id = /tasks\/([^?]+)/.exec(path)?.[1]; reads.push(id); return details[id] || {} } }
@@ -135,6 +135,8 @@ test('warmChains walks every waiting card\'s chain to its leaf, so a switch show
     const ch = m.chainFor(item, Date.now(), { local, fallback: () => route })
     assert.ok(!ch.loading, 'warm: the whole chain is known')
     assert.ok(reads.includes('t_bbbbbb2'), 'the named card was read')
+    assert.ok(reads.includes('t_ccccccc3'), 'the walk went on to the leaf card')
+    assert.equal(ch.leaf.kind, 'running', 'the chain ends on the running leaf')
   } finally { delete window.hermesDesktop }
 })
 

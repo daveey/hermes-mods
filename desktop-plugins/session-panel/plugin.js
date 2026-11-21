@@ -437,13 +437,23 @@ const TITLE_MAX = 500
 const titles = new Map()
 // Reads in flight (card, park, title, chat title), so the background warm can wait for a chain's next hop to land.
 const readFlights = new Set()
-const flight = p => { readFlights.add(p); p.finally(() => readFlights.delete(p)); return p }
+const flight = p => {
+  readFlights.add(p)
+  const forget = setTimeout(() => readFlights.delete(p), 60_000) // a read that never answers is not waited on forever
+  forget?.unref?.()
+  p.finally(() => { clearTimeout(forget); readFlights.delete(p) })
+  return p
+}
 /** Resolves once every read in flight now has answered (or failed), or after `ms` (a bridge can ignore its timeout). */
 export const readsSettled = (ms = 10_000, list = [...readFlights]) => Promise.race([Promise.allSettled(list),
   new Promise(r => { const t = setTimeout(r, ms); t?.unref?.() })])
 /** Set as the most recent entry (Map order = recency, so eviction drops the least recently used), capped. */
 const put = (map, k, v) => { map.delete(k); map.set(k, v); while (map.size > TITLE_MAX) map.delete(map.keys().next().value) }
 const titleSubs = new Set()
+// Read answers re-render the panel at once. Reads the background warm starts (`quietReads`, another chat's chain)
+// do not: warmChains re-renders once when its walk ends, instead of once per read.
+let quietReads = false
+const notifyTitles = (loud = true) => { if (loud) titleSubs.forEach(fn => fn()) }
 /** Where a card named in `chip`'s wait text is read and opened: the chip's owner route, else the chat's. */
 export function refRoute(chip, fallback = () => panelRoute()) {
   if (chip?.connectionId) return { connectionId: chip.connectionId, profile: str(chip.profile) || 'default', board: str(chip.board) || 'default' }
@@ -540,12 +550,12 @@ export function parkFor(chip, nowMs = Date.now(), read = readPark, fallback) {
   if (hit && (hit.pending ? age < PARK_PENDING_MS : age < (hit.failed ? PARK_RETRY_MS : PARK_FRESH_MS))) {
     return { state: hit.pending && !hit.park ? 'loading' : hit.failed && !hit.park ? 'failed' : hit.stale ? 'stale' : 'ok', park: hit.park || null }
   }
-  if (parks.size >= TITLE_MAX) parks.delete(parks.keys().next().value)
   put(parks, k, { ...(hit || {}), at: nowMs, pending: true })
+  const loud = !quietReads
   flight(Promise.resolve(read(route, chip.id)).catch(() => ({ failed: true })).then(r => {
     put(parks, k, { park: r?.failed ? hit?.park || null : r?.park || null, failed: !!r?.failed, stale: !!r?.failed && !!hit?.park, at: Date.now() })
     saveReadsSoon()
-    titleSubs.forEach(fn => fn())
+    notifyTitles(loud)
   }))
   // A known answer (a park, or a read that found none) shows while it is re-read; only a first read is loading.
   const known = hit && !hit.pending && !hit.failed
@@ -574,13 +584,13 @@ export function cardRef(chip, id, nowMs = Date.now(), read = readTitle, fallback
   const k = titleKey(route, id), hit = titles.get(k)
   const age = hit ? nowMs - hit.at : Infinity
   if (hit && (hit.pending ? age < TITLE_PENDING_MS : age < (hit.title ? TITLE_FRESH_MS : TITLE_RETRY_MS))) return { route, title: hit.title, board: hit.board || route.board, state: hit.state || '' }
-  if (titles.size >= TITLE_MAX) titles.delete(titles.keys().next().value)
   put(titles, k, { title: hit?.title || '', board: hit?.board || route.board, at: nowMs, pending: true })
+  const loud = !quietReads
   flight(Promise.resolve(read(route, id)).catch(() => ({ title: '' })).then(r => {
     const title = str(r?.title) || hit?.title || ''
     put(titles, k, { title, board: str(r?.board) || hit?.board || route.board, at: Date.now() })
     if (title) saveReadsSoon()
-    if (str(r?.title) && r.title !== hit?.title) titleSubs.forEach(fn => fn())
+    if (str(r?.title) && r.title !== hit?.title) notifyTitles(loud)
   }))
   return { route, title: hit?.title || '', board: hit?.board || route.board }
 }
@@ -600,7 +610,8 @@ export function sessionTitle(route, sid, nowMs = Date.now(), read = readSessionT
   // A known title is kept; a restored one (at -Infinity) is shown and re-read once (chats get renamed).
   if (hit && ((hit.title && hit.at !== -Infinity) || (!hit.title && nowMs - hit.at < (hit.pending ? TITLE_PENDING_MS : TITLE_RETRY_MS)))) return hit.title
   put(sessionTitles, k, { title: hit?.title || '', at: nowMs, pending: true })
-  flight(Promise.resolve(read(route, sid)).catch(() => '').then(t => { put(sessionTitles, k, { title: str(t) || hit?.title || '', at: Date.now() }); if (t) { saveReadsSoon(); titleSubs.forEach(fn => fn()) } }))
+  const loud = !quietReads
+  flight(Promise.resolve(read(route, sid)).catch(() => '').then(t => { put(sessionTitles, k, { title: str(t) || hit?.title || '', at: Date.now() }); if (t) { saveReadsSoon(); notifyTitles(loud) } }))
   return hit?.title || ''
 }
 async function readSessionTitle(route, sid) {
@@ -964,6 +975,7 @@ export const WARM_RECENT = 8
 export const WARM_SIDEBAR = 12
 export const WARM_MAX = 20
 export const WARM_EVERY_MS = 2 * 60_000
+export const WARM_STEP_MS = 30_000
 export const WARM_TICK_MS = 30_000
 export const WARM_SETTLE_MS = 10_000
 const warmedAt = new Map() // routeKey -> ms
@@ -1012,12 +1024,15 @@ export async function warmChains(route, { snapshot = (typeof window !== 'undefin
   const deadline = Date.now() + 20_000
   for (let round = 0; round < 8 && Date.now() < deadline; round++) {
     const before = new Set(readFlights)
-    const loading = rows.map(i => chainFor(i, Date.now(), { local, fallback })).some(c => c.loading)
+    quietReads = true
+    let loading
+    try { loading = rows.map(i => chainFor(i, Date.now(), { local, fallback })).some(c => c.loading) } finally { quietReads = false }
     if (!loading || !readFlights.size) break
     // Wait for the reads this round started (the next hops); a hop already in flight from elsewhere gets 2 s.
     const started = [...readFlights].filter(f => !before.has(f))
     await readsSettled(Math.min(Math.max(0, deadline - Date.now()), started.length ? 10_000 : 2_000), started.length ? started : [...readFlights])
   }
+  notifyTitles() // one re-render for the whole walk (the focused chat may share a card with it)
   return rows.length
 }
 
@@ -1048,7 +1063,9 @@ export async function warmRecent({ nowMs = Date.now(), force = false } = {}) {
       if (typeof document !== 'undefined' && document.hidden) break
       if (routeKey(panelRoute()) !== focused) break // the user switched: stop, the next pass starts over
       warmedAt.set(key, nowMs)
-      const safe = p => Promise.resolve(p).catch(e => { log('warm failed', key, e?.message || e); return false })
+      // Each step is bounded: a bridge that ignores its own timeout must not leave `warming` stuck for the session.
+      const safe = p => Promise.race([Promise.resolve(p), new Promise((_, no) => { const t = setTimeout(() => no(new Error('warm step timed out')), WARM_STEP_MS); t?.unref?.() })])
+        .catch(e => { log('warm failed', key, e?.message || e); return false })
       await safe(window.__sessionTasks?.warm?.(route))
       await safe(window.__userSteps?.warm?.(route))
       await safe(warmDone(route))
@@ -1435,8 +1452,8 @@ export function cardInfo(chip, id, nowMs = Date.now(), read = readCard, fallback
   if (!route.connectionId) return { state: 'failed', info: null }
   const k = titleKey(route, id), hit = cards.get(k), age = hit ? nowMs - hit.at : Infinity
   if (hit && (hit.pending ? age < TITLE_PENDING_MS : age < (hit.info && !hit.stale ? CARD_FRESH_MS : CARD_RETRY_MS))) return { state: hit.info ? (hit.stale ? 'stale' : 'ok') : hit.pending ? 'loading' : 'failed', info: hit.info ? (hit.stale ? { ...hit.info, stale: true } : hit.info) : null }
-  if (cards.size >= TITLE_MAX) cards.delete(cards.keys().next().value)
   put(cards, k, { info: hit?.info || null, ...(hit?.stale ? { stale: true } : {}), at: nowMs, pending: true })
+  const loud = !quietReads
   flight(Promise.resolve(read(route, id)).catch(() => null).then(r => {
     const t = r?.detail?.task
     if (t) sharePark(route, id, r)
@@ -1445,7 +1462,7 @@ export function cardInfo(chip, id, nowMs = Date.now(), read = readCard, fallback
     put(cards, k, { info, stale: !t && !!hit?.info, at: Date.now() })
     if (info?.title && t) { titles.delete(k); titles.set(k, { title: info.title, board: info.board, state: info.status, at: Date.now() }); while (titles.size > TITLE_MAX) titles.delete(titles.keys().next().value) }
     saveReadsSoon()
-    titleSubs.forEach(fn => fn())
+    notifyTitles(loud)
   }))
   return { state: hit?.info ? (hit.stale ? 'stale' : 'ok') : 'loading', info: hit?.info ? (hit.stale ? { ...hit.info, stale: true } : hit.info) : null }
 }
@@ -1920,6 +1937,15 @@ export function Panel() {
   const [tasks, setTasks] = useState(() => (typeof window !== 'undefined' ? window.__sessionTasks?.snapshot : null) || null)
   const [doneState, setDone] = useState(done)
   const [, setTick] = useState(0)
+  const firstPaint = useRef({ scope: null, at: 0 })
+  // When a cached copy's honour runs out (CACHED_HONOUR_MS after its paint), re-render then, so a read that never
+  // answers turns its cards unknown on time instead of on the next unrelated render.
+  const honourLeft = useRef(0)
+  useEffect(() => {
+    if (!(honourLeft.current > 0)) return
+    const t = setTimeout(() => setTick(x => x + 1), honourLeft.current + 50)
+    return () => clearTimeout(t)
+  })
   const [collapsedKeys, setCollapsedState] = useState(readCollapsed)
   const [finishedScopes, setFinishedScopes] = useState(() => new Set())
   const [reportedScopes, setReportedScopes] = useState(() => new Set())
@@ -1952,10 +1978,14 @@ export function Panel() {
   // Match on the stored chat only: the runtime id lands later (resume), and gating on it hid this chat's
   // already-painted cards until session-tasks' next round (seconds after a switch).
   // Before session-tasks repaints for this chat (the first frame after a switch), its per-chat cache paints.
-  const snap = tasks && tasks.stored === stored ? tasks : (stored && (typeof window !== 'undefined' ? window.__sessionTasks : null)?.cachedSnapshot?.(scope, stored)) || null
+  // The first frame's cache paint time is fixed per chat, so the honour bound runs out (re-renders don't reset it).
+  if (firstPaint.current.scope !== scope) firstPaint.current = { scope, at: now }
+  const snap = tasks && tasks.stored === stored ? tasks : (stored && (typeof window !== 'undefined' ? window.__sessionTasks : null)?.cachedSnapshot?.(scope, stored, firstPaint.current.at)) || null
   const chips = snap?.chips || []
   // The switch's cached cards are judged as of when they were read until the fresh read lands (chipAsOf).
   const asOf = chips.reduce((a, c) => Math.min(a, chipAsOf(c, now)), now)
+  honourLeft.current = chips.reduce((a, c) => (chipAsOf(c, now) < now ? Math.min(a, Number(c.paintedAt) + CACHED_HONOUR_MS - now) : a), Infinity)
+  if (!Number.isFinite(honourLeft.current)) honourLeft.current = 0
   const silence = trackSubagents(chips, now, subMemory)
   noteTitles(chips)
   const isAsked = c => !!US?.requestForSource?.({ gatewayId: c.gatewayId || c.gateway, profile: c.profile, type: 'kanban', board: c.board, id: c.id })

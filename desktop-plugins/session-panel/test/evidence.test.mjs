@@ -321,3 +321,17 @@ test('the cached copy is honoured only briefly after the paint, and only when re
   assert.equal(m.chipAsOf({ ...tagged(100, 590), kind: 'bg' }, now), now, 'process / sub-agent chips are always live')
   assert.equal(m.chipAsOf(c, now), now, 'an untagged (fresh) card is judged at now')
 })
+
+test('when the honour window runs out the panel re-renders on its own: a read that never answered turns unknown', { skip }, async () => {
+  const now = (BASE_AT + 600) * 1000
+  const chips = [card('task-a', 'running', { observations: [record('task-a')], cachedAt: (BASE_AT + 100) * 1000, paintedAt: now - m.CACHED_HONOUR_MS + 20 })]
+  bridges({ chips })
+  window.__sessionTasks.snapshot = { runtime: 'R1', stored: 'S1', chips, cachedAt: (BASE_AT + 100) * 1000 }
+  at(600)
+  await show(React.createElement(m.Panel, { key: 'honour-expiry' }))
+  assert.equal(el().querySelectorAll('[data-running-row]').length, 1)
+  at(601) // no event from any source after this: only the panel's own timer can re-render
+  await React.act(async () => { await new Promise(r => setTimeout(r, 200)) })
+  assert.equal(el().querySelectorAll('[data-running-row]').length, 0)
+  assert.equal(el().querySelector('[data-panel-updating]'), null)
+})
