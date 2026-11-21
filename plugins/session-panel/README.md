@@ -26,14 +26,14 @@ The feed thread starts on the first request (only `hermes serve`, which runs plu
 
 1. Data stamps of every board, board replica and `state.db` (core's `session_list_flight.data_stamp`, else file mtime/size): 2 ms on the hub for 19 files. Unchanged and no full refresh due: done.
 2. Cards with new `task_events` rows since the last tick, per file (`id > cursor`), with each card's chat. Heartbeat events are not changes (the full refresh renews run evidence), and card rows leave out `last_heartbeat_at`, so a heartbeat alone never re-pushes a bundle.
-3. Recompute only watched chats whose bundle references a changed card or whose lineage owns one; every watched chat every 60 s (`FULL_EVERY_S`) as a safety net for changes with no event.
+3. Recompute only watched chats whose bundle references a changed card or whose lineage owns one. As a safety net for changes with no event: a chat with open cards every 60 s (`FULL_EVERY_S`; their run evidence expires), one with none every 5 min (`QUIET_FULL_EVERY_S`). Measured on the hub (12 watched chats): core's `session_tasks` is ~0.35 s CPU per chat and dominates; card records, stamps and change detection are under 0.1 s for 24 chat passes.
 4. Hash each bundle (without `computed_at`); push only the ones that differ, in one batch, under one new revision.
 
 5. Nothing to push: a heartbeat when 20 s have passed since the last push.
 
 Bundles are computed outside any lock, on per-thread read-only connections (reopened when a file was replaced, another inode, dropped when it is gone; a catch-up request thread closes its own when done). Each compute takes a sequence number before it reads, and a bundle computed earlier never replaces one computed later (a slow catch-up racing the tick). Storing, taking a revision and pushing are serialized, so revisions go out in order. One chat's failure keeps its last bundle, never stops the others, is logged (first time at warning) and counted in `/status`; a failing push is dropped (clients see no heartbeat and catch up).
 
-Changes with no `task_events` row (a chat link adopted or released, a wake probe's next run, another card's queue move, origin receipt history) show at the next full refresh, within 60 s.
+Changes with no `task_events` row (a chat link adopted or released, a wake probe's next run, another card's queue move, origin receipt history) show at the next full refresh: within 60 s for a chat with open cards, 5 min for one with none.
 
 ## Desktop
 

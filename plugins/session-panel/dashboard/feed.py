@@ -34,7 +34,8 @@ import time
 import uuid
 from typing import Any, Callable, Iterable, Optional
 
-FULL_EVERY_S = 60.0          # every watched chat is recomputed at least this often
+FULL_EVERY_S = 60.0          # a watched chat with open cards is recomputed at least this often (run evidence)
+QUIET_FULL_EVERY_S = 300.0   # one with none (it changes only through card events, which recompute it at once)
 HEARTBEAT_S = 20.0           # with nothing to push, a heartbeat at least this often (clients' liveness)
 INTEREST_TTL_S = 15 * 60.0   # a chat nobody re-registers stops being computed
 MAX_WATCHED = 200            # interest cap across all clients
@@ -219,7 +220,17 @@ class Feed:
         self._stamps = stamps
         if full:
             self._last_full = now
-            dirty = set(watched)
+            # Open cards carry run evidence that expires: those chats every FULL_EVERY_S. A chat with none changes
+            # only through card events (handled below) or a link adopted with no event: every QUIET_FULL_EVERY_S.
+            with self.lock:
+                dirty = {s for s in watched if s not in self.bundles or self.bundles[s]['bundle'].get('tasks')
+                         or now - self.bundles[s]['bundle'].get('computed_at', 0) >= QUIET_FULL_EVERY_S}
+            touched = {v for v in changed_cards.values() if v}
+            with self.lock:
+                for s in watched:
+                    b = self.bundles.get(s)
+                    if b and (b['refs'] & set(changed_cards) or b['lineage'] & touched):
+                        dirty.add(s)
         else:
             touched = {v for v in changed_cards.values() if v}
             with self.lock:

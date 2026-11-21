@@ -167,6 +167,29 @@ def test_full_refresh_recomputes_every_watched_chat_and_catches_unevented_change
     assert f.tick() == 1 and set(pushed[-1]['bundles']) == {'S2'}
 
 
+def test_a_chat_with_no_open_cards_is_fully_refreshed_only_every_quiet_interval():
+    f, r, pushed, t = make()
+    r.links['S3'] = []
+    r.lineages['S3'] = ['S3']
+    f.changes(['S2', 'S3'])
+    computed = []
+    real = f.compute
+    f.compute = lambda s: (computed.append(s), real(s))[1]
+    t['now'] += feedmod.FULL_EVERY_S + 1
+    f.tick()
+    assert computed == ['S2'], 'S3 has no open cards: not every minute'
+    computed.clear()
+    t['now'] += feedmod.QUIET_FULL_EVERY_S
+    f.tick()
+    assert 'S3' in computed, 'but within QUIET_FULL_EVERY_S'
+    computed.clear()
+    r.events = [('t_newcard', 'S3')]  # a card created in S3: recomputed at once
+    r.stamp = 77
+    t['now'] += 1
+    f.tick()
+    assert computed == ['S3']
+
+
 def test_interest_expires_and_is_capped():
     f, r, _, t = make()
     f.changes(['S1'])
