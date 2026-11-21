@@ -1,5 +1,6 @@
 """Leading-edge send, coalescing and opt-in server stage timing."""
 import time
+import threading
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -19,6 +20,7 @@ def stream_app(api, monkeypatch, state, compute_s=0.0, calls=None):
         return {'status': seen}
     monkeypatch.setattr(api, 'lane_view', view)
     monkeypatch.setattr(api, 'WATCH_S', .02)
+    monkeypatch.setattr(api, 'MIN_PROJECT_GAP_S', .1, raising=False)
     monkeypatch.setattr(api, 'HEARTBEAT_S', 30)
     app = FastAPI()
     app.include_router(api.router)
@@ -38,7 +40,7 @@ def test_first_dirty_tick_after_quiet_projects_without_a_fixed_wait(monkeypatch)
             assert time.monotonic() - start < .5, 'the old 1 s trailing debounce is back'
 
 
-def test_changes_during_a_slow_projection_coalesce_into_one_immediate_follow_up(monkeypatch):
+def test_changes_during_a_slow_projection_coalesce_into_one_gapped_follow_up(monkeypatch):
     api = load()
     state = {'status': 'a', 'cursor': 0}
     calls = []
@@ -55,7 +57,45 @@ def test_changes_during_a_slow_projection_coalesce_into_one_immediate_follow_up(
             assert second['view']['status'] == 's6'
             assert len(calls) == 3, calls
             gap = second['timing']['project_start'] - first['timing']['project_end']
-            assert 0 <= gap < .2, gap
+            assert .1 <= gap < .3, gap
+
+
+def test_continuous_churn_bounds_projection_duty_and_preserves_latest(monkeypatch):
+    api = load()
+    state = {'status': '0', 'cursor': 0}
+    starts = []
+    app = stream_app(api, monkeypatch, state, compute_s=.12, calls=starts)
+    # Scaled production case: a 1.2 s projection and revisions every .95 s.
+    monkeypatch.setattr(api, 'WATCH_S', .025)
+    stop = threading.Event()
+
+    def churn():
+        for revision in range(1, 12):
+            if stop.wait(.095):
+                return
+            state.update(status=str(revision), cursor=revision)
+
+    with TestClient(app) as client:
+        with client.websocket_connect('/v1/lanes/stream?debug=true') as ws:
+            frames = [ws.receive_json()]
+            thread = threading.Thread(target=churn)
+            thread.start()
+            try:
+                while frames[-1]['view']['status'] != '11':
+                    frames.append(ws.receive_json())
+            finally:
+                stop.set()
+                thread.join()
+            assert len(starts) <= 7, starts
+            for first, second in zip(frames, frames[1:]):
+                gap = second['timing']['project_start'] - first['timing']['project_end']
+                assert gap >= .1, gap
+            time.sleep(.15)
+            monkeypatch.setattr(api, 'WATCH_S', .25)
+            changed = time.monotonic()
+            state.update(status='quiet', cursor=12)
+            assert ws.receive_json()['view']['status'] == 'quiet'
+            assert time.monotonic() - changed < .6
 
 
 def test_debug_frames_carry_ordered_server_stage_timings_only_on_request(monkeypatch):
