@@ -57,6 +57,11 @@ metadata:
      the current one; don't rewrite content otherwise.
    - Verify: every non-blank line of the backup is in one of the new files; each new skill loads via
      `skill_view`; a `skill_manage patch` on a sub-skill is accepted.
+   - Trimming a SKILL.md over the 30k body budget is a different move: carry situational sections (pitfalls,
+     notes, failure handling, unattended/cron runs) verbatim to `references/<topic>.md`, leaving the heading plus a
+     one-line "read when" pointer. Never move the main procedure, and skip any unit over ~75% of the body: a
+     largest-section-first move hollowed procedure skills into a single pointer. Skills whose bulk IS the procedure
+     need a real redesign into sub-skills; report them instead of moving text.
    - Grep the repo docs for copies of the skill elsewhere (other profiles, remote gateways) and update the
      copy instruction to name all the new dirs.
 4. **Unreferenced references**: check machine consumers before treating a missing Markdown link as an orphan.
