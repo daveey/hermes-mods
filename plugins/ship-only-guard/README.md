@@ -240,9 +240,20 @@ Any failed or odd read refuses with the
 reason; a blocking verdict on H itself is never overridden. Base drift is
 checked separately and still applies. Why: #1812, #1837 and #2438 were refused
 although `gh pr update-branch` left their patch-id unchanged. Missing/malformed/offline,
-main/other base, changed head, pending/failed/skipped/neutral checks, a possibly
+main/other base, changed head, pending/failed/skipped/neutral checks (one exemption below), a possibly
 truncated rollup, unreadable reviews/comments, an unanswered review point and a
 missing exact-head approval fail closed. This is not a blanket non-main exemption.
+
+**One exempt check: Blacksmith's on-demand `Proof`.** Since 2026-11-21 the `blacksmith-sh`
+app adds a `Proof` check run to every PR head, concluded SKIPPED ("Proof is set to run only
+when asked"). It is an AI demo, not CI evidence, and each run costs money, so the state
+preflight (`on_demand_proof_skip` in `guard.py`; it is the only rollup evaluation for a state
+merge, and the update-branch carry and land-turn reads take their checks from that same
+preflight) ignores it. It counts only when it is a `CheckRun` named `Proof`, COMPLETED and
+SKIPPED, has no `workflowName`, and its `detailsUrl` is `https` on `blacksmith.sh` or a
+subdomain. Proof with any other conclusion or status, another app's skipped check, or a
+look-alike host still refuses. At least one other check must exist and be green. The
+upstream-sync route and main ship are unchanged. Tests: `tests_proof_skip.py`.
 
 **Why a carry needs no confirm review on the new head.** A carry does not ask
 for an `Exact-head confirmation` review on H, by design (decided in
