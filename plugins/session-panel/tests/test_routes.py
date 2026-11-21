@@ -93,3 +93,36 @@ def test_a_plugin_reload_resumes_the_process_feed_on_register_and_on_the_next_re
         if core.PROCESS_FEED is not None:
             core.PROCESS_FEED.stopped.set()
         core.PROCESS_FEED = None
+
+
+def test_a_changed_feed_py_is_loaded_anew_and_the_running_feed_handed_over(monkeypatch):
+    # [daveey 2026-11-21] a hot mods-reload re-imported plugin_api.py but kept the old feed.py module, so the feed
+    # fix stayed inactive until the backend restarted.
+    api = load('_spf_hot_api', HERE.parents[1] / 'dashboard' / 'plugin_api.py')
+    fakes = load('_spf_hot_fakes', HERE.parent / 'test_feed.py')
+    monkeypatch.setattr(api, 'CoreReaders', fakes.Readers)
+    monkeypatch.setattr(api, '_emit', lambda payload: None)
+    old_mod = api._load_feed()
+    assert api._load_feed() is old_mod, 'an unchanged feed.py is not reloaded'
+    old_mod.PROCESS_FEED = None
+    try:
+        running = api.feed()
+        first = running.changes(['S1'])
+        monkeypatch.setattr(old_mod, 'SOURCE_STAMP', ('older code',))  # feed.py on disk differs from what runs
+        new_mod = api._load_feed()
+        assert new_mod is not old_mod and new_mod.Feed is not old_mod.Feed
+        assert new_mod.PROCESS_FEED is running and running.stopped.is_set(), 'the old-class feed is stopped'
+        assert new_mod.PROCESS_LOCK is old_mod.PROCESS_LOCK
+        f = api.feed()
+        assert isinstance(f, new_mod.Feed) and not f.stopped.is_set()
+        assert f.epoch == first['epoch'] and f.rev == running.rev, 'same revision space under the new code'
+        out = f.changes(['S1'], since=first['rev'], epoch=first['epoch'])
+        assert out['reset'] is False and out['bundles'] == {}
+        sent = []
+        running.emit(sent.append)  # the old feed's emit is silenced
+        assert sent == []
+    finally:
+        mod = api._load_feed()
+        if mod.PROCESS_FEED is not None:
+            mod.PROCESS_FEED.stopped.set()
+        mod.PROCESS_FEED = None

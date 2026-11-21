@@ -52,17 +52,55 @@ EVENTS_KEPT = 40   # newest events per card record (heartbeats left out): the pa
 log = logging.getLogger(PLUGIN_ID)
 
 
+_FEED_KEY = '_session_panel_feed_core'
+_FEED_PATH = Path(__file__).resolve().parent / 'feed.py'
+_FEED_LOAD_LOCK = threading.Lock()
+
+
+def _feed_stamp() -> tuple:
+    try:
+        st = os.stat(_FEED_PATH)
+        return (st.st_ino, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return ()
+
+
 def _load_feed():
-    """feed.py, loaded once per process: it holds the process's one feed (PROCESS_FEED). hermes-sync restarts the
-    dashboard for any change under dashboard/, so a new feed.py takes effect with a fresh process."""
-    key = '_session_panel_feed_core'
-    if key in sys.modules:
-        return sys.modules[key]
-    spec = importlib.util.spec_from_file_location(key, Path(__file__).resolve().parent / 'feed.py')
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[key] = mod
-    spec.loader.exec_module(mod)
-    return mod
+    """feed.py as a module of this process: it holds the process's one feed (PROCESS_FEED), so it outlives plugin
+    reloads (plugin_api.py is re-imported; this module is not). A changed feed.py on disk is loaded anew on the next
+    call and the running feed is handed over: it is stopped here and the next feed() resumes it under the new code
+    (same epoch and revisions). [daveey 2026-11-21] a hot mods-reload re-imported plugin_api.py but kept the old
+    feed.py, so a feed fix did not take effect until the backend process restarted."""
+    stamp = _feed_stamp()
+    old = sys.modules.get(_FEED_KEY)
+    # Current, or feed.py unreadable (keep what runs). A module loaded by older code carries no stamp: reloaded.
+    if old is not None and (not stamp or getattr(old, 'SOURCE_STAMP', None) == stamp):
+        return old
+    with _FEED_LOAD_LOCK:
+        old = sys.modules.get(_FEED_KEY)
+        if old is not None and (not stamp or getattr(old, 'SOURCE_STAMP', None) == stamp):
+            return old
+        spec = importlib.util.spec_from_file_location(_FEED_KEY, _FEED_PATH)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[_FEED_KEY] = mod  # dataclasses resolve their module while it executes
+        try:
+            spec.loader.exec_module(mod)
+        except BaseException:
+            if old is not None:
+                sys.modules[_FEED_KEY] = old
+            else:
+                sys.modules.pop(_FEED_KEY, None)
+            raise
+        if old is not None:
+            with old.PROCESS_LOCK:
+                running = getattr(old, 'PROCESS_FEED', None)
+                mod.PROCESS_LOCK = old.PROCESS_LOCK  # one lock for every generation of this process's feed
+                mod.PROCESS_FEED = running
+                mod.RESTART = getattr(old, 'RESTART', None)
+                if running is not None and not isinstance(running, mod.Feed):
+                    running.stopped.set()  # the next feed() resumes it with the new code
+        mod.SOURCE_STAMP = stamp  # last: callers that saw no stamp waited on the lock above
+        return mod
 
 
 class CoreReaders:

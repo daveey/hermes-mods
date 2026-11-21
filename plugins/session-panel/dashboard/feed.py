@@ -133,6 +133,9 @@ class Feed:
             top = max((int(b['bundle'].get('computed_seq') or 0) for b in prev.bundles.values()), default=0)
             self._seq = itertools.count(top + 1)
             prev._successor = self
+            # Older feed code (a hot reload) has no stopped-check in its publish: silence it, so nothing it still
+            # computes is pushed under the revision space this feed now owns.
+            prev.emit = lambda payload: None
         return self
 
     def _current(self) -> 'Feed':
