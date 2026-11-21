@@ -47,6 +47,13 @@ def read(reader, session, lineage):
     out['profile'] = profile
     try:
         out['gateway'] = reader.ksc.load_identity().gateway
+        # user-steps owns local requests as `install:<id>`: the same gateway under its other name.
+        try:
+            from hermes_cli.install_identity import get_install_id
+            install = get_install_id()
+            out['gateway_aliases'] = [f'install:{install}'] if install else []
+        except Exception:
+            out['gateway_aliases'] = []
     except (AttributeError, OSError, ValueError, RuntimeError):
         # Core raises SyncUnavailable (RuntimeError) on standalone/unenrolled
         # installs. Missing hub identity must not discard the local panel inputs.

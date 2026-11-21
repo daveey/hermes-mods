@@ -157,6 +157,17 @@ def test_cross_owner_alias_is_never_attached_by_bare_card_id():
     assert not model._matches({'id': 't_abc123'}, foreign['scope']['sourceRefs'][0])
 
 
+def test_own_install_alias_attaches_request_to_card_but_foreign_install_does_not():
+    own = request()
+    own['scope']['sourceRefs'][0]['gatewayId'] = 'install:abc'
+    b = bundle(task(human_request=human(), wait={'wait_state': 'human'}), requests=[own])
+    m = model.reduce_panel({**b, 'gateway': 'remote', 'gateway_aliases': ['install:abc']}, now=NOW)
+    assert len(m['sections']['needs_you']) == 1
+    assert m['sections']['needs_you'][0]['request_id'] == own['requestId']
+    m = model.reduce_panel({**b, 'gateway': 'remote', 'gateway_aliases': ['install:zzz']}, now=NOW)
+    assert next(r for r in m['sections']['needs_you'] if r['source'] == 'card')['request_id'] is None
+
+
 def test_boolean_recommendation_and_explanation_in_native_question():
     r = {'requestId': 'q', 'revision': 1, 'state': 'open', 'title': 'Choose a route',
          'choices': [{'id': 'fast', 'label': 'Fast', 'recommended': True, 'explain': 'No extra cost'}, {'id': 'slow', 'label': 'Slow'}]}

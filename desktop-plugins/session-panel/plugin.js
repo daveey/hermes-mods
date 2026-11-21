@@ -248,54 +248,104 @@ export const chooseText = (row, option) => `Card ${row.id}: go with ${option.let
 export const validModel = model => model?.version === 1 && !!model.header?.counts && Array.isArray(model.header?.pips) &&
   MODEL_SECTIONS.every(([section]) => Array.isArray(model.sections?.[section]))
 
+// Palette and shapes carried over from the pre-hub panel so the cutover keeps the same look: one coloured box per
+// state (header pips and row markers read as one legend), red-edged ask cards, accent-filled recommended option.
+// Text colours keep >= 4.5:1 contrast on both themes via light-dark(); ACCENT_FILL carries white text.
+export const SECTION_COLOR = { needs_you: '#f85149', stuck: '#f0883e', running: '#3b82f6', waiting: '#d29922', ready: '#3fb950', done: '#8b949e' }
+const ACCENT_TEXT = 'light-dark(#0969da, #58a6ff)', ALERT_TEXT = 'light-dark(#cf222e, #ff7b72)', ACCENT_FILL = '#0969da'
+const muted = { color: 'var(--muted-foreground)', fontSize: 12 }
+const box = section => ({ width: 9, height: 9, borderRadius: 2, boxSizing: 'border-box', flex: 'none',
+  ...(section === 'waiting' ? { border: `1.5px solid ${SECTION_COLOR.waiting}` } : { background: SECTION_COLOR[section] || SECTION_COLOR.done }) })
+const ghostBtn = { minHeight: 26, padding: '2px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'transparent', color: 'var(--foreground)', font: 'inherit', fontSize: 12, whiteSpace: 'nowrap' }
+const PANEL_CSS = `[data-session-panel] [data-choice-letter]:not(:disabled):hover{background:color-mix(in srgb,var(--foreground) 5%,transparent)}
+[data-session-panel] [data-choice-letter][data-recommended-row]:not(:disabled):hover{background:color-mix(in srgb,${ACCENT_FILL} 15%,transparent)}
+[data-session-panel] [data-choice-letter]:disabled{cursor:default;opacity:.6}
+[data-session-panel] [data-line-row]{border-radius:5px}[data-session-panel] [data-line-row]:hover{background:color-mix(in srgb,var(--foreground) 5%,transparent)}
+[data-session-panel] summary{cursor:pointer}`
+const STATE_LABEL = { decision: 'needs your decision', needs_input: 'needs you', needs_user: 'needs you', working: 'working', done: 'done', stuck: 'stuck', idle: 'idle' }
+
 /** Pure model -> React tree. No parsing, classification, I/O, clock or ambient state. */
 export function renderModel(model, { onChoose, onAction, decisionStatus = () => null, onCheck } = {}) {
   if (!validModel(model)) return null
-  const details = row => row.details?.length > 0 && jsxs('details', { 'data-ask-details': '', style: modelSmall, children: [
-    jsx('summary', { children: 'Details' }),
-    ...row.details.map((text, i) => jsx('div', { style: { whiteSpace: 'pre-wrap', marginTop: 4 }, children: text }, i))
+  const state = str(model.header.state)
+  const alert = state === 'decision' || state === 'needs_input' || state === 'needs_user' || (model.header.counts.needs_you || 0) > 0
+  const details = row => row.details?.length > 0 && jsxs('details', { 'data-ask-details': '', style: { ...modelSmall, ...muted, flex: 1, minWidth: 0 }, children: [
+    jsx('summary', { style: { fontSize: 11.5 }, children: 'Details' }),
+    ...row.details.map((text, i) => jsx('div', { style: { whiteSpace: 'pre-wrap', marginTop: 4, fontSize: 11.5 }, children: text }, i))
   ] })
+  const openLinks = row => row.actions.filter(action => action.kind === 'open_card').map((action, i) => jsx('button', { type: 'button', 'data-open-card': '',
+    style: { ...askLinkBtn, fontSize: 11.5, whiteSpace: 'nowrap', cursor: onAction ? 'pointer' : 'default' }, disabled: !onAction, onClick: () => onAction?.(row, action), children: action.label }, `open${i}`))
+  const askRow = row => {
+    const status = decisionStatus(row)
+    const enabled = option => !!onChoose && (draftOnly(row) || (!!row.request_id && !!option.choice_id && row.actions.some(a => a.kind === 'decide' && a.owner && a.request_id === row.request_id && a.revision === row.request_revision))) && !status?.locked
+    const decision = row.options.length > 0
+    return jsxs('article', { 'data-panel-row': row.key, 'data-ask-row': row.source,
+      style: { border: '1px solid var(--border)', borderLeft: `3px solid ${SECTION_COLOR.needs_you}`, borderRadius: 8, padding: '10px 12px', marginBottom: 8, minWidth: 0, display: 'grid', gap: 8 }, children: [
+      jsxs('div', { style: { display: 'flex', alignItems: 'baseline', gap: 8, minWidth: 0 }, children: [
+        jsx('span', { 'data-ask-kind': '', style: { fontSize: 10.5, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: ALERT_TEXT, whiteSpace: 'nowrap' }, children: decision ? 'Needs your decision' : 'Needs you' }),
+        row.id && jsx('span', { 'data-ask-card': '', style: { ...muted, marginLeft: 'auto', fontSize: 10.5, fontFamily: 'var(--font-mono, ui-monospace, monospace)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', minWidth: 0 }, children: row.source === 'card' ? row.id : 'question' })
+      ] }),
+      jsx('strong', { 'data-ask-title': '', style: { fontWeight: 600, fontSize: 14, lineHeight: 1.35, overflowWrap: 'anywhere', marginTop: -4 }, children: row.title }),
+      row.detail && jsx('div', { style: { ...modelSmall, ...muted }, children: row.detail }),
+      row.situation && jsx('div', { 'data-ask-situation': '', title: row.situation, style: { ...modelSmall, fontSize: 12.5, ...clamp(3) }, children: row.situation }),
+      decision && jsx('div', { 'data-ask-options': '', style: { display: 'grid', gap: 6 }, children: row.options.map(option => {
+        const rec = !!option.recommended, on = enabled(option)
+        return jsxs('button', { type: 'button', 'data-choice-letter': option.letter, ...(rec ? { 'data-recommended-row': '' } : {}), disabled: !on,
+          'aria-label': `Choose option ${option.letter}: ${option.name}`, onClick: () => onChoose?.(row, option),
+          style: { textAlign: 'left', font: 'inherit', color: 'inherit', border: `1px solid ${rec ? ACCENT_FILL : 'var(--border)'}`, borderRadius: 6, padding: '8px 10px',
+            background: rec ? `color-mix(in srgb, ${ACCENT_FILL} 9%, transparent)` : 'transparent', display: 'grid', gridTemplateColumns: '22px minmax(0,1fr) auto', columnGap: 10, alignItems: 'start', cursor: on ? 'pointer' : 'default', minWidth: 0 }, children: [
+          jsx('span', { 'data-option-badge': '', 'aria-hidden': true, style: { width: 22, height: 22, borderRadius: 999, display: 'grid', placeItems: 'center', fontSize: 11.5, fontWeight: 700, background: rec ? ACCENT_FILL : 'color-mix(in srgb, var(--foreground) 12%, transparent)', color: rec ? '#fff' : 'var(--foreground)' }, children: option.letter }),
+          jsxs('span', { style: { minWidth: 0 }, children: [
+            jsxs('span', { style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }, children: [
+              jsx('strong', { 'data-option-label': '', style: { fontWeight: 600, fontSize: 13 }, children: option.name }),
+              rec && jsx('span', { style: pill(ACCENT_TEXT), children: 'Recommended' })
+            ] }),
+            jsx('span', { 'data-option-detail': '', title: option.detail, style: { display: 'block', fontSize: 12, lineHeight: 1.45, marginTop: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', color: 'var(--muted-foreground)' }, children: option.detail }),
+            rec && option.reason && jsx('span', { 'data-option-reason': '', style: { display: 'block', fontSize: 12, lineHeight: 1.45, marginTop: 3, color: ACCENT_TEXT }, children: `Why: ${option.reason}` })
+          ] }),
+          jsx('span', { 'aria-hidden': true, style: { ...ghostBtn, alignSelf: 'center', display: 'inline-flex', alignItems: 'center', ...(rec ? { background: ACCENT_FILL, borderColor: ACCENT_FILL, color: '#fff', fontWeight: 600 } : {}) }, children: `Choose ${option.letter}` })
+        ] }, option.letter)
+      }) }),
+      row.only_you && jsx('div', { 'data-ask-only-you': '', style: { ...modelSmall, ...muted }, children: row.only_you }),
+      draftOnly(row) && decision && jsx('div', { style: { ...muted, fontSize: 11 }, children: 'Choosing drafts your answer; send it in the chat to decide.' }),
+      status?.text && jsx('div', { role: 'status', style: { ...modelSmall, color: status.locked ? 'var(--foreground)' : ALERT_TEXT }, children: status.text }),
+      status?.locked && onCheck && jsx('button', { type: 'button', style: { ...ghostBtn, justifySelf: 'start', cursor: 'pointer' }, onClick: () => onCheck(row), children: 'Check status' }),
+      (row.details?.length > 0 || row.actions.some(a => a.kind === 'open_card')) && jsxs('div', { style: { display: 'flex', alignItems: 'flex-start', gap: 12, minWidth: 0 }, children: [
+        details(row), ...openLinks(row)
+      ] })
+    ] }, row.key)
+  }
+  // Every other section: one compact line per row — state box, title, short detail; details/open on the right.
+  const lineRow = (row, section) => jsxs('article', { 'data-panel-row': row.key, 'data-line-row': '',
+    style: { display: 'grid', gridTemplateColumns: '12px minmax(0,1fr) auto', columnGap: 8, alignItems: 'start', padding: '3px 4px', fontSize: 13, minWidth: 0 }, children: [
+    jsx('span', { 'aria-hidden': true, 'data-row-pip': section, style: { ...box(section), justifySelf: 'center', marginTop: 5 } }),
+    jsxs('div', { style: { minWidth: 0 }, children: [
+      jsx('strong', { 'data-ask-title': '', title: row.title, style: { display: 'block', fontWeight: 400, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: row.title }),
+      row.detail && jsx('div', { 'data-row-detail': '', style: { ...muted, overflowWrap: 'anywhere', ...(section === 'stuck' ? { color: SECTION_COLOR.stuck } : {}) }, children: row.detail }),
+      details(row)
+    ] }),
+    jsx('span', { style: { display: 'flex', gap: 8, paddingTop: 2 }, children: openLinks(row) })
+  ] }, row.key)
   return jsxs('section', { 'data-session-panel': '', 'data-hub-model': model.revision, 'aria-label': 'Session status',
-    style: { minWidth: 0, width: '100%', color: 'var(--foreground)', maxHeight: '55vh', overflowY: 'auto', padding: '6px 12px', boxSizing: 'border-box' }, children: [
-    jsxs('header', { style: { ...modelSmall, display: 'flex', gap: 8, flexWrap: 'wrap' }, children: [
-      jsx('strong', { children: 'This session' }),
-      jsx('span', { 'data-session-status': '', children: model.header.state }),
-      ...model.header.pips.map((pip, i) => jsx('span', { 'data-model-pip': pip.section, children: `${pip.count} ${pip.label}` }, i)),
+    style: { minWidth: 0, width: '100%', color: 'var(--foreground)', maxHeight: '55vh', overflowY: 'auto', padding: '6px 12px 8px', boxSizing: 'border-box',
+      borderBottom: '1px solid color-mix(in srgb, var(--border) 60%, transparent)', userSelect: 'text', WebkitUserSelect: 'text' }, children: [
+    jsx('style', { 'data-panel-css': '', children: PANEL_CSS }),
+    jsxs('header', { style: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 12, lineHeight: '18px', minWidth: 0 }, children: [
+      jsxs('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 6, color: 'var(--muted-foreground)' }, children: [
+        jsx('span', { 'aria-hidden': true, style: { width: 7, height: 7, borderRadius: '50%', background: alert ? SECTION_COLOR.needs_you : (model.header.counts.running ? SECTION_COLOR.running : SECTION_COLOR.done) } }),
+        jsx('span', { children: 'This session' })
+      ] }),
+      jsx('span', { 'data-session-status': '', title: STATE_LABEL[state] || state, style: { color: alert ? ALERT_TEXT : 'var(--muted-foreground)', fontWeight: alert ? 600 : 400 }, children: model.header.state }),
+      ...model.header.pips.map((pip, i) => jsxs('span', { 'data-model-pip': pip.section, style: { display: 'inline-flex', alignItems: 'center', gap: 5, color: pip.section === 'needs_you' ? ALERT_TEXT : pip.section === 'stuck' ? SECTION_COLOR.stuck : 'var(--muted-foreground)', fontWeight: pip.section === 'needs_you' || pip.section === 'stuck' ? 600 : 400 }, children: [
+        jsx('span', { 'aria-hidden': true, style: box(pip.section) }),
+        `${pip.count} ${pip.label}`
+      ] }, i)),
       // Counts are the hub's values, not row lengths, even if a test deliberately makes them disagree.
       ...MODEL_SECTIONS.map(([section]) => jsx('span', { 'data-model-count': section, hidden: true, children: model.header.counts[section] }, section))
     ] }),
     ...MODEL_SECTIONS.map(([section, label]) => model.sections[section].length > 0 && jsxs('div', { 'data-model-section': section, children: [
-      jsx('h3', { 'data-section': section.replaceAll('_', '-'), style: { fontSize: 12, margin: '10px 0 6px', color: 'var(--muted-foreground)' }, children: `${label} · ${model.header.counts[section]}` }),
-      ...model.sections[section].map(row => {
-        const status = decisionStatus(row)
-        return jsxs('article', { 'data-panel-row': row.key, ...(section === 'needs_you' ? { 'data-ask-row': row.source } : {}),
-          style: { border: '1px solid var(--border)', borderRadius: 8, padding: '8px 10px', marginBottom: 6, minWidth: 0, display: 'grid', gap: 6 }, children: [
-          jsx('strong', { 'data-ask-title': '', style: { fontSize: 13, overflowWrap: 'anywhere' }, children: row.title }),
-          row.detail && jsx('div', { style: modelSmall, children: row.detail }),
-          section === 'needs_you' && jsxs('div', { style: { display: 'grid', gap: 6 }, children: [
-            row.situation && jsx('div', { 'data-ask-situation': '', title: row.situation, style: { ...modelSmall, ...clamp(3) }, children: row.situation }),
-            ...row.options.map(option => jsxs('button', { type: 'button', 'data-choice-letter': option.letter,
-              ...(option.recommended ? { 'data-recommended-row': '' } : {}), disabled: !onChoose || (!draftOnly(row) && (!row.request_id || !option.choice_id || !row.actions.some(a => a.kind === 'decide' && a.owner && a.request_id === row.request_id && a.revision === row.request_revision))) || !!status?.locked,
-              'aria-label': `Choose option ${option.letter}: ${option.name}`,
-              onClick: () => onChoose?.(row, option),
-              style: { textAlign: 'left', font: 'inherit', color: 'inherit', border: '1px solid var(--border)', borderRadius: 6, padding: '8px 10px', background: option.recommended ? 'color-mix(in srgb, var(--foreground) 6%, transparent)' : 'transparent', display: 'grid', gridTemplateColumns: '22px minmax(0,1fr)', gap: 8, cursor: 'pointer' }, children: [
-              jsx('span', { 'data-option-badge': '', style: { fontWeight: 700 }, children: option.letter }),
-              jsxs('span', { style: { minWidth: 0 }, children: [
-                jsx('strong', { 'data-option-label': '', children: option.name }),
-                option.recommended && jsx('span', { style: { ...pill('var(--foreground)'), marginLeft: 8 }, children: 'Recommended' }),
-                jsx('span', { 'data-option-detail': '', title: option.detail, style: { display: 'block', ...modelSmall, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', color: 'var(--muted-foreground)' }, children: option.detail }),
-                option.recommended && option.reason && jsx('span', { 'data-option-reason': '', style: { display: 'block', ...modelSmall }, children: `Why: ${option.reason}` })
-              ] })
-            ] }, option.letter)),
-            row.only_you && jsx('div', { 'data-ask-only-you': '', style: modelSmall, children: row.only_you }),
-            draftOnly(row) && jsx('small', { children: 'Choosing drafts your answer; send it in the chat to decide.' }),
-            status?.text && jsx('div', { role: 'status', style: modelSmall, children: status.text }),
-            status?.locked && onCheck && jsx('button', { type: 'button', onClick: () => onCheck(row), children: 'Check status' })
-          ] }),
-          details(row),
-          ...row.actions.filter(action => action.kind === 'open_card').map((action, i) => jsx('button', { type: 'button', style: askLinkBtn, disabled: !onAction, onClick: () => onAction?.(row, action), children: action.label }, i))
-        ] }, row.key)
-      })
+      jsx('h3', { 'data-section': section.replaceAll('_', '-'), style: { fontSize: 11, fontWeight: 700, letterSpacing: 0.4, textTransform: 'uppercase', margin: '12px 0 6px', color: section === 'needs_you' ? ALERT_TEXT : section === 'stuck' ? SECTION_COLOR.stuck : 'var(--muted-foreground)' }, children: `${label} · ${model.header.counts[section]}` }),
+      ...model.sections[section].map(row => section === 'needs_you' ? askRow(row) : lineRow(row, section))
     ] }, section))
   ] })
 }

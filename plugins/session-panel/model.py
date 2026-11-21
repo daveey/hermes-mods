@@ -218,9 +218,14 @@ def _aliases(request):
             if isinstance(a, dict) and a.get('type') == 'kanban']
 
 
-def _matches(row, alias):
+def _matches(row, alias, same_gateway=()):
+    """`same_gateway`: other names of the serving gateway (its `install:<id>` owner id). user-steps
+    stamps local card refs with the install id while board rows carry the hub gateway name; without
+    this the card and its own mirrored request both show as separate asks."""
+    def gw(value):
+        return 'self' if value and value in same_gateway else value
     return str(alias.get('id')) == str(row.get('id')) and all(
-        bool(row.get(field)) and row[field] == alias.get(other)
+        bool(row.get(field)) and (gw(row[field]) if field == 'gateway' else row[field]) == (gw(alias.get(other)) if field == 'gateway' else alias.get(other))
         for field, other in (('gateway', 'gatewayId'), ('profile', 'profile'), ('board', 'board')))
 
 
@@ -256,6 +261,8 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
     sections = {s: [] for s in SECTIONS}
     requests = list(requests if requests is not None else bundle.get('requests') or [])
     used, seen = set(), set()
+    # The serving gateway's own names (board name + install owner id). Only these are equated, never a foreign one.
+    same_gateway = frozenset(g for g in [bundle.get('gateway'), *(bundle.get('gateway_aliases') or [])] if g) if bundle.get('gateway') else frozenset()
     read_at = number(bundle.get('computed_at')) or now
     for raw in bundle.get('tasks') or []:
         if not isinstance(raw, dict) or not raw.get('id'):
@@ -293,7 +300,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             v['detail'] = f'status unknown · last known: {state or "unknown"}; the card could not be re-read'
             sections['waiting'].append(v)
             continue
-        matches = [(i, r) for i, r in enumerate(requests) if any(_matches(row, a) for a in _aliases(r))]
+        matches = [(i, r) for i, r in enumerate(requests) if any(_matches(row, a, same_gateway) for a in _aliases(r))]
         if human_owned(row):
             live = next(((i, r) for i, r in matches if r.get('state') in ('open', 'needs_context') and not r.get('resolution')), None)
             if live:
@@ -347,7 +354,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         if i not in used and r.get('state') in ('open', 'needs_context') and not r.get('resolution'):
             # A linked card no longer waiting for a person cannot revive an obsolete mirror ask.
             aliases = _aliases(r)
-            linked = [t for t in bundle.get('tasks') or [] if any(_matches(t, a) for a in aliases)]
+            linked = [t for t in bundle.get('tasks') or [] if any(_matches({**t, 'gateway': t.get('gateway') or (bundle.get('gateway') if not t.get('remote') and t.get('source') != 'replica' else None), 'profile': t.get('profile') or bundle.get('profile'), 'board': t.get('board') or 'default'}, a, same_gateway) for a in aliases)]
             if linked and not any(human_owned(t) for t in linked):
                 continue
             sections['needs_you'].append(ask({}, r))
