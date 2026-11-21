@@ -109,11 +109,13 @@ def flow(window: str, now: Optional[float] = None) -> Dict[str, Any]:
             try:
                 db = replica if replica is not None else conn
                 if 'reader' in inspect.signature(kanban_lanes_flow.snapshot).parameters:
-                    contexts = _pr_contexts(db, kanban_lanes_flow)
+                    evidence = kanban_lanes_flow.Evidence(db) if hasattr(kanban_lanes_flow, 'Evidence') else None
+                    contexts = _pr_contexts(db, kanban_lanes_flow, evidence=evidence)
                     with _observer_init_lock:
                         reader = _observations().reader(contexts)
                         observation_cursor = reader.cursor
-                    body = dict(kanban_lanes_flow.snapshot(db, window=window, reader=reader))
+                    extra = {'evidence': evidence} if evidence is not None else {}
+                    body = dict(kanban_lanes_flow.snapshot(db, window=window, reader=reader, **extra))
                 else:
                     # Compatibility while the additive core reader seam rolls out.
                     body = dict(kanban_lanes_flow.snapshot(db, window=window))
@@ -131,7 +133,7 @@ def flow(window: str, now: Optional[float] = None) -> Dict[str, Any]:
     return body
 
 
-def _pr_contexts(db, flow_module):
+def _pr_contexts(db, flow_module, *, evidence=None):
     """Only a PR's owning card evidence invalidates its network observation.
 
     Heartbeats/external-watch ticks carry no head evidence. Other events on the
@@ -140,19 +142,22 @@ def _pr_contexts(db, flow_module):
     from collections import defaultdict
     groups = defaultdict(list)
     identity = tuple(tuple(row) for row in db.execute('PRAGMA database_list'))
-    for row in db.execute(f'SELECT * FROM tasks WHERE status IN {flow_module._OPEN}'):
-        events = db.execute('SELECT id,kind,payload FROM task_events WHERE task_id=? ORDER BY id', (row['id'],)).fetchall()
-        pr = flow_module._pr_snapshot(row, events, flow_module._awaiting(row, events))
-        if pr and pr.get('url'):
+    rows = evidence.rows if evidence is not None else db.execute(f'SELECT * FROM tasks WHERE status IN {flow_module._OPEN}')
+    for row in rows:
+        events = (evidence.events(row['id']) if evidence is not None else
+                  db.execute('SELECT id,kind,payload FROM task_events WHERE task_id=? ORDER BY id', (row['id'],)).fetchall())
+        pr = None if evidence is not None else flow_module._pr_snapshot(row, events, flow_module._awaiting(row, events))
+        url = evidence.pr_url(row) if evidence is not None else (pr or {}).get('url')
+        if url:
             revision = 0
             for event in events:
                 payload = flow_module._payload(dict(event))
                 meta = payload.get('metadata')
-                evidence = meta if isinstance(meta, dict) else payload
-                carries_pr = any(key in evidence for key in ('published_pr', 'reviewed_pr', 'pr', 'flow_pr', 'head', 'head_sha', 'headRefOid'))
+                pr_evidence = meta if isinstance(meta, dict) else payload
+                carries_pr = any(key in pr_evidence for key in ('published_pr', 'reviewed_pr', 'pr', 'flow_pr', 'head', 'head_sha', 'headRefOid'))
                 if event['kind'] not in ('heartbeat', 'external_watch') or carries_pr:
                     revision = max(revision, event['id'])
-            groups[pr['url']].append((row['id'], row['status'], row['completion_contract'], revision))
+            groups[url].append((row['id'], row['status'], row['completion_contract'], revision))
     return {url: (identity, tuple(sorted(cards))) for url, cards in groups.items()}
 
 

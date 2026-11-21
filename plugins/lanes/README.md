@@ -56,6 +56,12 @@ The render-only push interface needs no Desktop restart. Fast expanded projectio
 requires core's additive `snapshot(..., reader=...)` seam; older cores remain
 compatible but use the previous synchronous PR reads until upgraded naturally.
 
+A core exposing `Evidence(conn)` also shares one request-local ordered history
+between PR-context invalidation and flow classification. Each payload is decoded
+once, and dependency parent reads are reused within that view; no classified card
+cache survives into the next request. Older cores retain the existing projection
+path until upgraded naturally.
+
 PR network observation runs in one process-shared, bounded background worker,
 not the stream or GET request. A report consumes an immutable published reader.
 Entries expire 60 seconds after read **start**, refresh becomes due at 30 seconds,
