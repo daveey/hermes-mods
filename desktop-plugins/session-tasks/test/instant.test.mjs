@@ -474,8 +474,7 @@ test('a pushed bundle becomes the chat\'s feed-kept copy and its ancestry', () =
 
 test('a switch to a feed-kept chat paints it untagged and reads no kanban list while the feed is live', async () => {
   m.ingestFeed({ connectionId: 'conn', profile: 'default', session: 'chat-live', lineage: ['chat-live'], tasks: [card('t_l1')] })
-  m.markFeedLive('conn', 'default')
-  assert.equal(m.feedFresh(scopeOf('chat-live'), { connectionId: 'conn', profile: 'default' }), true)
+  assert.equal(m.feedFresh(scopeOf('chat-live')), true)
   focus.stored = 'chat-live'
   const paths = []
   host.request = async () => ({ processes: [], subagents: [] })
@@ -501,8 +500,10 @@ test('a switch to a feed-kept chat paints it untagged and reads no kanban list w
 })
 
 test('when the feed is not live a feed-kept chat is read as before', async () => {
-  m.ingestFeed({ connectionId: 'conn', profile: 'default', session: 'chat-dead', lineage: ['chat-dead'], tasks: [card('t_d1')] })
-  m.markFeedLive('conn', 'default', Date.now() - m.FEED_STALE_MS - 1)
+  const realNow = Date.now
+  Date.now = () => realNow() - m.FEED_STALE_MS - 1
+  try { m.ingestFeed({ connectionId: 'conn', profile: 'default', session: 'chat-dead', lineage: ['chat-dead'], tasks: [card('t_d1')] }) } finally { Date.now = realNow }
+  assert.equal(m.feedFresh(scopeOf('chat-dead')), false, 'no push re-stamped it')
   focus.stored = 'chat-dead'
   const paths = []
   host.request = async () => ({ processes: [], subagents: [] })
@@ -517,4 +518,20 @@ test('when the feed is not live a feed-kept chat is read as before', async () =>
     await m.refresh()
     assert.ok(paths.some(p => p.startsWith('/api/session-kanban-tasks')), 'stale feed: read it ourselves')
   } finally { dispose(); delete globalThis.window; delete host.request }
+})
+
+
+test('pushes re-stamp feed-kept chats; an untrusted bundle is an ordinary cached copy', () => {
+  const realNow = Date.now
+  try {
+    Date.now = () => 1_000_000
+    m.ingestFeed({ connectionId: 'conn', profile: 'default', session: 'chat-t', lineage: ['chat-t'], tasks: [card('t_t1')] })
+    m.ingestFeed({ connectionId: 'conn', profile: 'default', session: 'chat-u', lineage: ['chat-u'], tasks: [card('t_u1')], trusted: false })
+    Date.now = () => 1_000_000 + m.FEED_STALE_MS + 10
+    assert.equal(m.feedFresh(scopeOf('chat-t')), false)
+    assert.equal(m.touchFeed('conn', 'default', ['chat-t', 'chat-u'], Date.now()), 1, 'only the feed-kept chat is re-stamped')
+    assert.equal(m.feedFresh(scopeOf('chat-t')), true)
+    assert.equal(m.feedFresh(scopeOf('chat-u')), false, 'untrusted: never current')
+    assert.deepEqual(m.cachedChips(scopeOf('chat-u')).kanban.map(c => c.id), ['t_u1'], 'still a prepaint copy')
+  } finally { Date.now = realNow }
 })

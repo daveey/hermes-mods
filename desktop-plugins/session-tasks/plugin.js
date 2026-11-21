@@ -830,40 +830,45 @@ const subs = new Set()
 let timer = null
 let lastKanbanAt = 0
 
-// ── session-panel-feed (the gateway pushes each watched chat's cards) ──────
+// ── session-panel feed (the gateway pushes each watched chat's cards) ──────
 // [daveey 2026-11-20] "precompute the status panel data on the hub ... kept in sync without polling". session-panel
-// runs the feed client (catch-up + pushed events) and hands each chat's bundle here: its cards become this chat's
-// cached copy, marked as feed-kept (`feedAt`), and the focused chat is republished at once. While the feed is live for
-// a connection (an answer or push within FEED_STALE_MS), a feed-kept chat is current: a switch to it paints its
-// cards untagged (no "updating…") and its own kanban read runs only every FEED_KANBAN_POLL_MS as a safety net.
+// runs the feed client and hands each chat's bundle here. A bundle that arrived while the gateway's pushes are flowing
+// (`trusted`) becomes this chat's feed-kept copy (`feedAt`), re-stamped by every later push or heartbeat that names
+// the chat (`touchFeed`). While its `feedAt` is within FEED_STALE_MS the copy is current: a switch paints it untagged
+// (no "updating…") and its kanban list is read only every FEED_KANBAN_POLL_MS as a safety net. When pushes stop, the
+// stamps stop, and after FEED_STALE_MS the chat is read as before. An untrusted bundle is an ordinary cached copy.
 export const FEED_STALE_MS = 150_000
 export const FEED_KANBAN_POLL_MS = 60_000
-const feedLiveAt = new Map() // JSON [connectionId, profile] -> ms
-export function markFeedLive(connectionId, profile = 'default', at = Date.now()) {
-  if (connectionId) feedLiveAt.set(JSON.stringify([connectionId, profile || 'default']), at)
-}
-export function feedLive(connectionId, profile = 'default', nowMs = Date.now()) {
-  const at = feedLiveAt.get(JSON.stringify([connectionId || '', profile || 'default']))
+/** True when this chat's cards are a feed-kept copy re-stamped within FEED_STALE_MS. */
+export function feedFresh(scope, _route, nowMs = Date.now()) {
+  const at = cachedChips(scope)?.feedAt
   return !!at && nowMs - at <= FEED_STALE_MS
 }
-/** True when this chat's cached cards came from the feed and the feed is live for its connection. */
-export function feedFresh(scope, route, nowMs = Date.now()) {
-  return !!(cachedChips(scope)?.feedAt && feedLive(route?.connectionId, route?.profile, nowMs))
+/** A push or heartbeat from the chat's gateway feed: its feed-kept copies are still current. */
+export function touchFeed(connectionId, profile = 'default', sessions = [], at = Date.now()) {
+  loadCache()
+  let n = 0
+  for (const session of sessions || []) {
+    const e = chipCache.get(JSON.stringify([connectionId, profile || 'default', session]))
+    if (e?.feedAt) { e.feedAt = at; n++ }
+  }
+  if (n) saveCacheSoon()
+  return n
 }
 /** Take one pushed bundle (`tasks` = /api/session-kanban-tasks rows, `lineage` = the chat and its ancestors). */
-export function ingestFeed({ connectionId, profile = 'default', session, lineage, tasks } = {}) {
+export function ingestFeed({ connectionId, profile = 'default', session, lineage, tasks, trusted = true } = {}) {
   if (!connectionId || !session || !Array.isArray(tasks)) return false
   profile = profile || 'default'
   const route = { connectionId, profile }
   const scope = JSON.stringify([connectionId, profile, session])
   const chips = sessionTaskChips(tasks, route)
-  rememberChips(scope, chips, undefined, { feed: true })
+  rememberChips(scope, chips, undefined, { feed: !!trusted })
   if (Array.isArray(lineage) && lineage.length) {
     const ids = new Set(lineage.map(String))
     lineageCache.set(scope, { at: Date.now(), ids })
     saveLineage(scope, ids)
   }
-  if (snapshot.scope === scope) {
+  if (snapshot.scope === scope && trusted) {
     // The focused chat: its kanban answer just arrived. Live process / sub-agent rows stay as they are.
     kanbanCachedAt = null
     kanbanCache = chips
@@ -1502,7 +1507,7 @@ export default {
     })
     const onVis = () => document.hidden || void refresh()
     document.addEventListener('visibilitychange', onVis)
-    window.__sessionTasks = { version: 'wait-visible-v1', get snapshot() { return snapshot }, refresh, subscribe, openTaskChip, lineageIds, focusedRoute, warm, cachedSnapshot, ingestFeed, markFeedLive, feedLive, feedFresh, activityLabel, connectionForHubGateway }
+    window.__sessionTasks = { version: 'wait-visible-v1', get snapshot() { return snapshot }, refresh, subscribe, openTaskChip, lineageIds, focusedRoute, warm, cachedSnapshot, ingestFeed, touchFeed, feedFresh, activityLabel, connectionForHubGateway }
     return () => {
       for (const stop of stops) stop?.()
       document.removeEventListener('visibilitychange', onVis)

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-_spec = importlib.util.spec_from_file_location('_spf_feed_test', Path(__file__).resolve().parents[1] / 'feed.py')
+_spec = importlib.util.spec_from_file_location('_spf_feed_test', Path(__file__).resolve().parents[1] / 'dashboard' / 'feed.py')
 feedmod = importlib.util.module_from_spec(_spec)
 sys.modules['_spf_feed_test'] = feedmod
 _spec.loader.exec_module(feedmod)
@@ -131,6 +131,7 @@ def test_tick_does_nothing_while_stamps_are_unchanged_and_no_full_refresh_is_due
     t['now'] += 1
     assert f.tick() == 0
     assert len(r.reads) == calls, 'no reads at all'
+    assert all(p.get('heartbeat') or p['bundles'] for p in pushed)
 
 
 def test_an_unchanged_recompute_is_not_pushed_and_takes_no_revision():
@@ -223,3 +224,58 @@ def test_a_failing_emit_never_breaks_the_feed():
     f = feedmod.Feed(r, emit=lambda p: (_ for _ in ()).throw(RuntimeError('no transport')), clock=lambda: 1000.0)
     out = f.changes(['S1'])
     assert set(out['bundles']) == {'S1'}
+
+
+def test_with_nothing_to_push_a_heartbeat_goes_out_every_heartbeat_s_and_only_while_watched():
+    f, r, pushed, t = make()
+    assert f.tick() == 0 and pushed == [], 'nobody watching: silent'
+    f.changes(['S1'])
+    pushed.clear()
+    t['now'] += 1
+    f.tick()
+    assert pushed == [], 'a push just went out (the catch-up computation)'
+    t['now'] += feedmod.HEARTBEAT_S + 1
+    f.tick()
+    assert len(pushed) == 1 and pushed[0]['heartbeat'] is True and pushed[0]['bundles'] == {}
+    assert pushed[0]['prev'] == pushed[0]['rev'] == f.rev, 'a heartbeat continues the chain without a revision'
+    t['now'] += 1
+    f.tick()
+    assert len(pushed) == 1, 'not again before HEARTBEAT_S'
+
+
+def test_failures_are_counted_shown_and_cleared():
+    f, r, pushed, t = make()
+    real = r.linked
+    r.linked = lambda ids: (_ for _ in ()).throw(RuntimeError('boom')) if 'S1' in ids else real(ids)
+    f.changes(['S1'])
+    st = f.status()
+    assert st['failures']['S1']['count'] == 1 and 'boom' in st['failures']['S1']['error']
+    r.linked = real
+    t['now'] += feedmod.FULL_EVERY_S + 1
+    f.tick()
+    assert f.status()['failures'] == {}
+
+
+def test_concurrent_catch_up_and_tick_keep_the_chain_in_order():
+    import threading
+    f, r, pushed, t = make()
+    f.changes(['S1'])
+    sessions = [f'C{i}' for i in range(30)]
+    for s in sessions:
+        r.lineages[s] = [s]
+    def catch_up(s):
+        f.changes([s])
+    threads = [threading.Thread(target=catch_up, args=(s,)) for s in sessions]
+    for th in threads:
+        th.start()
+    for i in range(5):
+        r.stamp += 1
+        r.events = [('t_aaaaaa1', 'S1')]
+        r.cards['t_aaaaaa1'] = detail('t_aaaaaa1', 'blocked', parents=['t_bbbbbb2'], session=f'S1-{i}')
+        t['now'] += 1
+        f.tick()
+    for th in threads:
+        th.join()
+    revs = [(p['prev'], p['rev']) for p in pushed if not p.get('heartbeat')]
+    assert all(a[1] == b[0] for a, b in zip(revs, revs[1:])), revs
+    assert revs[-1][1] == f.rev

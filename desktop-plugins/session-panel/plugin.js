@@ -554,7 +554,7 @@ export function parkFor(chip, nowMs = Date.now(), read = readPark, fallback) {
   const route = refRoute(chip, fallback)
   if (!route.connectionId) return { state: 'failed', park: null }
   const k = titleKey(route, chip.id), hit = parks.get(k)
-  const age = hit ? (hit.feed && feedIsLive(route) ? 0 : nowMs - hit.at) : Infinity
+  const age = hit ? nowMs - hit.at : Infinity
   if (hit && (hit.pending ? age < PARK_PENDING_MS : age < (hit.failed ? PARK_RETRY_MS : PARK_FRESH_MS))) {
     return { state: hit.pending && !hit.park ? 'loading' : hit.failed && !hit.park ? 'failed' : hit.stale ? 'stale' : 'ok', park: hit.park || null }
   }
@@ -953,7 +953,7 @@ export const resetDoneCacheForTests = () => { doneCache = null; done = { scope: 
 
 export async function refreshDone() {
   const route = panelRoute(), scope = routeKey(route)
-  if (feedKept.has(scope) && feedIsLive(route) && cachedDone(scope)) {
+  if (Date.now() - (doneFeedAt.get(scope) || 0) <= FEED_STALE_MS && cachedDone(scope)) {
     done = { scope, rows: cachedDone(scope) }
     doneSubs.forEach(fn => fn(done))
     return
@@ -1479,8 +1479,10 @@ export function cardInfo(chip, id, nowMs = Date.now(), read = readCard, fallback
   loadReads()
   const route = refRoute(chip, fallback)
   if (!route.connectionId) return { state: 'failed', info: null }
-  const k = titleKey(route, id), hit = cards.get(k), age = hit ? (hit.feed && feedIsLive(route) ? 0 : nowMs - hit.at) : Infinity
-  if (hit && (hit.pending ? age < TITLE_PENDING_MS : age < (hit.info && !hit.stale ? CARD_FRESH_MS : CARD_RETRY_MS))) return { state: hit.info ? (hit.stale ? 'stale' : 'ok') : hit.pending ? 'loading' : 'failed', info: hit.info ? (hit.stale ? { ...hit.info, stale: true } : hit.info) : null }
+  const k = titleKey(route, id), hit = cards.get(k), age = hit ? nowMs - hit.at : Infinity
+  // A record pushed by the gateway keeps its card detail: the next hop (waits, "10m left", overdue) is worked out now.
+  const live = i => (i && hit?.detail ? { ...i, hop: nextHop(hit.detail, nowMs) } : i)
+  if (hit && (hit.pending ? age < TITLE_PENDING_MS : age < (hit.info && !hit.stale ? CARD_FRESH_MS : CARD_RETRY_MS))) return { state: hit.info ? (hit.stale ? 'stale' : 'ok') : hit.pending ? 'loading' : 'failed', info: hit.info ? (hit.stale ? { ...live(hit.info), stale: true } : live(hit.info)) : null }
   put(cards, k, { info: hit?.info || null, ...(hit?.stale ? { stale: true } : {}), at: nowMs, pending: true })
   const loud = !quietReads
   flight(Promise.resolve(read(route, id)).catch(() => null).then(r => {
@@ -1493,7 +1495,7 @@ export function cardInfo(chip, id, nowMs = Date.now(), read = readCard, fallback
     saveReadsSoon()
     notifyTitles(loud)
   }))
-  return { state: hit?.info ? (hit.stale ? 'stale' : 'ok') : 'loading', info: hit?.info ? (hit.stale ? { ...hit.info, stale: true } : hit.info) : null }
+  return { state: hit?.info ? (hit.stale ? 'stale' : 'ok') : 'loading', info: hit?.info ? (hit.stale ? { ...live(hit.info), stale: true } : live(hit.info)) : null }
 }
 
 /** The first step of a waiting card of this chat: a card its own row names (rowWait's reason), else what a read
@@ -1922,53 +1924,83 @@ function Fold({ label, items, k }) {
   ] })
 }
 
-// ── session-panel-feed client (the gateway pushes; nothing polls) ───────────
+// ── session-panel feed client (the gateway pushes; nothing polls) ──────────
 // [daveey 2026-11-20] "precompute the status panel data on the hub, and then simply render it on the desktop ...
 // use a websocket or some form of event streaming so that the desktop is always kept in sync without polling".
-// Each gateway with the session-panel-feed plugin precomputes the chats this window watches (warmTargets + the
-// focused chat) and pushes every changed bundle as `plugin.session-panel-feed.changed` on the gateway event stream.
-// A bundle fills every cache the panel renders from (session-tasks' cards and ancestry, Done, the chain's card,
-// wake and title reads), so a switch to a watched chat paints its final panel with no request. `POST /changes`
-// registers the watched chats and catches up: on load, when the watched set grows, on a revision gap or an
-// oversized batch, and every FEED_CATCHUP_MS as a safety net. A gateway without the plugin keeps today's reads.
-const FEED_PATH = '/api/plugins/session-panel-feed/changes'
-export const FEED_EVENT = 'plugin.session-panel-feed.changed'
+// The backend half of this plugin (plugins/session-panel) precomputes the chats this window watches (the focused chat
+// plus warmTargets, per gateway connection) and pushes every changed bundle as `plugin.session-panel.changed`, and a
+// heartbeat every 20 s when nothing changed. `POST /changes` registers the watched chats and catches up: on load, when
+// focus reaches a chat the gateway does not watch yet, on a revision gap, a new epoch or a batch sent by name only,
+// and every FEED_CATCHUP_MS. A bundle fills every cache the panel renders from (session-tasks' cards and ancestry,
+// Done, the chain's card / wake / title reads).
+// Trust comes from pushes only: a connection is live while its pushes or heartbeats arrive (FEED_STALE_MS), and each
+// push re-stamps the watched chats' entries, so they stay current with no reads; a catch-up answer alone never makes
+// data current (an answer from a backend whose pushes do not reach this window would otherwise be trusted). When pushes
+// stop, the entries age like any other read and the panel reads for itself again. A gateway without the backend half
+// (a 404) or serving another profile keeps today's reads, asked again after FEED_UNSUPPORTED_RETRY_MS.
+const FEED_PATH = '/api/plugins/session-panel/changes'
+export const FEED_EVENT = 'plugin.session-panel.changed'
 export const FEED_CATCHUP_MS = 60_000
+export const FEED_STALE_MS = 150_000
 const FEED_UNSUPPORTED_RETRY_MS = 10 * 60_000
-const feeds = new Map()      // JSON [connectionId, profile] -> { connectionId, profile, feed, epoch, rev, at, sessions, unsupported }
-const feedKept = new Set()   // routeKey scopes whose data came from a feed
+const feeds = new Map()      // JSON [connectionId, profile] -> { connectionId, profile, feed, epoch, rev, sessions, liveAt, unsupported, at }
+const feedFlights = new Map() // same key -> the catch-up in flight
+const feedScopes = new Map() // routeKey scope -> Set of card keys its last trusted bundle carried
+const doneFeedAt = new Map() // routeKey scope -> when its Done rows were last confirmed by a push
 const connKey = (connectionId, profile) => JSON.stringify([connectionId || '', profile || 'default'])
 const tasksBridge = () => (typeof window !== 'undefined' ? window.__sessionTasks : null)
-/** True when `route`'s gateway feed answered or pushed recently (session-tasks owns the clock). */
+/** True while `route`'s gateway feed pushes (or heartbeats) reach this window. */
 export function feedIsLive(route, nowMs = Date.now()) {
-  const st = tasksBridge()
-  return typeof st?.feedLive === 'function' && !!route?.connectionId && st.feedLive(route.connectionId, route.profile || 'default', nowMs)
+  const st = route?.connectionId ? feeds.get(connKey(route.connectionId, route.profile)) : null
+  return !!st?.liveAt && !st.unsupported && nowMs - st.liveAt <= FEED_STALE_MS
 }
-export const resetFeedForTests = () => { feeds.clear(); feedKept.clear() }
+export const resetFeedForTests = () => { feeds.clear(); feedFlights.clear(); feedScopes.clear(); doneFeedAt.clear() }
 
-/** Fill every cache the panel renders from with one chat's bundle. Exported for tests. */
-export function ingestBundle(connectionId, profile, b, nowMs = Date.now()) {
+/** Fill every cache the panel renders from with one chat's bundle. `trusted`: it came while pushes are flowing, so
+ *  it is current (re-stamped by later pushes); otherwise it is an ordinary cached copy. Exported for tests. */
+export function ingestBundle(connectionId, profile, b, { nowMs = Date.now(), trusted = true } = {}) {
   if (!connectionId || !b?.session) return false
   profile = profile || 'default'
   const scope = routeKey({ connectionId, profile, session: b.session })
-  tasksBridge()?.ingestFeed?.({ connectionId, profile, session: b.session, lineage: b.lineage, tasks: Array.isArray(b.tasks) ? b.tasks : [] })
+  tasksBridge()?.ingestFeed?.({ connectionId, profile, session: b.session, lineage: b.lineage, tasks: Array.isArray(b.tasks) ? b.tasks : [], trusted })
   if (Array.isArray(b.done)) {
     const rows = doneRows(b.done)
     rememberDone(scope, rows)
+    if (trusted) doneFeedAt.set(scope, nowMs)
     if (routeKey(panelRoute()) === scope) { done = { scope, rows }; doneSubs.forEach(fn => fn(done)) }
   }
+  const keys = new Set()
   for (const [id, rec] of Object.entries(b.cards || {})) {
     if (!rec?.detail?.task) continue
     const route = { connectionId, profile, board: str(rec.board) || 'default' }
     const k = titleKey(route, id), r = { detail: rec.detail, board: route.board }
     const info = cardSummary(id, r)
-    put(cards, k, { info, at: nowMs, feed: true })
-    put(parks, k, { park: parkFromDetail(rec.detail), failed: false, at: nowMs, feed: true })
+    put(cards, k, { info, detail: rec.detail, at: nowMs })
+    put(parks, k, { park: parkFromDetail(rec.detail), failed: false, at: nowMs })
     if (info.title) put(titles, k, { title: info.title, board: info.board, state: info.status, at: nowMs })
+    keys.add(k)
   }
-  feedKept.add(scope)
+  if (trusted) feedScopes.set(scope, keys)
+  else feedScopes.delete(scope)
   saveReadsSoon()
   return true
+}
+
+/** A push or heartbeat confirmed this connection's watched chats: re-stamp their cards, wakes, Done and kanban. */
+function confirmFeed(st, nowMs = Date.now()) {
+  st.liveAt = nowMs
+  for (const session of st.sessions || []) {
+    const scope = routeKey({ connectionId: st.connectionId, profile: st.profile, session })
+    const keys = feedScopes.get(scope)
+    if (!keys) continue
+    for (const k of keys) {
+      const c = cards.get(k), p = parks.get(k)
+      if (c?.detail && !c.pending) c.at = nowMs
+      if (p && !p.pending && !p.failed) p.at = nowMs
+    }
+    if (doneFeedAt.has(scope)) doneFeedAt.set(scope, nowMs)
+  }
+  tasksBridge()?.touchFeed?.(st.connectionId, st.profile, st.sessions, nowMs)
 }
 
 /** The chats to watch, per gateway connection: the focused chat first, then warmTargets(). */
@@ -1985,52 +2017,83 @@ export function feedTargets(rows) {
   return [...out.values()]
 }
 
-/** Register `target.sessions` with its gateway's feed and apply what changed since our last revision. False when
- *  the gateway has no feed (remembered for FEED_UNSUPPORTED_RETRY_MS) or the call failed. */
-export async function feedCatchUp(target, { nowMs = Date.now(), reset = false } = {}) {
+/** Register `target.sessions` with its gateway's feed and apply what changed since our last revision. One in flight
+ *  per connection (a later call waits for it). False when the gateway has no feed or the call failed. */
+export function feedCatchUp(target, opts = {}) {
+  const key = connKey(target?.connectionId, target?.profile)
+  const running = feedFlights.get(key)
+  if (running) return running.then(() => feedCatchUpNow(target, opts))
+  const p = feedCatchUpNow(target, opts).finally(() => { if (feedFlights.get(key) === p) feedFlights.delete(key) })
+  feedFlights.set(key, p)
+  return p
+}
+
+async function feedCatchUpNow(target, { nowMs = Date.now(), reset = false, full = false } = {}) {
   const bridge = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
   if (!bridge || !target?.connectionId || !target.sessions?.length) return false
-  const key = connKey(target.connectionId, target.profile)
+  const profile = target.profile || 'default'
+  const key = connKey(target.connectionId, profile)
   const st = feeds.get(key)
   if (st?.unsupported && nowMs - st.at < FEED_UNSUPPORTED_RETRY_MS) return false
+  const unsupported = () => { feeds.set(key, { connectionId: target.connectionId, profile, unsupported: true, at: nowMs }); return false }
+  const sameFeed = !reset && st && !st.unsupported
   let r
   try {
-    r = await bridge({ path: FEED_PATH, method: 'POST', connectionId: target.connectionId, profile: target.profile || 'default', timeoutMs: 15_000,
-      body: { sessions: target.sessions.slice(0, 200), since: reset ? 0 : st?.rev || 0, epoch: reset ? null : st?.epoch || null } })
+    r = await bridge({ path: FEED_PATH, method: 'POST', connectionId: target.connectionId, profile, timeoutMs: 15_000,
+      body: { sessions: target.sessions.slice(0, 200), since: sameFeed && !full ? st.rev || 0 : 0, epoch: sameFeed ? st.epoch || null : null } })
   } catch (e) {
+    // The Desktop bridge rejects a 404 with "404: ...": this gateway has no backend half.
+    if (/^404\b/.test(String(e?.message || ''))) return unsupported()
     log('feed catch-up failed', target.connectionId, e?.message || e)
     return false
   }
-  if (!r || typeof r.epoch !== 'string') { feeds.set(key, { ...(st || {}), unsupported: true, at: nowMs }); return false }
-  feeds.set(key, { connectionId: target.connectionId, profile: target.profile || 'default', feed: r.feed, epoch: r.epoch,
-    rev: Number(r.rev) || 0, at: Date.now(), sessions: [...target.sessions] })
-  tasksBridge()?.markFeedLive?.(target.connectionId, target.profile || 'default')
-  for (const b of Object.values(r.bundles || {})) ingestBundle(target.connectionId, target.profile || 'default', b)
+  if (!r || r.profile_unsupported || typeof r.epoch !== 'string') return unsupported()
+  const cur = feeds.get(key)
+  // A push for a later revision landed while this request was out: keep it, drop this older answer's bundles.
+  if (cur && !cur.unsupported && cur.epoch === r.epoch && cur.feed === r.feed && Number(r.rev) < cur.rev) {
+    cur.sessions = [...new Set([...(cur.sessions || []), ...target.sessions])]
+    return true
+  }
+  const next = { connectionId: target.connectionId, profile, feed: r.feed, epoch: r.epoch, rev: Number(r.rev) || 0,
+    sessions: [...target.sessions], liveAt: cur?.feed === r.feed && cur?.epoch === r.epoch ? cur.liveAt : 0, at: Date.now() }
+  feeds.set(key, next)
+  const trusted = feedIsLive({ connectionId: target.connectionId, profile })
+  for (const b of Object.values(r.bundles || {})) ingestBundle(target.connectionId, profile, b, { trusted })
   notifyTitles()
   return true
 }
 
-/** One pushed batch: apply it when it continues our revision chain, else catch up. Exported for tests. */
+/** One pushed batch or heartbeat: apply it when it continues our revision chain, else catch up. Exported for tests. */
 export function onFeedEvent(ev) {
   const p = ev?.payload
   if (!p || typeof p.feed !== 'string') return
-  const st = [...feeds.values()].find(f => f.feed === p.feed && !f.unsupported)
-  if (!st) return // a gateway this window did not register with: the next catch-up covers it
+  const st = [...feeds.values()].find(f => !f.unsupported && f.feed === p.feed && (f.profile || 'default') === (p.profile || 'default'))
+  if (!st) return // a gateway or profile this window did not register with: the next catch-up covers it
   const target = { connectionId: st.connectionId, profile: st.profile, sessions: st.sessions }
   if (p.epoch !== st.epoch) { void feedCatchUp(target, { reset: true }); return }
-  if (Number(p.rev) <= st.rev) return // already have it (a catch-up answered first)
+  const rev = Number(p.rev)
+  const wasLive = feedIsLive(st)
+  if (p.heartbeat) {
+    if (rev === st.rev) {
+      confirmFeed(st)
+      // Pushes just started reaching us: what the catch-up gave before was untrusted; fetch it all again, trusted.
+      if (!wasLive) void feedCatchUp(target, { full: true })
+    } else if (rev > st.rev) void feedCatchUp(target)
+    return
+  }
+  if (rev <= st.rev) return // already have it (a catch-up answered first)
   if (Number(p.prev) !== st.rev || (Array.isArray(p.sessions) && p.sessions.length)) { void feedCatchUp(target); return }
-  st.rev = Number(p.rev)
-  st.at = Date.now()
-  tasksBridge()?.markFeedLive?.(st.connectionId, st.profile)
-  for (const b of Object.values(p.bundles || {})) ingestBundle(st.connectionId, st.profile, b)
+  st.rev = rev
+  for (const b of Object.values(p.bundles || {})) ingestBundle(st.connectionId, st.profile, b, { trusted: true })
+  confirmFeed(st)
   notifyTitles()
+  if (!wasLive) void feedCatchUp(target, { full: true })
 }
 
-/** Catch up every gateway once (the safety net, and on load). A chat newly focused is registered at once. */
-export async function feedPass({ nowMs = Date.now() } = {}) {
+/** Catch up every gateway once (the safety net, and on load). */
+export async function feedPass() {
   const done = []
-  for (const t of feedTargets()) if (await feedCatchUp(t, { nowMs })) done.push(t)
+  for (const t of feedTargets()) if (await feedCatchUp(t)) done.push(t)
   return done
 }
 /** Focus moved: register the chat with its gateway's feed now if that feed does not watch it yet. */

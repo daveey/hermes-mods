@@ -1,5 +1,6 @@
 """The real readers against a board built with core's own kanban_db: card records, changed cards, stamps, lineage."""
 import importlib.util
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -29,7 +30,7 @@ def board(tmp_path):
 
 
 def readers_for(api, path, monkeypatch):
-    r = api.CoreReaders()
+    r = api.CoreReaders(state_db=path.parent / 'state.db')
     monkeypatch.setattr(r, 'boards', lambda: [('default', path)])
     return r
 
@@ -72,7 +73,7 @@ def test_lineage_walks_parent_sessions(api, tmp_path, monkeypatch):
     c.execute('CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT)')
     c.executemany('INSERT INTO sessions VALUES (?, ?)', [('S3', 'S2'), ('S2', 'S1'), ('S1', None), ('L1', 'L2'), ('L2', 'L1')])
     c.commit()
-    r = api.CoreReaders()
+    r = api.CoreReaders(state_db=db)
     assert r.lineage('S3') == ['S3', 'S2', 'S1']
     assert r.lineage('L1') == ['L1', 'L2'], 'a cycle ends the walk'
     assert r.lineage('unknown') == ['unknown']
@@ -83,3 +84,49 @@ def test_push_payload_is_json_safe_and_bounded(api):
     assert body['bundles']['S1'] == {'x': None, 'title': 'NaN Infinity'}, 'text is untouched'
     big = api.push_payload({'epoch': 'e', 'prev': 1, 'rev': 2, 'bundles': {'S1': {'blob': 'x' * 2000}, 'S2': {}}}, max_bytes=500)
     assert big['bundles'] == {} and big['sessions'] == ['S1', 'S2'], 'too big: names only, clients fetch them'
+
+
+def test_heartbeats_change_nothing_in_a_card_record(api, board, monkeypatch):
+    path, conn = board
+    a = kanban_db.create_task(conn, title='A', initial_status='running', session_id='S1')
+    r = readers_for(api, path, monkeypatch)
+    before = r.card(a, 'default')
+    conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'heartbeat', '{}', 1)", (a,))
+    conn.execute('UPDATE tasks SET last_heartbeat_at = 123 WHERE id = ?', (a,))
+    conn.commit()
+    after = r.card(a, 'default')
+    def flat(d, pre=''):
+        out = {}
+        for k, v in (d.items() if isinstance(d, dict) else enumerate(d)):
+            out.update(flat(v, f'{pre}.{k}') if isinstance(v, (dict, list)) else {f'{pre}.{k}': v})
+        return out
+    fb, fa = flat(before), flat(after)
+    diff = {k: (fb.get(k), fa.get(k)) for k in set(fb) | set(fa) if fb.get(k) != fa.get(k)}
+    assert diff == {}, f'a heartbeat alone never re-pushes a bundle: {diff}'
+    assert 'ready_since' in after['detail']['task']
+
+
+def test_each_thread_reads_on_its_own_connection_and_a_replaced_file_is_reopened(api, board, monkeypatch, tmp_path):
+    import threading
+    path, conn = board
+    a = kanban_db.create_task(conn, title='A', initial_status='running', session_id='S1')
+    r = readers_for(api, path, monkeypatch)
+    main = r.conn(path)
+    other = []
+    th = threading.Thread(target=lambda: other.append(r.conn(path)))
+    th.start(); th.join()
+    assert other[0] is not main
+    assert r.card(a, 'default') is not None
+    # Replace the board file with another one (another inode): the reader follows it.
+    from hermes_cli.kanban_db_connect import connect
+    fresh = tmp_path / 'fresh.db'
+    c2 = connect(fresh)
+    b = kanban_db.create_task(c2, title='B', initial_status='running', session_id='S2')
+    c2.close(); conn.close()
+    for suffix in ('', '-wal', '-shm'):
+        try:
+            os.replace(f'{fresh}{suffix}', f'{path}{suffix}')
+        except FileNotFoundError:
+            pass
+    assert r.card(b, 'default') is not None, 'reads the new file'
+    assert r.card(a, 'default') is None

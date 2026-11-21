@@ -25,17 +25,29 @@ def test_changes_route_watches_and_catches_up():
     core.PROCESS_FEED = core.Feed(fakes.Readers(), emit=pushed.append)
     try:
         app = FastAPI()
-        app.include_router(api.router, prefix='/api/plugins/session-panel-feed')
+        app.include_router(api.router, prefix='/api/plugins/session-panel')
         c = TestClient(app)
-        first = c.post('/api/plugins/session-panel-feed/changes', json={'sessions': ['S1', 'S2']}).json()
+        first = c.post('/api/plugins/session-panel/changes', json={'sessions': ['S1', 'S2']}).json()
         assert first['feed'] == api.FEED_ID and first['reset'] is True
         assert set(first['bundles']) == {'S1', 'S2'}
         assert set(first['bundles']['S1']['cards']) == {'t_aaaaaa1', 't_bbbbbb2', 't_ccccccc3'}
-        again = c.post('/api/plugins/session-panel-feed/changes',
+        again = c.post('/api/plugins/session-panel/changes',
                        json={'sessions': ['S1', 'S2'], 'since': first['rev'], 'epoch': first['epoch']}).json()
         assert again['bundles'] == {} and again['reset'] is False
-        st = c.get('/api/plugins/session-panel-feed/status').json()
-        assert st['running'] is True and st['watched'] == 2 and st['bundles'] == 2
-        assert c.post('/api/plugins/session-panel-feed/changes', json={'sessions': ['x'] * 201}).status_code == 422
+        st = c.get('/api/plugins/session-panel/status').json()
+        assert st['running'] is True and st['watched'] == 2 and st['bundles'] == 2 and st['failures'] == {}
+        assert first['profile'] == api.LAUNCH_PROFILE
+        assert c.post('/api/plugins/session-panel/changes', json={'sessions': ['x'] * 201}).status_code == 422
     finally:
         core.PROCESS_FEED = None
+
+
+def test_a_request_for_another_profile_is_refused_not_served_from_the_wrong_state_db(monkeypatch):
+    api = load('_spf_routes_api2', HERE.parents[1] / 'dashboard' / 'plugin_api.py')
+    monkeypatch.setattr(api, '_request_profile', lambda: 'work')
+    monkeypatch.setattr(api, 'LAUNCH_PROFILE', 'default')
+    app = FastAPI()
+    app.include_router(api.router, prefix='/api/plugins/session-panel')
+    r = TestClient(app).post('/api/plugins/session-panel/changes', json={'sessions': ['S1']}).json()
+    assert r == {'feed': api.FEED_ID, 'profile': 'work', 'profile_unsupported': True}
+    assert api._load_feed().PROCESS_FEED is None, 'no feed started for it'
