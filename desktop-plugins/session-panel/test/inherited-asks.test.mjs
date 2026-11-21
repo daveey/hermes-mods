@@ -68,6 +68,60 @@ test('persisted summaries cannot assert a current ask while their re-read is pen
     assert.equal(r.asks.length,0); assert.equal(r.incomplete,true)
   } finally { m.resetReadsForTests(); globalThis.window=old }
 })
+test('fresh responses preserve missing graph provenance through the real summary/cache path', async () => {
+  const old=globalThis.window
+  try {
+    for (const graph of [{}, {links:{}}, {links:{parents:null}}, {links:{parents:[]}}]) {
+      m.resetReadsForTests()
+      globalThis.window={hermesDesktop:{api:async()=>({task:{id:'root',status:'todo'},...graph})}}
+      m.inheritedAsks([row(chip())]); await new Promise(resolve=>setImmediate(resolve))
+      const r=m.inheritedAsks([row(chip())])
+      assert.equal(r.incomplete,!Array.isArray(graph.links?.parents))
+      assert.equal(r.asks.length,0)
+    }
+  } finally {m.resetReadsForTests();globalThis.window=old}
+})
+test('same-id different-board cache reads cannot publish another board human action', async () => {
+  const old=globalThis.window, calls=[]
+  globalThis.window={hermesDesktop:{api:async({path})=>{
+    const board=new URL(path,'http://example.com').searchParams.get('board')
+    const id=path.split('/').pop().split('?')[0]; calls.push(`${board}:${id}`)
+    return detail(id,id==='ask'?'blocked':'todo',id==='root'?['ask']:[],id==='ask'?{block_kind:'needs_input',human_request:{...request,action:`${board} action`}}:{})
+  }}}
+  try {
+    m.resetReadsForTests()
+    const a={...chip(),board:'A'}, b={...chip(),board:'B'}
+    for(let n=0;n<3;n++){m.inheritedAsks([row(a)]);await new Promise(resolve=>setImmediate(resolve))}
+    assert.equal(m.inheritedAsks([row(a)]).asks[0].request.action,'A action')
+    const cold=m.inheritedAsks([row(b)])
+    assert.equal(cold.asks.length,0);assert.equal(cold.incomplete,true)
+    for(let n=0;n<3;n++){await new Promise(resolve=>setImmediate(resolve));m.inheritedAsks([row(b)])}
+    const r=m.inheritedAsks([row(b)])
+    assert.equal(r.asks[0].request.action,'B action');assert.equal(r.asks[0].chip.board,'B')
+    assert.ok(calls.includes('B:root'));assert.ok(calls.includes('B:ask'))
+    m.writeReads();m.resetReadsForTests()
+  } finally {m.resetReadsForTests();globalThis.window=old}
+})
+test('feed and park seeded answers remain board-qualified and legacy persisted keys are ignored', async () => {
+  const old=globalThis.window, values=new Map()
+  globalThis.window={localStorage:{getItem:k=>values.get(k)||null,setItem:(k,v)=>values.set(k,v)},hermesDesktop:{api:()=>new Promise(()=>{})}}
+  try {
+    for (const seed of ['feed','park','legacy']) {
+      m.resetReadsForTests()
+      const ds=fixture(), a={...chip(),board:'A'}, b={...chip(),board:'B'}
+      if(seed==='feed') m.ingestBundle('C','default',{session:'test',cards:Object.fromEntries(Object.entries(ds).map(([id,d])=>[id,{board:'A',detail:d}]))})
+      if(seed==='park') {
+        globalThis.window.hermesDesktop.api=async()=>ds.root
+        m.parkFor(a)
+        await new Promise(resolve=>setImmediate(resolve))
+        globalThis.window.hermesDesktop.api=()=>new Promise(()=>{})
+      }
+      if(seed==='legacy') values.set('hermes.sessionPanel.reads.v1',JSON.stringify({cards:[['C|default|root',{info:m.cardSummary('root',{board:'A',detail:ds.root})}]]}))
+      const r=m.inheritedAsks([row(b)])
+      assert.equal(r.asks.length,0);assert.equal(r.incomplete,true)
+    }
+  } finally {m.resetReadsForTests();globalThis.window=old}
+})
 test('read-only upstream row renders exact action, dependency provenance, scope and qualified source', () => {
   const a=m.inheritedAsks([row(chip())],Date.now(),{info:reader(fixture())}).asks[0]
   const tree=m.UpstreamAsk({ask:a}), text=JSON.stringify(tree)

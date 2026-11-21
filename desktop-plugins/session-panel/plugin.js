@@ -468,7 +468,7 @@ export function refRoute(chip, fallback = () => panelRoute()) {
   const r = (() => { try { return fallback() } catch { return null } })()
   return { connectionId: r?.connectionId || null, profile: str(r?.profile) || str(chip?.profile) || 'default', board: str(chip?.board) || 'default' }
 }
-const titleKey = (r, id) => [str(r.connectionId), r.profile, id].join('|')
+const titleKey = (r, id) => [str(r.connectionId), r.profile, str(r.board) || 'default', id].join('|')
 export function noteTitles(chips) {
   for (const c of chips || []) {
     if (c?.kind !== 'kanban' || !c.id || !c.connectionId || !str(c.label) || c.label === c.id) continue
@@ -1451,7 +1451,8 @@ const cards = new Map()
 // launches and plugin reloads (localStorage), so a revisited chat's chains, titles and wakes paint from the last
 // answer instead of "reading…" for the 1-5 s of reads. A restored entry is always due (at -Infinity): it is shown at once and
 // re-read in the background, exactly like an in-memory answer past its freshness (at -Infinity: always due). Pending reads are never saved.
-const READS_KEY = 'hermes.sessionPanel.reads.v1'
+// v1 keys omitted board: do not restore those ambiguous card/park/title answers.
+const READS_KEY = 'hermes.sessionPanel.reads.v2'
 let readsLoaded = false
 let readsSaveTimer = null
 const readStore = () => { try { return typeof window !== 'undefined' ? window.localStorage : null } catch { return null } }
@@ -1501,7 +1502,7 @@ async function readCard(route, id) {
   return null
 }
 export const cardSummary = (id, r) => ({ id, title: str(r.detail.task.title), status: str(r.detail.task.status), session: str(r.detail.task.session_id), owner: typeof r.detail.owner === 'string' ? r.detail.owner : '', board: r.board, hop: nextHop(r.detail, Date.now()),
-  parents: (r.detail.links?.parents || []).map(str),
+  parents: Array.isArray(r.detail.links?.parents) ? r.detail.links.parents.map(str) : null,
   request: validHumanRequest(r.detail.task.human_request, r.detail.task.block_kind) ? r.detail.task.human_request : null
 })
 
