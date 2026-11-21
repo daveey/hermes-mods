@@ -37,7 +37,7 @@ import { useEffect, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'session-panel'
-const VERSION = 'session-panel-v12-owner-wake'
+const VERSION = 'session-panel-v13-wait-chains'
 export const STUCK_CARD_S = 2 * 3600 // running card with no event this long
 export const STUCK_SUB_MS = 30 * 60_000 // sub-agent with no new tool call this long
 const DONE_POLL_MS = 30_000
@@ -502,12 +502,11 @@ export function parkFromDetail(detail) {
   }
 }
 async function readPark(route, id) {
-  const bridge = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
-  if (!bridge || !route.connectionId) return { failed: true }
-  try {
-    const r = await bridge({ path: `/api/plugins/kanban/tasks/${encodeURIComponent(id)}?board=${encodeURIComponent(route.board)}`, connectionId: route.connectionId, profile: route.profile, timeoutMs: 8_000 })
-    return { park: parkFromDetail(r) }
-  } catch { return { failed: true } }
+  // The same card read as the chain walk (readCard): one request feeds both caches.
+  const r = await readCard(route, id)
+  if (!r) return { failed: true }
+  shareCardRead(route, id, r)
+  return { park: parkFromDetail(r.detail) }
 }
 /** `{ state: 'loading' | 'ok' | 'failed', park }` for a parked card; starts at most one read. */
 export function parkFor(chip, nowMs = Date.now(), read = readPark, fallback) {
@@ -557,6 +556,31 @@ export function cardRef(chip, id, nowMs = Date.now(), read = readTitle, fallback
     if (str(r?.title) && r.title !== hit?.title) titleSubs.forEach(fn => fn())
   })
   return { route, title: hit?.title || '', board: hit?.board || route.board }
+}
+
+// The chat that owns a card, by title: this Desktop's session rows first, else one read of /api/sessions/<id> on the
+// route (cached). '' until known.
+const sessionTitles = new Map()
+export function sessionTitle(route, sid, nowMs = Date.now(), read = readSessionTitle) {
+  if (!sid) return ''
+  try {
+    const row = (host?.sessions?.rows?.get?.() || []).find(r => r?.id === sid)
+    if (row && str(row.title)) return str(row.title)
+  } catch {}
+  if (!route?.connectionId) return ''
+  const k = `${route.connectionId}|${route.profile}|${sid}`, hit = sessionTitles.get(k)
+  if (hit && (hit.title || nowMs - hit.at < (hit.pending ? TITLE_PENDING_MS : TITLE_RETRY_MS))) return hit.title
+  sessionTitles.set(k, { title: hit?.title || '', at: nowMs, pending: true })
+  Promise.resolve(read(route, sid)).catch(() => '').then(t => { sessionTitles.set(k, { title: str(t), at: Date.now() }); if (t) titleSubs.forEach(fn => fn()) })
+  return hit?.title || ''
+}
+async function readSessionTitle(route, sid) {
+  const bridge = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
+  if (!bridge) return ''
+  try {
+    const r = await bridge({ path: `/api/sessions/${encodeURIComponent(sid)}`, connectionId: route.connectionId, profile: route.profile, timeoutMs: 8_000 })
+    return str(r?.title) || str(r?.preview).slice(0, 60)
+  } catch { return '' }
 }
 
 const CARD_ID = /\bt_[0-9a-f]{6,}\b/g
@@ -644,7 +668,6 @@ export function parkedWaitText(c, on, nowMs = Date.now()) {
  *  There is no catch-all bucket: "1 other" told the user nothing. A status-unknown row is never guessed into
  *  parent/schedule; any other lifecycle state is counted under its own name. */
 export const WAIT_KINDS = ['parent', 'schedule', 'contained', 'triage', 'review', 'blocked', 'unknown']
-const WAIT_LABEL = { parent: 'on parent', schedule: 'on schedule', contained: 'contained', triage: 'in triage', review: 'in review', blocked: 'blocked', unknown: 'unknown' }
 export function waitKind(i) {
   const c = i?.chip || {}
   if (c.stale || /^(status )?unknown\b/.test(str(i?.detail)) || /\bunknown \(/.test(str(i?.detail)) || c.state === 'unknown') return 'unknown'
@@ -656,13 +679,6 @@ export function waitKind(i) {
   if (c.state === 'triage' || c.state === 'review' || c.state === 'blocked') return c.state
   if (c.state === 'scheduled' || on) return 'schedule'
   return str(c.state) || 'unknown'
-}
-export function waitBreakdown(rows) {
-  const n = Object.create(null)
-  for (const i of rows || []) { const k = waitKind(i); n[k] = (n[k] || 0) + 1 }
-  // Only buckets with something in them show; a zero bucket is noise. Known kinds first, any other state after.
-  const keys = [...WAIT_KINDS.filter(k => n[k]), ...Object.keys(n).filter(k => !WAIT_KINDS.includes(k))]
-  return { n, text: keys.map(k => `${n[k]} ${Object.hasOwn(WAIT_LABEL, k) ? WAIT_LABEL[k] : k}`).join(' · ') }
 }
 
 /** True when the chat has anything not finished: an ask, a card/sub-agent/process that is open, an open ledger
@@ -797,8 +813,8 @@ export function counts(sorted, { asks = 0, done = null } = {}) {
     running: sorted.active.length,
     needsYou: asks + sorted.unasked.length,
     stuck: sorted.stuck.length,
-    blockedUpstream: (sorted.blockedUpstream || []).length,
-    waiting: sorted.waiting.length,
+    blockedUpstream: 0, // shown as waiting: each one's chain ends on its blocked parent's cause
+    waiting: sorted.waiting.length + (sorted.blockedUpstream || []).length,
     ready: (sorted.ready || []).length,
     queued: sorted.queued.length
   }
@@ -1005,8 +1021,6 @@ const btn = { minHeight: 32, padding: '4px 10px', borderRadius: 6, border: '1px 
 const PIP_ORDER = ['needsYou', 'stuck', 'blockedUpstream', 'running', 'ready', 'waiting', 'queued', 'done']
 export const PIPS_MAX = 24 // boxes drawn before the rest fold into "+N"
 // A hub-scheduled card's box is a little larger and carries an "H" (running and waiting work alike).
-// A one-line waiting row carries the same box as its full row, so its colour says what it is (yellow = waiting).
-const lineKind = i => (i.blockedUpstreamRow ? 'blockedUpstream' : 'waiting')
 const pipStyle = (k, hub = false) => {
   const base = { width: 9, height: 9, borderRadius: 2, boxSizing: 'border-box', flex: 'none' }
   const h = hub ? { width: 12, height: 12, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: 8.5, fontWeight: 700, lineHeight: 1 } : {}
@@ -1019,7 +1033,7 @@ const pipStyle = (k, hub = false) => {
 const onHub = i => i.kind === 'kanban' && i.chip?.runMachine === 'hub'
 export function hubCounts(sorted) {
   const on = list => (list || []).filter(onHub).length
-  return { running: on(sorted.active), stuck: on(sorted.stuck), blockedUpstream: on(sorted.blockedUpstream), waiting: on(sorted.waiting), ready: on(sorted.ready), queued: on(sorted.queued) }
+  return { running: on(sorted.active), stuck: on(sorted.stuck), blockedUpstream: 0, waiting: on(sorted.waiting) + on(sorted.blockedUpstream), ready: on(sorted.ready), queued: on(sorted.queued) }
 }
 
 export function Pips({ n, hub = {} }) {
@@ -1191,139 +1205,333 @@ function RefChip({ ref: r, chip }) {
 // One stylesheet for the waiting rows: a hover tint says a row opens; the disclosure button is the title itself.
 const WAIT_CSS = `[data-wait-row]{border-radius:5px}[data-wait-row]:hover{background:color-mix(in srgb,var(--foreground) 5%,transparent)}
 [data-wait-toggle]:focus-visible{outline:1px solid color-mix(in srgb,var(--foreground) 50%,transparent);outline-offset:1px;border-radius:3px}`
-/** Waiting rows share one grid, so the reason column lines up across rows: box · title · reason · age. The reason
- *  column is a fixed 42% in every list, so it starts at the same place folded, opened and in Blocked upstream, and
- *  the title always keeps the rest. */
-/** The cards a waiting row waits on, nearest first: the cards its published wait names, its upstream, the parent
- *  holding it (blocked upstream) and, when contained, the card that releases it. */
-const waitsOnIds = i => {
-  const c = i?.chip || {}
-  const ids = str(c.waitingOn).match(/\bt_[0-9a-f]{6,}\b/g) || []
-  for (const id of [c.upstream?.id, c.blockedUpstream?.contained?.authority?.id, c.blockedUpstream?.id]) if (id) ids.push(str(id))
-  return ids
+// ── dependency chains ─────────────────────────────────────────────────────────
+// [daveey 2026-11-20] "if a card is waiting, it should have a full dependency tree under it, ending on a blocked card.
+// a card is blocked because it's waiting on me (red), waiting on external service (pink), waiting on worker slot
+// (grey)... if the card is in a different session, show the session name and let you navigate there". Design:
+// claude.ai/artifact/H13j1JAueqaFVHyzF5hpLe. Each waiting card walks its blockers card by card (each card read once
+// from its owner route, cached) to a leaf: `you` (red), `external` (pink), `slot` (grey), plus `running` (blue: the
+// chain ends on work in progress), `done` (its blocker finished; the waiter should resume) and `unknown` (dashed:
+// a card could not be read, a cycle, or the walk ran past MAX_HOPS). Never a guess.
+export const LEAF = {
+  you: { color: '#f85149', text: '#ffb3ad', tint: 'rgba(248,81,73,0.08)', label: 'you' },
+  external: { color: '#db61a2', text: '#f2b6d6', tint: 'rgba(219,97,162,0.08)', label: 'external' },
+  slot: { color: '#8b949e', text: 'var(--foreground)', tint: 'rgba(139,148,158,0.10)', label: 'worker slot' },
+  running: { color: '#3b82f6', text: 'var(--foreground)', tint: 'rgba(59,130,246,0.08)', label: 'running' },
+  done: { color: '#3fb950', text: 'var(--foreground)', tint: 'rgba(63,185,80,0.08)', label: 'finished' },
+  unknown: { color: '#8b949e', text: 'var(--muted-foreground)', tint: 'transparent', label: 'unknown', dashed: true }
 }
-/** Waiting rows as an outline: a card that waits on another card of the same list sits under it.
- *  [daveey 2026-11-20] "these cards are waiting for other cards in the session, can we display them as outline view".
- *  Returns `[{ i, depth, parentId }]` in display order: roots keep the list's order, each followed by its subtree.
- *  A card whose blocker is not in the list stays a root (and its line names the blocker); a cycle never nests.
- *  Ids are matched bare (`t_<hex>` is unique in practice); a card seen twice (two gateways) nests under its first copy. */
-export function waitTree(rows, rankOf = () => 0) {
-  const list = (rows || []).filter(Boolean)
-  const byId = new Map(list.filter(i => i.chip?.id).map(i => [str(i.chip.id), i]))
-  const parent = new Map()
-  for (const i of list) {
-    const own = str(i.chip?.id)
-    const p = waitsOnIds(i).find(id => id !== own && byId.has(id))
-    if (p) parent.set(i.key, p)
+export const MAX_HOPS = 6
+const OPEN = s => !['done', 'archived', 'cancelled', 'canceled'].includes(str(s))
+const cleanNote = t => str(t).replace(/^(current|unknown):\s*/i, '').replace(/;?\s*admissible capacity unknown\.?$/i, '').replace(/^restriction coverage incomplete$/i, '').trim()
+const realChat = sid => !!sid && !/^local-/.test(sid)
+// core hermes_cli/kanban_human_request.validate_human_request: what makes a block "waiting on you".
+const HR_FIELDS = ['action', 'why_human', 'interaction', 'scope', 'evidence']
+const HR_INTERACTIONS = new Set(['approval', 'reply', 'user_terminal', 'physical', 'external'])
+const NONHUMAN_KINDS = new Set(['dependency', 'transient', 'time'])
+const validChoices = c => c == null || (Array.isArray(c) && c.length >= 2 && c.length <= 6 &&
+  c.every(x => x && typeof x === 'object' && typeof x.label === 'string' && x.label.trim() && x.label.trim().length <= 60 &&
+    typeof x.value === 'string' && x.value.trim() && x.value.trim().length <= 120) &&
+  new Set(c.map(x => x.value.trim())).size === c.length)
+const validResolvedCheck = hr => {
+  const cmd = hr.resolved_check, every = hr.resolved_check_every
+  if (cmd == null) return every == null
+  if (typeof cmd !== 'string' || !cmd.trim() || cmd.trim().length > 2000) return false
+  return every == null || (Number.isInteger(every) && every >= 120 && every <= 21600)
+}
+export const validHumanRequest = (hr, kind) => !!hr && typeof hr === 'object' && !Array.isArray(hr) && HR_FIELDS.every(f => typeof hr[f] === 'string' && hr[f].trim()) &&
+  HR_INTERACTIONS.has(hr.interaction) && !NONHUMAN_KINDS.has(str(kind)) && validChoices(hr.choices) && validResolvedCheck(hr)
+
+/** What a card read (`/api/plugins/kanban/tasks/<id>`) says its card waits on next: `{ ref: { id, status } }` (another
+ *  card) or `{ leaf: { kind, text, sub } }`. The same states core reads: a person ask, a dependency's open parent, the
+ *  scheduled park (parkFromDetail), a ready card's queue/capacity note, triage, review, running. */
+export function nextHop(detail, nowMs = Date.now()) {
+  const t = detail?.task || {}, status = str(t.status), now = nowMs / 1000
+  const parents = (detail?.links?.parents || []).map(id => ({ id: str(id), status: str((detail?.link_tasks || []).find(x => x?.id === id)?.status) }))
+  const openParent = parents.find(p => OPEN(p.status))
+  const hr = t.human_request && typeof t.human_request === 'object' ? t.human_request : null
+  const machine = str(t.run_machine) || str(t.claim_lock).split(':')[0]
+  if (!status) return { leaf: { kind: 'unknown', text: 'status unknown' } }
+  if (!OPEN(status)) return { leaf: { kind: 'done', text: `${status} · the waiting card should resume` } }
+  if (status === 'running') return { leaf: { kind: 'running', text: `running${machine ? ` on ${machine}` : ''}` } }
+  if (status === 'blocked') {
+    if (validHumanRequest(hr, t.block_kind)) return { leaf: { kind: 'you', text: str(hr.action), ask: true } }
+    if (str(t.block_kind) === 'dependency' && openParent) return { ref: openParent }
+    if (str(t.block_kind) === 'time') return parkHop(detail, nowMs)
+    // An ask-less needs_input/capability block, or an agent kind: an agent must clear it (core: agent-owned).
+    return { leaf: { kind: 'slot', text: `an agent must clear a ${str(t.block_kind) || 'untyped'} block${hr ? ' (its ask is not valid)' : ''}` } }
   }
-  // Break cycles: a card whose chain comes back to itself is a root. A chain that runs into some other loop just
-  // stops there (that loop is broken when its own cards are walked), so a card leading into a loop still nests.
-  for (const i of list) {
-    const own = str(i.chip?.id), seen = new Set([own])
-    let cur = parent.get(i.key)
-    while (cur) {
-      if (cur === own) { parent.delete(i.key); break }
-      if (seen.has(cur)) break
-      seen.add(cur)
-      cur = parent.get(byId.get(cur)?.key)
-    }
+  if (status === 'scheduled') return parkHop(detail, nowMs)
+  if (status === 'todo') return openParent ? { ref: openParent } : { leaf: { kind: 'slot', text: 'not started: waiting to be promoted' } }
+  if (status === 'ready') return { leaf: { kind: 'slot', text: `waiting for a worker${cleanNote(detail?.queue_note || detail?.capacity_note) ? `: ${cleanNote(detail?.queue_note || detail?.capacity_note)}` : ''}` } }
+  if (status === 'triage') return openParent && str(t.block_kind) === 'dependency' ? { ref: openParent } : { leaf: { kind: 'slot', text: 'needs triage: nobody is working it' } }
+  if (status === 'review') {
+    const run = (detail?.runs || []).slice(-1)[0]
+    return str(run?.status) === 'running' ? { leaf: { kind: 'running', text: 'review running' } } : { leaf: { kind: 'slot', text: 'no reviewer running' } }
   }
-  const kids = new Map()
-  for (const i of list) {
-    const p = parent.get(i.key)
-    if (p) kids.set(p, [...(kids.get(p) || []), i])
-  }
-  // A root's rank is the most urgent (lowest) rank in its subtree, so a three-line cut never hides a blocked-upstream
-  // or overdue line behind a long calm chain. Equal ranks keep the list's order.
-  const rankMemo = new Map()
-  const subtreeRank = (i, seen = new Set()) => {
-    if (rankMemo.has(i.key)) return rankMemo.get(i.key)
-    if (seen.has(i.key)) return Infinity
-    seen.add(i.key)
-    let r = Number(rankOf(i)) || 0
-    for (const k of kids.get(str(i.chip?.id)) || []) r = Math.min(r, subtreeRank(k, seen))
-    rankMemo.set(i.key, r)
-    return r
-  }
-  const roots = list.map((i, n) => ({ i, n })).filter(x => !parent.has(x.i.key))
-    .sort((a, b) => subtreeRank(a.i) - subtreeRank(b.i) || a.n - b.n).map(x => x.i)
-  const out = [], done = new Set()
-  const walk = (i, depth, parentId) => {
-    if (done.has(i.key)) return
-    done.add(i.key)
-    out.push({ i, depth, parentId })
-    for (const k of kids.get(str(i.chip?.id)) || []) walk(k, depth + 1, str(i.chip?.id))
-  }
-  for (const i of roots) walk(i, 0, null)
-  return out
+  return { leaf: { kind: 'unknown', text: status } }
+}
+function parkHop(detail, nowMs) {
+  const pk = parkFromDetail({ ...detail, task: { ...(detail?.task || {}), status: 'scheduled' } }), now = nowMs / 1000
+  if (!pk) return { leaf: { kind: 'unknown', text: 'parked with no wake' } }
+  if (pk.forHuman) return { leaf: { kind: 'you', text: 'no timed wake: will be blocked for you' } }
+  if (pk.superseded) return { leaf: { kind: 'unknown', text: 'new park not synced yet', sub: `backstop ${pacificShort(pk.wakeAt, nowMs)}` } }
+  const a = pk.awaiting && !pk.awaiting.inferred ? pk.awaiting : null
+  const when = pk.wakeAt ? (pk.wakeAt >= now ? `${shortDur(pk.wakeAt - now)} left · ${pacificShort(pk.wakeAt, nowMs)}` : `${shortDur(now - pk.wakeAt)} overdue`) : ''
+  if (a?.kind === 'human') return { leaf: { kind: 'you', text: a.why || 'waits on you' } }
+  const card = a && /\bt_[0-9a-f]{6,}\b/.exec(a.ref)?.[0]
+  if (card) return { ref: { id: card, status: '' } }
+  if (a && a.kind !== 'clock' && a.ref) return { leaf: { kind: 'external', text: a.kind === 'ci' ? shortWait(`ci ${a.ref}`).replace(/^ci (?!run |on PR)/i, 'CI: ') : `${a.kind === 'external' || a.kind === 'resource' ? '' : `${a.kind}: `}${shortWait(a.ref)}`, sub: when } }
+  if (pk.check) return { leaf: { kind: 'external', text: `probe ${/([\w.-]+\.(?:py|sh|mjs|js))\b/.exec(pk.check)?.[1] || shortWait(pk.check).split(/\s+/).slice(0, 2).join(' ')}`, sub: when } }
+  if (pk.wakeAt) return { leaf: { kind: 'external', text: pk.continued ? 'resumes on its own' : `timer${a?.why ? `: ${a.why.slice(0, 60)}` : ''}`, sub: when } }
+  return { leaf: { kind: 'unknown', text: 'parked with no wake' } }
 }
 
-/** Waiting rows share one grid, so the reason column lines up across rows: (indent · box · title) · reason · age.
- *  The reason column is a fixed 42% in every list, so it starts at the same place folded, opened and in Blocked
- *  upstream, and the title always keeps the rest. Rows are an outline (waitTree); `limit` cuts the outline after
- *  that many lines (children stay under their parent) and the rest count as "+N more waiting". */
-export function WaitList({ rows, now = Date.now(), kindOf = () => 'waiting', limit = Infinity, more = 0, attrs = {} }) {
-  // Most urgent first when cut: blocked upstream, then a warning (well overdue, a retired ask), then the rest.
-  const tree = waitTree(rows, i => (i.blockedUpstreamRow ? 0 : rowWait(i, now, needsPark(i) ? parkFor(i.chip, now) : null).tone === 'warn' ? 1 : 2))
-  const shown = tree.slice(0, limit)
-  const rest = tree.length - shown.length + more
-  if (!shown.length && !rest) return null
-  return jsxs('div', { ...attrs, style: { display: 'grid', gridTemplateColumns: 'minmax(0,1fr) minmax(0,42%) auto', columnGap: 10, minWidth: 0 }, children: [
-    ...shown.map(n => jsx(WaitRow, { i: n.i, now, k: kindOf(n.i), depth: n.depth, parentId: n.parentId }, n.i.key)),
-    rest > 0 && jsx('div', { 'data-wait-more': '', style: { ...muted, gridColumn: '1 / -1', padding: '2px 0 2px 22px' }, children: `+${rest} more waiting` }, 'more')
+// One cached card read per (route, id) for the walk: title, status, owning chat, owner gateway and the next hop.
+const CARD_FRESH_MS = 60_000, CARD_RETRY_MS = 2 * 60_000
+const cards = new Map()
+async function readCard(route, id) {
+  const bridge = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
+  if (!bridge || !route.connectionId) return null
+  for (const board of [...new Set([route.board, 'default'])]) {
+    try {
+      const r = await bridge({ path: `/api/plugins/kanban/tasks/${encodeURIComponent(id)}?board=${encodeURIComponent(board)}`, connectionId: route.connectionId, profile: route.profile, timeoutMs: 8_000 })
+      if (r?.task) return { detail: r, board }
+    } catch {}
+  }
+  return null
+}
+const cardSummary = (id, r) => ({ id, title: str(r.detail.task.title), status: str(r.detail.task.status), session: str(r.detail.task.session_id), owner: typeof r.detail.owner === 'string' ? r.detail.owner : '', board: r.board, hop: nextHop(r.detail, Date.now()) })
+/** One card read fills both caches: the park reader's answer seeds the chain's, and the chain's the park's. */
+function shareCardRead(route, id, r) {
+  if (!r?.detail?.task) return
+  cards.set(titleKey(route, id), { info: cardSummary(id, r), at: Date.now() })
+}
+function sharePark(route, id, r) {
+  const k = titleKey(route, id), hit = parks.get(k)
+  if (!hit?.pending) parks.set(k, { park: parkFromDetail(r.detail), failed: false, at: Date.now() })
+}
+/** `{ state: 'loading' | 'ok' | 'stale' | 'failed', info }`, info = `{ id, title, status, session, owner, board, hop }`. */
+export function cardInfo(chip, id, nowMs = Date.now(), read = readCard, fallback) {
+  const route = refRoute(chip, fallback)
+  if (!route.connectionId) return { state: 'failed', info: null }
+  const k = titleKey(route, id), hit = cards.get(k), age = hit ? nowMs - hit.at : Infinity
+  if (hit && (hit.pending ? age < TITLE_PENDING_MS : age < (hit.info && !hit.stale ? CARD_FRESH_MS : CARD_RETRY_MS))) return { state: hit.info ? (hit.stale ? 'stale' : 'ok') : hit.pending ? 'loading' : 'failed', info: hit.info ? (hit.stale ? { ...hit.info, stale: true } : hit.info) : null }
+  if (cards.size >= TITLE_MAX) cards.delete(cards.keys().next().value)
+  cards.set(k, { info: hit?.info || null, at: nowMs, pending: true })
+  Promise.resolve(read(route, id)).catch(() => null).then(r => {
+    const t = r?.detail?.task
+    if (t) sharePark(route, id, r)
+    const info = t ? cardSummary(id, r) : hit?.info || null
+    // A failed re-read keeps the last answer but marks it stale (shown as "not re-read"), never as current.
+    cards.set(k, { info, stale: !t && !!hit?.info, at: Date.now() })
+    if (info?.title && t) { titles.delete(k); titles.set(k, { title: info.title, board: info.board, state: info.status, at: Date.now() }); while (titles.size > TITLE_MAX) titles.delete(titles.keys().next().value) }
+    titleSubs.forEach(fn => fn())
+  })
+  return { state: hit?.info ? (hit.stale ? 'stale' : 'ok') : 'loading', info: hit?.info ? (hit.stale ? { ...hit.info, stale: true } : hit.info) : null }
+}
+
+/** The first step of a waiting card of this chat: a card its own row names (rowWait's reason), else what a read
+ *  of the card itself says (nextHop, the same rules as every hop), else, when that read is not available, only what
+ *  the row plainly states (a CI run, deploy, timer or probe is external; a retired ask is you); anything else is
+ *  `unknown`, never a guessed colour. */
+export function firstHop(i, nowMs = Date.now(), { info = cardInfo, fallback } = {}) {
+  if (i?.cardStatus) return { leaf: { kind: 'you', text: 'still blocked; its ask was retired' } }
+  const view = rowWait(i, nowMs, needsPark(i) ? parkFor(i.chip, nowMs) : null)
+  const ref = view.reason.find(p => typeof p !== 'string' && p.ref?.id)?.ref
+  if (ref) return { ref: { id: ref.id, status: ref.status || '' } }
+  const id = str(i?.chip?.id)
+  if (i?.kind === 'kanban' && id && !i.chip?.stale) {
+    const own = info(i.chip, id, nowMs, undefined, fallback)
+    if (own.info?.hop) return own.state === 'stale' ? { ...own.info.hop, stale: true } : own.info.hop
+    if (own.state === 'loading') return { leaf: { kind: 'unknown', text: 'reading…' }, loading: true }
+  }
+  const text = view.reason.map(p => (typeof p === 'string' ? p : '')).join('').trim()
+  return { leaf: { kind: rowLeafKind(i, text), text: text.replace(/^on /, '') || 'status unknown', sub: view.sub || '' } }
+}
+/** A row's own wait, by core's wait labels (kanban_wait_info.describe), when the card itself cannot be read: agent
+ *  work is a worker slot, a person is you, a named producer (CI, deploy, clock, probe, external ref) is external;
+ *  a parent card that was not read, a stale row or anything unrecognised stays unknown. */
+export function rowLeafKind(i, text) {
+  const c = i?.chip || {}, w = str(c.waitingOn).trim()
+  if (c.stale || /^(status unknown|reading wake|no wake published|new park not synced)/.test(text)) return 'unknown'
+  if (/^(an agent\b|nothing named|triage$)/.test(w) || / with no named producer$/.test(w) || /^(needs triage|no reviewer running|blocked · no reason|an agent)/.test(text)) return 'slot'
+  if (/^(you$|a hidden ask|an unvalidated ask)/.test(w) || /(waits on a person|for a person)/.test(text)) return 'you'
+  if (/^(a parent card|parent cards|a human or shared blocker|a producer the owner did not publish)/.test(w) || /^on parent cards$/.test(text)) return 'unknown'
+  // A named producer (core's labels start with its kind): CI, deploy, external/resource ref, the clock, a probe.
+  if (/^(ci|deploy|external|resource|probe|chat|the clock until|a declared window)\b/i.test(w) || /\b(left|overdue)$/.test(text) || /^(on )?(CI|deploy|probe)\b/i.test(text)) return 'external'
+  return 'unknown'
+}
+
+/** A waiting card's chain: `{ nodes: [info…], leaf: { kind, text, sub, ask }, loading }`. Walks at most MAX_HOPS
+ *  cards; a card met twice ends on an `unknown` cycle leaf. */
+export function chainFor(i, nowMs = Date.now(), { info = cardInfo, fallback, local = new Map() } = {}) {
+  const nodes = [], seen = new Set([str(i.chip?.id)])
+  const mine = local
+  let hop = firstHop(i, nowMs, { info, fallback })
+  if (hop.loading) return { nodes, leaf: hop.leaf, loading: true }
+  const rootStale = !!hop.stale
+  while (hop.ref) {
+    const id = hop.ref.id
+    if (seen.has(id)) return { nodes, leaf: { kind: 'unknown', text: 'circular wait' }, stale: rootStale }
+    if (nodes.length >= MAX_HOPS) return { nodes, leaf: { kind: 'unknown', text: `chain longer than ${MAX_HOPS} cards` }, stale: rootStale }
+    seen.add(id)
+    // A card of this chat: its own row already says what it waits on (no remote read).
+    const own = mine.get(id)
+    if (own) {
+      nodes.push({ id, title: own.label, status: str(own.chip?.state), session: '', owner: '', local: true })
+      hop = own.waiting ? firstHop(own.item, nowMs, { info, fallback }) : localHop(own.item)
+      continue
+    }
+    const r = info(i.chip, id, nowMs, undefined, fallback)
+    if (!r.info) return { nodes: [...nodes, { id, title: '', status: hop.ref.status || '', loading: r.state === 'loading' }], leaf: { kind: 'unknown', text: r.state === 'loading' ? 'reading…' : 'could not read this card' }, loading: r.state === 'loading', stale: rootStale }
+    nodes.push(r.info)
+    hop = r.info.hop
+  }
+  return { nodes, leaf: hop.leaf, stale: rootStale || nodes.some(n => n.stale) }
+}
+export const hops = ch => ch.nodes.length + 1
+// This chat's waiting rows by card id, set by the panel each render (chains through them use their own rows).
+/** This chat's cards by id (`{ item, waiting, label, chip }`): a chain through a waiting one continues from its own
+ *  row; through any other it ends by that card's state. Built per render and passed down (no shared module state). */
+export function chainLocal(waiting, others = []) {
+  const map = new Map()
+  for (const i of others || []) if (i?.chip?.id) map.set(str(i.chip.id), { item: i, waiting: false, label: i.label, chip: i.chip })
+  for (const i of waiting || []) if (i?.chip?.id) map.set(str(i.chip.id), { item: i, waiting: true, label: i.label, chip: i.chip })
+  return map
+}
+/** Where a chain ends on one of this chat's cards that is not waiting: by its own state. */
+function localHop(i) {
+  const st = str(i?.chip?.state), m = whereText(i?.chip)
+  if (st === 'running') return { leaf: { kind: 'running', text: `running${m ? ` on ${m}` : ''}` } }
+  if (st === 'review') return { leaf: { kind: 'running', text: 'in review' } }
+  if (st === 'ready') return { leaf: { kind: 'slot', text: 'waiting for a worker' } }
+  if (st === 'todo') return { leaf: { kind: 'slot', text: 'not started' } }
+  if (!OPEN(st)) return { leaf: { kind: 'done', text: `${st} · the waiting card should resume` } }
+  return { leaf: { kind: 'unknown', text: st || 'status unknown' } }
+}
+
+const chatIcon = jsx('svg', { width: 12, height: 12, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, 'aria-hidden': true, style: { flex: 'none' }, children: jsx('path', { d: 'M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z' }) })
+/** Where a chain card lives: "this chat", a chip naming the chat that owns it (opens it), or its owner gateway. */
+function ChatChip({ node, chip, known, now }) {
+  if (known.has(node.id)) return jsx('span', { 'data-this-chat': '', children: 'this chat' })
+  // A card another gateway owns (a replica read names it) lives in a chat on THAT gateway: its connection, never the
+  // waiting card's; with no known connection for it, the chat is named but not opened.
+  const st = typeof window !== 'undefined' ? window.__sessionTasks : null
+  const ownerConn = node.owner ? (typeof st?.connectionForHubGateway === 'function' ? st.connectionForHubGateway(node.owner) : null) : undefined
+  const base = refRoute(chip)
+  const route = ownerConn === undefined ? base : { connectionId: ownerConn, profile: base.profile, board: base.board }
+  if (realChat(node.session)) {
+    const title = sessionTitle(route, node.session, now)
+    const open = typeof host?.openSession === 'function' && route.connectionId
+    const label = title ? (title.length > 34 ? `${title.slice(0, 33).trimEnd()}…` : title) : 'its chat'
+    return open
+      ? jsxs('button', { type: 'button', 'data-open-session': node.session, title: `Open the chat that owns this card${title ? `: ${title}` : ''}`, onClick: e => { e.stopPropagation(); void Promise.resolve(host.openSession(node.session, { route: { connectionId: route.connectionId, profile: route.profile } })).catch(err => host.notifyError?.(err, 'Could not open that chat')) },
+        style: { display: 'inline-flex', alignItems: 'center', gap: 5, padding: '0 8px', border: '1px solid color-mix(in srgb, var(--border) 90%, transparent)', borderRadius: 999, background: 'transparent', color: 'var(--foreground)', font: 'inherit', fontSize: 12, lineHeight: '18px', cursor: 'pointer', maxWidth: 220, minWidth: 0, flex: '0 1 auto', whiteSpace: 'nowrap' }, children: [chatIcon, jsx('span', { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }, children: label }, 'l')] })
+      : jsxs('span', { children: ['chat ', label] })
+  }
+  return jsx('span', { children: node.owner ? `on ${node.owner}` : 'another chat' })
+}
+
+const GRID = { display: 'grid', gridTemplateColumns: 'minmax(0,1fr) minmax(0,42%) 4.2em', columnGap: 12, alignItems: 'center' }
+const CELL = { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
+const GUIDE = { marginLeft: 4, paddingLeft: 16, borderLeft: '1px solid color-mix(in srgb, var(--border) 90%, transparent)' }
+const leafBox = k => (LEAF[k]?.dashed ? { width: 9, height: 9, borderRadius: 2, boxSizing: 'border-box', flex: 'none', border: `1.5px dashed ${LEAF[k].color}` } : { width: 9, height: 9, borderRadius: 2, flex: 'none', background: LEAF[k]?.color })
+const summaryText = ch => `${ch.leaf.kind === 'unknown' ? shortLeaf(ch.leaf.text) : `waiting on ${ch.leaf.kind === 'you' ? 'you' : ch.leaf.kind === 'slot' ? 'a worker slot' : ch.leaf.kind === 'running' ? 'running work' : ch.leaf.kind === 'done' ? 'a finished card' : shortLeaf(ch.leaf.text)}`} · ${hops(ch)} ${hops(ch) === 1 ? 'hop' : 'hops'}`
+const shortLeaf = t => { const x = str(t).replace(/^CI: /, 'CI ').split(/[:(·]/)[0].trim(); return x.length > 28 ? `${x.slice(0, 27).trimEnd()}…` : x || 'something external' }
+
+/** One waiting card of this chat and its chain: the root line (box · title, its disclosure · root cause and hops ·
+ *  age), then each card it passes through on a tree guide (box by state · title, opens it · its chat · state), ending
+ *  on the tinted leaf. `sameAs` = an earlier root this chain runs into: its chain is not repeated. */
+export function WaitChain({ i, now = Date.now(), known, local = new Map(), sameAs = new Map(), k = 'waiting' }) {
+  const [open, setOpen] = useState(false)
+  const ch = chainFor(i, now, { local })
+  const st = typeof window !== 'undefined' ? window.__sessionTasks : null
+  const age = rowWait(i, now, needsPark(i) ? parkFor(i.chip, now) : null).age
+  const L = LEAF[ch.leaf.kind] || LEAF.unknown
+  const canOpen = i.kind === 'kanban' && !!i.chip?.connectionId && !!i.chip?.profile && typeof st?.openTaskChip === 'function'
+  const cut = ch.nodes.findIndex(nd => sameAs.has(nd.id))
+  const nodes = cut >= 0 ? ch.nodes.slice(0, cut + 1) : ch.nodes
+  let tail = jsxs('div', { 'data-chain-leaf': ch.leaf.kind, style: { ...GRID, padding: '5px 10px 5px 8px', margin: '2px 0', background: L.tint, borderRadius: 6 }, children: [
+    jsxs('span', { style: { display: 'flex', alignItems: ch.leaf.kind === 'you' ? 'flex-start' : 'center', gap: 10, minWidth: 0 }, children: [jsx('span', { 'aria-hidden': true, style: { ...leafBox(ch.leaf.kind), ...(ch.leaf.kind === 'you' ? { marginTop: 5 } : {}) } }), jsx('span', { 'data-leaf-text': '', title: ch.leaf.text, style: ch.leaf.kind === 'you' ? { minWidth: 0, color: L.text, whiteSpace: 'normal', overflowWrap: 'anywhere' } : { ...CELL, color: L.text }, children: ch.leaf.text })] }),
+    jsxs('span', { style: { ...muted, ...CELL, color: L.color, display: 'flex', alignItems: 'center', gap: 8 }, children: [
+      jsx('span', { style: CELL, children: `${L.label}${ch.leaf.sub ? ` · ${ch.leaf.sub}` : ''}` })
+    ] }),
+    jsx('span', {})
+  ] })
+  if (cut >= 0) tail = jsx('div', { 'data-chain-same': nodes[cut].id, style: { ...muted, padding: '3px 0 3px 2px' }, children: `same chain as “${sameAs.get(nodes[cut].id)}” above` })
+  // Nest from the leaf outwards: each card wraps the rest of the chain on its own tree guide.
+  let inner = tail
+  for (let n = nodes.length - 1; n >= 0; n--) {
+    const nd = nodes[n]
+    const kind = STATE_BOX[nd.status] || (nd.loading ? 'queued' : 'waiting')
+    const seg = waitSegments(`card ${nd.id}`, i.chip, now).find(x => x.id === nd.id)
+    const title = nd.title || nd.id
+    inner = jsxs('div', { style: GUIDE, children: [
+      jsxs('div', { 'data-chain-card': nd.id, style: { ...GRID, padding: '3px 0' }, children: [
+        jsxs('span', { style: { display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }, children: [
+          jsx('span', { 'aria-hidden': true, style: { ...pipStyle(kind), display: 'inline-flex' } }),
+          seg?.linkable && typeof st?.openTaskChip === 'function'
+            ? jsx('button', { type: 'button', 'data-wait-card': nd.id, title: `Open card ${nd.id}: ${title}`, onClick: () => st.openTaskChip(seg.open), style: { ...CELL, flex: 1, padding: 0, border: 0, background: 'transparent', font: 'inherit', color: 'var(--foreground)', opacity: 0.85, textAlign: 'left', cursor: 'pointer' }, children: title })
+            : jsx('span', { style: { ...CELL, flex: 1, opacity: 0.85 }, children: title })
+        ] }),
+        jsxs('span', { style: { ...muted, ...CELL, display: 'flex', alignItems: 'center', gap: 8 }, children: [jsx(ChatChip, { node: nd, chip: i.chip, known, now }), nd.status && jsx('span', { children: `${nd.status.replace(/_/g, ' ')}${nd.stale ? ' · not re-read' : ''}` }, 's')] }),
+        jsx('span', {})
+      ] }),
+      inner
+    ] })
+  }
+  if (!nodes.length) inner = jsx('div', { style: GUIDE, children: tail })
+  const tip = `${str(i.chip?.title) || i.label}${i.detail ? `\n${i.cardStatus ? i.detail : waitLabel(i.detail, i.chip)}` : ''}`
+  return jsxs('div', { 'data-wait-chain': i.key, 'data-panel-row': i.key, 'data-waiting-line': i.key, style: { fontSize: 13, display: 'flex', flexDirection: 'column', marginTop: 4 }, children: [
+    jsxs('div', { 'data-wait-row': '', title: tip, onClick: () => setOpen(o => !o), style: { ...GRID, padding: '4px 0', cursor: 'pointer' }, children: [
+      jsxs('span', { style: { display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }, children: [
+        jsx('span', { 'aria-hidden': true, 'data-row-pip': k, 'data-line-pip': k, ...(onHub(i) ? { 'data-row-pip-hub': '', 'data-line-pip-hub': '' } : {}), style: { ...pipStyle(k, onHub(i)), display: 'inline-flex' }, children: onHub(i) ? 'H' : undefined }),
+        jsx('button', { type: 'button', 'data-wait-toggle': '', 'aria-expanded': open, 'data-wait-title': '', style: { ...CELL, flex: 1, padding: 0, border: 0, background: 'transparent', font: 'inherit', color: 'inherit', textAlign: 'left', cursor: 'pointer' }, children: i.label })
+      ] }),
+      jsxs('span', { 'data-wait-reason': '', 'data-root-cause': ch.leaf.kind, title: `${L.label}: ${ch.leaf.text}`, style: { ...muted, color: L.color, display: 'flex', minWidth: 0, gap: 0, whiteSpace: 'nowrap' }, children: [
+        jsx('span', { style: { ...CELL }, children: `${summaryText(ch).replace(/ · \d+ hops?$/, '')}${ch.stale ? ' · not re-read' : ''}` }),
+        jsx('span', { 'data-hops': '', style: { flex: 'none' }, children: ` · ${hops(ch)} ${hops(ch) === 1 ? 'hop' : 'hops'}` })
+      ] }),
+      jsx('span', { 'data-wait-age': '', style: { ...muted, textAlign: 'right', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }, children: age })
+    ] }),
+    open && jsxs('div', { 'data-wait-details': '', style: { ...muted, fontSize: 11.5, lineHeight: 1.5, padding: '0 0 6px 22px', overflowWrap: 'anywhere' }, children: [
+      i.detail && jsx('div', { 'data-row-detail': '', children: jsx(WaitText, { text: str(i.detail).replace(SOURCE_TAIL, ''), chip: i.chip, plain: i.cardStatus }) }),
+      i.chip?.id && jsx('div', { 'data-wait-ident': '', children: [i.chip.id, i.chip.state, whereText(i.chip), SOURCE_TAIL.exec(str(i.detail))?.[1] ? `read from ${SOURCE_TAIL.exec(str(i.detail))[1]}` : ''].filter(Boolean).join(' · ') }),
+      i.evidenceText && jsx('div', { 'data-evidence': i.evidenceState || '', children: `evidence: ${i.evidenceText}` }),
+      canOpen && jsx('button', { type: 'button', 'data-open-card': '', style: { ...btn, minHeight: 26, marginTop: 4, fontSize: 12 }, onClick: () => st.openTaskChip(i.chip), children: 'Open card' })
+    ] }),
+    inner
+  ] })
+}
+const STATE_BOX = { running: 'running', review: 'waiting', ready: 'ready', todo: 'queued', done: 'done', archived: 'done', blocked: 'waiting', scheduled: 'waiting', triage: 'waiting' }
+
+/** One line per waiting card for the folded and collapsed views: box · title · ● root cause · detail · via N cards · age. */
+export function WaitLine({ i, now = Date.now(), k = 'waiting', local = new Map() }) {
+  const ch = chainFor(i, now, { local })
+  const L = LEAF[ch.leaf.kind] || LEAF.unknown
+  const age = rowWait(i, now, needsPark(i) ? parkFor(i.chip, now) : null).age
+  const via = ch.nodes.length ? ` · via ${ch.nodes.length} ${ch.nodes.length === 1 ? 'card' : 'cards'}` : ''
+  return jsxs('div', { 'data-waiting-line': i.key, 'data-wait-line': '', title: `${str(i.chip?.title) || i.label}\n${L.label}: ${ch.leaf.text}${via}`, style: { ...GRID, padding: '3px 0', fontSize: 13 }, children: [
+    jsxs('span', { style: { display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }, children: [
+      jsx('span', { 'aria-hidden': true, 'data-line-pip': k, ...(onHub(i) ? { 'data-line-pip-hub': '' } : {}), style: { ...pipStyle(k, onHub(i)), display: 'inline-flex' }, children: onHub(i) ? 'H' : undefined }),
+      jsx('span', { 'data-wait-title': '', style: CELL, children: i.label })
+    ] }),
+    jsxs('span', { 'data-wait-reason': '', 'data-root-cause': ch.leaf.kind, style: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, whiteSpace: 'nowrap' }, children: [
+      jsx('span', { 'aria-hidden': true, style: { width: 7, height: 7, borderRadius: '50%', flex: 'none', ...(L.dashed ? { border: `1px dashed ${L.color}`, boxSizing: 'border-box' } : { background: L.color }) } }),
+      jsx('span', { style: { color: L.color }, children: L.label }),
+      jsx('span', { style: { ...muted, ...CELL }, children: `· ${ch.leaf.text}${ch.leaf.sub ? `, ${ch.leaf.sub}` : ''}${via}${ch.stale ? ' · not re-read' : ''}` })
+    ] }),
+    jsx('span', { 'data-wait-age': '', style: { ...muted, textAlign: 'right', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }, children: age })
   ] })
 }
 
-/** The owner's park in words, for the long form: what it waits on (and why), the probe, and the wake. */
-export function parkLine(pk) {
-  if (!pk) return ''
-  const a = pk.awaiting
-  const parts = []
-  if (a && (a.ref || a.why)) parts.push(`${a.inferred ? 'inferred: ' : ''}waits on ${a.kind}${a.ref ? ` ${a.ref}` : ''}${a.why ? ` (${a.why})` : ''}`)
-  if (pk.check) parts.push(`probe \`${pk.check}\`${pk.nextProbeAt ? `, next ${pacificShort(pk.nextProbeAt)}` : ''}`)
-  if (pk.superseded) parts.push('its newest park already ended; the next park has not synced')
-  if (pk.forHuman) parts.push('no timed wake: the dispatcher blocks it for a person on its next tick')
-  else if (pk.wakeAt) parts.push(`${pk.superseded ? 'backstop' : pk.continued ? 'resumes' : 'wakes'} ${pacificShort(pk.wakeAt)}`)
-  return `owner's park: ${parts.join(' · ') || 'no wake'}`
-}
-
-/** One waiting card on one line of its WaitList (subgrid): box · title · short reason · how long. The title is the
- *  row's disclosure button (keyboard: Tab, Enter/Space); a click anywhere on the line opens it too. The long form:
- *  the full wait text (cards linked, the source), id · state · where, the execution evidence, and Open card. */
-export function WaitRow({ i, now = Date.now(), k = 'waiting', depth = 0, parentId = null }) {
-  const [open, setOpen] = useState(false)
-  const parkInfo = needsPark(i) ? parkFor(i.chip, now) : null
-  const base = rowWait(i, now, parkInfo)
-  // Nested under the card it waits on: the outline already says "on <parent>", so that reason is dropped.
-  const view = parentId && base.reason[0] === 'on ' && base.reason[1]?.ref?.id === parentId ? { ...base, reason: [], sub: '' } : base
-  // Indent is capped so a deep chain never squeezes the title away; the depth is still on the row (data-depth).
-  const indent = Math.min(depth, 4) * 20
-  const hub = onHub(i)
-  const st = typeof window !== 'undefined' ? window.__sessionTasks : null
-  const canOpen = i.kind === 'kanban' && !!i.chip?.connectionId && !!i.chip?.profile && typeof st?.openTaskChip === 'function'
-  const tip = `${str(i.chip?.title) || i.label}${i.detail ? `\n${i.cardStatus ? i.detail : waitLabel(i.detail, i.chip)}` : ''}`
-  const tone = view.tone === 'warn' ? C.stuck : view.tone === 'note' ? C.waiting : null
-  const cell = { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
-  return jsxs('div', { 'data-panel-row': i.key, 'data-waiting-line': i.key, 'data-wait-row': '', title: tip, onClick: () => setOpen(o => !o),
-    style: { display: 'grid', gridColumn: '1 / -1', gridTemplateColumns: 'subgrid', alignItems: 'center', fontSize: 13, padding: '3px 0', cursor: 'pointer' }, children: [
-      jsxs('span', { 'data-wait-head': '', ...(depth ? { 'data-depth': depth } : {}), style: { display: 'flex', alignItems: 'center', gap: 10, minWidth: 0, overflow: 'hidden', paddingLeft: indent }, children: [
-        jsx('span', { 'aria-hidden': true, style: { width: 12, flex: 'none', display: 'inline-flex', justifyContent: 'center' }, children: jsx('span', { 'data-row-pip': k, 'data-line-pip': k, ...(hub ? { 'data-row-pip-hub': '', 'data-line-pip-hub': '' } : {}), style: { ...pipStyle(k, hub), display: 'inline-flex' }, children: hub ? 'H' : undefined }) }),
-        jsx('button', { type: 'button', 'data-wait-toggle': '', 'aria-expanded': open, 'data-wait-title': '', style: { ...cell, display: 'block', flex: 1, padding: 0, border: 0, background: 'transparent', font: 'inherit', color: 'inherit', textAlign: 'left', cursor: 'pointer' }, children: i.label })
-      ] }),
-      jsxs('span', { 'data-wait-reason': '', ...(view.tone ? { 'data-tone': view.tone } : {}), ...(view.tone === 'warn' ? { 'data-warn': '' } : {}), style: { ...muted, ...cell, ...(tone ? { color: tone } : {}) }, children: [
-        ...view.reason.map((p, n) => (typeof p === 'string' ? p : jsx(RefChip, { ref: p.ref, chip: i.chip }, `r${n}`))),
-        view.sub && jsx('span', { 'data-wait-sub': '', style: { opacity: 0.75 }, children: ` · ${view.sub}` }, 'sub')
-      ] }),
-      jsx('span', { 'data-wait-age': '', title: view.age ? `waiting ${view.age}` : '', style: { ...muted, textAlign: 'right', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap', minWidth: '2.6em' }, children: view.age }),
-      open && jsxs('div', { 'data-wait-details': '', onClick: e => e.stopPropagation(), style: { ...muted, gridColumn: '1 / -1', fontSize: 11.5, lineHeight: 1.5, padding: `2px 0 6px ${indent + 22}px`, overflowWrap: 'anywhere', cursor: 'auto' }, children: [
-        // The wait itself first; where the state was read (`board status` / `reported board status`) joins the id line.
-        i.detail && jsx('div', { 'data-row-detail': '', children: jsx(WaitText, { text: str(i.detail).replace(SOURCE_TAIL, ''), chip: i.chip, plain: i.cardStatus }) }),
-        i.chip?.id && !i.cardStatus && jsx('div', { 'data-wait-ident': '', children: [i.chip.id, i.chip.state, whereText(i.chip), i.chip.board && i.chip.board !== 'default' ? `board ${i.chip.board}` : '', SOURCE_TAIL.exec(str(i.detail))?.[1] ? `read from ${SOURCE_TAIL.exec(str(i.detail))[1]}` : ''].filter(Boolean).join(' · ') }),
-        parkInfo?.park && jsx('div', { 'data-wait-park': '', children: parkLine(parkInfo.park) }),
-        i.evidenceText && jsx('div', { 'data-evidence': i.evidenceState || '', children: `evidence: ${i.evidenceText}` }),
-        canOpen && jsx('button', { type: 'button', 'data-open-card': '', style: { ...btn, minHeight: 26, marginTop: 4, fontSize: 12 }, onClick: () => st.openTaskChip(i.chip), children: 'Open card' })
-      ] })
-    ] })
+/** Counts of the waiting cards by root cause, for the Waiting heading. */
+export function causeBreakdown(rows, now = Date.now(), local = new Map()) {
+  const n = {}
+  // A chain still being read is not counted yet (it would flash as "unknown").
+  for (const i of rows || []) { const ch = chainFor(i, now, { local }); if (ch.loading) continue; const kk = ch.leaf.kind; n[kk] = (n[kk] || 0) + 1 }
+  return ['you', 'external', 'slot', 'running', 'done', 'unknown'].filter(kk => n[kk]).map(kk => ({ kind: kk, count: n[kk], label: LEAF[kk].label }))
 }
 
 // ── running rows ───────────────────────────────────────────────────────────
@@ -1590,6 +1798,7 @@ export function Panel() {
   const isAsked = c => !!US?.requestForSource?.({ gatewayId: c.gatewayId || c.gateway, profile: c.profile, type: 'kanban', board: c.board, id: c.id })
   const presentationFor = c => US?.presentationForSource?.({ gatewayId: c.gatewayId || c.gateway, profile: c.profile, type: 'kanban', board: c.board, id: c.id })
   const sorted = classify(chips, { nowMs: now, silence, isAsked, presentationFor, evidence: c => (c.kind === 'kanban' ? chipObservation(c, now / 1000) : null) })
+  const known = new Set(chips.filter(c => c?.kind === 'kanban' && c.id).map(c => str(c.id))) // this chat's cards
   const evidenceUnknown = annotateEvidence(sorted, now)
   const asks = typeof US?.openAskCount === 'function' ? US.openAskCount() : 0
   const finished = doneState.scope === scope ? doneState.rows : cachedDone(scope)
@@ -1609,7 +1818,6 @@ export function Panel() {
     else next.add(scope)
     return next
   })
-  const waitingBreakdown = waitBreakdown(sorted.waiting)
   const reported = sorted.reported
   const reportedOpen = reportedScopes.has(scope)
   const toggleReported = () => setReportedScopes(previous => {
@@ -1636,8 +1844,16 @@ export function Panel() {
   // "2 waiting" reads as a card running when none is.
   const status = busy ? 'Agent replying in this chat' : sorted.lastActivity ? `Idle · last activity ${ago(sorted.lastActivity, now)}` : 'Idle'
   // Collapsed, a bare "2 waiting" left the user asking "on what?": keep one short line per waiting card.
+  // Every waiting card of this chat, blocked-upstream ones included, as a chain root (retired asks keep their row).
+  const chainRows = [...sorted.blockedUpstream, ...sorted.waiting.filter(i => !i.cardStatus)]
   const waitingRows = [...sorted.blockedUpstream, ...sorted.waiting]
-  const foldRows = sorted.waiting.filter(i => !i.cardStatus) // cardStatus rows always render in full
+  const local = chainLocal(chainRows, [...sorted.active, ...sorted.stuck, ...sorted.ready, ...sorted.queued, ...sorted.unasked])
+  // A still-blocked card whose ask was retired is waiting on you too: it counts, and keeps a line when collapsed.
+  const retired = sorted.waiting.filter(i => i.cardStatus)
+  const lineRows = [...chainRows, ...retired]
+  const causes = causeBreakdown(lineRows, now, local)
+  // A chain that runs into another root shown above is not repeated (`same chain as … above`).
+  const sameAs = new Map()
   const needsYou = [
     (asks > 0 || sorted.unasked.length > 0) && jsx('h3', { 'data-section': 'needs-you', style: heading(C.needsYou), children: `Needs you · ${asks + sorted.unasked.length}` }, 'h-needs-you'),
     US?.ActionQueue && jsx(US.ActionQueue, { embedded: true, audience: 'human' }, 'queue'),
@@ -1646,6 +1862,7 @@ export function Panel() {
   ].filter(Boolean)
   const summaryParts = PIP_ORDER.filter(k => n[k]).map(k => ({ k, text: `${n[k]} ${LABEL[k]}` }))
   const otherSections = asks + sorted.unasked.length + sorted.stuck.length + sorted.blockedUpstream.length + sorted.waiting.length > 0
+  const waitingCount = sorted.blockedUpstream.length + sorted.waiting.length
   // Rows whose source evidence is unknown (expired, missing from an older producer, or SDK projector absent) are
   // counted apart: they are neither green nor zero.
   if (reported.length) summaryParts.push({ k: 'reported', text: `${reported.length} reported finished, unconfirmed` })
@@ -1665,30 +1882,40 @@ export function Panel() {
       summaryParts.length > 0 && jsx('span', { 'data-status-summary': '', ...(collapsed ? { 'data-collapsed-summary': '' } : {}), className: 'min-w-0 truncate', children: summaryParts.flatMap((p, idx) => [idx > 0 && ' · ', jsx('span', { style: p.k === 'needsYou' || p.k === 'stuck' ? { color: C[p.k], fontWeight: 600 } : undefined, children: p.text }, p.k)].filter(Boolean)) })
     ] }) }),
     // Collapsed, a bare "2 waiting" left the user asking "on what?": keep one short line per waiting card.
-    collapsed && waitingRows.length > 0 && jsx('div', { style: { padding: '0 12px 2px 30px', minWidth: 0 }, children: jsx(WaitList, { rows: waitingRows, now, kindOf: lineKind, limit: WAIT_LINES_COLLAPSED, attrs: { 'data-collapsed-waiting': '' } }) }),
+    collapsed && lineRows.length > 0 && jsxs('div', { 'data-collapsed-waiting': '', style: { padding: '0 12px 2px 30px', minWidth: 0 }, children: [
+      ...lineRows.slice(0, WAIT_LINES_COLLAPSED).map(i => jsx(WaitLine, { i, now, local }, i.key)),
+      lineRows.length > WAIT_LINES_COLLAPSED && jsx('div', { 'data-wait-more': '', style: { ...muted, padding: '2px 0 2px 22px' }, children: `+${lineRows.length - WAIT_LINES_COLLAPSED} more waiting` }, 'more')
+    ] }),
     !collapsed && jsxs('div', { 'data-panel-body': '', className: 'status-section-body', style: { maxHeight: '55vh', overflowY: 'auto', minWidth: 0, padding: '0 10px 0 12px' }, children: [
       ...needsYou,
       US?.ActionQueue && jsx('div', { 'data-agent-deliveries': '', style: { color: 'var(--muted-foreground)' }, children: jsx(US.ActionQueue, { embedded: true, audience: 'agent' }, 'agent-queue') }),
       sorted.stuck.length > 0 && jsx('h3', { 'data-section': 'stuck', style: heading(C.stuck), children: `Stuck · ${sorted.stuck.length}` }),
       ...sorted.stuck.map(i => jsx(StuckCard, { i, session: route.session, now }, i.key)),
-      sorted.blockedUpstream.length > 0 && jsx('h3', { 'data-section': 'blocked-upstream', style: heading(C.blockedUpstream), children: `Blocked upstream · ${sorted.blockedUpstream.length}` }),
-      jsx(WaitList, { rows: sorted.blockedUpstream, now, kindOf: () => 'blockedUpstream' }, 'wl-bu'),
       // The header already says "N running" with N blue boxes: the heading only earns its line when other
       // sections share the body and the running rows need telling apart from them.
       sorted.active.length > 0 && otherSections &&
         jsx('h3', { 'data-section': 'in-progress', style: heading('var(--muted-foreground)'), children: `In progress · ${sorted.active.length}` }),
       sorted.active.length > 0 && jsx('div', { 'data-running-list': '', style: { paddingTop: otherSections ? 0 : 4 }, children: sorted.active.map(i => jsx(RunningRow, { i, now }, i.key)) }),
-      sorted.waiting.length > 0 && jsxs('button', { type: 'button', 'data-waiting-toggle': '', 'aria-expanded': waitingOpen, onClick: toggleWaiting, title: waitingOpen ? 'Hide waiting cards' : 'Show waiting cards', style: { display: 'flex', alignItems: 'baseline', flexWrap: 'wrap', gap: 8, width: '100%', margin: '12px 0 6px', padding: 0, background: 'transparent', border: 0, cursor: 'pointer', font: 'inherit', textAlign: 'left', color: 'var(--muted-foreground)' }, children: [
+      waitingCount > 0 && jsxs('button', { type: 'button', 'data-waiting-toggle': '', 'aria-expanded': waitingOpen, onClick: toggleWaiting, title: waitingOpen ? 'Hide the dependency chains' : 'Show each waiting card\'s dependency chain', style: { display: 'flex', alignItems: 'baseline', flexWrap: 'wrap', gap: 10, width: '100%', margin: '12px 0 6px', padding: 0, background: 'transparent', border: 0, cursor: 'pointer', font: 'inherit', textAlign: 'left', color: 'var(--muted-foreground)' }, children: [
         jsx('span', { 'aria-hidden': true, style: { fontSize: 10, width: 10 }, children: waitingOpen ? '▾' : '▸' }),
-        jsx('h3', { 'data-section': 'waiting', style: { ...heading('var(--muted-foreground)'), margin: 0 }, children: `Waiting · ${sorted.waiting.length}` }),
-        jsx('span', { 'data-waiting-breakdown': '', style: muted, children: waitingBreakdown.text })
+        jsx('h3', { 'data-section': 'waiting', style: { ...heading('var(--muted-foreground)'), margin: 0 }, children: `Waiting · ${waitingCount}` }),
+        causes.length > 0 && jsxs('span', { 'data-waiting-breakdown': '', style: { ...muted, display: 'inline-flex', flexWrap: 'wrap', alignItems: 'center', gap: 10 }, children: [
+          jsx('span', { children: 'blocked on' }, 'on'),
+          ...causes.map(c => jsxs('span', { 'data-cause': c.kind, style: { display: 'inline-flex', alignItems: 'center', gap: 5, color: LEAF[c.kind].color }, children: [jsx('span', { 'aria-hidden': true, style: { width: 7, height: 7, borderRadius: '50%', ...(LEAF[c.kind].dashed ? { border: `1px dashed ${LEAF[c.kind].color}`, boxSizing: 'border-box' } : { background: LEAF[c.kind].color }) } }), `${c.count} ${c.label}`] }, c.kind))
+        ] })
       ] }),
-      // Folded, the counts alone ("1 other") left the user asking "on what?": name up to 3 cards and what each
-      // waits on, one line each, as the collapsed panel does. Opening the fold shows the full rows.
-      !waitingOpen && foldRows.length > 0 && jsx(WaitList, { rows: foldRows, now, limit: WAIT_LINES_COLLAPSED, attrs: { 'data-folded-waiting': '' } }, 'wl-fold'),
+      // Folded: one line per waiting card naming its root cause (first WAIT_LINES_COLLAPSED); opened: each chain.
+      !waitingOpen && chainRows.length > 0 && jsxs('div', { 'data-folded-waiting': '', children: [
+        ...chainRows.slice(0, WAIT_LINES_COLLAPSED).map(i => jsx(WaitLine, { i, now, local }, i.key)),
+        chainRows.length > WAIT_LINES_COLLAPSED && jsx('div', { 'data-wait-more': '', style: { ...muted, padding: '2px 0 2px 22px' }, children: `+${chainRows.length - WAIT_LINES_COLLAPSED} more waiting` }, 'more')
+      ] }, 'fold'),
       // A still-blocked owner whose ask was retired has no other surface: its status row is never folded away.
-      ...(waitingOpen ? [] : sorted.waiting.filter(i => i.cardStatus).map(i => jsx(Row, { i, k: 'waiting' }, i.key))),
-      waitingOpen && jsx(WaitList, { rows: sorted.waiting, now, attrs: { 'data-open-waiting': '' } }, 'wl-open'),
+      ...sorted.waiting.filter(i => i.cardStatus).map(i => jsx(Row, { i, k: 'waiting' }, i.key)),
+      waitingOpen && jsx('div', { 'data-open-waiting': '', children: chainRows.map(i => {
+        const el = jsx(WaitChain, { i, now, known, local, sameAs: new Map(sameAs) }, i.key)
+        if (i.chip?.id) sameAs.set(str(i.chip.id), i.label)
+        return el
+      }) }, 'open'),
       (finished?.length || reported.length || sorted.ready.length || sorted.queued.length) ? jsxs('div', { style: { borderTop: '1px solid color-mix(in srgb, var(--border) 60%, transparent)', marginTop: 10, paddingTop: 4 }, children: [
         jsx(Fold, { label: `Ready · ${sorted.ready.length}`, items: sorted.ready, k: 'ready' }),
         jsx(Fold, { label: `Not started · ${sorted.queued.length}`, items: sorted.queued, k: 'queued' }),

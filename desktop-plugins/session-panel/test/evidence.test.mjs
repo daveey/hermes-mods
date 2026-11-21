@@ -45,7 +45,7 @@ test('fresh board status survives a parked card with no execution generation', {
   const b = bridges({ chips })
   await show(React.createElement(m.Panel, { key: 'board-status' }))
   await openWaiting()
-  assert.match(el().querySelector('[data-wait-reason]').textContent, /^no wake published$/)
+  assert.match(el().querySelector('[data-wait-reason]').textContent, /^no wake published · 1 hop$/)
   assert.equal(el().querySelector('[data-row-detail]').textContent, 'scheduled · its owner has not published what wakes it')
   assert.match(el().querySelector('[data-wait-ident]').textContent, /^t_x · scheduled.* · read from board status$/)
   assert.match(el().querySelector('[data-evidence]').textContent, /hub\/default\/default\/card:t_x/)
@@ -230,7 +230,7 @@ test('legacy needs-you ask keeps its actionable row even when its evidence expir
   at(500) // record long expired
   await show(React.createElement(m.Panel, { key: 'c' }))
   assert.equal(el().querySelector('[data-section="needs-you"]').textContent, 'Needs you · 1')
-  assert.match(el().querySelector('[data-ask-step]').textContent, /^Do this: Pick one\./)
+  assert.match(el().querySelector('[data-ask-step]').textContent, /^Pick one\./)
   assert.ok(el().querySelector('[data-open-card]'), 'Open card stays')
   assert.match(el().querySelector('[data-evidence]').textContent, /unknown \(source expired\)/)
 })

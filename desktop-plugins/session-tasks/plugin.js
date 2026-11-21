@@ -1410,7 +1410,7 @@ export default {
     })
     const onVis = () => document.hidden || void refresh()
     document.addEventListener('visibilitychange', onVis)
-    window.__sessionTasks = { version: 'wait-visible-v1', get snapshot() { return snapshot }, refresh, subscribe, openTaskChip, lineageIds, focusedRoute, warm, activityLabel }
+    window.__sessionTasks = { version: 'wait-visible-v1', get snapshot() { return snapshot }, refresh, subscribe, openTaskChip, lineageIds, focusedRoute, warm, activityLabel, connectionForHubGateway }
     return () => {
       for (const stop of stops) stop?.()
       document.removeEventListener('visibilitychange', onVis)

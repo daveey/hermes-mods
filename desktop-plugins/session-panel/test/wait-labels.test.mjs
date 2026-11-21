@@ -26,7 +26,6 @@ test('contained wait kind and blocked-upstream / on-parent labels', () => {
   ], { nowMs: NOW })
   assert.equal(m.waitKind(waiting.waiting.find(i => i.id === 't_held')), 'contained')
   assert.equal(waiting.waiting.find(i => i.id === 't_card').detail, 'waiting on card t_x on hub → t_run running')
-  assert.equal(m.waitBreakdown(waiting.waiting).text, '1 on parent · 1 contained')
 })
 
 test('unreadable containment authority stays explicit', () => {

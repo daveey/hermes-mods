@@ -64,7 +64,6 @@ test('each parked state leads with what it waits on, never a bare state name', (
   // Core's wait text for a blocked dependency is "a parent card": that is on parent, not blocked.
   assert.equal(m.waitKind({ kind: 'kanban', detail: 'waiting on a parent card · board status', chip: { state: 'blocked', waitingOn: 'a parent card' } }), 'parent')
   // Built-in names are ordinary states, not Object prototype keys.
-  assert.equal(m.waitBreakdown([{ kind: 'kanban', detail: 'x', chip: { state: 'constructor' } }]).text, '1 constructor')
   // A published wait is said as published, with its upstream leaf.
   const timed = parked([waitFor('scheduled', { wait: { wait_state: 'waiting', waiting_on: 'the clock until 2026-11-23 00:00 UTC' } })])
   assert.equal(timed.waiting[0].detail, '2d 12h left (until 2026-11-22 16:00 PST) · board status')
@@ -77,12 +76,8 @@ test('a replica board read is labelled reported, after the reason', () => {
 
 test('the breakdown names every bucket: no "other" for triage, review, blocked, retired asks or unknown states', () => {
   const out = parked([waitFor('triage'), waitFor('review'), waitFor('blocked'), waitFor('scheduled')])
-  assert.equal(m.waitBreakdown(out.waiting).text, '1 on schedule · 1 in triage · 1 in review · 1 blocked')
   assert.equal(m.waitKind({ kind: 'kanban', cardStatus: true, detail: 'G1 / default / default / t_x · blocked · request dismissed', chip: { state: 'blocked' } }), 'blocked')
-  const odd = { kind: 'kanban', detail: 'paused', chip: { state: 'paused' } }
-  assert.equal(m.waitKind(odd), 'paused')
-  assert.equal(m.waitBreakdown([odd]).text, '1 paused')
-  assert.doesNotMatch(m.waitBreakdown(out.waiting).text, /other/)
+  assert.equal(m.waitKind({ kind: "kanban", detail: "paused", chip: { state: "paused" } }), "paused")
 })
 
 test('parked rows with unknown execution evidence are not counted as "evidence unknown"; unread running ones still are', () => {
@@ -254,29 +249,6 @@ test('pacificShort: weekday within six days, month and day beyond; PDT in daylig
   assert.equal(m.pacificShort(Date.parse('2026-12-03T06:20:00Z') / 1000, NOW), 'Dec 2 22:20 PST')
   assert.equal(m.pacificShort(Date.parse('2026-07-01T07:00:00Z') / 1000, Date.parse('2026-06-30T00:00:00Z')), 'Wed 00:00 PDT')
 })
-
-test('waitTree: a card waiting on another card of the list sits under it; order, cycles and outside blockers', () => {
-  const r = (id, chip = {}) => ({ key: `kb:${id}`, kind: 'kanban', label: id, chip: { id, ...chip } })
-  const shape = rows => m.waitTree(rows).map(n => `${'  '.repeat(n.depth)}${n.i.chip.id}${n.parentId ? `<${n.parentId}` : ''}`)
-  // A ← B (named wait), A ← C (upstream), C ← D (blocked upstream); E waits on a card outside the list.
-  const rows = [r('t_aaaaaaaa'), r('t_eeeeeeee', { waitingOn: 'card t_99999999' }), r('t_dddddddd', { blockedUpstream: { id: 't_cccccccc', status: 'blocked' } }),
-    r('t_bbbbbbbb', { waitingOn: 'card t_aaaaaaaa on hub' }), r('t_cccccccc', { upstream: { id: 't_aaaaaaaa', status: 'scheduled' } })]
-  assert.deepEqual(shape(rows), ['t_aaaaaaaa', '  t_bbbbbbbb<t_aaaaaaaa', '  t_cccccccc<t_aaaaaaaa', '    t_dddddddd<t_cccccccc', 't_eeeeeeee'])
-  // A cycle never nests forever: every card is listed once.
-  const cyc = shape([r('t_11111111', { waitingOn: 'card t_22222222' }), r('t_22222222', { waitingOn: 'card t_11111111' })])
-  assert.equal(cyc.length, 2)
-  assert.deepEqual(cyc.map(x => x.trim().slice(0, 10)).sort(), ['t_11111111', 't_22222222'])
-  // A card naming itself is a root.
-  assert.deepEqual(shape([r('t_33333333', { waitingOn: 'card t_33333333' })]), ['t_33333333'])
-  // A card leading into a cycle still nests: C waits on A; A and B wait on each other.
-  const lead = shape([r('t_cccc0000', { waitingOn: 'card t_aaaa0000' }), r('t_aaaa0000', { waitingOn: 'card t_bbbb0000' }), r('t_bbbb0000', { waitingOn: 'card t_aaaa0000' })])
-  assert.ok(lead.some(x => /^ +t_cccc0000<t_aaaa0000$/.test(x)), JSON.stringify(lead))
-  // Roots are ordered by the most urgent line in their subtree: D (rank 0) is under C, so C's tree comes first.
-  const ranked = m.waitTree([r('t_a1111111'), r('t_e1111111'), r('t_c1111111'), r('t_d1111111', { blockedUpstream: { id: 't_c1111111' } })], i => (i.chip.blockedUpstream ? 0 : 2))
-  assert.deepEqual(ranked.map(n => n.i.chip.id), ['t_c1111111', 't_d1111111', 't_a1111111', 't_e1111111'])
-})
-
-
 
 test('owner park: read from the card detail; the line shows the real wake instead of "no wake published"', async () => {
   const NOW = Date.parse('2026-11-20T22:53:00Z'), S = NOW / 1000
