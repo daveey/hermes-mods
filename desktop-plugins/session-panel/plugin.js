@@ -959,23 +959,30 @@ export async function refreshDone() {
   }
   const st = typeof window !== 'undefined' ? window.__sessionTasks : null
   const bridge = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
-  if (!route.session || !route.connectionId || !bridge || typeof st?.lineageIds !== 'function') return
+  if (!route.session || !route.connectionId) return
+  const unavailable = () => {
+    if (routeKey(panelRoute()) !== scope) return
+    done = { scope, rows: (done.scope === scope && done.rows) || cachedDone(scope), unavailable: true }
+    doneSubs.forEach(fn => fn(done))
+  }
+  if (!bridge || typeof st?.lineageIds !== 'function') { unavailable(); return }
   try {
     const ids = await st.lineageIds(route.session, route.connectionId, route.profile)
-    if (ids?.incomplete) return
+    if (ids?.incomplete) { unavailable(); return }
     const r = await bridge({ path: `/api/plugins/user-steps/session-cards?ids=${encodeURIComponent([...ids].join(','))}`, connectionId: route.connectionId, profile: route.profile, timeoutMs: 15_000 })
     if (routeKey(panelRoute()) !== scope) return
     // Only an answer that says it lists finished cards counts; any other answer (an owner that cannot list them)
     // leaves done unknown.
-    done = { scope, rows: Array.isArray(r?.tasks) && Array.isArray(r.includes) && r.includes.includes('done') ? doneRows(r.tasks) : null }
+    if (!Array.isArray(r?.tasks) || !Array.isArray(r.includes) || !r.includes.includes('done')) { unavailable(); return }
+    done = { scope, rows: doneRows(r.tasks) }
     if (done.rows) rememberDone(scope, done.rows)
   } catch (e) {
     // A failed read keeps the last-known list (unknown when there is none). [daveey 2026-11-21] "panels keep
     // flipping between correct and incorrect": a busy owner failed this read and the Done count vanished until
     // the next read answered.
     log('session-cards read failed', e?.message || e)
-    if (routeKey(panelRoute()) !== scope) return
-    done = { scope, rows: (done.scope === scope && done.rows) || cachedDone(scope) }
+    unavailable()
+    return
   }
   doneSubs.forEach(fn => fn(done))
 }
@@ -1666,26 +1673,36 @@ export function rowLeafKind(i, text) {
 /** A waiting card's chain: `{ nodes: [info…], leaf: { kind, text, sub, ask }, loading }`. Walks at most MAX_HOPS
  *  cards; a card met twice ends on an `unknown` cycle leaf. */
 export function chainFor(i, nowMs = Date.now(), { info = cardInfo, fallback, local = new Map() } = {}) {
-  const nodes = [], seen = new Set([str(i.chip?.id)])
+  const nodes = [], seen = new Set([chainKey(refRoute(i.chip, fallback), i.chip?.id)].filter(Boolean))
+  let source = i.chip
   const mine = local
   let hop = firstHop(i, nowMs, { info, fallback })
   if (hop.loading) return { nodes, leaf: hop.leaf, loading: true }
   const rootStale = !!hop.stale
   while (hop.ref) {
-    const id = hop.ref.id
-    if (seen.has(id)) return { nodes, leaf: { kind: 'unknown', text: 'circular wait' }, stale: rootStale }
+    const id = hop.ref.id, key = chainKey(source, id)
     if (nodes.length >= MAX_HOPS) return { nodes, leaf: { kind: 'unknown', text: `chain longer than ${MAX_HOPS} cards` }, stale: rootStale }
-    seen.add(id)
-    // A card of this chat: its own row already says what it waits on (no remote read).
-    const own = mine.get(id)
+    // Use another row only when its full local route is known and identical.
+    const own = key && mine.get(key)
     if (own) {
-      nodes.push({ id, title: own.label, status: str(own.chip?.state), session: '', owner: '', local: true })
+      if (seen.has(key)) return { nodes, leaf: { kind: 'unknown', text: 'circular wait' }, stale: rootStale }
+      seen.add(key)
+      nodes.push({ id, key, title: own.label, status: str(own.chip?.state), session: '', owner: '', local: true })
+      source = own.chip
       hop = own.waiting ? firstHop(own.item, nowMs, { info, fallback }) : localHop(own.item, nowMs, { info, fallback })
       continue
     }
-    const r = info(i.chip, id, nowMs, undefined, fallback)
-    if (!r.info) return { nodes: [...nodes, { id, title: '', status: hop.ref.status || '', loading: r.state === 'loading' }], leaf: { kind: 'unknown', text: r.state === 'loading' ? 'reading…' : 'could not read this card' }, loading: r.state === 'loading', stale: rootStale }
-    nodes.push(r.info)
+    if (key && seen.has(key)) return { nodes, leaf: { kind: 'unknown', text: 'circular wait' }, stale: rootStale }
+    const r = info(source, id, nowMs, undefined, fallback)
+    if (!r.info) return { nodes: [...nodes, { id, key, title: '', status: hop.ref.status || '', loading: r.state === 'loading' }], leaf: { kind: 'unknown', text: r.state === 'loading' ? 'reading…' : 'could not read this card' }, loading: r.state === 'loading', stale: rootStale }
+    // readCard may fall back to the default board. Detect cycles by the actual
+    // read identity, without promoting an implicit route into local-row authority.
+    const readRoute = { ...refRoute(source, fallback), board: r.info.board || refRoute(source, fallback).board }
+    const readKey = chainKey(readRoute, id)
+    if (readKey && seen.has(readKey)) return { nodes, leaf: { kind: 'unknown', text: 'circular wait' }, stale: rootStale }
+    if (readKey) seen.add(readKey)
+    source = { ...source, board: readRoute.board }
+    nodes.push({ ...r.info, key: chainKey(source, id) })
     hop = r.info.hop
   }
   return { nodes, leaf: hop.leaf, stale: rootStale || nodes.some(n => n.stale) }
@@ -1694,10 +1711,14 @@ export const hops = ch => ch.nodes.length + 1
 // This chat's waiting rows by card id, set by the panel each render (chains through them use their own rows).
 /** This chat's cards by id (`{ item, waiting, label, chip }`): a chain through a waiting one continues from its own
  *  row; through any other it ends by that card's state. Built per render and passed down (no shared module state). */
+export function chainKey(chip, id = chip?.id) {
+  if (!chip?.connectionId || !chip?.profile || !id) return null
+  return JSON.stringify([chip.connectionId, chip.profile, chip.board || 'default', str(id)])
+}
 export function chainLocal(waiting, others = []) {
   const map = new Map()
-  for (const i of others || []) if (i?.chip?.id) map.set(str(i.chip.id), { item: i, waiting: false, label: i.label, chip: i.chip })
-  for (const i of waiting || []) if (i?.chip?.id) map.set(str(i.chip.id), { item: i, waiting: true, label: i.label, chip: i.chip })
+  for (const i of others || []) if (chainKey(i?.chip)) map.set(chainKey(i.chip), { item: i, waiting: false, label: i.label, chip: i.chip })
+  for (const i of waiting || []) if (chainKey(i?.chip)) map.set(chainKey(i.chip), { item: i, waiting: true, label: i.label, chip: i.chip })
   return map
 }
 /** Where a chain ends on one of this chat's cards that is not waiting: by its own state. */
@@ -1714,7 +1735,7 @@ function localHop(i, nowMs = Date.now(), { info = cardInfo, fallback } = {}) {
 const chatIcon = jsx('svg', { width: 12, height: 12, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, 'aria-hidden': true, style: { flex: 'none' }, children: jsx('path', { d: 'M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z' }) })
 /** Where a chain card lives: "this chat", a chip naming the chat that owns it (opens it), or its owner gateway. */
 function ChatChip({ node, chip, known, now }) {
-  if (known.has(node.id)) return jsx('span', { 'data-this-chat': '', children: 'this chat' })
+  if (node.key && known.has(node.key)) return jsx('span', { 'data-this-chat': '', children: 'this chat' })
   // A card another gateway owns (a replica read names it) lives in a chat on THAT gateway: its connection, never the
   // waiting card's; with no known connection for it, the chat is named but not opened.
   const st = typeof window !== 'undefined' ? window.__sessionTasks : null
@@ -1750,13 +1771,13 @@ export function WaitChain({ i, now = Date.now(), known, local = new Map(), sameA
   const age = rowWait(i, now, needsPark(i) ? parkFor(i.chip, now) : null).age
   const L = LEAF[ch.leaf.kind] || LEAF.unknown
   const canOpen = i.kind === 'kanban' && !!i.chip?.connectionId && !!i.chip?.profile && typeof st?.openTaskChip === 'function'
-  // Cut where this chain meets one already shown: another waiting root (`sameAs` by card id; that row is kept as the
-  // last node) or a prerequisite an earlier chain already listed (`sameAs` by `node:<id>`; shown once, not repeated).
-  const rootCut = ch.nodes.findIndex(nd => sameAs.has(nd.id)), nodeCut = ch.nodes.findIndex(nd => sameAs.has(`node:${nd.id}`))
+  // Cut before a qualified root or prerequisite already drawn above; neither is repeated.
+  const rootCut = ch.nodes.findIndex(nd => nd.key && sameAs.has(nd.key)), nodeCut = ch.nodes.findIndex(nd => nd.key && sameAs.has(`node:${nd.key}`))
   const sharedFirst = nodeCut >= 0 && (rootCut < 0 || nodeCut < rootCut)
-  const cut = sharedFirst ? nodeCut : rootCut
+  const candidateCut = sharedFirst ? nodeCut : rootCut
+  const cut = parent && candidateCut >= parent.index ? -1 : candidateCut
   // Nested under its prerequisite (`parent`, see groupSharedRunning): only the cards between this row and that parent.
-  const nodes = parent ? ch.nodes.slice(0, parent.index) : cut >= 0 ? ch.nodes.slice(0, sharedFirst ? cut : cut + 1) : ch.nodes
+  const nodes = cut >= 0 ? ch.nodes.slice(0, cut) : parent ? ch.nodes.slice(0, parent.index) : ch.nodes
   let tail = jsxs('div', { 'data-chain-leaf': ch.leaf.kind, style: { ...GRID, padding: '5px 10px 5px 8px', margin: '2px 0', background: L.tint, borderRadius: 6 }, children: [
     jsxs('span', { style: { display: 'flex', alignItems: ch.leaf.kind === 'you' ? 'flex-start' : 'center', gap: 10, minWidth: 0 }, children: [jsx('span', { 'aria-hidden': true, style: { ...leafBox(ch.leaf.kind), ...(ch.leaf.kind === 'you' ? { marginTop: 5 } : {}) } }), jsx('span', { 'data-leaf-text': '', title: ch.leaf.text, style: ch.leaf.kind === 'you' ? { minWidth: 0, color: L.text, whiteSpace: 'normal', overflowWrap: 'anywhere' } : { ...CELL, color: L.text }, children: ch.leaf.text })] }),
     jsxs('span', { style: { ...muted, ...CELL, color: L.color, display: 'flex', alignItems: 'center', gap: 8 }, children: [
@@ -1764,11 +1785,11 @@ export function WaitChain({ i, now = Date.now(), known, local = new Map(), sameA
     ] }),
     jsx('span', {})
   ] })
-  if (parent) tail = null
+  if (parent && cut < 0) tail = null
   else if (cut >= 0 && sharedFirst) {
     const shared = ch.nodes[cut]
-    tail = jsx('div', { 'data-chain-same': shared.id, style: { ...muted, padding: '3px 0 3px 2px' }, children: `same prerequisite as “${sameAs.get(`node:${shared.id}`)}” above: ${shared.title || shared.id}${shared.status ? ` — ${shared.status.replace(/_/g, ' ')}` : ''}` })
-  } else if (cut >= 0) tail = jsx('div', { 'data-chain-same': nodes[cut].id, style: { ...muted, padding: '3px 0 3px 2px' }, children: `same chain as “${sameAs.get(nodes[cut].id)}” above` })
+    tail = jsx('div', { 'data-chain-same': shared.id, style: { ...muted, padding: '3px 0 3px 2px' }, children: `same prerequisite as “${sameAs.get(`node:${shared.key}`)}” above: ${shared.title || shared.id}${shared.status ? ` — ${shared.status.replace(/_/g, ' ')}` : ''}` })
+  } else if (cut >= 0) tail = jsx('div', { 'data-chain-same': ch.nodes[cut].id, style: { ...muted, padding: '3px 0 3px 2px' }, children: `same chain as “${sameAs.get(ch.nodes[cut].key)}” above` })
   // Nest from the leaf outwards: each card wraps the rest of the chain on its own tree guide.
   let inner = tail
   for (let n = nodes.length - 1; n >= 0; n--) {
@@ -1826,14 +1847,21 @@ export function groupSharedRunning(rows, now = Date.now(), local = new Map()) {
   for (const i of rows || []) {
     const ch = chainFor(i, now, { local })
     const term = !ch.loading && ch.leaf.kind === 'running' && ch.nodes.length ? ch.nodes[ch.nodes.length - 1] : null
-    const e = { i, ch, term: term?.id || '' }
+    const e = { i, ch, term: term?.key || '' }
     entries.push(e)
-    if (term) { if (!byTerm.has(term.id)) byTerm.set(term.id, { term, leaf: ch.leaf, entries: [] }); byTerm.get(term.id).entries.push(e) }
+    if (term?.key) { if (!byTerm.has(term.key)) byTerm.set(term.key, { term, leaf: ch.leaf, entries: [] }); byTerm.get(term.key).entries.push(e) }
   }
   const groups = new Map()
   for (const [id, g] of byTerm) groups.set(id, g)
   const order = [], seen = new Set()
-  for (const e of entries) {
+  // Only actual qualified edges constrain ordering. Chain length changes during reads
+  // and is capped, so sorting by length both jitters unrelated rows and misses ancestors.
+  const pending = [...entries], pendingKeys = new Set(entries.map(e => chainKey(e.i.chip)).filter(Boolean))
+  while (pending.length) {
+    const at = pending.findIndex(e => !e.ch.nodes.some(nd => nd.key && pendingKeys.has(nd.key)))
+    // A cycle has no topological order; retain source order and its unknown cycle leaf.
+    const [e] = pending.splice(at < 0 ? 0 : at, 1)
+    pendingKeys.delete(chainKey(e.i.chip))
     if (e.term && groups.has(e.term)) { if (!seen.has(e.term)) { seen.add(e.term); order.push({ group: e.term }) } } else order.push({ row: e.i })
   }
   return { order, groups }
@@ -1842,17 +1870,28 @@ export function groupSharedRunning(rows, now = Date.now(), local = new Map()) {
 /** One shared running prerequisite with its waiting dependents nested beneath (the same tree guide as a chain). */
 export function WaitGroup({ g, now = Date.now(), known, local = new Map(), k = 'waiting', root = null }) {
   const st = typeof window !== 'undefined' ? window.__sessionTasks : null
-  const ids = new Set(g.entries.map(e => str(e.i.chip?.id)))
+  const ids = new Set(g.entries.map(e => chainKey(e.i.chip)).filter(Boolean))
   const L = LEAF.running, title = g.term.title || g.term.id
   const parentOf = e => {
-    const idx = e.ch.nodes.findIndex(nd => ids.has(nd.id) || nd.id === g.term.id)
+    const idx = e.ch.nodes.findIndex(nd => nd.key && (ids.has(nd.key) || nd.key === g.term.key))
     const nd = e.ch.nodes[idx]
-    return { id: nd.id, index: idx, title: nd.id === g.term.id ? title : (g.entries.find(x => str(x.i.chip?.id) === nd.id)?.i.label || nd.title || nd.id) }
+    return { id: nd.id, key: nd.key, index: idx, title: nd.key === g.term.key ? title : (g.entries.find(x => chainKey(x.i.chip) === nd.key)?.i.label || nd.title || nd.id) }
   }
   const parents = new Map(g.entries.map(e => [e, parentOf(e)]))
-  const kidsOf = pid => g.entries.filter(e => parents.get(e).id === pid).map(e => {
+  const shown = new Map()
+  const kidsOf = pid => g.entries.filter(e => parents.get(e).key === pid).map(e => {
     const p = parents.get(e)
-    return jsx(WaitChain, { i: e.i, now, known, local, sameAs: new Map(), k, parent: p, kids: kidsOf(str(e.i.chip?.id)) }, e.i.key)
+    const sameAs = new Map(shown)
+    // Record only the segment that this row actually paints, before descending.
+    const segment = e.ch.nodes.slice(0, p.index)
+    for (const nd of segment) {
+      if (!nd.key) continue
+      if (shown.has(nd.key) || shown.has(`node:${nd.key}`)) break
+      shown.set(`node:${nd.key}`, e.i.label)
+    }
+    const key = chainKey(e.i.chip)
+    if (key) shown.set(key, e.i.label)
+    return jsx(WaitChain, { i: e.i, now, known, local, sameAs, k, parent: p, kids: kidsOf(key) }, e.i.key)
   })
   const seg = waitSegments(`card ${g.term.id}`, g.entries[0].i.chip, now).find(x => x.id === g.term.id)
   return jsxs('div', { 'data-wait-group': g.term.id, style: { fontSize: 13, display: 'flex', flexDirection: 'column', marginTop: 4 }, children: [
@@ -1869,7 +1908,7 @@ export function WaitGroup({ g, now = Date.now(), known, local = new Map(), k = '
       ] }),
       jsx('span', {})
     ] }),
-    jsx('div', { 'data-wait-kids': g.term.id, style: GUIDE, children: kidsOf(g.term.id) })
+    jsx('div', { 'data-wait-kids': g.term.id, style: GUIDE, children: kidsOf(g.term.key) })
   ] })
 }
 const STATE_BOX = { running: 'running', review: 'waiting', ready: 'ready', todo: 'queued', done: 'done', archived: 'done', blocked: 'waiting', scheduled: 'waiting', triage: 'waiting' }
@@ -2222,7 +2261,7 @@ export function ingestBundle(connectionId, profile, b, { nowMs = Date.now(), tru
     const rows = doneRows(b.done)
     rememberDone(scope, rows)
     if (trusted) doneFeedAt.set(scope, nowMs)
-    if (routeKey(panelRoute()) === scope) { done = { scope, rows }; doneSubs.forEach(fn => fn(done)) }
+    if (routeKey(panelRoute()) === scope) { done = { scope, rows, unavailable: !trusted && done.scope === scope && !!done.unavailable }; doneSubs.forEach(fn => fn(done)) }
   }
   const keys = new Set()
   for (const [id, rec] of Object.entries(b.cards || {})) {
@@ -2524,7 +2563,7 @@ export function Panel() {
   const isAsked = c => US?.requestsForSource ? US.requestsForSource(cardSource(c)).length > 0 : !!US?.requestForSource?.(cardSource(c))
   const presentationFor = c => US?.presentationForSource?.({ gatewayId: c.gatewayId || c.gateway, profile: c.profile, type: 'kanban', board: c.board, id: c.id })
   const sorted = classify(chips, { nowMs: now, silence, isAsked, presentationFor, evidence: c => (c.kind === 'kanban' ? chipObservation(c, chipAsOf(c, now) / 1000) : null) })
-  const known = new Set(chips.filter(c => c?.kind === 'kanban' && c.id).map(c => str(c.id))) // this chat's cards
+  const known = new Set(chips.filter(c => c?.kind === 'kanban').map(c => chainKey(c)).filter(Boolean)) // this chat's qualified cards
   const evidenceUnknown = annotateEvidence(sorted, now)
   const upstream = inheritedAsks([...sorted.blockedUpstream, ...sorted.waiting, ...sorted.queued], now)
   const upstreamAsks = upstream.asks.filter(a => !presentationFor(a.chip)?.representedInQueue && !chips.some(c => c.kind === 'kanban' && c.id === a.chip.id && c.connectionId === a.chip.connectionId && c.profile === a.chip.profile && (c.board || 'default') === a.chip.board))
@@ -2560,7 +2599,8 @@ export function Panel() {
   // Keep finished history reachable even after the final open card closes.
   const fresh = !!(snap?.fresh && asOf === now)
   const people = personState.scope === scope ? personState.records : []
-  if (!people.length && !finished?.length && !US?.hasQueuePresentation?.() && !hasOpenWork(sorted, { asks, steps: US?.snapshot?.ledger?.steps, issues: US?.snapshot?.issues })) {
+  const historyUnavailable = doneState.scope === scope && doneState.unavailable
+  if (!historyUnavailable && !people.length && !finished?.length && !US?.hasQueuePresentation?.() && !hasOpenWork(sorted, { asks, steps: US?.snapshot?.ledger?.steps, issues: US?.snapshot?.issues })) {
     tracePanel(route, `hidden${fresh ? ' fresh' : ''} chips${chips.length}`)
     return null
   }
@@ -2590,7 +2630,7 @@ export function Panel() {
   const byRunning = groupSharedRunning(chainRows, now, local)
   // Any local card that is running is a root wherever its presentation bucket draws it: In progress (`active`) or Stuck
   // (no progress for hours). The bucket changes the row's warning and heading, never where its dependents hang.
-  const rootIds = new Set([...sorted.active, ...sorted.stuck].map(i => str(i.chip?.id)).filter(Boolean))
+  const rootIds = new Set([...sorted.active, ...sorted.stuck].map(i => chainKey(i.chip)).filter(Boolean))
   const nestedGroups = new Map([...byRunning.groups].filter(([id]) => rootIds.has(id)))
   const nestedKeys = new Set([...nestedGroups.values()].flatMap(g => g.entries.map(e => e.i.key)))
   const flatRows = chainRows.filter(i => !nestedKeys.has(i.key))
@@ -2598,6 +2638,15 @@ export function Panel() {
   tracePanel(route, panelSignature({ sorted, n, asks, finished, evidenceUnknown, causes, chainRows, fresh }))
   // A chain that runs into another root shown above is not repeated (`same chain as … above`).
   const sameAs = new Map()
+  const rememberChain = (i, ch) => {
+    const key = chainKey(i.chip)
+    if (key) sameAs.set(key, i.label)
+    for (const nd of ch.nodes) if (nd.key && !sameAs.has(`node:${nd.key}`)) sameAs.set(`node:${nd.key}`, i.label)
+  }
+  for (const g of nestedGroups.values()) {
+    sameAs.set(g.term.key, g.term.title || g.term.id)
+    for (const e of g.entries) rememberChain(e.i, e.ch)
+  }
   const needsYou = [
     (asks > 0 || sorted.unasked.length > 0) && jsx('h3', { 'data-section': 'needs-you', style: heading(C.needsYou), children: `Needs you · ${asks + sorted.unasked.length}` }, 'h-needs-you'),
     US?.ActionQueue && jsx(US.ActionQueue, { embedded: true, audience: 'human' }, 'queue'),
@@ -2630,6 +2679,7 @@ export function Panel() {
       jsx(Pips, { n, hub: hubCounts(sorted) }),
       summaryParts.length > 0 && jsx('span', { 'data-status-summary': '', ...(collapsed ? { 'data-collapsed-summary': '' } : {}), className: 'min-w-0 truncate', children: summaryParts.flatMap((p, idx) => [idx > 0 && ' · ', jsx('span', { style: p.k === 'needsYou' || p.k === 'stuck' ? { color: C[p.k], fontWeight: 600 } : undefined, children: p.text }, p.k)].filter(Boolean)) })
     ] }) }),
+    historyUnavailable && jsx('div', { 'data-history-unavailable': '', style: { ...muted, padding: '2px 12px' }, children: `Finished history unavailable.${finished?.length ? ' Showing last-known finished cards.' : ' Finished cards could not be verified.'}` }),
     sorted.sources.length > 0 && jsx('div', { 'data-source-unavailable': '', style: { ...muted, padding: '2px 12px' }, children: `Source status: ${sorted.sources.map(i => i.detail).join('; ')}. Work may be missing from this panel.` }),
     // Collapsed, a bare "2 waiting" left the user asking "on what?": keep one short line per waiting card.
     collapsed && lineRows.length > 0 && jsxs('div', { 'data-collapsed-waiting': '', style: { padding: '0 12px 2px 30px', minWidth: 0 }, children: [
@@ -2641,7 +2691,7 @@ export function Panel() {
       US?.ActionQueue && jsx('div', { 'data-agent-deliveries': '', style: { color: 'var(--muted-foreground)' }, children: jsx(US.ActionQueue, { embedded: true, audience: 'agent' }, 'agent-queue') }),
       sorted.stuck.length > 0 && jsx('h3', { 'data-section': 'stuck', style: heading(C.stuck), children: `Stuck · ${sorted.stuck.length}` }),
       ...sorted.stuck.map(i => {
-        const g = nestedGroups.get(str(i.chip?.id))
+        const g = nestedGroups.get(chainKey(i.chip))
         const card = jsx(StuckCard, { i, session: route.session, now })
         return g ? jsx(WaitGroup, { g, now, known, local, root: card }, i.key) : jsx(StuckCard, { i, session: route.session, now }, i.key)
       }),
@@ -2650,7 +2700,7 @@ export function Panel() {
       sorted.active.length > 0 && otherSections &&
         jsx('h3', { 'data-section': 'in-progress', style: heading('var(--muted-foreground)'), children: `In progress · ${sorted.active.length}` }),
       sorted.active.length > 0 && jsx('div', { 'data-running-list': '', style: { paddingTop: otherSections ? 0 : 4 }, children: sorted.active.map(i => {
-        const g = nestedGroups.get(str(i.chip?.id))
+        const g = nestedGroups.get(chainKey(i.chip))
         return g ? jsx(WaitGroup, { g, now, known, local, root: jsx(RunningRow, { i, now }) }, i.key) : jsx(RunningRow, { i, now }, i.key)
       }) }),
       waitingCount > 0 && jsxs('button', { type: 'button', 'data-waiting-toggle': '', 'aria-expanded': waitingOpen, onClick: toggleWaiting, title: waitingOpen ? 'Hide the dependency chains' : 'Show each waiting card\'s dependency chain', style: { display: 'flex', alignItems: 'baseline', flexWrap: 'wrap', gap: 10, width: '100%', margin: '12px 0 6px', padding: 0, background: 'transparent', border: 0, cursor: 'pointer', font: 'inherit', textAlign: 'left', color: 'var(--muted-foreground)' }, children: [
@@ -2673,14 +2723,13 @@ export function Panel() {
         return order.map(o => {
           if (o.group) {
             const g = groups.get(o.group)
-            for (const e of g.entries) if (e.i.chip?.id) sameAs.set(str(e.i.chip.id), e.i.label)
+            for (const e of g.entries) rememberChain(e.i, e.ch)
             sameAs.set(`node:${o.group}`, g.entries[0].i.label)
             return jsx(WaitGroup, { g, now, known, local }, `grp:${o.group}`)
           }
           const i = o.row
           const el = jsx(WaitChain, { i, now, known, local, sameAs: new Map(sameAs) }, i.key)
-          if (i.chip?.id) sameAs.set(str(i.chip.id), i.label)
-          for (const nd of chainFor(i, now, { local }).nodes) if (!sameAs.has(`node:${nd.id}`)) sameAs.set(`node:${nd.id}`, i.label)
+          rememberChain(i, chainFor(i, now, { local }))
           return el
         })
       })() }, 'open'),
