@@ -165,6 +165,7 @@ class Feed:
         self.bundles.pop(s, None)
         self.failures.pop(s, None)
         self._retry.discard(s)
+        self._carried.discard(s)
 
     # ── computing ───────────────────────────────────────────────────────────
     def compute(self, session: str, *, seq: Optional[int] = None) -> dict:

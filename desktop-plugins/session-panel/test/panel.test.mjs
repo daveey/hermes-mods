@@ -1618,10 +1618,13 @@ test('panel: a Done read that fails after focus moved leaves the new chat alone'
   await React.act(async () => { pending = m.refreshDone(); await flush() }) // a read for S1 hangs
   host.state.focusedStoredSessionId.value = 'S2' // focus moves to a chat with no Done known
   window.__sessionTasks.snapshot.stored = 'S2'
-  await React.act(async () => { fail(new Error('timeout')); await pending; await flush() })
-  assert.equal(m.cachedDone(JSON.stringify(['C1', 'default', 'S2'])), null)
-  await show(React.createElement(m.Panel, { key: 'moved-2' }))
-  assert.deepEqual(el().querySelector('[data-status-summary]').textContent.split(' · '), ['1 running'], 'S1\'s Done is not painted on S2')
-  host.state.focusedStoredSessionId.value = 'S1'
-  window.__sessionTasks.snapshot.stored = 'S1'
+  try {
+    await React.act(async () => { fail(new Error('timeout')); await pending; await flush() })
+    assert.equal(m.cachedDone(JSON.stringify(['C1', 'default', 'S2'])), null)
+    await show(React.createElement(m.Panel, { key: 'moved-2' }))
+    assert.deepEqual(el().querySelector('[data-status-summary]').textContent.split(' · '), ['1 running'], 'S1\'s Done is not painted on S2')
+  } finally {
+    host.state.focusedStoredSessionId.value = 'S1'
+    window.__sessionTasks.snapshot.stored = 'S1'
+  }
 })

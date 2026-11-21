@@ -540,3 +540,48 @@ def test_a_catch_up_that_reached_the_stopped_feed_lands_in_its_successor():
     out = old.changes(['S1', 'S2'], since=first['rev'], epoch=first['epoch'])  # a request that held the old feed
     assert 'S2' in new.interest and 'S2' in new.bundles and 'S2' not in old.interest
     assert out['epoch'] == new.epoch and set(out['bundles']) == {'S2'}
+
+
+def test_a_quiet_carried_chat_is_recomputed_on_the_first_pass_not_after_the_quiet_interval():
+    # S3 has no open cards: a full pass alone does not recompute it within QUIET_FULL_EVERY_S.
+    old, r, pushed, t = make()
+    r.lineages['S3'] = ['S3']
+    old.changes(['S3'])
+    t['now'] += 61
+    old.tick()
+    old.stopped.set()
+    new = feedmod.Feed(r, emit=pushed.append, clock=lambda: t['now']).resume(old)
+    t['now'] += 21
+    pushed.clear()
+    new.tick()  # unchanged content: no push, but the carried mark is cleared by the recompute
+    t['now'] += 21
+    new._publish({}, heartbeat=True)
+    assert pushed and pushed[-1]['fresh'] == ['S3'], 'the carried quiet chat was recomputed and vouched for'
+
+
+def test_a_reload_that_lands_while_a_catch_up_computes_hands_the_request_to_the_successor():
+    old, r, pushed, t = make()
+    first = old.changes(['S1'])
+    box = {}
+    real = r.lineage
+
+    def lineage(s):  # the reload lands in the middle of the request's compute
+        if s == 'S2' and 'new' not in box:
+            old.stopped.set()
+            box['new'] = feedmod.Feed(r, emit=pushed.append, clock=lambda: t['now']).resume(old)
+        return real(s)
+    r.lineage = lineage
+    out = old.changes(['S1', 'S2'], since=first['rev'], epoch=first['epoch'])
+    new = box['new']
+    assert 'S2' in new.interest and 'S2' in new.bundles, 'the watch and bundle landed in the live feed'
+    assert out['epoch'] == new.epoch and set(out['bundles']) == {'S2'}
+
+
+def test_forgetting_a_carried_chat_clears_its_carried_mark():
+    old, r, pushed, t = make()
+    old.changes(['S1'])
+    old.stopped.set()
+    new = feedmod.Feed(r, emit=pushed.append, clock=lambda: t['now']).resume(old)
+    assert 'S1' in new._carried
+    new._forget('S1')
+    assert 'S1' not in new._carried
