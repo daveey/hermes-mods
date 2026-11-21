@@ -60,7 +60,7 @@ test('the first push makes the feed live and fetches everything again, trusted; 
   window.__answer = () => answer({ rev: 3 })
   await m.feedCatchUp(target())
   window.__answer = () => answer({ rev: 3, reset: false, bundles: { S1: bundle() } })
-  push({ heartbeat: true, prev: 3, rev: 3 })
+  push({ heartbeat: true, prev: 3, rev: 3, fresh: ['S1'] })
   await settle(); await settle()
   assert.equal(m.feedIsLive({ connectionId: 'C1', profile: 'default' }), true)
   assert.equal(calls.at(-1).body.since, 0, 'a full catch-up (since 0, same epoch)')
@@ -69,7 +69,7 @@ test('the first push makes the feed live and fetches everything again, trusted; 
   const t0 = Date.now()
   const realNow = Date.now
   try {
-    for (let i = 1; i <= 30; i++) { Date.now = () => t0 + i * 20_000; push({ heartbeat: true, prev: 3, rev: 3 }) }
+    for (let i = 1; i <= 30; i++) { Date.now = () => t0 + i * 20_000; push({ heartbeat: true, prev: 3, rev: 3, fresh: ['S1'] }) }
     let reads = 0
     const now = t0 + 30 * 20_000
     const r = m.cardInfo(chip, 't_aaaaaa1', now, () => { reads++; return never() })
@@ -116,12 +116,12 @@ test('pushes continuing the chain apply; a duplicate is ignored; a gap, an overs
   window.__answer = () => answer({ rev: 3 })
   await m.feedCatchUp(target())
   calls.length = 0
-  push({ prev: 3, rev: 4, bundles: { S1: bundle() } })
+  push({ prev: 3, rev: 4, bundles: { S1: bundle() }, fresh: ['S1'] })
   assert.equal(ingested.length, 1, 'applied in order')
   assert.equal(ingested[0].trusted, true)
   await settle()
   calls.length = 0
-  push({ prev: 3, rev: 4, bundles: { S1: bundle() } })
+  push({ prev: 3, rev: 4, bundles: { S1: bundle() }, fresh: ['S1'] })
   assert.equal(ingested.length, 1 + 0, 'already have it')
   window.__answer = () => answer({ rev: 7, reset: false })
   push({ prev: 6, rev: 7, bundles: { S1: bundle() } })
@@ -148,7 +148,7 @@ test('a catch-up answer older than a push that landed meanwhile is dropped', asy
   window.__answer = () => new Promise(r => { release = () => r(answer({ rev: 3, reset: false, bundles: { S1: { ...bundle(), tasks: [] } } })) })
   const slow = m.feedCatchUp(target(['S1', 'S2']))
   await settle()
-  push({ prev: 3, rev: 4, bundles: { S1: bundle() } })
+  push({ prev: 3, rev: 4, bundles: { S1: bundle() }, fresh: ['S1'] })
   const n = ingested.length
   release()
   assert.equal(await slow, true)
@@ -176,4 +176,28 @@ test('feedTargets groups the focused chat and warm targets by connection', () =>
   assert.equal(c1.sessions[0], 'S1', 'the focused chat first')
   assert.ok(c1.sessions.includes('S8'))
   assert.deepEqual(c2, { connectionId: 'C2', profile: 'work', sessions: ['S7'] })
+})
+
+
+test('a push re-stamps only the chats it vouches for; the gateway\'s own profile name is what pushes carry', async () => {
+  window.__answer = () => answer({ rev: 3, profile: 'custom' }) // the hub calls its launch profile 'custom'
+  await m.feedCatchUp(target(['S1', 'S2']))
+  window.__answer = () => answer({ rev: 3, profile: 'custom', reset: false, bundles: { S1: bundle('S1'), S2: bundle('S2') } })
+  m.onFeedEvent({ type: m.FEED_EVENT, payload: { feed: 'hub:1', profile: 'custom', epoch: 'E1', prev: 3, rev: 3, heartbeat: true, bundles: {}, fresh: ['S1', 'S2'] } })
+  await settle(); await settle()
+  assert.equal(m.feedIsLive({ connectionId: 'C1', profile: 'default' }), true, 'matched on the hub\'s name for its profile')
+  touched.length = 0
+  m.onFeedEvent({ type: m.FEED_EVENT, payload: { feed: 'hub:1', profile: 'custom', epoch: 'E1', prev: 3, rev: 3, heartbeat: true, bundles: {}, fresh: ['S1'] } })
+  assert.deepEqual(touched.at(-1)[2], ['S1'], 'S2 (dropped or failing on the gateway) is left to age')
+})
+
+test('three queued catch-ups for one connection run one after another, never two at once', async () => {
+  let inFlight = 0, most = 0
+  const releases = []
+  window.__answer = () => { inFlight++; most = Math.max(most, inFlight); return new Promise(r => releases.push(() => { inFlight--; r(answer()) })) }
+  const all = [m.feedCatchUp(target()), m.feedCatchUp(target()), m.feedCatchUp(target())]
+  for (let i = 0; i < 3; i++) { await settle(); await settle(); releases.shift()?.() }
+  await Promise.all(all)
+  assert.equal(calls.length, 3)
+  assert.equal(most, 1)
 })

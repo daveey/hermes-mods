@@ -1934,14 +1934,15 @@ function Fold({ label, items, k }) {
 // and every FEED_CATCHUP_MS. A bundle fills every cache the panel renders from (session-tasks' cards and ancestry,
 // Done, the chain's card / wake / title reads).
 // Trust comes from pushes only: a connection is live while its pushes or heartbeats arrive (FEED_STALE_MS), and each
-// push re-stamps the watched chats' entries, so they stay current with no reads; a catch-up answer alone never makes
+// push re-stamps the entries of the chats it vouches for (`fresh`: held, watched and computed without a failure on
+// the gateway), so they stay current with no reads; a catch-up answer alone never makes
 // data current (an answer from a backend whose pushes do not reach this window would otherwise be trusted). When pushes
 // stop, the entries age like any other read and the panel reads for itself again. A gateway without the backend half
 // (a 404) or serving another profile keeps today's reads, asked again after FEED_UNSUPPORTED_RETRY_MS.
 const FEED_PATH = '/api/plugins/session-panel/changes'
 export const FEED_EVENT = 'plugin.session-panel.changed'
 export const FEED_CATCHUP_MS = 60_000
-export const FEED_STALE_MS = 150_000
+export const FEED_STALE_MS = 60_000 // three missed 20 s heartbeats
 const FEED_UNSUPPORTED_RETRY_MS = 10 * 60_000
 const feeds = new Map()      // JSON [connectionId, profile] -> { connectionId, profile, feed, epoch, rev, sessions, liveAt, unsupported, at }
 const feedFlights = new Map() // same key -> the catch-up in flight
@@ -1986,10 +1987,12 @@ export function ingestBundle(connectionId, profile, b, { nowMs = Date.now(), tru
   return true
 }
 
-/** A push or heartbeat confirmed this connection's watched chats: re-stamp their cards, wakes, Done and kanban. */
-function confirmFeed(st, nowMs = Date.now()) {
+/** A push or heartbeat vouched for `fresh` (chats the gateway holds, watches and last computed without a failure):
+ *  re-stamp their cards, wakes, Done and kanban. A chat it does not name is left to age. */
+function confirmFeed(st, fresh, nowMs = Date.now()) {
   st.liveAt = nowMs
-  for (const session of st.sessions || []) {
+  const vouched = (st.sessions || []).filter(s => Array.isArray(fresh) && fresh.includes(s))
+  for (const session of vouched) {
     const scope = routeKey({ connectionId: st.connectionId, profile: st.profile, session })
     const keys = feedScopes.get(scope)
     if (!keys) continue
@@ -2000,7 +2003,7 @@ function confirmFeed(st, nowMs = Date.now()) {
     }
     if (doneFeedAt.has(scope)) doneFeedAt.set(scope, nowMs)
   }
-  tasksBridge()?.touchFeed?.(st.connectionId, st.profile, st.sessions, nowMs)
+  tasksBridge()?.touchFeed?.(st.connectionId, st.profile, vouched, nowMs)
 }
 
 /** The chats to watch, per gateway connection: the focused chat first, then warmTargets(). */
@@ -2021,10 +2024,11 @@ export function feedTargets(rows) {
  *  per connection (a later call waits for it). False when the gateway has no feed or the call failed. */
 export function feedCatchUp(target, opts = {}) {
   const key = connKey(target?.connectionId, target?.profile)
-  const running = feedFlights.get(key)
-  if (running) return running.then(() => feedCatchUpNow(target, opts))
-  const p = feedCatchUpNow(target, opts).finally(() => { if (feedFlights.get(key) === p) feedFlights.delete(key) })
-  feedFlights.set(key, p)
+  const before = feedFlights.get(key) || Promise.resolve()
+  // Chained: each call runs after every earlier one for this connection has answered (never two at once).
+  const p = before.catch(() => {}).then(() => feedCatchUpNow(target, opts))
+  const tail = p.finally(() => { if (feedFlights.get(key) === tail) feedFlights.delete(key) })
+  feedFlights.set(key, tail)
   return p
 }
 
@@ -2054,7 +2058,7 @@ async function feedCatchUpNow(target, { nowMs = Date.now(), reset = false, full 
     cur.sessions = [...new Set([...(cur.sessions || []), ...target.sessions])]
     return true
   }
-  const next = { connectionId: target.connectionId, profile, feed: r.feed, epoch: r.epoch, rev: Number(r.rev) || 0,
+  const next = { connectionId: target.connectionId, profile, feedProfile: str(r.profile) || profile, feed: r.feed, epoch: r.epoch, rev: Number(r.rev) || 0,
     sessions: [...target.sessions], liveAt: cur?.feed === r.feed && cur?.epoch === r.epoch ? cur.liveAt : 0, at: Date.now() }
   feeds.set(key, next)
   const trusted = feedIsLive({ connectionId: target.connectionId, profile })
@@ -2067,7 +2071,8 @@ async function feedCatchUpNow(target, { nowMs = Date.now(), reset = false, full 
 export function onFeedEvent(ev) {
   const p = ev?.payload
   if (!p || typeof p.feed !== 'string') return
-  const st = [...feeds.values()].find(f => !f.unsupported && f.feed === p.feed && (f.profile || 'default') === (p.profile || 'default'))
+  // Matched on the gateway's own name for its profile (it may call it 'custom' where the Desktop says 'default').
+  const st = [...feeds.values()].find(f => !f.unsupported && f.feed === p.feed && (f.feedProfile || 'default') === (p.profile || 'default'))
   if (!st) return // a gateway or profile this window did not register with: the next catch-up covers it
   const target = { connectionId: st.connectionId, profile: st.profile, sessions: st.sessions }
   if (p.epoch !== st.epoch) { void feedCatchUp(target, { reset: true }); return }
@@ -2075,7 +2080,7 @@ export function onFeedEvent(ev) {
   const wasLive = feedIsLive(st)
   if (p.heartbeat) {
     if (rev === st.rev) {
-      confirmFeed(st)
+      confirmFeed(st, p.fresh)
       // Pushes just started reaching us: what the catch-up gave before was untrusted; fetch it all again, trusted.
       if (!wasLive) void feedCatchUp(target, { full: true })
     } else if (rev > st.rev) void feedCatchUp(target)
@@ -2085,7 +2090,7 @@ export function onFeedEvent(ev) {
   if (Number(p.prev) !== st.rev || (Array.isArray(p.sessions) && p.sessions.length)) { void feedCatchUp(target); return }
   st.rev = rev
   for (const b of Object.values(p.bundles || {})) ingestBundle(st.connectionId, st.profile, b, { trusted: true })
-  confirmFeed(st)
+  confirmFeed(st, p.fresh)
   notifyTitles()
   if (!wasLive) void feedCatchUp(target, { full: true })
 }
@@ -2394,11 +2399,15 @@ export default {
     const offFeed = typeof subscribe === 'function' ? subscribe(FEED_EVENT, onFeedEvent) : null
     const feedFirst = setTimeout(() => void feedPass(), 1_000)
     const feedTimer = setInterval(() => { if (typeof document === 'undefined' || !document.hidden) void feedPass() }, FEED_CATCHUP_MS)
+    // A hidden window stops registering (the gateway drops its chats after 15 min): shown again, re-register at once.
+    const onVisible = () => { if (typeof document !== 'undefined' && !document.hidden) void feedPass() }
+    if (typeof document !== 'undefined') document.addEventListener?.('visibilitychange', onVisible)
     return () => {
       clearTimeout(first)
       clearInterval(warmTimer)
       clearTimeout(feedFirst)
       clearInterval(feedTimer)
+      if (typeof document !== 'undefined') document.removeEventListener?.('visibilitychange', onVisible)
       if (typeof offFeed === 'function') offFeed()
       if (typeof window !== 'undefined' && window.__sessionPanel?.version === VERSION) delete window.__sessionPanel
       if (doneTimer) clearInterval(doneTimer)

@@ -535,3 +535,26 @@ test('pushes re-stamp feed-kept chats; an untrusted bundle is an ordinary cached
     assert.deepEqual(m.cachedChips(scopeOf('chat-u')).kanban.map(c => c.id), ['t_u1'], 'still a prepaint copy')
   } finally { Date.now = realNow }
 })
+
+
+test('the 60 s safety-net read of a feed-kept chat keeps it feed-kept', async () => {
+  m.ingestFeed({ connectionId: 'conn', profile: 'default', session: 'chat-net', lineage: ['chat-net'], tasks: [card('t_n1')] })
+  focus.stored = 'chat-net'
+  host.request = async () => ({ processes: [], subagents: [] })
+  globalThis.window = { hermesDesktop: { api: async ({ path }) => {
+    if (path.startsWith('/api/sessions/')) return { id: 'chat-net', parent_session_id: null }
+    if (path.startsWith('/api/session-kanban-tasks')) return { tasks: [card('t_n1')] }
+    return { machines: [] }
+  } } }
+  const dispose = m.default.register({ register() {} })
+  const realNow = Date.now
+  try {
+    await m.refresh()                       // switch: no kanban read (feed-kept)
+    const t0 = realNow()
+    m.touchFeed('conn', 'default', ['chat-net'], t0 + m.FEED_KANBAN_POLL_MS + 5)
+    Date.now = () => t0 + m.FEED_KANBAN_POLL_MS + 10
+    await m.refresh()                       // the safety-net read runs now
+    assert.ok(m.cachedChips(scopeOf('chat-net')).feedAt, 'still feed-kept after its own read')
+    assert.equal(m.feedFresh(scopeOf('chat-net')), true)
+  } finally { Date.now = realNow; dispose(); delete globalThis.window; delete host.request }
+})

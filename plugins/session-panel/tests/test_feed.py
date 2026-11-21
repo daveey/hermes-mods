@@ -279,3 +279,48 @@ def test_concurrent_catch_up_and_tick_keep_the_chain_in_order():
     revs = [(p['prev'], p['rev']) for p in pushed if not p.get('heartbeat')]
     assert all(a[1] == b[0] for a, b in zip(revs, revs[1:])), revs
     assert revs[-1][1] == f.rev
+
+
+def test_a_slower_older_compute_never_replaces_a_newer_bundle():
+    import threading
+    f, r, pushed, t = make()
+    f.watch(['S1'])
+    gate, entered = threading.Event(), threading.Event()
+    real = r.linked
+    state = {'n': 0}
+
+    def linked(ids):
+        state['n'] += 1
+        if state['n'] == 1:      # the catch-up's compute reads first, then stalls with the old answer
+            rows = [dict(x, status='review') for x in real(ids)]
+            entered.set()
+            gate.wait(5)
+            return rows
+        return [dict(x, status='blocked') for x in real(ids)]
+    r.linked = linked
+    th = threading.Thread(target=lambda: f.changes(['S1']))
+    th.start()
+    entered.wait(5)
+    t['now'] += feedmod.FULL_EVERY_S + 1
+    f.tick()                     # computes later, publishes 'blocked'
+    gate.set()
+    th.join()
+    assert f.bundles['S1']['bundle']['tasks'][0]['status'] == 'blocked', 'the newer compute wins'
+    assert [b['tasks'][0]['status'] for p in pushed for b in p['bundles'].values()] == ['blocked']
+
+
+def test_every_push_names_the_chats_it_vouches_for():
+    f, r, pushed, t = make()
+    f.changes(['S1', 'S2'])
+    real = r.linked
+    r.linked = lambda ids: (_ for _ in ()).throw(RuntimeError('boom')) if 'S2' in ids else real(ids)
+    t['now'] += feedmod.FULL_EVERY_S + 1
+    f.tick()
+    t['now'] += feedmod.HEARTBEAT_S + 1
+    f.tick()
+    assert pushed[-1].get('heartbeat') and pushed[-1]['fresh'] == ['S1'], 'a failing chat is not vouched for'
+    t['now'] += feedmod.INTEREST_TTL_S + 1
+    f.watch(['S1'])
+    t['now'] += feedmod.HEARTBEAT_S + 1
+    f.tick()
+    assert 'S2' not in pushed[-1]['fresh'], 'nor a chat no longer watched'

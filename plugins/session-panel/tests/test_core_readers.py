@@ -130,3 +130,26 @@ def test_each_thread_reads_on_its_own_connection_and_a_replaced_file_is_reopened
             pass
     assert r.card(b, 'default') is not None, 'reads the new file'
     assert r.card(a, 'default') is None
+
+
+def test_heartbeat_events_are_not_card_changes_and_rows_drop_last_heartbeat(api, board, monkeypatch):
+    path, conn = board
+    a = kanban_db.create_task(conn, title='A', initial_status='running', session_id='S1')
+    r = readers_for(api, path, monkeypatch)
+    _, cursor = r.changed_cards(None)
+    conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'heartbeat', '{}', 1)", (a,))
+    conn.commit()
+    changed, cursor = r.changed_cards(cursor)
+    assert changed == {}, 'a heartbeat is not a change'
+    assert api._calm([{'id': a, 'last_heartbeat_at': 5, 'status': 'running'}]) == [{'id': a, 'status': 'running'}]
+
+
+def test_release_closes_this_threads_connections(api, board, monkeypatch):
+    path, conn = board
+    r = readers_for(api, path, monkeypatch)
+    c = r.conn(path)
+    r.release()
+    import sqlite3 as _sq
+    with pytest.raises(_sq.ProgrammingError):
+        c.execute('select 1')
+    assert r.conn(path) is not None, 'reopened on demand'

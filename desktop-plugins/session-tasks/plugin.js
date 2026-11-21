@@ -837,7 +837,7 @@ let lastKanbanAt = 0
 // the chat (`touchFeed`). While its `feedAt` is within FEED_STALE_MS the copy is current: a switch paints it untagged
 // (no "updating…") and its kanban list is read only every FEED_KANBAN_POLL_MS as a safety net. When pushes stop, the
 // stamps stop, and after FEED_STALE_MS the chat is read as before. An untrusted bundle is an ordinary cached copy.
-export const FEED_STALE_MS = 150_000
+export const FEED_STALE_MS = 60_000 // session-panel's window: three missed 20 s heartbeats
 export const FEED_KANBAN_POLL_MS = 60_000
 /** True when this chat's cards are a feed-kept copy re-stamped within FEED_STALE_MS. */
 export function feedFresh(scope, _route, nowMs = Date.now()) {
@@ -1210,7 +1210,8 @@ export async function refresh() {
             // null = fetch failed: keep this chat's last good list (cached or live), never the previous chat's.
             if (kChips) {
               kanbanCache = kChips
-              rememberChips(scope, kChips, undefined)
+              // The safety-net read of a feed-kept chat keeps it feed-kept (pushes go on re-stamping it).
+              rememberChips(scope, kChips, undefined, { feed: viaFeed })
             }
             publish()
           })

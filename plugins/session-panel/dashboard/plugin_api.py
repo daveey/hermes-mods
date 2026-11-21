@@ -79,6 +79,15 @@ class CoreReaders:
     def state_db(self) -> Path:
         return self._state_db
 
+    def release(self) -> None:
+        """Close this thread's connections (a request thread after its catch-up; the feed thread keeps its own)."""
+        for c, _ in (getattr(self._local, 'conns', None) or {}).values():
+            try:
+                c.close()
+            except sqlite3.Error:
+                pass
+        self._local.conns = {}
+
     def conn(self, path: Path) -> Optional[sqlite3.Connection]:
         conns = getattr(self._local, 'conns', None)
         if conns is None:
@@ -136,12 +145,14 @@ class CoreReaders:
                 if key not in cursor or top < cursor[key]:
                     cursor[key] = top
                     continue
-                rows = c.execute('SELECT e.id, e.task_id, t.session_id FROM task_events e LEFT JOIN tasks t '
-                                 'ON t.id = e.task_id WHERE e.id > ? ORDER BY e.id LIMIT 20000', (cursor[key],)).fetchall()
+                # Heartbeats change nothing a bundle shows (the full refresh renews run evidence every FULL_EVERY_S).
+                rows = c.execute("SELECT e.id, e.task_id, e.kind, t.session_id FROM task_events e LEFT JOIN tasks t "
+                                 "ON t.id = e.task_id WHERE e.id > ? ORDER BY e.id LIMIT 20000", (cursor[key],)).fetchall()
             except sqlite3.Error:
                 continue
             for r in rows:
-                changed[str(r['task_id'])] = r['session_id'] or changed.get(str(r['task_id']))
+                if r['kind'] != 'heartbeat':
+                    changed[str(r['task_id'])] = r['session_id'] or changed.get(str(r['task_id']))
             if rows:
                 cursor[key] = rows[-1]['id']
         return changed, cursor
@@ -160,12 +171,12 @@ class CoreReaders:
 
     def linked(self, ids):
         from hermes_cli import kanban_session_activity as ksa
-        return ksa.session_tasks(list(ids)[:50], stale_ok=True)
+        return _calm(ksa.session_tasks(list(ids)[:50], stale_ok=True))
 
     def done(self, ids):
         from hermes_cli import kanban_session_activity as ksa
         ids = list(ids)[:50]
-        tasks = ksa.session_tasks(ids, tuple(ksa.LISTED_STATUSES) + ('done', 'archived'), stale_ok=True)
+        tasks = _calm(ksa.session_tasks(ids, tuple(ksa.LISTED_STATUSES) + ('done', 'archived'), stale_ok=True))
         reader = getattr(ksa, 'remote_links_and_origin_rows', None)
         if reader is None:
             return tasks
@@ -247,6 +258,12 @@ class CoreReaders:
             except Exception:
                 pass
         return out
+
+
+def _calm(rows):
+    """Card rows without `last_heartbeat_at`: a heartbeat moves it every minute, the panel never reads it, and it
+    would re-push the chat's whole bundle each time."""
+    return [{k: v for k, v in r.items() if k != 'last_heartbeat_at'} if isinstance(r, dict) else r for r in rows or []]
 
 
 def json_safe(v):

@@ -25,6 +25,7 @@ and each batch's `prev` is the revision right before it. Pure: every read goes t
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import logging
 import re
@@ -47,7 +48,7 @@ log = logging.getLogger('session-panel')
 
 
 def _hash(bundle: dict) -> str:
-    body = {k: v for k, v in bundle.items() if k != 'computed_at'}
+    body = {k: v for k, v in bundle.items() if k not in ('computed_at', 'computed_seq')}
     return hashlib.sha1(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
 
 
@@ -92,6 +93,7 @@ class Feed:
         self.stopped = threading.Event()
         self.last_emit = 0.0
         self.last_tick_s = 0.0               # duration of the last tick that recomputed (shown by /status)
+        self._seq = itertools.count(1)       # compute order: a bundle computed earlier never replaces a later one
         self._stamps: Any = None
         self._cursor: Any = None
         self._last_full = 0.0
@@ -121,6 +123,7 @@ class Feed:
 
     # ── computing ───────────────────────────────────────────────────────────
     def compute(self, session: str) -> dict:
+        seq = next(self._seq)  # taken before any read: a slower compute that started earlier loses to this one
         r = self.readers
         lineage = list(r.lineage(session)) or [session]
         tasks = list(r.linked(lineage))
@@ -144,7 +147,7 @@ class Feed:
                 if ref not in seen:
                     queue.append((ref, rec.get('board') or board, None, depth + 1))
         return {'session': session, 'lineage': lineage, 'tasks': tasks, 'done': done, 'cards': cards,
-                'computed_at': self.clock()}
+                'computed_at': self.clock(), 'computed_seq': seq}
 
     def _compute_all(self, sessions: Iterable[str]) -> dict[str, dict]:
         """Compute outside any lock. A chat that fails keeps its last bundle; its failure is counted and logged."""
@@ -166,6 +169,8 @@ class Feed:
         """Keep `bundle`; True when it differs from what clients last got (it took a new revision)."""
         h = _hash(bundle)
         prev = self.bundles.get(session)
+        if prev and prev['bundle'].get('computed_seq', 0) > bundle.get('computed_seq', 0):
+            return False  # computed before what we hold (a slow catch-up racing the tick): never goes back
         refs = set(bundle['cards']) | {str(t.get('id')) for t in bundle['tasks'] + bundle['done'] if t.get('id')}
         if prev and prev['hash'] == h:
             prev.update(bundle=bundle, refs=refs, lineage=set(bundle['lineage']))
@@ -183,8 +188,12 @@ class Feed:
                 changed = {s: b for s, b in computed.items() if s in self.interest and self._store(s, b)}
             now = self.clock()
             if changed or (heartbeat and now - self.last_emit >= self.heartbeat_s):
+                with self.lock:
+                    # The chats this push vouches for: held, watched, and last computed without a failure. Clients
+                    # re-stamp only these (a dropped or failing chat is never confirmed by a heartbeat).
+                    fresh = sorted(s for s in self.interest if s in self.bundles and s not in self.failures)
                 try:
-                    self.emit({'epoch': self.epoch, 'prev': prev, 'rev': self.rev, 'bundles': changed,
+                    self.emit({'epoch': self.epoch, 'prev': prev, 'rev': self.rev, 'bundles': changed, 'fresh': fresh,
                                **({} if changed else {'heartbeat': True})})
                     self.last_emit = now
                 except Exception:  # no client / transport down: clients catch up, and see no heartbeat meanwhile
@@ -233,7 +242,12 @@ class Feed:
         with self.lock:
             missing = [s for s in wanted if s not in self.bundles]
         if missing:
-            self._publish(self._compute_all(missing))
+            try:
+                self._publish(self._compute_all(missing))
+            finally:
+                release = getattr(self.readers, 'release', None)
+                if callable(release):
+                    release()  # request threads keep no connections between catch-ups
         with self.compute_lock, self.lock:
             out = {s: self.bundles[s]['bundle'] for s in wanted
                    if s in self.bundles and (reset or self.bundles[s]['rev'] > since)}
