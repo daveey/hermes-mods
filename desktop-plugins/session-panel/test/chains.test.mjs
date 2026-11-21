@@ -213,3 +213,35 @@ test('chainFor: a card waiting behind a spend-held card ends on the amber spend 
   assert.deepEqual(ch.leaf, HOLD)
   assert.deepEqual([m.LEAF.hold.label, m.LEAF.hold.color], ['spend hold', '#d29922'])
 })
+
+test('lane_gate triage reads "Waiting for admission to lane", never worker slot; real slot waits and dependency labels are unchanged', () => {
+  const lane = m.nextHop(d({ status: 'triage', block_kind: 'lane_gate' }), NOW)
+  assert.equal(lane.leaf.kind, 'lane')
+  assert.equal(m.LEAF.lane.label, 'Waiting for admission to lane')
+  assert.notEqual(m.LEAF.lane.label, m.LEAF.slot.label)
+  // Plain triage, ready (a real capacity wait) and a dependency-blocked triage keep their labels.
+  assert.equal(m.nextHop(d({ status: 'triage' }), NOW).leaf.kind, 'slot')
+  assert.equal(m.nextHop(d({ status: 'triage', block_kind: 'capability' }), NOW).leaf.kind, 'slot')
+  assert.equal(m.nextHop(d({ status: 'ready' }, { queue_note: 'current: 3 cards ahead on worker-a1' }), NOW).leaf.kind, 'slot')
+  assert.equal(m.LEAF.slot.label, 'worker slot')
+  assert.deepEqual(m.nextHop(d({ status: 'triage', block_kind: 'dependency' }, { links: { parents: ['t_p'] }, link_tasks: [{ id: 't_p', status: 'running' }] }), NOW), { ref: { id: 't_p', status: 'running' } })
+  // Row-only fallback (card unreadable) and the Waiting breakdown name it too.
+  assert.equal(m.rowLeafKind({ chip: {} }, 'Waiting for admission to lane'), 'lane')
+  const r = (id, leafText) => ({ key: `kb:${id}`, kind: 'kanban', label: id, chip: { id, state: 'triage', look: 'waiting', waitingOn: 'triage', connectionId: 'C1', profile: 'default' } })
+  const info = (chip, id) => ({ state: 'ok', info: { id, title: id, status: 'triage', session: '', owner: '', board: 'default', hop: m.nextHop(d({ id, status: 'triage', block_kind: 'lane_gate' }), NOW) } })
+  const ch = m.chainFor(r('t_gate'), NOW, { info, local: new Map() })
+  assert.deepEqual([ch.leaf.kind, m.LEAF[ch.leaf.kind].label], ['lane', 'Waiting for admission to lane'])
+})
+
+test('two waiting cards sharing one running prerequisite: waiters are counted once each, the running card is not counted as waiting', () => {
+  const run = { chip: { id: 't_a0a0d0', state: 'running', where: 'worker-a1' }, label: 'Stage2 (d)' }
+  const local = m.chainLocal([], [run])
+  const w = id => ({ key: `kb:${id}`, kind: 'kanban', label: id, chip: { id, state: 'scheduled', look: 'waiting', waitingOn: 'card t_a0a0d0', connectionId: 'C1', profile: 'default' } })
+  const rows = [w('t_a0a0e0'), w('t_a0a0f0')]
+  const noRead = () => { throw new Error('no remote read') }
+  const chains = rows.map(i => m.chainFor(i, NOW, { info: noRead, local }))
+  for (const ch of chains) assert.deepEqual([ch.nodes.map(n => [n.id, n.status]), ch.leaf.kind], [[['t_a0a0d0', 'running']], 'running'])
+  // Two waiting cards, one running one: the breakdown counts the waiters (2), never a third "running" card.
+  assert.deepEqual(m.causeBreakdown(rows, NOW, local).map(x => `${x.count} ${x.label}`), ['2 running'])
+  assert.equal(new Set([...rows.map(i => i.chip.id), run.chip.id]).size, 3)
+})

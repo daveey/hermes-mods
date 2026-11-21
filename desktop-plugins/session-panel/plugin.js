@@ -1324,6 +1324,9 @@ export const LEAF = {
   hold: { color: '#d29922', text: '#f0c674', tint: 'rgba(210,153,34,0.08)', label: 'spend hold' },
   external: { color: '#db61a2', text: '#f2b6d6', tint: 'rgba(219,97,162,0.08)', label: 'external' },
   slot: { color: '#8b949e', text: 'var(--foreground)', tint: 'rgba(139,148,158,0.10)', label: 'worker slot' },
+  // A triage card held by lane admission (block_kind=lane_gate): the dispatcher admits it when its lane has room;
+  // nobody triages it. Grey like a worker slot, but named for what it waits on.
+  lane: { color: '#8b949e', text: 'var(--foreground)', tint: 'rgba(139,148,158,0.10)', label: 'Waiting for admission to lane', breakdown: 'lane admission' },
   running: { color: '#3b82f6', text: 'var(--foreground)', tint: 'rgba(59,130,246,0.08)', label: 'running' },
   done: { color: '#3fb950', text: 'var(--foreground)', tint: 'rgba(63,185,80,0.08)', label: 'finished' },
   unknown: { color: '#8b949e', text: 'var(--muted-foreground)', tint: 'transparent', label: 'unknown', dashed: true }
@@ -1420,6 +1423,7 @@ export function nextHop(detail, nowMs = Date.now()) {
   if (status === 'scheduled') return parkHop(detail, nowMs)
   if (status === 'todo') return openParent ? { ref: openParent } : { leaf: { kind: 'slot', text: 'not started: waiting to be promoted' } }
   if (status === 'ready') return { leaf: pacingLeaf(detail, nowMs) || { kind: 'slot', text: `waiting${readyWait(t.ready_since, now)} for a worker${cleanNote(detail?.queue_note || detail?.capacity_note) ? `: ${cleanNote(detail?.queue_note || detail?.capacity_note)}` : ''}` } }
+  if (status === 'triage' && str(t.block_kind) === 'lane_gate') return { leaf: { kind: 'lane', text: 'its lane admits it when a slot is open; no triage needed' } }
   if (status === 'triage') return openParent && str(t.block_kind) === 'dependency' ? { ref: openParent } : { leaf: { kind: 'slot', text: 'needs triage: nobody is working it' } }
   if (status === 'review') {
     const run = (detail?.runs || []).slice(-1)[0]
@@ -1558,6 +1562,7 @@ export function firstHop(i, nowMs = Date.now(), { info = cardInfo, fallback } = 
 export function rowLeafKind(i, text) {
   const c = i?.chip || {}, w = str(c.waitingOn).trim()
   if (c.stale || /^(status unknown|reading wake|no wake published|new park not synced)/.test(text)) return 'unknown'
+  if (/^(waiting for admission to lane|its lane admits)/i.test(text)) return 'lane'
   if (/^(an agent\b|nothing named|triage$)/.test(w) || / with no named producer$/.test(w) || /^(needs triage|no reviewer running|blocked · no reason|an agent)/.test(text)) return 'slot'
   if (/^(you$|a hidden ask|an unvalidated ask)/.test(w) || /(waits on a person|for a person)/.test(text)) return 'you'
   if (/^(a parent card|parent cards|a human or shared blocker|a producer the owner did not publish)/.test(w) || /^on parent cards$/.test(text)) return 'unknown'
@@ -1640,21 +1645,26 @@ const GRID = { display: 'grid', gridTemplateColumns: 'minmax(0,1fr) minmax(0,42%
 const CELL = { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
 const GUIDE = { marginLeft: 4, paddingLeft: 16, borderLeft: '1px solid color-mix(in srgb, var(--border) 90%, transparent)' }
 const leafBox = k => (LEAF[k]?.dashed ? { width: 9, height: 9, borderRadius: 2, boxSizing: 'border-box', flex: 'none', border: `1.5px dashed ${LEAF[k].color}` } : { width: 9, height: 9, borderRadius: 2, flex: 'none', background: LEAF[k]?.color })
-const summaryText = ch => `${ch.leaf.kind === 'unknown' ? shortLeaf(ch.leaf.text) : `waiting on ${ch.leaf.kind === 'you' ? 'you' : ch.leaf.kind === 'hold' ? 'a spend decision' : ch.leaf.kind === 'slot' ? 'a worker slot' : ch.leaf.kind === 'running' ? 'running work' : ch.leaf.kind === 'done' ? 'a finished card' : shortLeaf(ch.leaf.text)}`} · ${hops(ch)} ${hops(ch) === 1 ? 'hop' : 'hops'}`
+const summaryText = ch => `${ch.leaf.kind === 'unknown' ? shortLeaf(ch.leaf.text) : `waiting on ${ch.leaf.kind === 'you' ? 'you' : ch.leaf.kind === 'hold' ? 'a spend decision' : ch.leaf.kind === 'slot' ? 'a worker slot' : ch.leaf.kind === 'lane' ? 'admission to a lane' : ch.leaf.kind === 'running' ? 'running work' : ch.leaf.kind === 'done' ? 'a finished card' : shortLeaf(ch.leaf.text)}`} · ${hops(ch)} ${hops(ch) === 1 ? 'hop' : 'hops'}`
 const shortLeaf = t => { const x = str(t).replace(/^CI: /, 'CI ').split(/[:(·]/)[0].trim(); return x.length > 28 ? `${x.slice(0, 27).trimEnd()}…` : x || 'something external' }
 
 /** One waiting card of this chat and its chain: the root line (box · title, its disclosure · root cause and hops ·
  *  age), then each card it passes through on a tree guide (box by state · title, opens it · its chat · state), ending
  *  on the tinted leaf. `sameAs` = an earlier root this chain runs into: its chain is not repeated. */
-export function WaitChain({ i, now = Date.now(), known, local = new Map(), sameAs = new Map(), k = 'waiting' }) {
+export function WaitChain({ i, now = Date.now(), known, local = new Map(), sameAs = new Map(), k = 'waiting', parent = null, kids = null }) {
   const [open, setOpen] = useState(false)
   const ch = chainFor(i, now, { local })
   const st = typeof window !== 'undefined' ? window.__sessionTasks : null
   const age = rowWait(i, now, needsPark(i) ? parkFor(i.chip, now) : null).age
   const L = LEAF[ch.leaf.kind] || LEAF.unknown
   const canOpen = i.kind === 'kanban' && !!i.chip?.connectionId && !!i.chip?.profile && typeof st?.openTaskChip === 'function'
-  const cut = ch.nodes.findIndex(nd => sameAs.has(nd.id))
-  const nodes = cut >= 0 ? ch.nodes.slice(0, cut + 1) : ch.nodes
+  // Cut where this chain meets one already shown: another waiting root (`sameAs` by card id; that row is kept as the
+  // last node) or a prerequisite an earlier chain already listed (`sameAs` by `node:<id>`; shown once, not repeated).
+  const rootCut = ch.nodes.findIndex(nd => sameAs.has(nd.id)), nodeCut = ch.nodes.findIndex(nd => sameAs.has(`node:${nd.id}`))
+  const sharedFirst = nodeCut >= 0 && (rootCut < 0 || nodeCut < rootCut)
+  const cut = sharedFirst ? nodeCut : rootCut
+  // Nested under its prerequisite (`parent`, see groupSharedRunning): only the cards between this row and that parent.
+  const nodes = parent ? ch.nodes.slice(0, parent.index) : cut >= 0 ? ch.nodes.slice(0, sharedFirst ? cut : cut + 1) : ch.nodes
   let tail = jsxs('div', { 'data-chain-leaf': ch.leaf.kind, style: { ...GRID, padding: '5px 10px 5px 8px', margin: '2px 0', background: L.tint, borderRadius: 6 }, children: [
     jsxs('span', { style: { display: 'flex', alignItems: ch.leaf.kind === 'you' ? 'flex-start' : 'center', gap: 10, minWidth: 0 }, children: [jsx('span', { 'aria-hidden': true, style: { ...leafBox(ch.leaf.kind), ...(ch.leaf.kind === 'you' ? { marginTop: 5 } : {}) } }), jsx('span', { 'data-leaf-text': '', title: ch.leaf.text, style: ch.leaf.kind === 'you' ? { minWidth: 0, color: L.text, whiteSpace: 'normal', overflowWrap: 'anywhere' } : { ...CELL, color: L.text }, children: ch.leaf.text })] }),
     jsxs('span', { style: { ...muted, ...CELL, color: L.color, display: 'flex', alignItems: 'center', gap: 8 }, children: [
@@ -1662,7 +1672,11 @@ export function WaitChain({ i, now = Date.now(), known, local = new Map(), sameA
     ] }),
     jsx('span', {})
   ] })
-  if (cut >= 0) tail = jsx('div', { 'data-chain-same': nodes[cut].id, style: { ...muted, padding: '3px 0 3px 2px' }, children: `same chain as “${sameAs.get(nodes[cut].id)}” above` })
+  if (parent) tail = null
+  else if (cut >= 0 && sharedFirst) {
+    const shared = ch.nodes[cut]
+    tail = jsx('div', { 'data-chain-same': shared.id, style: { ...muted, padding: '3px 0 3px 2px' }, children: `same prerequisite as “${sameAs.get(`node:${shared.id}`)}” above: ${shared.title || shared.id}${shared.status ? ` — ${shared.status.replace(/_/g, ' ')}` : ''}` })
+  } else if (cut >= 0) tail = jsx('div', { 'data-chain-same': nodes[cut].id, style: { ...muted, padding: '3px 0 3px 2px' }, children: `same chain as “${sameAs.get(nodes[cut].id)}” above` })
   // Nest from the leaf outwards: each card wraps the rest of the chain on its own tree guide.
   let inner = tail
   for (let n = nodes.length - 1; n >= 0; n--) {
@@ -1684,7 +1698,7 @@ export function WaitChain({ i, now = Date.now(), known, local = new Map(), sameA
       inner
     ] })
   }
-  if (!nodes.length) inner = jsx('div', { style: GUIDE, children: tail })
+  if (!nodes.length && tail) inner = jsx('div', { style: GUIDE, children: tail })
   const tip = `${str(i.chip?.title) || i.label}${i.detail ? `\n${i.cardStatus ? i.detail : waitLabel(i.detail, i.chip)}` : ''}`
   return jsxs('div', { 'data-wait-chain': i.key, 'data-panel-row': i.key, 'data-waiting-line': i.key, style: { fontSize: 13, display: 'flex', flexDirection: 'column', marginTop: 4 }, children: [
     jsxs('div', { 'data-wait-row': '', title: tip, onClick: () => setOpen(o => !o), style: { ...GRID, padding: '4px 0', cursor: 'pointer' }, children: [
@@ -1692,9 +1706,11 @@ export function WaitChain({ i, now = Date.now(), known, local = new Map(), sameA
         jsx('span', { 'aria-hidden': true, 'data-row-pip': k, 'data-line-pip': k, ...(onHub(i) ? { 'data-row-pip-hub': '', 'data-line-pip-hub': '' } : {}), style: { ...pipStyle(k, onHub(i)), display: 'inline-flex' }, children: onHub(i) ? 'H' : undefined }),
         jsx('button', { type: 'button', 'data-wait-toggle': '', 'aria-expanded': open, 'data-wait-title': '', style: { ...CELL, flex: 1, padding: 0, border: 0, background: 'transparent', font: 'inherit', color: 'inherit', textAlign: 'left', cursor: 'pointer' }, children: i.label })
       ] }),
-      jsxs('span', { 'data-wait-reason': '', 'data-root-cause': ch.leaf.kind, title: `${L.label}: ${ch.leaf.text}`, style: { ...muted, color: L.color, display: 'flex', minWidth: 0, gap: 0, whiteSpace: 'nowrap' }, children: [
-        jsx('span', { style: { ...CELL }, children: `${summaryText(ch).replace(/ · \d+ hops?$/, '')}${ch.stale ? ' · not re-read' : ''}` }),
-        jsx('span', { 'data-hops': '', style: { flex: 'none' }, children: ` · ${hops(ch)} ${hops(ch) === 1 ? 'hop' : 'hops'}` })
+      jsxs('span', { 'data-wait-reason': '', 'data-root-cause': ch.leaf.kind, title: `${L.label}: ${ch.leaf.text}`, style: { ...muted, color: parent ? 'var(--muted-foreground)' : L.color, display: 'flex', minWidth: 0, gap: 0, whiteSpace: 'nowrap' }, children: [
+        parent
+          ? jsx('span', { 'data-wait-parent': parent.id, style: { ...CELL }, children: `Waiting on ${parent.title}${ch.stale ? ' · not re-read' : ''}` })
+          : jsx('span', { style: { ...CELL }, children: `${summaryText(ch).replace(/ · \d+ hops?$/, '')}${ch.stale ? ' · not re-read' : ''}` }),
+        !parent && jsx('span', { 'data-hops': '', style: { flex: 'none' }, children: ` · ${hops(ch)} ${hops(ch) === 1 ? 'hop' : 'hops'}` })
       ] }),
       jsx('span', { 'data-wait-age': '', style: { ...muted, textAlign: 'right', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }, children: age })
     ] }),
@@ -1704,7 +1720,64 @@ export function WaitChain({ i, now = Date.now(), known, local = new Map(), sameA
       i.evidenceText && jsx('div', { 'data-evidence': i.evidenceState || '', children: `evidence: ${i.evidenceText}` }),
       canOpen && jsx('button', { type: 'button', 'data-open-card': '', style: { ...btn, minHeight: 26, marginTop: 4, fontSize: 12 }, onClick: () => st.openTaskChip(i.chip), children: 'Open card' })
     ] }),
-    inner
+    inner,
+    kids && kids.length ? jsx('div', { 'data-wait-kids': i.key, style: GUIDE, children: kids }) : null
+  ] })
+}
+
+/** Waiting cards that end on the SAME running prerequisite, as one hierarchy: `{ order, groups }`. The running card is
+ *  the root (listed once); each waiter nests under the nearest card of its own chain that is either another waiting
+ *  card of the group or that running card (so a waiter of a waiter sits one level deeper). Any waiting card whose
+ *  chain ends on a running card is grouped, one dependent or many. */
+export function groupSharedRunning(rows, now = Date.now(), local = new Map()) {
+  const byTerm = new Map(), entries = []
+  for (const i of rows || []) {
+    const ch = chainFor(i, now, { local })
+    const term = !ch.loading && ch.leaf.kind === 'running' && ch.nodes.length ? ch.nodes[ch.nodes.length - 1] : null
+    const e = { i, ch, term: term?.id || '' }
+    entries.push(e)
+    if (term) { if (!byTerm.has(term.id)) byTerm.set(term.id, { term, leaf: ch.leaf, entries: [] }); byTerm.get(term.id).entries.push(e) }
+  }
+  const groups = new Map()
+  for (const [id, g] of byTerm) groups.set(id, g)
+  const order = [], seen = new Set()
+  for (const e of entries) {
+    if (e.term && groups.has(e.term)) { if (!seen.has(e.term)) { seen.add(e.term); order.push({ group: e.term }) } } else order.push({ row: e.i })
+  }
+  return { order, groups }
+}
+
+/** One shared running prerequisite with its waiting dependents nested beneath (the same tree guide as a chain). */
+export function WaitGroup({ g, now = Date.now(), known, local = new Map(), k = 'waiting', root = null }) {
+  const st = typeof window !== 'undefined' ? window.__sessionTasks : null
+  const ids = new Set(g.entries.map(e => str(e.i.chip?.id)))
+  const L = LEAF.running, title = g.term.title || g.term.id
+  const parentOf = e => {
+    const idx = e.ch.nodes.findIndex(nd => ids.has(nd.id) || nd.id === g.term.id)
+    const nd = e.ch.nodes[idx]
+    return { id: nd.id, index: idx, title: nd.id === g.term.id ? title : (g.entries.find(x => str(x.i.chip?.id) === nd.id)?.i.label || nd.title || nd.id) }
+  }
+  const parents = new Map(g.entries.map(e => [e, parentOf(e)]))
+  const kidsOf = pid => g.entries.filter(e => parents.get(e).id === pid).map(e => {
+    const p = parents.get(e)
+    return jsx(WaitChain, { i: e.i, now, known, local, sameAs: new Map(), k, parent: p, kids: kidsOf(str(e.i.chip?.id)) }, e.i.key)
+  })
+  const seg = waitSegments(`card ${g.term.id}`, g.entries[0].i.chip, now).find(x => x.id === g.term.id)
+  return jsxs('div', { 'data-wait-group': g.term.id, style: { fontSize: 13, display: 'flex', flexDirection: 'column', marginTop: 4 }, children: [
+    root || jsxs('div', { 'data-chain-prereq': g.term.id, style: { ...GRID, padding: '4px 0' }, children: [
+      jsxs('span', { style: { display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }, children: [
+        jsx('span', { 'aria-hidden': true, 'data-prereq-pip': 'running', style: { ...pipStyle('running'), display: 'inline-flex' } }),
+        seg?.linkable && typeof st?.openTaskChip === 'function'
+          ? jsx('button', { type: 'button', 'data-prereq-title': '', 'data-wait-card': g.term.id, title: `Open card ${g.term.id}: ${title}`, onClick: () => st.openTaskChip(seg.open), style: { ...CELL, flex: 1, padding: 0, border: 0, background: 'transparent', font: 'inherit', color: 'var(--foreground)', textAlign: 'left', cursor: 'pointer' }, children: title })
+          : jsx('span', { 'data-prereq-title': '', style: { ...CELL, flex: 1 }, children: title })
+      ] }),
+      jsxs('span', { style: { ...muted, ...CELL, display: 'flex', alignItems: 'center', gap: 8 }, children: [
+        jsx(ChatChip, { node: g.term, chip: g.entries[0].i.chip, known, now }),
+        jsx('span', { 'data-prereq-state': '', style: { color: L.color }, children: `${g.leaf.text}${g.leaf.sub ? `, ${g.leaf.sub}` : ''}` })
+      ] }),
+      jsx('span', {})
+    ] }),
+    jsx('div', { 'data-wait-kids': g.term.id, style: GUIDE, children: kidsOf(g.term.id) })
   ] })
 }
 const STATE_BOX = { running: 'running', review: 'waiting', ready: 'ready', todo: 'queued', done: 'done', archived: 'done', blocked: 'waiting', scheduled: 'waiting', triage: 'waiting' }
@@ -1715,6 +1788,7 @@ export function WaitLine({ i, now = Date.now(), k = 'waiting', local = new Map()
   const L = LEAF[ch.leaf.kind] || LEAF.unknown
   const age = rowWait(i, now, needsPark(i) ? parkFor(i.chip, now) : null).age
   const via = ch.nodes.length ? ` · via ${ch.nodes.length} ${ch.nodes.length === 1 ? 'card' : 'cards'}` : ''
+  const dep = ch.leaf.kind === 'running' && ch.nodes.length ? ch.nodes[ch.nodes.length - 1] : null
   return jsxs('div', { 'data-waiting-line': i.key, 'data-wait-line': '', title: `${str(i.chip?.title) || i.label}\n${L.label}: ${ch.leaf.text}${via}`, style: { ...GRID, padding: '3px 0', fontSize: 13 }, children: [
     jsxs('span', { style: { display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }, children: [
       jsx('span', { 'aria-hidden': true, 'data-line-pip': k, ...(onHub(i) ? { 'data-line-pip-hub': '' } : {}), style: { ...pipStyle(k, onHub(i)), display: 'inline-flex' }, children: onHub(i) ? 'H' : undefined }),
@@ -1722,8 +1796,11 @@ export function WaitLine({ i, now = Date.now(), k = 'waiting', local = new Map()
     ] }),
     jsxs('span', { 'data-wait-reason': '', 'data-root-cause': ch.leaf.kind, style: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, whiteSpace: 'nowrap' }, children: [
       jsx('span', { 'aria-hidden': true, style: { width: 7, height: 7, borderRadius: '50%', flex: 'none', ...(L.dashed ? { border: `1px dashed ${L.color}`, boxSizing: 'border-box' } : { background: L.color }) } }),
-      jsx('span', { style: { color: L.color }, children: L.label }),
-      jsx('span', { style: { ...muted, ...CELL }, children: `· ${ch.leaf.text}${ch.leaf.sub ? `, ${ch.leaf.sub}` : ''}${via}${ch.stale ? ' · not re-read' : ''}` })
+      // A card waiting on a running dependency says so by name: the waiter stays yellow, only the dependency's own state is blue.
+      dep
+        ? jsxs('span', { 'data-wait-dependency': dep.id, style: { ...CELL, minWidth: 0 }, children: [jsx('span', { style: muted, children: `Waiting on ${dep.title || dep.id} — ` }), jsx('span', { style: { color: L.color }, children: `${ch.leaf.text}${ch.leaf.sub ? `, ${ch.leaf.sub}` : ''}` }), jsx('span', { style: muted, children: `${ch.nodes.length > 1 ? via : ''}${ch.stale ? ' · not re-read' : ''}` })] })
+        : jsx('span', { style: { color: L.color }, children: L.label }),
+      !dep && jsx('span', { style: { ...muted, ...CELL }, children: `· ${ch.leaf.text}${ch.leaf.sub ? `, ${ch.leaf.sub}` : ''}${via}${ch.stale ? ' · not re-read' : ''}` })
     ] }),
     jsx('span', { 'data-wait-age': '', style: { ...muted, textAlign: 'right', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }, children: age })
   ] })
@@ -1734,7 +1811,7 @@ export function causeBreakdown(rows, now = Date.now(), local = new Map()) {
   const n = {}
   // A chain still being read is not counted yet (it would flash as "unknown").
   for (const i of rows || []) { const ch = chainFor(i, now, { local }); if (ch.loading) continue; const kk = ch.leaf.kind; n[kk] = (n[kk] || 0) + 1 }
-  return ['you', 'hold', 'external', 'slot', 'running', 'done', 'unknown'].filter(kk => n[kk]).map(kk => ({ kind: kk, count: n[kk], label: LEAF[kk].label }))
+  return ['you', 'hold', 'external', 'slot', 'lane', 'running', 'done', 'unknown'].filter(kk => n[kk]).map(kk => ({ kind: kk, count: n[kk], label: LEAF[kk].breakdown || LEAF[kk].label }))
 }
 
 // ── running rows ───────────────────────────────────────────────────────────
@@ -2368,7 +2445,17 @@ export function Panel() {
   // A still-blocked card whose ask was retired is waiting on you too: it counts, and keeps a line when collapsed.
   const retired = sorted.waiting.filter(i => i.cardStatus)
   const lineRows = [...chainRows, ...retired]
-  const causes = causeBreakdown(lineRows, now, local)
+  // One hierarchy for work that waits on a running card: when that running card is one of this chat's In progress rows,
+  // its waiting dependents nest under that row there (the running card is listed once in the whole panel) and are left
+  // out of the flat Waiting list. The header totals (`n`) are untouched: they count every card once either way.
+  const byRunning = groupSharedRunning(chainRows, now, local)
+  // Any local card that is running is a root wherever its presentation bucket draws it: In progress (`active`) or Stuck
+  // (no progress for hours). The bucket changes the row's warning and heading, never where its dependents hang.
+  const rootIds = new Set([...sorted.active, ...sorted.stuck].map(i => str(i.chip?.id)).filter(Boolean))
+  const nestedGroups = new Map([...byRunning.groups].filter(([id]) => rootIds.has(id)))
+  const nestedKeys = new Set([...nestedGroups.values()].flatMap(g => g.entries.map(e => e.i.key)))
+  const flatRows = chainRows.filter(i => !nestedKeys.has(i.key))
+  const causes = causeBreakdown([...flatRows, ...retired], now, local)
   tracePanel(route, panelSignature({ sorted, n, asks, finished, evidenceUnknown, causes, chainRows, fresh }))
   // A chain that runs into another root shown above is not repeated (`same chain as … above`).
   const sameAs = new Map()
@@ -2380,7 +2467,7 @@ export function Panel() {
   ].filter(Boolean)
   const summaryParts = PIP_ORDER.filter(k => n[k]).map(k => ({ k, text: `${n[k]} ${LABEL[k]}` }))
   const otherSections = asks + sorted.unasked.length + sorted.stuck.length + sorted.blockedUpstream.length + sorted.waiting.length > 0
-  const waitingCount = sorted.blockedUpstream.length + sorted.waiting.length
+  const waitingCount = sorted.blockedUpstream.length + sorted.waiting.length - nestedKeys.size
   // Rows whose source evidence is unknown (expired, missing from an older producer, or SDK projector absent) are
   // counted apart: they are neither green nor zero.
   if (reported.length) summaryParts.push({ k: 'reported', text: `${reported.length} reported finished, unconfirmed` })
@@ -2411,12 +2498,19 @@ export function Panel() {
       ...needsYou,
       US?.ActionQueue && jsx('div', { 'data-agent-deliveries': '', style: { color: 'var(--muted-foreground)' }, children: jsx(US.ActionQueue, { embedded: true, audience: 'agent' }, 'agent-queue') }),
       sorted.stuck.length > 0 && jsx('h3', { 'data-section': 'stuck', style: heading(C.stuck), children: `Stuck · ${sorted.stuck.length}` }),
-      ...sorted.stuck.map(i => jsx(StuckCard, { i, session: route.session, now }, i.key)),
+      ...sorted.stuck.map(i => {
+        const g = nestedGroups.get(str(i.chip?.id))
+        const card = jsx(StuckCard, { i, session: route.session, now })
+        return g ? jsx(WaitGroup, { g, now, known, local, root: card }, i.key) : jsx(StuckCard, { i, session: route.session, now }, i.key)
+      }),
       // The header already says "N running" with N blue boxes: the heading only earns its line when other
       // sections share the body and the running rows need telling apart from them.
       sorted.active.length > 0 && otherSections &&
         jsx('h3', { 'data-section': 'in-progress', style: heading('var(--muted-foreground)'), children: `In progress · ${sorted.active.length}` }),
-      sorted.active.length > 0 && jsx('div', { 'data-running-list': '', style: { paddingTop: otherSections ? 0 : 4 }, children: sorted.active.map(i => jsx(RunningRow, { i, now }, i.key)) }),
+      sorted.active.length > 0 && jsx('div', { 'data-running-list': '', style: { paddingTop: otherSections ? 0 : 4 }, children: sorted.active.map(i => {
+        const g = nestedGroups.get(str(i.chip?.id))
+        return g ? jsx(WaitGroup, { g, now, known, local, root: jsx(RunningRow, { i, now }) }, i.key) : jsx(RunningRow, { i, now }, i.key)
+      }) }),
       waitingCount > 0 && jsxs('button', { type: 'button', 'data-waiting-toggle': '', 'aria-expanded': waitingOpen, onClick: toggleWaiting, title: waitingOpen ? 'Hide the dependency chains' : 'Show each waiting card\'s dependency chain', style: { display: 'flex', alignItems: 'baseline', flexWrap: 'wrap', gap: 10, width: '100%', margin: '12px 0 6px', padding: 0, background: 'transparent', border: 0, cursor: 'pointer', font: 'inherit', textAlign: 'left', color: 'var(--muted-foreground)' }, children: [
         jsx('span', { 'aria-hidden': true, style: { fontSize: 10, width: 10 }, children: waitingOpen ? '▾' : '▸' }),
         jsx('h3', { 'data-section': 'waiting', style: { ...heading('var(--muted-foreground)'), margin: 0 }, children: `Waiting · ${waitingCount}` }),
@@ -2426,17 +2520,28 @@ export function Panel() {
         ] })
       ] }),
       // Folded: one line per waiting card naming its root cause (first WAIT_LINES_COLLAPSED); opened: each chain.
-      !waitingOpen && chainRows.length > 0 && jsxs('div', { 'data-folded-waiting': '', children: [
-        ...chainRows.slice(0, WAIT_LINES_COLLAPSED).map(i => jsx(WaitLine, { i, now, local }, i.key)),
-        chainRows.length > WAIT_LINES_COLLAPSED && jsx('div', { 'data-wait-more': '', style: { ...muted, padding: '2px 0 2px 22px' }, children: `+${chainRows.length - WAIT_LINES_COLLAPSED} more waiting` }, 'more')
+      !waitingOpen && flatRows.length > 0 && jsxs('div', { 'data-folded-waiting': '', children: [
+        ...flatRows.slice(0, WAIT_LINES_COLLAPSED).map(i => jsx(WaitLine, { i, now, local }, i.key)),
+        flatRows.length > WAIT_LINES_COLLAPSED && jsx('div', { 'data-wait-more': '', style: { ...muted, padding: '2px 0 2px 22px' }, children: `+${flatRows.length - WAIT_LINES_COLLAPSED} more waiting` }, 'more')
       ] }, 'fold'),
       // A still-blocked owner whose ask was retired has no other surface: its status row is never folded away.
       ...sorted.waiting.filter(i => i.cardStatus).map(i => jsx(Row, { i, k: 'waiting' }, i.key)),
-      waitingOpen && jsx('div', { 'data-open-waiting': '', children: chainRows.map(i => {
-        const el = jsx(WaitChain, { i, now, known, local, sameAs: new Map(sameAs) }, i.key)
-        if (i.chip?.id) sameAs.set(str(i.chip.id), i.label)
-        return el
-      }) }, 'open'),
+      waitingOpen && jsx('div', { 'data-open-waiting': '', children: (() => {
+        const { order, groups } = groupSharedRunning(flatRows, now, local)
+        return order.map(o => {
+          if (o.group) {
+            const g = groups.get(o.group)
+            for (const e of g.entries) if (e.i.chip?.id) sameAs.set(str(e.i.chip.id), e.i.label)
+            sameAs.set(`node:${o.group}`, g.entries[0].i.label)
+            return jsx(WaitGroup, { g, now, known, local }, `grp:${o.group}`)
+          }
+          const i = o.row
+          const el = jsx(WaitChain, { i, now, known, local, sameAs: new Map(sameAs) }, i.key)
+          if (i.chip?.id) sameAs.set(str(i.chip.id), i.label)
+          for (const nd of chainFor(i, now, { local }).nodes) if (!sameAs.has(`node:${nd.id}`)) sameAs.set(`node:${nd.id}`, i.label)
+          return el
+        })
+      })() }, 'open'),
       (finished?.length || reported.length || sorted.ready.length || sorted.queued.length) ? jsxs('div', { style: { borderTop: '1px solid color-mix(in srgb, var(--border) 60%, transparent)', marginTop: 10, paddingTop: 4 }, children: [
         jsx(Fold, { label: `Ready · ${sorted.ready.length}`, items: sorted.ready, k: 'ready' }),
         jsx(Fold, { label: `Not started · ${sorted.queued.length}`, items: sorted.queued, k: 'queued' }),
