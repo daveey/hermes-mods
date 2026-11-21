@@ -926,9 +926,78 @@ def _mods_merge_checked(cmd: str, cwd: str, python: bool = False, depth: int = 0
 
 # --- entry points --------------------------------------------------------------------------------------------
 
+CUSTODY_NS = "refs/hermes-source-custody"
+_GIT_FALSE = {"false", "no", "off", "0"}
+
+
+def _custody_side(side: str) -> bool:
+    side = side if side.startswith("refs/") else "refs/" + side
+    return CUSTODY_NS in side
+
+
+def check_custody_push(cmd: str, cwd: str) -> Optional[str]:
+    """Refuse a `git push` that would publish core's source-custody refs. Those refs pin unpushed, possibly
+    private work that was preserved locally; they are never meant to reach a remote.
+
+    Always refused: a refspec that names the namespace (full or abbreviated, either side). Refused only while
+    the repository holds custody refs, because only then would they travel: `--mirror`, a remote configured as a
+    mirror, and a `*` refspec on the command line or in the remote's push config. Applies to every remote, with
+    or without a configured guard, and PUSH_GUARD=off does not skip it. This is a second fence: core's own
+    publisher refuses the same argv."""
+    for repo, sub, args in _git_calls(cmd, cwd):
+        if sub != "push":
+            continue
+        pos, mirror, i = [], False, 0
+        while i < len(args):
+            a = args[i]
+            if a in VALUE_OPTS:
+                i += 2
+                continue
+            if a == "--mirror":
+                mirror = True
+            elif not a.startswith("-"):
+                pos.append(a)
+            i += 1
+        specs = [s.lstrip("+") for s in pos[1:]]
+        for s in specs:
+            if any(_custody_side(side) for side in s.split(":", 1) if side):
+                return f"`git push ... {s[:80]}` names the source-custody namespace {CUSTODY_NS}"
+        if _git(repo, "for-each-ref", "--count=1", "--format=%(refname)", CUSTODY_NS) in (None, ""):
+            continue  # no custody refs here (or not a readable repo): a broad push cannot carry any
+        if mirror:
+            return f"`git push --mirror` would publish this repo's source-custody refs ({CUSTODY_NS})"
+        if any("*" in s and not _heads_or_tags_only(s) for s in specs):
+            return f"a `*` refspec would publish this repo's source-custody refs ({CUSTODY_NS})"
+        if not specs:
+            cur = _git(repo, "symbolic-ref", "-q", "--short", "HEAD") or "HEAD"
+            remote = pos[0] if pos else (_git(repo, "config", f"branch.{cur}.remote") or "origin")
+            conf = _git(repo, "config", "--get-regexp", rf"^remote\.{re.escape(remote)}\.(mirror|push)$") or ""
+            for line in conf.splitlines():
+                key, _, value = line.partition(" ")
+                if key.endswith(".mirror") and value.strip().lower() not in _GIT_FALSE:
+                    return f"remote {remote} is a mirror: a push would publish source-custody refs ({CUSTODY_NS})"
+                if key.endswith(".push") and ("*" in value and not _heads_or_tags_only(value)
+                                              or _custody_side(value.lstrip("+").split(":", 1)[0])):
+                    return (f"remote {remote} push config `{value.strip()[:80]}` would publish source-custody "
+                            f"refs ({CUSTODY_NS})")
+    return None
+
+
+def _heads_or_tags_only(spec: str) -> bool:
+    """A glob confined to branches or tags (`refs/heads/*:...`, `refs/tags/*`) cannot select the custody namespace."""
+    src = spec.strip().lstrip("+").split(":", 1)[0]
+    return src.startswith(("refs/heads/", "refs/tags/"))
+
+
 def check_shell(cmd: str, cwd: Optional[str] = None, guards: Optional[list[dict]] = None) -> Optional[str]:
     guards = load_guards() if guards is None else guards
     cmd = cmd or ""
+    if "push" in cmd:
+        custody = check_custody_push(cmd, _resolve(cwd or os.getcwd()))
+        if custody:
+            return ("PUSH GUARD: blocked: " + custody + ". Custody refs hold unpushed work that was preserved "
+                    "locally and must not reach a remote: push the branches you mean by name. "
+                    + OVERRIDE + " does not skip this check.")
     policy = _mods_merge(cmd, _resolve(cwd or os.getcwd())) if "merge" in cmd.lower() else None
     if policy:
         return policy

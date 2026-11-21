@@ -364,3 +364,67 @@ def test_gh_json_falls_back_to_token_broker_when_gh_has_no_login(tmp_path, monke
     (bin_ / "token-broker").unlink()
     monkeypatch.setattr(guard.Path, "home", lambda: tmp_path)  # no ~/.local/bin/token-broker either
     assert guard.check_state("acme/core", "abc", "C").startswith("unreadable (You are not logged")
+
+
+# --- source-custody namespace ----------------------------------------------------------------------------------
+
+NS = "refs/hermes-source-custody"
+
+
+def hold_custody_ref(work):
+    git("update-ref", f"{NS}/store/op/unit/pin", "HEAD", cwd=work)
+
+
+@pytest.mark.parametrize("spec", [
+    f"{NS}/store/op/unit/pin", f"HEAD:{NS}/x", f"+{NS}/*:{NS}/*", "hermes-source-custody/x",
+    f"feat:refs/heads/ok {NS}/a:{NS}/a", f":{NS}/x"])
+def test_a_refspec_naming_the_custody_namespace_is_blocked_on_any_remote(repo, tmp_path, spec):
+    other = tmp_path / "someone" / "else.git"
+    other.mkdir(parents=True)
+    git("init", "-q", "--bare", cwd=other)
+    git("remote", "add", "backup", str(other), cwd=repo)
+    for remote in ("origin", "backup"):  # backup has no configured guard
+        got = block("terminal", {"command": f"git push {remote} {spec}", "workdir": str(repo)})
+        assert got and got["action"] == "block" and NS in got["message"], (remote, spec)
+
+
+def test_custody_check_needs_no_guard_config_and_ignores_the_override(repo, monkeypatch, tmp_path):
+    monkeypatch.setenv("PUSH_GUARD_CONFIG", str(tmp_path / "absent.json"))
+    cmd = f"PUSH_GUARD=off git push origin HEAD:{NS}/x"
+    got = block("terminal", {"command": cmd, "workdir": str(repo)})
+    assert got and "does not skip this check" in got["message"]
+    code = f"import subprocess\nsubprocess.run(['git', 'push', 'origin', 'HEAD:{NS}/x'])\n"
+    assert guard.check_python(code, str(repo))
+    code = f"import subprocess\nsubprocess.run('git push origin HEAD:{NS}/x', shell=True)\n"
+    assert guard.check_python(code, str(repo))
+
+
+def test_mirror_and_glob_pushes_are_blocked_only_while_the_repo_holds_custody_refs(repo):
+    broad = ["git push --mirror origin", "git push origin 'refs/*:refs/*'", "git push origin '+refs/hermes*:refs/x/*'"]
+    for cmd in broad:  # nothing to leak yet
+        assert block("terminal", {"command": cmd, "workdir": str(repo)}) is None, cmd
+    hold_custody_ref(repo)
+    for cmd in broad:
+        got = block("terminal", {"command": cmd, "workdir": str(repo)})
+        assert got and got["action"] == "block" and NS in got["message"], cmd
+    # Named branches still go: the guard is about the namespace, not about pushing.
+    assert block("terminal", {"command": "git push origin feat", "workdir": str(repo)}) is None
+    for cmd in ("git push --all origin", "git push origin '+refs/heads/*:refs/heads/*'", "git push origin 'refs/tags/*'"):
+        assert block("terminal", {"command": cmd, "workdir": str(repo)}) is None, cmd
+
+
+def test_configured_mirror_or_broad_push_refspec_is_blocked_for_a_bare_push(repo):
+    hold_custody_ref(repo)
+    bare_push = {"command": "git push origin", "workdir": str(repo)}
+    assert block("terminal", bare_push) is None
+    git("config", "remote.origin.push", "refs/heads/*:refs/heads/*", cwd=repo)
+    assert block("terminal", bare_push) is None  # branches only: cannot select the namespace
+    git("config", "--add", "remote.origin.push", "refs/*:refs/*", cwd=repo)
+    got = block("terminal", bare_push)
+    assert got and "push config" in got["message"]
+    git("config", "--unset-all", "remote.origin.push", cwd=repo)
+    git("config", "remote.origin.mirror", "true", cwd=repo)
+    got = block("terminal", bare_push)
+    assert got and "is a mirror" in got["message"]
+    git("config", "remote.origin.mirror", "false", cwd=repo)
+    assert block("terminal", bare_push) is None

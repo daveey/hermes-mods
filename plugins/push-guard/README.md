@@ -121,3 +121,19 @@ boundary; their existing activation paths still apply.
 Regression coverage: `tests/test_guard_decision_reload.py` at the repository root
 loads temporary plugin copies and exercises the registered pre-tool hook across
 allowed-to-refused edits, syntax errors, recovery and same-second/same-size edits.
+
+## Source-custody refs are never pushed
+
+Core pins preserved, unpushed work under `refs/hermes-source-custody/` in the local repository. Those refs can hold
+private or unreviewed source, so a `git push` that would carry them is blocked on every remote, with or without a
+configured guard, and `PUSH_GUARD=off` does not skip it:
+
+- always: a refspec naming the namespace, full or abbreviated, on either side (`HEAD:refs/hermes-source-custody/x`,
+  `hermes-source-custody/x`, a deletion);
+- only while the repository holds custody refs (only then could they travel): `--mirror`, a remote configured with
+  `remote.<name>.mirror`, and a `*` refspec on the command line or in `remote.<name>.push`, unless the glob is
+  confined to `refs/heads/` or `refs/tags/`.
+
+Named branches, `--all` and `--tags` are unaffected. This is a second fence: core's own publisher refuses the same
+argv. Limits: like the rest of the guard it reads the command text, so a push assembled at run time or a refspec in
+`branch.<name>.pushRemote`/`push.default` it does not model is not seen.
