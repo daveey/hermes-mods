@@ -129,17 +129,18 @@ class Owner(unittest.TestCase):
             c.execute('create table task_runs (id text, task_id text, status text, outcome text, ended_at integer)')
         self.m = load()
         original = self.m.on_tool_call
+        self.raw_hook = original
         def verified_call(name, args, duration_ms=0, env=None, **kwargs):
             env = dict(env or {}, HERMES_KANBAN_DB=str(self.db), HERMES_KANBAN_RUN_ID='run1')
             if name == 'kanban_complete' and env.get('HERMES_KANBAN_TASK'):
                 with closing(sqlite3.connect(self.db)) as c, c:
-                    c.execute('insert or replace into tasks values (?, ?, ?, ?)',
+                    c.execute('insert or replace into tasks (id,status,current_run_id,workspace_path) values (?, ?, ?, ?)',
                               (env['HERMES_KANBAN_TASK'], 'done', None, env.get('HERMES_KANBAN_WORKSPACE', '')))
                     c.execute('delete from task_runs where task_id=?', (env['HERMES_KANBAN_TASK'],))
                     c.execute("insert into task_runs values ('run1', ?, 'done', 'completed', 1)", (env['HERMES_KANBAN_TASK'],))
                     c.execute("delete from tasks where id like 'shared%'")
                     for i, path in enumerate(self.live):
-                        c.execute('insert into tasks values (?, ?, ?, ?)', (f'shared{i}', 'running', 'other', path))
+                        c.execute('insert into tasks (id,status,current_run_id,workspace_path) values (?, ?, ?, ?)', (f'shared{i}', 'running', 'other', path))
                 kwargs['result'] = json.dumps(dict(ok=True, task_id=env['HERMES_KANBAN_TASK'], run_id='run1'))
             return original(name, args, duration_ms, env, **kwargs)
         self.m.on_tool_call = verified_call
@@ -165,6 +166,114 @@ class Owner(unittest.TestCase):
         cmd = cmd or f"cd {self.repo} && git worktree add -b {branch} {path} origin/main"
         self.m.on_tool_call("terminal", {"command": cmd}, duration_ms=int((time.time() - t0) * 1000) + 50, env=env)
         return path
+
+    def scratch_clone(self, tool='terminal'):
+        with closing(sqlite3.connect(self.db)) as c, c:
+            if 'workspace_kind' not in {r[1] for r in c.execute('pragma table_info(tasks)')}:
+                c.execute("alter table tasks add column workspace_kind text default 'scratch'")
+        ws = self.tmp / 'kanban' / 'workspaces' / 't_clone'; ws.mkdir(parents=True, exist_ok=True)
+        env = {'HERMES_KANBAN_TASK': 't_clone', 'HERMES_KANBAN_WORKSPACE': str(ws)}
+        p = ws / 'repo'
+        git(ws, 'clone', '-q', str(self.repo), str(p))
+        text = f'git clone {self.repo} {p}' if tool == 'terminal' else f"git('clone', '{self.repo}', '{p}')"
+        self.m.on_tool_call(tool, {'command' if tool == 'terminal' else 'code': text}, duration_ms=2000, env=env)
+        return p, env
+
+    def test_finished_scratch_clone_reclaimed_for_both_entry_paths(self):
+        for tool in ('terminal', 'execute_code'):
+            with self.subTest(tool=tool):
+                p, env = self.scratch_clone(tool)
+                self.assertEqual(self.marker(p)['kind'], 'scratch-clone')
+                self.m.on_tool_call('kanban_complete', {}, env=env)
+                self.assertFalse(p.exists())
+
+    def test_scratch_clone_preserves_unsaved_data(self):
+        for mode in ('dirty', 'ignored', 'stash', 'branch', 'tag', 'live', 'shared', 'foreign-marker'):
+            with self.subTest(mode=mode):
+                p, env = self.scratch_clone()
+                if mode == 'dirty': (p / 'wip').write_text('keep')
+                if mode == 'ignored':
+                    (p / '.git' / 'info' / 'exclude').write_text('private\n')
+                    (p / 'private').write_text('keep')
+                if mode in ('stash', 'branch', 'tag'):
+                    (p / 'a.txt').write_text('changed')
+                    if mode == 'stash': git(p, 'stash', 'push', '-qm', 'keep')
+                    else:
+                        git(p, 'commit', '-qam', 'local')
+                        git(p, 'branch' if mode == 'branch' else 'tag', 'keep')
+                        git(p, 'reset', '--hard', 'origin/main')
+                if mode == 'live': self.m.live_cwds = lambda: [str(p)]
+                if mode == 'shared': self.live = [str(p)]
+                if mode == 'foreign-marker':
+                    mk = p / '.git' / self.m.MARKER
+                    rec = json.loads(mk.read_text()); rec['run_id'] = 'foreign'; mk.write_text(json.dumps(rec))
+                self.m.on_tool_call('kanban_complete', {}, env=env)
+                self.assertTrue(p.exists())
+                shutil.rmtree(p)
+                self.live = []; self.m.live_cwds = lambda: []
+
+    def test_clone_board_specific_workspace(self):
+        p, env = self.scratch_clone()
+        board = self.tmp / 'kanban' / 'boards' / 'review'
+        board.mkdir(parents=True)
+        db = board / 'kanban.db'; self.db.rename(db); self.db = db
+        ws = board / 'workspaces' / 't_clone'; ws.parent.mkdir()
+        p.parent.rename(ws); p = ws / 'repo'
+        (p / '.git' / self.m.MARKER).unlink()
+        env['HERMES_KANBAN_WORKSPACE'] = str(ws)
+        self.m.on_tool_call('terminal', {'command': f'git clone remote {p}'}, duration_ms=2000, env=env)
+        self.assertEqual(self.marker(p)['kind'], 'scratch-clone')
+        self.m.on_tool_call('kanban_complete', {}, env=env)
+        self.assertFalse(p.exists())
+
+    def test_rejected_clone_completion_preserves_even_settled_clone(self):
+        p, env = self.scratch_clone()
+        full = dict(env, HERMES_KANBAN_DB=str(self.db), HERMES_KANBAN_RUN_ID='run1')
+        for result in (None, {'ok': False}, {'ok': True, 'task_id': 't_clone', 'run_id': 'other'}):
+            self.assertEqual(self.raw_hook('kanban_complete', {}, env=full, result=result), [])
+            self.assertTrue(p.exists())
+        # Failed clone commands may register a complete repo; they still cannot remove it until completion.
+        self.assertEqual(self.raw_hook('terminal', {'command': f'git clone remote {p}; false'}, env=full,
+                                      result={'exit_code': 1}), [])  # already registered; no second ownership
+        self.assertTrue(p.exists())
+
+    def test_clone_completion_guards(self):
+        p, env = self.scratch_clone()
+        # Registration alone cannot authorize deletion, nor can a rejected completion.
+        self.m.on_tool_call('terminal', {'command': 'git status'}, env=env)
+        self.assertTrue(p.exists())
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("insert into tasks (id,status,current_run_id,workspace_path) values ('t_clone','done',null,?)", (str(p.parent),))
+            c.execute("insert into task_runs values ('run1','t_clone','done','completed',1)")
+            c.execute("insert into tasks (id,status,current_run_id,workspace_path) values ('child','ready',null,'')")
+            c.execute("insert into task_links values ('t_clone','child')")
+        full = dict(env, HERMES_KANBAN_DB=str(self.db), HERMES_KANBAN_RUN_ID='run1')
+        self.assertEqual(self.m.teardown('t_clone', full), [])
+        self.assertTrue(p.exists())
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute('delete from task_links')
+            c.execute("update tasks set workspace_kind='dir' where id='t_clone'")
+        self.assertEqual(self.m.teardown('t_clone', full), [])
+        self.assertTrue(p.exists())
+
+    def test_clone_registration_rejects_ssh_and_symlinked_workspace(self):
+        p, env = self.scratch_clone()
+        mk = p / '.git' / self.m.MARKER; mk.unlink()
+        self.m.on_tool_call('terminal', {'command': f'ssh remote git clone x {p}'}, env=env)
+        self.assertFalse(mk.exists())
+        ws = p.parent; outside = self.tmp / 'outside'
+        ws.rename(outside); ws.symlink_to(outside, target_is_directory=True)
+        self.m.on_tool_call('terminal', {'command': f'git clone x {p}'}, env=env)
+        self.assertFalse((outside / 'repo' / '.git' / self.m.MARKER).exists())
+
+    def test_clone_is_not_claimed_without_creation_evidence(self):
+        p, env = self.scratch_clone()
+        (p / '.git' / self.m.MARKER).unlink()
+        with patch.object(self.m, '_birth', return_value=1):
+            self.m.on_tool_call('terminal', {'command': f'git clone remote {p}'}, duration_ms=1, env=env)
+        self.assertIsNone(self.marker(p))
+        self.m.on_tool_call('kanban_complete', {}, env=env)
+        self.assertTrue(p.exists())
 
     def marker(self, path):
         gd = git(path, "rev-parse", "--absolute-git-dir").strip()

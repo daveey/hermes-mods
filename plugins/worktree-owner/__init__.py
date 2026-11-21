@@ -580,6 +580,111 @@ def _remove(path: str, why_owned: str) -> dict:
     return dict(path=path, action="removed")
 
 
+def _scratch_clones(ws: str, task_id: str, db: str) -> list[Path]:
+    """Only direct children of this card's canonical managed scratch directory.
+
+    Never recursively discover arbitrary repositories or follow directory links.
+    The board's stored workspace kind is checked at teardown too.
+    """
+    if not ws or not task_id or not db:
+        return []
+    p = Path(ws).expanduser()
+    root = _board_root(db)
+    allowed = [root / 'kanban' / 'workspaces' / task_id]
+    board = Path(db).resolve().parent
+    if board.parent.name == 'boards':
+        allowed.append(board / 'workspaces' / task_id)
+    if not any(p.resolve() == a.parent.resolve() / task_id for a in allowed):
+        return []
+    # ~/.hermes itself may be a symlink; children within its resolved root may not.
+    p = p.resolve()
+    out = []
+    if not p.is_dir():
+        return []
+    for child in p.iterdir():
+        gd = child / '.git'
+        if child.is_symlink() or not child.is_dir() or gd.is_symlink() or not gd.is_dir():
+            continue
+        out.append(child)
+    return out
+
+
+def register_clones(since: float, env, text: str, tool: str) -> list[dict]:
+    owner = owner_from_env(env)
+    if not all(owner.get(k) for k in ('task_id', 'board_db', 'run_id')) or re.search(r'\bssh\b', text):
+        return []
+    out = []
+    ws = env.get('HERMES_KANBAN_WORKSPACE', '')
+    for p in _scratch_clones(ws, owner['task_id'], owner['board_db']):
+        gd = p / '.git'
+        birth = _birth(str(gd))
+        if birth is None or birth < since or (gd / MARKER).exists():
+            continue
+        if not _ours(str(p), text, tool, env, [ws]):
+            continue
+        common = _git(str(p), 'rev-parse', '--path-format=absolute', '--git-common-dir')
+        if common.returncode or Path(common.stdout.strip()).resolve() != gd:
+            continue
+        rec = dict(owner, kind='scratch-clone', path=str(p), gitdir_inode=gd.stat().st_ino,
+                   gitdir_device=gd.stat().st_dev)
+        (gd / MARKER).write_text(json.dumps(rec))
+        _log(f'REGISTER clone {p} owner={owner}')
+        out.append(rec)
+    return out
+
+
+def teardown_clones(task_id: str, env, ws: str, live: set[str], runs: set[str], unreadable) -> list[dict]:
+    db = env['HERMES_KANBAN_DB']
+    candidates = _scratch_clones(ws, task_id, db)
+    if not any((p / '.git' / MARKER).exists() for p in candidates):
+        return []
+    with closing(_ro_connect(db)) as c:
+        row = c.execute('select workspace_kind from tasks where id=?', (task_id,)).fetchone()
+    if not row or row[0] != 'scratch':
+        return []
+    results = []
+    for p in _scratch_clones(ws, task_id, db):
+        gd = p / '.git'
+        try:
+            rec = json.loads((gd / MARKER).read_text())
+        except (OSError, ValueError):
+            continue
+        if (not isinstance(rec, dict) or rec.get('kind') != 'scratch-clone'
+                or rec.get('task_id') != task_id or rec.get('path') != str(p)
+                or rec.get('gitdir_inode') != gd.stat().st_ino or rec.get('gitdir_device') != gd.stat().st_dev
+                or _marker_fence(rec, task_id, env, runs)):
+            continue
+        why = None
+        if unreadable:
+            why = 'a kanban board is unreadable'
+        elif any(_overlap(str(p), other) for other in live):
+            why = 'shared with an open card'
+        elif any(_overlap(str(p), cwd) and (cwd == str(p) or cwd.startswith(str(p) + '/')) for cwd in live_cwds()):
+            why = 'live process'
+        else:
+            common = _git(str(p), 'rev-parse', '--path-format=absolute', '--git-common-dir')
+            worktrees = gd / 'worktrees'
+            if common.returncode or Path(common.stdout.strip()).resolve() != gd or worktrees.exists():
+                why = 'not a standalone clone'
+            else:
+                why = _complex_reason(str(p)) or _removable(str(p))
+                # HEAD alone misses a local branch/tag or stash left on another ref.
+                local = _git(str(p), 'rev-list', '--all', '--not', '--remotes')
+                stash = _git(str(p), 'stash', 'list')
+                if local.returncode or local.stdout.strip() or stash.returncode or stash.stdout.strip():
+                    why = 'local-only refs or stash'
+        if why:
+            _log(f'KEEP {p} (clone of {task_id}): {why}')
+            results.append(dict(path=str(p), action=f'kept: {why}'))
+        elif _DRY:
+            results.append(dict(path=str(p), action='would remove'))
+        else:
+            shutil.rmtree(p)
+            _log(f'REMOVED clone {p} (registered to {task_id})')
+            results.append(dict(path=str(p), action='removed'))
+    return results
+
+
 def teardown(task_id: str, env) -> list[dict]:
     """Completion path: the worker that just completed *task_id* in run HERMES_KANBAN_RUN_ID tears its trees down."""
     db, run = env.get('HERMES_KANBAN_DB'), env.get('HERMES_KANBAN_RUN_ID')
@@ -746,7 +851,7 @@ def _marker_fence(rec: dict, task_id: str, env, runs: set[str] | None) -> str | 
 
 def _teardown_locked(task_id: str, env, ws: str, live: set[str], runs: set[str] | None = None,
                      unreadable: list[str] | None = None) -> list[dict]:
-    results = []
+    results = teardown_clones(task_id, env, ws, live, runs or set(), unreadable)
     def remove(path, why):
         if unreadable:
             _log(f"KEEP {path} ({why}): cannot read board {', '.join(unreadable)}; an open card there may use it")
@@ -799,13 +904,18 @@ def on_tool_call(tool_name: str, args: Any, duration_ms: Any = 0, env=None, resu
         name = str(tool_name or "")
         a = args if isinstance(args, dict) else {}
         if name in CREATE_TOOLS:
-            if not _mentions_worktree_add(str(a.get("command") or a.get("code") or "")):
+            text = str(a.get('command') or a.get('code') or '')
+            worktree_add = _mentions_worktree_add(text)
+            clone = bool(re.search(r'\bclone\b', text) and re.search(r'\bgit\b', text))
+            if not worktree_add and not clone:
                 return []
             dur = float(duration_ms) / 1000 if isinstance(duration_ms, (int, float)) and duration_ms else 600.0
             since = time.time() - dur - SLACK_S
-            text = str(a.get("command") or a.get("code") or "")
-            return register_markers(since, env, [a.get("workdir") or "", env.get("HERMES_KANBAN_WORKSPACE") or "", os.getcwd()],
-                                    text, name)
+            results = register_clones(since, env, text, name) if clone else []
+            if worktree_add:
+                results += register_markers(since, env, [a.get('workdir') or '', env.get('HERMES_KANBAN_WORKSPACE') or '', os.getcwd()],
+                                            text, name)
+            return results
         if name == "kanban_complete" and env.get("HERMES_KANBAN_TASK"):
             task = str(a.get("task_id") or env["HERMES_KANBAN_TASK"])
             if task != env["HERMES_KANBAN_TASK"]:

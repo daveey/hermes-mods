@@ -57,6 +57,30 @@ Two `post_tool_call` hooks. Neither one blocks or changes a tool call, and every
 - Registration is best-effort, not a security boundary: command text and creation windows cannot prove arbitrary shell semantics or concurrent loop ownership. Unregistered trees remain protected by core preservation, not automatically reaped.
 - Process and filesystem scans are snapshots, not locks on arbitrary external Git users. The board reservation serializes transitions on that board; it is not a cross-host filesystem lease. Never use this as a global managed-root exemption.
 
+## Scratch clone lifecycle
+
+Plain clones made as **direct children of the owning card's managed scratch workspace** are also owned.
+After a `terminal` or `execute_code` call mentioning Git and clone, newly born, named clones receive a
+`scratch-clone` marker inside `.git`, bound to the exact board/task/run and Git directory inode/device.
+Only a verified own-card completion removes them, under the existing board writer reservation and
+child/cross-board/process guards. The stored workspace must still be scratch. Dirty, ignored-data-bearing,
+stashed, unpushed (including other branches/tags), nested/linked, uncertain, foreign or unmarked clones stay.
+Root-home symlinks are supported; task-directory symlinks are not. No new recurring sweep is installed.
+Clones kept at completion need explicit owner cleanup; existing worktree sweeps do not discover plain clones.
+
+This closes a producer gap: core intentionally preserves every Git-bearing scratch tree, while the owner
+hook previously registered only `git worktree add`. A clean clone therefore had neither immediate teardown
+nor an owner marker. Keep core's preservation guard; do not replace it with blanket repository deletion.
+SSH-created clones, nested clones, bare clones and arbitrary Python helpers that do not mention Git/clone
+are not registered. Prefer a linked worktree and explicit teardown; for a clone, use a direct workspace child,
+filtered/reference cloning where available, and verify its marker before relying on completion cleanup.
+
+Tests: `test_finished_scratch_clone_reclaimed_for_both_entry_paths` exercises real Git cloning and removal
+through both tool entry paths. Clone tests also exercise branch/tag/stash custody, dirty/ignored files,
+shared/live/foreign markers, open children, persistent workspaces, symlink roots, SSH exclusion, old births,
+board-specific workspace roots and refused completion. These are hook integration fixtures, not real-card
+lifecycle side effects. Older boards without `workspace_kind` fail closed through the hook error handler.
+
 Log: `~/.hermes/logs/worktree-owner.log` (`REGISTER`, `REMOVED`, `KEEP`, `SKIP` lines).
 
 ## Claude Code and Codex (`agent_hook.py`)
