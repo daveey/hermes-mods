@@ -579,6 +579,54 @@ def test_fleet_route_gateway_section_carries_worker_events_from_the_scaler_ledge
                                           launched_at=now - 10, slots=6, running=[])
 
 
+def test_fleet_route_gateway_section_ignores_unsynced_board_replicas(disk_api, monkeypatch, tmp_path):
+    """REST path: the real ``_gateway_section`` passes core ``board_paths()`` to both replica scans, so a frozen
+    replica of a board dropped from kanban.sync.boards adds neither waiting cards nor running leases."""
+    import sqlite3, time
+    module, client, _, _, _, _ = disk_api
+    module.FLEET_CACHE_S = 0
+    module.FLEET_STALE_MAX_S = 0
+    replicas = tmp_path / 'replicas'
+    replicas.mkdir()
+    lease_until = int(time.time() * 1000) + 600_000
+    for board in ('default', 'dropped'):
+        db = sqlite3.connect(replicas / f'{board}.db')
+        db.execute('CREATE TABLE tasks (id TEXT, title TEXT, status TEXT, assignee TEXT, started_at INTEGER, '
+                   'lease_holder TEXT, lease_expires INTEGER)')
+        db.executemany('INSERT INTO tasks VALUES (?,?,?,?,?,?,?)', [
+            (f'{board}_ready', 'Ready', 'ready', 'default', None, None, None),
+            (f'{board}_run', 'Running', 'running', 'default', 1, 'hub', lease_until)])
+        db.commit()
+        db.close()
+    ksc = types.ModuleType('hermes_cli.kanban_sync_client')
+    ksc.shadow_path = lambda board: replicas / f'{board}.db'
+    ksc.board_paths = lambda: [('default', tmp_path / 'kanban.db')]
+    node = types.ModuleType('hermes_cli.kanban_worker_node')
+    node.registry = lambda: dict(me='hub', machines=dict(hub=dict(name='hub', state='active', last_seen=time.time() * 1000)))
+    node._REGISTRY = dict(at=time.monotonic())
+    node.eligible = lambda *args: None
+    kdb = types.ModuleType('hermes_cli.kanban_db')
+    kdb.kanban_home = lambda: tmp_path
+    consts = types.ModuleType('hermes_constants')
+    consts.set_hermes_home_override = lambda home: home
+    consts.reset_hermes_home_override = lambda token: None
+    core = types.ModuleType('hermes_cli')  # fakes only: no core checkout needed, none imported
+    core.__path__ = []
+    for name, fake in (('hermes_cli', core), ('hermes_constants', consts), ('hermes_cli.kanban_db', kdb),
+                       ('hermes_cli.kanban_sync_client', ksc), ('hermes_cli.kanban_worker_node', node)):
+        monkeypatch.setitem(sys.modules, name, fake)
+    core.kanban_sync_client, core.kanban_worker_node, core.kanban_db = ksc, node, kdb
+    monkeypatch.setattr(module, '_local_cap', lambda: 4)
+    seen = []
+    monkeypatch.setattr(module, '_waiting_cards', lambda fleet, shadow_dir, boards=None: seen.append(boards) or
+                        fleet.waiting_cards(shadow_dir, lambda p: True, boards=boards))
+    gateways = client.get(PREFIX + '/fleet', headers=TOKEN).json()['gateways']
+    hub = next(m for m in gateways['machines'] if m['name'] == 'hub')
+    assert gateways['waiting'] == 1 and hub['waiting'] == 1
+    assert [(r['board'], r['task']) for r in hub['running']] == [('default', 'default_run')]
+    assert seen == [{'default'}]
+
+
 def test_fleet_route_without_runner_config_still_serves_gateways(disk_api, monkeypatch):
     module, client, path, _, _, _ = disk_api
     path.unlink()

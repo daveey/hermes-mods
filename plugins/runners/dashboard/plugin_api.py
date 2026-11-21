@@ -221,8 +221,10 @@ def _waiting_cards(fleet, shadow_dir, boards=None):
 def _synced_boards():
     """Slugs this gateway syncs (core ``board_paths``, under the Kanban home), or None when unknown.
 
-    Only these replicas are refreshed; any other file in the shadow dir is a frozen copy of a board
-    dropped from ``kanban.sync.boards``. None makes the scan fall back to every replica.
+    The sync loop refreshes only these replicas (when it runs here); any other file in the shadow dir
+    is a frozen copy of a board dropped from ``kanban.sync.boards``. None makes the scan fall back to
+    every replica. The home override is defensive: current core resolves ``kanban_home()`` from the
+    environment, not the per-request profile.
     """
     try:
         from hermes_constants import set_hermes_home_override, reset_hermes_home_override
@@ -233,7 +235,7 @@ def _synced_boards():
             return {slug for slug, _ in ksc.board_paths()}
         finally:
             reset_hermes_home_override(token)
-    except Exception as exc:  # older core or unreadable config: keep the old every-replica scan
+    except Exception as exc:  # older core without board_paths, or a refused override: every-replica scan
         logging.getLogger(__name__).warning('runners fleet: synced board list unavailable, scanning every replica: %s', exc)
         return None
 
