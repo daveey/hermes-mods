@@ -119,18 +119,216 @@ def _commands(cmd: str, cwd: str, segments: Optional[list] = None):
 
 
 _ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.S)
+_VAR_REF = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+# Pseudo-entries of the environment dict a command runs with (never passed to git): `env -i`, a working
+# directory the guard could not resolve, a command word that is an unknown `$VAR`.
+CLEAR, BADCWD, OPAQUE, SUDO = "\0clear", "\0badcwd", "\0opaque", "\0sudo"
+PUSH_MARK, POP_MARK = "\0push", "\0pop"
+SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "ash", "fish", "su"}
+RESERVED = {"{", "}", "(", ")", "then", "do", "else", "elif", "if", "while", "until", "!", "coproc"}
+WRAPPER_OPTS = {  # wrapper -> options that take a value
+    "sudo": {"-u", "-g", "-h", "-p", "-C", "-D", "-R", "-T", "-U", "-r", "-t", "--user", "--group", "--host",
+             "--prompt", "--chdir", "--chroot", "--close-from", "--command-timeout", "--other-user", "--role",
+             "--type"},
+    "doas": {"-u", "-C"}, "timeout": {"-s", "-k", "--signal", "--kill-after"}, "nice": {"-n", "--adjustment"},
+    "exec": {"-a"}, "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
+    "ionice": {"-c", "-n", "-p", "-P", "-u"}, "command": set(), "nohup": set(), "setsid": set(), "time": set(),
+}
+ENV_VALUE_OPTS = {"-u", "-C", "-S", "-a", "--unset", "--chdir", "--split-string", "--argv0"}
+FALLBACK_WRAPPERS = {"xargs", "flock", "watch", "parallel", "chronic"}
 
 
-def _commands_env(cmd: str, cwd: str, segments: Optional[list] = None):
-    """Like _commands, plus a 3rd item: the environment assignments in effect for that command (earlier
-    `export X=1` / `X=1;` segments and the command's own `X=1 git ...` / `env X=1 git ...` prefixes)."""
-    shell_env: dict = {}
-    for seg in (SEPARATORS.split(cmd or "") if segments is None else segments):
+def _strip_options(words: list, value_opts: set):
+    """Parse the leading options of a wrapper command (words[0]). Returns (rest, [(option, value-or-None)])."""
+    i, opts = 1, []
+    while i < len(words):
+        w = words[i]
+        if w == "--":
+            i += 1
+            break
+        if not w.startswith("-") or w == "-":
+            break
+        if w.startswith("--"):
+            name, eq, val = w.partition("=")
+            if eq:
+                opts.append((name, val))
+            elif name in value_opts and i + 1 < len(words):
+                opts.append((name, words[i + 1]))
+                i += 1
+            else:
+                opts.append((name, None))
+        else:  # short cluster: -iu NAME, -n5, -uroot
+            j = 1
+            while j < len(w):
+                ch = "-" + w[j]
+                if ch in value_opts:
+                    v = w[j + 1:] or None
+                    if v is None and i + 1 < len(words):
+                        i += 1
+                        v = words[i]
+                    opts.append((ch, v))
+                    break
+                opts.append((ch, None))
+                j += 1
+        i += 1
+    return words[i:], opts
+
+
+def _expand_word(w: str, shell_env: dict) -> str:
+    """Expand $VAR / ${VAR} from the shell variables the command line set, then the process environment."""
+    w = _VAR_REF.sub(lambda m: shell_env.get(m.group(1) or m.group(2)) if shell_env.get(m.group(1) or m.group(2))
+                     is not None else m.group(0), w)
+    return os.path.expanduser(os.path.expandvars(w))
+
+
+def _split_shell(cmd: str):
+    """Quote-aware split into [(segment text, persists)] on ; & | newline && || ( ) $( and backticks outside
+    quotes. Subshell boundaries become PUSH_MARK / POP_MARK segments. `persists` is False for a segment that is
+    part of a pipeline or runs in the background: its cd / assignments do not reach the next command. None when
+    a quote never closes (callers fall back to a plain split, which can only refuse more)."""
+    segs: list = []
+    cur: list = []
+    quote = None
+    i, n = 0, len(cmd)
+    last = {"sep": ""}  # separator before the segment being built
+
+    def flush(after: str):
+        text = "".join(cur)
+        cur.clear()
+        if text.strip():
+            segs.append([text, not (last["sep"] == "|" or after in ("|", "&"))])
+        last["sep"] = after
+
+    while i < n:
+        c = cmd[i]
+        if quote:
+            if c == "\\" and quote == '"' and i + 1 < n:
+                cur.append(cmd[i:i + 2])
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+        elif c == "\\" and i + 1 < n:
+            cur.append(cmd[i:i + 2])
+            i += 2
+            continue
+        elif c in "'\"":
+            quote = c
+        elif c == "$" and cmd.startswith("$(", i) or c == "`":
+            # command substitution: its commands run in a subshell; the outer word keeps a `$` placeholder
+            if c == "`":
+                j = cmd.find("`", i + 1)
+                inner_start = i + 1
+            else:
+                depth_, j, q = 1, i + 2, None
+                while j < n and depth_:
+                    d = cmd[j]
+                    if q:
+                        q = None if d == q else q
+                    elif d in "'\"":
+                        q = d
+                    elif d == "(":
+                        depth_ += 1
+                    elif d == ")":
+                        depth_ -= 1
+                    j += 1
+                j = j - 1 if depth_ == 0 else -1
+                inner_start = i + 2
+            if j < 0:
+                return None
+            sub = _split_shell(cmd[inner_start:j])
+            if sub is None:
+                return None
+            segs.append([PUSH_MARK, True])
+            segs.extend([list(s) for s in sub])
+            segs.append([POP_MARK, True])
+            cur.append("$__SUBST__")
+            i = j + 1
+            continue
+        elif c == "(":
+            flush(";")
+            segs.append([PUSH_MARK, True])
+            i += 1
+            continue
+        elif c == ")":
+            flush(";")
+            segs.append([POP_MARK, True])
+            i += 1
+            continue
+        elif c in ";\n":
+            flush(";")
+            i += 1
+            continue
+        elif cmd.startswith("&&", i) or cmd.startswith("||", i):
+            flush(";")
+            i += 2
+            continue
+        elif c == "|":
+            flush("|")
+            i += 1
+            continue
+        elif c == "&" and not (i > 0 and cmd[i - 1] in "<>") and not cmd.startswith("&>", i):
+            flush("&")
+            i += 1
+            continue
+        cur.append(c)
+        i += 1
+    if quote:
+        return None
+    flush(";")
+    return [(t, p) for t, p in segs]
+
+
+def _shell_payload(words: list) -> Optional[str]:
+    """The command string a shell wrapper would run: `bash -c STR`, `sh -lc STR`, `su -c STR`, `eval ...`."""
+    tool = os.path.basename(words[0])
+    if tool == "eval":
+        return " ".join(words[1:])
+    i = 1
+    while i < len(words):
+        w = words[i]
+        if w.startswith("--command="):
+            return w.partition("=")[2]
+        if w in ("-o", "+o", "-O", "+O", "--rcfile", "--init-file") and i + 1 < len(words):
+            i += 2
+            continue
+        if w == "--command" and i + 1 < len(words):
+            return words[i + 1]
+        if w.startswith("-") and not w.startswith("--") and "c" in w[1:]:
+            return words[i + 1] if i + 1 < len(words) else None
+        if not w.startswith(("-", "+")):
+            return None  # a script file, not a command string
+        i += 1
+    return None
+
+
+def _commands_env(cmd: str, cwd: str, segments: Optional[list] = None, env0: Optional[dict] = None):
+    """Like _commands, plus a 3rd item: the environment in effect for that command (earlier `export X=1` /
+    `X=1;` segments and the command's own `X=1 git ...` / `env X=1 git ...` / `env -i` / `env -u X` prefixes;
+    a BADCWD entry when its working directory could not be resolved). A subshell, a pipeline stage and a
+    background command do not leak `cd` or assignments into the commands after them."""
+    shell_env: dict = dict(env0 or {})
+    cwd_bad = bool(shell_env.get(BADCWD))
+    stack: list = []
+    if segments is None:
+        segments = _split_shell(cmd or "")
+        if segments is None:
+            segments = [(s, True) for s in re.split(r"&&|\|\||;|\n|\||&|\(|\)|`|\$\(", cmd or "")]
+    for seg in segments:
+        seg, persist = (seg, True) if isinstance(seg, str) else seg
+        if seg == PUSH_MARK:
+            stack.append((cwd, dict(shell_env), cwd_bad))
+            continue
+        if seg == POP_MARK:
+            if stack:
+                cwd, shell_env, cwd_bad = stack.pop()
+            continue
         try:
             words = shlex.split(seg, comments=True)
         except ValueError:
             words = seg.split()
         own: dict = {}
+        ccwd, ccwd_bad = cwd, cwd_bad
         changed = True
         while changed and words:
             changed = False
@@ -138,31 +336,114 @@ def _commands_env(cmd: str, cwd: str, segments: Optional[list] = None):
                 k, _, v = words[0].partition("=")
                 own[k] = v
                 words, changed = words[1:], True
-            if words and words[0] in PREFIXES:
+            while words and words[0] in RESERVED:
                 words, changed = words[1:], True
-                while words and re.match(r"^(-\S+|\d+[smh]?)$", words[0]):
-                    words = words[1:]
-            if len(words) > 1 and re.match(r"^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$", words[0]):
-                words, changed = words[1:], True  # `$B gh api ...`: B holds a wrapper (token-broker exec ... --)
+            while words and re.match(r"^\d*(?:>>?|<<?|&>|>&|<&)(.*)$", words[0]):
+                words, changed = words[1 if re.match(r"^\d*(?:>>?|<<?|&>|>&|<&)\S", words[0]) else 2:], True
+            if not words:
+                break
+            w0 = os.path.basename(words[0])
+            if w0 == "env":
+                rest, opts = _strip_options(words, ENV_VALUE_OPTS)
+                pre: list = []
+                for o, v in opts:
+                    if o in ("-i", "--ignore-environment"):
+                        own.clear()
+                        own[CLEAR] = True
+                    elif o in ("-u", "--unset") and v:
+                        own[v] = None
+                    elif o in ("-C", "--chdir") and v:
+                        v = _expand_word(v, {**shell_env, **own})
+                        if re.search(r"[$`]", v):
+                            ccwd_bad = True
+                        ccwd = _resolve(v, ccwd)
+                        if not os.path.isdir(ccwd):
+                            ccwd_bad = True
+                    elif o in ("-S", "--split-string") and v is not None:
+                        if re.search(r"[$`]", v):
+                            ccwd_bad = True  # env expands ${VAR} inside -S itself: the command is unproved
+                        try:
+                            pre = shlex.split(v)
+                        except ValueError:
+                            pre = v.split()
+                words, changed = pre + rest, True
+                continue
+            if w0 in WRAPPER_OPTS:
+                rest, opts = _strip_options(words, WRAPPER_OPTS[w0])
+                names = {o for o, _ in opts}
+                if w0 == "command" and names & {"-v", "-V"}:
+                    words = ["true"]
+                    break
+                if w0 in ("sudo", "doas"):
+                    own[SUDO] = True
+                    if names & {"-D", "--chdir", "-R", "--chroot"}:
+                        ccwd_bad = True
+                if w0 == "timeout" and rest and re.match(r"^\d", rest[0]):
+                    rest = rest[1:]
+                words, changed = rest, True
+                continue
+            if w0 in FALLBACK_WRAPPERS:
+                for j, w in enumerate(words[1:], 1):
+                    if os.path.basename(w) in SHELLS | {"git", "env", "sudo", "eval"}:
+                        words, changed = words[j:], True
+                        if w0 in ("xargs", "parallel"):
+                            own[OPAQUE] = True  # stdin appends arguments the guard cannot see
+                        break
+                else:
+                    break
+                continue
+            if re.match(r"^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$", words[0]):
+                val = _expand_word(words[0], {**shell_env, **own})
+                if not re.search(r"[$`]", val) and val != words[0]:
+                    try:
+                        words, changed = shlex.split(val) + words[1:], True
+                    except ValueError:
+                        pass
+                    continue
+                if len(words) > 1:
+                    own[OPAQUE] = True
+                    words, changed = words[1:], True  # `$B gh api ...`: B holds a wrapper (token-broker ... --)
             if words and os.path.basename(words[0]) == "token-broker" and "--" in words:
                 words, changed = words[words.index("--") + 1:], True
         if not words:
-            shell_env.update(own)  # bare `X=1`: sticks for the rest of the command line
+            if persist:
+                shell_env.update(own)  # bare `X=1`: sticks for the rest of the command line
             continue
         if words[0] in ("export", "declare", "typeset", "local", "readonly") and len(words) > 1:
-            for w in words[1:]:
-                m = _ASSIGN.match(w)
-                if m:
-                    shell_env[m.group(1)] = m.group(2)
+            if persist:
+                for w in words[1:]:
+                    m = _ASSIGN.match(w)
+                    if m:
+                        shell_env[m.group(1)] = m.group(2)
             continue
         if words[0] == "unset":
-            for w in words[1:]:
-                shell_env[w] = None
+            if persist:
+                for w in words[1:]:
+                    shell_env[w] = None
             continue
-        if words[0] in ("cd", "pushd") and len(words) > 1:
-            cwd = _resolve(words[1], cwd)
+        if words[0] in ("cd", "pushd", "popd", "chdir"):
+            if persist:
+                args = [a for a in words[1:] if a == "-" or not a.startswith("-")]
+                if words[0] == "popd" or (args and args[0] == "-"):
+                    cwd_bad = True
+                else:
+                    tgt = _expand_word(args[0], shell_env) if args else os.path.expanduser("~")
+                    if re.search(r"[$`]", tgt):
+                        cwd_bad = True
+                    else:
+                        absolute = os.path.isabs(tgt)
+                        cwd = _resolve(tgt, cwd)
+                        if not os.path.isdir(cwd):
+                            cwd_bad = True
+                        elif absolute:
+                            cwd_bad = False
             continue
-        yield cwd, words, {**shell_env, **own}
+        final = dict(own) if own.get(CLEAR) else {**shell_env, **own}
+        if ccwd_bad:
+            final[BADCWD] = True
+        elif cwd_bad:
+            final[BADCWD] = True
+        yield ccwd, words, final
 
 
 def _git_calls(cmd: str, cwd: str):
@@ -175,18 +456,33 @@ class GitView:
     """The git a command line would actually run: cwd/-C plus --git-dir, --work-tree, -c, --config-env and
     GIT_* environment assignments. Queries run real git with those same inputs, so what the guard reads is
     what the push would see. `unresolved` is True when any input needs shell expansion (or an environment
-    variable) the guard cannot see: the view is then unproved and callers must fail closed."""
+    variable) the guard cannot see: the view is then unproved and callers must fail closed. `failed` is set when
+    a query itself errored (not merely "no such key"): a failed query never proves a config absent."""
 
     def __init__(self, repo: str, env: Optional[dict] = None):
         self.repo, self.env, self.opts, self.unresolved, self.repointed = repo, dict(env or {}), [], False, False
-        for v in self.env.values():
+        self.failed, self.params, self.exports = False, [], {}
+        for k, v in self.env.items():
+            if k.startswith("\0"):
+                continue
             if v is not None and re.search(r"[$`]", v):
                 self.unresolved = True
+        if self.env.get(BADCWD) or self.env.get(OPAQUE):
+            self.unresolved = True
+        if self.env.get(SUDO) and any(k.startswith("GIT_") for k in self.env):
+            self.unresolved = True  # sudo resets the environment: which GIT_* it keeps depends on sudoers
 
     def add(self, *opt: str) -> None:
         self.opts.extend(opt)
         if any(re.search(r"[$`]", o) for o in opt):
             self.unresolved = True
+        if opt[0] == "-c" and len(opt) > 1:
+            self.params.append(opt[1])
+        elif opt[0] in ("--git-dir", "--work-tree") and len(opt) > 1:
+            self.exports["GIT_DIR" if opt[0] == "--git-dir" else "GIT_WORK_TREE"] = opt[1]
+        elif opt[0].startswith(("--git-dir=", "--work-tree=")):
+            k, _, v = opt[0].partition("=")
+            self.exports["GIT_DIR" if k == "--git-dir" else "GIT_WORK_TREE"] = v
 
     def config_env(self, spec: str) -> None:
         self.add("--config-env=" + spec)
@@ -194,9 +490,23 @@ class GitView:
         if var not in os.environ and self.env.get(var) is None:
             self.unresolved = True  # git would fail or read a value the guard cannot see
 
-    def run(self, *args: str) -> Optional[str]:
-        env = dict(os.environ)
+    def exported_env(self) -> dict:
+        """The environment a child of this git (a `!shell` alias) would inherit."""
+        env = dict(self.env)
+        env.update(self.exports)
+        if self.params:
+            env["GIT_CONFIG_PARAMETERS"] = " ".join("'" + p + "'" for p in self.params)
+        return env
+
+    def query(self, *args: str):
+        """(returncode, stdout); returncode None when git could not run. rc 1 is git config's "no such key"."""
+        if self.env.get(CLEAR):
+            env = {"PATH": os.environ.get("PATH", "")}
+        else:
+            env = dict(os.environ)
         for k, v in self.env.items():
+            if k.startswith("\0"):
+                continue
             if v is None:
                 env.pop(k, None)
             else:
@@ -205,43 +515,113 @@ class GitView:
             r = subprocess.run(["git", "-C", self.repo, *self.opts, *args], capture_output=True, text=True,
                                timeout=15, env=env)
         except (OSError, subprocess.SubprocessError):
-            return None
-        return r.stdout.strip() if r.returncode == 0 else None
+            self.failed = True
+            return None, ""
+        if r.returncode not in (0, 1):
+            self.failed = True
+        return r.returncode, r.stdout.strip()
+
+    def run(self, *args: str) -> Optional[str]:
+        rc, out = self.query(*args)
+        return out if rc == 0 else None
 
 
-def _git_calls_cfg(cmd: str, cwd: str):
-    """Like _git_calls, plus a 4th item: the GitView the command would run in (see GitView)."""
-    for cwd, words, env in _commands_env(cmd, cwd):
-        if os.path.basename(words[0]) != "git":
+GIT_BUILTINS = {
+    "status", "log", "diff", "show", "add", "commit", "fetch", "pull", "checkout", "branch", "merge", "rebase",
+    "reset", "stash", "tag", "remote", "config", "clone", "init", "rev-parse", "rev-list", "ls-files", "cherry-pick",
+    "revert", "worktree", "describe", "grep", "blame", "bisect", "clean", "mv", "rm", "restore", "switch",
+    "submodule", "apply", "am", "format-patch", "for-each-ref", "update-ref", "symbolic-ref", "cat-file",
+    "ls-remote", "ls-tree", "gc", "fsck", "help", "version", "show-ref", "merge-base", "reflog", "notes",
+}
+
+
+def _unproved_push(repo: str, env: dict):
+    view = GitView(repo, env)
+    view.unresolved = True
+    return repo, "push", [], view
+
+
+def _git_calls_cfg(cmd: str, cwd: str, env0: Optional[dict] = None, depth: int = 0):
+    """Like _git_calls, plus a 4th item: the GitView the command would run in (see GitView). Follows nested
+    `bash -c STR` / `eval` / `su -c`, subshells and `git` aliases (config `alias.<name>`, read from the same view);
+    depth-exhausted or unreadable forms that mention a push come back as an unproved push."""
+    for cwd, words, env in _commands_env(cmd, cwd, None, env0):
+        tool = os.path.basename(words[0])
+        if tool in SHELLS or tool == "eval":
+            inner = _shell_payload(words)
+            if inner is not None:
+                if depth >= 4:
+                    if "push" in inner:
+                        yield _unproved_push(cwd, env)
+                else:
+                    yield from _git_calls_cfg(inner, cwd, env, depth + 1)
             continue
-        repo, i = cwd, 1
+        if tool != "git":
+            if env.get(OPAQUE) and "push" in words:
+                yield _unproved_push(cwd, env)
+            continue
+        repo, i, hops = cwd, 1, 0
         view = GitView(repo, env)
-        while i < len(words) and words[i].startswith("-"):
-            w = words[i]
-            if w == "-C" and i + 1 < len(words):
-                if re.search(r"[$`]", words[i + 1]):
-                    view.unresolved = True
-                repo = _resolve(words[i + 1], repo)
-                view.repo = repo
-                i += 2
-            elif w == "-c" and i + 1 < len(words):
-                view.add("-c", words[i + 1])
-                i += 2
-            elif w == "--config-env" and i + 1 < len(words):
-                view.config_env(words[i + 1])
-                i += 2
-            elif w.startswith("--config-env="):
-                view.config_env(w[13:])
-                i += 1
-            elif w in ("--git-dir", "--work-tree", "--namespace") and i + 1 < len(words):
-                view.add(w, words[i + 1])
-                i += 2
-            else:
-                if w.startswith(("--git-dir=", "--work-tree=", "--namespace=")):
-                    view.add(w)
-                i += 1
-        if i < len(words):
-            yield repo, words[i], words[i + 1:], view
+        while True:
+            while i < len(words) and words[i].startswith("-"):
+                w = words[i]
+                if w == "-C" and i + 1 < len(words):
+                    if re.search(r"[$`]", words[i + 1]):
+                        view.unresolved = True
+                    repo = _resolve(words[i + 1], repo)
+                    view.repo = repo
+                    i += 2
+                elif w == "-c" and i + 1 < len(words):
+                    view.add("-c", words[i + 1])
+                    i += 2
+                elif w == "--config-env" and i + 1 < len(words):
+                    view.config_env(words[i + 1])
+                    i += 2
+                elif w.startswith("--config-env="):
+                    view.config_env(w[13:])
+                    i += 1
+                elif w in ("--git-dir", "--work-tree", "--namespace") and i + 1 < len(words):
+                    view.add(w, words[i + 1])
+                    i += 2
+                else:
+                    if w.startswith(("--git-dir=", "--work-tree=", "--namespace=")):
+                        view.add(w)
+                    i += 1
+            if i >= len(words):
+                break
+            sub = words[i]
+            if sub == "push" or sub in GIT_BUILTINS:
+                yield repo, sub, words[i + 1:], view
+                break
+            rc, value = view.query("config", "--get", "alias." + sub)
+            if rc != 0:
+                if view.failed and "push" in words[i:]:
+                    yield repo, "push", [], _force_unresolved(view)
+                else:
+                    yield repo, sub, words[i + 1:], view
+                break
+            rest = words[i + 1:]
+            hops += 1
+            if hops > 5:
+                yield repo, "push", [], _force_unresolved(view)
+                break
+            if value.startswith("!"):
+                payload = value[1:] + " " + " ".join(shlex.quote(a) for a in rest)
+                if depth >= 4:
+                    if "push" in payload:
+                        yield repo, "push", [], _force_unresolved(view)
+                else:
+                    yield from _git_calls_cfg(payload, repo, view.exported_env(), depth + 1)
+                break
+            try:
+                words, i = shlex.split(value) + rest, 0
+            except ValueError:
+                words, i = value.split() + rest, 0
+
+
+def _force_unresolved(view: "GitView") -> "GitView":
+    view.unresolved = True
+    return view
 
 
 VALUE_OPTS = {"-o", "--push-option", "--repo", "--receive-pack", "--exec"}
@@ -1021,7 +1401,13 @@ def _custody_side(side: str) -> bool:
     return CUSTODY_NS in side
 
 
-def check_custody_push(cmd: str, cwd: str) -> Optional[str]:
+def _abbrev(a: str, *fulls: str) -> bool:
+    """git accepts any unambiguous prefix of a long option (`--mir` is `--mirror`); `--x=value` too."""
+    name = a.partition("=")[0]
+    return a.startswith("--") and len(name) > 2 and any(f.startswith(name) for f in fulls)
+
+
+def check_custody_push(cmd: str, cwd: str, depth: int = 0) -> Optional[str]:
     """Refuse a `git push` that would publish core's source-custody refs. Those refs pin unpushed, possibly
     private work that was preserved locally; they are never meant to reach a remote.
 
@@ -1030,6 +1416,11 @@ def check_custody_push(cmd: str, cwd: str) -> Optional[str]:
     mirror, and a `*` refspec on the command line or in the remote's push config. Applies to every remote, with
     or without a configured guard, and PUSH_GUARD=off does not skip it. This is a second fence: core's own
     publisher refuses the same argv."""
+    if depth < 3:  # `$(...)` / backticks inside double quotes: scanned as their own command lines
+        for m in re.finditer(r"\$\(([^()]*)\)|`([^`]*)`", cmd or ""):
+            why = check_custody_push(m.group(1) or m.group(2) or "", cwd, depth + 1)
+            if why:
+                return why
     for repo, sub, args, view in _git_calls_cfg(cmd, cwd):
         if sub != "push":
             continue
@@ -1037,28 +1428,40 @@ def check_custody_push(cmd: str, cwd: str) -> Optional[str]:
         def cfg(*a: str) -> Optional[str]:  # real git config view: -c/--config-env/--git-dir/GIT_* included
             return view.run("config", *a)
 
-        pos, mirror, repo_opt, i = [], False, None, 0
+        pos, mirror, repo_opt, i, ddash = [], False, None, 0, False
         while i < len(args):
             a = args[i]
-            if a == "--repo" and i + 1 < len(args):
-                repo_opt = args[i + 1]
-                i += 2
-                continue
-            if a.startswith("--repo="):
-                repo_opt = a[7:]
-            elif a in VALUE_OPTS:
-                i += 2
-                continue
-            elif a == "--mirror":
+            if ddash:
+                pos.append(a)
+            elif a == "--":
+                ddash = True
+            elif a.startswith("--") and _abbrev(a, "--repo") and not _abbrev(a, "--receive-pack", "--recurse-submodules"):
+                if "=" in a:
+                    repo_opt = a.partition("=")[2]
+                elif i + 1 < len(args):
+                    repo_opt = args[i + 1]
+                    i += 1
+            elif a.startswith("--") and _abbrev(a, "--mirror"):
                 mirror = True
+            elif a.startswith("--") and "=" not in a and (a in VALUE_OPTS or _abbrev(a, *VALUE_OPTS - {"-o"})):
+                i += 1  # option with a separate value (also its unambiguous abbreviations)
+            elif a == "-o" or (a.startswith("-") and not a.startswith("--") and len(a) > 2 and a.endswith("o")
+                               and "=" not in a):
+                i += 1
             elif not a.startswith("-"):
                 pos.append(a)
             i += 1
+        if repo_opt is not None:  # with --repo every positional is a refspec
+            pos = [repo_opt] + pos
         specs = [s.lstrip("+") for s in pos[1:]]
         for s in specs:
             if any(_custody_side(side) for side in s.split(":", 1) if side):
                 return f"`git push ... {s[:80]}` names the source-custody namespace {CUSTODY_NS}"
-        held = None if view.unresolved else view.run("for-each-ref", "--count=1", "--format=%(refname)", CUSTODY_NS)
+        held = None
+        if not view.unresolved:
+            rc, held = view.query("for-each-ref", "--count=1", "--format=%(refname)", CUSTODY_NS)
+            if rc != 0:
+                held = None
         if held == "":
             continue  # provably no custody refs here: a broad push cannot carry any
         # otherwise refs exist, or the repo is unreadable / re-pointed (unproved): assume they exist
@@ -1066,7 +1469,7 @@ def check_custody_push(cmd: str, cwd: str) -> Optional[str]:
             return f"`git push --mirror` would publish this repo's source-custody refs ({CUSTODY_NS})"
         if any("*" in s and not _heads_or_tags_only(s) for s in specs):
             return f"a `*` refspec would publish this repo's source-custody refs ({CUSTODY_NS})"
-        if view.unresolved and not (specs and pos and re.search(r"[/:@]", pos[0])):
+        if (view.unresolved and not (specs and pos and re.search(r"[/:@]", pos[0]))) or (view.failed and not specs):
             # the effective repository/config depends on shell expansion the guard cannot see; only a push by URL
             # with explicit refspecs is independent of remote.<name>.mirror/push config
             return (f"this `git push` runs in a git view the guard cannot resolve (unexpanded shell variable or "
@@ -1075,6 +1478,10 @@ def check_custody_push(cmd: str, cwd: str) -> Optional[str]:
         remote = (pos[0] if pos else repo_opt) or cfg(f"branch.{cur}.pushRemote") or cfg("remote.pushDefault") \
             or cfg(f"branch.{cur}.remote") or "origin"
         conf_lines = cfg("--get-regexp", rf"^remote\.{re.escape(remote)}\.(mirror|push)$") or ""
+        if view.failed and not specs:  # explicit refspecs replace configured ones and cannot combine with a mirror
+            # a failed git query (unreadable repository, git error, timeout) is not proof the config is absent
+            return (f"the git view of this `git push` could not be read (a git query failed); it might publish "
+                    f"source-custody refs ({CUSTODY_NS})")
         lines = conf_lines.splitlines()
         last_mirror = [l for l in lines if l.partition(" ")[0].endswith(".mirror")][-1:]  # last value wins
         for line in [l for l in lines if not l.partition(" ")[0].endswith(".mirror")] + last_mirror:

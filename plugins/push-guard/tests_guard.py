@@ -580,3 +580,95 @@ def test_unresolvable_view_inputs_fail_closed_but_url_pushes_with_refspecs_pass(
                 "git -C $WHERE push origin feat"):
         assert _blocked(elsewhere, cmd), cmd
     assert not _blocked(elsewhere, f"git --git-dir=$HOLD push {url} feat")
+
+
+# --- custody: abbreviations, wrappers, nested shells, aliases, failed views --------------------------------------
+
+@pytest.fixture
+def held_mirror(repo, tmp_path):
+    """A repo holding a custody ref, with a configured mirror remote `mir` and a clean cwd elsewhere."""
+    hold_custody_ref(repo)
+    mir = tmp_path / "mirror.git"
+    mir.mkdir()
+    git("init", "-q", "--bare", cwd=mir)
+    git("remote", "add", "mir", str(mir), cwd=repo)
+    git("config", "remote.mir.mirror", "true", cwd=repo)
+    return repo, mir
+
+
+def _leaked(mir):
+    out = subprocess.run(["git", "-C", str(mir), "for-each-ref"], capture_output=True, text=True).stdout
+    return "hermes-source-custody" in out
+
+
+@pytest.mark.parametrize("cmd", [
+    "git push --mir @M", "git push --mi mir", "git push --mirror=1 mir", "git push --m mir",
+    "env -u FOO git push mir", "env -u FOO -u BAR git push --mirror @M", "env -i git push mir",
+    "env -iu FOO git push mir", "env --unset=FOO git push mir", "env -C . git push mir", "env -S 'git push mir'",
+    "env -S'git push --mirror @M'", "env -i -- git push mir", "sudo -u root git push mir",
+    "sudo -E -u root git push --mirror @M", "timeout -s KILL 5 git push mir", "nice -n 5 git push mir",
+    "nohup git push mir", "time -p git push mir", "command git push mir", "xargs git push --mirror",
+    "bash -c 'git push mir'", "sh -c \"git push --mirror @M\"", "bash -lc 'git push mir'",
+    "sudo bash -c 'env -u X git push mir'", "bash -c \"bash -c 'git push mir'\"", "eval 'git push mir'",
+    "su -c 'git push mir'", "(git push mir)", "{ git push mir; }", "if true; then git push mir; fi",
+    "true && (git push mir)", "echo x | git push mir", "git push mir &", "echo $(git push mir)",
+    "echo \"$(git push mir)\"", "echo `git push mir`", "\\git push mir", "/usr/bin/git push mir",
+    "git -c alias.p='push --mirror' p @M", "git -c alias.p='push' p mir", "git -c alias.p='!git push mir' p",
+    "git -c alias.p='!git push' p mir", "git -c alias.p='push' -c alias.q=p q mir", "GIT=git; $GIT push mir",
+    "$GIT push mir", "git push --rep=mir", "git push --repo mir", "git push -- mir",
+    "git push --exec x mir", "git push --receive-pack=x --mir @M", "git push --push-opt x --mirror @M",
+    "env GIT_DIR=.git git push mir", "(cd /; true); git push mir", "cd /tmp | git push mir",
+    "git --git-dir=.git -C . push mir",
+])
+def test_custody_escapes_in_the_effective_view_are_blocked(held_mirror, cmd):
+    repo, mir = held_mirror
+    assert _blocked(repo, cmd.replace("@M", str(mir))), cmd
+
+
+def test_cd_into_an_unresolved_or_missing_directory_is_a_failed_view_not_absent_config(held_mirror, tmp_path):
+    repo, mir = held_mirror
+    elsewhere = tmp_path / "clean-elsewhere"
+    elsewhere.mkdir()
+    for cmd in (f"R={repo}; cd $R && git push mir", f"R={repo}; cd ${{R}}; git push mir",
+                "cd $UNKNOWN_DIR_XYZ && git push mir", "cd /does/not/exist; git push mir",
+                f"cd {repo} && git push mir", f"pushd {repo}; git push mir"):
+        assert _blocked(elsewhere, cmd), cmd
+    # the shell variable is resolved, so an explicit branch push from the held repo is fine
+    assert not _blocked(elsewhere, f"R={repo}; cd $R && git push origin feat")
+    assert not _blocked(repo, f"(cd {elsewhere}; true); git push origin feat")
+
+
+def test_env_wrappers_change_the_view_the_guard_reads(held_mirror, tmp_path):
+    repo, mir = held_mirror
+    gd = subprocess.run(["git", "rev-parse", "--absolute-git-dir"], cwd=repo, capture_output=True,
+                        text=True).stdout.strip()
+    elsewhere = tmp_path / "clean-elsewhere"
+    elsewhere.mkdir()
+    assert _blocked(elsewhere, f"env -C {repo} git push mir")
+    assert _blocked(elsewhere, f"env --chdir={repo} -u FOO git push mir")
+    assert _blocked(elsewhere, f"env -S 'GIT_DIR={gd} git push mir'")
+    assert _blocked(elsewhere, f"env -i GIT_DIR={gd} git push mir")
+    # sudo may keep or drop GIT_* by policy: an assigned GIT_* var makes the view unproved
+    assert _blocked(repo, f"GIT_DIR={gd} sudo git push")
+    assert not _blocked(repo, "sudo git push origin feat")
+
+
+def test_non_push_aliases_and_explicit_branch_pushes_through_wrappers_are_not_blocked(held_mirror):
+    repo, mir = held_mirror
+    for cmd in ("git -c alias.p='status' p", "git status", "git -c alias.p='!echo push' p", "env -u FOO git status",
+                "bash -c 'git status'", "echo 'git push --mirror'", "git push origin feat",
+                "env -u FOO git push origin feat", "sudo git push origin feat", "bash -c 'git push origin feat'",
+                "(git push origin feat)", "git -c alias.p='push origin' p feat",
+                "git push origin HEAD:refs/heads/feat", "git push --no-verify origin feat"):
+        assert not _blocked(repo, cmd), cmd
+
+
+def test_blocked_mirror_pushes_really_would_have_reached_the_remote(held_mirror):
+    repo, mir = held_mirror
+    for cmd in ("git push --mir mir", "env -u FOO git push mir", "git -c alias.p='push --mirror' p mir"):
+        assert _blocked(repo, cmd), cmd
+    assert not _leaked(mir)
+    # the same argv really leaks when it is not routed through the guard (the probe is meaningful)
+    subprocess.run(["git", "push", "--mir", "mir"], cwd=repo, capture_output=True,
+                   env={**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null"})
+    assert _leaked(mir)
