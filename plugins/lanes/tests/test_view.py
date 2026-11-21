@@ -59,6 +59,8 @@ def test_collapsed_view_carries_all_lanes_status_counts(monkeypatch):
         assert sum(s['blocked'] for s in strips.values()) == view['status']['you']
         assert sum(s['running'] for s in strips.values()) == view['status']['run']
         assert sum(sum(s.values()) for s in strips.values()) == len(cards)
+        for key in view['status']:  # per-lane status adds up to the all-lanes totals
+            assert sum(view['lanes'][n]['status'][key] for n in ('a', 'b')) == view['status'][key]
     collapsed = api.lane_view(6, '6h', False)
     assert 'cards' not in collapsed and 'floor' not in collapsed
     # Unavailable flow: no status rather than zeros that look real (a fresh module: views are cached).

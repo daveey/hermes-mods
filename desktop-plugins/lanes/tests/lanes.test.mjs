@@ -408,23 +408,17 @@ test('open/closed is persisted; collapsed is the default', async () => {
   assert.equal(document.querySelector('[data-lane="product"]'), null)
 })
 
-test('clicking a lane pill expands and scrolls to that row', async () => {
-  const seen = []
-  const orig = HTMLElement.prototype.scrollIntoView
-  HTMLElement.prototype.scrollIntoView = function (opts) { seen.push([this.getAttribute('data-lane'), opts]) }
-  try {
-    const view = await mount(React.createElement(P.Lanes, { ctx: ctxWith([], () => snap()) }))
-    assert.equal(document.querySelector('[data-lane="infra"]'), null)
-    await view.click(document.querySelector('[data-lane-pill="infra"]'))
-    assert.ok(document.querySelector('[data-lane="infra"]'))
-    assert.equal(document.querySelector('[data-slot=lanes-strip]').getAttribute('data-open'), '1')
-    assert.deepEqual(seen.filter((s) => s[0] === 'infra').map((s) => s[1]), [{ block: 'nearest' }])
-    const body = document.querySelector('.hermes-lanes-body')
-    assert.equal(body.style.maxHeight, '60vh')
-    assert.equal(getComputedStyle(body).overflow, 'auto')
-  } finally {
-    HTMLElement.prototype.scrollIntoView = orig
-  }
+test('a lane pill selects the lane without expanding; the arrow expands the body', async () => {
+  const view = await mount(React.createElement(P.Lanes, { ctx: ctxWith([], () => snap()) }))
+  await view.click(document.querySelector('[data-lane-pill="infra"]'))
+  assert.equal(document.querySelector('[data-lane-pill="infra"]').getAttribute('aria-pressed'), 'true')
+  assert.equal(document.querySelector('[data-slot=lanes-strip]').getAttribute('data-open'), '0')
+  assert.equal(document.querySelector('[data-lane="infra"]'), null)
+  await view.click(document.querySelector('.hermes-lanes-toggle'))
+  assert.ok(document.querySelector('[data-lane="infra"]'))
+  const body = document.querySelector('.hermes-lanes-body')
+  assert.equal(body.style.maxHeight, '60vh')
+  assert.equal(getComputedStyle(body).overflow, 'auto')
 })
 
 // ── Floor and Flow ─────────────────────────────────────────────────────────

@@ -355,6 +355,22 @@ export function reasonInfo(reason) {
   return { label, color }
 }
 
+const SELECT_KEY = 'hermes.lanes.selected'
+/** Lanes picked in the strip (empty = all lanes). */
+export function loadSelected(storage = globalThis.localStorage) {
+  try { const v = JSON.parse(storage?.getItem(SELECT_KEY) || '[]'); return Array.isArray(v) ? v.filter((x) => typeof x === 'string') : [] } catch { return [] }
+}
+export function saveSelected(names, storage = globalThis.localStorage) { try { storage?.setItem(SELECT_KEY, JSON.stringify(names)) } catch {} }
+/** Totals for the selected lanes; with no selection (or an older hub without per-lane status) the all-lanes totals. */
+export function selectedStatus(snap, selected) {
+  const lanes = snap?.lanes || {}
+  const picked = selected.filter((name) => lanes[name])
+  if (!picked.length || picked.some((name) => !lanes[name].status)) return snap?.status
+  const out = {}
+  for (const name of picked) for (const [key, n] of Object.entries(lanes[name].status)) out[key] = (out[key] || 0) + (Number(n) || 0)
+  return out
+}
+
 export function loadTab(storage = globalThis.localStorage) {
   try { const v = storage?.getItem(TAB_KEY); return TABS.some(([key]) => key === v) ? v : 'floor' } catch { return 'floor' }
 }
@@ -432,10 +448,6 @@ export function meter(row) {
   return { running: row?.running ?? 0, notReady: row?.not_ready ?? 0, blocked: row?.blocked_on_you ?? 0, total: row?.open ?? 0 }
 }
 
-function laneSelector(name) {
-  const esc = globalThis.CSS?.escape ? globalThis.CSS.escape(name) : String(name).replace(/\\/g, '\\\\').replace(/"/g, '\\"')
-  return `[data-lane="${esc}"]`
-}
 
 // ── components ────────────────────────────────────────────────────────────
 
@@ -619,15 +631,15 @@ export function stripMeter(row) {
   return { blocked: s.blocked || 0, running: s.running || 0, notReady: s.other || 0, total: (s.blocked || 0) + (s.running || 0) + (s.other || 0) }
 }
 
-function MiniPill({ row, onOpen, expanded }) {
+function MiniPill({ row, onToggle, selected, dimmed }) {
   const m = stripMeter(row)
   const counts = laneCounts(row)
   return h('button', {
     type: 'button', className: 'hermes-lanes-pill', 'data-lane-pill': row.name,
     title: `${row.name}: ${m.blocked} blocked on you · ${m.running} running · ${m.notReady} other · ${m.total} open`,
     'aria-label': `${row.name}: ${m.blocked} blocked on you, ${m.running} running, ${m.notReady} other`,
-    'aria-expanded': expanded,
-    onClick: (event) => { event.stopPropagation(); onOpen(row.name) }
+    'aria-pressed': selected, 'data-selected': selected ? '1' : '0', 'data-dimmed': dimmed ? '1' : '0',
+    onClick: (event) => { event.stopPropagation(); onToggle(row.name) }
   },
     h('span', { className: 'hermes-lanes-pill-name' }, row.name),
     counts.length
@@ -636,12 +648,12 @@ function MiniPill({ row, onOpen, expanded }) {
 }
 
 /** The all-lanes counts on the right, from the hub's `status` projection (older hubs send none: nothing shows). */
-function StatusTotals({ status }) {
+function StatusTotals({ status, scope }) {
   if (!status) return null
   const items = STATUS.filter(([key]) => (status[key] || 0) > 0)
-  return h('span', { className: 'hermes-lanes-status', 'data-slot': 'lanes-status' },
+  return h('span', { className: 'hermes-lanes-status', 'data-slot': 'lanes-status', 'data-scope': scope || 'all' },
     items.map(([key, label, color]) => h('span', {
-      key, className: 'hermes-lanes-status-item', 'data-status': key, title: `${status[key]} ${label}`
+      key, className: 'hermes-lanes-status-item', 'data-status': key, title: `${status[key]} ${label}${scope ? ` in ${scope}` : ''}`
     },
       h('span', { className: color ? 'hermes-lanes-sw' : 'hermes-lanes-sw is-outline', style: color ? { background: color } : undefined, 'aria-hidden': 'true' }),
       h('span', { className: 'hermes-lanes-n' }, status[key]),
@@ -650,7 +662,7 @@ function StatusTotals({ status }) {
 
 export function Lanes({ ctx }) {
   const [open, setOpenState] = useState(loadOpen)
-  const [focus, setFocus] = useState('')
+  const [selected, setSelectedState] = useState(loadSelected)
   const [windowHours, setWindowState] = useState(loadWindow)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
@@ -705,11 +717,6 @@ export function Lanes({ ctx }) {
     window.addEventListener(KANBAN_CHIP_EVENT, take)
     return () => window.removeEventListener(KANBAN_CHIP_EVENT, take)
   }, [working])
-  useEffect(() => {
-    if (!open || !focus) return undefined
-    const el = (bodyRef.current || document).querySelector(laneSelector(focus))
-    el?.scrollIntoView?.({ block: 'nearest' })
-  }, [open, focus])
   // One PUT per changed lane, in order. On a failure the lanes already written stay written: refetch so the panel
   // shows them, name the lane that failed, and keep the draft so the rest can be retried.
   const apply = async (pending) => {
@@ -731,21 +738,22 @@ export function Lanes({ ctx }) {
   }
   if (!working) return null
   const list = rows(snap)
-  const openLane = (name) => { setFocus(name); setOpen(!open || name !== focus) }
+  // A lane pill selects/deselects that lane for the totals on the right; only the arrow expands or collapses.
+  const shown = list.filter((row) => (row.strip ? stripMeter(row).total > 0 : row.open == null || Number(row.open) > 0)) // no open cards: hidden
+  const picked = selected.filter((name) => shown.some((row) => row.name === name))
+  const toggleLane = (name) => setSelectedState((prev) => {
+    const next = prev.includes(name) ? prev.filter((n) => n !== name) : [...prev, name]
+    saveSelected(next)
+    return next
+  })
   const toggle = () => setOpen((value) => !value)
   return h('div', { ref: stripRef, className: 'hermes-lanes-strip', 'data-slot': 'lanes-strip', 'data-open': open ? '1' : '0' },
-    h('div', {
-      className: 'hermes-lanes-mini', role: 'button', tabIndex: 0,
-      'aria-label': 'Toggle lanes', 'aria-expanded': open, onClick: toggle,
-      onKeyDown: (event) => {
-        if (event.target === event.currentTarget && (event.key === 'Enter' || event.key === ' ')) {
-          event.preventDefault(); toggle()
-        }
-      }
-    },
-      list.filter((row) => (row.strip ? stripMeter(row).total > 0 : row.open == null || Number(row.open) > 0)) // no open cards: hidden
-        .map((row) => h(MiniPill, { key: row.name, row, onOpen: openLane, expanded: open && focus === row.name })),
-      h(StatusTotals, { status: snap?.status }),
+    h('div', { className: 'hermes-lanes-mini', role: 'group', 'aria-label': 'Lanes' },
+      shown.map((row) => h(MiniPill, {
+        key: row.name, row, onToggle: toggleLane,
+        selected: picked.includes(row.name), dimmed: picked.length > 0 && !picked.includes(row.name)
+      })),
+      h(StatusTotals, { status: selectedStatus(snap, picked), scope: picked.length ? picked.join(', ') : '' }),
       !live ? h('small', { className: 'hermes-lanes-dim', title: 'Push unavailable; refreshing every 60 seconds' }, 'not live') : null,
       h('button', {
         type: 'button', className: 'hermes-lanes-toggle', 'aria-expanded': open,
@@ -763,9 +771,11 @@ export function Lanes({ ctx }) {
 
 const CSS = `
 .hermes-lanes-strip{display:flex;flex-direction:column;min-width:0;width:100%}
-.hermes-lanes-mini{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:4px 8px;min-height:28px;cursor:pointer}
+.hermes-lanes-mini{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:4px 8px;min-height:28px}
 .hermes-lanes-pill{display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 8px;border:1px solid var(--ui-stroke-secondary);border-radius:999px;background:transparent;color:inherit;font:inherit;cursor:pointer}
 .hermes-lanes-pill-name{font-weight:600;font-size:12px}
+.hermes-lanes-pill[data-selected="1"]{border-color:var(--ui-text-tertiary);background:var(--ui-stroke-secondary)}
+.hermes-lanes-pill[data-dimmed="1"]{opacity:.45}
 .hermes-lanes-n{font-variant-numeric:tabular-nums;font-size:11.5px;font-weight:600}
 .hermes-lanes-status{margin-left:auto;display:inline-flex;align-items:center;gap:8px;padding-left:10px;border-left:1px solid var(--ui-stroke-secondary);white-space:nowrap}
 .hermes-lanes-status-item{display:inline-flex;align-items:center;gap:4px}

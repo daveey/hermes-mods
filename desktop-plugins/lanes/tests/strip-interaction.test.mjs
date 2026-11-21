@@ -4,7 +4,12 @@ import { loadPlugin, mount, React } from './sdk-mock.mjs'
 
 const P = await loadPlugin()
 const views = []
-const snap = { configured: true, lanes: { product: { share: 50 }, infra: { share: 50 } } }
+const snap = { configured: true, lanes: {
+  product: { share: 50, status: { you: 2, ext: 1, worker: 0, run: 3, dep: 0, triage: 0, other: 0 } },
+  infra: { share: 50, status: { you: 1, ext: 4, worker: 2, run: 0, dep: 5, triage: 1, other: 0 } } },
+  status: { you: 3, ext: 5, worker: 2, run: 3, dep: 5, triage: 1, other: 0 } }
+const totals = (view) => Object.fromEntries([...view.container.querySelectorAll('[data-status]')]
+  .map(i => [i.dataset.status, Number(i.querySelector('.hermes-lanes-n').textContent)]))
 async function setup(zoneHeight) {
   const view = await mount(React.createElement('div', {
     'data-tree-group': zoneHeight === undefined ? undefined : 'main',
@@ -34,35 +39,43 @@ test('registers exactly once in the shell area on older hosts', () => {
   finally { disposers.forEach(fn => fn()) }
 })
 
-test('blank line space toggles in both directions with truthful aria-expanded', async () => {
-  const { view, line, expanded } = await setup()
-  assert.equal(expanded(), false)
-  assert.equal(line.getAttribute('aria-expanded'), 'false')
+test('clicking the line or a pill never expands; only the arrow does', async () => {
+  const { view, line, pill, expanded } = await setup()
   await view.click(line)
+  assert.equal(expanded(), false)
+  await view.click(pill('product'))
+  assert.equal(expanded(), false)
+  await view.click(view.container.querySelector('.hermes-lanes-toggle'))
   assert.equal(expanded(), true)
-  assert.equal(line.getAttribute('aria-expanded'), 'true')
-  await view.click(line)
-  assert.equal(expanded(), false)
+  await view.click(pill('product'))
+  assert.equal(expanded(), true, 'a pill click does not collapse either')
 })
 
-test('closed pill opens, another pill switches focus, focused pill collapses', async () => {
-  const seen = []
-  const original = HTMLElement.prototype.scrollIntoView
-  HTMLElement.prototype.scrollIntoView = function () { seen.push(this.dataset.lane) }
-  try {
-    const { view, pill, expanded } = await setup()
-    await view.click(pill('product'))
-    assert.equal(expanded(), true)
-    assert.equal(pill('product').getAttribute('aria-expanded'), 'true')
-    await view.click(pill('infra'))
-    assert.equal(expanded(), true)
-    assert.deepEqual(seen, ['product', 'infra'])
-    assert.equal(pill('product').getAttribute('aria-expanded'), 'false')
-    assert.equal(pill('infra').getAttribute('aria-expanded'), 'true')
-    await view.click(pill('infra'))
-    assert.equal(expanded(), false)
-    assert.equal(pill('infra').getAttribute('aria-expanded'), 'false')
-  } finally { HTMLElement.prototype.scrollIntoView = original }
+test('pills select and deselect lanes and the totals follow the selection', async () => {
+  const { view, pill } = await setup()
+  assert.deepEqual(totals(view), { you: 3, ext: 5, worker: 2, run: 3, dep: 5, triage: 1 })
+  await view.click(pill('product'))
+  assert.equal(pill('product').getAttribute('aria-pressed'), 'true')
+  assert.equal(pill('infra').dataset.dimmed, '1')
+  assert.deepEqual(totals(view), { you: 2, ext: 1, run: 3 })
+  assert.match(view.container.querySelector('[data-status=you]').title, /in product$/)
+  await view.click(pill('infra'))
+  assert.deepEqual(totals(view), { you: 3, ext: 5, worker: 2, run: 3, dep: 5, triage: 1 })
+  await view.click(pill('product'))
+  assert.deepEqual(totals(view), { you: 1, ext: 4, worker: 2, dep: 5, triage: 1 })
+  assert.deepEqual(JSON.parse(localStorage.getItem('hermes.lanes.selected')), ['infra'])
+  await view.click(pill('infra'))
+  assert.equal(pill('infra').getAttribute('aria-pressed'), 'false')
+  assert.equal(pill('product').dataset.dimmed, '0')
+  assert.deepEqual(totals(view), { you: 3, ext: 5, worker: 2, run: 3, dep: 5, triage: 1 })
+})
+
+test('selection survives a remount; an older hub without per-lane status keeps all-lanes totals', async () => {
+  localStorage.setItem('hermes.lanes.selected', JSON.stringify(['infra', 'gone']))
+  const { view, pill } = await setup()
+  assert.equal(pill('infra').getAttribute('aria-pressed'), 'true')
+  assert.deepEqual(totals(view), { you: 1, ext: 4, worker: 2, dep: 5, triage: 1 })
+  assert.deepEqual(P.selectedStatus({ lanes: { a: {} }, status: { you: 9 } }, ['a']), { you: 9 })
 })
 
 test('toggle button acts once and expanded body controls never collapse', async () => {
@@ -91,10 +104,10 @@ test('expanded body measures and follows 60 percent of its zone, not the window'
     disconnect() { this.disconnected = true }
   }
   try {
-    const { view, line } = await setup(400)
-    await view.click(line)
+    const { view } = await setup(400)
+    await view.click(view.container.querySelector('.hermes-lanes-toggle'))
     const body = view.container.querySelector('.hermes-lanes-body')
-    assert.ok(body, 'line opens the body')
+    assert.ok(body, 'arrow opens the body')
     assert.equal(body.style.maxHeight, '240px')
     const observer = observers.find(o => o.target?.hasAttribute('data-tree-group'))
     assert.ok(observer, 'observes main zone size')
@@ -108,20 +121,13 @@ test('expanded body measures and follows 60 percent of its zone, not the window'
   } finally { globalThis.ResizeObserver = original }
 })
 
-test('Enter and Space on the line toggle without catching child keyboard events', async () => {
+test('keyboard: the line is not a button; Enter on a pill selects it without expanding', async () => {
   const { view, line, pill, expanded } = await setup()
-  assert.equal(line.getAttribute('role'), 'button')
-  assert.equal(line.tabIndex, 0)
-  for (const key of ['Enter', ' ']) {
-    await React.act(async () => line.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true })))
-    await view.flush()
-    assert.equal(expanded(), key === 'Enter')
-  }
-  // Native buttons synthesize click on keyboard activation; bubbling keydown must not toggle the parent too.
-  await React.act(async () => pill('product').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })))
+  assert.equal(line.getAttribute('role'), 'group')
+  await React.act(async () => line.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })))
   assert.equal(expanded(), false)
+  // Native buttons synthesize click on keyboard activation (detail 0).
   await view.click(pill('product'), { detail: 0 })
-  assert.equal(expanded(), true)
-  await view.click(pill('product'), { detail: 0 })
+  assert.equal(pill('product').getAttribute('aria-pressed'), 'true')
   assert.equal(expanded(), false)
 })

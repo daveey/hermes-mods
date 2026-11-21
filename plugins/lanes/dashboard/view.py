@@ -98,6 +98,7 @@ def project(snap, raw, expanded):
             lane = Counter(status_of(c.get('reason')) for c in raw['cards'] if c.get('lane') == name)
             row['strip'] = {'blocked': lane['you'], 'running': lane['run'],
                             'other': sum(lane.values()) - lane['you'] - lane['run']}
+            row['status'] = {key: lane.get(key, 0) for key in STATUS}  # the strip's totals for a lane selection
     if not expanded:
         return view
     view['flow_error'] = raw.get('reason', '') if raw.get('configured') is False else ''
