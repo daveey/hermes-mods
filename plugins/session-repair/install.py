@@ -1,0 +1,106 @@
+"""Install the session-repair cron job on this host (the hub). Idempotent; prints the plan unless --apply.
+
+    python3 install.py                 # show what would change
+    python3 install.py --apply         # write the wrapper script + config, create the cron job if missing
+    python3 install.py --apply --mode live   # also switch the tick to live (default: shadow)
+
+What it does:
+1. `$HERMES_HOME/scripts/session_repair_tick.py`: a 3-line wrapper (Hermes cron runs only files under
+   `$HERMES_HOME/scripts/`) that runs this plugin's run.py through the `~/.hermes/plugins/session-repair` link, so a
+   hermes-sync update takes effect on the next tick.
+2. `$HERMES_HOME/session-repair/config.json` `{"mode": "shadow"}` unless it exists (or `--mode` is given).
+3. `hermes cron create "every 15m" --name session-repair --no-agent --script session_repair_tick.py --deliver local
+   --catch-up off`, unless a job named `session-repair` exists (read from `$HERMES_HOME/cron/jobs.json`).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+JOB_NAME = 'session-repair'
+SCRIPT_NAME = 'session_repair_tick.py'
+SCHEDULE = 'every 15m'
+WRAPPER = '''#!/usr/bin/env python3
+# session-repair tick (hermes-mods plugins/session-repair, installed by its install.py): silent unless something is new
+import os, runpy
+runpy.run_path(os.path.join(os.environ.get('HERMES_HOME') or os.path.expanduser('~/.hermes'), 'plugins', 'session-repair', 'run.py'), run_name='__main__')
+'''
+
+
+def home() -> Path:
+    return Path(os.environ.get('HERMES_HOME') or Path.home() / '.hermes')
+
+
+def hermes() -> list[str]:
+    found = shutil.which('hermes')
+    return [found] if found else [sys.executable, '-m', 'hermes_cli.main']
+
+
+def job_exists(h: Path) -> bool:
+    try:
+        data = json.loads((h / 'cron' / 'jobs.json').read_text())
+    except (OSError, ValueError):
+        return False
+    jobs = data.get('jobs', data) if isinstance(data, dict) else data
+    jobs = jobs.values() if isinstance(jobs, dict) else jobs
+    return any(isinstance(j, dict) and j.get('name') == JOB_NAME for j in jobs or [])
+
+
+def cron_argv() -> list[str]:
+    return hermes() + ['cron', 'create', SCHEDULE, '--name', JOB_NAME, '--no-agent', '--script', SCRIPT_NAME,
+                       '--deliver', 'local', '--catch-up', 'off']
+
+
+def plan(h: Path, mode: str | None) -> list[tuple[str, str]]:
+    steps = []
+    script = h / 'scripts' / SCRIPT_NAME
+    if not script.exists() or script.read_text() != WRAPPER:
+        steps.append(('write', str(script)))
+    cfg = h / 'session-repair' / 'config.json'
+    if mode or not cfg.exists():
+        steps.append(('config', mode or 'shadow'))
+    if not (h / 'plugins' / 'session-repair' / 'run.py').exists():
+        steps.append(('warn', f'{h}/plugins/session-repair is not linked yet: run hermes-sync first'))
+    if not job_exists(h):
+        steps.append(('cron', ' '.join(cron_argv())))
+    return steps
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument('--apply', action='store_true')
+    p.add_argument('--mode', choices=('off', 'shadow', 'live'))
+    args = p.parse_args(argv)
+    h = home()
+    steps = plan(h, args.mode)
+    if not steps:
+        print('session-repair: already installed')
+        return 0
+    for kind, what in steps:
+        print(f'{"" if args.apply else "would "}{kind}: {what}')
+        if not args.apply:
+            continue
+        if kind == 'write':
+            path = Path(what)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(WRAPPER)
+            path.chmod(0o755)
+        elif kind == 'config':
+            cfg = h / 'session-repair' / 'config.json'
+            cfg.parent.mkdir(parents=True, exist_ok=True)
+            cfg.write_text(json.dumps({'mode': what}) + '\n')
+        elif kind == 'cron':
+            r = subprocess.run(cron_argv(), capture_output=True, text=True)
+            print(r.stdout.strip() or r.stderr.strip())
+            if r.returncode != 0:
+                return r.returncode
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
