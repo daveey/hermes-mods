@@ -53,7 +53,16 @@ The result has exactly these fields:
 
 `status` is `resolved`, `already-settled` (same outcome retry), or `skipped` (a user
 archived/resolved the item). Skipped results return the **stored** outcome/attribution,
-including nulls, not the requested outcome. Success exits 0. Runtime errors exit 1 with
+including nulls, not the requested outcome. For a still-hidden archived review with a
+frozen typed `veto` prompt action, a producer's exact-identity `vetoed` settlement also
+records a separate `handled_archives` receipt and returns `handled_archive:true`.
+This is a producer acknowledgment, not a fabricated user action: the item and transcript
+remain byte-for-byte unchanged, Archive still blocks the same key, and the strict junk
+audit still reports the untouched archive. Only the consecutive-ignore classifier treats
+the acknowledged veto as a handled review instead of noise. Generic/status archives,
+visible conversations, non-veto results and independent Junk mutes are unchanged.
+Producers must only acknowledge vetoes they actually honored; archive alone supplies no
+editorial motive or global pause instruction. Success exits 0. Runtime errors exit 1 with
 JSON `{status:"error", error:CODE, session_id, key, message, exception_type}`. Missing
 arguments exit 2 with JSON `{status:"error", error:"invalid_arguments", message}`.
 `SettlementError.code` identifies `invalid_key`, `invalid_poster`, `invalid_outcome`,

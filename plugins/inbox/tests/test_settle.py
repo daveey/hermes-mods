@@ -58,6 +58,76 @@ def test_mismatch_untouched(env, kw, code):
     assert inbox.outcome("draft:example") == before
 
 
+def test_handled_archive_veto_receipt_preserves_archive_and_stops_noise_streak(env):
+    inbox, db, _ = env
+    ids = []
+    for i in range(2):
+        sid = inbox.post("Draft", "Options", "Review", key=f"draft:{i}", poster="cli")["session_id"]
+        with sqlite3.connect(inbox.path) as c:
+            snap = {"name": "review", "actions": [{"id": "veto", "kind": "prompt", "prompt": "Veto this draft"}]}
+            c.execute("UPDATE items SET actions_json=? WHERE session_id=?", (json.dumps(snap), sid))
+        inbox.archive(sid)
+        ids.append(sid)
+    before = [inbox.get(sid) for sid in ids]
+    messages = [db.get_messages(sid) for sid in ids]
+    side = inbox._side()
+    assert inbox._ignored_streak(side, db, "cli", inbox.clock()) == 2
+    side.close()
+    for i, sid in enumerate(ids):
+        result = inbox.settle(sid, key=f"draft:{i}", poster="cli", outcome="vetoed", body="Veto honored")
+        assert result["status"] == "skipped" and result["state"] == "archived"
+        assert result.get("handled_archive") is True
+        assert inbox.settle(sid, key=f"draft:{i}", poster="cli", outcome="vetoed", body="Retry") == result
+    assert [inbox.get(sid) for sid in ids] == before
+    assert [db.get_messages(sid) for sid in ids] == messages
+    side = inbox._side()
+    assert inbox._ignored_streak(side, db, "cli", inbox.clock()) == 0
+    assert inbox._archived_key(side, db, "draft:1", inbox.clock()) is not None
+    side.execute("INSERT INTO junk_mutes VALUES ('cli','draft',?,?)", (inbox.clock(), ids[-1]))
+    side.commit()
+    assert inbox._junk_muted(side, "cli", "draft:new")
+    side.close()
+    # A real Junk instruction is an independent hold, never cleared by settlement.
+    inbox._task_creator = lambda **kw: "owner-task"
+    with pytest.raises(store.PosterMuted, match="Junk"):
+        inbox.post("Draft", "Options", "Review", key="draft:new", poster="cli")
+
+
+@pytest.mark.parametrize("outcome", ["posted", "failed", "expired", "vetoed"])
+def test_generic_archives_never_become_handled_vetoes(env, outcome):
+    inbox, db, _ = env
+    sid = post(inbox)
+    inbox.archive(sid)
+    before = inbox.get(sid)
+    assert not settle(inbox, sid, outcome=outcome).get("handled_archive")
+    assert inbox.get(sid) == before
+    side = inbox._side()
+    assert inbox._ignored_streak(side, db, "cli", inbox.clock()) == 1
+    side.close()
+
+
+@pytest.mark.parametrize("change", ["visible", "wrong_key", "wrong_poster", "not_veto"])
+def test_handled_archive_requires_identity_hidden_veto(env, change):
+    inbox, db, _ = env
+    sid = post(inbox)
+    with sqlite3.connect(inbox.path) as c:
+        snap = {"name": "review", "actions": [{"id": "veto", "kind": "prompt", "prompt": "Veto"}]}
+        c.execute("UPDATE items SET actions_json=? WHERE session_id=?", (json.dumps(snap), sid))
+    if change == "visible":
+        db.set_session_hidden(sid, False)
+    inbox.archive(sid)
+    kw = {"outcome": "vetoed"}
+    if change == "wrong_key": kw["key"] = "other"
+    if change == "wrong_poster": kw["poster"] = "other"
+    if change == "not_veto": kw["outcome"] = "failed"
+    if change.startswith("wrong"):
+        with pytest.raises(store.SettlementError): settle(inbox, sid, **kw)
+    else:
+        assert not settle(inbox, sid, **kw).get("handled_archive")
+    with sqlite3.connect(inbox.path) as c:
+        assert c.execute("SELECT COUNT(*) FROM handled_archives").fetchone()[0] == 0
+
+
 def test_missing(env):
     inbox, db, _ = env
     with pytest.raises(store.SettlementError, match="not_found"):
