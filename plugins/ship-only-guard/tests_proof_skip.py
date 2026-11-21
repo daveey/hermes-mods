@@ -26,8 +26,11 @@ URL = "https://dashboardbackend.blacksmith.sh/org/run/1"
 
 @pytest.fixture(autouse=True)
 def _no_land_turn(monkeypatch):
-    monkeypatch.setattr(g, "_live_turns", lambda *a: [])
-    monkeypatch.setattr(g, "_turn_acquire", lambda *a: "")
+    # The adapter loads a separate guard module; isolate its turn store too,
+    # without replacing the hook's real rollup evaluation.
+    for module in (g, plugin.guard):
+        monkeypatch.setattr(module, "_live_turns", lambda *a: [])
+        monkeypatch.setattr(module, "_turn_acquire", lambda *a: "")
 
 
 def proof(**kw):
@@ -65,9 +68,7 @@ def test_proof_skipped_with_green_others_passes_every_path(monkeypatch):
     got = run_all(monkeypatch, [ok(), proof()])
     assert got["argv"] is None and got["shell"] is None
     assert got["cli"] == 0
-    # The hook also runs the land-turn read, which has no snapshot here; only the check stage is in scope.
-    assert got["hook"] is None or not any(
-        t in got["hook"]["message"] for t in ("checks not green", "no check other than", "statusCheckRollup"))
+    assert got["hook"] is None
 
 
 @pytest.mark.parametrize("bad", [
@@ -120,6 +121,9 @@ def test_failure_message_counts_proof_with_total(monkeypatch):
 @pytest.mark.parametrize("bad", [
     proof(status="IN_PROGRESS"), proof(status="QUEUED"), proof(status=None),
     proof(detailsUrl="https://u:p@blacksmith.sh/"),
+    proof(detailsUrl="https://u@blacksmith.sh/"),
+    proof(detailsUrl="https://blacksmith.sh/\x00x"),
+    proof(detailsUrl="https://blacksmith.sh/\x7fx"),
     proof(detailsUrl="https://evil.com\\.blacksmith.sh/"),
     proof(detailsUrl="https://blacksmith.sh/ x"),
     proof(detailsUrl="https://blacksmith.sh/\tx"),
