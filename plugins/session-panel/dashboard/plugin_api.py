@@ -538,6 +538,9 @@ class CoreReaders:
                 # Stamped with the read time (observed_at, age): the chain reads none of it, and it would make every
                 # recompute differ. The card rows in `tasks` carry the evidence the panel judges.
                 extra.pop('execution_observations', None)
+                if isinstance(extra.get('queue'), dict):
+                    # Local queue snapshots carry a fresh read timestamp even when their position is unchanged.
+                    extra['queue'] = {k: v for k, v in extra['queue'].items() if k != 'observed_at'}
                 out.update(extra)
             except Exception:
                 pass
