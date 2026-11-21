@@ -12,8 +12,10 @@ rule can never loop. Every check fails open.
 """
 from __future__ import annotations
 
+import ast
 import os
 import re
+import textwrap
 import time
 from pathlib import Path
 
@@ -129,14 +131,50 @@ LIVE_MESSAGE = ("[coach live_chat_sleep] A person is waiting in this chat and ha
                 "a foreground wait shows them nothing until it ends. First reply with the status: what is done, what "
                 "you are waiting for, and until when. Then run the wait and the retry with terminal(background=true, "
                 "notify=true) (or park them on a scheduled card) and end the turn. (This {what} wait was not run.)")
-# A real loop whose body sleeps: a shell `for|while|until ... do ... sleep N ... done` starting a command, or a Python
-# `while|for ...:` line followed by `sleep(N)`. The bare word "for" in prose (`--reason "... for rows 4-6"; sleep 2`)
-# or a sleep after `done` is no loop: replaying 3 days of hub desktop commands, the looser form flagged 41 such calls.
-# `do` may sit on the header line or open a later line (`for i in $(seq 1 16)\ndo\n  sleep 5\ndone`, PR 322 review).
+# A real shell loop whose body sleeps. Keep `do` on either the header or a later line.
+# Prose `for` and a sleep after `done` are not loops.
 _LOOP_SLEEP = re.compile(
     r"(?:^|[;&|({'\"]|\bdo\b|\bthen\b)\s*(?:for|while|until)\b[^\n]*?(?:\bdo|\n\s*do)\b"
-    r"(?:(?!\bdone\b)[\s\S])*?\bsleep\s+\d"
-    r"|^[ \t]*(?:while|for)\b[^\n]*:[ \t]*$[\s\S]*?\bsleep\s*\(\s*\d", re.M)
+    r"(?:(?!\bdone\b)[\s\S])*?\bsleep\s+\d", re.M)
+_PY_LOOP = re.compile(r"^([ \t]*)(?:while|for)\b", re.M)
+
+
+def _python_loop_sleep(command: str) -> bool:
+    """Parse each Python loop's suite, never searching past its dedent.
+
+    Commands may wrap Python in a shell heredoc, so parse loop snippets rather than
+    the whole shell command. AST body traversal handles nested and inline suites
+    without mistaking an `else` suite or string literal for the loop body. This is
+    a sampler signal, not a duration estimate (even for a bounded `range`).
+    """
+    for match in _PY_LOOP.finditer(command):
+        indent = len(match[1].expandtabs(8))
+        lines = command[match.start():].splitlines(keepends=True)
+        end = 1
+        for line in lines[1:]:
+            if line.strip() and not line.lstrip().startswith("#"):
+                prefix = line[:len(line) - len(line.lstrip(" \t"))]
+                if len(prefix.expandtabs(8)) <= indent:
+                    break
+            end += 1
+        try:
+            tree = ast.parse(textwrap.dedent("".join(lines[:end]).expandtabs(8)))
+        except (SyntaxError, ValueError):
+            continue
+        if not tree.body or not isinstance(tree.body[0], (ast.For, ast.While)):
+            continue
+        for statement in tree.body[0].body:
+            for node in ast.walk(statement):
+                if not isinstance(node, ast.Call) or not node.args:
+                    continue
+                func = node.func
+                name = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else ""
+                arg = node.args[0]
+                if (name == "sleep" and isinstance(arg, ast.Constant)
+                        and isinstance(arg.value, (int, float)) and not isinstance(arg.value, bool)
+                        and arg.value >= 0):
+                    return True
+    return False
 
 
 def now() -> float:
@@ -148,7 +186,7 @@ def terminal_wait(args) -> float | None:
     if not isinstance(args, dict) or args.get("background"):
         return None
     cmd = str(args.get("command") or "")
-    if _LOOP_SLEEP.search(cmd):
+    if _LOOP_SLEEP.search(cmd) or _python_loop_sleep(cmd):
         return float("inf")
     total = sum(float(n) * _UNIT[u] for n, u in _SLEEP.findall(cmd))
     return total or None

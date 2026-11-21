@@ -87,6 +87,39 @@ def test_real_loops_count_and_prose_for_does_not():
         assert (long_wait.terminal_wait({"command": cmd}) or 0) < 60, cmd
 
 
+PY_BODY_CASES = {
+    "dedented": ('import time\nfor i in range(2):\n    print(i)\n'
+                 'time.sleep(0.01)\nprint("finished")\n', False),
+    "nested-dedented": ('if True:\n    for i in range(2):\n        print(i)\n'
+                        '    time.sleep(0.01)\n', False),
+    "inline-dedented": ('for i in range(2): print(i)\ntime.sleep(0.01)\n', False),
+    "loop-else": ('for i in range(2):\n    print(i)\nelse:\n    time.sleep(0.01)\n', False),
+    "nested-body": ('for i in range(2):\n    if i:\n        time.sleep(0.01)\n', True),
+    "inline-body": ('for i in range(2): time.sleep(0.01)\n', True),
+    "inline-nested-body": ('while ready():\n    if ready(): time.sleep(0.01)\n', True),
+}
+
+
+@pytest.mark.parametrize("case", sorted(PY_BODY_CASES))
+@pytest.mark.parametrize("stale", [False, True], ids=["first-reply", "stale-status"])
+def test_python_sleep_stays_in_loop_body(chat, monkeypatch, case, stale):
+    _, hooks = chat
+    source, loops = PY_BODY_CASES[case]
+    args = {"command": "python3 - <<'EOF'\n" + source + "EOF"}
+    clock = _Clock()
+    monkeypatch.setattr(long_wait, "now", clock)
+    hooks["pre_llm_call"](session_id="s1", user_message=DECISION, platform="desktop", parent_session_id="")
+    if stale:
+        hooks["on_interim_message"](session_id="s1", text="Checking now.")
+        clock.t += 400
+    out = _block(hooks, args)
+    if loops:
+        assert out and ("live_chat_sleep" if stale else "long_wait_pending_reply") in out["message"]
+    else:
+        assert out is None
+    assert long_wait.terminal_wait(args) == (float("inf") if loops else 0.01)
+
+
 def test_python_sleep_forms_are_counted():
     assert long_wait.terminal_wait({"command": "python3 -c 'import time; time.sleep(90)'"}) == 90
     assert long_wait.terminal_wait({"command": "python3 -c 'import asyncio; asyncio.run(asyncio.sleep( 75 ))'"}) == 75
