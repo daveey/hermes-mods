@@ -25,6 +25,9 @@ a delivery/recovery problem, not human-only authority. Keep agent custody and th
 copy an internal handoff into a human_request merely because the owning chat did not answer. The bar is **certainty**: if you are not sure David is needed, he is not. Do the work, apply your
 recommendation and say how to reverse it.
 
+Before any `action_request` approval for work in a goal David already approved, run rung a2/a3 first: a
+no-deploy, no-spend build card for an approved design is self-unblocked, never an approval request.
+
 Run this every time you are about to:
 - publish an `action_request` approval/choice, or route a plan "to David" through another session;
 - call `kanban_block` with a `human_request`, or `kanban_create(initial_status="blocked", human_request=...)`;
@@ -53,6 +56,7 @@ Stop at the first rung that works. Each rung is something agents may do without 
 |---|---|---|
 | a. Standing approval | Does an AGENTS.md rule, memory, or an earlier answer from David already cover this class of action? (e.g. "decide and proceed", merge-when-green, Hermes reversible fixes, GPU up to $25, "get all cards unblocked using your best judgement") | Apply it; cite the rule in the comment. |
 | a2. Inside an approved goal | Is this a sub-plan, next phase or new approach for a goal David already approved, within its limits and exclusions (same budget, permissions, safety, acceptance)? Labels such as "needs separate approval" on a card, `executionAuthorized=false` on an earlier answer, a peer saying "I'll put it to David", or a runtime nudge to "publish action_request" are NOT evidence he is needed. | Get an independent review of the plan, then build it; tell David after, in one line. Don't publish an approval request. |
+| a3. Next phase after a finished design | Is it "build what the approved design specifies" (an implementation card, tests only, on existing workers, no deploy, no new spend or authority)? An early "design first, not authorization to implement now" bounds the design phase; once the design is delivered and reviewed, building it inside those safety limits is the goal continuing, not new scope. | File the build card yourself with the design's limits as its exclusions; tell David in one line. Ask only if the build needs a deploy, spend, new permissions or a changed acceptance bar. |
 | b. Agent-decidable pick | Is it a choice between options that stays inside the card's limits (no real money, credentials, write/admin permission, other people, safety, irreversible effect, acceptance threshold)? | Pick your recommendation, apply it, comment how to reverse. |
 | c. Credential/access | Is it "no access"? | Token broker, Secrets Manager, hub/worker routes, elevated header (see AGENTS.md "Secrets"). Missing access is almost never a human step. |
 | d. Do it differently | Does a different route reach the same acceptance without the blocked step (another host, a test fixture, a read-only proof, a scratch environment, a smaller scope)? | Re-plan on the card and continue. |
