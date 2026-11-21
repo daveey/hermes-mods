@@ -42,7 +42,8 @@ snapshots at board/config changes, not a separate clock-driven feed.
 Desktop performs one GET on mount and one on reconnect, then uses pushed views.
 Expanded/window changes use stream messages. There are no interval GETs on a live
 stream. If sockets are unavailable (including OAuth/browser-hosted Desktop), a
-60-second GET fallback displays **not live**. A 45-second heartbeat timeout marks
+60-second GET fallback displays **not live** (it reads nothing while the window is hidden;
+test: `push.test.mjs` "fallback poll reads nothing while the window is hidden"). A 45-second heartbeat timeout marks
 a stalled connection unavailable. Apply and Reset retain their PUT/draft semantics;
 a successful live write is reflected by the next hub push.
 

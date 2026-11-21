@@ -50,9 +50,6 @@ def test_cold_fresh_expiry_and_current_cap(tmp_path, monkeypatch):
     series, replica = measurement(tmp_path)
     assert S.payload(tmp_path, series, 1000, now=NOW, replicas=[replica]) is None
     owner = join(tmp_path)
-    with owner.lock:
-        owner.retry_at = float("inf")
-        owner.next_at = float("inf")
     got = S.payload(tmp_path, series, 1000, now=NOW, replicas=[replica])
     assert got["gateways"]["worker-1"]["allowed"] == 1
     assert got["observed_at"] == NOW and got["window_since"] == START and got["window_until"] == END
@@ -66,7 +63,10 @@ def test_cold_fresh_expiry_and_current_cap(tmp_path, monkeypatch):
     mono[0] = stamp + S.CACHE_S
     assert S.payload(tmp_path, series, 1000, now=NOW, replicas=[replica]) is None
     mono[0] = stamp
-    assert S.payload(tmp_path, series, 1000, now=NOW + 30, replicas=[replica]) is None
+    # The previous minute's window stays usable until the next tick's flight replaces it (one flight a minute)...
+    assert S.payload(tmp_path, series, 1000, now=NOW + 30, replicas=[replica]) is not None
+    # ...but never two minutes back, nor CACHE_S after it was observed.
+    assert S.payload(tmp_path, series, 1000, now=NOW + 90, replicas=[replica]) is None
     assert S.payload(tmp_path, series, 1000, now=NOW - 1, replicas=[replica]) is None
 
 
@@ -138,11 +138,11 @@ def test_unavailable_is_not_zero_and_retries(tmp_path, fault):
     assert owner.snapshot is None
     first = owner.thread
     assert S.payload(tmp_path, series, 1000, now=NOW, replicas=[replica]) is None
-    assert owner.thread is first  # failed refresh has a bounded retry backoff
+    assert owner.thread is first  # a failed minute is not retried within that minute
     repaired = tmp_path / "repaired"
     repaired.mkdir()
     series, replica = measurement(repaired)
-    owner.retry_at = 0
+    owner.attempted = None  # the next minute's tick
     S.payload(tmp_path, series, 1000, now=NOW, replicas=[replica])
     join(tmp_path)
     assert S.payload(tmp_path, series, 1000, now=NOW, replicas=[replica]) is not None
@@ -213,88 +213,146 @@ def test_stop_and_start_are_serialized(tmp_path, monkeypatch):
     assert not A._stopped and not A._owners
 
 
-@pytest.mark.parametrize("interval", [15, 30])
-def test_steady_poll_availability(tmp_path, monkeypatch, interval):
-    """Drive the real coordinator/worker across minutes, without waiting wall minutes."""
+def fake_clock(monkeypatch, start=NOW):
     from types import SimpleNamespace
-    clock = [NOW]
+    clock = [start]
     fake_time = SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0])
     monkeypatch.setattr(A, "time", fake_time)
     monkeypatch.setattr(S, "time", fake_time)
-    series, replica = measurement(tmp_path)
-    # Every later share window still contains a sampled minute and this completed run.
-    read = lambda: S.payload(tmp_path, series, 1000, replicas=[replica])
-    assert read() is None
-    owner = join(tmp_path)
-    available = []
-    for step in range(5, 181, 5):
-        clock[0] = NOW + step
-        if hasattr(owner, "wake"):
-            owner.wake.set()
-        # Give a due background flight its execution turn BEFORE the next client read.
-        # No read is allowed to trigger or repair that flight in this synchronization.
-        if step % 10 == 0 or int(clock[0]) % 60 == 0:
-            deadline = time.monotonic() + 0.5
-            while time.monotonic() < deadline:
-                if owner.snapshot and owner.snapshot[1]["observed_at"] == clock[0]:
-                    break
-                time.sleep(0.005)
-        if step % interval == 0:
-            got = read()
-            available.append(got is not None)
-            if got:
-                assert got["window_until"] == int(clock[0]) // 60 * 60
-                assert 0 <= clock[0] - got["observed_at"] < S.CACHE_S
-    assert all(available), available
+    return clock
 
 
 def wait_for(predicate):
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + 3
     while not predicate() and time.monotonic() < deadline:
         time.sleep(0.005)
     assert predicate()
 
 
-def test_scheduler_idle_restart_and_failed_refresh(tmp_path, monkeypatch):
-    from types import SimpleNamespace
-    clock = [NOW]
-    fake_time = SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0])
-    monkeypatch.setattr(A, "time", fake_time)
-    monkeypatch.setattr(S, "time", fake_time)
+def settle(owner, clock):
+    """Let the scheduler act on the current fake time: it launches a due minute's flight, then we join it."""
+    due = int((clock[0] - A.TICK_OFFSET_S) // 60)
+    owner.wake.set()
+    wait_for(lambda: owner.attempted is not None and owner.attempted >= due)
+    if owner.thread is not None:
+        owner.thread.join(3)
+
+
+@pytest.mark.parametrize("interval", [5, 15, 30])
+def test_one_flight_per_minute_tick_regardless_of_read_count(tmp_path, monkeypatch, interval):
+    """Drive the real coordinator/worker across minutes, without waiting wall minutes: whatever the read rate, the
+    advisory is computed once per minute tick (plus the cold start's), and every read finds a usable snapshot."""
+    clock = fake_clock(monkeypatch)
+    series, replica = measurement(tmp_path)
+    # Every later share window still contains a sampled minute and this completed run.
+    read = lambda: S.payload(tmp_path, series, 1000, replicas=[replica])
+    assert read() is None  # cold start: this minute's flight
+    owner = join(tmp_path)
+    assert owner.flights == 1
+    available, reads = [], 0
+    for step in range(5, 181, 5):
+        clock[0] = NOW + step
+        settle(owner, clock)  # a due tick's flight runs here, never because of a read
+        if step % interval == 0:
+            got = read()
+            reads += 1
+            available.append(got is not None)
+            if got:
+                assert got["window_until"] in (int(clock[0]) // 60 * 60, int(clock[0]) // 60 * 60 - 60)
+                assert 0 <= clock[0] - got["observed_at"] < S.CACHE_S
+    assert all(available), available
+    # NOW is 30 s into a minute; 180 s later three more minute ticks have passed (at +33, +93, +153 s).
+    assert owner.flights == 4, (interval, reads, owner.flights)
+
+
+def test_no_interest_no_compute_and_interest_lapses(tmp_path, monkeypatch):
+    clock = fake_clock(monkeypatch)
+    series, replica = measurement(tmp_path)
+    spawned = []
+    real = A.subprocess.Popen
+    monkeypatch.setattr(A.subprocess, "Popen", lambda *a, **k: spawned.append(1) or real(*a, **k))
+    # Reads that record no interest (the dashboard's own pushes) never start a computation.
+    for _ in range(5):
+        assert S.payload(tmp_path, series, 1000, replicas=[replica], interest=False) is None
+    owner = A._owners[str(tmp_path)]
+    assert spawned == [] and owner.thread is None and owner.scheduler is None
+    # One interested read: the cold start, then the scheduler computes each tick while interest lasts.
+    assert S.payload(tmp_path, series, 1000, replicas=[replica]) is None
+    join(tmp_path)
+    scheduler = owner.scheduler
+    assert len(spawned) == 1 and scheduler.is_alive()
+    clock[0] += 60
+    settle(owner, clock)
+    assert len(spawned) == 2
+    # Uninterested reads keep nothing alive: past INTEREST_S since the last interested read the scheduler exits.
+    clock[0] = owner.last_read + A.INTEREST_S
+    S.payload(tmp_path, series, 1000, replicas=[replica], interest=False)
+    owner.wake.set()
+    scheduler.join(3)
+    assert not scheduler.is_alive()
+    before = len(spawned)
+    for _ in range(3):
+        clock[0] += 60
+        owner.wake.set()
+        assert S.payload(tmp_path, series, 1000, replicas=[replica], interest=False) is None
+    time.sleep(0.05)
+    assert len(spawned) == before and owner.scheduler is None
+
+
+def test_listener_is_told_after_each_flight(tmp_path, monkeypatch):
+    fake_clock(monkeypatch)
+    series, replica = measurement(tmp_path)
+    told = []
+    off = A.subscribe(lambda root, ok: told.append((root, ok)))
+    try:
+        S.payload(tmp_path, series, 1000, replicas=[replica])
+        join(tmp_path)
+        wait_for(lambda: told == [(str(tmp_path), True)])
+    finally:
+        off()
+    S.payload(tmp_path, series, 1000, replicas=[replica])
+    assert told == [(str(tmp_path), True)]
+
+
+def test_failed_refresh_waits_for_next_tick_and_restart(tmp_path, monkeypatch):
+    clock = fake_clock(monkeypatch)
     series, replica = measurement(tmp_path)
     read = lambda: S.payload(tmp_path, series, 1000, replicas=[replica])
     assert read() is None
     owner = join(tmp_path)
     scheduler = owner.scheduler
+    assert read() is not None
     # A refresh failure must invalidate even a not-yet-expired old observation.
     replica.unlink()
     first = owner.thread
-    clock[0] += 10
-    owner.wake.set()
-    wait_for(lambda: owner.thread is not first)
-    join(tmp_path)
-    assert owner.snapshot is None and read() is None
+    clock[0] += 60
+    settle(owner, clock)
+    assert owner.thread is not first and owner.snapshot is None and read() is None
     failed = owner.thread
-    assert read() is None and owner.thread is failed
-    # Repair, then let the scheduler retry without a request initiating the flight.
+    # Not retried within its minute, however many reads arrive.
+    clock[0] += 20
+    owner.wake.set()
+    for _ in range(10):
+        assert read() is None
+    time.sleep(0.05)
+    assert owner.thread is failed
+    # Repair; the next minute's tick computes again without a request initiating the flight.
     repaired = tmp_path / "repair"
     repaired.mkdir()
     _, new_replica = measurement(repaired)
     replica.write_bytes(new_replica.read_bytes())
-    clock[0] += A.RETRY_S
-    owner.wake.set()
-    wait_for(lambda: owner.thread is not failed)
-    join(tmp_path)
-    assert read() is not None
-    # No polling -> stop background work at the exact activity boundary.
-    clock[0] += A.ACTIVE_S
+    clock[0] += 40
+    settle(owner, clock)
+    assert owner.thread is not failed and read() is not None
+    # No interest -> stop background work at the exact boundary.
+    clock[0] = owner.last_read + A.INTEREST_S
     owner.wake.set()
     scheduler.join(2)
     assert not scheduler.is_alive()
     last = owner.thread
-    clock[0] += 60
+    clock[0] += 120
     assert owner.thread is last
-    assert read() is None
+    assert read() is None  # an interested read restarts it (cold start)
     join(tmp_path)
     new_scheduler = owner.scheduler
     assert new_scheduler is not scheduler and new_scheduler.is_alive()
@@ -303,11 +361,7 @@ def test_scheduler_idle_restart_and_failed_refresh(tmp_path, monkeypatch):
 
 
 def test_proactive_flight_current_cap_and_joined_cancellation(tmp_path, monkeypatch):
-    from types import SimpleNamespace
-    clock = [NOW]
-    fake_time = SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0])
-    monkeypatch.setattr(A, "time", fake_time)
-    monkeypatch.setattr(S, "time", fake_time)
+    clock = fake_clock(monkeypatch)
     series, replica = measurement(tmp_path)
     assert S.payload(tmp_path, series, 1000, replicas=[replica]) is None
     owner = join(tmp_path)
@@ -322,15 +376,15 @@ def test_proactive_flight_current_cap_and_joined_cancellation(tmp_path, monkeypa
     blocker = sqlite3.connect(replica)
     blocker.execute("BEGIN EXCLUSIVE")
     try:
-        clock[0] += 10
+        clock[0] += 33  # the next minute's tick (NOW is 30 s into its minute)
         owner.wake.set()
         wait_for(lambda: bool(spawned))
         assert spawned[0].poll() is None
-        for _ in range(10):
+        for _ in range(10):  # the previous minute's snapshot serves meanwhile, at the current cap
             got = S.payload(tmp_path, series, 2000, replicas=[replica])
             assert got["gateways"]["worker-1"]["allowed"] == 2
         assert len(spawned) == 1
-        clock[0] += 30
+        clock[0] += 60  # two minutes after that observation: unusable
         assert S.payload(tmp_path, series, 2000, replicas=[replica]) is None
         started = time.monotonic()
         A.stop()

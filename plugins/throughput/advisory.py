@@ -1,7 +1,19 @@
-"""Owned, bounded slots refresh. No database work runs on a throttle request thread.
+"""Owned, bounded slots refresh: at most one flight per sampler minute, only while a client is interested.
 
-A subprocess, not a timed-out future, owns the SQLite connections. Timeout/unload
-kills and reaps that process before its single-flight coordinator is released.
+No database work runs on a throttle request thread. A subprocess, not a timed-out future, owns the SQLite
+connections. Timeout/unload kills and reaps that process before its single-flight coordinator is released.
+
+Cadence (2026-11-20; the Desktop's 15 s ``/v1/throttle`` polls used to keep a 10 s refresh loop warm for good, and
+a hub under load timed the worker out and respawned it every ~1.3 s):
+
+* The share window the advisory measures only moves when a minute ends (``slots.collect``: ``until`` is the last
+  minute boundary; the sampler writes that minute ~2 s after it). So each owner computes once per minute:
+  ``TICK_OFFSET_S`` after the boundary, and at most once for that minute however many reads arrive and whether the
+  flight succeeded or failed (a failure waits for the next minute; it is never retried within one).
+* Reads do not drive refreshes. A read records interest (``read(..., interest=True)``); a read that finds no usable
+  snapshot and no flight yet for its minute starts that minute's flight (cold start). The scheduler thread runs only
+  while some read recorded interest in the last ``INTEREST_S``; with none it exits and nothing is computed.
+* ``subscribe(fn)``: ``fn(root, ok)`` after every finished flight (the dashboard pushes the new snapshot).
 """
 from __future__ import annotations
 
@@ -13,49 +25,65 @@ import threading
 import time
 from pathlib import Path
 
-REFRESH_TIMEOUT_S = 2.0
-RETRY_S = 1.0
-REFRESH_INTERVAL_S = 10.0
-ACTIVE_S = 45.0  # covers the Desktop's 30-second polling cadence
+REFRESH_TIMEOUT_S = 15.0  # once a minute: a loaded hub needs several seconds just to start the worker
+TICK_OFFSET_S = 3.0  # after the sampler's write (``sampler._loop`` wakes 2 s after each minute)
+INTEREST_S = 300.0  # compute only while a client read the advisory (or registered interest) in the last 5 min
+ACTIVE_S = INTEREST_S
 _lock = threading.Lock()
 _lifecycle = threading.Lock()
 _owners = {}
+_listeners = []
 _stopped = False
 
 
+def minute_of(request) -> int:
+    return int(float(request["now"]) // 60)
+
+
 class Owner:
-    def __init__(self):
+    def __init__(self, root=""):
+        self.root = root
         self.lock = threading.Lock()
         self.cancel = threading.Event()
         self.thread = None
         self.snapshot = None
-        self.retry_at = 0.0
-        self.next_at = float("inf")
-        self.last_read = 0.0
+        self.attempted = None  # the minute of the last flight started (success or not): one flight per minute
+        self.flights = 0
+        self.last_read = float("-inf")
         self.prepare = None
         self.scheduler = None
         self.wake = threading.Event()
 
+    def interested(self) -> bool:
+        return time.monotonic() < self.last_read + INTEREST_S
+
     def launch(self, request):
-        """Called under lock; at most one child, including during kill/reap."""
-        if (self.cancel.is_set() or time.monotonic() < self.retry_at
+        """Called under lock; at most one child, including during kill/reap, and one per minute."""
+        minute = minute_of(request)
+        if (self.cancel.is_set() or self.attempted == minute
                 or (self.thread is not None and self.thread.is_alive())):
-            return
-        self.next_at = float("inf")
+            return False
+        self.attempted = minute
+        self.flights += 1
         self.thread = threading.Thread(target=self.refresh, args=(request,),
                                        name="throughput-slots", daemon=True)
         self.thread.start()
+        return True
 
-    def read(self, request, fresh, prepare=None):
+    def read(self, request, fresh, prepare=None, interest=True):
         with self.lock:
             hit = self.snapshot
             if self.cancel.is_set():
                 return hit
-            self.last_read = time.monotonic()
-            self.prepare = prepare
+            if interest:
+                self.last_read = time.monotonic()
+            if prepare is not None:
+                self.prepare = prepare
+            if not self.interested():
+                return hit  # nobody asked lately: never compute (the pusher's own reads record no interest)
             if not fresh(hit):
-                self.launch(request)
-            if prepare is not None and (self.scheduler is None or not self.scheduler.is_alive()):
+                self.launch(request)  # cold start; a no-op once this minute had its flight
+            if self.prepare is not None and (self.scheduler is None or not self.scheduler.is_alive()):
                 self.scheduler = threading.Thread(target=self.schedule,
                                                    name="throughput-slots-schedule", daemon=True)
                 self.scheduler.start()
@@ -66,21 +94,23 @@ class Owner:
         while not self.cancel.is_set():
             self.wake.clear()
             with self.lock:
-                now = time.monotonic()
-                active_until = self.last_read + ACTIVE_S
-                if now >= active_until:
+                if not self.interested():
                     # Clear under the read lock so a simultaneous read can restart us.
                     self.scheduler = None
                     return
-                delay = min(max(self.next_at, self.retry_at), active_until) - now
+                wall = time.time()
+                due = int((wall - TICK_OFFSET_S) // 60)  # the minute whose tick has passed
+                delay = (due + 1) * 60 + TICK_OFFSET_S - wall
+                delay = min(delay, self.last_read + INTEREST_S - time.monotonic())
                 prepare = self.prepare
                 running = self.thread is not None and self.thread.is_alive()
-            if delay <= 0 and not running and prepare is not None:
+                pending = self.attempted is None or self.attempted < due
+            if pending and not running and prepare is not None:
                 # Preparation is restricted to clocks and the nonblocking Cards snapshot.
                 # Never retain a request's old attribution or timestamp for a future flight.
                 request = prepare()
                 with self.lock:
-                    if time.monotonic() < self.last_read + ACTIVE_S:
+                    if self.interested():
                         self.launch(request)
                 continue
             self.wake.wait(max(0.01, delay) if not running else 0.05)
@@ -120,11 +150,10 @@ class Owner:
             with self.lock:
                 if not success:
                     self.snapshot = None
-                self.retry_at = time.monotonic() + RETRY_S
-                # Refresh ahead of 30s expiry and promptly after a minute changes.
-                interval = min(REFRESH_INTERVAL_S, 60 - time.time() % 60)
-                self.next_at = time.monotonic() + (interval if success else RETRY_S)
+                cancelled = self.cancel.is_set()
             self.wake.set()
+            if not cancelled:
+                _notify(self.root, success)
 
     def close(self):
         with self.lock:
@@ -138,12 +167,34 @@ class Owner:
             thread.join()  # refresh owns and reaps its killable DB worker
 
 
-def read(root, request, fresh, prepare=None):
+def _notify(root, ok):
+    with _lock:
+        listeners = list(_listeners)
+    for fn in listeners:
+        try:
+            fn(root, ok)
+        except Exception:  # a listener never breaks the refresh
+            pass
+
+
+def subscribe(fn):
+    """Call ``fn(root, ok)`` after each finished flight; returns the unsubscribe function."""
+    with _lock:
+        _listeners.append(fn)
+
+    def off():
+        with _lock:
+            if fn in _listeners:
+                _listeners.remove(fn)
+    return off
+
+
+def read(root, request, fresh, prepare=None, interest=True):
     with _lock:
         if _stopped:
             return None
-        owner = _owners.setdefault(str(root), Owner())
-        return owner.read(request, fresh, prepare)
+        owner = _owners.setdefault(str(root), Owner(str(root)))
+        return owner.read(request, fresh, prepare, interest)
 
 
 def start():

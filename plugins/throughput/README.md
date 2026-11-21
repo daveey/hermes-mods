@@ -336,14 +336,21 @@ and a body that is not a JSON object a 422, and neither changes anything.
   because its per-gateway limits are not published. Each pool carries its `pacing_factor`. `slots` is null if it cannot be computed; that never fails
   the route. Fresh snapshots add `observed_at`, `window_since`, `window_until` (Unix seconds), `valid: true`
   and `stale: false`; `pacing` adds its own `window_since`/`window_until`. The observation is taken at refresh
-  start, not publication. At 30 seconds of wall or monotonic age, at a minute-window change, on cold start,
-  or after incomplete/failed reads, the response is `slots: null` (never stale limits or fabricated zero holds).
+  start, not publication. A snapshot is served for the current minute's window, or the previous minute's until the
+  next tick's flight replaces it, and never past 90 seconds of wall or monotonic age; on cold start or after
+  incomplete/failed reads the response is `slots: null` (never stale limits or fabricated zero holds).
   The current request's cap always recomputes the plan from the measurement.
   All optional replica and usage reads run in one owned subprocess per root, not on GET/PUT's awaited path.
-  A two-second deadline cancels/kills and reaps that child; teardown joins its coordinator before reloading.
-  While read within the last 45 seconds, a joined scheduler refreshes every 10 seconds and at minute boundaries;
-  failures back off one second and invalidate the prior snapshot. Cold reads and reads racing a minute-boundary
-  refresh can still return null; no expired window is served to hide refresh latency.
+  A 15-second deadline cancels/kills and reaps that child; teardown joins its coordinator before reloading.
+  **Cadence (advisory.py)**: the share window only moves when a minute ends, so the advisory is computed **at most
+  once per minute**: 3 s after each minute boundary (just after the sampler's write), and once for that minute
+  however many reads arrive and whether it succeeded (a failure invalidates the prior snapshot and waits for the
+  next minute; no in-minute retry). Reads do not drive refreshes: `GET /v1/throttle` (and `POST /v1/watch` with
+  `advisory: true`) records interest; a read that finds no usable snapshot and no flight yet for its minute starts
+  that minute's flight (cold start). The scheduler runs only while interest was recorded in the last 5 minutes; with
+  none it exits and nothing is computed. The dashboard's own pushes read with `interest=False`, so they never keep
+  it alive. Before 2026-11-20 every read kept a 10 s refresh loop warm for 45 s and failures retried every second:
+  the Desktop's 15 s polls kept `slots_worker.py` running permanently on the hub (measured: 46 workers a minute).
   Plugin unload and process exit own cleanup. Router lifespan shutdown also cleans up when mounted before
   startup; hot-mounted routers do not run that lifespan and rely on unload/process-exit cleanup.
   Boot attribution uses only a nonblocking fresh Cards snapshot, rechecked at each refresh. Missing mappings
@@ -351,8 +358,9 @@ and a body that is not a JSON object a 422, and neither changes anything.
   usage leave the entire slots advisory unavailable. This is intentionally fail-closed, not a claim that the
   live fleet has complete attribution or usage. An unlearnable UUID need not recover on the next series refresh.
   No background Cards rebuild or empty series substitution.
-  Tests: `tests/test_slots.py`, `tests/test_advisory.py`, `tests/test_api.py` (real blocked Cards rebuild,
-  SQLite-lock GET/PUT bound, cancellation and lifecycle). **Not tested**: live macOS activation/soak.
+  Tests: `tests/test_slots.py`, `tests/test_advisory.py` (one flight per minute tick at 5/15/30 s read rates, no
+  compute without interest, interest lapse, failed minute not retried, listener), `tests/test_api.py` (real blocked
+  Cards rebuild, SQLite-lock GET/PUT bound, cancellation and lifecycle). **Not tested**: live macOS activation/soak.
 - **Runway** (`runway.py`): per subscription pool, from the usage samples core's Kanban pacing governor keeps in
   `llm_pacing.json` (no usage request is made): `remaining_pct` (sum of `100 - used` over the accounts' weekly
   windows), `burn_pct_per_h` (each account's slope over the last 10-60 minutes), `runway_s = remaining / burn`
@@ -435,6 +443,37 @@ budget is unchanged. Live process accounting remains the deployment acceptance c
 the Desktop divides a partly sampled bucket's count by the minutes actually sampled (cards are complete, so by
 the whole bucket) and converts to /s, /m, /h; `recent` holds the last 15 per-minute
 counts for the "rate now" numbers. Built at most once per range per 15 s (single flight), in a worker thread.
+
+### Push
+
+`POST /api/plugins/throughput/v1/watch` with `{"series": [{"range": "6h", "by": "gateway"}], "advisory": bool}`
+registers interest for 5 minutes and answers the current snapshot (the catch-up). `GET /v1/series` and
+`GET /v1/throttle` count as interest too; only `GET /v1/throttle` and a watch with `advisory: true` keep the slots
+advisory computing. While anyone is interested, the process serving the Desktop (`hermes serve`; no thread starts
+where the gateway transport is not loaded) pushes **`plugin.throughput.snapshot`** once a minute, right after that
+minute's advisory flight (at the latest 20 s into the minute), plus once when interest starts and after a cold-start
+flight:
+
+```json
+{"feed": "hub:4242", "epoch": "…", "seq": 7, "at": 1800000003.1, "minute": 1800000000, "interval_s": 60,
+ "throttle": {"…": "the GET /v1/throttle payload"}, "series": {"6h|gateway": {"…": "GET /v1/series"}},
+ "series_keys": ["6h|gateway"]}
+```
+
+`series` holds the views read or watched in the last 5 minutes (at most 4, the most recent). The body is JSON-safe
+(NaN/inf → null); over 256 KB the series go by name only (`series_keys`) and clients read them. `feed` (host:pid) is
+also on every `GET /v1/throttle` payload, so a client knows which connection a push belongs to. With no interest for
+5 minutes the push thread exits. Tests: `tests/test_push.py` (one push per minute, deadline push, no push without
+interest, JSON safety and size bound, the advisory kick, the thread, the watch route). **Not tested**: delivery over
+a live gateway stream (core `broadcast_plugin_event`).
+
+Desktop (`desktop-plugins/throughput`): while the window is shown and the host has an event stream (`ctx.onEvent`),
+it watches its current view (`advisory` while the panel or chip menu is open) on mount, on a view change and every
+4 min, applies every push whose `feed` matches the watch answer's to the series and throttle queries, and, while
+pushes arrive (the last within 2 min), re-reads only every 4 min instead of every 30 s. Pushes stopped for 2 min (or
+a gateway without `/v1/watch`): the 30 s reads resume. Nothing runs while the window is hidden. The budget charts
+are not pushed; they still read every 30 s while the panel is open. Tests: `throughput.test.mjs` "push: …",
+"applySnapshot: …".
 
 ## Tests
 

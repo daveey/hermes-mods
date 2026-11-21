@@ -13,6 +13,14 @@ import { useQuery, useQueryClient, STATUSBAR_AREAS, PALETTE_AREA, Popover, Popov
 import { createElement as h, useState, useEffect, useMemo, useRef } from 'react'
 
 export const POLL_MS = 30000
+// Push (plugins/throughput dashboard): POST /v1/watch registers the views this window shows (5 min of interest on the
+// gateway) and answers the current snapshot with the gateway's `feed` id; the gateway then pushes
+// `plugin.throughput.snapshot` once a minute (after its sampler minute) with the throttle and those series. While its
+// pushes arrive (the last within PUSH_TRUST_MS) nothing polls; the watch is renewed and the views re-read every
+// SAFETY_MS. When pushes stop (or the gateway has no /v1/watch) the POLL_MS reads resume. Nothing runs while hidden.
+export const SNAPSHOT_EVENT = 'plugin.throughput.snapshot'
+export const PUSH_TRUST_MS = 120000
+export const SAFETY_MS = 240000
 export const REQUEST_TIMEOUT_MS = 20000 // the hub answers in 0.3-10 s under load
 export const STORE_KEY = 'hermes-throughput-view'
 export const RANGES = ['1h', '6h', '24h', '7d']
@@ -26,6 +34,26 @@ const NOREP = 'These gateways don\u2019t report this metric yet (their Board cou
 const BAR = 'inline-flex h-full items-center gap-1.5 px-1.5 text-[0.6875rem] text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground'
 
 // ── pure helpers (exported for tests) ─────────────────────────────────────
+
+export const validSeries = (body, by = 'gateway') =>
+  !!body && Array.isArray(body.gateways) && (by !== 'model' || Array.isArray(body.models)) && !!body.series && !!body.bucket_s
+export const seriesQueryKey = (range, by = 'gateway') => by === 'model' ? ['throughput', 'series', range, 'model'] : ['throughput', 'series', range]
+
+// One snapshot (a push, or the watch answer) into the query cache: every series view it carries, and the throttle. A
+// view sent by name only (too big to push) is re-read. True when it carried anything usable.
+export function applySnapshot(client, p) {
+  if (!p || typeof p !== 'object') return false
+  let used = false
+  for (const key of Array.isArray(p.series_keys) ? p.series_keys : []) {
+    const [range, by = 'gateway'] = String(key).split('|')
+    if (!RANGES.includes(range) || !GROUPS.includes(by)) continue
+    const body = p.series?.[key]
+    if (validSeries(body, by)) { client.setQueryData(seriesQueryKey(range, by), body); used = true }
+    else client.invalidateQueries({ queryKey: seriesQueryKey(range, by), exact: true })
+  }
+  if (p.throttle && typeof p.throttle.percent === 'number') { client.setQueryData(['throughput', 'throttle'], p.throttle); used = true }
+  return used
+}
 
 export function loadView(storage = globalThis.localStorage) {
   try {
@@ -762,10 +790,50 @@ export function Throughput({ ctx }) {
   const visible = useVisible()
   const fetchRange = (range, by = 'gateway') => async () => {
     const body = await ctx.rest(`/v1/series?range=${encodeURIComponent(range)}${by === 'model' ? '&by=model' : ''}`, { timeoutMs: REQUEST_TIMEOUT_MS })
-    if (!body || !Array.isArray(body.gateways) || (by === 'model' && !Array.isArray(body.models)) || !body.series || !body.bucket_s) throw Error('Invalid throughput response')
+    if (!validSeries(body, by)) throw Error('Invalid throughput response')
     return body
   }
   const client = useQueryClient()
+  // Push: the gateway's feed id (from the watch answer) and when its last push arrived.
+  const feed = useRef(null)
+  const [liveAt, setLiveAt] = useState(-Infinity)
+  const [clock, setClock] = useState(() => Date.now())
+  const live = clock - liveAt < PUSH_TRUST_MS
+  const poll = (on) => (visible && on ? (live ? SAFETY_MS : POLL_MS) : false)
+  useEffect(() => {
+    const subscribe = typeof ctx?.onEvent === 'function' ? ctx.onEvent : null
+    const off = subscribe ? subscribe(SNAPSHOT_EVENT, (ev) => {
+      const p = ev?.payload
+      if (!p?.feed || p.feed !== feed.current) return // another gateway's, or before our watch answered
+      applySnapshot(client, p)
+      const t = Date.now()
+      setLiveAt(t); setClock(t)
+    }) : null
+    return () => { if (typeof off === 'function') off() }
+  }, [ctx, client])
+  useEffect(() => { // re-evaluate liveness while shown (so polling resumes when pushes stop)
+    if (!visible) return undefined
+    setClock(Date.now()) // shown again: judge liveness now, not at the next tick
+    const t = setInterval(() => setClock(Date.now()), 15000)
+    return () => clearInterval(t)
+  }, [visible])
+  const advisory = open || menuOpen
+  useEffect(() => { // register this window's views; renewed every SAFETY_MS while shown
+    if (!visible || typeof ctx?.onEvent !== 'function') return undefined // no event stream: pushes cannot reach us
+    let gone = false
+    const watch = async () => {
+      const series = [{ range: view.range, by: 'gateway' }, ...(view.by === 'model' ? [{ range: view.range, by: 'model' }] : [])]
+      try {
+        const body = await ctx.rest('/v1/watch', { method: 'POST', body: { series, advisory }, timeoutMs: REQUEST_TIMEOUT_MS })
+        if (gone || typeof body?.feed !== 'string') return
+        feed.current = body.feed
+        applySnapshot(client, body)
+      } catch { /* an older gateway without /v1/watch: the polls below carry on */ }
+    }
+    void watch()
+    const t = setInterval(() => void watch(), SAFETY_MS)
+    return () => { gone = true; clearInterval(t) }
+  }, [ctx, client, visible, view.range, view.by, advisory])
   // Hovering a range button fetches it ahead of the click, so switching is usually instant.
   const prefetch = (range) => {
     if (range !== view.range) {
@@ -776,7 +844,7 @@ export function Throughput({ ctx }) {
   const query = useQuery({
     queryKey: ['throughput', 'series', view.range],
     queryFn: fetchRange(view.range),
-    refetchInterval: visible ? POLL_MS : false,
+    refetchInterval: poll(true),
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: false,
     retry: false,
@@ -787,7 +855,7 @@ export function Throughput({ ctx }) {
     queryKey: ['throughput', 'series', view.range, 'model'],
     queryFn: fetchRange(view.range, 'model'),
     enabled: view.by === 'model',
-    refetchInterval: visible && view.by === 'model' ? POLL_MS : false,
+    refetchInterval: poll(view.by === 'model'),
     refetchIntervalInBackground: false, refetchOnWindowFocus: false, retry: false, staleTime: 10000,
     placeholderData: (prev) => prev
   })
@@ -798,7 +866,7 @@ export function Throughput({ ctx }) {
       if (!body || typeof body.percent !== 'number') throw Error('Invalid throttle response')
       return body
     },
-    enabled: open || menuOpen, refetchInterval: visible && (open || menuOpen) ? POLL_MS : false,
+    enabled: open || menuOpen, refetchInterval: poll(open || menuOpen),
     refetchIntervalInBackground: false, refetchOnWindowFocus: false, retry: false, staleTime: 5000
   })
   const [throttleError, setThrottleError] = useState(null)

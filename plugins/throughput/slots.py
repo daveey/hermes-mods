@@ -18,9 +18,10 @@ The Runners panel crosses out a gateway's slots beyond ``allowed``.
   replicas record: ``pacing.held_starts``, the cards whose start the governor held in the last
   ``PACING_WINDOW_S`` (their ``llm_paced`` events), fleet-wide.
 
-The throttle route reads only a fresh snapshot. All optional reads run in one owned,
-killable worker per root; cold, expired or incomplete measurements return null rather
-than presenting missing observations as zero usage or measured slot limits.
+The throttle route reads only a fresh snapshot: the current minute's window, or the previous minute's until the
+next tick's flight (advisory.py: one flight per minute, a few seconds after the boundary) replaces it, and never
+older than ``CACHE_S``. All optional reads run in one owned, killable worker per root; cold, expired or incomplete
+measurements return null rather than presenting missing observations as zero usage or measured slot limits.
 """
 from __future__ import annotations
 
@@ -37,7 +38,7 @@ from .sampler import ro_connect
 
 MIN_BUSY_S = 300.0  # under five busy slot-minutes in the window a gateway's own cost per slot is noise
 CLAIM_SLACK_S = 5.0  # a run's ``claimed`` event is written just before the run row
-CACHE_S = 30.0
+CACHE_S = 90.0  # one flight per minute (advisory.py): a snapshot lives until a little after the next tick
 PACING_WINDOW_S = 300.0
 
 from . import advisory
@@ -162,8 +163,10 @@ def collect(request: dict) -> dict:
 
 
 def payload(root: Path, series_db: Path, cap_per_s: Optional[float], cards=None,
-            now: Optional[float] = None, replicas: Optional[Iterable[Path]] = None) -> Optional[dict]:
-    """Return only a fresh advisory snapshot; cold/expired/failed data is unavailable."""
+            now: Optional[float] = None, replicas: Optional[Iterable[Path]] = None,
+            interest: bool = True) -> Optional[dict]:
+    """Return only a fresh advisory snapshot; cold/expired/failed data is unavailable. ``interest=False`` (the
+    dashboard's own pushes) reads without keeping the per-minute computation alive."""
     explicit_now = now
     now = time.time() if now is None else now
     requested_at = time.monotonic()
@@ -171,7 +174,7 @@ def payload(root: Path, series_db: Path, cap_per_s: Optional[float], cards=None,
 
     def fresh(hit):
         return (hit is not None and 0 <= time.monotonic() - hit[0] < CACHE_S
-                and 0 <= now - hit[1]["observed_at"] < CACHE_S and hit[1]["window_until"] == until)
+                and 0 <= now - hit[1]["observed_at"] < CACHE_S and hit[1]["window_until"] in (until, until - 60))
 
     paths = None if replicas is None else [str(p) for p in replicas]
 
@@ -183,7 +186,7 @@ def payload(root: Path, series_db: Path, cap_per_s: Optional[float], cards=None,
                 "replicas": paths, "boot_map": (attribution or {}).get("boot_map", {}),
                 "known": (attribution or {}).get("known")}
 
-    hit = advisory.read(root, prepare(initial=True), fresh, prepare)
+    hit = advisory.read(root, prepare(initial=True), fresh, prepare, interest)
     if not fresh(hit):
         return None
     data = hit[1]

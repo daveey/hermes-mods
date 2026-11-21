@@ -135,7 +135,8 @@ export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
     }
     const unavailable = () => {
       live = false; onLive(false)
-      if (!poll && !disposed) poll = timers.setInterval(() => void fetch(), FALLBACK_MS)
+      // Nothing is read while the window is hidden; the stream (or the next tick once shown) catches up.
+      if (!poll && !disposed) poll = timers.setInterval(() => { if (!globalThis.document?.hidden) void fetch() }, FALLBACK_MS)
     }
     const receive = (frame) => {
       if (disposed) return

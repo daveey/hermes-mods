@@ -921,3 +921,58 @@ test('review fixes: no pacing switch without a publisher; one change at a time; 
     await ui.close()
   }
 })
+
+test('push: watch registers the view, pushes update the chip, polls slow to the safety read, resume when pushes stop', async () => {
+  localStorage.setItem(P.STORE_KEY, JSON.stringify({ unit: 'm', range: '1h', cache: false }))
+  const listeners = new Map()
+  const FEED = 'hub:77'
+  const ctx = ctxWith((path) => path === '/v1/watch'
+    ? { feed: FEED, series_keys: ['1h|gateway'], series: { '1h|gateway': payload() }, throttle: null }
+    : forRange(path))
+  ctx.onEvent = (type, fn) => { listeners.set(type, fn); return () => listeners.delete(type) }
+  const ui = await mount(React.createElement(P.Throughput, { ctx }))
+  const realNow = Date.now
+  try {
+    const watch = ctx.calls.find(([p]) => p === '/v1/watch')
+    assert.ok(watch, 'the window registered its view')
+    assert.deepEqual(watch[1].body, { series: [{ range: '1h', by: 'gateway' }], advisory: false })
+    const series = () => ui.client.getQueryCache().find({ queryKey: ['throughput', 'series', '1h'] })
+    assert.equal(series().observers[0].options.refetchInterval, P.POLL_MS, 'no push yet: the old cadence')
+    const faster = payload()
+    faster.recent.tokens_io.hub = faster.recent.tokens_io.hub.map((v) => (v == null ? null : 1200))
+    await React.act(async () => listeners.get(P.SNAPSHOT_EVENT)({ payload: { feed: 'other:1', series_keys: ['1h|gateway'], series: { '1h|gateway': faster } } }))
+    assert.match(button('Show throughput').textContent, /600 tok\/m/, 'another gateway\'s push is ignored')
+    await React.act(async () => listeners.get(P.SNAPSHOT_EVENT)({ payload: { feed: FEED, series_keys: ['1h|gateway'], series: { '1h|gateway': faster } } }))
+    await ui.flush()
+    assert.match(button('Show throughput').textContent, /1\.2k tok\/m/, 'the pushed series is drawn')
+    assert.equal(series().observers[0].options.refetchInterval, P.SAFETY_MS, 'live: only the safety read')
+    // Hidden: nothing polls.
+    const vis = async (state) => {
+      Object.defineProperty(document, 'visibilityState', { value: state, configurable: true })
+      await React.act(async () => document.dispatchEvent(new window.Event('visibilitychange')))
+      await ui.flush()
+    }
+    await vis('hidden')
+    assert.equal(series().observers[0].options.refetchInterval, false)
+    // Pushes stopped meanwhile: once shown and PUSH_TRUST_MS past the last push, the 30 s polls are back (the same
+    // check runs every 15 s while shown).
+    const t0 = realNow()
+    Date.now = () => t0 + P.PUSH_TRUST_MS + 1
+    await vis('visible')
+    assert.equal(series().observers[0].options.refetchInterval, P.POLL_MS, 'fallback to polling')
+  } finally {
+    Date.now = realNow
+    delete document.visibilityState
+    await ui.close()
+  }
+  assert.equal(listeners.size, 0, 'unsubscribed on unmount')
+})
+
+test('applySnapshot: series by name only are re-read; invalid bodies never land; the throttle is taken', () => {
+  const set = [], invalidated = []
+  const client = { setQueryData: (k, v) => set.push([k, v]), invalidateQueries: (o) => invalidated.push(o.queryKey) }
+  assert.equal(P.applySnapshot(client, { series_keys: ['6h|model', '7d|gateway', 'bad|gateway'], series: { '7d|gateway': { nope: 1 } }, throttle: { percent: 40 } }), true)
+  assert.deepEqual(invalidated, [['throughput', 'series', '6h', 'model'], ['throughput', 'series', '7d']])
+  assert.deepEqual(set, [[['throughput', 'throttle'], { percent: 40 }]])
+  assert.equal(P.applySnapshot(client, null), false)
+})

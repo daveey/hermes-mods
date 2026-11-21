@@ -3,6 +3,7 @@
 import {
   host,
   useQuery,
+  useQueryClient,
   STATUSBAR_AREAS,
   PALETTE_AREA,
   Popover,
@@ -18,6 +19,16 @@ export const POLL_OPEN_MS = 15000
 // Closed too, so opening the panel always shows data at most 15s old. Cheap: the gateway
 // serves a 5s cached build; nothing polls while the window is hidden.
 export const POLL_CLOSED_MS = 15000
+// Pushes (plugins/runners and plugins/throughput dashboards): `plugin.runners.fleet` carries a gateway's fleet when it
+// changes (checked every 15 s there, a heartbeat every 60 s) and `plugin.throughput.snapshot` its throttle once a
+// minute. While pushes from a route's gateway keep arriving (the last within PUSH_TRUST_MS) that route is not polled,
+// only read every SAFETY_MS (inside the gateway's 5-minute interest window, so it keeps pushing); when they stop, the
+// 15 s polls resume. A push is matched to a route by the gateway's `feed` id (host:pid, on every GET /v1/fleet answer)
+// and the profile it was built for.
+export const FLEET_EVENT = 'plugin.runners.fleet'
+export const SNAPSHOT_EVENT = 'plugin.throughput.snapshot'
+export const PUSH_TRUST_MS = 120000
+export const SAFETY_MS = 240000
 export const BACKOFF_MAX_MS = 300000
 export const REQUEST_TIMEOUT_MS = 5000
 const text = (v) => String(v ?? '').slice(0, 300)
@@ -56,7 +67,8 @@ export function createTransport(ctx, hostRef = host, clock = () => Date.now()) {
         { connectionId: route.connectionId, timeoutMs: REQUEST_TIMEOUT_MS }
       )
       if (body?.contract_version !== 1 || !body.gateways || !body.ci) throw Error('Invalid fleet response')
-      routes.set(key, { route, body, at: clock(), failures: 0, nextAt: 0 })
+      const cur = routes.get(key) || {}
+      routes.set(key, { route, body, at: clock(), fetchedAt: clock(), failures: 0, nextAt: 0, liveAt: cur.liveAt, pushHash: typeof body.hash === 'string' ? body.hash : undefined })
     } catch (e) {
       const failures = s.failures + 1
       const status = e?.status ?? e?.statusCode
@@ -76,6 +88,9 @@ export function createTransport(ctx, hostRef = host, clock = () => Date.now()) {
     const owner = c.owner && list.find((r) => routeKey(r) === c.owner)
     const byDefault = list.find((r) => r.targetProfile === 'default')
     const lead = owner || byDefault || list[0]
+    // The lead's gateway is pushing this route's fleet: no request until the safety read (or a push says "changed").
+    const ls = state(lead)
+    if (ls?.body && !ls.dirty && now - (ls.liveAt ?? -Infinity) < PUSH_TRUST_MS && now - (ls.fetchedAt ?? -Infinity) < SAFETY_MS) return
     // Until the owner is known, sweep every poll; if a sweep got answers but no profile
     // serves CI, settle on the lead and keep re-sweeping only every DISCOVERY_MS.
     const sweep = (!owner && !c.answered) || c.afterFailure || now - c.sweptAt >= DISCOVERY_MS
@@ -110,7 +125,29 @@ export function createTransport(ctx, hostRef = host, clock = () => Date.now()) {
     await Promise.all([...groups].map(([id, g]) => pollConnection(id, g)))
     return merge([...routes.values()], clock())
   }
-  return { poll, routes }
+  // One `plugin.runners.fleet` push: apply it to every route whose last answer came from that gateway process and
+  // profile. True when it changed what the panel shows (the caller then re-renders from view()).
+  function applyPush(p) {
+    if (!p || typeof p.feed !== 'string') return false
+    const now = clock()
+    let changed = false
+    for (const [key, s] of routes) {
+      if (s.body?.feed !== p.feed || (s.body.profile || 'default') !== (p.profile || 'default')) continue
+      if (p.fleet && p.fleet.contract_version === 1 && p.fleet.gateways && p.fleet.ci) {
+        routes.set(key, { ...s, body: { ...p.fleet, feed: p.feed }, at: now, failures: 0, nextAt: 0, liveAt: now, pushHash: p.hash, dirty: false })
+        changed = true
+      } else if (p.heartbeat) {
+        // The gateway's fleet is still the one we hold (same hash as our last answer or push): current again. A
+        // heartbeat over data we cannot match only keeps the gateway counted as live.
+        routes.set(key, { ...s, liveAt: now, ...(s.pushHash && s.pushHash === p.hash ? { at: now } : {}) })
+        changed = changed || (s.pushHash && s.pushHash === p.hash)
+      } else {
+        routes.set(key, { ...s, liveAt: now, dirty: true }) // too big to push: read it on the next poll
+      }
+    }
+    return changed
+  }
+  return { poll, routes, applyPush, view: () => merge([...routes.values()], clock()) }
 }
 
 // One transport per plugin ctx, not per mount. The status bar wraps each contribution in a
@@ -1231,10 +1268,18 @@ export function PipChip({ groups }) {
 
 // The React Query cache keeps the last view across refetches (no flicker, no spinner);
 // one poll runs at a time and polling stops while the window is hidden.
+// The gateway stream (ctx.onEvent; older hosts: host.onEvent). Returns a disposer, or null without one.
+export function onPush(ctx, type, fn) {
+  const subscribe = typeof ctx?.onEvent === 'function' ? ctx.onEvent : typeof host?.onEvent === 'function' ? host.onEvent : null
+  return subscribe ? subscribe(type, fn) : null
+}
+
 export function Runners({ ctx }) {
   const [open, setOpen] = useState(false)
   const visible = useVisible()
   const transport = useMemo(() => transportFor(ctx), [ctx])
+  const client = useQueryClient()
+  const throttleLive = useRef(-Infinity)
   const repairClient = useMemo(() => createRepairClient(ctx), [ctx])
   const scalerClient = useMemo(() => createScalerClient(ctx), [ctx])
   const query = useQuery({
@@ -1252,6 +1297,19 @@ export function Runners({ ctx }) {
     return () => window.removeEventListener('hermes-show-runners', show)
   }, [])
   useEffect(() => { if (open && visible) query.refetch() }, [open])
+  useEffect(() => {
+    const offFleet = onPush(ctx, FLEET_EVENT, (ev) => {
+      if (transport.applyPush(ev?.payload)) client.setQueryData(['runners', 'fleet'], transport.view())
+    })
+    const offThrottle = onPush(ctx, SNAPSHOT_EVENT, (ev) => {
+      const p = ev?.payload
+      const cur = client.getQueryData(['runners', 'throttle'])
+      if (!p?.feed || !cur || cur.feed !== p.feed || !p.throttle || typeof p.throttle.percent !== 'number') return
+      throttleLive.current = Date.now()
+      client.setQueryData(['runners', 'throttle'], p.throttle)
+    })
+    return () => { offFleet?.(); offThrottle?.() }
+  }, [ctx, transport, client])
   const now = useNow(visible)
   const view = query.data
   // The token throttle and per-gateway slot limits (throughput plugin). Absent or failing: nothing is crossed out.
@@ -1259,7 +1317,8 @@ export function Runners({ ctx }) {
   const tq = useQuery({
     queryKey: ['runners', 'throttle'],
     queryFn: async () => { try { return await bridge(THROTTLE_PATH) } catch { return null } },
-    refetchInterval: visible ? POLL_OPEN_MS : false,
+    // Pushed once a minute while the gateway sees our reads: then only the safety read (which also renews interest).
+    refetchInterval: visible ? (now - throttleLive.current < PUSH_TRUST_MS ? SAFETY_MS : POLL_OPEN_MS) : false,
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: false,
     retry: false,

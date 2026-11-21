@@ -2,6 +2,13 @@
 
 Mounted by the dashboard at /api/plugins/runners. The core owns Host validation,
 OAuth verification and token verification. No caller-selected profile/home is used.
+
+Push (see FleetPusher at the end): while a client read GET /v1/fleet in the last FLEET_INTEREST_S, this process
+checks its own (launch) profile's fleet every FLEET_CHECK_S and pushes ``plugin.runners.fleet``
+``{feed, epoch, seq, at, profile, fleet}`` when it changed, else ``{..., heartbeat: true}`` every
+FLEET_HEARTBEAT_S. GET /v1/fleet carries the same ``feed`` (host:pid), so a client can tell which connection a push
+came from. A fleet over FLEET_PUSH_MAX_BYTES goes out as ``{changed: true}`` only (clients read it).
+
 Cookie sessions require a same-origin Origin for refresh; native loopback session
 and registered service tokens can omit Origin, but never send a foreign Origin.
 """
@@ -474,7 +481,10 @@ def fleet_view():
     a poll burst over every profile costs one registry/replica read plus one CI projection each.
     """
     profile = active_profile()
-    return _cached(_fleet_entry(profile), lambda: _build_fleet(profile))
+    fleet_pusher().note()
+    body = _cached(_fleet_entry(profile), lambda: _build_fleet(profile))
+    # ``hash`` is what this process's pushes call the same fleet: a heartbeat with it confirms this answer is current.
+    return {**body, 'feed': FEED_ID, 'hash': fleet_digest(_json_safe(body))}
 
 
 def _build_fleet(profile):
@@ -651,3 +661,129 @@ def job_submit(request: Request, payload: dict):
 @router.get('/jobs/{job_id}')
 def job_lookup(job_id: str):
     return jobs_invoke('get', job_id)
+
+
+# ── push: the launch profile's fleet, when it changes ──────────────────────────────────────────────────────────────
+import hashlib  # noqa: E402
+import itertools  # noqa: E402
+import json  # noqa: E402
+import logging  # noqa: E402
+import os  # noqa: E402
+import socket  # noqa: E402
+import time as _time  # noqa: E402
+import uuid  # noqa: E402
+
+FEED_ID = f'{socket.gethostname()}:{os.getpid()}'
+FLEET_INTEREST_S = 300.0   # no GET /v1/fleet for 5 min: no checks, no pushes
+FLEET_CHECK_S = 15.0       # the Desktop's old poll cadence, now once per process instead of per window and route
+FLEET_HEARTBEAT_S = 60.0   # with nothing changed, clients still hear from us this often (their trust lasts 2 min)
+FLEET_PUSH_MAX_BYTES = 256 * 1024
+_VOLATILE = ('generated_at',)
+_push_log = logging.getLogger('hermes.plugins.runners')
+
+
+def _json_safe(v):
+    if isinstance(v, float):
+        return v if v == v and v not in (float('inf'), float('-inf')) else None
+    if v is None or isinstance(v, (bool, int, str)):
+        return v
+    if isinstance(v, dict):
+        return {str(k): _json_safe(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple, set)):
+        return [_json_safe(x) for x in v]
+    return str(v)
+
+
+def fleet_digest(fleet):
+    """One fleet's identity, ignoring when it was built."""
+    return hashlib.sha1(json.dumps({k: v for k, v in fleet.items() if k not in _VOLATILE},
+                                   sort_keys=True, default=str).encode()).hexdigest()
+
+
+class FleetPusher:
+    """``build()`` -> (profile, fleet body); ``emit(payload)`` delivers one push. Tests drive ``step()``."""
+
+    def __init__(self, emit, build, clock=_time.monotonic, wall=_time.time):
+        self.emit, self.build, self.clock, self.wall = emit, build, clock, wall
+        self.epoch = uuid.uuid4().hex[:12]
+        self.seq = itertools.count(1)
+        self.lock = threading.Lock()
+        self.interest_at = float('-inf')
+        self.last_hash = None
+        self.last_push = float('-inf')
+        self.stopped = threading.Event()
+        self.thread = None
+
+    @staticmethod
+    def can_push():
+        return 'tui_gateway.server' in sys.modules  # only the serving process has windows to push to
+
+    def note(self):
+        with self.lock:
+            self.interest_at = self.clock()
+            if (not self.stopped.is_set() and self.can_push()
+                    and (self.thread is None or not self.thread.is_alive())):
+                self.thread = threading.Thread(target=self.run, name='runners-fleet-push', daemon=True)
+                self.thread.start()
+
+    def interested(self):
+        return self.clock() - self.interest_at < FLEET_INTEREST_S
+
+    def step(self):
+        """One check: push the fleet when it changed, a heartbeat when one is due. Returns what was pushed or None."""
+        if not self.interested():
+            return None
+        profile, fleet = self.build()
+        fleet = _json_safe(fleet)
+        digest = fleet_digest(fleet)
+        now = self.clock()
+        base = dict(feed=FEED_ID, epoch=self.epoch, at=self.wall(), profile=profile, hash=digest)
+        if digest != self.last_hash:
+            body = dict(base, seq=next(self.seq), fleet=fleet)
+            if len(json.dumps(body)) > FLEET_PUSH_MAX_BYTES:
+                body = dict(base, seq=body['seq'], fleet=None, changed=True)
+        elif now - self.last_push >= FLEET_HEARTBEAT_S:
+            body = dict(base, seq=next(self.seq), heartbeat=True)
+        else:
+            return None
+        self.emit(body)
+        self.last_hash, self.last_push = digest, now
+        return body
+
+    def run(self):
+        while not self.stopped.is_set():
+            with self.lock:
+                if not self.interested():
+                    self.thread = None
+                    return
+            started = self.clock()
+            try:
+                self.step()
+            except Exception:  # noqa: BLE001 -- no transport or a broken build: try again next check
+                _push_log.debug('runners fleet push failed', exc_info=True)
+            self.stopped.wait(max(1.0, FLEET_CHECK_S - (self.clock() - started)))
+
+    def stop(self):
+        self.stopped.set()
+
+
+_fleet_pusher = {}
+_fleet_pusher_lock = threading.Lock()
+
+
+def _emit_fleet(body):
+    from hermes_cli.plugin_events import broadcast_plugin_event
+    broadcast_plugin_event('runners', 'fleet', body)
+
+
+def _launch_fleet():
+    profile = active_profile()  # the push thread has no request scope: this process's own profile
+    return profile, _cached(_fleet_entry(profile), lambda: _build_fleet(profile))
+
+
+def fleet_pusher():
+    with _fleet_pusher_lock:
+        p = _fleet_pusher.get('p')
+        if p is None or p.stopped.is_set():
+            p = _fleet_pusher['p'] = FleetPusher(_emit_fleet, _launch_fleet)
+        return p

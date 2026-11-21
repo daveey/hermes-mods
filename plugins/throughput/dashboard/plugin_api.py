@@ -9,6 +9,16 @@ GET /api/plugins/throughput/v1/budget[?factor=&hours=[&projection_only=1]]: this
 spend per provider over 7 days (cached a minute per process) and the current burst, plus the cost of the given burst
 (../budget_view.py); ``projection_only`` returns just the burst and its cost.
 
+POST /api/plugins/throughput/v1/watch (body ``{"series": [{"range": "6h", "by": "gateway"}, ...], "advisory": bool}``):
+register interest (5 min) and catch up: answers the current snapshot (below). GET /v1/throttle and /v1/series count as
+interest too. Only GET /v1/throttle and a watch with ``advisory: true`` keep the per-minute slots advisory computing.
+Push: ``plugin.throughput.snapshot`` ``{feed, epoch, seq, at, minute, interval_s, throttle, series, series_keys}`` once a
+minute (right after the minute's advisory flight, advisory.py; at the latest ``PUSH_DEADLINE_S`` into the minute) and
+after an advisory flight that changed it, while a client showed interest in the last ``INTEREST_S``. ``throttle`` is
+the GET /v1/throttle payload, ``series`` the GET /v1/series payloads of the (range, by) views read or watched lately
+(at most ``MAX_SERIES_KEYS``). JSON-safe; over ``PUSH_MAX_BYTES`` the series are sent by name only (``series_keys``).
+``feed`` (host:pid) is also on the GET /v1/throttle payload, so a client can tell which connection a push is from.
+
 Loaded by path by the dashboard, outside its package: the plugin package is imported under a private name.
 Single-flight per (range, by) for 15 s; the slow work (sqlite reads, registry fetch) runs in a worker thread.
 Requesting the series also starts the sampler in this process if no other process on this Hermes root runs it
@@ -37,6 +47,7 @@ async def lifespan(app):
     try:
         yield
     finally:
+        stop_pusher()
         await asyncio.to_thread(advisory.stop)
 
 
@@ -134,10 +145,11 @@ async def get_series(range: str = Query("6h"), by: str = Query("gateway")) -> Di
         raise HTTPException(status_code=400, detail="range must be 1h, 6h, 24h or 7d")
     if by not in BYS:
         raise HTTPException(status_code=400, detail="by must be gateway or model")
+    note_interest([(range, by)])
     return await asyncio.to_thread(cached, range, by)
 
 
-def throttle_payload(now: float | None = None) -> Dict[str, Any]:
+def throttle_payload(now: float | None = None, interest: bool = True) -> Dict[str, Any]:
     """Level, cap and measured rate (tokens/s, in+out) the fleet obeys, plus each pool's runway. ``fleet`` is false
     on a host without the hermes-hub link (the level then applies to ``scope``, this gateway, alone);
     ``gateways`` lists this and every running gateway with whether it has acknowledged the current level."""
@@ -158,7 +170,7 @@ def throttle_payload(now: float | None = None) -> Dict[str, Any]:
     try:  # advisory (the Runners panel crosses out slots a limit will not let run): never fail the route
         slots = importlib.import_module(pkg().__name__ + ".slots")
         out["slots"] = slots.payload(root, sampler.series_path(root), out["cap_per_s"], cards=_state["cards"],
-                                     now=now)
+                                     now=now, interest=interest)
     except Exception:
         out["slots"] = None
     try:  # this gateway's enforced slot limit (slotgate.py): what its start gate obeys
@@ -176,6 +188,7 @@ def throttle_payload(now: float | None = None) -> Dict[str, Any]:
     except Exception:
         out["slot_gate"] = None
     out["now"] = now
+    out["feed"] = FEED_ID
     return out
 
 
@@ -214,6 +227,7 @@ def set_throttle(percent: Any) -> Dict[str, Any]:
 
 @router.get("/v1/throttle")
 async def get_throttle() -> Dict[str, Any]:
+    note_interest()
     return await asyncio.to_thread(throttle_payload)
 
 
@@ -374,3 +388,219 @@ async def get_budget(factor: float | None = Query(None), hours: float | None = Q
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
     return await asyncio.to_thread(budget_payload, factor, hours, None, projection_only)
+
+
+# ── push: one snapshot a minute while someone looks ──────────────────────────────────────────────────────────────────
+import itertools  # noqa: E402
+import json  # noqa: E402
+import logging  # noqa: E402
+import os  # noqa: E402
+import socket  # noqa: E402
+import uuid  # noqa: E402
+
+PLUGIN_ID = "throughput"
+PUSH_EVENT = "snapshot"
+FEED_ID = f"{socket.gethostname()}:{os.getpid()}"
+INTEREST_S = 300.0  # a client that neither read nor watched for 5 min gets no pushes and causes no computation
+PUSH_DEADLINE_S = 20.0  # push by this far into a minute even if its advisory flight has not finished
+PUSH_MAX_BYTES = 256 * 1024
+MAX_SERIES_KEYS = 4
+_log = logging.getLogger("hermes.plugins.throughput")
+
+
+def json_safe(v):
+    """``v`` as plain JSON: non-finite floats become null, unknown types their str(), keys strings."""
+    if isinstance(v, float):
+        return v if v == v and v not in (float("inf"), float("-inf")) else None
+    if v is None or isinstance(v, (bool, int, str)):
+        return v
+    if isinstance(v, dict):
+        return {str(k): json_safe(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple, set)):
+        return [json_safe(x) for x in v]
+    return str(v)
+
+
+def series_key(range_key: str, by: str) -> str:
+    return f"{range_key}|{by}"
+
+
+class Pusher:
+    """Interest, the push thread and its snapshots for this process. ``emit(payload)`` delivers one push; ``clock`` is
+    monotonic, ``wall`` the minute clock. Tests drive ``step()`` directly."""
+
+    def __init__(self, emit, build_throttle, build_series, clock=time.monotonic, wall=time.time):
+        self.emit = emit
+        self.build_throttle = build_throttle
+        self.build_series = build_series
+        self.clock = clock
+        self.wall = wall
+        self.epoch = uuid.uuid4().hex[:12]
+        self.seq = itertools.count(1)
+        self.lock = threading.Lock()
+        self.interest_at = float("-inf")
+        self.keys: Dict[str, float] = {}  # "range|by" -> last interest
+        self.pushed_minute = None
+        self.last_hash = None
+        self.kick = threading.Event()
+        self.stopped = threading.Event()
+        self.thread = None
+        self.pushes = 0
+
+    def note(self, keys=()) -> None:
+        now = self.clock()
+        with self.lock:
+            self.interest_at = now
+            for r, by in keys:
+                self.keys[series_key(r, by)] = now
+            for k, at in list(self.keys.items()):
+                if now - at >= INTEREST_S:
+                    self.keys.pop(k)
+            while len(self.keys) > MAX_SERIES_KEYS:
+                self.keys.pop(min(self.keys, key=self.keys.get))
+            start = (not self.stopped.is_set() and self.can_push()
+                     and (self.thread is None or not self.thread.is_alive()))
+            if start:
+                self.thread = threading.Thread(target=self.run, name="throughput-push", daemon=True)
+                self.thread.start()
+
+    def interested(self) -> bool:
+        return self.clock() - self.interest_at < INTEREST_S
+
+    @staticmethod
+    def can_push() -> bool:
+        """Only a process whose gateway transport is loaded (``hermes serve``, the one the Desktop talks to) has anyone
+        to push to; elsewhere (tests, a CLI importing the router) no thread starts."""
+        return "tui_gateway.server" in sys.modules
+
+    def snapshot(self) -> Dict[str, Any]:
+        """The push body (also the catch-up answer). Reads record no interest (they must not keep themselves alive)."""
+        with self.lock:
+            keys = sorted(k for k, at in self.keys.items() if self.clock() - at < INTEREST_S)
+        try:
+            throttle = self.build_throttle()
+        except Exception:
+            _log.debug("throughput push: throttle unavailable", exc_info=True)
+            throttle = None
+        series = {}
+        for k in keys:
+            r, by = k.split("|", 1)
+            try:
+                series[k] = self.build_series(r, by)
+            except Exception:
+                _log.debug("throughput push: series %s unavailable", k, exc_info=True)
+        now = self.wall()
+        return {"feed": FEED_ID, "epoch": self.epoch, "at": now, "minute": int(now // 60) * 60, "interval_s": 60,
+                "throttle": throttle, "series": series, "series_keys": sorted(series)}
+
+    def push(self) -> Dict[str, Any]:
+        body = json_safe(self.snapshot())
+        digest = json.dumps({k: body.get(k) for k in ("throttle", "series")}, sort_keys=True)
+        body["seq"] = next(self.seq)
+        if len(json.dumps(body)) > PUSH_MAX_BYTES:
+            body["series"] = {}  # names stay in series_keys: clients read those views themselves
+        self.last_hash = digest
+        self.emit(body)
+        self.pushes += 1
+        return body
+
+    def step(self, kicked: bool) -> bool:
+        """One decision: push when the minute's advisory flight finished (``kicked``) or this minute has no push yet
+        at ``PUSH_DEADLINE_S``. True when it pushed."""
+        if not self.interested():
+            return False
+        wall = self.wall()
+        minute = int(wall // 60)
+        due = kicked or (self.pushed_minute != minute and wall - minute * 60 >= PUSH_DEADLINE_S) \
+            or self.pushed_minute is None
+        if not due:
+            return False
+        try:
+            self.push()
+        except Exception:  # no transport (a CLI-imported router) or a broken build: the next minute tries again
+            _log.debug("throughput push failed", exc_info=True)
+        self.pushed_minute = minute
+        return True
+
+    def wait_s(self) -> float:
+        if self.pushed_minute is None:
+            return 0.0  # interest just started: push at once
+        wall = self.wall()
+        minute = int(wall // 60) * 60
+        target = minute + PUSH_DEADLINE_S if self.pushed_minute != minute // 60 else minute + 60 + PUSH_DEADLINE_S
+        return max(0.5, min(target - wall, INTEREST_S))
+
+    def run(self) -> None:
+        while not self.stopped.is_set():
+            if not self.interested():
+                with self.lock:
+                    if not self.interested():
+                        self.thread = None
+                        return
+            kicked = self.kick.wait(self.wait_s())
+            self.kick.clear()
+            if self.stopped.is_set():
+                return
+            self.step(kicked)
+
+    def on_flight(self, root, ok) -> None:
+        if root == str(_state.get("root")):
+            self.kick.set()
+
+    def stop(self) -> None:
+        self.stopped.set()
+        self.kick.set()
+
+
+_pusher_lock = threading.Lock()
+_pusher: Dict[str, Any] = {}
+
+
+def _emit(body: Dict[str, Any]) -> None:
+    from hermes_cli.plugin_events import broadcast_plugin_event
+    broadcast_plugin_event(PLUGIN_ID, PUSH_EVENT, body)
+
+
+def pusher() -> Pusher:
+    with _pusher_lock:
+        p = _pusher.get("p")
+        if p is None or p.stopped.is_set():
+            import importlib
+            _services()
+            advisory = importlib.import_module(pkg().__name__ + ".advisory")
+            p = Pusher(_emit, lambda: throttle_payload(interest=False), cached)
+            p.off = advisory.subscribe(p.on_flight)
+            _pusher["p"] = p
+        return p
+
+
+def stop_pusher() -> None:
+    with _pusher_lock:
+        p = _pusher.pop("p", None)
+    if p is not None:
+        p.stop()
+        off = getattr(p, "off", None)
+        if callable(off):
+            off()
+
+
+def note_interest(keys=()) -> None:
+    try:
+        pusher().note(keys)
+    except Exception:  # interest is best effort: the route still answers
+        _log.debug("throughput push: interest not recorded", exc_info=True)
+
+
+@router.post("/v1/watch")
+async def watch(body: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
+    keys = []
+    for item in (body or {}).get("series") or []:
+        if isinstance(item, dict) and item.get("range") in ("1h", "6h", "24h", "7d") and item.get("by", "gateway") in BYS:
+            keys.append((item["range"], item.get("by", "gateway")))
+    p = pusher()
+    p.note(keys[:MAX_SERIES_KEYS])
+    # ``advisory: true`` (a client that shows slot limits) keeps the per-minute slots advisory alive, like a GET
+    # /v1/throttle; a client that only charts series does not.
+    advisory = bool((body or {}).get("advisory"))
+    snap = await asyncio.to_thread(lambda: {**p.snapshot(), "throttle": throttle_payload(interest=advisory)})
+    return json_safe({**snap, "seq": None, "interest_s": INTEREST_S})

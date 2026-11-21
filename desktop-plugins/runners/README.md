@@ -168,8 +168,17 @@ The server builds one result per 5 s per profile, single-flight, so any number o
 registry read (core caches it 60 s), indexed reads of each board replica (~30 ms on the hub) and one
 inventory projection. A registry older than 3 min marks gateway liveness unknown (Board not answering).
 
-The panel polls every 15 s, open or closed (so opening it always shows data at most 15 s old), and not at
-all while the window is hidden. One poll
+**Push.** The gateway pushes instead (plugins/runners `plugin.runners.fleet`: its own profile's fleet when it changes,
+checked every 15 s there, else a heartbeat every 60 s, while some client read `/v1/fleet` in the last 5 min; the
+throttle comes in plugins/throughput's per-minute `plugin.throughput.snapshot`). A push is matched to a route by the
+gateway's `feed` id (host:pid, on every `/v1/fleet` and `/v1/throttle` answer) and profile; a heartbeat makes the
+data current again only when its `hash` equals the fleet we hold. While a route's gateway pushes (the last within
+2 min), that route is not requested except for a safety read every 4 min (inside the gateway's 5-minute interest
+window, so the pushes continue); the throttle query drops to the same 4 min. When pushes stop for 2 min, the 15 s
+polls below resume on their own. A fleet too big to push (`changed: true`) is read on the next poll.
+
+Without pushes the panel polls every 15 s, open or closed (so opening it always shows data at most 15 s old), and
+not at all while the window is hidden. One poll
 runs at a time; each request times out after 5 s. The React Query cache keeps the last view during refetches,
 so an open panel updates in place. A failing gateway is retried after 15 s, 30 s, 60 s … capped at 5 min, and
 its last data stays on screen marked "Stale: last update … · <error>". Each section comes from the connected
@@ -207,6 +216,9 @@ python -m pytest plugins/runners/tests/test_fleet.py plugins/runners/tests/test_
 - one request per connection, owner lead, sweep after a lead failure and every 5 min: "one request per
   connection", "the CI owner route leads", "when the lead fails", "discovery sweeps"
 - a remount keeps the transport (no sweep per mount): "a remounted chip keeps the transport"
+- pushes replace the poll (safety read only), polling resumes when they stop, foreign feeds/profiles ignored,
+  heartbeat hash, oversize push re-read, chip and throttle updated from pushes, nothing while hidden: `push.test.mjs`;
+  server side `plugins/runners/tests/test_fleet_push.py`, `plugins/throughput/tests/test_push.py`
 
 - CI groups: categories + counts + health, collapsed by default, expand/remember/collapse: `groups.test.mjs`,
   `test_fleet.py` `test_ci_machine_categories_for_the_panel_groups`

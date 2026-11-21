@@ -99,3 +99,21 @@ test('no Desktop card counting outside the geometry helper',async()=>{
   assert.doesNotMatch(src,/cards\.length|cards\?\.length|cards\.reduce\(|for \(const c of cards\)|list\.reduce\(/)
   assert.doesNotMatch(src,/refetchInterval:/)
 })
+
+test('fallback poll reads nothing while the window is hidden', async () => {
+  const timers=[]; let reads=0
+  const source=P.createSource({rest:async()=>{reads++;return fixture}},host)
+  const stop=source.subscribe({hours:6,window:'6h',expanded:false},()=>{},()=>{}, {
+    setInterval:(fn,ms)=>{timers.push({fn,ms});return timers.length},clearInterval:()=>{},
+    setTimeout:()=>1,clearTimeout:()=>{}
+  })
+  await new Promise(r=>setTimeout(r,10))
+  assert.deepEqual(timers.map(t=>t.ms),[60000])
+  const before=reads
+  Object.defineProperty(document,'hidden',{value:true,configurable:true})
+  try { timers[0].fn(); await new Promise(r=>setTimeout(r,5)); assert.equal(reads,before,'hidden: no read') }
+  finally { delete document.hidden }
+  timers[0].fn(); await new Promise(r=>setTimeout(r,5))
+  assert.equal(reads,before+1,'shown: the poll reads again')
+  stop()
+})
