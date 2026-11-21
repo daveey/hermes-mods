@@ -6,6 +6,7 @@ triggers:
     - "the status panel shows X wrong"
     - "add a field to the session panel"
     - "how does an unblock card render"
+    - "blocked section shows cards but no session is red"
   not_for: "writing a human ask (use generate-unblock-card); deciding whether a human is needed (use try-to-unblock)"
 version: 0.1.0
 author: David Bloom (daveey), Hermes Agent
@@ -100,6 +101,7 @@ For a private historical golden, retain raw input, observation time, source revi
 
 ## Pitfalls and verification
 
+- The left-pane **Blocked** sidebar section and the red row stripe have different inputs and different owners. Look for the Blocked section in core (`apps/desktop/src/plugins/kanban/blocked-section.tsx`, `fetchBlockedTasks` in `api.ts`), not in hermes-mods `desktop-plugins`. It lists every blocked card on every gateway and board. It groups each card by `managing_session_id` (the latest `tui` notify subscriber), else by the card's `session_id`, and gets group titles from `/session-labels` on the backend's own profile. The stripe turns red only from a visible row's `kanban_blocked`. When the section shows a card but no row is red, check the card's owner session on its home gateway (`home_gateway`; the local replica can be empty, so read the owner's DB through `tailnet_exec`). Cards created by background profiles have sessions the user's chats never show.
 - A push heartbeat proves transport freshness, not executor liveness. Do not reinterpret the cached model.
 - An ask for an unfocused chat can exist in the backend without being painted; inspect both independently.
 - MODEL.md contains phase-era notes; source and deployed bindings settle current answer-path behavior.
