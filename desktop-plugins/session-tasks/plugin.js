@@ -407,6 +407,8 @@ export function briefOf(scope) {
   return { situation, options: briefOptions(parts.options || ''), recommend: flatText(parts.recommend || '') }
 }
 
+const epochSec = v => { const n = Number(v); return Number.isFinite(n) && n > 0 ? (n > 1e11 ? n / 1000 : n) : 0 }
+
 function taskChip(t, status) {
   const watching = t.via === 'subscribed'
   const connectionId = t.connectionId || (t.gateway ? connectionForHubGateway(t.gateway) : null)
@@ -456,6 +458,9 @@ function taskChip(t, status) {
     prUrl: /^https:\/\/github\.com\//.test(str(t.pr_url)) ? str(t.pr_url) : null,
     activity: str(t.activity_kind) || null,
     activityAt: Number(t.activity_at) || 0,
+    // When the card last became ready (the Board's ready_since, ms; seconds tolerated), 0 = unknown: the panel's
+    // "waiting N for a worker" age.
+    readySince: epochSec(t.ready_since),
     // When the card last made progress: its newest event, else the current run's start; 0 = unknown. Never the
     // first claim or creation (`since`, display only): a hub row without events otherwise read as a week-old stall
     // (kanban-f241d1f60b).
