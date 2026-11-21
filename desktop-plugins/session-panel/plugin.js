@@ -1757,6 +1757,46 @@ function Fold({ label, items, k }) {
   ] })
 }
 
+// ── switch timing ──────────────────────────────────────────────────────────
+// [daveey 2026-11-20] "session changes must be instant". One desktop.log line per switch, like core's open-timing:
+// every distinct thing the panel showed in the PANEL_TRACE_MS after focus reached a chat, with ms since then.
+// `[panel-timing] {"session","connection","steps":[[ms,"signature"],...]}`; a switch with one step painted final.
+export const PANEL_TRACE_MS = 12_000
+let trace = null
+const nowMono = () => (typeof performance !== 'undefined' ? performance.now() : Date.now())
+/** A compact text of what the panel shows: section counts, pips, done, unread chains, evidence unknown, causes. */
+export function panelSignature({ sorted, n, asks, finished, evidenceUnknown, causes, chainRows, fresh }) {
+  const sec = ['active', 'stuck', 'waiting', 'blockedUpstream', 'ready', 'queued', 'unasked', 'reported']
+    .map(k => `${k[0]}${k === 'blockedUpstream' ? 'u' : ''}${(sorted[k] || []).length}`).join(' ')
+  const pips = Object.keys(n || {}).filter(k => n[k]).map(k => `${k}:${n[k]}`).join(',')
+  const read = (chainRows || []).length - (causes || []).reduce((a, c) => a + c.count, 0)
+  return [fresh ? 'fresh' : 'cached', sec, `asks${asks}`, `done${finished ? finished.length : '?'}`, `pips[${pips}]`,
+    evidenceUnknown ? `evunk${evidenceUnknown}` : '', read ? `reading${read}` : '',
+    `causes[${(causes || []).map(c => `${c.kind}:${c.count}`).join(',')}]`].filter(Boolean).join(' ')
+}
+export function tracePanel(route, sig, t = nowMono(), sink = line => window.hermesDesktop?.logLine?.(line)) {
+  if (!route?.session) return
+  const key = routeKey(route)
+  if (!trace || trace.key !== key) {
+    if (trace) flushTrace(sink)
+    trace = { key, session: route.session, connection: route.connectionId, t0: t, steps: [] }
+    trace.timer = setTimeout(() => flushTrace(sink), PANEL_TRACE_MS)
+    trace.timer?.unref?.() // node tests: never hold the process open
+  }
+  const ms = Math.round(t - trace.t0)
+  if (ms > PANEL_TRACE_MS) return
+  const last = trace.steps[trace.steps.length - 1]
+  if (!last || last[1] !== sig) trace.steps.push([ms, sig])
+}
+function flushTrace(sink) {
+  const tr = trace
+  if (!tr || tr.flushed) return
+  tr.flushed = true
+  clearTimeout(tr.timer)
+  try { sink(`[panel-timing] ${JSON.stringify({ session: tr.session, connection: tr.connection, steps: tr.steps })}`) } catch {}
+}
+export const resetTraceForTests = () => { if (trace) clearTimeout(trace.timer); trace = null }
+
 export function Panel() {
   const [tasks, setTasks] = useState(() => (typeof window !== 'undefined' ? window.__sessionTasks?.snapshot : null) || null)
   const [doneState, setDone] = useState(done)
@@ -1830,7 +1870,11 @@ export function Panel() {
   // would show again: hand those identities to the strip so each card renders once. Exact identity only.
   const legacy = US?.Strip ? jsx(US.Strip, { hideCards: sorted.unasked.map(i => i.chip) }, 'legacy') : null
   // Keep finished history reachable even after the final open card closes.
-  if (!finished?.length && !US?.hasQueuePresentation?.() && !hasOpenWork(sorted, { asks, steps: US?.snapshot?.ledger?.steps, issues: US?.snapshot?.issues })) return null
+  const fresh = !!(tasks && tasks.stored === stored && tasks.fresh)
+  if (!finished?.length && !US?.hasQueuePresentation?.() && !hasOpenWork(sorted, { asks, steps: US?.snapshot?.ledger?.steps, issues: US?.snapshot?.issues })) {
+    tracePanel(route, `hidden${fresh ? ' fresh' : ''} chips${chips.length}`)
+    return null
+  }
   // The user-steps bridge qualifies these by owner/request/revision. A count alone cannot distinguish
   // a replacement ask; old bridges without identity must fail open rather than hide an unknown set.
   const askKeys = typeof US?.openAskKeys === 'function' ? US.openAskKeys() : []
@@ -1852,6 +1896,7 @@ export function Panel() {
   const retired = sorted.waiting.filter(i => i.cardStatus)
   const lineRows = [...chainRows, ...retired]
   const causes = causeBreakdown(lineRows, now, local)
+  tracePanel(route, panelSignature({ sorted, n, asks, finished, evidenceUnknown, causes, chainRows, fresh }))
   // A chain that runs into another root shown above is not repeated (`same chain as … above`).
   const sameAs = new Map()
   const needsYou = [
