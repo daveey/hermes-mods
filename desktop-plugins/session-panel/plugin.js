@@ -534,6 +534,7 @@ export function parkFromDetail(detail) {
     wakeAt: impliedWake(p, parkedAt),
     awaiting: aw ? { kind: str(aw.kind), ref: str(aw.ref), why: str(aw.why), ...(aw.inferred ? { inferred: true } : {}) } : null,
     check, nextProbeAt: Number(wc?.next_at) > 0 ? Number(wc.next_at) : null,
+    episode: detail?.task?.wait_episode || null,
     continued: ev.kind === 'continued', parkedAt, superseded: false,
     forHuman: !timed && HUMAN_BLOCK_KINDS.has(str(detail?.task?.block_kind))
   }
@@ -569,7 +570,7 @@ export function parkFor(chip, nowMs = Date.now(), read = readPark, fallback) {
 }
 /** True when a waiting row's own wait names nothing, so its owner's park is worth reading. */
 export const needsPark = i => i?.kind === 'kanban' && !i.cardStatus && str(i.chip?.state) === 'scheduled' &&
-  (!str(i.chip?.waitingOn) || /did not publish/i.test(str(i.chip?.waitingOn))) && !i.chip?.upstream?.id && !i.chip?.stale
+  (!str(i.chip?.waitingOn) || /did not publish/i.test(str(i.chip?.waitingOn)) || /^(?:external\s+)?(?:ci|git-ci|deploy)\b/i.test(str(i.chip?.waitingOn))) && !i.chip?.upstream?.id && !i.chip?.stale
 
 async function readTitle(route, id) {
   const bridge = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
@@ -1193,6 +1194,24 @@ export function shortWait(w) {
     .replace(/\b([0-9a-f]{9})[0-9a-f]{31}\b/g, '$1')
 }
 
+/** CI/deploy duration is canonical episode age, never the newest park or task age. */
+export function externalWait(pk, nowMs, published = '') {
+  if (pk?.forHuman || pk?.superseded) return null
+  const a = pk?.awaiting
+  const hint = a && !a.inferred ? `${a.kind} ${a.ref}` : published
+  const match = /^(?:external\s+)?(ci|git-ci|deploy)\b/i.exec(hint)
+  if (a && !a.inferred && !match) return null
+  const kind = match ? (match[1].toLowerCase() === 'deploy' ? 'deploy' : 'ci') : pk?.episode?.kind
+  if (kind !== 'ci' && kind !== 'deploy') return null
+  const now = nowMs / 1000, since = Number(pk?.episode?.since)
+  const waited = Number.isFinite(since) && since > 0 && since <= now ? shortDur(now - since) : '(start unknown)'
+  const rawRef = a?.ref || published.replace(/^(?:external\s+)?(?:ci|git-ci|deploy)\s*/i, '')
+  const ref = shortWait(kind === 'ci' ? `ci ${rawRef}` : rawRef).replace(/^CI (?:on )?/i, '')
+  const at = pk?.nextProbeAt || pk?.wakeAt
+  const check = at ? (at > now ? `next check in ${shortDur(at - now)}` : `next check overdue by ${shortDur(now - at)}`) : ''
+  return { text: `${kind === 'ci' ? 'CI' : 'Deploy'} · waiting ${waited}${ref ? ` · ${ref}` : ''}`, sub: check }
+}
+
 /** What a Waiting row shows on its line: `{ reason: [text | { ref }], tone, age, sub }`. `ref` is
  *  `{ id, status, text }`; `tone` 'warn' (orange: well overdue, a retired ask still blocked) or 'note' (yellow: no wake
  *  or reason published);
@@ -1244,7 +1263,9 @@ export function rowWait(i, nowMs = Date.now(), parkInfo = null) {
     const at = Number(c.activityAt)
     return v([`no reviewer running${kind ? ` · ${kind}${at > 0 ? ` ${shortDur(now - at)} ago` : ''}` : ''}`])
   }
-  if (w && !/did not publish/i.test(w)) return v([`on ${shortWait(w)}`])
+  const external = externalWait(parkInfo?.park, nowMs, w)
+  if (external) return { reason: [external.text], sub: external.sub + (parkInfo?.state === 'stale' ? ' · not re-read' : ''), age: '', tone: '' }
+  if (w && !/did not publish/i.test(w) && !(parkInfo?.park?.awaiting && /^(?:external\s+)?(?:ci|git-ci|deploy)\b/i.test(w))) return v([`on ${shortWait(w)}`])
   // Nothing on the row: the owner's park (read by the caller via parkFor) says what wakes it.
   if (parkInfo?.state === 'loading' && !parkInfo.park) return v(['reading wake…'])
   const pk = parkInfo?.park
@@ -1434,6 +1455,8 @@ function parkHop(detail, nowMs) {
   if (!pk) return { leaf: { kind: 'unknown', text: 'parked with no wake' } }
   if (pk.forHuman) return { leaf: { kind: 'you', text: 'no timed wake: will be blocked for you' } }
   if (pk.superseded) return { leaf: { kind: 'unknown', text: 'new park not synced yet', sub: `backstop ${pacificShort(pk.wakeAt, nowMs)}` } }
+  const external = externalWait(pk, nowMs)
+  if (external) return { leaf: { kind: 'external', ...external } }
   const a = pk.awaiting && !pk.awaiting.inferred ? pk.awaiting : null
   const when = pk.wakeAt ? (pk.wakeAt >= now ? `${shortDur(pk.wakeAt - now)} left · ${pacificShort(pk.wakeAt, nowMs)}` : `${shortDur(now - pk.wakeAt)} overdue`) : ''
   if (a?.kind === 'human') return { leaf: { kind: 'you', text: a.why || 'waits on you' } }
@@ -1504,6 +1527,7 @@ async function readCard(route, id) {
   return null
 }
 export const cardSummary = (id, r) => ({ id, title: str(r.detail.task.title), status: str(r.detail.task.status), session: str(r.detail.task.session_id), owner: typeof r.detail.owner === 'string' ? r.detail.owner : '', board: r.board, hop: nextHop(r.detail, Date.now()),
+  waitPark: parkFromDetail(r.detail),
   parents: Array.isArray(r.detail.links?.parents) ? r.detail.links.parents.map(str) : null,
   request: validHumanRequest(r.detail.task.human_request, r.detail.task.block_kind) ? r.detail.task.human_request : null
 })
@@ -1581,7 +1605,10 @@ export function cardInfo(chip, id, nowMs = Date.now(), read = readCard, fallback
   if (!route.connectionId) return { state: 'failed', info: null }
   const k = titleKey(route, id), hit = cards.get(k), age = hit ? nowMs - hit.at : Infinity
   // A record pushed by the gateway keeps its card detail: the next hop (waits, "10m left", overdue) is worked out now.
-  const live = i => (i && hit?.detail ? { ...i, hop: nextHop(hit.detail, nowMs) } : i)
+  const live = i => {
+    const external = i?.waitPark && externalWait(i.waitPark, nowMs)
+    return i && hit?.detail ? { ...i, hop: nextHop(hit.detail, nowMs) } : external ? { ...i, hop: { leaf: { kind: 'external', ...external } } } : i
+  }
   if (hit && (hit.pending ? age < TITLE_PENDING_MS : age < (hit.info && !hit.stale ? CARD_FRESH_MS : CARD_RETRY_MS))) return { state: hit.info ? (hit.stale ? 'stale' : 'ok') : hit.pending ? 'loading' : 'failed', info: hit.info ? (hit.stale ? { ...live(hit.info), stale: true } : live(hit.info)) : null }
   put(cards, k, { info: hit?.info || null, ...(hit?.stale ? { stale: true } : {}), at: nowMs, pending: true })
   const loud = !quietReads

@@ -206,7 +206,7 @@ test('row line: a short reason per kind of wait, tone and age; the long form sta
     [row('scheduled', { waitingOn: 'card t_01a1fa96bc4ff0f5 on hub', waitingSince: S - 600 }), 'on [t_01a1fa96bc4ff0f5]', '', '10m', ''],
     [row('todo', { upstream: { id: 't_01a197166756bd53', status: 'scheduled' } }), 'on [t_01a197166756bd53:scheduled]', '', '', ''],
     [row('triage', { waitingOn: 'release by card t_01a1e1778ac09234 (running)', contained: {} }), 'released by [t_01a1e1778ac09234:running]', '', '', ''],
-    [row('scheduled', { waitingOn: 'ci https://github.com/o/r/actions/runs/44819160264' }), 'on CI run 44819160264', '', '', ''],
+    [row('scheduled', { waitingOn: 'ci https://github.com/o/r/actions/runs/44819160264' }), 'CI · waiting (start unknown) · run 44819160264', '', '', ''],
     [row('scheduled', {}), 'no wake published', 'note', '', ''],
     [row('scheduled', { waitingOn: 'a producer the owner did not publish' }), 'no wake published', 'note', '', ''],
     [row('blocked', {}), 'blocked · no reason given', 'note', '', ''],
@@ -261,11 +261,11 @@ test('owner park: read from the card detail; the line shows the real wake instea
   assert.deepEqual([pk.wakeAt, pk.awaiting.kind, pk.continued, pk.parkedAt], [S + 360, 'ci', true, S - 240])
   const row = (park, chip = {}) => m.rowWait({ key: 'kb:x', kind: 'kanban', label: 'X', chip: { id: 't_x', state: 'scheduled', connectionId: 'C1', profile: 'default', ...chip } }, NOW, park)
   const line = v => [v.reason.map(p => (typeof p === 'string' ? p : `[${p.ref.id}]`)).join(''), v.sub, v.age, v.tone]
-  assert.deepEqual(line(row({ state: 'ok', park: pk })), ['on CI: local core-wt consumer suite PID 4143137', 'by Fri 14:59 PST', '4m', ''])
+  assert.deepEqual(line(row({ state: 'ok', park: pk })), ['CI · waiting (start unknown) · local core-wt consumer suite PID 4143137', 'next check in 6m', '', ''])
   const mk = (awaiting, extra = {}) => ({ state: 'ok', park: { wakeAt: S + 3600, awaiting, check: '', continued: false, parkedAt: S - 600, ...extra } })
-  assert.deepEqual(line(row(mk({ kind: 'ci', ref: 'https://github.com/o/r/actions/runs/44830930932' }))), ['on CI: run 44830930932', 'by Fri 15:53 PST', '10m', ''])
-  assert.deepEqual(line(row(mk({ kind: 'deploy', ref: 'https://github.com/o/r/pull/3824' }))), ['on deploy PR #3824', 'by Fri 15:53 PST', '10m', ''])
-  assert.deepEqual(line(row(mk({ kind: 'deploy', ref: 'e4fd7587390a189fa2726896a7809979858d1e2d' }))), ['on deploy e4fd75873', 'by Fri 15:53 PST', '10m', ''])
+  assert.deepEqual(line(row(mk({ kind: 'ci', ref: 'https://github.com/o/r/actions/runs/44830930932' }))), ['CI · waiting (start unknown) · run 44830930932', 'next check in 1h', '', ''])
+  assert.deepEqual(line(row(mk({ kind: 'deploy', ref: 'https://github.com/o/r/pull/3824' }))), ['Deploy · waiting (start unknown) · PR #3824', 'next check in 1h', '', ''])
+  assert.deepEqual(line(row(mk({ kind: 'deploy', ref: 'e4fd7587390a189fa2726896a7809979858d1e2d' }))), ['Deploy · waiting (start unknown) · e4fd75873', 'next check in 1h', '', ''])
   assert.deepEqual(line(row(mk({ kind: 'card', ref: 't_01a1eea7e9cf1de6' }))), ['on [t_01a1eea7e9cf1de6]', 'by Fri 15:53 PST', '10m', ''])
   assert.deepEqual(line(row(mk({ kind: 'external', ref: 'natural GitHub REST use/reset' }, { wakeAt: S - 3 * 3600 }))), ['on natural GitHub REST use/reset', '⚠ 3h overdue', '10m', 'warn'])
   assert.deepEqual(line(row(mk({ kind: 'clock', why: 'two-day soak' }, { wakeAt: S + 86_400 }))), ['1d left (two-day soak)', 'Sat 14:53 PST', '10m', ''])
@@ -280,7 +280,7 @@ test('owner park: read from the card detail; the line shows the real wake instea
   const i = (chip, extra = {}) => ({ kind: 'kanban', chip: { state: 'scheduled', ...chip }, ...extra })
   assert.equal(m.needsPark(i({})), true)
   assert.equal(m.needsPark(i({ waitingOn: 'a producer the owner did not publish' })), true)
-  assert.equal(m.needsPark(i({ waitingOn: 'ci run 1' })), false)
+  assert.equal(m.needsPark(i({ waitingOn: 'ci run 1' })), true)
   assert.equal(m.needsPark(i({ upstream: { id: 't_u' } })), false)
   assert.equal(m.needsPark(i({ state: 'triage' })), false)
   assert.equal(m.needsPark(i({}, { cardStatus: true })), false)

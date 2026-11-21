@@ -14,6 +14,12 @@ A canonical decision can be dismissed, withdrawn, or resolved while its owner ca
 
 The bridge additions `presentationForSource(source)` and `hasQueuePresentation()` are optional for compatibility with older user-steps installations. They are scoped to the focused connection/profile/session; matching uses existing exact-source provenance rules.
 
+## Continuous CI/deploy wait clocks
+
+CI/deploy rows use `task.wait_episode` from the owner's core task-detail API. Core derives the start from durable park history: repeat wake/claim/repark cycles of the exact same producer (kind, ref, gateway) retain the first timestamp; a different producer/wait or explicit lifecycle exit resets it. History is bounded; a missing start, old backend, invalid/future timestamp or truncated beginning shows `waiting (start unknown)`, never card age, newest park age or zero. Cached reads and reloads retain the timestamp and recalculate elapsed duration with the existing render clock and `shortDur`. These rows have no disconnected trailing age.
+
+`next check` is the armed probe time, falling back to the park's wake/backstop when no probe is available; it is not an expected CI/deploy completion time. Other clock/card waits keep their existing presentation. `test/wait-elapsed.test.mjs` covers formatting/unknown timestamps and detail reloads; `test/wait-elapsed-dom.test.mjs` mounts the real WaitLine and exercises cached clock advancement/remount. Producer episode reset and repeated scheduling are tested in core's `tests/hermes_cli/test_kanban_wait_episode.py`. No new runtime dependency.
+
 ## Inherited human requests
 
 A session may be red because one of its waiting cards depends on a valid human ask owned elsewhere. The panel now searches **all** open parent branches, not only the first displayed chain. Fresh validated blocked ancestors appear under **Needs you · upstream dependency**, with the original action and scope (including the device named by its owner), the dependency path and qualified read source. **Open original card** opens that ancestor, not the dependent card. There are no answer, skip, permission-grant or draft controls on inherited rows.
@@ -82,7 +88,7 @@ The short reason (`rowWait`), built from the card itself, never from the long te
 | blocked upstream | `parent blocked: <card>` |
 | a clock wait | `10h left · Sat 00:00 PST` (Pacific time; `Dec 2 22:20 PST` beyond six days) |
 | a clock wake past due | `10m overdue · due Fri 13:50 PST`; from 30 minutes late `⚠ 4h overdue`, orange |
-| a CI run / PR / other named wait | `on CI run 44819160264`, `on CI on PR #7`, `on deploy abc123` (URLs are shortened) |
+| a CI run / PR / deploy wait | `CI · waiting 12m · run 44819160264` / `Deploy · waiting 4m · PR #7`, plus a separately labelled `next check in 2m` (URLs shortened) |
 | triage | `needs triage` |
 | review with no review running | `no reviewer running · <newest event, in the task rows' words> 15m ago` (the review is a run on the card itself, not a separate card) |
 | scheduled with no wait on its row | its owner's real wake, read once from the card (`/api/plugins/kanban/tasks/<id>` on the owner route) the way core's `park_state` reads it: the newest `continued`/`scheduled` park unless spent (a later `continuation_woken`, or a claim/spawn of another run: then `new park not synced yet · backstop <1 h after the last event>`), its wake_at else its `SCHEDULED_UNTIL=` marker else 24 h after the park, the armed wake check (not an ask's), and a human block kind with no timed wake (`no timed wake · will be blocked for a person`). Lines: `on CI: local suite PID 7 · by Fri 14:57 PST`, `on deploy PR #3824`, `on <card>`, `on probe probe_quiet.py`, `resumes in 10m · Fri 14:57 PST`, `12d left · Dec 2 22:20 PST`; `⚠ 3h overdue` (orange) once well past its wake. `reading wake…` while the read runs (cached: re-read after a minute, a failed read after two). A failed re-read keeps the last park and adds `· not re-read`. `no wake published` (yellow) only when the owner has no park event and no check, or cannot be read. A blocked card is never read for a park (core wakes only scheduled cards) |

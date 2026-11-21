@@ -36,8 +36,8 @@ test('nextHop: every card state leads to the next card or a leaf', () => {
   // Scheduled: the owner's park.
   const park = (payload, extra = {}) => d({ status: 'scheduled', ...extra }, { events: [{ id: 2, kind: 'scheduled', created_at: S - 600, payload }] })
   assert.deepEqual(m.nextHop(park({ wake_at: S + 3600, awaiting: { kind: 'card', ref: 't_01a1eea7e9cf1de6' } }), NOW), { ref: { id: 't_01a1eea7e9cf1de6', status: '' } })
-  assert.deepEqual(m.nextHop(park({ wake_at: S + 3600, awaiting: { kind: 'ci', ref: 'https://github.com/o/r/actions/runs/123' } }), NOW).leaf, { kind: 'external', text: 'CI run 123', sub: '1h left · Fri 15:00 PST' })
-  assert.deepEqual(leaf(m.nextHop(park({ wake_at: S + 3600, awaiting: { kind: 'deploy', ref: 'https://github.com/o/r/pull/9' } }), NOW)), ['external', 'deploy: PR #9'])
+  assert.deepEqual(m.nextHop(park({ wake_at: S + 3600, awaiting: { kind: 'ci', ref: 'https://github.com/o/r/actions/runs/123' } }), NOW).leaf, { kind: 'external', text: 'CI · waiting (start unknown) · run 123', sub: 'next check in 1h' })
+  assert.deepEqual(leaf(m.nextHop(park({ wake_at: S + 3600, awaiting: { kind: 'deploy', ref: 'https://github.com/o/r/pull/9' } }), NOW)), ['external', 'Deploy · waiting (start unknown) · PR #9'])
   assert.deepEqual(leaf(m.nextHop(park({ wake_at: S + 3600, awaiting: { kind: 'human', why: 'pick a window' } }), NOW)), ['you', 'pick a window'])
   assert.deepEqual(leaf(m.nextHop(park({ wake_at: S + 3600, awaiting: { kind: 'clock', why: 'two-day soak' } }), NOW)), ['external', 'timer: two-day soak'])
   assert.deepEqual(leaf(m.nextHop(park({ reason: 'x' }, { block_kind: 'needs_input' }), NOW)), ['you', 'no timed wake: will be blocked for you'])
