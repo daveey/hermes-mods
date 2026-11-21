@@ -1103,6 +1103,85 @@ test('panel (whole): a Stuck root and a separate flat waiter keep both layouts, 
   everyOnce([D, E, H])
 })
 
+// [daveey 2026-11-21 screenshot] a named running prerequisite was followed by a tinted "running | running" child and
+// "2 hops", repeated under every waiter: the status drawn as another card. A tree under a running root has no
+// status-only running leaf and no hop text, whichever bucket draws the root.
+const noPseudo = (tree, name) => {
+  assert.ok(tree, `${name}: tree`)
+  assert.equal(tree.querySelectorAll('[data-chain-leaf="running"]').length, 0, `${name}: no status-only running child`)
+  assert.equal(tree.querySelectorAll('[data-hops]').length, 0, `${name}: no synthetic hop count`)
+  assert.doesNotMatch(tree.textContent, /\bhops?\b/, `${name}: no hop wording`)
+}
+
+test('panel (whole): no running pseudo-child and no hop count under an active, Stuck or remote running root (single, shared, multilevel)', async () => {
+  const shapes = { single: [wchip(E, 'Stage2 (e)', D)], shared: [wchip(E, 'Stage2 (e)', D), wchip(F, 'Baseline producer', D)], multilevel: [wchip(E, 'Stage2 (e)', D), wchip(F, 'Baseline producer', D), wchip(G, 'Closeout', E)] }
+  for (const [shape, waiters] of Object.entries(shapes)) {
+    for (const [bucket, at] of [['active', FRESH_AT()], ['stuck', STUCK_AT()]]) {
+      window.localStorage.clear()
+      bridges({ chips: [card(D, 'running', { label: 'Stage2 (d)', activityAt: at }), ...waiters] })
+      await show(React.createElement(m.Panel, { key: `pseudo-${bucket}-${shape}` }))
+      await settle()
+      const tree = el().querySelector(`[data-wait-group="${D}"]`)
+      noPseudo(tree, `${bucket} ${shape}`)
+      assert.equal(physical(D), 1, `${bucket} ${shape}: the running card once`)
+      assert.equal(tree.querySelectorAll('[data-wait-chain]').length, waiters.length, `${bucket} ${shape}: one row per real dependent`)
+      assert.equal(sTitles().filter(t => t === 'Stage2 (d)').length + el().querySelectorAll(`[data-stuck="kb:${D}"]`).length >= 1, true)
+    }
+    const R = 't_d7d7000001'
+    window.localStorage.clear()
+    bridges({ chips: waiters.map(c => (c.waitingOn === `card ${D}` ? { ...c, waitingOn: `card ${R}` } : c)) })
+    window.hermesDesktop = { api: async a => /tasks\/t_d7d7000001/.test(a.path)
+      ? { task: { id: R, title: 'Remote build', status: 'running', claim_lock: 'worker-a1:9', session_id: 'local-x' }, events: [], links: { parents: [] } }
+      : { tasks: [], includes: ['done'] } }
+    await show(React.createElement(m.Panel, { key: `pseudo-remote-${shape}` }))
+    await settle()
+    await React.act(async () => el().querySelector('[data-waiting-toggle]').click())
+    await settle()
+    const tree = el().querySelector(`[data-wait-group="${R}"]`)
+    noPseudo(tree, `remote ${shape}`)
+    assert.equal(el().querySelectorAll(`[data-chain-prereq="${R}"]`).length, 1, `remote ${shape}: the running card once`)
+    assert.equal(tree.querySelector('[data-prereq-state]').textContent, 'running on worker-a1', 'status inline on the root row')
+    assert.equal(tree.querySelectorAll('[data-wait-chain]').length, waiters.length)
+  }
+})
+
+// One-line rows (collapsed panel, folded Waiting) name the running card, so "via N" counts only the cards BETWEEN the
+// waiter and it: none says nothing, one says "via 1 card", two say "via 2 cards".
+const reasonOf = id => el().querySelector(`[data-wait-line][data-waiting-line="kb:${id}"] [data-wait-reason]`).textContent
+test('a waiter of a waiter is one card away from the named running card', async () => {
+  window.localStorage.clear()
+  const I = 't_a0a0b001'
+  bridges({ chips: [card(D, 'running', { label: 'Stage2 (d)', activityAt: Date.now() / 1000 - 30 }), wchip(E, 'Stage2 (e)', D), wchip(G, 'Closeout', E), wchip(I, 'Report', G)] })
+  await show(React.createElement(m.Panel, { key: 'via-count' }))
+  for (let n = 0; n < 4; n++) await React.act(async () => { await flush(); await flush() })
+  await React.act(async () => el().querySelector('[data-panel-toggle]').click())
+  assert.equal(reasonOf(E), 'Waiting on Stage2 (d) — running on G1')
+  assert.equal(reasonOf(G), 'Waiting on Stage2 (d) — running on G1 · via 1 card')
+  assert.equal(reasonOf(I), 'Waiting on Stage2 (d) — running on G1 · via 2 cards')
+  // The hover title carries the same count as the row.
+  const title = id => el().querySelector(`[data-wait-line][data-waiting-line="kb:${id}"]`).getAttribute('title')
+  assert.doesNotMatch(title(E), /via/)
+  assert.match(title(G), /via 1 card$/)
+  assert.match(title(I), /via 2 cards$/)
+})
+
+test('a waiter of a waiter under a remote running card counts the same way (collapsed and folded Waiting)', async () => {
+  window.localStorage.clear()
+  const R = 't_d7d7000001'
+  bridges({ chips: [wchip(E, 'Stage2 (e)', R), wchip(G, 'Closeout', E)] })
+  window.hermesDesktop = { api: async a => /tasks\/t_d7d7000001/.test(a.path)
+    ? { task: { id: R, title: 'Remote build', status: 'running', claim_lock: 'worker-a1:9', session_id: 'local-x' }, events: [], links: { parents: [] } }
+    : { tasks: [], includes: ['done'] } }
+  await show(React.createElement(m.Panel, { key: 'via-count-remote' }))
+  for (let n = 0; n < 4; n++) await React.act(async () => { await flush(); await flush() })
+  const folded = id => el().querySelector(`[data-folded-waiting] [data-wait-line][data-waiting-line="kb:${id}"] [data-wait-reason]`).textContent
+  assert.equal(folded(E), 'Waiting on Remote build — running on worker-a1')
+  assert.equal(folded(G), 'Waiting on Remote build — running on worker-a1 · via 1 card')
+  await React.act(async () => el().querySelector('[data-panel-toggle]').click())
+  assert.equal(reasonOf(E), 'Waiting on Remote build — running on worker-a1')
+  assert.equal(reasonOf(G), 'Waiting on Remote build — running on worker-a1 · via 1 card')
+})
+
 test('panel: the Waiting heading counts cards by root cause', async () => {
   window.localStorage.clear()
   bridges({ chips: [
