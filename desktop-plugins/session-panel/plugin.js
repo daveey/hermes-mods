@@ -316,16 +316,24 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
     ] }, row.key)
   }
   // Every other section: one compact line per row — state box, title, short detail; details/open on the right.
-  const lineRow = (row, section) => jsxs('article', { 'data-panel-row': row.key, 'data-line-row': '',
-    style: { display: 'grid', gridTemplateColumns: '12px minmax(0,1fr) auto', columnGap: 8, alignItems: 'start', padding: '3px 4px', fontSize: 13, minWidth: 0 }, children: [
-    jsx('span', { 'aria-hidden': true, 'data-row-pip': section, style: { ...box(section), justifySelf: 'center', marginTop: 5 } }),
-    jsxs('div', { style: { minWidth: 0 }, children: [
-      jsx('strong', { 'data-ask-title': '', title: row.title, style: { display: 'block', fontWeight: 400, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: row.title }),
-      row.detail && jsx('div', { 'data-row-detail': '', style: { ...muted, overflowWrap: 'anywhere', ...(section === 'stuck' ? { color: SECTION_COLOR.stuck } : {}) }, children: row.detail }),
-      details(row)
-    ] }),
-    jsx('span', { style: { display: 'flex', gap: 8, paddingTop: 2 }, children: openLinks(row) })
-  ] }, row.key)
+  // In progress keeps the old one-line shape: title, then where · model · how long right-aligned beside it.
+  const lineRow = (row, section) => {
+    const inline = (section === 'running' || section === 'done') && !!row.detail
+    return jsxs('article', { 'data-panel-row': row.key, 'data-line-row': '',
+      style: { display: 'grid', gridTemplateColumns: '12px minmax(0,1fr) auto', columnGap: 8, alignItems: 'start', padding: '3px 4px', fontSize: 13, minWidth: 0 }, children: [
+      jsx('span', { 'aria-hidden': true, 'data-row-pip': section, style: { ...box(section), justifySelf: 'center', marginTop: 5 } }),
+      jsxs('div', { style: { minWidth: 0 }, children: [
+        jsxs('div', { style: { display: 'flex', alignItems: 'baseline', gap: 10, minWidth: 0 }, children: [
+          jsx('strong', { 'data-ask-title': '', title: row.title, style: { flex: 1, minWidth: 0, fontWeight: 400, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: row.title }),
+          inline && jsx('span', { 'data-row-detail': '', 'data-run-meta': '', title: row.details?.join('\n') || row.detail,
+            style: { ...muted, flex: 'none', whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums', ...(row.quiet ? { color: SECTION_COLOR.stuck } : {}) }, children: row.detail })
+        ] }),
+        !inline && row.detail && jsx('div', { 'data-row-detail': '', style: { ...muted, overflowWrap: 'anywhere', ...(section === 'stuck' ? { color: SECTION_COLOR.stuck } : {}) }, children: row.detail }),
+        details(row)
+      ] }),
+      jsx('span', { style: { display: 'flex', gap: 8, paddingTop: 2 }, children: openLinks(row) })
+    ] }, row.key)
+  }
   return jsxs('section', { 'data-session-panel': '', 'data-hub-model': model.revision, 'aria-label': 'Session status',
     style: { minWidth: 0, width: '100%', color: 'var(--foreground)', maxHeight: '55vh', overflowY: 'auto', padding: '6px 12px 8px', boxSizing: 'border-box',
       borderBottom: '1px solid color-mix(in srgb, var(--border) 60%, transparent)', userSelect: 'text', WebkitUserSelect: 'text' }, children: [
@@ -343,10 +351,16 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
       // Counts are the hub's values, not row lengths, even if a test deliberately makes them disagree.
       ...MODEL_SECTIONS.map(([section]) => jsx('span', { 'data-model-count': section, hidden: true, children: model.header.counts[section] }, section))
     ] }),
-    ...MODEL_SECTIONS.map(([section, label]) => model.sections[section].length > 0 && jsxs('div', { 'data-model-section': section, children: [
-      jsx('h3', { 'data-section': section.replaceAll('_', '-'), style: { fontSize: 11, fontWeight: 700, letterSpacing: 0.4, textTransform: 'uppercase', margin: '12px 0 6px', color: section === 'needs_you' ? ALERT_TEXT : section === 'stuck' ? SECTION_COLOR.stuck : 'var(--muted-foreground)' }, children: `${label} · ${model.header.counts[section]}` }),
-      ...model.sections[section].map(row => section === 'needs_you' ? askRow(row) : lineRow(row, section))
-    ] }, section))
+    ...MODEL_SECTIONS.map(([section, label]) => {
+      if (!model.sections[section].length) return false
+      const heading = jsx('h3', { 'data-section': section.replaceAll('_', '-'), style: { display: 'inline', fontSize: 11, fontWeight: 700, letterSpacing: 0.4, textTransform: 'uppercase', margin: 0, color: section === 'needs_you' ? ALERT_TEXT : section === 'stuck' ? SECTION_COLOR.stuck : 'var(--muted-foreground)' }, children: `${label} · ${model.header.counts[section]}` })
+      const rows = model.sections[section].map(row => section === 'needs_you' ? askRow(row) : lineRow(row, section))
+      // Finished history stays one click away (closed by default), as before the cutover.
+      if (section === 'done') return jsxs('details', { 'data-model-section': section, style: { marginTop: 12 }, children: [
+        jsx('summary', { style: { margin: '0 0 6px', listStylePosition: 'inside', color: 'var(--muted-foreground)' }, children: heading }), ...rows
+      ] }, section)
+      return jsxs('div', { 'data-model-section': section, children: [jsx('div', { style: { margin: '12px 0 6px' }, children: heading }), ...rows] }, section)
+    })
   ] })
 }
 

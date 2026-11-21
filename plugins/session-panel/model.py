@@ -77,6 +77,38 @@ def pacific(at):
     return datetime.fromtimestamp(at, ZoneInfo('America/Los_Angeles')).strftime('%Y-%m-%d %H:%M %Z')
 
 
+QUIET_S = 20 * 60  # a running card with no event this long reads "quiet" (Stuck takes over at STUCK_S)
+
+
+def where_text(row):
+    """Where the run is, in one short word: a worker name, hub, pool, or the owning gateway."""
+    m = text(row.get('run_machine'))
+    if m == 'worker-pool':
+        return 'pool'
+    return m or (text(row.get('gateway')) if row.get('gateway') not in (None, '', 'local') else '')
+
+
+def model_text(row):
+    """`class:deep` -> `deep`, `claude-opus-5-5` -> `opus-5-5`; '' when unknown."""
+    return ', '.join(p for p in (re.sub(r'^(class:|claude-)', '', s.strip()) for s in text(row.get('run_model')).split(',')) if p)
+
+
+def run_meta(row, state, progress, now):
+    """Running/review row detail: `worker-a4 · opus-5-5 · 12m` (or `quiet 25m`), plus full-word details lines."""
+    where, model = where_text(row), model_text(row)
+    since = seconds(row.get('current_run_started_at')) or seconds(row.get('started_at'))
+    quiet = bool(progress) and now - progress >= QUIET_S
+    run_for = short_dur(now - since) if 0 < since <= now else ''
+    last = (f'last event{" " + row["activity_kind"] if row.get("activity_kind") else ""} {ago(progress, now)}' if progress else 'last event unknown')
+    head = ['in review'] if state == 'review' else []
+    detail = ' · '.join(p for p in [*head, where, model, f'quiet {short_dur(now - progress)}' if quiet else run_for or (ago(progress, now) if progress else '')] if p) or 'running'
+    details = [' · '.join(p for p in [f'card {row.get("id")}' if row.get('id') else '', f'assignee {row["assignee"]}' if row.get('assignee') else '',
+                                      f'model {row["run_model"]}' if row.get('run_model') else '', f'on {where}' if where else '',
+                                      f'board {row["board"]}' if row.get('board') not in (None, '', 'default') else ''] if p),
+               ' · '.join(p for p in [f'started {ago(since, now)}' if 0 < since <= now else '', last] if p)]
+    return {'detail': detail, 'details': [d for d in details if d], 'quiet': quiet}
+
+
 def key(row):
     return ':'.join(str(row.get(k) or ('default' if k in ('profile', 'board') else ''))
                     for k in ('gateway', 'profile', 'board', 'id'))
@@ -342,7 +374,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             v.update(reason='no-progress', last_at=progress, detail=f'running, no progress since {pacific(progress)} ({ago(progress, now)})' + (f' · last event: {row["activity_kind"]}' if row.get('activity_kind') else ''))
             sections['stuck'].append(v)
         elif state in ('running', 'review'):
-            v['detail'] = ('in review' if state == 'review' else 'running' + (f' · {row["assignee"]}' if row.get('assignee') else '')) + (f' · {ago(progress, now)}' if progress else ' · last event unknown')
+            v.update(run_meta(row, state, progress, now))
             sections['running'].append(v)
         elif state in ('ready', 'todo'):
             v.update(detail=_ready(row, detail, now) if state == 'ready' else 'not started', queued=state == 'todo')

@@ -175,3 +175,22 @@ def test_boolean_recommendation_and_explanation_in_native_question():
     assert a['options'][0]['recommended'] is True
     assert a['options'][0]['detail'] == 'No extra cost'
     assert a['options'][0]['choice_id'] == 'fast'
+
+
+def test_running_row_shows_where_model_and_run_time():
+    row = task(status='running', run_machine='worker-a4', run_model='claude-opus-5-5', current_run_started_at=NOW - 750,
+               activity_at=NOW - 30, activity_kind='tool', assignee='default')
+    m = model.reduce_panel(bundle(observed(row)), now=NOW, projector=project)
+    r = m['sections']['running'][0]
+    assert r['detail'] == 'worker-a4 · opus-5-5 · 12m'
+    assert 'model claude-opus-5-5' in r['details'][0] and 'on worker-a4' in r['details'][0]
+    assert r['details'][1] == 'started 12 min ago · last event tool just now'
+    assert r['quiet'] is False
+
+
+def test_run_meta_pool_class_model_and_quiet():
+    row = {'id': 't_x', 'run_machine': 'worker-pool', 'run_model': 'class:deep', 'started_at': NOW - 7200}
+    meta = model.run_meta(row, 'running', NOW - 1500, NOW)
+    assert meta['detail'] == 'pool · deep · quiet 25m'
+    assert meta['quiet'] is True
+    assert model.run_meta({'id': 't_y'}, 'review', 0, NOW)['detail'] == 'in review'
