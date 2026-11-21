@@ -10,13 +10,13 @@ export async function resolve(spec, ctx, next) {
 const m = await import('../plugin.js')
 const now = Date.parse('2026-11-21T10:00:00Z'), sec = now / 1000
 const detail = kind => ({task:{status:'scheduled', wait_episode:{kind,since:sec-720},wake_check:{cmd:'probe',next_at:sec+120}},events:[{id:1,kind:'scheduled',created_at:sec-240,payload:{awaiting:{kind,ref:'https://example.com/pull/123'},wake_at:sec+3600}}]})
-for (const kind of ['ci','deploy']) test(`${kind} row labels elapsed beside reason, separate next check`, () => {
+for (const kind of ['ci','git-ci','deploy']) test(`${kind} row labels elapsed beside reason, separate next check`, () => {
  const chip = {state:'scheduled', waitingOn:`${kind} PR #123`,waitingSince:sec-240}
  const item = {kind:'kanban',chip}
  assert.equal(m.needsPark(item), true)
  const d = detail(kind), park = m.parkFromDetail(d)
  const first = m.rowWait(item,now,{state:'ok',park})
- assert.match(first.reason.join(''),new RegExp(`${kind === 'ci' ? 'CI' : 'Deploy'} · waiting 12m`))
+ assert.match(first.reason.join(''),new RegExp(`${kind !== 'deploy' ? 'CI' : 'Deploy'} · waiting 12m`))
  assert.match(first.sub,/next check in 2m/)
  assert.doesNotMatch(first.sub,/left|ETA/)
  assert.equal(first.age,'')
