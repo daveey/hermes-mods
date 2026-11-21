@@ -355,6 +355,67 @@ def test_supervisor_backoff_fallback_is_fresh_and_coalesces(monkeypatch):
         supervisor.close()
 
 
+def test_cursor_reads_coalesce_for_32_viewers(actual_board, monkeypatch):
+    import threading
+    api, config = actual_board
+    child = start_process(api, config)
+    supervisor = api._rpc_client.Supervisor(api, api._loaded_identity)
+    supervisor.process = child
+    barrier = threading.Barrier(32)
+    calls = []
+    request = child.request
+    def slow_request(*args):
+        calls.append(1)
+        time.sleep(.1)  # Make the overlapping poll window deterministic.
+        return request(*args)
+    monkeypatch.setattr(child, 'request', slow_request)
+    def poll(_):
+        barrier.wait(3)
+        return supervisor.cursor()
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool:
+            results = list(pool.map(poll, range(32)))
+        assert all(isinstance(value, str) and len(value) == 64 for value in results)
+        assert len(set(results)) == 1
+        assert len(calls) == 1
+        assert not child.closed
+    finally:
+        supervisor.close()
+
+
+def test_stream_replacement_revision_not_labelled_current(monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from test_view import load
+    api = load()
+    class Replacement:
+        def acquire(self):
+            pass
+        def release(self):
+            pass
+        def cursor(self):
+            return 'a' * 64
+        def submit(self, params, generation, cursor):
+            future = concurrent.futures.Future()
+            now = time.time()
+            future.set_result({'view': {'configured': False}, 'mode': 'projector',
+                               'projector_pid': 123, 'revision': [generation + 1, 'b' * 64],
+                               'timing': {'project_start': now, 'project_end': now}})
+            return future
+    monkeypatch.setattr(api, '_projector_enabled', True)
+    monkeypatch.setattr(api, '_projector', Replacement)
+    monkeypatch.setattr(api, '_ws_upgrade_authorized', lambda ws: True)
+    monkeypatch.setattr(api, 'change_cursor', lambda: ['unchanged'])
+    monkeypatch.setattr(api, 'WATCH_S', .01)
+    app = FastAPI()
+    app.include_router(api.router)
+    with TestClient(app) as client, client.websocket_connect('/v1/lanes/stream?debug=true') as ws:
+        frame = ws.receive_json()
+        assert frame['projector']['source_current'] is False
+        assert frame['projector']['revision'][1] == 'b' * 64
+        assert 'detected' not in frame['timing']
+
+
 def test_parent_cursor_keeps_planner_config_and_observation_triggers(actual_board):
     api, config = actual_board
     base = api.change_cursor()
@@ -377,19 +438,21 @@ def test_child_observation_cursor_marks_parent_dirty_without_board_change(monkey
     from fastapi.testclient import TestClient
     from test_view import load
     api = load()
-    state = {'observation': 0}
+    state = {'observation': 0, 'unavailable': False, 'submitted': 0}
     class FakeSupervisor:
         def acquire(self):
             pass
         def release(self):
             pass
         def cursor(self):
-            return state['observation']
+            return None if state['unavailable'] else state['observation']
         def submit(self, params, generation, cursor):
+            state['submitted'] += 1
             result = concurrent.futures.Future()
             now = time.time()
             result.set_result({'view': {'configured': False, 'observation': state['observation']},
                                'mode': 'projector', 'projector_pid': 123,
+                               'revision': [generation, api._rpc_client.rpc.digest(cursor)],
                                'timing': {'project_start': now, 'project_end': now}})
             return result
     monkeypatch.setattr(api, '_projector_enabled', True)
@@ -402,5 +465,11 @@ def test_child_observation_cursor_marks_parent_dirty_without_board_change(monkey
     app.include_router(api.router)
     with TestClient(app) as client, client.websocket_connect('/v1/lanes/stream') as ws:
         assert ws.receive_json()['view']['observation'] == 0
+        state['unavailable'] = True
+        time.sleep(.1)
+        assert state['submitted'] == 1  # unavailable is not a new revision
+        state['unavailable'] = False
+        time.sleep(.1)
+        assert state['submitted'] == 1  # recovery to the same cursor is not dirty
         state['observation'] = 1
         assert ws.receive_json()['view']['observation'] == 1
