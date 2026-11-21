@@ -1,0 +1,99 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
+import { loadPlugin, mount, React, host } from './sdk-mock.mjs'
+const P = await loadPlugin()
+const graph = { total: 83, sources: [{key:'manual',count:83}], lanes:[{key:'work',count:83}],
+  sinks:[{key:'dam:you',count:83,dam:true,label:'needs you',color:'#f00',hint:'server hint'}],
+  edges:{sourceLane:[{from:'manual',to:'work',count:83}],laneSink:[{from:'work',to:'dam:you',count:83}]} }
+const fixture = { configured:true, totals:{running:71,open:93}, lanes:{work:{share:10,target:.7,actual:.2,drift:'server drift',
+  running:7,not_ready:42,blocked_on_you:9,open:58,ready:3}},
+  floor:{columns:[{key:'waiting',label:'Waiting'}],names:['work'],cells:[{lane:'work',step:'waiting',count:66,piling:true,summary:'66 server reasons',cards:[]}]},
+  flow:{cards:[],lanes:{work:{}},graphs:{project:graph,source:graph}} }
+
+test.afterEach(()=>{ localStorage.clear(); host.routes=[] })
+test('pill, footer, Floor and Flow render server counts even with empty card lists', async()=>{
+  localStorage.setItem(P.OPEN_KEY,'1')
+  const view = await mount(React.createElement(P.Lanes,{ctx:{rest:async()=>fixture}}))
+  try {
+    assert.equal(view.container.querySelector('.hermes-lanes-mini-bar').getAttribute('aria-label'),'7 running, 42 not ready, 9 blocked on you')
+    assert.match(view.container.textContent,/71 running · 93 open/)
+    assert.equal(view.container.querySelector('[data-step=waiting]').dataset.count,'66')
+    assert.equal(view.container.querySelector('[data-step=waiting]').dataset.piling,'1')
+    await view.click([...view.container.querySelectorAll('button')].find(b=>b.textContent==='Flow'))
+    assert.match(view.container.textContent,/83 open cards/)
+    assert.equal(view.container.querySelector('[data-flow-node=source]').dataset.count,'83')
+    assert.match(view.container.textContent,/server hint/)
+  } finally { await view.close() }
+})
+
+test('live subscription has no polling timer; unavailable socket alone polls at 60 seconds', async()=>{
+  for(const available of [true,false]) {
+    const timers=[];const cleared=[];let callback
+    const source=P.createSource({rest:async()=>fixture,...(available?{socket:(_path,fn)=>{callback=fn;return ()=>{}}}:{})},host)
+    const stop=source.subscribe({hours:6,window:'6h',expanded:false},()=>{},()=>{}, {
+      setInterval:(fn,ms)=>{timers.push({fn,ms});return timers.length},clearInterval:id=>cleared.push(id),
+      setTimeout:()=>1,clearTimeout:()=>{}
+    })
+    await new Promise(r=>setTimeout(r,10))
+    if(available) { callback({version:1,view:fixture}); assert.equal(timers.length,0) }
+    else { assert.deepEqual(timers.map(t=>t.ms),[60000]);assert.equal(timers.length,1) }
+    stop()
+  }
+})
+
+test('connection-pinned native stream changes parameters without reconnecting and refreshes once on reconnect', async()=>{
+  const oldBridge=window.hermesDesktop, oldWS=globalThis.WebSocket
+  const sockets=[], grants=[], reads=[], intervals=new Map(), timeouts=new Map(); let serial=0
+  const timers={ setInterval:(fn,ms)=>{const id=++serial;intervals.set(id,{fn,ms});return id},clearInterval:id=>intervals.delete(id),
+    setTimeout:(fn,ms)=>{const id=++serial;timeouts.set(id,{fn,ms});return id},clearTimeout:id=>timeouts.delete(id) }
+  window.hermesDesktop={getConnectionFor:async opts=>{assert.equal(opts.connectionId,'hub');return {authMode:'native'}},
+    getPluginWsUrl:async opts=>{grants.push(opts);return 'ws://example.com/ticket'}}
+  globalThis.WebSocket=class {
+    constructor(url){this.url=url;this.readyState=0;this.sent=[];sockets.push(this)}
+    send(text){this.sent.push(JSON.parse(text))}
+    close(){this.readyState=3;this.onclose?.()}
+  }
+  const source=P.createSource({rest:async(path,opts)=>{reads.push([path,opts]);return fixture}}, {profileRoutes:async()=>[{connectionId:'hub',targetProfile:'default'}]})
+  const stop=source.subscribe({hours:6,window:'6h',expanded:false},()=>{},()=>{},timers)
+  const flush=()=>new Promise(r=>setTimeout(r,5))
+  try{
+    await flush();assert.equal(sockets.length,1);assert.equal(grants[0].connectionId,'hub')
+    const ws=sockets[0];ws.readyState=1;ws.onopen();ws.onmessage({data:JSON.stringify({version:1,view:fixture})})
+    assert.equal(intervals.size,0);assert.equal(reads.length,1)
+    stop.update({hours:24,window:'24h',expanded:true})
+    assert.deepEqual(ws.sent.at(-1),{hours:24,window:'24h',expanded:true})
+    assert.equal(sockets.length,1);assert.equal(reads.length,1)
+    ws.close();assert.deepEqual([...intervals.values()].map(t=>t.ms),[60000])
+    const reconnect=[...timeouts.values()].find(t=>t.ms<30000);reconnect.fn();await flush()
+    const next=sockets[1];next.readyState=1;next.onopen();next.onmessage({data:JSON.stringify({version:1,view:fixture})});await flush()
+    assert.equal(intervals.size,0);assert.equal(reads.length,2)
+  }finally{stop();window.hermesDesktop=oldBridge;globalThis.WebSocket=oldWS}
+  assert.equal(intervals.size,0)
+})
+
+test('parameter change during initial GET opens only one stream and closes every socket', async()=>{
+  const oldBridge=window.hermesDesktop, oldWS=globalThis.WebSocket
+  const sockets=[], pending=[]
+  window.hermesDesktop={getConnectionFor:async()=>({authMode:'native'}),getPluginWsUrl:async()=> 'ws://example.com/ticket'}
+  globalThis.WebSocket=class { constructor(){this.readyState=0;sockets.push(this)} close(){this.readyState=3;this.onclose?.()} }
+  const source=P.createSource({rest:()=>new Promise(resolve=>pending.push(resolve))},{profileRoutes:async()=>[{connectionId:'hub',targetProfile:'default'}]})
+  const stop=source.subscribe({hours:6,window:'6h',expanded:false},()=>{},()=>{})
+  const flush=()=>new Promise(r=>setTimeout(r,5))
+  try {
+    await flush()
+    stop.update({hours:24,window:'24h',expanded:true})
+    await flush()
+    for(const resolve of pending) resolve(fixture)
+    await flush()
+    assert.equal(sockets.length,1)
+  } finally {stop();window.hermesDesktop=oldBridge;globalThis.WebSocket=oldWS}
+  assert.ok(sockets.every(ws=>ws.readyState===3))
+})
+
+test('no Desktop card counting outside the geometry helper',async()=>{
+  let src=await readFile(new URL('../plugin.js',import.meta.url),'utf8')
+  src=src.replace(/export function sankey[\s\S]*?const HOUR_WINDOW/,'const HOUR_WINDOW')
+  assert.doesNotMatch(src,/cards\.length|cards\?\.length|cards\.reduce\(|for \(const c of cards\)|list\.reduce\(/)
+  assert.doesNotMatch(src,/refetchInterval:/)
+})

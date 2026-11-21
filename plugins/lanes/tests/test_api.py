@@ -222,7 +222,7 @@ def test_flow_route_validates_the_window(api, core, monkeypatch):
     app.include_router(api.router)
     client = TestClient(app)
     assert client.get("/v1/lanes/flow?window=2h").status_code == 400
-    assert client.get("/v1/lanes/flow?window=24h").json()["configured"] is False
+    assert client.get("/v1/lanes/flow?window=24h").json()["flow"]["configured"] is False
 
 
 @pytest.mark.parametrize("body", [{"weight": 3}, {"paused": "yes"}])

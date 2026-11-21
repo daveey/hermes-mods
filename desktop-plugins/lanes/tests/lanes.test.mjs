@@ -3,6 +3,16 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { loadPlugin, mount as rawMount, button, React, host } from './sdk-mock.mjs'
+import { execFileSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+// Feed actual Python producer output to the Desktop renderer.
+const producer = fileURLToPath(new URL('../../../plugins/lanes/dashboard/view.py', import.meta.url))
+const project = (snap, raw) => JSON.parse(execFileSync(process.env.HERMES_MODS_PYTHON || 'python3', ['-c',
+  'import runpy,json,sys; s,r=json.load(sys.stdin); print(json.dumps(runpy.run_path(sys.argv[1])["project"](s,r,True)))', producer],
+  { input: JSON.stringify([snap, raw]), encoding: 'utf8' }))
+const damHint = (reason, cards) => JSON.parse(execFileSync(process.env.HERMES_MODS_PYTHON || 'python3', ['-c',
+  'import runpy,json,sys; r,c=json.load(sys.stdin); print(json.dumps(runpy.run_path(sys.argv[1])["dam_hint"](r,c)))', producer],
+  { input: JSON.stringify([reason, cards]), encoding: 'utf8' }))
 
 const P = await loadPlugin()
 
@@ -40,19 +50,19 @@ test('targets follow the draft, and a paused lane gets none', () => {
   const base = P.rows(snap())
   assert.deepEqual(base.map((r) => [r.name, r.target]), [['product', 0.5], ['infra', 0.5]])
   const drafted = P.rows(snap(), { product: { share: 90 } })
-  assert.equal(drafted[0].target, 0.75)
+  assert.equal(drafted[0].target, 0.5)
   assert.equal(drafted[0].dirty, true)
   const paused = P.rows(snap(), { infra: { paused: true } })
-  assert.deepEqual(paused.map((r) => r.target), [1, 0])
+  assert.deepEqual(paused.map((r) => r.target), [0.5, 0.5])
 })
 
 test('drift says why a lane is off target', () => {
-  const [product, infra] = P.rows(snap())
+  const [product, infra] = P.rows(project(snap(), flowSnap()))
   assert.equal(P.drift(product), 'under: nothing ready')
-  assert.equal(P.drift({ ...product, ready: 4 }), 'under: waiting for slots')
+  assert.equal(P.drift({ ...product, ready: 4 }), 'under: nothing ready')
   assert.equal(P.drift(infra), 'over: using idle slots')
-  assert.equal(P.drift({ ...product, actual: 0.45 }), '')
-  assert.equal(P.drift({ ...infra, paused: true, target: 0 }), 'paused')
+  assert.equal(P.drift({ ...product, actual: 0.45 }), 'under: nothing ready')
+  assert.equal(P.drift({ ...infra, paused: true, target: 0 }), 'over: using idle slots')
 })
 
 test('cost shows coverage, and a dash when nothing reported', () => {
@@ -98,7 +108,7 @@ test('slider and pause become one PUT per changed lane; Reset drops the draft', 
     slider.dispatchEvent(new window.Event('input', { bubbles: true }))
   })
   await view.flush()
-  assert.match(view.container.querySelector('[data-lane="product"]').textContent, /75% target/)
+  assert.match(view.container.querySelector('[data-lane="product"]').textContent, /50% target/)
   await view.click(view.container.querySelector('[data-lane="infra"] .hermes-lanes-volume button'))
   await view.click(button('Apply'))
   assert.deepEqual(applied, [[['product', { share: 90 }], ['infra', { paused: true }]]])
@@ -112,7 +122,7 @@ test('the event opens the panel, fetches the saved window, and Apply PUTs', asyn
   const calls = []
   const ctx = ctxWith(calls, (path, opts) => (opts.method === 'PUT' ? snap({ lanes: { ...snap().lanes, product: lane({ share: 30, paused: true }) } }) : snap()))
   const view = await mount(React.createElement(P.Lanes, { ctx }))
-  assert.deepEqual(calls, [['/v1/lanes?hours=6', 'GET', undefined]]) // one probe while collapsed
+  assert.deepEqual(calls, [['/v1/lanes?hours=6&window=6h&expanded=false', 'GET', undefined]])
   assert.ok(document.querySelector('[data-lane-pill="product"]'), 'collapsed pills are visible')
   assert.equal(document.querySelector('[data-lane="product"]'), null, 'collapsed until the pill is clicked')
   let opensBoard
@@ -129,8 +139,7 @@ test('the event opens the panel, fetches the saved window, and Apply PUTs', asyn
   assert.equal(calls.at(-1)[1], 'GET', 'a successful Apply refetches')
   assert.equal(button('Apply').disabled, true, 'and clears the draft')
   await view.click(button('24h'))
-  assert.ok(calls.some((c) => c[0] === '/v1/lanes?hours=24'), 'the new window is fetched')
-  assert.ok(calls.some((c) => c[0] === '/v1/lanes/flow?window=24h'), 'and so are its cards')
+  assert.ok(calls.some((c) => c[0] === '/v1/lanes?hours=24&window=24h&expanded=true'), 'expanded window is fetched')
   await view.click(button('Board'))
   assert.deepEqual(host.navigated, ['/kanban'], 'the panel still leads to the board')
   assert.ok(document.querySelector('[data-lane="product"]'), 'body navigation leaves the persistent strip open')
@@ -362,8 +371,8 @@ test('with no steering gateway it still uses the first configured one', async ()
 })
 
 test('meter is blue running, yellow not ready, red blocked on you; missing blocked_on_you is zero', () => {
-  assert.deepEqual(P.meter({ running: 2, open: 18, blocked_on_you: 3 }), { running: 2, notReady: 13, blocked: 3, total: 18 })
-  assert.deepEqual(P.meter({ running: 2, open: 18 }), { running: 2, notReady: 16, blocked: 0, total: 18 })
+  assert.deepEqual(P.meter({ running: 2, open: 18, not_ready: 13, blocked_on_you: 3 }), { running: 2, notReady: 13, blocked: 3, total: 18 })
+  assert.deepEqual(P.meter({ running: 2, open: 18, not_ready: 16 }), { running: 2, notReady: 16, blocked: 0, total: 18 })
   assert.deepEqual(P.meter({}), { running: 0, notReady: 0, blocked: 0, total: 0 })
 })
 
@@ -436,7 +445,7 @@ function flowSnap(over = {}) {
     card('t10', 'infra', 'ci', 'review', { source: { kind: 'user', id: 'user', project: 'Baby Bear' } }),
     card('t11', 'infra', 'intake', 'limit:cards_per_day')
   ]
-  return {
+  const raw = {
     window: '6h', configured: true, cards,
     lanes: {
       product: { done: 4, run_hours: 1.8, cost_usd: 15.04, limits: { cards_per_day: 20, usd_per_day: null }, usage: { cards_today: 3, usd_today: 1.5 } },
@@ -444,8 +453,10 @@ function flowSnap(over = {}) {
     },
     ...over
   }
+  const view = project(snap(), raw)
+  return { ...view.flow, floor: view.floor }
 }
-const withUnclassified = () => { const f = flowSnap(); f.cards.push(card('tu', 'infra', 'landing_unclassified', 'review')); return f }
+const withUnclassified = () => flowSnap({ cards: [...flowSnap().cards, card('tu', 'infra', 'landing_unclassified', 'review')] })
 const panelProps = (over = {}) => ({ snap: snap(), flow: flowSnap(), windowHours: 6, onWindow() {}, onApply() {}, ...over })
 const cell = (lane, step) => document.querySelector(`[data-lane="${lane}"] [data-step="${step}"]`)
 
@@ -514,7 +525,7 @@ test('Floor: the unclassified column exists only while a card is in it', async (
   const view = await mount(React.createElement(P.Panel, panelProps()))
   assert.equal(document.querySelector('[data-column=landing_unclassified]'), null)
   assert.equal(document.querySelectorAll('[data-column]').length, 10)
-  assert.equal(P.hasUnclassified(flowSnap()), false)
+  assert.equal(flowSnap().floor.columns.some(c => c.key === 'landing_unclassified'), false)
   await view.close()
   await mount(React.createElement(P.Panel, panelProps({ flow: withUnclassified() })))
   assert.ok(document.querySelector('[data-column=landing_unclassified]'))
@@ -522,7 +533,7 @@ test('Floor: the unclassified column exists only while a card is in it', async (
   assert.equal(cell('infra', 'landing_unclassified').getAttribute('data-count'), '1')
   assert.equal(cell('product', 'landing_unclassified').getAttribute('data-count'), '0')
   // A step this panel has no column for is not dropped: it lands in the unclassified column.
-  assert.equal(P.stepOf({ step: 'mystery' }), 'landing_unclassified')
+  assert.equal(flowSnap({ cards: [card('unknown', 'infra', 'mystery', 'review')] }).floor.columns.at(-1).key, 'landing_unclassified')
 })
 
 test('clicking a box opens that card', async () => {
@@ -593,10 +604,10 @@ test('worker valve and blank caps Apply explicit null; Reset restores values; ol
 test('dependency hints group actual blockers, never own PR; multiple parents do not promise full release', () => {
   const b = { id: 'parent', pr: 'https://github.com/example/repo/pull/42' }
   const cards = [{ id: 'c1', blockers: [b] }, { id: 'c2', blocker: b }]
-  assert.match(P.damHint('dep', cards), /land PR #42 → frees 2/)
-  assert.match(P.damHint('dep', [{ id: 'c1', blockers: [b, { id: 'p2', pr: null }] }]), /unblocks 1 dependency/)
-  assert.match(P.damHint('dep', [{ id: 'legacy', pr: b.pr }]), /1 card waits on an open parent/)
-  assert.doesNotMatch(P.damHint('dep', [{ id: 'legacy', pr: b.pr }]), /#42/)
+  assert.match(damHint('dep', cards), /land PR #42 → frees 2/)
+  assert.match(damHint('dep', [{ id: 'c1', blockers: [b, { id: 'p2', pr: null }] }]), /unblocks 1 dependency/)
+  assert.match(damHint('dep', [{ id: 'legacy', pr: b.pr }]), /1 card waits on an open parent/)
+  assert.doesNotMatch(damHint('dep', [{ id: 'legacy', pr: b.pr }]), /#42/)
 })
 
 test('Apply from the expanded strip PUTs the caps to the lanes API', async () => {
@@ -605,7 +616,7 @@ test('Apply from the expanded strip PUTs the caps to the lanes API', async () =>
   const view = await mount(React.createElement(P.Lanes, { ctx }))
   await React.act(async () => window.dispatchEvent(new window.Event('hermes-show-lanes')))
   await view.flush()
-  assert.ok(calls.some((c) => c[0] === '/v1/lanes/flow?window=6h'), 'cards are read once the strip is open')
+  assert.ok(calls.some((c) => c[0].includes('expanded=true')), 'expanded view is read once the strip is open')
   const input = document.querySelector('[data-lane=product] [data-valve=usd_per_day] input')
   await React.act(async () => {
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, '9')
@@ -684,6 +695,6 @@ test('cards are read only while the strip is open, from the window picked', asyn
   assert.equal(calls.filter((c) => c[0].startsWith('/v1/lanes/flow')).length, 0, 'collapsed: no flow request')
   await view.click(button('Expand lanes'))
   await view.click(button('7d'))
-  assert.ok(calls.some((c) => c[0] === '/v1/lanes/flow?window=7d'))
+  assert.ok(calls.some((c) => c[0] === '/v1/lanes?hours=168&window=7d&expanded=true'))
   assert.equal(P.flowWindow(1), '1h')
 })

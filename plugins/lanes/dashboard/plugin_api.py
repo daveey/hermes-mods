@@ -19,9 +19,10 @@ import asyncio
 import inspect
 import threading
 import time
+from functools import lru_cache
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Body, HTTPException, Query
+from fastapi import APIRouter, Body, HTTPException, Query, WebSocket, WebSocketDisconnect
 
 router = APIRouter()
 CACHE_S = 10
@@ -119,6 +120,23 @@ def flow(window: str, now: Optional[float] = None) -> Dict[str, Any]:
     return body
 
 
+@lru_cache(maxsize=1)
+def _view_module():
+    # File-loaded by core's plugin loader and by standalone test harnesses.
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location("lanes_view", Path(__file__).with_name("view.py"))
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def lane_view(hours: float = 6.0, window: str = "6h", expanded: bool = False):
+    snap = read(hours)
+    return _view_module().project(snap, flow(window) if expanded and snap.get("configured") else None, expanded)
+
+
 def _need_core():
     """Core's lanes modules, or 409 when this core has none or no lanes are configured."""
     mods = core()
@@ -175,17 +193,16 @@ def admit(card: str, reason: str) -> Dict[str, Any]:
 
 
 @router.get("/v1/lanes")
-async def get_lanes(hours: float = Query(6.0)) -> Dict[str, Any]:
-    if hours not in WINDOWS:
-        raise HTTPException(status_code=400, detail=f"hours must be one of {', '.join(f'{w:g}' for w in WINDOWS)}")
-    return await asyncio.to_thread(read, hours)
+async def get_lanes(hours: float = Query(6.0), window: str = Query("6h"), expanded: bool = Query(False)) -> Dict[str, Any]:
+    _validate_view(hours, window, expanded)
+    return await asyncio.to_thread(lane_view, hours, window, expanded)
 
 
 @router.get("/v1/lanes/flow")
 async def get_flow(window: str = Query("6h")) -> Dict[str, Any]:
     if window not in FLOW_WINDOWS:
         raise HTTPException(status_code=400, detail=f"window must be one of {', '.join(FLOW_WINDOWS)}")
-    return await asyncio.to_thread(flow, window)
+    return await asyncio.to_thread(lane_view, dict(zip(FLOW_WINDOWS, WINDOWS))[window], window, True)
 
 
 @router.put("/v1/lanes/{lane}")
@@ -204,3 +221,136 @@ async def get_held(lane: Optional[str] = Query(None)) -> Dict[str, Any]:
 @router.post("/v1/held/{card}/admit")
 async def post_admit(card: str, body: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
     return await asyncio.to_thread(admit, card, str(body.get("reason") or "admitted from the lanes panel"))
+
+
+WATCH_S = 0.5
+DEBOUNCE_S = 1.0
+HEARTBEAT_S = 30.0
+_seen_cursor = None
+
+
+def _refresh_cursor(cursor):
+    """Invalidate shared GET caches once per source revision, not once per viewer."""
+    global _seen_cursor, _generation
+    with _lock:
+        if cursor != _seen_cursor:
+            _seen_cursor = cursor
+            _generation += 1
+            _cache.clear()
+            _flow_cache.clear()
+
+
+def _validate_view(hours, window, expanded):
+    if isinstance(hours, bool) or hours not in WINDOWS or window not in FLOW_WINDOWS or type(expanded) is not bool:
+        raise HTTPException(status_code=400, detail="invalid lanes hours, window or expanded")
+
+
+def _ws_upgrade_authorized(ws):
+    # Same canonical gate as Kanban /events, but fail closed if unavailable.
+    try:
+        from hermes_cli.web_server_chat import _ws_auth_ok
+        return bool(_ws_auth_ok(ws))
+    except ImportError:
+        return False
+
+
+def change_cursor():
+    """Cheap watch of the source board AND fleet replica, policy and planner notes."""
+    from pathlib import Path
+    from hermes_constants import get_default_hermes_root
+    mods = core()
+    if mods is None:
+        return None
+    kbc, _, cli = mods
+    cursors = []
+    with kbc.connect_closing() as conn:
+        replica = cli._fleet(conn, local=False)
+        try:
+            for db in (conn, replica):
+                if db is not None:
+                    cursors.append(tuple(db.execute('SELECT coalesce(max(id),0) FROM task_events').fetchone()))
+        finally:
+            if replica is not None:
+                replica.close()
+    root = Path(get_default_hermes_root())
+    for path in (root / 'config.yaml', root / 'kanban' / 'lanes-planner.json'):
+        try:
+            stat = path.stat()
+            cursors.append((stat.st_mtime_ns, stat.st_size))
+        except FileNotFoundError:
+            cursors.append(None)
+    return cursors
+
+
+@router.websocket('/v1/lanes/stream')
+async def stream_lanes(ws: WebSocket):
+    import hashlib
+    import json
+    if not _ws_upgrade_authorized(ws):
+        await ws.close(code=1008)
+        return
+    try:
+        params = (float(ws.query_params.get('hours', '6')), ws.query_params.get('window', '6h'),
+                  ws.query_params.get('expanded', 'false').lower() == 'true')
+        _validate_view(*params)
+    except (ValueError, HTTPException):
+        await ws.close(code=1008)
+        return
+    await ws.accept()
+    last_hash = None
+    version = 0
+    async def send_view():
+        nonlocal last_hash, version
+        view = await asyncio.to_thread(lane_view, *params)
+        echo = dict(zip(('hours', 'window', 'expanded'), params))
+        digest = hashlib.sha256(json.dumps({'view': view, 'params': echo}, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        if digest != last_hash:
+            version += 1
+            await ws.send_json({'version': version, 'view': view, 'params': echo})
+            last_hash = digest
+    try:
+        cursor = await asyncio.to_thread(change_cursor)
+        _refresh_cursor(cursor)
+        await send_view()
+        last_heartbeat = time.monotonic()
+        dirty_at = None
+        while True:
+            # wait_for cancels and joins receive on timeout. No detached poll/receive tasks.
+            try:
+                message = await asyncio.wait_for(ws.receive(), WATCH_S)
+                if message['type'] == 'websocket.disconnect':
+                    return
+                if message.get('text'):
+                    try:
+                        update = json.loads(message['text'])
+                        new = (update.get('hours', params[0]), update.get('window', params[1]), update.get('expanded', params[2]))
+                        _validate_view(*new)
+                    except (ValueError, AttributeError, HTTPException):
+                        await ws.close(code=1008)
+                        return
+                    params = new
+                    await send_view()
+            except TimeoutError:
+                pass
+            current = await asyncio.to_thread(change_cursor)
+            now = time.monotonic()
+            if current != cursor:
+                cursor = current
+                if dirty_at is None:
+                    dirty_at = now
+            if dirty_at is not None and now - dirty_at >= DEBOUNCE_S:
+                _refresh_cursor(cursor)
+                await send_view()
+                dirty_at = None
+            if now - last_heartbeat >= HEARTBEAT_S:
+                await ws.send_json({'type': 'heartbeat', 'version': version})
+                last_heartbeat = now
+    except WebSocketDisconnect:
+        return
+    except (OSError, RuntimeError) as exc:
+        import logging
+        logging.getLogger(__name__).warning('Lanes stream closed: %s', exc)
+        try:
+            await ws.close(code=1011)
+        except (RuntimeError, WebSocketDisconnect):
+            pass

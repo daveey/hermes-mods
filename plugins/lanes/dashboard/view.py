@@ -1,0 +1,150 @@
+"""Pure hub projections. Desktop may lay these out, never recount cards."""
+from collections import Counter, defaultdict
+
+STEPS = [
+    ('intake', 'Intake', 'triage + lane gate'), ('waiting', 'Waiting', 'on a card, time or you'),
+    ('ready', 'Ready', 'needs a worker'), ('running', 'Running', 'on a worker'),
+    ('review', 'Review', 'PR review'), ('ci', 'CI', 'required checks'), ('merge', 'Merge', 'approved + green'),
+    ('deploy', 'Deploy', 'merged, not live'), ('test', 'Test', 'live verification'), ('done', 'Done', 'this window')]
+REASONS = {
+    'you': ('needs you', '#ff5d5d'), 'dep': ('waits on a card', '#f5c542'), 'gate': ('held at gate', '#c49bff'),
+    'time': ('scheduled', '#6b7280'), 'slot': ('no free worker', '#ff9f43'), 'quota': ('model quota', '#ff9f43'),
+    'triage': ('unspecified', '#9aa3b2'), 'run': ('running', '#4c9bff'), 'review': ('review / CI', '#3ddc97'),
+    'limit:cards_per_day': ('over cards/day', '#e08bd0'), 'limit:usd_per_day': ('over $/day', '#e08bd0')}
+
+
+def reason_info(reason):
+    return REASONS.get(reason, ('over limit', '#e08bd0') if str(reason).startswith('limit:') else (reason or 'unknown', '#9aa3b2'))
+
+
+def age(hours):
+    # Match the former renderer's positive Math.round semantics.
+    rounded = lambda n: int(n + .5)
+    return f'{max(1, rounded(hours * 60))}m' if hours < 1 else f'{rounded(hours)}h' if hours < 48 else f'{rounded(hours / 24)}d'
+
+
+def dam_hint(reason, cards):
+    n = len(cards)
+    plural = lambda word: f'{n} {word}' + ('' if n == 1 else 's')
+    if reason == 'you':
+        text = 'answer ' + plural('ask')
+    elif reason == 'dep':
+        groups = {}
+        unknown = 0
+        for card in cards:
+            blockers = card.get('blockers') or ([card['blocker']] if card.get('blocker') else [])
+            valid = {b['id']: b for b in blockers if isinstance(b, dict) and b.get('id')}
+            if not valid:
+                unknown += 1
+            for b in valid.values():
+                group = groups.setdefault(b.get('pr') or b['id'], {'blocker': b, 'cards': set(), 'partial': False})
+                group['cards'].add(card['id'])
+                group['partial'] |= len(valid) > 1
+        hints = []
+        for g in sorted(groups.values(), key=lambda g: -len(g['cards'])):
+            b = g['blocker']
+            action = 'land PR #' + b['pr'].rstrip('/').split('/')[-1] if b.get('pr') else 'finish ' + b['id']
+            result = f"unblocks {len(g['cards'])} dependency waits" if g['partial'] else f"frees {len(g['cards'])}"
+            hints.append(f'{action} → {result}')
+        if unknown:
+            hints.append(f"{unknown} card{' waits' if unknown == 1 else 's wait'} on an open parent")
+        text = '; '.join(hints)
+    else:
+        text = {
+            'gate': f'admit or release {n} held', 'limit:cards_per_day': 'raise cards/day, or wait for local midnight',
+            'limit:usd_per_day': 'raise $/day, or wait for local midnight', 'quota': 'waits for model quota',
+            'time': 'wakes on its schedule', 'triage': 'specify ' + plural('card'),
+            'slot': plural('card') + (' needs' if n == 1 else ' need') + ' a free worker'
+        }.get(reason, plural('card') + ' held')
+    return f"{text} · oldest {age(max((float(c.get('age_h') or 0) for c in cards), default=0))}"
+
+
+def project(snap, raw, expanded):
+    view = {**snap, 'view_version': 1, 'lanes': {name: dict(row) for name, row in snap.get('lanes', {}).items()}}
+    raw = raw or {}
+    if expanded:
+        for name, row in raw.get('lanes', {}).items():
+            view['lanes'].setdefault(name, {}).update({k: v for k, v in row.items()
+                                                     if k in ('limits', 'usage', 'run_hours', 'cost_usd', 'done')})
+    for row in view['lanes'].values():
+        row['not_ready'] = max(0, row.get('open', 0) - row.get('running', 0) - row.get('blocked_on_you', 0))
+        for key in ('running', 'blocked_on_you', 'open', 'ready', 'held', 'done'):
+            row.setdefault(key, 0)
+        gap = row.get('actual', 0) - row.get('target', 0)
+        row['drift'] = ('paused' if row.get('paused') else '' if abs(gap) <= .1 else 'over: using idle slots'
+                        if gap > 0 else 'under: nothing ready' if row['ready'] == 0 else 'under: waiting for slots')
+    view['totals'] = {key: sum(r[key] for r in view['lanes'].values()) for key in
+                      ('running', 'not_ready', 'blocked_on_you', 'open', 'ready', 'held', 'done')}
+    if not expanded:
+        return view
+    view['flow_error'] = raw.get('reason', '') if raw.get('configured') is False else ''
+    cards = raw.get('cards', [])
+    # Legacy /flow consumers still see cards and per-lane limits/usage at the top level.
+    view['cards'] = cards
+    view['window'] = raw.get('window')
+
+    keys = [s[0] for s in STEPS]
+    step = lambda c: c.get('step') if c.get('step') in keys else 'landing_unclassified'
+    columns = [dict(key=k, label=l, hint=h) for k, l, h in STEPS]
+    if any(step(c) == 'landing_unclassified' for c in cards):
+        columns.append(dict(key='landing_unclassified', label='Unclassified', hint='landing stage not provable'))
+    names = list(dict.fromkeys([*view['lanes'], *raw.get('lanes', {}), *(c['lane'] for c in cards)]))
+    rank = lambda r: list(REASONS).index(r) if r in REASONS else len(REASONS)
+    grouped = defaultdict(list)
+    for c in cards:
+        grouped[c['lane'], step(c)].append(c)
+    cells = []
+    for name in names:
+        for column in columns:
+            group = sorted(grouped[name, column['key']], key=lambda c: (rank(c.get('reason')), -float(c.get('age_h') or 0)))
+            tally = Counter(c.get('reason') for c in group)
+            count = raw.get('lanes', {}).get(name, {}).get('done', 0) if column['key'] == 'done' else len(group)
+            cells.append(dict(lane=name, step=column['key'], cards=group, count=count,
+                              piling=len(group) >= 4 or any(c.get('reason') == 'you' for c in group),
+                              summary=' · '.join(f'{tally[r]} {reason_info(r)[0]}' for r in sorted(tally, key=rank)[:2])))
+    assert sum(c['count'] for c in cells if c['step'] != 'done') == len(cards)
+    view['floor'] = dict(columns=columns, names=names, cells=cells)
+    graphs = {}
+    for by in ('project', 'source'):
+        def label(c):
+            s = c.get('source') or {}
+            kind = s.get('kind')
+            if by == 'project':
+                return s.get('project') or ('automations' if kind == 'automation' else 'you (manual)' if kind == 'user' else 'no project')
+            if kind == 'user':
+                return 'you (manual)'
+            ident = str(s.get('id') or '?')
+            return ('session' if kind == 'session' else 'auto') + ' ' + (ident[:21] + '…' if len(ident) > 22 else ident)
+        counts = Counter(label(c) for c in cards)
+        keep = set(sorted(counts, key=lambda k: -counts[k])[:6])
+        sources, lanes, sinks, sl, lk = Counter(), Counter(), Counter(), Counter(), Counter()
+        by_sink = defaultdict(list)
+        for c in cards:
+            source = label(c) if label(c) in keep else 'other'
+            sink = 'step:' + step(c) if c.get('reason') in ('run', 'review') else 'dam:' + str(c.get('reason') or 'unknown')
+            lane = c['lane']
+            sources[source] += 1; lanes[lane] += 1; sinks[sink] += 1
+            sl[source, lane] += 1; lk[lane, sink] += 1
+            by_sink[sink].append(c)
+        def nodes(counter, order):
+            return [dict(key=k, count=counter[k]) for k in sorted(counter, key=order)]
+        sink_nodes = nodes(sinks, lambda k: keys.index(k[5:]) - 100 if k.startswith('step:') and k[5:] in keys else rank(k[4:]))
+        for node in sink_nodes:
+            dam = node['key'].startswith('dam:')
+            reason = node['key'][4:] if dam else 'run' if node['key'][5:] == 'running' else 'review'
+            label_text, color = reason_info(reason)
+            node.update(dam=dam, label=label_text if dam else dict((k, l) for k, l, _ in STEPS).get(node['key'][5:], node['key'][5:]),
+                        color=color, hint=dam_hint(reason, by_sink[node['key']]) if dam else '')
+        graph = dict(total=len(cards), sources=nodes(sources, lambda k: (-sources[k], k)),
+                     lanes=nodes(lanes, lambda k: (names.index(k), k)), sinks=sink_nodes,
+                     edges=dict(sourceLane=[dict(from_=a, to=b, count=n) for (a, b), n in sl.items()],
+                                laneSink=[dict(from_=a, to=b, count=n) for (a, b), n in lk.items()]))
+        for edges in graph['edges'].values():
+            for edge in edges:
+                edge['from'] = edge.pop('from_')
+            assert sum(e['count'] for e in edges) == len(cards)
+        for layer in ('sources', 'lanes', 'sinks'):
+            assert sum(n['count'] for n in graph[layer]) == len(cards)
+        graphs[by] = graph
+    view['flow'] = {**raw, 'graphs': graphs}
+    return view

@@ -1,46 +1,70 @@
 # lanes
 
-REST API behind the Desktop lanes panel (`desktop-plugins/lanes`). All data and writes go through core's
-`hermes kanban lanes` (`hermes_cli/kanban_lanes*.py`); this plugin adds no state of its own.
+Hub-computed view model and push stream for `desktop-plugins/lanes`. Core's
+`hermes kanban lanes` remains the authority for classification, shares and policy;
+this plugin adds presentation projections, not scheduling behaviour.
 
-| Route | What |
+| Route | Contract |
 |---|---|
-| `GET /api/plugins/lanes/v1/lanes?hours=1\|6\|24\|168` | Per lane: target and actual share, running, ready, held, blocked_on_you (human asks), open, done, tokens, estimated cost; the planner's latest notes |
-| `PUT /api/plugins/lanes/v1/lanes/<lane>` | `{"share": n, "paused": bool, "admit_per_day": n, "max_workers": n, "cards_per_day": n, "usd_per_day": n}`, any subset; the last three also accept null to clear on supporting core |
-| `GET /api/plugins/lanes/v1/lanes/flow?window=1h\|6h\|24h\|7d` | Core's `hermes kanban lanes flow --json`: every open card `{id,title,lane,step,reason,source,age_h,pr}` plus per lane done, run-hours, cost, `limits` and today's `usage` |
-| `GET /api/plugins/lanes/v1/held?lane=x` | Cards waiting at a lane gate |
-| `POST /api/plugins/lanes/v1/held/<card>/admit` | Release one, `{"reason": "..."}` |
+| `GET /api/plugins/lanes/v1/lanes?hours=1\|6\|24\|168&window=1h\|6h\|24h\|7d&expanded=false` | Full strip view: per-lane running, not_ready, blocked_on_you, open, ready, held, done, share, target, actual, drift; `totals`, scope and planner notes |
+| `GET /api/plugins/lanes/v1/lanes/flow?window=1h\|6h\|24h\|7d` | Same view model, expanded. Also preserves top-level `cards`, `window` and per-lane limits/usage for older Desktop renderers |
+| `WS /api/plugins/lanes/v1/lanes/stream?hours=6&window=6h&expanded=false` | Initial `{version, view, params}`, then changed views only. Client may send `{hours, window, expanded}` (any subset) without reconnecting |
+| `PUT /api/plugins/lanes/v1/lanes/<lane>` | `{share, paused, admit_per_day, max_workers, cards_per_day, usd_per_day}`, any subset; last three accept null to clear on supporting core |
+| `GET /api/plugins/lanes/v1/held?lane=x` | Cards at the lane gate |
+| `POST /api/plugins/lanes/v1/held/<card>/admit` | Release one: `{reason: "..."}` |
 
-On a core without lanes support, or with no `kanban.admission.lanes`, `GET /v1/lanes` answers
-`{"configured": false, "reason": ...}` and every other route answers 409. The panel uses the lanes read and the
-share and pause writes; `admit_per_day` and the held routes are API-only for now. Cost is an estimate from the
-runs whose workers reported usage; `usage_runs` against `runs` says how many that is.
+## Render-only rule
 
-The Desktop plugin (`desktop-plugins/lanes`) docks a full-width strip at the top of the window (`shell.topStrip`),
-not a status-bar popup. Collapsed (the default, persisted in localStorage) is one line of per-lane pills: colour
-dot, name, a small bar (blue running, yellow not ready, red blocked on you) and the open count, plus a toggle.
-Clicking a lane expands the strip and scrolls to that row. Expanded is two tabs (the last one is remembered in
-localStorage), capped at 60vh with internal scroll. **Floor**: lanes are rows, the ten steps (intake, waiting, ready,
-running, review, ci, merge, deploy, test, done; plus an Unclassified column only while a card sits in it) are columns,
-one box per open card coloured by why it waits (hover = title, click = open the card); a cell with 4+ cards or any
-card that needs you is hatched. Each lane row carries its valves: share slider and Pause, a max-workers input,
-and cards/day and $/day inputs with today's usage; Apply writes the changes through `PUT` (`lanes set`), Reset drops
-them. **Flow**: an SVG Sankey of sources (by project, or by session/automation) into lanes and then into flowing
-steps or dams named by reason, each dam saying what clears it (the PR whose merge frees the most cards, asks to
-answer, a cap to raise), with a limits line below. Both read `/v1/lanes/flow` only while expanded. Older cores
-without `limits.max_workers` keep a read-only running gauge. Blanking a saved limit sends null; an older core
-without explicit clearing support returns 409 before any write, keeping the draft/error visible. Dependency hints
-group `blockers` (or `blocker`) by parent/PR; multi-parent cards say dependency waits rather than promising release.
-Without those fields they keep the generic open-parent hint, never the waiting card's own PR. Window, Board,
-Apply/Reset and notes as before. Where lanes are configured, the status-bar task
-pill and the Show lanes palette command expand it; its Board button opens the board. On an older Desktop SDK
-without `TOP_STRIP_AREA`, the plugin still activates using the `shell.topStrip` area string.
+**All counts and grouping live on the hub.** `lane_view(hours, window, expanded)`
+returns the strip totals and, when expanded, `floor: {columns, names, cells}` and
+`flow.graphs: {project, source}`. Every Floor cell carries `lane`, `step`, `count`,
+`piling`, `summary`, and `cards`. Graphs carry `sources`, `lanes`, `sinks`, `edges`
+and `total`; sink nodes include dam hints. The server asserts conservation of
+open cards through Floor cells and each Flow node/edge layer. Done is a separate
+window-throughput count, not an open-card layer.
 
-Lanes are configured on one gateway (the one that holds the board). The Desktop panel asks every
-connection once, by id (answered by that connection's default profile), and reads and writes on the first that
-answers `configured: true`, whichever gateway the window has in front,
-so the plugin must be enabled on that gateway.
+Desktop renders these numbers even when card lists disagree. It may calculate
+pixel geometry, percentages for presentation, and edit PUT payloads; it never
+recounts cards, recomputes drift/targets, groups sources, or infers dams. Target
+and drift reflect the saved policy until Apply has reached the hub; editing a
+slider does not invent a client-side forecast.
 
-Enable: add `lanes` to the private repo's `home/plugins-enabled.txt` (a core-only host enables it as the
-backend of the Desktop plugin it serves). Tests: `scripts/test-all -k plugins/lanes`,
-`node --test desktop-plugins/lanes/tests/lanes.test.mjs`.
+## Push and compatibility
+
+The stream uses core's canonical WebSocket authorization (ticket/token/internal
+identity), failing closed with 1008. It watches the local and fleet-replica
+`task_events` cursor and policy/planner-note mtimes every 0.5 seconds, coalesces
+changes for about one second, invalidates legacy read caches once per revision,
+and sends only when the view/parameter hash differs. An unchanged board produces
+only `{type: "heartbeat", version}` every 30 seconds. Time-window/age values are
+snapshots at board/config changes, not a separate clock-driven feed.
+
+Desktop performs one GET on mount and one on reconnect, then uses pushed views.
+Expanded/window changes use stream messages. There are no interval GETs on a live
+stream. If sockets are unavailable (including OAuth/browser-hosted Desktop), a
+60-second GET fallback displays **not live**. A 45-second heartbeat timeout marks
+a stalled connection unavailable. Apply and Reset retain their PUT/draft semantics;
+a successful live write is reflected by the next hub push.
+
+The plugin discovers the steering gateway (gated lanes/planner notes), then pins
+reads, writes and the stream to that connection, independent of the active chat.
+The current SDK `ctx.socket` has no connection/send/status API: unscoped older
+hosts use it; native connection-pinned hosts use the same `getPluginWsUrl` ticket
+bridge as core, with bounded lookups and reconnect backoff. OAuth stays on REST.
+No core modification or Desktop restart is needed.
+
+Floor/Flow, lane/card navigation, window/tab persistence, per-lane valves, explicit
+null clearing, multi-parent dependency hints and the compact collapsed strip are
+preserved. Unsupported cores return a reason; failed expanded reads retain strip
+counts and an unavailable-flow explanation. Cost remains estimated reported usage.
+
+Enable `lanes` on the gateway holding the board. Tests:
+
+```sh
+scripts/test-all -k plugins/lanes
+node --test desktop-plugins/lanes/tests/*.test.mjs
+```
+
+The Desktop regression fixtures execute the actual Python producer before
+rendering; a separate deliberately inconsistent fixture proves numbers are not
+recounted on the client.

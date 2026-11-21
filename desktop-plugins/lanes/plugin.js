@@ -13,13 +13,12 @@
 import * as sdk from '@hermes/plugin-sdk'
 import { createElement as h, useState, useEffect, useMemo, useRef } from 'react'
 
-const { host, useQuery, PALETTE_AREA } = sdk
+const { host, PALETTE_AREA } = sdk
 // Older Desktops do not export TOP_STRIP_AREA; a named import would throw at load and skip activation.
 export const TOP_STRIP_AREA = sdk.TOP_STRIP_AREA || 'shell.topStrip'
 export const STRIP_AREA = sdk.MAIN_PANE_TOP_AREA || TOP_STRIP_AREA
 
-export const POLL_MS = 15000
-export const IDLE_POLL_MS = 300000
+export const FALLBACK_MS = 60000
 export const REQUEST_TIMEOUT_MS = 20000
 export const WINDOWS = [[1, '1h'], [6, '6h'], [24, '24h'], [168, '7d']]
 export const STORE_KEY = 'hermes-lanes-window'
@@ -85,8 +84,8 @@ export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
     unconfigured = { ...first, configured: false, reason: `${first?.reason || 'No lanes are configured.'}${missed}` }
     return unconfigured
   }
-  async function read(hours) {
-    const path = `/v1/lanes?hours=${hours}`
+  async function read(hours, window, expanded) {
+    const path = `/v1/lanes?hours=${hours}` + (window ? `&window=${window}&expanded=${Boolean(expanded)}` : '')
     if (!chosen) return unconfigured && clock() - sweptAt < UNCONFIGURED_MS ? unconfigured : discover(path)
     let body
     try {
@@ -112,7 +111,104 @@ export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
     if (body?.configured === false) throw Error(body.reason || 'lanes flow is not available')
     return body
   }
-  return { read, write, flow, target: () => chosen }
+  function subscribe(initial, onView, onLive, timers = globalThis) {
+    let params = initial, disposed = false, socket, off, poll, watchdog, retry
+    let epoch = 0, frames = 0, live = false, attempt = 0, connections = 0, started = false
+    const bounded = (promise) => new Promise((resolve, reject) => {
+      const timer = timers.setTimeout(() => reject(Error('Lanes socket bridge timed out')), REQUEST_TIMEOUT_MS)
+      Promise.resolve(promise).then(resolve, reject).finally(() => timers.clearTimeout(timer))
+    })
+    const path = () => `v1/lanes/stream?hours=${params.hours}&window=${params.window}&expanded=${params.expanded}`
+    const fetch = async (redial = true) => {
+      const at = epoch, before = frames, previousTarget = chosen?.connectionId
+      try {
+        const view = await read(params.hours, params.window, params.expanded)
+        if (!disposed && at === epoch && before === frames) {
+          onView(view)
+          if (redial && started && previousTarget !== chosen?.connectionId) {
+            epoch += 1; off?.(); off = undefined; socket?.close(); socket = undefined
+            timers.clearTimeout(watchdog); timers.clearTimeout(retry)
+            void dial()
+          }
+        }
+      } catch (e) { if (!disposed) onView(undefined, e) }
+    }
+    const unavailable = () => {
+      live = false; onLive(false)
+      if (!poll && !disposed) poll = timers.setInterval(() => void fetch(), FALLBACK_MS)
+    }
+    const receive = (frame) => {
+      if (disposed) return
+      if (frame?.params && (frame.params.hours !== params.hours || frame.params.window !== params.window || frame.params.expanded !== params.expanded)) return
+      timers.clearTimeout(watchdog)
+      watchdog = timers.setTimeout(() => { if (socket) socket.close(); else unavailable() }, 45000)
+      if (!live) { live = true; onLive(true); timers.clearInterval(poll); poll = undefined }
+      attempt = 0
+      if (frame?.view) {
+        frames += 1; onView(frame.view)
+        // version 1 is a new connection: refresh once, not on ordinary updates.
+        if (frame.version === 1 && connections++ > 0) void fetch()
+        if (frame.view.configured === false) { unavailable(); void fetch() }
+      }
+    }
+    const dial = async () => {
+      const at = epoch
+      const bridge = globalThis.window?.hermesDesktop
+      // The legacy SDK cannot pin a connection or send updates. Use its socket only
+      // in an unscoped host; never stream another gateway's counts into a pinned hub.
+      if (!bridge?.getConnectionFor || !chosen?.connectionId) {
+        if (typeof ctx.socket === 'function' && chosen?.connectionId === null) {
+          off = ctx.socket(path(), receive)
+          watchdog = timers.setTimeout(unavailable, 45000)
+        } else unavailable()
+        return
+      }
+      try {
+        const connection = await bounded(bridge.getConnectionFor({ connectionId: chosen.connectionId, profile: null }))
+        if (disposed || at !== epoch) return
+        if (connection.authMode === 'oauth') { unavailable(); return }
+        const suffix = '/' + path()
+        const url = connection.authMode === 'native'
+          ? await bounded(bridge.getPluginWsUrl({ connectionId: chosen.connectionId, profile: null, pluginId: 'lanes', path: suffix }))
+          : connection.token ? `${connection.baseUrl.replace(/\/$/, '').replace(/^http/, 'ws')}/api/plugins/lanes${suffix}&token=${encodeURIComponent(connection.token)}` : null
+        if (disposed || at !== epoch) return
+        if (typeof url !== 'string') { unavailable(); return }
+        const current = new WebSocket(url)
+        socket = current
+        current.onopen = () => { if (disposed || at !== epoch) { current.close(); return }; current.send(JSON.stringify(params)) }
+        current.onmessage = (event) => { if (!disposed && at === epoch) { try { receive(JSON.parse(event.data)) } catch {} } }
+        current.onclose = () => {
+          if (disposed || at !== epoch) return
+          unavailable()
+          retry = timers.setTimeout(() => void dial(), Math.min(30000, 500 * 2 ** Math.min(attempt++, 6)))
+        }
+        watchdog = timers.setTimeout(() => { unavailable(); current.close() }, 45000)
+      } catch {
+        if (!disposed && at === epoch) { unavailable(); retry = timers.setTimeout(() => void dial(), 5000) }
+      }
+    }
+    const start = () => {
+      const at = ++epoch
+      off?.(); off = undefined; socket?.close(); socket = undefined
+      timers.clearTimeout(retry); timers.clearTimeout(watchdog)
+      void fetch(false).then(() => {
+        if (!disposed && at === epoch) { started = true; void dial() }
+      })
+    }
+    start()
+    const stop = () => {
+      disposed = true; epoch += 1; off?.(); socket?.close()
+      timers.clearInterval(poll); timers.clearTimeout(watchdog); timers.clearTimeout(retry)
+    }
+    stop.update = (next) => {
+      params = next
+      if (socket?.readyState === 1) socket.send(JSON.stringify(params))
+      else start()
+    }
+    stop.refresh = fetch
+    return stop
+  }
+  return { read, write, flow, subscribe, target: () => chosen }
 }
 
 // One source per plugin ctx, not per mount: the status bar remounts contributions often.
@@ -147,12 +243,7 @@ export function saveOpen(open, storage = globalThis.localStorage) {
 /** Rows in server order with a stable color, the target each lane WOULD get with `draft` shares applied. */
 export function rows(snap, draft = {}) {
   const names = Object.keys(snap?.lanes || {})
-  const share = (name) => {
-    const lane = snap.lanes[name]
-    const paused = draft[name]?.paused ?? lane.paused
-    return paused ? 0 : Number(draft[name]?.share ?? lane.share) || 0
-  }
-  const total = names.reduce((sum, name) => sum + share(name), 0) || 1
+
   return names.map((name, i) => {
     const lane = snap.lanes[name]
     return {
@@ -161,7 +252,7 @@ export function rows(snap, draft = {}) {
       color: COLORS[i % COLORS.length],
       share: Number(draft[name]?.share ?? lane.share) || 0,
       paused: draft[name]?.paused ?? lane.paused,
-      target: share(name) / total,
+      target: lane.target,
       dirty: draft[name] != null
     }
   })
@@ -169,11 +260,7 @@ export function rows(snap, draft = {}) {
 
 /** Why a lane is off its target, in the user's terms; '' when it is within 10 points. */
 export function drift(row) {
-  if (row.paused) return 'paused'
-  const gap = row.actual - row.target
-  if (Math.abs(gap) <= 0.1) return ''
-  if (gap > 0) return 'over: using idle slots'
-  return row.ready === 0 ? 'under: nothing ready' : 'under: waiting for slots'
+  return row.drift || ''
 }
 
 export function pct(value) { return `${Math.round((Number(value) || 0) * 100)}%` }
@@ -257,33 +344,10 @@ export function loadBy(storage = globalThis.localStorage) {
 }
 export function saveBy(by, storage = globalThis.localStorage) { try { storage?.setItem(BY_KEY, by) } catch {} }
 
-/** A card's column: any step core sent that this panel has no column for is shown as unclassified, never dropped. */
-export const stepOf = (card) => (STEP_KEYS.includes(card?.step) ? card.step : UNCLASSIFIED)
-
-export const hasUnclassified = (flow) => (flow?.cards || []).some((c) => stepOf(c) === UNCLASSIFIED)
-
-/** Columns of the Floor: the ten steps, plus the unclassified column only while a card sits in it. */
-export function floorColumns(flow) {
-  const cols = STEPS.map(([key, label, hint]) => ({ key, label, hint }))
-  if (hasUnclassified(flow)) cols.push({ key: UNCLASSIFIED, label: 'Unclassified', hint: 'landing stage not provable' })
-  return cols
-}
-
-const reasonRank = (r) => { const i = REASON_ORDER.indexOf(r); return i < 0 ? REASON_ORDER.length : i }
-
-/** { lane: { step: [cards] } }, a cell sorted by reason (you first) then oldest first. */
-export function floorGrid(flow, names = []) {
-  const grid = {}
-  for (const n of names) grid[n] = {}
-  for (const card of flow?.cards || []) ((grid[card.lane] ||= {})[stepOf(card)] ||= []).push(card)
-  for (const cells of Object.values(grid)) {
-    for (const list of Object.values(cells)) list.sort((a, b) => reasonRank(a.reason) - reasonRank(b.reason) || (b.age_h || 0) - (a.age_h || 0))
-  }
-  return grid
-}
-
-/** A cell is piling up when it holds PILE_AT or more cards, or any card that needs you. */
-export const piling = (cards) => (cards?.length || 0) >= PILE_AT || (cards || []).some((c) => c.reason === 'you')
+/** Server projections only: no card grouping or counting in Desktop. */
+export const floorColumns = (flow) => flow?.floor?.columns || []
+export const floorGrid = (flow) => flow?.floor?.cells || []
+export const piling = (cell) => Boolean(cell?.piling)
 
 export function ageHours(hours) {
   const h = Number(hours) || 0
@@ -294,96 +358,8 @@ export function ageHours(hours) {
 
 const prLabel = (url) => { const m = /\/pull\/(\d+)/.exec(String(url || '')); return m ? `#${m[1]}` : String(url || '').split('/').filter(Boolean).pop() || '' }
 
-/** What clears a dam, without inferring blocker identity from a card's own PR. */
-export function damHint(reason, cards) {
-  const n = cards.length
-  const plural = (word) => `${n} ${word}${n === 1 ? '' : 's'}`
-  const oldest = ageHours(Math.max(0, ...cards.map((c) => Number(c.age_h) || 0)))
-  let text
-  if (reason === 'you') text = `answer ${plural('ask')}`
-  else if (reason === 'dep') {
-    const groups = new Map()
-    let unknown = 0
-    for (const card of cards) {
-      const blockers = Array.isArray(card.blockers) ? card.blockers : card.blocker ? [card.blocker] : []
-      const valid = [...new Map(blockers.filter((b) => b && typeof b.id === 'string' && b.id).map((b) => [b.id, b])).values()]
-      if (!valid.length) unknown++
-      for (const b of valid) {
-        const key = b.pr || b.id
-        const group = groups.get(key) || { blocker: b, cards: new Set(), partial: false }
-        group.cards.add(card.id || card)
-        group.partial ||= valid.length > 1
-        groups.set(key, group)
-      }
-    }
-    const hints = [...groups.values()].sort((a, b) => b.cards.size - a.cards.size).map(({ blocker, cards, partial }) =>
-      `${blocker.pr ? `land PR ${prLabel(blocker.pr)}` : `finish ${blocker.id}`} → ${partial ? `unblocks ${cards.size} dependency waits` : `frees ${cards.size}`}`)
-    if (unknown) hints.push(`${unknown} card${unknown === 1 ? ' waits' : 's wait'} on an open parent`)
-    text = hints.join('; ') || `${plural('card')} ${n === 1 ? 'waits' : 'wait'} on an open parent`
-  } else if (reason === 'gate') text = `admit or release ${n} held`
-  else if (reason === 'limit:cards_per_day') text = 'raise cards/day, or wait for local midnight'
-  else if (reason === 'limit:usd_per_day') text = 'raise $/day, or wait for local midnight'
-  else if (reason === 'slot') text = `${plural('card')} ${n === 1 ? 'needs' : 'need'} a free worker`
-  else if (reason === 'quota') text = 'waits for model quota'
-  else if (reason === 'time') text = 'wakes on its schedule'
-  else if (reason === 'triage') text = `specify ${plural('card')}`
-  else text = `${plural('card')} held`
-  return `${text} · oldest ${oldest}`
-}
-
-const FLOWING = new Set(['run', 'review'])
-const shortId = (id) => (String(id).length > 22 ? `${String(id).slice(0, 21)}…` : String(id))
-
-/** The source node a card is drawn from: its project, or the session / automation that created it. */
-export function sourceLabel(card, by) {
-  const s = card.source || {}
-  if (by === 'project') return s.project || (s.kind === 'automation' ? 'automations' : s.kind === 'user' ? 'you (manual)' : 'no project')
-  if (s.kind === 'user') return 'you (manual)'
-  return `${s.kind === 'session' ? 'session' : 'auto'} ${shortId(s.id || '?')}`
-}
-
-const SOURCE_CAP = 6
-
-/**
- * Sankey data: sources → lanes → sinks. A sink is a flowing step (running, review…) or a dam named by its reason.
- * Every card is in exactly one source, lane and sink, so each layer's totals equal the card count.
- */
-export function flowGraph(flow, by = 'project') {
-  const cards = flow?.cards || []
-  const counts = new Map()
-  for (const c of cards) counts.set(sourceLabel(c, by), (counts.get(sourceLabel(c, by)) || 0) + 1)
-  const keep = new Set([...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, SOURCE_CAP).map(([k]) => k))
-  const src = (c) => { const label = sourceLabel(c, by); return keep.has(label) ? label : 'other' }
-  const sinkKey = (c) => (FLOWING.has(c.reason) ? `step:${stepOf(c)}` : `dam:${c.reason}`)
-  const nodes = { source: new Map(), lane: new Map(), sink: new Map() }
-  const edges = { sl: new Map(), lk: new Map() }
-  const bump = (map, key, by1 = 1) => map.set(key, (map.get(key) || 0) + by1)
-  for (const c of cards) {
-    const s = src(c)
-    const k = sinkKey(c)
-    bump(nodes.source, s); bump(nodes.lane, c.lane); bump(nodes.sink, k)
-    bump(edges.sl, `${s}\u0000${c.lane}`); bump(edges.lk, `${c.lane}\u0000${k}`)
-  }
-  const bySink = {}
-  for (const c of cards) (bySink[sinkKey(c)] ||= []).push(c)
-  const sinkOrder = (key) => (key.startsWith('step:') ? STEP_KEYS.indexOf(key.slice(5)) - 100 : reasonRank(key.slice(4)))
-  const laneOrder = Object.keys(flow?.lanes || {})
-  const list = (map, order) => [...map.entries()].map(([key, count]) => ({ key, count })).sort(order)
-  const edgeList = (map) => [...map.entries()].map(([k, count]) => { const [from, to] = k.split('\u0000'); return { from, to, count } })
-  return {
-    total: cards.length,
-    sources: list(nodes.source, (a, b) => b.count - a.count || a.key.localeCompare(b.key)),
-    lanes: list(nodes.lane, (a, b) => laneOrder.indexOf(a.key) - laneOrder.indexOf(b.key) || a.key.localeCompare(b.key)),
-    sinks: list(nodes.sink, (a, b) => sinkOrder(a.key) - sinkOrder(b.key)).map((n) => {
-      const dam = n.key.startsWith('dam:')
-      const reason = dam ? n.key.slice(4) : null
-      return { ...n, dam, label: dam ? reasonInfo(reason).label : STEPS.find(([k]) => k === n.key.slice(5))?.[1] || n.key.slice(5),
-        color: dam ? reasonInfo(reason).color : reasonInfo(n.key.slice(5) === 'running' ? 'run' : 'review').color,
-        hint: dam ? damHint(reason, bySink[n.key]) : '' }
-    }),
-    edges: { sourceLane: edgeList(edges.sl), laneSink: edgeList(edges.lk) }
-  }
-}
+/** Graphs and dam hints are counted and authored on the hub. */
+export const flowGraph = (flow, by = 'project') => flow?.graphs?.[by] || { total: 0, sources: [], lanes: [], sinks: [], edges: { sourceLane: [], laneSink: [] } }
 
 /** Geometry for the Sankey: node boxes per column and one stroked curve per edge. Pure, so tests can check it. */
 export function sankey(graph, { width = 960, height = 300, nodeW = 14, gap = 6, minH = 10, cols = [0, 330, 640] } = {}) {
@@ -433,11 +409,7 @@ export function openCard(id, connectionId, win = typeof window !== 'undefined' ?
 
 /** Open-card mix for a mini pill: blue running, yellow not ready, red human-blocked. Older cores omit blocked_on_you. */
 export function meter(row) {
-  const running = Number(row?.running) || 0
-  const blocked = Number(row?.blocked_on_you) || 0
-  const open = Number(row?.open) || 0
-  const notReady = Math.max(0, open - running - blocked)
-  return { running, notReady, blocked, total: running + notReady + blocked }
+  return { running: row?.running ?? 0, notReady: row?.not_ready ?? 0, blocked: row?.blocked_on_you ?? 0, total: row?.open ?? 0 }
 }
 
 function laneSelector(name) {
@@ -474,18 +446,17 @@ function Valves({ row, limits, usage, draft, saving, onShare, onPause, onLimit }
     cap('usd_per_day', '$/day', 0.5, 'usd_today', usd))
 }
 
-function Cell({ column, cards, lane, flowLane, onOpen }) {
-  const pile = piling(cards)
+function Cell({ column, cell = {}, flowLane, onOpen }) {
+  const pile = cell.piling
+  const cards = cell.cards || []
 
   if (column.key === 'done') {
-    return h('div', { className: 'hermes-lanes-cell', 'data-step': 'done', 'data-count': flowLane?.done ?? 0 },
-      h('div', { className: 'hermes-lanes-count' }, flowLane?.done ?? 0),
+    return h('div', { className: 'hermes-lanes-cell', 'data-step': 'done', 'data-count': cell.count ?? 0 },
+      h('div', { className: 'hermes-lanes-count' }, cell.count ?? 0),
       h('div', { className: 'hermes-lanes-dim' }, flowLane ? `${flowLane.run_hours ?? 0} run-h${flowLane.cost_usd ? ` · ${usd(flowLane.cost_usd)}` : ''}` : ''))
   }
-  const tally = {}
-  for (const c of cards) tally[c.reason] = (tally[c.reason] || 0) + 1
-  return h('div', { className: `hermes-lanes-cell${pile ? ' is-piling' : ''}`, 'data-step': column.key, 'data-count': cards.length, 'data-piling': pile ? '1' : '0' },
-    h('div', { className: 'hermes-lanes-count' }, cards.length || '·'),
+  return h('div', { className: `hermes-lanes-cell${pile ? ' is-piling' : ''}`, 'data-step': column.key, 'data-count': cell.count ?? 0, 'data-piling': pile ? '1' : '0' },
+    h('div', { className: 'hermes-lanes-count' }, cell.count || '·'),
     h('div', { className: 'hermes-lanes-boxes' }, cards.map((c) => {
       const info = reasonInfo(c.reason)
       return h('button', {
@@ -494,14 +465,13 @@ function Cell({ column, cards, lane, flowLane, onOpen }) {
         style: { background: info.color }, onClick: () => onOpen(c.id)
       })
     })),
-    cards.length ? h('div', { className: 'hermes-lanes-dim hermes-lanes-why' }, Object.entries(tally).sort((a, b) => reasonRank(a[0]) - reasonRank(b[0])).slice(0, 2)
-      .map(([r, n]) => `${n} ${reasonInfo(r).label}`).join(' · ')) : null)
+    cell.summary ? h('div', { className: 'hermes-lanes-dim hermes-lanes-why' }, cell.summary) : null)
 }
 
 /** Mockup A: lanes are rows, steps are columns, one box per card coloured by why it waits; piled-up cells are hatched. */
 export function Floor({ list, flow, flowError, draft, saving, edit, onOpen }) {
   const columns = floorColumns(flow)
-  const names = [...new Set([...list.map((r) => r.name), ...Object.keys(flow?.lanes || {}), ...(flow?.cards || []).map((c) => c.lane)])]
+  const names = flow?.floor?.names || list.map((r) => r.name)
   const grid = floorGrid(flow, names)
   const byName = Object.fromEntries(list.map((r) => [r.name, r]))
   const style = { gridTemplateColumns: `240px repeat(${columns.length}, minmax(86px, 1fr))` }
@@ -525,7 +495,7 @@ export function Floor({ list, flow, flowError, draft, saving, edit, onOpen }) {
             row, limits: flowLane?.limits, usage: flowLane?.usage, draft: draft[name], saving,
             onShare: (n, share) => edit(n, { share }), onPause: (n, paused) => edit(n, { paused }), onLimit: (n, key, value) => edit(n, { [key]: value })
           }) : null),
-        columns.map((col) => h(Cell, { key: col.key, column: col, cards: grid[name]?.[col.key] || [], lane: name, flowLane, onOpen })))
+        columns.map((col) => h(Cell, { key: col.key, column: col, cell: grid.find((c) => c.lane === name && c.step === col.key), flowLane, onOpen })))
     }),
     h('div', { className: 'hermes-lanes-legend' }, ['you', 'dep', 'gate', 'limit:usd_per_day', 'time', 'slot', 'triage', 'run', 'review'].map((r) => h('span', { key: r },
       h('i', { style: { background: reasonInfo(r).color } }), reasonInfo(r).label)), h('span', { className: 'hermes-lanes-dim' }, 'Hatched = piling up (4+ cards, or any that need you).')))
@@ -533,7 +503,7 @@ export function Floor({ list, flow, flowError, draft, saving, edit, onOpen }) {
 
 /** Mockup B: sources → lanes → flowing steps or dams, a dam labelled with what clears it. */
 export function Flow({ flow, flowError, by, onBy, list, onEditLimits }) {
-  if (!flow) return h('div', { className: 'hermes-lanes-note', 'data-view': 'flow' }, flowError ? `Flow unavailable: ${flowError}` : 'Loading…')
+  if (!flow || flow.configured === false) return h('div', { className: 'hermes-lanes-note', 'data-view': 'flow' }, flowError ? `Flow unavailable: ${flowError}` : 'Loading…')
   const graph = flowGraph(flow, by)
   const geo = sankey(graph)
   const color = Object.fromEntries(list.map((r) => [r.name, r.color]))
@@ -581,6 +551,8 @@ export function Flow({ flow, flowError, by, onBy, list, onEditLimits }) {
 }
 
 export function Panel({ snap, flow, flowError, windowHours, onWindow, onApply, saving, error, onBoard, onOpenCard, storage }) {
+  flow = snap?.flow ? { ...snap.flow, floor: snap.floor } : flow
+  flowError = snap?.flow_error || flowError
   const [draft, setDraft] = useState({})
   const [tab, setTabState] = useState(() => loadTab(storage))
   const [by, setByState] = useState(() => loadBy(storage))
@@ -594,7 +566,7 @@ export function Panel({ snap, flow, flowError, windowHours, onWindow, onApply, s
   return h('div', { className: 'hermes-lanes' },
     h('div', { className: 'hermes-lanes-head' },
       h('strong', null, 'Lanes'),
-      h('span', { className: 'hermes-lanes-dim' }, `${list.reduce((s, r) => s + r.running, 0)} running · ${list.reduce((s, r) => s + r.open, 0)} open · ${snap.scope === 'fleet' ? 'whole fleet' : 'this board'}`),
+      h('span', { className: 'hermes-lanes-dim' }, `${snap.totals?.running ?? 0} running · ${snap.totals?.open ?? 0} open · ${snap.scope === 'fleet' ? 'whole fleet' : 'this board'}`),
       snap.shadow ? h('span', { className: 'hermes-lanes-warn', title: 'kanban.admission.lane_shadow is on: cards are classified and counted, but nothing is held, capped, reordered or paused' }, 'Shadow mode: reporting only') : null,
       h('div', { className: 'hermes-lanes-seg', role: 'tablist', 'aria-label': 'View' },
         TABS.map(([value, label]) => h('button', { key: value, type: 'button', role: 'tab', className: value === tab ? 'is-on' : '', 'aria-selected': value === tab, onClick: () => setTab(value) }, label))),
@@ -656,17 +628,21 @@ export function Lanes({ ctx }) {
       return next
     })
   }
-  const key = ['lanes', windowHours]
-  const query = useQuery({
-    queryKey: key,
-    queryFn: () => source.read(windowHours),
-    // Collapsed still shows counts, so poll at the live interval once lanes are configured.
-    refetchInterval: (q) => q.state.data?.configured ? POLL_MS : IDLE_POLL_MS,
-    refetchIntervalInBackground: false,
-    refetchOnWindowFocus: false,
-    retry: false,
-    placeholderData: (prev) => prev
-  })
+  const [snap, setSnap] = useState()
+  const [live, setLive] = useState(false)
+  const subscription = useRef()
+  useEffect(() => {
+    subscription.current = source.subscribe({ hours: windowHours, window: flowWindow(windowHours), expanded: open },
+      (view, err) => { if (view) setSnap(view); setError(err ? String(err.message || err) : '') }, setLive)
+    return () => subscription.current?.()
+  }, [source])
+  const previous = useRef({ windowHours, open })
+  useEffect(() => {
+    if (previous.current.windowHours !== windowHours || previous.current.open !== open) {
+      subscription.current?.update({ hours: windowHours, window: flowWindow(windowHours), expanded: open })
+      previous.current = { windowHours, open }
+    }
+  }, [windowHours, open])
   useEffect(() => {
     const show = () => setOpen(true)
     window.addEventListener('hermes-show-lanes', show)
@@ -674,7 +650,7 @@ export function Lanes({ ctx }) {
   }, [])
   // The task pill expands this strip only where lanes are configured and the API answers; anywhere else its
   // click is left alone and opens the board as before.
-  const working = query.data?.configured === true
+  const working = snap?.configured === true
   useEffect(() => {
     const zone = stripRef.current?.closest('[data-tree-group]')
     if (!zone) return undefined // Older hosts use the full-window shell area.
@@ -685,18 +661,7 @@ export function Lanes({ ctx }) {
     observer.observe(zone)
     return () => observer.disconnect()
   }, [working])
-  // Cards for Floor and Flow: only while the strip is expanded, so a collapsed strip costs one request.
-  const flowLabel = flowWindow(windowHours)
-  const flowQuery = useQuery({
-    queryKey: ['lanes-flow', flowLabel],
-    queryFn: () => source.flow(flowLabel),
-    enabled: open && working,
-    refetchInterval: POLL_MS,
-    refetchIntervalInBackground: false,
-    refetchOnWindowFocus: false,
-    retry: false,
-    placeholderData: (prev) => prev
-  })
+
   useEffect(() => {
     if (!working) return undefined
     const take = (event) => { event.preventDefault(); setOpen(true) }
@@ -719,18 +684,16 @@ export function Lanes({ ctx }) {
         at = name
         await source.write(name, body, target)
       }
-      await query.refetch()
-      if (open) await flowQuery.refetch().catch(() => {})
+      if (!live) await subscription.current?.refresh()
       return true
     } catch (e) {
+      if (!live) await subscription.current?.refresh()
       setError(`${at}: ${String(e?.message || e).slice(0, 180)}`)
-      await query.refetch().catch(() => {})
-      if (open) await flowQuery.refetch().catch(() => {})
       return false
     } finally { setSaving(false) }
   }
   if (!working) return null
-  const list = rows(query.data)
+  const list = rows(snap)
   const openLane = (name) => { setFocus(name); setOpen(!open || name !== focus) }
   const toggle = () => setOpen((value) => !value)
   return h('div', { ref: stripRef, className: 'hermes-lanes-strip', 'data-slot': 'lanes-strip', 'data-open': open ? '1' : '0' },
@@ -744,14 +707,15 @@ export function Lanes({ ctx }) {
       }
     },
       list.map((row) => h(MiniPill, { key: row.name, row, onOpen: openLane, expanded: open && focus === row.name })),
+      !live ? h('small', { className: 'hermes-lanes-dim', title: 'Push unavailable; refreshing every 60 seconds' }, 'not live') : null,
       h('button', {
         type: 'button', className: 'hermes-lanes-toggle', 'aria-expanded': open,
         'aria-label': open ? 'Collapse lanes' : 'Expand lanes', onClick: (event) => { event.stopPropagation(); toggle() }
       }, open ? '▴' : '▾')),
     open ? h('div', { ref: bodyRef, className: 'hermes-lanes-body', style: { maxHeight: bodyMaxHeight, overflow: 'auto' } },
       h(Panel, {
-        snap: query.data, flow: flowQuery.data, flowError: flowQuery.error ? String(flowQuery.error.message).slice(0, 200) : '',
-        windowHours, saving, error: error || (query.error ? String(query.error.message).slice(0, 200) : ''),
+        snap, flowError: '',
+        windowHours, saving, error,
         onOpenCard: (id) => openCard(id, source.target()?.connectionId || undefined),
         onWindow: (v) => { setWindowState(v); saveWindow(v) }, onApply: apply,
         onBoard: () => host.navigate('/kanban')
