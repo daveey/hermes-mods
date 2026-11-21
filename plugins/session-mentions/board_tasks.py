@@ -93,6 +93,10 @@ def handle(args):
                 # Reuse public tool projections; do not export raw task authority fields.
                 view = {key: task.get(key) for key in kt._TASK_FIELDS}
                 view.update(source="replica", owner=owner)
+                # Only persisted pacing, never this reader host's placement/capacity.
+                from hermes_cli import kanban_queue_position as queues
+                if hasattr(queues, "recorded_pacing"):  # older core has no recorded-only projection
+                    view.update(queues.fields(queues.recorded_pacing(conn, kb.get_task(conn, tid))))
                 comments, events, runs = kb.list_comments(conn, tid), kb.list_events(conn, tid), kb.list_runs(conn, tid)
                 # Resolve custody from the latest completion before truncating history.
                 # Preserve records verbatim, including unknown machines and warnings.

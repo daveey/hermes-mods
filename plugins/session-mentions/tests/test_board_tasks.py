@@ -126,6 +126,25 @@ def test_legacy_replica_without_events_has_empty_receipt(replica):
     assert result['artifact_receipt'] == []
 
 
+def test_headless_replica_preserves_recorded_pacing_queue(replica, monkeypatch):
+    queues = pytest.importorskip('hermes_cli.kanban_queue_position')
+    if not hasattr(queues, 'recorded_pacing'):
+        pytest.skip('recorded-only pacing requires newer core')
+    import sqlite3
+    with sqlite3.connect(replica) as conn:
+        conn.execute("UPDATE tasks SET status='ready' WHERE id='t_123'")
+        conn.execute('INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?,?,?,?)',
+                     ('t_123', 'dispatch_skipped', json.dumps({'reason': 'llm_paced',
+                      'detail': 'xai-oauth held', 'until': 1795474351.914}), 2))
+    monkeypatch.setattr(queues, '_position', lambda *_a, **_kw: pytest.fail('local placement on replica'))
+    result = bt.handle({'action': 'read', 'target': 't_123'})
+    assert result['ok'], result
+    assert result['task']['queue']['lane'] == 'llm_pacing'
+    assert 'LLM quota pacing (xai-oauth held pool) until' in result['task']['queue_note']
+    assert 'worker' not in result['task']['queue_note']
+    assert result['source'] == 'replica' and result['live'] is False
+
+
 def test_comment_refused_without_board_open(replica, monkeypatch):
     from tools import kanban_tools as kt
     monkeypatch.setattr(kt, '_granted_board', lambda *a: pytest.fail('write opened board'))
