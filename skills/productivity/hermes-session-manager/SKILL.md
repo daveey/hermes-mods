@@ -196,6 +196,13 @@ say what's running, never what needs the user.
   `crons` list (the chat is `owner_session_id` of a live job in `cron/jobs.json`) draws a green loop glyph, never
   the bar, so check `crons` in `outcome --refresh --json` before promising green. That owner field only feeds the
   sidebar; releasing it doesn't change how the job runs.
+- "Why was it stuck grey?": read `desktop-stripe.jsonl` for the row's last change. A chat whose work ended but
+  that never called `session_outcome` stays derived `waiting`/`running` for days, held by a linked card parked
+  far out (`scheduled` to a future date) or a cron it owns. Every chat you work in: when its work ends, call
+  `session_outcome` that turn (`done` + `keep_crons=false`, or `wait` naming the exact card/cron/time), and
+  unsubscribe it from cards you park for days. "Your request was not processed" with no reply: grep the logs
+  for `agent build failed for session <ui> (<session id>): SubscriptionQuotaUnavailable` (route out of quota,
+  turn never started) before suspecting the chat.
 - Verify completion with `hermes sessions outcome <id> --refresh --json`, then read it back; without
   `--refresh` the command only reads stored state. Live card links can restore `waiting` after a done declaration. Trace remote links to the
   owner's `kanban notify-list <task> --json` and the card's named canonical origin. Remove only a demonstrably
