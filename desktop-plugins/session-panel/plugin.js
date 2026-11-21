@@ -1949,6 +1949,9 @@ const feedFlights = new Map() // same key -> the catch-up in flight
 const feedScopes = new Map() // routeKey scope -> Set of card keys its last trusted bundle carried
 const doneFeedAt = new Map() // routeKey scope -> when its Done rows were last confirmed by a push
 const connKey = (connectionId, profile) => JSON.stringify([connectionId || '', profile || 'default'])
+// One desktop.log line per feed state change (registered, no backend half, pushes started), like open-timing:
+// `[panel-feed] <connection>/<profile> <state> ...`.
+const feedLog = msg => { try { window.hermesDesktop?.logLine?.(`[panel-feed] ${msg}`) } catch {} }
 const tasksBridge = () => (typeof window !== 'undefined' ? window.__sessionTasks : null)
 /** True while `route`'s gateway feed pushes (or heartbeats) reach this window. */
 export function feedIsLive(route, nowMs = Date.now()) {
@@ -2060,7 +2063,11 @@ async function feedCatchUpNow(target, { nowMs = Date.now(), reset = false, full 
   const key = connKey(target.connectionId, profile)
   const st = feeds.get(key)
   if (st?.unsupported && nowMs - st.at < FEED_UNSUPPORTED_RETRY_MS) return false
-  const unsupported = () => { feeds.set(key, { connectionId: target.connectionId, profile, unsupported: true, at: nowMs }); return false }
+  const unsupported = why => {
+    if (!st?.unsupported) feedLog(`${target.connectionId}/${profile} no-feed ${why}`)
+    feeds.set(key, { connectionId: target.connectionId, profile, unsupported: true, at: nowMs })
+    return false
+  }
   const sameFeed = !reset && st && !st.unsupported
   let r
   try {
@@ -2068,11 +2075,11 @@ async function feedCatchUpNow(target, { nowMs = Date.now(), reset = false, full 
       body: { sessions: target.sessions.slice(0, 200), since: sameFeed && !full ? st.rev || 0 : 0, epoch: sameFeed ? st.epoch || null : null } })
   } catch (e) {
     // The Desktop bridge rejects a 404 with "404: ...": this gateway has no backend half.
-    if (/^404\b/.test(String(e?.message || ''))) return unsupported()
+    if (/^404\b/.test(String(e?.message || ''))) return unsupported('404')
     log('feed catch-up failed', target.connectionId, e?.message || e)
     return false
   }
-  if (!r || r.profile_unsupported || typeof r.epoch !== 'string') return unsupported()
+  if (!r || r.profile_unsupported || typeof r.epoch !== 'string') return unsupported(r?.profile_unsupported ? `profile ${r.profile}` : 'no epoch')
   const cur = feeds.get(key)
   // A push for a later revision landed while this request was out: keep it, drop this older answer's bundles.
   if (cur && !cur.unsupported && cur.epoch === r.epoch && cur.feed === r.feed && Number(r.rev) < cur.rev) {
@@ -2082,6 +2089,7 @@ async function feedCatchUpNow(target, { nowMs = Date.now(), reset = false, full 
   const next = { connectionId: target.connectionId, profile, feedProfile: str(r.profile) || profile, feed: r.feed, epoch: r.epoch, rev: Number(r.rev) || 0,
     sessions: [...target.sessions], liveAt: cur?.feed === r.feed && cur?.epoch === r.epoch ? cur.liveAt : 0, at: Date.now() }
   feeds.set(key, next)
+  if (cur?.epoch !== r.epoch || cur?.feed !== r.feed) feedLog(`${target.connectionId}/${profile} registered feed=${r.feed} epoch=${r.epoch} rev=${next.rev} watching=${target.sessions.length} bundles=${Object.keys(r.bundles || {}).length}`)
   // Trusted only while pushes flow, and only for chats the last push vouched for (a chat failing on the gateway
   // keeps its old bundle there: it is a cached copy here).
   const live = feedIsLive({ connectionId: target.connectionId, profile })
@@ -2102,6 +2110,7 @@ export function onFeedEvent(ev) {
   if (p.epoch !== st.epoch) { void feedCatchUp(target, { reset: true }); return }
   const rev = Number(p.rev)
   const wasLive = feedIsLive(st)
+  if (!wasLive) feedLog(`${st.connectionId}/${st.profile} live rev=${rev} ${p.heartbeat ? 'heartbeat' : 'push'} vouched=${(p.fresh || []).length}`)
   if (p.heartbeat) {
     if (rev === st.rev) {
       confirmFeed(st, p.fresh)
