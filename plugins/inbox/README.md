@@ -298,8 +298,9 @@ The gateway backend (`dashboard/plugin_api.py`) pushes `plugin.inbox.changed` {f
 an inbox sidecar is written: a post, an update of a keyed card, act / accept / archive / junk / settle, from any
 process (the `inbox_post` tool, `hermes inbox post`, cron, this API). A watcher thread compares the stat (mtime,
 size) of `inbox.db`, `-wal` and `-journal` every 2 s (`HERMES_INBOX_WATCH_TICK_S`), for this profile and, on the root
-dashboard, every named profile's sidecar. A change seen by the watcher is pushed once two ticks agree, so a write that commits
-the sidecar more than once is one push. The watcher keeps the first `/items` request's profile context, so its ticks
+dashboard, every named profile's sidecar. A change seen by the watcher is held for one tick and pushed on the next, so a write that
+commits the sidecar more than once is one push, and a sidecar written more often than every tick still pushes at
+least every two ticks (the Desktop coalesces bursts). The watcher keeps the first `/items` request's profile context, so its ticks
 (and later requests scoped to another profile) always watch the same files. A write through the REST API pushes at once. Reads never write the sidecar,
 so a refresh never triggers another push. The watcher starts on the first `GET /items`, so only the process serving a
 Desktop runs it. Tests: `tests/test_push.py`, `desktop-plugins/inbox/test/push.test.mjs`.

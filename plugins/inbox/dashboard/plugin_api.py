@@ -20,8 +20,8 @@ Push: `plugin.inbox.changed` {feed, seq} on the gateway event stream whenever an
 (`<home>/inbox/inbox.db`, plus every named profile's on the root dashboard) is written: a post, an
 update of a keyed card, an act/accept/archive/junk/settle, from ANY process (agent tool, CLI, cron,
 this API). A watcher thread compares the sidecar files' stat (db, -wal, -journal) every WATCH_TICK_S
-and pushes once two ticks agree (a half-done write is one push); a write through this API pushes at
-once. `feed` (hostname:pid) is also on every GET /items answer, so the Desktop re-reads only the
+and pushes on the tick after the one that first saw a change (a half-done write is one push; a sidecar
+written more often than every tick still pushes every two ticks); a write through this API pushes at once. `feed` (hostname:pid) is also on every GET /items answer, so the Desktop re-reads only the
 connection that changed. The watcher starts on the first GET /items, i.e. only in the process that
 serves a Desktop, and keeps that request's profile context. A session archived or un-hidden through
 another door (core's sidebar) touches state.db only: the Desktop's 5-minute safety poll covers that.
@@ -146,7 +146,7 @@ class _Watch:
         self.lock = threading.Lock()
         self.thread = None
         self.ctx = None
-        self.settling = None  # a tick's new signature, pushed once the next tick sees it unchanged
+        self.settling = None  # a tick's new signature, pushed on the next tick (sooner if that tick agrees)
         self.stop = threading.Event()
 
     def _resolve(self):
@@ -155,8 +155,10 @@ class _Watch:
 
     def check(self, settle: bool = False) -> bool:
         """Push if the sidecars changed. ``settle`` (the thread's ticks): a write seen from outside may be half
-        done (one post commits the sidecar more than once), so push only once two ticks agree. A write through
-        this API has finished when it calls check(), so it pushes at once."""
+        done (one post commits the sidecar more than once), so the first tick that sees a change holds it and the
+        next tick pushes, whether or not the files moved again in between: a sidecar written more often than
+        every tick still pushes every two ticks (the Desktop coalesces bursts). A write through this API has
+        finished when it calls check(), so it pushes at once."""
         try:
             sig = _signature(self._resolve())
         except Exception:
@@ -167,8 +169,8 @@ class _Watch:
                 self.sig = sig  # the first read is the baseline: nothing changed yet
                 self.settling = None
                 return False
-            if settle and sig != self.settling:
-                self.settling = sig
+            if settle and self.settling is None:
+                self.settling = sig  # held for one tick
                 return False
             self.settling = None
             self.sig = sig

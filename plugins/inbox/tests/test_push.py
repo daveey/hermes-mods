@@ -130,3 +130,30 @@ def test_ticks_and_requests_resolve_paths_in_the_start_context(api, monkeypatch,
         assert w.check() is True
     finally:
         w.stop.set()
+
+
+def test_a_sidecar_that_never_settles_still_pushes_every_two_ticks(api, tmp_path):
+    """Written more often than every tick, the signature never repeats: the hold is capped at one tick."""
+    mod, sent, root = api
+    f = tmp_path / "busy.db"
+    f.write_text("0")
+    w = mod._Watch(paths=lambda: [f])
+    w.check()  # baseline
+    for n in range(1, 7):
+        f.write_text("x" * n)  # a new signature on every tick
+        w.check(settle=True)
+    assert [p["seq"] for p in sent] == [1, 2, 3]
+
+
+def test_a_half_done_write_is_one_push(api, tmp_path):
+    mod, sent, root = api
+    f = tmp_path / "half.db"
+    f.write_text("0")
+    w = mod._Watch(paths=lambda: [f])
+    w.check()
+    f.write_text("partial")
+    assert w.check(settle=True) is False  # held
+    f.write_text("partial+done")
+    assert w.check(settle=True) is True   # pushed with the finished signature
+    assert w.check(settle=True) is False
+    assert len(sent) == 1
