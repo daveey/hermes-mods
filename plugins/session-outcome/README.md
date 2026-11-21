@@ -149,7 +149,10 @@ not claimed by this plugin section.
   nothing, because user-steps resolves the steps a reply answers in its own `transform_llm_output`, which runs
   after this gate (counted, they let an undeclared reply pass as `decision`, and the chat fell to
   `unresolved{no_summary}` a second later when that reply resolved them). Inside the gate the judge gets a 15 s budget (6 s elsewhere): the gate runs in a
-  busy Desktop serve process under a 30 s hook limit, with the reply already buffered. When the judge still gives
+  busy Desktop serve process under a 30 s hook limit, with the reply already buffered. The whole derivation,
+  including card/provider reads before the judge, has a 20 s budget. If it times out, the gate asks once rather
+  than letting core abandon the callback and silently lose its nudge; it never declares an outcome on a timeout.
+  Late derivation work cannot mark the turn as already asked. When the judge still gives
   up (timeout, error, no YES/NO) and only core's heuristic called the reply a summary, the gate also holds once.
   A later refresh whose judge works (the auditor's CLI `outcome-audit --refresh`) could otherwise flip that
   heuristic `done` to `unresolved{no_summary}`, and nobody would have been asked. Judge give-ups are logged at

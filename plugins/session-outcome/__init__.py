@@ -63,6 +63,9 @@ JUDGE_BUDGET_S = 6.0  # thinking off, a standard-tier reason-then-verdict call m
 # The gate runs inside a busy Desktop serve process (a 30 s pre_final_gate limit, reply already buffered), where the
 # same call can take longer than in a quiet CLI refresh; it gets a longer budget so the two agree more often.
 GATE_JUDGE_BUDGET_S = 15.0
+# Core abandons a pre-final callback after 30s. Bound the entire derivation, including
+# providers/card reads before the judge, so it can return its nudge while core still listens.
+GATE_DERIVE_BUDGET_S = 20.0
 # The judge sees at most this many characters of the reply: whole up to here, else head + tail, never only the
 # tail. A long report leads with its answer; a tail-only cut leaves sources and a closing aside, which the judge
 # reads as "not a summary".
@@ -1051,6 +1054,10 @@ _JUDGED: dict[tuple, Optional[bool]] = {}
 _GATE_SCOPE: ContextVar[Optional[dict]] = ContextVar("session_outcome_gate_scope", default=None)
 
 
+class _BudgetTimeout(TimeoutError):
+    """Our worker exceeded its budget, not a TimeoutError raised by its callee."""
+
+
 def _with_budget(fn: Callable[[], Any], budget: float) -> Any:
     """fn() on a daemon thread; TimeoutError past budget (the call is abandoned, never awaited).
 
@@ -1070,7 +1077,7 @@ def _with_budget(fn: Callable[[], Any], budget: float) -> Any:
     t.start()
     t.join(budget)
     if t.is_alive():
-        raise TimeoutError(f"judge over {budget}s")
+        raise _BudgetTimeout(f"outcome worker over {budget}s")
     if "e" in box:
         raise box["e"]
     return box.get("v")
@@ -1183,7 +1190,16 @@ def _would_be_no_summary(api, session_id: str, reply: str) -> bool:
     scope: dict = {"skip_steps": True}  # see provider(): this reply may resolve them after the gate
     token = _GATE_SCOPE.set(scope)
     try:
-        out = api.derive_outcome(session_id, ignore_live_turn=True, pending_reply=reply) or {}
+        out = _with_budget(
+            lambda: api.derive_outcome(session_id, ignore_live_turn=True, pending_reply=reply),
+            GATE_DERIVE_BUDGET_S,
+        ) or {}
+    except _BudgetTimeout:
+        # Unknown is not authority for done or waiting. Ask the agent to account for
+        # the outcome once; only the calling thread may set _ASKED after returning.
+        log.info("session-outcome gate: derivation timed out for %s after %.1fs; asking for the call",
+                 session_id, GATE_DERIVE_BUDGET_S)
+        return True
     except Exception:
         log.debug("session-outcome derive failed", exc_info=True)
         return False

@@ -737,6 +737,67 @@ def test_gate_does_not_hold_judged_done_or_outranking_kinds_after_give_up(plugin
     assert gate(plugin) is None  # the judge is never reached, nothing gave up
 
 
+def test_gate_bounds_slow_derivation_before_core_drops_callback(plugin, fake, monkeypatch):
+    """A provider can stall before the judge; core must receive the nudge, not discard it at its timeout."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    scopes = []
+
+    def stalled(sid, **kwargs):
+        scopes.append(plugin._GATE_SCOPE.get())
+        entered.set()
+        try:
+            assert release.wait(2)
+            return {"kind": "unresolved", "reason": "no_summary"}
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(plugin, "GATE_DERIVE_BUDGET_S", 0.01, raising=False)
+    monkeypatch.setattr(fake, "derive_outcome", stalled)
+    # Model core's outer callback deadline without waiting thirty seconds.
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(gate, plugin)
+        assert entered.wait(1)
+        try:
+            out = future.result(timeout=0.5)
+            assert out and out["hold"] and plugin.TAG in out["nudge"]
+            assert not fake.declared  # timeout is not authority to declare success or a wait
+        finally:
+            release.set()
+            assert finished.wait(1)
+    assert scopes[0]["skip_steps"] is True
+    # Only the delivered nudge counts as the once-per-turn ask; late work cannot cause a second hold.
+    assert gate(plugin, msgs=[{"role": "user", "content": out["nudge"]}], attempt=1) is None
+    assert plugin._GATE_SCOPE.get() is None
+
+
+def test_gate_preserves_derivation_errors_fail_open(plugin, fake, monkeypatch):
+    def failed(sid, **kwargs):
+        raise TimeoutError("provider read failed")
+    monkeypatch.setattr(fake, "derive_outcome", failed)
+    assert gate(plugin) is None
+    assert "S1" not in plugin._ASKED
+
+
+def test_gate_derivation_inherits_caller_context(plugin, fake, monkeypatch):
+    from contextvars import ContextVar
+    scope = ContextVar("derive_secret_scope", default=None)
+    seen = []
+    def derive(sid, **kwargs):
+        seen.append(scope.get())
+        return {"kind": "waiting", "on": [{"kind": "card", "id": "t_example"}]}
+    monkeypatch.setattr(fake, "derive_outcome", derive)
+    token = scope.set("profile-bound")
+    try:
+        assert gate(plugin) is None
+    finally:
+        scope.reset(token)
+    assert seen == ["profile-bound"]
+    assert plugin._GATE_SCOPE.get() is None
+
+
 def test_gate_fails_open_on_old_core_signature(plugin, fake, monkeypatch):
     monkeypatch.setattr(fake, "derive_outcome", lambda sid: {"kind": "unresolved", "reason": "no_summary"})
     assert gate(plugin) is None
