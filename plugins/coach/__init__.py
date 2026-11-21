@@ -193,6 +193,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             hint = coach.turn_start(session_id, user_message, platform=platform or "",
                                     parent_session_id=parent_session_id or "",
                                     replied_before=bool(_last_assistant(conversation_history)))
+            _note_coached(session_id, new_turn=not rules.is_resume_note(user_message))
             _wait_turn(session_id, user_message, platform, parent_session_id)
             # The fix-loop window survives process boundaries (`hermes chat -q --resume`, backend restarts): the
             # in-memory loop state is re-seeded from the session file, and windows count persistent user turns.
@@ -259,6 +260,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             coach.check_search_cap(session_id, tool_name, args, result)
             coach.check_gated_dispatch(session_id, tool_name, args, result)
             hint = coach.take(session_id) if isinstance(result, str) else None
+            if hint:
+                _note_coached(session_id, new_turn=False)
             return rules.attach_hint(result, hint) if hint else None
         except Exception as exc:
             log.debug("coach transform_tool_result: %s", exc)
@@ -897,6 +900,30 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             except Exception:
                 pass
 
+    def _note_coached(session_id, new_turn):
+        """Persist the correction requests (agent_rules.CORRECTION_RULES) the coach delivered into this session's
+        current turn under the session's `coached` key: a real user turn replaces the list, a resume note or a
+        mid-turn delivery extends it. The turn-end audit reads it (agent-9c2de0075e): the correction it asked for is
+        not a fresh self-admission. The session file, not memory, so a turn resumed after a backend restart keeps it."""
+        try:
+            new = coach.take_corrections(session_id) if hasattr(coach, "take_corrections") else []
+            if not new and not (new_turn and store.session(session_id).get("coached")):
+                return
+            cap = getattr(_load("self_heal"), "COACHED_MAX", 4)
+
+            def put(s):
+                s["coached"] = (([] if new_turn else list(s.get("coached") or [])) + new)[-cap:]
+            store._update(session_id, put)
+        except Exception as exc:
+            log.debug("coach coached corrections: %s", exc)
+
+    def _coached(session_id) -> list:
+        try:
+            c = store.session(session_id).get("coached") if session_id else None
+            return [str(x) for x in c] if isinstance(c, list) else []
+        except Exception:
+            return []
+
     def _selfheal_admission(session_id, reply, platform="", parent_session_id="", tool_log=None, ask="",
                             input_origin="", failure_reason=""):
         try:
@@ -909,7 +936,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             hit = sh.detect_admission(reply, llm=selfheal_llm, threshold=sh.audit_threshold(), tool_log=tool_log,
                                       ask=ask,
                                       confirm=_confirm(sh),
-                                      **({"failure_reason": failure_reason} if failure_reason else {}))
+                                      **({"failure_reason": failure_reason} if failure_reason else {}),
+                                      **({"coached": c} if (c := _coached(session_id)) else {}))
             # A machine signal carries what failed (tool, error line, count): lead with it, then the reply tail.
             evidence = (f"{hit['evidence'][:300]} | reply: {reply[-180:]}" if hit and hit.get("evidence")
                         else reply[-300:])

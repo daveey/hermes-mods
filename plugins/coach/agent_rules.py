@@ -1635,6 +1635,12 @@ METRIC_SPLIT_TOOLS = {"kanban_complete": ("summary", "result"), "kanban_comment"
                       "kanban_create": ("title", "body")}
 
 
+# Rules whose hint asks the agent to correct an earlier message ("correct it in your next message", "post a corrected
+# comment"). The correction it then writes reads as a self-admission to self-heal's turn-end audit, which filed one
+# as a new defect (agent-9c2de0075e): delivered requests are shown to that audit (self_heal.COACHED_SECTION).
+CORRECTION_RULES = frozenset({"metric_split", "card_claim"})
+
+
 def bare_metrics(text: Any) -> list[str]:
     """Metric numbers in `text` whose clause names no split (val/test/train...), as written ("1.787±0.009 BPB")."""
     if not isinstance(text, str) or not text:
@@ -4339,6 +4345,8 @@ class AgentCoach:
                 return
             s["fired"].add(k)
             s["pending"].append(HINTS[rule].format(**fmt))
+            if rule in CORRECTION_RULES:  # the turn-end audit is shown the request once delivered (take)
+                s.setdefault("pending_corrections", []).append(s["pending"][-1])
             hid = "h_" + uuid.uuid4().hex if rule in ("no_checkpoint", "poll_loop") else None
             if hid:
                 s.setdefault("pending_hint_ids", []).append({"hint_id": hid, "rule": rule, "slots": []})
@@ -4513,10 +4521,19 @@ class AgentCoach:
                 return None
             out = " ".join(s["pending"])
             s["pending"] = []
+            if s.get("pending_corrections"):
+                s["delivered_corrections"] = s.get("delivered_corrections", []) + s.pop("pending_corrections")
             st = self._hint_state(sid)
             for e in s.pop("pending_hint_ids", []):
                 st["active"][e["hint_id"]] = e
             return out
+
+    def take_corrections(self, sid: str) -> list[str]:
+        """Correction-request hints (CORRECTION_RULES) delivered since the last call, oldest first; clears them. The
+        plugin persists them per session so the turn-end audit sees what the coach asked for (agent-9c2de0075e)."""
+        with self.hint_lock:
+            s = self.sessions.get(sid)
+            return list(s.pop("delivered_corrections", None) or []) if s else []
 
     def check_live(self, sid: str, tool: str, args: Any) -> None:
         """live_checkout rule for one call. Also run from transform_tool_result: core's sequential path fires

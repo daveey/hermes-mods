@@ -1306,9 +1306,29 @@ def _ask_text(ask) -> str:
     return f"{t[:ASK_HEAD_TAIL]}\n[...]\n{t[-ASK_HEAD_TAIL:]}"
 
 
-def admission_prompt(final_reply: str, tool_log=None, ask="") -> str:
+# agent-9c2de0075e: coach rules that ask the agent to correct an earlier message (metric_split on a final reply: "If
+# the user saw it, correct it in your next message") made the audit file the requested correction as a fresh
+# self-admission, because the audit never saw the request. The requests delivered into the audited turn (persisted
+# per session by the plugin, so a turn resumed after a backend restart keeps them) are shown to the judge with this
+# rule; a turn with none gets the prompt unchanged.
+COACHED_SECTION = (
+    "COACH CORRECTION REQUESTS DELIVERED TO THE AGENT THIS TURN (Hermes' own coach flagged a slip in an earlier "
+    "message and asked the agent to correct it):\n{items}\n"
+    "A message that corrects or qualifies, as asked, a slip named in these requests is kind coached_correction (not a "
+    "defect: the coach rule that flagged it already owns that defect class), also when it says plainly what it has "
+    "not verified yet. Any other slip the message admits scores as usual.\n\n")
+COACHED_MAX = 4  # requests shown, newest kept, each capped at 600 chars
+
+
+def coached_section(coached) -> str:
+    items = [" ".join(str(c).split())[:600] for c in list(coached or []) if str(c).strip()][-COACHED_MAX:]
+    return COACHED_SECTION.format(items="\n".join(f"- {c}" for c in items)) if items else ""
+
+
+def admission_prompt(final_reply: str, tool_log=None, ask="", coached=None) -> str:
     return (f"USER'S REQUEST:\n{_ask_text(ask) or '(unknown)'}\n\n"
             f"TOOL LOG THIS TURN:\n{_log_text(tool_log, 30, 3500)}\n\n"
+            f"{coached_section(coached)}"
             f"AGENT'S FINAL MESSAGE:\n{(final_reply or '(empty)')[-4000:]}")
 
 
@@ -1542,14 +1562,14 @@ def _resolved(key: str) -> dict:
 
 def audit_verdict(final_reply: str, llm: Callable[[str, str], str], tool_log=None, ask="",
                   confirm: Optional[Callable[[str, str], str]] = None,
-                  judged_input: Optional[tuple] = None) -> Optional[dict]:
+                  judged_input: Optional[tuple] = None, coached=None) -> Optional[dict]:
     """The turn-end audit, before the threshold: judge; an admission at >= GATE goes to the confirm model (when
     configured), whose verdict replaces it. Only AUDIT_KINDS count; other kinds score 0. The verdict carries `stages`
     (judge, or judge+confirm) and, when confirmed, the judge's own `stage1_p`/`stage1_kind`, so a filed detection
     shows which stage filed it; `judge_model`/`confirm_model` name the model each stage resolved to (class routing
     picks one per session). `judged_input` = (system, prompt) a live detection logged to admission_inputs.jsonl:
     replay that exact input instead of rebuilding it."""
-    system, prompt = judged_input or (_with_profile(AUDIT_SYS), admission_prompt(final_reply, tool_log, ask))
+    system, prompt = judged_input or (_with_profile(AUDIT_SYS), admission_prompt(final_reply, tool_log, ask, coached))
     v = parse(_tracked(llm)(system, prompt))
     stages = {"stages": "judge", **_resolved("judge_model")}
     if v and confirm and v.get("kind") in AUDIT_KINDS and v["p_defect"] >= GATE:
@@ -1568,7 +1588,8 @@ def audit_verdict(final_reply: str, llm: Callable[[str, str], str], tool_log=Non
 
 def detect_admission(final_reply: str, llm: Optional[Callable[[str, str], str]] = None,
                      threshold: float = AUDIT_THRESHOLD, tool_log=None, ask="",
-                     confirm: Optional[Callable[[str, str], str]] = None, failure_reason: str = "") -> Optional[dict]:
+                     confirm: Optional[Callable[[str, str], str]] = None, failure_reason: str = "",
+                     coached=None) -> Optional[dict]:
     """post_llm_call path: machine signals first (no judge), then a turn-end audit when the reply admits a mistake or
     hands the user a step, or the turn's tool log shows errors. Only self-admissions count from the audit: the other
     audit kinds (unhandled failure, handoff, contradiction) cost more false alarms than they catch on the replay set.
@@ -1581,22 +1602,23 @@ def detect_admission(final_reply: str, llm: Optional[Callable[[str, str], str]] 
             return sig
         if not admission_prefilter(final_reply, tool_log):
             return None
-        v = audit_verdict(final_reply, llm or aux_judge, tool_log, ask, confirm)
+        v = audit_verdict(final_reply, llm or aux_judge, tool_log, ask, confirm, coached=coached)
         th = confirm_threshold(v, threshold)
         hit = _verdict(v, "admission", th)
         return ({**hit, "threshold": th, "audit_rule": AUDIT_RULE,
-                 "audit_input": audit_input(final_reply, tool_log, ask)} if hit else None)
+                 "audit_input": audit_input(final_reply, tool_log, ask, coached)} if hit else None)
     except Exception:
         return None
 
 
-def audit_input(final_reply: str, tool_log=None, ask="") -> dict:
+def audit_input(final_reply: str, tool_log=None, ask="", coached=None) -> dict:
     """What the turn-end audit judged, as a `selfheal_replay.py --mode admission` row body ({text, ask, tool_log}).
     A filed admission carries it to the hub (AUDIT_INPUT_FILE), so a not_defect verdict on it becomes a replayable
     negative row. Before, the negatives held only a 300-char reply tail, and every detector card rebuilt each turn by
     hand from the state.db of the host that ran it (plugin-aafb20159a: the MacBook's)."""
     return {"text": (final_reply or "")[-4000:], "ask": _ask_text(ask),
-            "tool_log": [str(x)[:400] for x in list(tool_log or [])[-30:]]}
+            "tool_log": [str(x)[:400] for x in list(tool_log or [])[-30:]],
+            **({"coached": [str(c)[:600] for c in list(coached)[-COACHED_MAX:]]} if coached else {})}
 
 
 AUDIT_INPUT_FILE = "audit_input.json"  # <coach>/selfheal/<fp>/: the audited turn of an admission finding
@@ -1627,7 +1649,8 @@ def _saved_audit_input(store, fp: str) -> dict:
 
 def _rejudge_admission(inp: dict) -> Optional[dict]:
     """The current turn-end audit (judge, then the confirm model) on a saved audited turn. None = no opinion."""
-    return audit_verdict(inp.get("text") or "", aux_judge, inp.get("tool_log"), inp.get("ask") or "", confirm_judge())
+    return audit_verdict(inp.get("text") or "", aux_judge, inp.get("tool_log"), inp.get("ask") or "", confirm_judge(),
+                         coached=inp.get("coached"))
 
 
 def _stale_admission(d: dict, store, fp: str) -> Optional[dict]:
@@ -1679,7 +1702,8 @@ def _audit_rule() -> str:
     files (_stale_admission). t_01a1d3759039b97a: 5 of the 6 rows that opened it had been analysed (and 3 fixed) by
     earlier detector cards; the 6th was detected under the pre-5720fd3e rule and filed 2 days later from the
     deferred queue, then closed not_defect. The current rule kept all 7 gate negatives below threshold."""
-    blob = json.dumps([AUDIT_SYS, AUDIT_KINDS, AUDIT_THRESHOLD, GATE, sorted(CONFIRM_THRESHOLDS.items())])
+    blob = json.dumps([AUDIT_SYS, AUDIT_KINDS, AUDIT_THRESHOLD, GATE, sorted(CONFIRM_THRESHOLDS.items()),
+                       COACHED_SECTION])
     return hashlib.sha1(blob.encode()).hexdigest()[:12]
 
 
