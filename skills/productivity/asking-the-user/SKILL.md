@@ -159,7 +159,9 @@ ask only once its prerequisite is verifiably in place. If an early one is alread
   as root on a THIRD host the Mac can reach (e.g. the mini), `tailnet_copy put` it to the Mac's `/tmp`, have the
   window print its sha256 next to the expected one, `ssh <host> 'cat > /tmp/x' < /tmp/x`, then
   `ssh -tt <host> 'sudo ... > out; rm -f /tmp/x'`, copy the output back to the Mac, and `tailnet_copy get` it;
-  passing a hub path to the window fails because the path does not exist on the Mac. In zsh, write SSH options inline rather
+  passing a hub path to the window fails because the path does not exist on the Mac. `tailnet_copy get` lands at
+  `~/.hermes/tailnet/files/<local_name>` on the gateway (its result prints no path); read it there, since a
+  `find ~/.hermes` for it times out on the evidence tree. In zsh, write SSH options inline rather
   than in an unquoted variable, which does not word-split.
 - `ssh host 'cmd'` runs a non-login shell whose PATH lacks `~/bin` (the hub's `gh`) and `~/.local/bin` (`uv`,
   `ruff`). Start every owner-route hub command with `export PATH=$HOME/.local/bin:$HOME/bin:$PATH;`: a `git push`
