@@ -515,16 +515,22 @@ export function parkFromDetail(detail) {
   let ev = null
   for (const e of events) if (PARK_EVENTS.has(e?.kind)) ev = e
   const wc = detail?.task?.wake_check
-  const check = wc && wc.purpose !== 'ask_resolved' ? str(wc.cmd) : ''
+  // An armed external watch re-probes the card on a timer: a timed wake, so never "blocked for a person".
+  let watch = null
+  for (const e of events) if (e?.kind === 'external_watch') watch = e
+  const wp = watch ? payloadOf(watch) : {}
+  const watchNext = str(wp.state) === 'external_stopped' ? 0 : Number(wp.next_due_at) || 0
+  const check = wc && wc.purpose !== 'ask_resolved' ? str(wc.cmd) : watchNext ? 'external watch' : ''
+  const nextProbe = Number(wc?.next_at) > 0 ? Number(wc.next_at) : watchNext || null
   const lastAt = Math.max(0, ...events.map(e => Number(e?.created_at) || 0))
   const spent = !!ev && events.some(e => evId(e) > evId(ev) && (e.kind === 'continuation_woken' ||
     (['claimed', 'spawned'].includes(e.kind) && (e.run_id == null || ev.run_id == null || e.run_id !== ev.run_id))))
   if (!ev || spent) {
     if (!check && !ev && !lastAt) return null
     const parkedAt = lastAt || Math.floor(Date.now() / 1000)
-    return { wakeAt: ev ? parkedAt + SUPERSEDED_GRACE_S : parkedAt + DEFAULT_WAKE_S, awaiting: null, check, nextProbeAt: Number(wc?.next_at) > 0 ? Number(wc.next_at) : null,
+    return { wakeAt: ev ? parkedAt + SUPERSEDED_GRACE_S : parkedAt + DEFAULT_WAKE_S, awaiting: null, check, nextProbeAt: nextProbe,
       // No park event at all (core: untimed, not superseded): a person block kind is blocked for a person on the next tick.
-      continued: false, parkedAt, superseded: !!ev, forHuman: !ev && HUMAN_BLOCK_KINDS.has(str(detail?.task?.block_kind)) }
+      continued: false, parkedAt, superseded: !!ev, forHuman: !ev && !watchNext && HUMAN_BLOCK_KINDS.has(str(detail?.task?.block_kind)) }
   }
   const p = payloadOf(ev)
   const parkedAt = Number(ev.created_at) || lastAt
@@ -533,10 +539,10 @@ export function parkFromDetail(detail) {
   return {
     wakeAt: impliedWake(p, parkedAt),
     awaiting: aw ? { kind: str(aw.kind), ref: str(aw.ref), why: str(aw.why), ...(aw.inferred ? { inferred: true } : {}) } : null,
-    check, nextProbeAt: Number(wc?.next_at) > 0 ? Number(wc.next_at) : null,
+    check, nextProbeAt: nextProbe,
     episode: detail?.task?.wait_episode || null,
     continued: ev.kind === 'continued', parkedAt, superseded: false,
-    forHuman: !timed && HUMAN_BLOCK_KINDS.has(str(detail?.task?.block_kind))
+    forHuman: !timed && !watchNext && HUMAN_BLOCK_KINDS.has(str(detail?.task?.block_kind))
   }
 }
 async function readPark(route, id) {

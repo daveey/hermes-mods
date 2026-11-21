@@ -332,6 +332,13 @@ test('owner park mirrors core: not scheduled, spent parks, implied wakes, a huma
   // No park event and a person block kind: core blocks it for a person, so no countdown.
   const noPark = m.parkFromDetail({ task: { status: 'scheduled', block_kind: 'needs_input' }, events: [ev(7, 'blocked')] })
   assert.deepEqual([noPark.forHuman, noPark.superseded], [true, false])
+  // An armed external watch is a timed probe: never "blocked for a person", and its next probe is shown.
+  const watchEv = ev(8, 'external_watch', { state: 'external_running', next_due_at: S + 900 })
+  const watchedPk = m.parkFromDetail({ task: { status: 'scheduled', block_kind: 'needs_input' }, events: [ev(7, 'blocked'), watchEv] })
+  assert.deepEqual([watchedPk.forHuman, watchedPk.nextProbeAt, watchedPk.check], [false, S + 900, 'external watch'])
+  assert.equal(m.parkFromDetail({ task: { status: 'scheduled', block_kind: 'needs_input' }, events: [bare, watchEv] }).forHuman, false)
+  const stopped = ev(9, 'external_watch', { state: 'external_stopped', next_due_at: S + 900 })
+  assert.equal(m.parkFromDetail({ task: { status: 'scheduled', block_kind: 'needs_input' }, events: [bare, stopped] }).forHuman, true)
   // A date-only marker is local midnight.
   assert.equal(m.impliedWake({ reason: 'SCHEDULED_UNTIL=2026-11-22' }, S), new Date(2026, 10, 22, 0, 0).getTime() / 1000)
   // Lines.
