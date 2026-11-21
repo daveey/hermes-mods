@@ -281,6 +281,22 @@ test('courier task_read: a gateway holding the card live wins over an earlier re
   assert.deepEqual(r.task.queue, { lane: 'local', ahead: 3, running: 7, limit: 7, approximate: true })
 })
 
+test('cross_task read preserves the pacing queue line and structured provider/reset', async () => {
+  const queue = { lane: 'llm_pacing', skip: { reason: 'llm_paced', detail: 'xai-oauth held', until: 1795474351.914 } }
+  const queue_note = 'last dispatcher skip: held: LLM quota pacing (xai-oauth held pool) until 2026-11-23 22:52Z'
+  const base = replicaApi()
+  const api = async req => {
+    const result = await base(req)
+    return result?.task ? { ...result, queue, queue_note } : result
+  }
+  const m = await load({ state, connections: async () => conns }, api)
+  const r = await m.performRequest({ action: 'task_read', args: { target: 't_eeee5555' } }, 'local', conns)
+  assert.equal(r.ok, true)
+  assert.equal(r.task.queue_note, queue_note)
+  assert.deepEqual(r.task.queue, queue)
+  assert.doesNotMatch(r.task.queue_note, /worker slot|waiting for a worker/)
+})
+
 test('courier task_comment: posts to the live holder; a replica-only card returns the owner-naming refusal', async () => {
   const calls = []
   const m1 = await load({ state, connections: async () => conns }, replicaApi(calls, { liveOn: 'mac-mini' }))

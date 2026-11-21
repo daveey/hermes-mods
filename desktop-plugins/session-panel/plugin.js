@@ -282,7 +282,7 @@ export function chipAsOf(c, nowMs = Date.now()) {
   if (nowMs - painted > CACHED_HONOUR_MS || nowMs - at > CACHED_MAX_AGE_MS) return nowMs
   return Math.min(nowMs, at)
 }
-export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsked = () => false, presentationFor = () => null, evidence = () => null } = {}) {
+export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsked = () => false, presentationFor = () => null, evidence = () => null, info = cardInfo } = {}) {
   const now = nowMs / 1000
   const out = { active: [], stuck: [], blockedUpstream: [], waiting: [], ready: [], queued: [], unasked: [], reported: [], lastActivity: 0 }
   const seen = at => { if (Number(at) > out.lastActivity) out.lastActivity = Number(at) }
@@ -362,7 +362,10 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
       // A parked card has no run to observe: its fresh board lifecycle is the answer, so its unknown execution
       // evidence is not counted (`parked`). The row leads with what it waits on; the source comes last.
       const source = board.source === 'replica' ? 'reported board status' : 'board status'
-      if (c.state === 'ready') { out.ready.push({ ...item(c), parked: true, detail: `ready · waiting${readyWait(c.readySince, now)} for a worker to claim it · ${source}` }); continue }
+      if (c.state === 'ready') {
+        const paced = readyPacing(c, nowMs, info)
+        out.ready.push({ ...item(c), parked: true, detail: `ready · ${paced ? paced.text : `waiting${readyWait(c.readySince, now)} for a worker to claim it`} · ${source}` }); continue
+      }
       if (c.state === 'todo' && !c.waitingOn && !c.upstream?.id) { out.queued.push({ ...item(c), parked: true, detail: `not started · ${source}` }); continue }
       // The upstream leaf follows a published wait only: without one, parkedWaitText already names the upstream.
       const text = parkedWaitText(c, on, nowMs)
@@ -379,7 +382,7 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
       continue
     }
     if (c.state === 'review') { out.active.push({ ...item(c), detail: `in review${last ? ` · ${ago(last, nowMs)}` : ''}` }); continue }
-    if (c.state === 'ready') { out.ready.push({ ...item(c), detail: 'ready to start' }); continue }
+    if (c.state === 'ready') { out.ready.push({ ...item(c), detail: readyPacing(c, nowMs, info)?.text || 'ready to start' }); continue }
     if (c.state === 'todo') { out.queued.push({ ...item(c), detail: 'not started' }); continue }
     out.waiting.push({ ...item(c), detail: (on || (c.state === 'scheduled' ? 'scheduled' : c.state === 'unknown' ? 'status unknown' : c.state)) + leaf })
   }
@@ -1338,6 +1341,21 @@ const validResolvedCheck = hr => {
 export const validHumanRequest = (hr, kind) => !!hr && typeof hr === 'object' && !Array.isArray(hr) && HR_FIELDS.every(f => typeof hr[f] === 'string' && hr[f].trim()) &&
   HR_INTERACTIONS.has(hr.interaction) && !NONHUMAN_KINDS.has(str(kind)) && validChoices(hr.choices) && validResolvedCheck(hr)
 
+// A recorded dispatcher verdict, not a fresh quota probe. Never infer pacing from generic capacity wording.
+function pacingLeaf(detail, nowMs) {
+  const skip = detail?.queue?.skip
+  if (!['llm_paced', 'llm_pacing'].includes(skip?.reason)) return null
+  const names = (Array.isArray(skip.providers) ? skip.providers : []).map(p => str(p?.provider)).filter(Boolean)
+  const provider = names.length ? [...new Set(names)].join(', ') : str(skip.detail).replace(/\s+held\b/g, '') || 'unknown provider'
+  const until = Number(skip.until)
+  return { kind: 'external', pacing: true, text: `model quota pacing (${provider})${Number.isFinite(until) && until > 0 ? ` until ${pacificShort(until, nowMs)}` : ' (reset unknown)'}` }
+}
+function readyPacing(chip, nowMs, info, fallback) {
+  const read = info(chip, str(chip?.id), nowMs, undefined, fallback)
+  const leaf = read?.info?.status === 'ready' ? read.info.hop?.leaf : null
+  return leaf?.pacing ? { ...leaf, text: `${leaf.text}${read.state === 'stale' ? ' (not re-read)' : ''}` } : null
+}
+
 /** What a card read (`/api/plugins/kanban/tasks/<id>`) says its card waits on next: `{ ref: { id, status } }` (another
  *  card) or `{ leaf: { kind, text, sub } }`. The same states core reads: a person ask, a dependency's open parent, the
  *  scheduled park (parkFromDetail), a ready card's queue/capacity note, triage, review, running. */
@@ -1359,7 +1377,7 @@ export function nextHop(detail, nowMs = Date.now()) {
   }
   if (status === 'scheduled') return parkHop(detail, nowMs)
   if (status === 'todo') return openParent ? { ref: openParent } : { leaf: { kind: 'slot', text: 'not started: waiting to be promoted' } }
-  if (status === 'ready') return { leaf: { kind: 'slot', text: `waiting${readyWait(t.ready_since, now)} for a worker${cleanNote(detail?.queue_note || detail?.capacity_note) ? `: ${cleanNote(detail?.queue_note || detail?.capacity_note)}` : ''}` } }
+  if (status === 'ready') return { leaf: pacingLeaf(detail, nowMs) || { kind: 'slot', text: `waiting${readyWait(t.ready_since, now)} for a worker${cleanNote(detail?.queue_note || detail?.capacity_note) ? `: ${cleanNote(detail?.queue_note || detail?.capacity_note)}` : ''}` } }
   if (status === 'triage') return openParent && str(t.block_kind) === 'dependency' ? { ref: openParent } : { leaf: { kind: 'slot', text: 'needs triage: nobody is working it' } }
   if (status === 'review') {
     const run = (detail?.runs || []).slice(-1)[0]
@@ -1521,7 +1539,7 @@ export function chainFor(i, nowMs = Date.now(), { info = cardInfo, fallback, loc
     const own = mine.get(id)
     if (own) {
       nodes.push({ id, title: own.label, status: str(own.chip?.state), session: '', owner: '', local: true })
-      hop = own.waiting ? firstHop(own.item, nowMs, { info, fallback }) : localHop(own.item, nowMs)
+      hop = own.waiting ? firstHop(own.item, nowMs, { info, fallback }) : localHop(own.item, nowMs, { info, fallback })
       continue
     }
     const r = info(i.chip, id, nowMs, undefined, fallback)
@@ -1542,11 +1560,11 @@ export function chainLocal(waiting, others = []) {
   return map
 }
 /** Where a chain ends on one of this chat's cards that is not waiting: by its own state. */
-function localHop(i, nowMs = Date.now()) {
+function localHop(i, nowMs = Date.now(), { info = cardInfo, fallback } = {}) {
   const st = str(i?.chip?.state), m = whereText(i?.chip)
   if (st === 'running') return { leaf: { kind: 'running', text: `running${m ? ` on ${m}` : ''}` } }
   if (st === 'review') return { leaf: { kind: 'running', text: 'in review' } }
-  if (st === 'ready') return { leaf: { kind: 'slot', text: `waiting${readyWait(i?.chip?.readySince, nowMs / 1000)} for a worker` } }
+  if (st === 'ready') return { leaf: readyPacing(i?.chip, nowMs, info, fallback) || { kind: 'slot', text: `waiting${readyWait(i?.chip?.readySince, nowMs / 1000)} for a worker` } }
   if (st === 'todo') return { leaf: { kind: 'slot', text: 'not started' } }
   if (!OPEN(st)) return { leaf: { kind: 'done', text: `${st} · the waiting card should resume` } }
   return { leaf: { kind: 'unknown', text: st || 'status unknown' } }

@@ -949,6 +949,7 @@ export function summarizeTask(data, limit = 10) {
     // A ready card's place in the queue that starts it (lane local: ahead/running/limit; lane
     // worker_pool: the Board's last reason), so a long wait reads as queued, not stuck.
     ...(data?.queue ? { queue: data.queue } : {}),
+    ...(data?.queue_note ? { queue_note: data.queue_note } : {}),
     assignee: t.assignee || null,
     priority: t.priority,
     created_by: t.created_by || null,
