@@ -439,8 +439,9 @@ def remove_created(worktree, owner_id, clock):
 
 def keep_note(worktree, owner_id, reason):
     """A kept worktree is said out loud and recorded beside it; nothing retries or deletes it."""
-    text = ('kept publication worktree %s (%s): %s. Inspect it, then remove it with '
-            '`git worktree remove`; the publication archive beside it is unaffected.'
+    text = ('kept publication worktree %s (%s): %s. Inspect it, then retry '
+            '`hermes kanban source-custody remove --kind worktree --path PATH --expected-owner OWNER_ID`; '
+            'never fall back to forced removal. The publication archive beside it is unaffected.'
             % (worktree, owner_id or 'no owner id', reason))
     print('skill-publish: ' + text, file=sys.stderr)
     _retry_log(pending_dir(), text)
