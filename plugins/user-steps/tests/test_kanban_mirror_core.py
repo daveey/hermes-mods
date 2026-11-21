@@ -8,9 +8,9 @@ from core_runtime import require_isolated_core
 from test_withdrawal import ROOT, OWNER, core, load_module
 
 
-@pytest.mark.parametrize("archive", [False, True])
+@pytest.mark.parametrize('archive,cited', [(False, False), (True, False), (False, True)])
 def test_projection_real_core_atomic_transition_and_retry(
-    tmp_path, monkeypatch, archive
+    tmp_path, monkeypatch, archive, cited
 ):
     require_isolated_core()
     from hermes_cli import kanban_db as kb
@@ -38,6 +38,19 @@ def test_projection_real_core_atomic_transition_and_retry(
             hr["choices"] = [
                 dict(label=x.title(), value=x) for x in ("red", "green", "blue")
             ]
+        store = core.ActionStore(tmp_path / "actions.sqlite3")
+        if cited:
+            from test_withdrawal import complete_request
+            hr.pop('choices', None)
+            ids = []
+            for title in ('Who may read this channel?', 'Which checks first?'):
+                worker = dict(OWNER, storedSessionId='local-worker')
+                r = complete_request(title=title)
+                r.update(owner=worker, kind='choice', outcomes=dict(answer='Record'),
+                         choices=[dict(id='red', label='Red', effect='answer'),
+                                  dict(id='green', label='Green', effect='answer')])
+                ids.append(store.create(worker, r)['requestId'])
+            hr['evidence'] = ' '.join(ids)
         task = kb.create_task(
             c,
             title="Synthetic color selection",
@@ -48,7 +61,6 @@ def test_projection_real_core_atomic_transition_and_retry(
             c, task, kind="needs_input", reason=hr["action"], human_request=hr
         )
         c.close()
-        store = core.ActionStore(tmp_path / "actions.sqlite3")
         mod = load_module("real_mirror", ROOT / "kanban_mirror.py")
         mirror = mod.Mirror(
             core,
@@ -58,7 +70,19 @@ def test_projection_real_core_atomic_transition_and_retry(
             tip=lambda sid: sid,
         )
         mirror.reconcile(OWNER)
-        request = store.requests(OWNER)[0]
+        if cited:
+            first, request = store.requests(OWNER)
+            partial = store.decide(OWNER, dict(requestId=first['requestId'], expectedRevision=1,
+                choiceId='q-green', revisionText='Green', idempotencyKey='first-answer'))['operation']
+            receipt = mirror.deliver(partial)
+            assert mirror.deliver(partial) == receipt
+            c = connect(path)
+            try:
+                assert kb.get_task(c, task).status == 'blocked'
+            finally:
+                c.close()
+        else:
+            request = store.requests(OWNER)[0]
         ch = request["choices"][1]
         op = store.decide(
             OWNER,
@@ -84,8 +108,8 @@ def test_projection_real_core_atomic_transition_and_retry(
                 "SELECT body FROM task_comments WHERE task_id=? AND author='user-steps'",
                 (task,),
             ).fetchall()
-            assert len(comments) == 1
-            assert ("archive" if archive else "green") in comments[0][0]
+            assert len(comments) == (2 if cited else 1)
+            assert ("archive" if archive else "green") in comments[0][0].lower()
             events = c.execute(
                 "SELECT payload FROM task_events WHERE task_id=? AND kind=?",
                 (task, "archived" if archive else "unblocked"),
