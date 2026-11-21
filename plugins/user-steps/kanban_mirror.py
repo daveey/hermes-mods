@@ -363,7 +363,14 @@ class Mirror:
             return []
         event = c.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='blocked' ORDER BY id DESC LIMIT 1",
                           (task,)).fetchone()
-        payload = json.loads(event[0] or '{}') if event else {}
+        # Legacy event payloads are not necessarily JSON objects. A corrupt
+        # reason must not prevent unrelated cards from projecting.
+        try:
+            payload = json.loads(event[0] or '{}') if event else {}
+        except (ValueError, TypeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
         text = '\n'.join(str(hr.get(k) or '') for k in ('action', 'scope', 'evidence'))
         text += '\n' + str(payload.get('reason') or '')
         ids = dict.fromkeys(re.findall(r'\b[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\b', text))
@@ -372,7 +379,12 @@ class Mirror:
             for rid in ids:
                 row = reader.execute('SELECT session FROM requests WHERE namespace=? AND id=?',
                                      (self.store._ns(owner), rid)).fetchone()
-                if row is None:
+                if row is None or row[0] == owner['storedSessionId']:
+                    continue
+                # Projections are already delivered by their own card. Never
+                # create a mirror of a mirror, even from another session.
+                if reader.execute('SELECT 1 FROM kanban_projections WHERE namespace=? AND request_id=?',
+                                  (self.store._ns(owner), rid)).fetchone():
                     continue
                 request = self.store._get(reader, dict(owner, storedSessionId=row[0]), rid)
                 if request['state'] == 'open' and request['kind'] == 'choice' and request['choices']:
