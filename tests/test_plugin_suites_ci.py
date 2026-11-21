@@ -148,7 +148,10 @@ class SkillTestsRootEvidence(unittest.TestCase):
                         text.index("      - name: Root guard node evidence"))
         self.assertLess(text.index("      - name: Root guard node evidence"),
                         text.index("      - name: Skill suites"))
-        self.assertIn('"$HERMES_MODS_PYTHON" scripts/test-all -k skills/ -j 4', text)
+        self.assertIn('"$HERMES_MODS_PYTHON" scripts/test-all -k skills/ -j 4 --json skill-results.json', text)
+        self.assertIn('"$HERMES_MODS_PYTHON" scripts/ci-plugin-suites summary skill-results.json', text)
+        self.assertLess(text.index('scripts/test-all -k skills/ -j 4 --json skill-results.json'),
+                        text.index('scripts/ci-plugin-suites summary skill-results.json'))
         self.assertNotIn("continue-on-error", text)
 
 
