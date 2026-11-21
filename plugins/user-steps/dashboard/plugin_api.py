@@ -275,7 +275,6 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
             except (ValueError, sqlite3.Error, OSError):
                 logging.getLogger('user-steps').exception('Card projection reconciliation deferred')
             st = migrate(own)
-            _load('chat').reconcile(_load('core'), st, own, db=state_db)
             retire_moot(st, own)
             presenter = mirror()
             return {'requests': [presenter.present(r) for r in st.views(own, include_withdrawn=include == 'withdrawn')]}

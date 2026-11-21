@@ -66,6 +66,26 @@ def test_hot_mounted_router_recovers_pending_without_lifespan(owner, mounted, mo
     assert len(started) == 1
 
 
+def test_requests_reconciles_chat_once(owner, mounted, monkeypatch):
+    db, session, params, started = owner
+    client, api = mounted
+    core = api._load('core')
+    monkeypatch.setattr(core, '_state_db', lambda: db.db_path)
+    own = core.server_owner(params['stored_session_id'])
+    chat = api._load('chat')
+    original = chat.reconcile
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(chat, 'reconcile', counted)
+    response = client.get('/api/plugins/user-steps/requests', params={'session': own['storedSessionId']})
+    assert response.status_code == 200, response.text
+    assert len(calls) == 1
+
+
 def test_secondary_profile_recovers_only_its_outbox_and_routes_owner_events(owner, mounted, tmp_path, monkeypatch):
     from hermes_cli import profiles
     from hermes_cli.web_server_profiles import _config_profile_scope
