@@ -19,6 +19,7 @@ def test_plan_apply_and_idempotence(tmp_path, monkeypatch, capsys):
         (tmp_path / 'cron' / 'jobs.json').write_text(json.dumps({'jobs': [{'name': 'session-repair'}]}))
         return subprocess.CompletedProcess(argv, 0, stdout='created', stderr='')
     monkeypatch.setattr(inst.subprocess, 'run', fake_run)
+    monkeypatch.setattr(inst, 'failure_target_problem', lambda h, target: None)
 
     assert inst.main([]) == 0
     assert 'would cron:' in capsys.readouterr().out and calls == [], 'no --apply: plan only'
@@ -60,3 +61,34 @@ def test_cron_argv_parses_with_cores_cron_parser():
     args = parser.parse_args(inst.cron_argv()[1:])
     assert args.schedule == 'every 15m' and args.name == 'session-repair' and args.no_agent
     assert args.script == 'session_repair_tick.py' and args.deliver == 'local' and args.failure_deliver == 'bot-chat'
+
+
+def test_plan_refuses_a_bot_chat_that_cannot_show_failures(tmp_path, monkeypatch, capsys):
+    import pytest
+    pytest.importorskip('tools.bot_live_delivery')
+    from gateway import warning_notifications
+    from tools import bot_live_delivery
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    calls = []
+    monkeypatch.setattr(inst.subprocess, 'run', lambda argv, **kw: calls.append(argv))
+    state = {'owner': {'session_id': 'B1'}, 'enabled': True}
+
+    def owner(home):
+        if isinstance(state['owner'], Exception):
+            raise state['owner']
+        return state['owner']
+    monkeypatch.setattr(bot_live_delivery, 'find_canonical_live_owner', owner)
+    monkeypatch.setattr(warning_notifications, 'warning_notifications_enabled', lambda platform, cfg=None: state['enabled'])
+    assert inst.failure_target_problem(tmp_path, 'bot-chat') is None
+    assert inst.failure_target_problem(tmp_path, 'telegram') is None, 'other targets are not checked here'
+
+    state['enabled'] = False
+    assert 'suppressed' in inst.failure_target_problem(tmp_path, 'bot-chat')
+    assert inst.main(['--apply']) == 2 and calls == [], 'refused: nothing installed'
+    assert 'refuse:' in capsys.readouterr().out
+    assert not (tmp_path / 'scripts').exists()
+
+    state['enabled'], state['owner'] = True, None
+    assert 'no canonical Bot Chat' in inst.failure_target_problem(tmp_path, 'bot-chat')
+    state['owner'] = ValueError('profile authority is not ready')
+    assert 'not ready' in inst.failure_target_problem(tmp_path, 'bot-chat')

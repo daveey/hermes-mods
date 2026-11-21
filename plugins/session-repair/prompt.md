@@ -13,9 +13,11 @@ it (outcome `moved_on`).
    probe park without running its probe first. Re-read after the fix: if it did not take, treat the finding as
    fix kind `card`.
 2. Fix cards (fix kind `card`, or a safe fix that did not take). At most {{CARD_BUDGET}} cards this run in total,
-   cards for failed safe fixes included; past that, outcome `deferred` (the scan already held back {{DEFERRED}}).
-   Before filing any card:
-   - Look for open work on the same thing (`kanban_list` on every board: the finding's `idempotency_key` prefix
+   cards for failed safe fixes included; past that, outcome `over_budget` (it comes back next run; the scan already
+   held back {{DEFERRED}}). Before filing any card:
+   - A finding with `fix.open_fix_card` already has an open fix card from an earlier run (any day): add ONE comment
+     there with the new evidence (outcome `commented`, `card` = that id), never a second card.
+   - Look for other open work on the same thing (`kanban_list` on every board: the finding's `idempotency_key` prefix
      `session-repair:<fingerprint>:`, its card id, the pattern id, the subsystem). If a card is open, add ONE comment
      with the new evidence instead (outcome `commented`), never a second card.
    - Every card body names the open or recently decided work on that subsystem (all boards) and why none of it
@@ -29,7 +31,7 @@ it (outcome `moved_on`).
    - `area: hermes` (Hermes machinery misbehaved: dispatcher, wakes, leases, notices). Hermes itself is the
      exception: if an open card covers that Hermes area, ONE comment on it (outcome `commented`). Without one, a new
      card only when the defect is on a dispatcher, credential, quota/pacing or money path, or blocks the finding's
-     card right now; otherwise outcome `deferred` with the reason. A new Hermes card carries
+     card right now; otherwise outcome `deferred` with the `reason`. A new Hermes card carries
      `self_work={version:1, repository:'hermes-mods', area:'session-repair', kind:'sweep'}` only when the
      `kanban_create` schema exposes `self_work` (an older runtime: create it the existing undeclared way, never
      both). If `kanban_create` answers with a queued acknowledgment, that is not a card: outcome `queued` with its
@@ -40,11 +42,12 @@ it (outcome `moved_on`).
 4. A finding whose rule misfired: no card, outcome `false_positive` with one line on why (the skill's "Adding a
    pattern or example" fixes the rule).
 
-End your reply with this block, one row per finding (the scheduler reads it; a finding you leave out or mark
-`deferred` comes back on a later run):
+End your reply with this block, one row per finding. The scheduler reads it: `deferred` needs a `reason` and is
+not shown again for 24 h; `over_budget` comes back next run; a finding you leave out, an unknown outcome or a
+`deferred` with no reason counts as a failed attempt and is retried with backoff.
 
 ```{{RESULT_FENCE}}
-{"results": [{"fingerprint": "<fingerprint>", "outcome": "fixed|card|queued|commented|moved_on|false_positive|deferred", "card": "<card id or request id, or null>"}]}
+{"results": [{"fingerprint": "<fingerprint>", "outcome": "fixed|card|queued|commented|moved_on|false_positive|deferred|over_budget", "card": "<card id or request id, or null>", "reason": "<why, required for deferred>"}]}
 ```
 
 Findings (JSON):

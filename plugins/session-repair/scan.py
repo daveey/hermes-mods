@@ -165,6 +165,98 @@ class Sources:
         self._own: dict[str, Optional[str]] = {}
         self._copies: dict[str, set] = {}
         self.exclude_chats = set(exclude_chats) if exclude_chats is not None else self.repair_chats()
+        self._ours: Optional[set] = None
+
+    def home(self) -> Path:
+        return Path(Path(self.readers.state_db()).parent)
+
+    def tracked_requests(self) -> set[str]:
+        """Card and request ids the repair turns reported (`filed` in ledger-live.jsonl: a card id, or the request id
+        of a queued self-work acknowledgment)."""
+        out: set[str] = set()
+        try:
+            for line in (self.home() / 'session-repair' / 'ledger-live.jsonl').read_text().splitlines():
+                try:
+                    filed = json.loads(line).get('filed')
+                except (ValueError, AttributeError):
+                    continue
+                if isinstance(filed, str) and filed:
+                    out.add(filed)
+        except OSError:
+            pass
+        return out
+
+    def ours_ids(self) -> set[str]:
+        """Cards the repair session filed that do not carry its key: cards it reported, and cards the self-work
+        intake created for a request it reported or whose request carried a `session-repair:` key (the intake's
+        receipt names the task)."""
+        if self._ours is not None:
+            return self._ours
+        tracked = self.tracked_requests()
+        out = {t for t in tracked if t.startswith('t_')}
+        for slug, _p in self.boards():
+            c = self.conn(slug)
+            try:
+                if c is None or not c.execute("SELECT 1 FROM sqlite_master WHERE name='self_work_intake'").fetchone():
+                    continue
+                for rid, req, rec in c.execute('SELECT request_id, request_json, receipt_json FROM self_work_intake'):
+                    key = str(((_json(req) or {}).get('args') or {}).get('idempotency_key') or '')
+                    if rid in tracked or key.startswith(REPAIR_KEY_PREFIX):
+                        task = (_json(rec) or {}).get('task_id')
+                        if task:
+                            out.add(str(task))
+            except Exception as e:  # noqa: BLE001
+                self.error(f'self_work_intake {slug}', e)
+        self._ours = out
+        return out
+
+    def open_fix_card(self, fingerprint: str) -> Optional[dict]:
+        """The repair session's open fix card for this fingerprint on any board (its idempotency key starts with
+        `session-repair:<fingerprint>:`, any day bucket, status not done/archived/cancelled), else None. A plain prefix
+        compare, not LIKE: fingerprints hold `_`."""
+        prefix = f'{REPAIR_KEY_PREFIX}{fingerprint}:'
+        marks = ','.join('?' * len(TERMINAL))
+        for slug, _p in self.boards():
+            c = self.conn(slug)
+            if c is None:
+                continue
+            try:
+                r = c.execute(f'SELECT id, status FROM tasks WHERE substr(idempotency_key, 1, ?) = ? AND status NOT IN '
+                              f'({marks}) ORDER BY created_at DESC LIMIT 1', (len(prefix), prefix, *TERMINAL)).fetchone()
+            except Exception as e:  # noqa: BLE001
+                self.error(f'open_fix_card {slug}', e)
+                continue
+            if r is not None:
+                return {'id': str(r[0]), 'board': slug, 'status': r[1]}
+        return None
+
+    def closeout_waking(self, board: str, card: str, premise: Optional[str]) -> Optional[dict]:
+        """chat-closeout's owner wake already handled this (card, premise) in the last 24 h (`owner-wake.db` `fired`:
+        a claim in flight, a chat turn started or a supervisor route), else None. Read-only."""
+        if not premise:
+            return None
+        path = os.environ.get('CHAT_CLOSEOUT_OWNER_WAKE_DB')
+        if not path:
+            try:
+                from hermes_cli import kanban_db
+                root = Path(kanban_db.kanban_home())
+            except Exception:  # noqa: BLE001
+                root = self.home()
+            path = str(root / 'cache' / 'chat-closeout' / 'owner-wake.db')
+        if not Path(path).exists():
+            return None
+        c = self.readers.conn(Path(path))
+        if c is None:
+            return None
+        try:
+            r = c.execute('SELECT claimed_at, result, route FROM fired WHERE card_key = ? AND premise = ?',
+                          (f'{board}/{card}', premise)).fetchone()
+        except Exception as e:  # noqa: BLE001
+            self.error('owner-wake.db', e)
+            return None
+        if r is None or r[1] == 'too_old' or (_num(r[0]) or 0) < self.now - 86400:
+            return None
+        return {'claimed_at': r[0], 'result': r[1], 'route': r[2]}
 
     def repair_chats(self) -> set[str]:
         """The Session repair chat(s): never scanned, never a notice target (`chat.json` from run.py, and any
@@ -578,6 +670,9 @@ def rule_unexplained_wait(card: Card, src: Sources) -> Optional[Finding]:
     since_w = _num(wait.get('waiting_since')) if isinstance(wait, dict) else None
     waited_w = _age(now, since_w) if since_w is not None else waited
     if agent and waited_w is not None and waited_w > AGENT_BLOCK_S:
+        handled = src.closeout_waking(card.board, card.id, wait.get('premise') if isinstance(wait, dict) else None)
+        if handled:
+            return None  # chat-closeout's owner wake already woke its chat for this very premise
         return _finding('BS-unexplained-wait', card, 'agent_owned_stalled',
                         f'{card.status} {_fmt_age(waited_w)} on an agent-owned wait '
                         f'({wait.get("waiting_on") or kind or "untyped block"}) nobody is working',
@@ -1016,7 +1111,7 @@ def scan(src: Optional[Sources] = None, *, rules: Optional[Iterable[str]] = None
             return
         card = Card(id=cid, board=board, chat=chat, task=task, conn=conn, row=row, via=via)
         human_blocked[cid] = card.status in ('blocked', 'triage') and _human_request(task)[1]
-        if card.status in TERMINAL or card.ours or cid in src.copies(board):
+        if card.status in TERMINAL or card.ours or cid in src.ours_ids() or cid in src.copies(board):
             return  # finished; filed by the repair session itself; or a worker copy its home board owns
         for rule in CARD_RULES:
             rid = 'BS-' + rule.__name__[len('rule_'):].replace('_', '-')
@@ -1058,6 +1153,12 @@ def scan(src: Optional[Sources] = None, *, rules: Optional[Iterable[str]] = None
         for f in notice_findings(src, on_person) + subscription_findings(src, alive):
             findings.setdefault(f.fingerprint, f)
     _allot_free_workers(findings)
+    for f in findings.values():  # the turn comments on an open fix card instead of filing a second one
+        if f.fix.get('kind') == 'card':
+            open_card = src.open_fix_card(f.fingerprint)
+            if open_card:
+                f.evidence['open_fix_card'] = open_card
+                f.fix = {**f.fix, 'open_fix_card': open_card['id']}
     out = sorted(findings.values(), key=lambda f: (RULES.index(f.rule), f.board or '', f.card or '', f.chat or ''))
     return {'scanned_at': src.now, 'duration_s': round(time.monotonic() - started, 3), 'chats': len(chats),
             'cards': len(judged), 'truncated_chats': truncated, 'excluded_chats': sorted(src.exclude_chats),

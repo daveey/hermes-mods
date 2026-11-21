@@ -146,7 +146,9 @@ def test_a_deferred_or_unreported_finding_is_not_marked_seen(tmp_path):
     assert fp1 not in seen and fp2 not in seen
     again = run.tick(home=tmp_path, scanner=scanner([finding(1), finding(2)]), runner=FakeHermes(), now=1100.0,
                      run_mode='live')
-    assert again['handed'] == [fp1], 'deferred comes straight back; the unreported one waits out its backoff'
+    assert again['handed'] == [], 'a reasonless deferral and an unreported one are failed attempts: both back off'
+    att = json.loads((tmp_path / 'session-repair' / 'attempts-live.json').read_text())
+    assert set(att['fps']) == {fp1, fp2}
 
 
 def test_failed_turns_back_off_exponentially_and_give_up_after_max_attempts(tmp_path):
@@ -223,7 +225,7 @@ def test_live_pins_the_repair_chat_once_it_exists(tmp_path):
 
 def test_parse_result_takes_the_last_block():
     text = result_block([{'fingerprint': 'a', 'outcome': 'deferred'}]) + result_block([{'fingerprint': 'a', 'outcome': 'fixed'}])
-    assert run.parse_result(text) == {'a': {'outcome': 'fixed', 'card': None}}
+    assert run.parse_result(text) == {'a': {'outcome': 'fixed', 'card': None, 'reason': ''}}
     assert run.parse_result('no block') is None and run.parse_result('```session-repair-result\nnot json\n```') is None
 
 
@@ -248,3 +250,65 @@ def test_prompt_states_the_card_policy():
                  'never wake a\n   probe park without running its probe first', 'Never delete or archive',
                  '```{{RESULT_FENCE}}'):
         assert must in text, must
+
+
+def outcomes_hermes(rows_for):
+    """A turn reporting rows_for(fingerprint) -> row dict (or None to leave it out)."""
+    class H(FakeHermes):
+        def __call__(self, argv, **kw):
+            self.calls.append(argv)
+            if argv[1] != 'chat':
+                return subprocess.CompletedProcess(argv, 0, stdout='', stderr='')
+            prompt = open(argv[argv.index('--query-file') + 1]).read()
+            found = json.loads(prompt.rsplit('```json', 1)[1].rsplit('```', 1)[0])
+            rows = [r for r in (rows_for(f['fingerprint']) for f in found) if r]
+            return subprocess.CompletedProcess(argv, 0, stdout=result_block(rows), stderr='')
+    return H()
+
+
+def test_a_deferral_with_a_reason_is_seen_for_24_hours(tmp_path):
+    fp = finding(1)['fingerprint']
+    h = outcomes_hermes(lambda f: {'fingerprint': f, 'outcome': 'deferred', 'reason': 'no open area card; not blocking'})
+    assert run.tick(home=tmp_path, scanner=scanner([finding(1)]), runner=h, now=1000.0, run_mode='live')['handed'] == [fp]
+    assert run.tick(home=tmp_path, scanner=scanner([finding(1)]), runner=h, now=1900.0, run_mode='live')['new'] == 0
+    assert lines(tmp_path / 'session-repair' / 'ledger-live.jsonl')[0]['reason'] == 'no open area card; not blocking'
+
+
+def test_over_budget_comes_back_next_tick_without_an_attempt(tmp_path):
+    fp = finding(1, 'card')['fingerprint']
+    h = outcomes_hermes(lambda f: {'fingerprint': f, 'outcome': 'over_budget'})
+    run.tick(home=tmp_path, scanner=scanner([finding(1, 'card')]), runner=h, now=1000.0, run_mode='live')
+    att = json.loads((tmp_path / 'session-repair' / 'attempts-live.json').read_text())
+    assert fp not in att['fps']
+    run.tick(home=tmp_path, scanner=scanner([finding(1, 'card')]), runner=h, now=1900.0, run_mode='live')
+    assert len(h.chats()) == 2, 'handed over again on the very next tick'
+
+
+def test_unknown_outcomes_and_reasonless_deferrals_are_failed_attempts(tmp_path):
+    fp1, fp2 = finding(1)['fingerprint'], finding(2)['fingerprint']
+    h = outcomes_hermes(lambda f: {'fingerprint': f, 'outcome': 'done-ish'} if f == fp1
+                        else {'fingerprint': f, 'outcome': 'deferred'})
+    out = run.tick(home=tmp_path, scanner=scanner([finding(1), finding(2)]), runner=h, now=1000.0, run_mode='live')
+    assert out['handed'] == []
+    att = json.loads((tmp_path / 'session-repair' / 'attempts-live.json').read_text())
+    assert att['fps'][fp1]['n'] == 1 and att['fps'][fp2]['n'] == 1
+
+
+def test_a_finding_left_out_of_the_block_is_given_up_with_a_ledger_row(tmp_path):
+    fp1 = finding(1)['fingerprint']
+    h = outcomes_hermes(lambda f: {'fingerprint': f, 'outcome': 'fixed'} if f != fp1 else None)
+    t = 1000.0
+    for _ in range(run.MAX_ATTEMPTS):
+        run.tick(home=tmp_path, scanner=scanner([finding(1)]), runner=h, now=t, run_mode='live')
+        t += run.BACKOFF_MAX_S + 1
+    rows = lines(tmp_path / 'session-repair' / 'ledger-live.jsonl')
+    assert [r['outcome'] for r in rows] == ['gave_up'] and rows[0]['fingerprint'] == fp1
+    assert fp1 in json.loads((tmp_path / 'session-repair' / 'seen-live.json').read_text())
+
+
+def test_an_open_fix_card_reaches_the_prompt_so_the_turn_comments(tmp_path):
+    f = finding(1, 'card')
+    f['fix'] = {**f['fix'], 'open_fix_card': 't_open'}
+    run.tick(home=tmp_path, scanner=scanner([f]), runner=FakeHermes(card_outcome='commented'), now=1000.0, run_mode='live')
+    prompt = (tmp_path / 'session-repair' / 'last-prompt.md').read_text()
+    assert '"open_fix_card": "t_open"' in prompt and 'never a second card' in prompt

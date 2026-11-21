@@ -12,8 +12,9 @@ Modes (`SESSION_REPAIR` env, else `$HERMES_HOME/session-repair/config.json` `{"m
   script itself never writes a board.
 
 Seen (24 h dedupe per fingerprint) only once handled: shadow marks what it logged; live marks what the turn's result
-block reports handled (`fixed`, `card`, `queued`, `commented`, `moved_on`, `false_positive`). `deferred` or a finding
-the block does not name stays unseen for the next tick. Caps: at most 5 fix cards per run and 20 per 24 h (cards
+block reports handled (`fixed`, `card`, `queued`, `commented`, `moved_on`, `false_positive`, or `deferred` with a
+reason). `over_budget` comes back next tick with no attempt counted; an unknown outcome, a `deferred` with no reason or
+a finding the block leaves out is a failed attempt (backoff, `gave_up` after 5). Caps: at most 5 fix cards per run and 20 per 24 h (cards
 the turn reports, including cards for safe fixes that did not take); safe fixes at most 20 per run. A failed turn
 (non-zero exit, no result block) backs off per fingerprint (15 min doubling, at most 6 h) and globally; after 5
 failed attempts a fingerprint is given up for 24 h and logged.
@@ -48,7 +49,9 @@ BACKOFF_MAX_S = 6 * 3600
 MAX_ATTEMPTS = 5
 LOG_MAX_LINES = 2000          # ledger-*.jsonl / actions-shadow.jsonl keep their newest lines only
 RESULT_FENCE = 'session-repair-result'
-HANDLED = ('fixed', 'card', 'queued', 'commented', 'moved_on', 'false_positive')
+HANDLED = ('fixed', 'card', 'queued', 'commented', 'moved_on', 'false_positive', 'deferred')  # seen for 24 h
+RETRY_NEXT_TICK = ('over_budget',)  # the turn ran out of card budget: back next tick, no attempt counted
+OUTCOMES = HANDLED + RETRY_NEXT_TICK  # anything else (or a finding left out) is a failed attempt
 CARD_OUTCOMES = ('card', 'queued')
 
 
@@ -266,7 +269,8 @@ def parse_result(text: str) -> Optional[dict[str, dict]]:
     out = {}
     for r in rows:
         if isinstance(r, dict) and isinstance(r.get('fingerprint'), str):
-            out[r['fingerprint']] = {'outcome': str(r.get('outcome') or ''), 'card': r.get('card')}
+            out[r['fingerprint']] = {'outcome': str(r.get('outcome') or ''), 'card': r.get('card'),
+                                     'reason': str(r.get('reason') or '')}
     return out
 
 
@@ -395,16 +399,24 @@ def tick(*, home: Optional[Path] = None, scanner: Optional[Callable[[], dict]] =
                            f'backoff, {len(gave_up)} given up after {MAX_ATTEMPTS} attempts')
             return out
         pin_chat(sd, runner, home)
-        handled = [fp for fp in fps if (results.get(fp) or {}).get('outcome') in HANDLED]
-        missing = [fp for fp in fps if fp not in results]
+
+        def accepted(fp: str) -> Optional[str]:
+            r = results.get(fp)
+            if r is None or r['outcome'] not in OUTCOMES or (r['outcome'] == 'deferred' and not r['reason'].strip()):
+                return None  # left out, unknown, or a deferral with no reason: a failed attempt
+            return r['outcome']
+        handled = [fp for fp in fps if accepted(fp) in HANDLED]
+        bad = [fp for fp in fps if accepted(fp) is None]
         by_fp = {f['fingerprint']: f for f in take}
-        _append(ledger, [_row(now, m, by_fp[fp], outcome=results[fp]['outcome'], filed=results[fp].get('card'))
-                         for fp in fps if fp in results])
+        _append(ledger, [_row(now, m, by_fp[fp], outcome=results[fp]['outcome'], filed=results[fp].get('card'),
+                              reason=results[fp]['reason'] or None) for fp in fps if fp in results])
         dedupe.mark(handled)
         attempts.succeeded(handled)
-        if missing:  # the turn ran but did not account for these: retried after backoff, never silently dropped
-            gave_up = attempts.failed(missing, turn=False)
-            dedupe.mark(gave_up)
+        if bad:  # the turn ran but did not account for these: retried after backoff, never silently dropped
+            gave_up = attempts.failed(bad, turn=False)
+            if gave_up:
+                dedupe.mark(gave_up)
+                _append(ledger, [_row(now, m, by_fp[fp], outcome='gave_up') for fp in gave_up])
         out['handed'] = handled
         cards = sum(1 for fp in handled if results[fp]['outcome'] in CARD_OUTCOMES)
         out['line'] = (f'session-repair (live): {len(new)} new finding(s); handled {len(handled)} ({cards} card(s)), '

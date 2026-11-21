@@ -31,7 +31,11 @@ why}, area: hermes|card, fingerprint}`; fingerprint = `<id>:<board>/<card>` (`<i
 one). `area` says who a fix card is for: `hermes` (Hermes machinery misbehaved) or `card` (the card owner's work).
 
 Never judged: the Session repair chat (its `chat.json` id and any chat titled "Session repair"), cards the repair
-session filed (idempotency key `session-repair:...`), worker-node copies (core `foreign_ids`). Chats over
+session filed (idempotency key `session-repair:...`, card ids its turns reported, and cards the self-work intake
+created for a request they reported or that carried a `session-repair:` key), worker-node copies (core
+`foreign_ids`). A `card` finding with an open fix card for its fingerprint (key prefix `session-repair:<fp>:`, any
+day, any board, not finished) carries `fix.open_fix_card`; the turn comments there. An agent-owned stall that
+chat-closeout's owner wake already handled for the same premise in the last 24 h (`owner-wake.db`) is skipped. Chats over
 `MAX_CHATS` (1000) are counted in `truncated_chats` and logged.
 
 Only this gateway's live board files are judged. A replica card (another gateway's) is skipped: its owner's scanner
@@ -55,8 +59,9 @@ so a core helper that tried to write raises instead (`tests/test_readonly.py`).
   when the schema exposes it; a queued acknowledgment is kept, never retried undeclared), never deletes or archives,
   and ends with a `session-repair-result` block giving each fingerprint's outcome. After the turn the chat is pinned
   and its id written to `chat.json`.
-- Seen only when handled: the result block's `fixed`, `card`, `queued`, `commented`, `moved_on`, `false_positive`.
-  `deferred` or unreported findings stay unseen.
+- Seen only when handled: the result block's `fixed`, `card`, `queued`, `commented`, `moved_on`, `false_positive`,
+  or `deferred` with a `reason` (24 h). `over_budget` returns next tick with no attempt; an unknown outcome, a
+  reasonless `deferred` or a finding left out of the block is a failed attempt.
 - Caps: at most 5 fix cards per run (the prompt's budget includes cards for safe fixes that did not take) and 20 per
   24 h, counted from the cards the turn reports (`ledger-<mode>.jsonl`); safe fixes 20 per run.
 - Failures: a turn that exits non-zero or reports no result block counts one attempt for each finding it was given
@@ -99,7 +104,10 @@ hermes plugins enable session-repair                           # only for the /f
 `install.py --apply` writes `~/.hermes/scripts/session_repair_tick.py` (runs `plugins/session-repair/run.py`), writes
 `config.json` (`shadow` unless `--mode`), and runs `hermes cron create "every 15m" --name session-repair --no-agent
 --script session_repair_tick.py --deliver local --failure-deliver bot-chat --catch-up off` unless a job of that name
-exists (`--failure-deliver local` is refused: failures must show). Run it again: it
+exists (`--failure-deliver local` is refused: failures must show). For `bot-chat[:profile]` the plan first checks,
+with core's own helpers, that the profile has a canonical Bot Chat authority (`find_canonical_live_owner`) and
+warning notifications on (`warning_notifications_enabled`, as cron's failure delivery does); otherwise it prints
+`refuse:` and exits 2 without installing anything: pass another `--failure-deliver`. Run it again: it
 does nothing. To stop: `hermes cron pause <id>` or `--mode off`.
 
 ## Tests
@@ -113,19 +121,21 @@ uv run --no-project --python 3.14 --with pytest --with pyyaml --with fastapi --w
   however old, core's 30-min unrecorded rule, `pool_could_run`, probe-first `probe_overdue`, `no_reason` threshold and
   `error` reasons, core's wait constants, cancelled parents and core's holds (breaker, containment), worker copies
   skipped by every rule, `lease_expired` / `no_claim`, review dispatch off, `missing_awaited`, the repair chat and
-  its own cards excluded, no `human` kind, `MAX_CHATS` truncation, the notice re-delivery command parsed by core's
+  its own cards excluded (key, ledger ids, self-work intake receipts), open fix cards named on day two (prefix
+  match, finished ones ignored), chat-closeout's handled stalls skipped, no `human` kind, `MAX_CHATS` truncation, the notice re-delivery command parsed by core's
   parser, the machine lane's slot allotment (registry and queue view stubbed), a chain card judged through the
   linked card, a healthy board with no finding.
 - `tests/test_readonly.py`: a scan that finds every rule leaves the board and `state.db` byte-identical; every
   connection refuses writes; a rule that tries to write is a counted error, not a write.
 - `tests/test_run.py`: modes, 24 h dedupe, caps (5/run, 20/day, cards for failed safe fixes counted, a new day),
   shadow logs and starts no turn, live starts one turn (fake `hermes`) and marks only what its result block handled,
-  deferred/unreported findings retried, exponential backoff and give-up after 5, no result block = failed, bounded
+  outcomes (`deferred` with a reason seen, `over_budget` next tick, unknown/reasonless/left out = attempts, `gave_up`
+  rows), an open fix card reaching the prompt, exponential backoff and give-up after 5, no result block = failed, bounded
   logs, pinning, the lock, the turn argv parsed by core's own parser, and the prompt's card-policy text.
 - `tests/test_routes.py`: `/findings` through FastAPI (last scan, chat filter, `fresh` scans and stores nothing,
   GET only).
-- `tests/test_install.py`: the plan, `--apply`, idempotence, `--failure-deliver` (never `local`), the cron argv parsed
-  by core's cron parser.
+- `tests/test_install.py`: the plan, `--apply`, idempotence, `--failure-deliver` (never `local`), the Bot Chat check
+  (no owner, authority not ready, warnings suppressed: refused), the cron argv parsed by core's cron parser.
 
 Untested: a real `hermes chat` turn and what the agent does with the prompt; the cron job firing on the hub; the
 scanner against a WAL board on Linux under load (it was dry-run once on the hub's live data, read-only).

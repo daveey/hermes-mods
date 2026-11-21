@@ -44,14 +44,18 @@ Every finding carries `id`, `variant`, `card`, `board`, `chat`, `evidence`, `fix
 Fix kinds: `auto` = safe and reversible, the repair chat applies it; `card` = needs real work, file a fix card.
 `area`: `hermes` = Hermes machinery misbehaved (dispatcher, wakes, leases, notices); `card` = the card owner's own
 work. Never judged: the Session repair chat itself (its `chat.json` id and any chat with that title), cards the
-repair session filed (idempotency key `session-repair:...`), and worker-node copies (core `foreign_ids`: their home
-board owns them).
+repair session filed (idempotency key `session-repair:...`, a card id the turns reported in `ledger-live.jsonl`, or
+the card the self-work intake created for a request they reported or that carried a `session-repair:` key), and
+worker-node copies (core `foreign_ids`: their home board owns them). A `card` finding whose fingerprint already has
+an open fix card (any board, key prefix `session-repair:<fingerprint>:`, any day, not done/archived/cancelled) carries
+`fix.open_fix_card`: comment there, never file a second card.
 
 Rules for every fix:
 - Re-read the card first (`kanban_show <id>`); findings can be 15 minutes old. Moved on = do nothing.
 - Use the Kanban tools/CLI only. Never edit a database, delete or archive a card, or kill/reclaim a live worker.
 - A safe fix that did not take becomes a fix card, and counts against the card cap.
-- Before any fix card, look for open work on the same thing (the finding's `idempotency_key` prefix
+- A finding with `fix.open_fix_card`: ONE comment on that card (outcome `commented`), never a second card.
+- Before any other fix card, look for open work on the same thing (the finding's `idempotency_key` prefix
   `session-repair:<fingerprint>:`, the card id, the pattern id, the subsystem, on every board): open = ONE comment,
   never a second card. The card body names the open or recently decided work on that subsystem and why none
   replaces it, plus evidence and acceptance (the detection no longer matches that card, plus "Done when").
@@ -66,7 +70,10 @@ Rules for every fix:
   `queued`), never retry it undeclared or replace it.
 - A human-only step is a blocked card with a valid `human_request`, only after try-to-unblock. It counts as a card.
 - The cron hands at most 5 card findings per run (20 per 24 h, counting every card the turn reports) and 20 safe
-  fixes per run; the turn's `session-repair-result` block decides what is marked seen.
+  fixes per run; the turn's `session-repair-result` block decides what is marked seen: `fixed`, `card`, `queued`,
+  `commented`, `moved_on`, `false_positive` and `deferred` with a `reason` are seen for 24 h; `over_budget` comes back
+  next run; an unknown outcome, a reasonless `deferred` or a finding left out is a failed attempt (backoff, given up
+  after 5 with a `gave_up` ledger row).
 
 ## BS-ready-worker-free: ready, unclaimed, while a worker is free
 
@@ -125,7 +132,9 @@ waiting card.
 - a `human_request` core's `needs_human` rejects → `invalid_human_request` (the ask is invisible);
 - `blocked`, no `block_kind`, no reason, for >= 30 min → `no_reason`;
 - an agent-owned wait (the session-tasks row's `wait.agent_owned`, else a block kind in core
-  `kanban_wait_info.AGENT_BLOCK_KINDS`) older than 2 h → `agent_owned_stalled`.
+  `kanban_wait_info.AGENT_BLOCK_KINDS`) older than 2 h → `agent_owned_stalled`, unless chat-closeout's owner wake
+  already handled that card and wait premise in the last 24 h (its `owner-wake.db` `fired` row: claimed, started or
+  routed; `too_old` does not count): that chat was woken for exactly this.
 
 **Fix card** (area card): `invalid_human_request`: re-file the ask validly (action, why_human, interaction, scope,
 evidence) or clear the block if no person is needed (try-to-unblock). `no_reason`: ask the owning chat; unblock or

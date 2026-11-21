@@ -62,6 +62,45 @@ def cron_argv(failure_deliver: str = FAILURE_DELIVER) -> list[str]:
                        '--deliver', 'local', '--failure-deliver', failure_deliver, '--catch-up', 'off']
 
 
+def failure_target_problem(h: Path, target: str) -> str | None:
+    """Why `target` would not show a failed tick, else None. For `bot-chat[:profile]` (core's own helpers): the
+    profile must have a canonical Bot Chat authority (`tools.bot_live_delivery.find_canonical_live_owner`) and
+    warning notifications on for its platform (`gateway.warning_notifications.warning_notifications_enabled`, as
+    cron's failure delivery checks): otherwise core books the failure notice `suppressed`. Other targets are not
+    checked here."""
+    if not target.startswith('bot-chat'):
+        return None
+    profile = target.partition(':')[2]
+    try:
+        from cron.scheduler_delivery import BOT_CHAT_POLICY_PLATFORM
+        from gateway.warning_notifications import warning_notifications_enabled
+        from hermes_cli.config_effective import load_user_config_effective
+        from tools.bot_live_delivery import find_canonical_live_owner
+        if profile:
+            from hermes_cli.profiles import get_profile_dir
+            home_dir = Path(get_profile_dir(profile))
+        else:
+            home_dir = h
+    except Exception as e:  # noqa: BLE001 -- core unreadable: cannot vouch for the target
+        return f'cannot check {target} with core ({type(e).__name__}: {e})'
+    try:
+        if find_canonical_live_owner(home_dir) is None:
+            return f'{target}: the profile has no session store, so no canonical Bot Chat'
+    except ValueError as e:
+        return f'{target}: the profile authority is not ready ({e}); failures would only queue'
+    except Exception as e:  # noqa: BLE001
+        return f'{target}: canonical Bot Chat lookup failed ({type(e).__name__}: {e})'
+    try:
+        enabled = warning_notifications_enabled(BOT_CHAT_POLICY_PLATFORM,
+                                                load_user_config_effective(home_dir / 'config.yaml'))
+    except Exception as e:  # noqa: BLE001
+        return f'{target}: warning-notification setting unreadable ({type(e).__name__}: {e})'
+    if not enabled:
+        return (f'{target}: warning notifications are suppressed for {BOT_CHAT_POLICY_PLATFORM} on that profile, so '
+                'cron books a failure notice as suppressed')
+    return None
+
+
 def plan(h: Path, mode: str | None, failure_deliver: str = FAILURE_DELIVER) -> list[tuple[str, str]]:
     steps = []
     script = h / 'scripts' / SCRIPT_NAME
@@ -73,7 +112,11 @@ def plan(h: Path, mode: str | None, failure_deliver: str = FAILURE_DELIVER) -> l
     if not (h / 'plugins' / 'session-repair' / 'run.py').exists():
         steps.append(('warn', f'{h}/plugins/session-repair is not linked yet: run hermes-sync first'))
     if not job_exists(h):
-        steps.append(('cron', ' '.join(cron_argv(failure_deliver))))
+        problem = failure_target_problem(h, failure_deliver)
+        if problem:
+            steps.append(('refuse', f'{problem}: pass --failure-deliver <a visible target> (telegram, slack:<chat>, ...)'))
+        else:
+            steps.append(('cron', ' '.join(cron_argv(failure_deliver))))
     return steps
 
 
@@ -91,8 +134,12 @@ def main(argv=None) -> int:
     if not steps:
         print('session-repair: already installed')
         return 0
+    refused = [what for kind, what in steps if kind == 'refuse']
     for kind, what in steps:
-        print(f'{"" if args.apply else "would "}{kind}: {what}')
+        print(f'{"" if args.apply or kind == "refuse" else "would "}{kind}: {what}')
+    if refused:
+        return 2  # nothing applied: a failure target that cannot show failures is not installed
+    for kind, what in steps:
         if not args.apply:
             continue
         if kind == 'write':

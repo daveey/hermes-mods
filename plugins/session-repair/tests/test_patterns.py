@@ -388,3 +388,62 @@ def test_chats_over_the_cap_are_counted_and_logged(env, monkeypatch, caplog):
     monkeypatch.setattr(env.scan_mod, 'MAX_CHATS', 2)
     out = env.scan()
     assert out['truncated_chats'] == 1 and any('MAX_CHATS' in e['error'] for e in out['errors'])
+
+
+# an open fix card from an earlier run (any day) is named, so the next day comments instead of filing again
+def test_a_finding_with_an_open_fix_card_names_it_second_day_no_duplicate(env):
+    tid = F.blocked_no_reason(env.conn, env.now)
+    fp = f'BS-unexplained-wait:default/{tid}'
+    fix = F.card(env.conn, 'Fix: blocked with no reason', status='ready', session='R9')
+    env.conn.execute('UPDATE tasks SET idempotency_key = ? WHERE id = ?', (f'session-repair:{fp}:20261120', fix))
+    env.conn.commit()
+    f = one(env, 'BS-unexplained-wait', tid)
+    assert f['fix']['open_fix_card'] == fix and f['evidence']['open_fix_card']['status'] == 'ready'
+    assert env.findings(card=fix) == [], 'the fix card itself is ours: never judged'
+    env.conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (fix,))
+    env.conn.commit()
+    assert 'open_fix_card' not in one(env, 'BS-unexplained-wait', tid)['fix'], 'a finished fix card: file a new one'
+
+
+def test_open_fix_card_lookup_is_a_prefix_not_like(env):
+    tid = F.blocked_no_reason(env.conn, env.now)
+    other = F.card(env.conn, 'Fix for a different fingerprint', status='ready', session='R9')
+    env.conn.execute('UPDATE tasks SET idempotency_key = ? WHERE id = ?',
+                     (f'session-repair:BS-unexplained-wait:defaultX{tid[1:]}:20261120', other))  # "_" would match "X" in LIKE
+    env.conn.commit()
+    assert 'open_fix_card' not in one(env, 'BS-unexplained-wait', tid)['fix']
+
+
+def test_cards_tracked_from_the_ledger_and_the_self_work_intake_are_ours(env):
+    a = F.blocked_no_reason(env.conn, env.now)
+    b = F.blocked_no_reason(env.conn, env.now)
+    (env.home / 'session-repair').mkdir()
+    (env.home / 'session-repair' / 'ledger-live.jsonl').write_text(
+        json.dumps({'outcome': 'card', 'filed': a}) + '\n' + json.dumps({'outcome': 'queued', 'filed': 'sw-req1'}) + '\n')
+    env.conn.execute('CREATE TABLE IF NOT EXISTS self_work_intake (request_id TEXT PRIMARY KEY NOT NULL, '
+                     'request_json TEXT NOT NULL, receipt_json TEXT NOT NULL)')
+    env.conn.execute('INSERT INTO self_work_intake VALUES (?, ?, ?)',
+                     ('sw-req1', json.dumps({'args': {'title': 'x'}}), json.dumps({'task_id': b, 'created': True})))
+    env.conn.commit()
+    assert env.findings(card=a) == [] and env.findings(card=b) == []
+
+
+def test_agent_owned_stall_chat_closeout_already_woke_is_skipped(env, monkeypatch):
+    import sqlite3
+    tid = F.blocked_agent_owned(env.conn, env.now)
+    premise = env.sources().bundle(F.CHAT)['tasks'][0]['wait']['premise']
+    db = env.home / 'owner-wake.db'
+    c = sqlite3.connect(db)
+    c.execute('CREATE TABLE fired (card_key TEXT NOT NULL, premise TEXT NOT NULL, session_id TEXT NOT NULL, '
+              'claimed_at REAL NOT NULL, result TEXT, route TEXT, supervisor_task TEXT, PRIMARY KEY (card_key, premise))')
+    c.execute('INSERT INTO fired VALUES (?, ?, ?, ?, ?, ?, NULL)', (f'default/{tid}', premise, F.CHAT, env.now - 600,
+                                                                    'started', 'chat'))
+    c.commit()
+    monkeypatch.setenv('CHAT_CLOSEOUT_OWNER_WAKE_DB', str(db))
+    none(env, 'BS-unexplained-wait', tid)
+    c.execute("UPDATE fired SET result = 'too_old'")
+    c.commit()
+    assert one(env, 'BS-unexplained-wait', tid)['variant'] == 'agent_owned_stalled', 'too_old never woke anyone'
+    c.execute("UPDATE fired SET result = 'started', claimed_at = ?", (env.now - 2 * 86400,))
+    c.commit()
+    assert one(env, 'BS-unexplained-wait', tid), 'a wake more than 24 h ago did not take: report it'
