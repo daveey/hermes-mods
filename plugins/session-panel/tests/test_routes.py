@@ -370,12 +370,35 @@ def test_the_exit_hook_is_registered_once_and_never_waits_past_its_timeout(monke
     monkeypatch.setattr(api, 'EXIT_SAVE_TIMEOUT_S', 0.05)
     try:
         f = api.feed()
+        assert registered == [api._save_running], "the process's first feed registers the exit hook"
         api._save_at_exit()
         assert registered == [api._save_running], 'registered once'
+        import threading
         with f.compute_lock:  # a push stuck in flight
-            started = time.monotonic()
-            assert api._save_running() is False
-            assert time.monotonic() - started < 2, 'the exit is not held up'
+            result = []
+            t = threading.Thread(target=lambda: result.append(api._save_running()), daemon=True)
+            t.start()
+            t.join(2)
+            assert not t.is_alive() and result == [False], 'the exit is not held up'
         assert api._save_running() is True
     finally:
         _restore(api, original)
+
+
+
+def test_an_older_process_cannot_retake_a_vanished_snapshot_from_a_newer_one(tmp_path):
+    api = load('_spf_vanish_api', HERE.parents[1] / 'dashboard' / 'plugin_api.py')
+    fakes = load('_spf_vanish_fakes', HERE.parent / 'test_feed.py')
+    f = api._load_feed().Feed(fakes.Readers(), emit=lambda p: None)
+    f.changes(['S1'])
+    path = tmp_path / 'feed.json'
+    assert api.save_snapshot(f, path, claim=True)
+    old_claim = api._CLAIMS[str(path)]
+    assert api.save_snapshot(f, path, claim=True)  # a newer process claims (same process stands in for it)
+    newer = api._CLAIMS[str(path)]
+    assert newer == old_claim + 1
+    path.unlink()  # the snapshot vanishes while both are alive
+    api._CLAIMS[str(path)] = old_claim  # the older process saves
+    assert api.save_snapshot(f, path) is False, 'the newer claim survives in the lock file'
+    api._CLAIMS[str(path)] = newer
+    assert api.save_snapshot(f, path) is True

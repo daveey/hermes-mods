@@ -713,7 +713,14 @@ def save_snapshot(f, path: Optional[Path] = None, *, claim: bool = False, timeou
         snap = json_safe(snap)
         with _locked(path):
             held = _read_header(path) or {}
-            held_gen = int(held.get('gen') or 0)
+            # The generation also lives in the .lock file (never pruned): a deleted snapshot does not reset it, so
+            # an older process cannot re-take the file from a newer one after it vanished.
+            gen_file = path.with_name(path.name + '.lock')
+            try:
+                lock_gen = int(gen_file.read_text(encoding='utf-8').strip() or 0)
+            except (OSError, ValueError):
+                lock_gen = 0
+            held_gen = max(int(held.get('gen') or 0), lock_gen)
             mine = _CLAIMS.get(str(path))
             if claim or mine is None:
                 mine = held_gen + 1  # recorded once it is on disk
@@ -729,6 +736,9 @@ def save_snapshot(f, path: Optional[Path] = None, *, claim: bool = False, timeou
                 fh.write(json.dumps(head, separators=(',', ':')) + '\n' + json.dumps(snap, separators=(',', ':')))
             os.replace(tmp, path)
             tmp = None
+            if mine > lock_gen:
+                with contextlib.suppress(OSError):
+                    gen_file.write_text(str(mine), encoding='utf-8')
             # A claim counts once written. A file that vanished (or never got our claim) is simply written again.
             _CLAIMS[str(path)] = max(mine, _CLAIMS.get(str(path), 0))
         if claim:
