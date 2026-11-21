@@ -2,7 +2,7 @@
 
 Before it, 52 of 57 plugin suites ran in no CI at all (only plugins with their own workflow did), so pushes
 that ran no tests landed red suites unnoticed. This pins the workflow's shape (triggers, matrix, no
-self-hosted runner on this public repo, test-all as the runner) and dry-runs its suite selection
+self-hosted runner on this public repo, test-all as the runner, public core on the 3.14 leg) and dry-runs its suite selection
 (scripts/ci-plugin-suites) on this tree.
 """
 import importlib.machinery
@@ -116,12 +116,31 @@ class PluginSuitesWorkflow(unittest.TestCase):
             self.assertEqual(set(re.findall(r"browser-harness==([0-9.]+)", other)), pins, name)
         self.assertIn('uv tool dir --bin)" >> "$GITHUB_PATH"', self.text)
 
-    def test_runs_each_suite_through_test_all_without_core(self):
+    def test_runs_each_suite_through_test_all(self):
         self.assertIn("scripts/test-all --exact", self.text)
         self.assertIn("--json results.json", self.text)
         self.assertIn("scripts/ci-plugin-suites summary results.json", self.text)
-        self.assertNotIn("--hermes-core", self.text)
+        self.assertNotIn("--hermes-core", self.text)  # core comes only from the checkout step's env
         self.assertNotIn("continue-on-error", self.text)
+
+    def test_core_backed_tests_run_against_the_public_core_on_the_314_leg(self):
+        # The hub used to run these (hub-mods-suite, hermes-sync mods-suite-gate); now core is public, CI does.
+        step = self.text.split("      - name: Check out public core (3.14 leg)\n", 1)[1].split("\n      - ", 1)[0]
+        self.assertRegex(step, r"(?m)^        if: matrix\.python == '3\.14'$")
+        self.assertIn('fetch -q --depth 1 -- https://github.com/daveey/hermes-agent.git "$CORE_REF"', step)  # ref never an option
+        self.assertNotIn("${{ inputs", step.split("run: |", 1)[1])  # inputs reach the shell only through env
+        self.assertIn("--locked --group dev --group test", step)  # core's own venv, as the hub syncs it
+        self.assertIn('echo "HERMES_MODS_PYTHON=${core}/.venv/bin/python" >> "$GITHUB_ENV"', step)
+        self.assertIn("CORE_REF: ${{ inputs.core_ref || 'main' }}", step)
+        self.assertIn('echo "HERMES_CORE_CHECKOUT=${core}" >> "$GITHUB_ENV"', step)
+        self.assertNotIn("secrets.", step)  # public mirror: no credential reaches this public repo's CI
+        self.assertLess(self.text.index("      - name: Check out public core"),
+                        self.text.index("      - name: Run selected suites"))
+        # hermes-hub's hub-core-mirror matches its dispatch run by this exact title
+        self.assertIn("format('plugin-suites core={0}', inputs.core_ref || 'main')", self.text)
+        inputs = self.text.split("  workflow_dispatch:\n", 1)[1].split("permissions:", 1)[0]
+        self.assertIn("core_ref:", inputs)
+        self.assertRegex(inputs, r"(?m)^        default: main$")
 
     def test_failure_uploads_full_suite_logs_only(self):
         run = self.text.split("      - name: Run selected suites", 1)[1].split("      - name: Upload", 1)[0]

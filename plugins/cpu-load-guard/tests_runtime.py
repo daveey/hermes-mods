@@ -54,7 +54,10 @@ def _busy_count() -> int:
 def main() -> None:
     if os.environ.get("CPU_LOAD_GUARD") == "off":
         raise SystemExit("CPU_LOAD_GUARD=off")
-    os.environ.pop("CPU_LOAD_GUARD_HOSTS", None)
+    # Protect the host this runs on, whatever it is: the guard only acts on protected hosts (hub by default), and
+    # this test is about the loaded plugin blocking, not about which hosts are configured (a CI runner is none).
+    import socket
+    os.environ["CPU_LOAD_GUARD_HOSTS"] = socket.gethostname().split(".")[0]
 
     from hermes_cli.plugin_capabilities import plugin_capability_granted
     from hermes_cli.plugins import (

@@ -212,7 +212,9 @@ def test_throttle_routes_do_not_wait_for_slots_sqlite(api, tmp_path, monkeypatch
     try:
         with TestClient(app) as client, concurrent.futures.ThreadPoolExecutor(2) as pool:
             assert client.get("/p/v1/throttle").json()["slots"] is None
-            assert entered.wait(1)
+            # setup, not the property: the slots reader process has started (a contended runner took over 1 s
+            # to spawn it). The routes' own no-wait bound is the timed block below.
+            assert entered.wait(15)
             started = time.monotonic()
             get = pool.submit(client.get, "/p/v1/throttle")
             put = pool.submit(client.put, "/p/v1/throttle", json={"percent": 42})
