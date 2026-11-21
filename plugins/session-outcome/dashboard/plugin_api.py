@@ -24,3 +24,7 @@ def create_router():
             raise HTTPException(503, 'person dependency ledger unreadable') from exc
 
     return router
+
+
+# Core's dashboard loader imports this attribute (it does not call factories).
+router = create_router()

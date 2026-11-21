@@ -52,7 +52,7 @@ INTERACTIVE = frozenset({"desktop", "local", "tui", "cli", "gui", "acp"})
 # core's MACHINE_SESSION_SOURCES.
 BACKGROUND = frozenset({"kanban", "cron", "oneshot", "subagent", "tool"})
 WAIT_KINDS = ("card", "process", "cron", "time", "capacity", "subagent", "person")
-# A ``person`` wait (an external human's reply is a prerequisite: "[Slack @Eve] answers X") is not a card, so a
+# A ``person`` wait (an external human's reply is a prerequisite: "[Slack @ExampleOperator] answers X") is not a card, so a
 # watch=true park never stands for it. Structured records live in person_waits.py;
 # core receives only its supported goal projection. Lifecycle (the ``state``): waiting -> verifying (the reply
 # arrived; check it) -> closed by a ``done`` that cites it in ``closes_person_waits`` with evidence.

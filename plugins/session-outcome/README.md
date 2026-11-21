@@ -10,7 +10,7 @@ A passive background watch with no action owed by anyone stays done (green eye).
 A required reply, deployment or access grant from a named person is different:
 
 ```json
-{"kind":"wait","on":[{"kind":"person","request_id":"example-request-123","contact":"Slack @Eve","channel":"slack","thread":"https://example.com/thread/123","response":"deploy the example build","next_step":"verify example staging"}]}
+{"kind":"wait","on":[{"kind":"person","request_id":"example-request-123","contact":"Slack @ExampleOperator","channel":"slack","thread":"https://example.com/thread/123","response":"deploy the example build","next_step":"verify example staging"}]}
 ```
 
 Use a stable unique `request_id` per request, including two requests in the same

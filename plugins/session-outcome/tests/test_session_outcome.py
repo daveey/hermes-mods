@@ -978,7 +978,7 @@ def test_decide_blank_why_not_default_does_not_override(plugin, fake, home):
 
 # ---- external person vs passive watch ----------------------------------------------------------------------
 
-PERSON = {"kind": "person", "contact": "Slack @Eve", "channel": "slack", "thread": "https://example.com/C0EXAMPLE/1700000000.000100",
+PERSON = {"kind": "person", "contact": "Slack @ExampleOperator", "channel": "slack", "thread": "https://example.com/C0EXAMPLE/1700000000.000100",
           "request_id": "request-staging-key", "response": "confirm the staging key is rotated", "next_step": "run the staging checks once she answers"}
 
 
@@ -995,7 +995,7 @@ def test_requested_slack_reply_is_a_visible_waiting_outcome(plugin, fake):
     item = fake.stored["S1"]["on"][0]
     assert fake.stored["S1"]["kind"] == "waiting" and item["state"] == "waiting"
     assert item["id"] == plugin.person_wait_id(PERSON['channel'], PERSON['contact'], PERSON['thread'], PERSON['request_id'])
-    for needle in ("Slack @Eve", "slack", "C0EXAMPLE/1700000000.000100", "confirm the staging key is rotated",
+    for needle in ("Slack @ExampleOperator", "slack", "C0EXAMPLE/1700000000.000100", "confirm the staging key is rotated",
                    "run the staging checks once she answers"):
         assert needle in item["label"]
 
@@ -1012,7 +1012,7 @@ def test_done_refused_while_person_reply_is_outstanding_even_with_a_watch(plugin
     call(plugin, {"kind": "wait", "on": [PERSON]})
     _fake_ksa(monkeypatch, [])  # the parked staging task is a watch: invisible to session_tasks
     out = call(plugin, {"kind": "done", "summary": "Staging check parked."})
-    assert not out["ok"] and "named person" in out["error"] and "Slack @Eve" in out["error"]
+    assert not out["ok"] and "named person" in out["error"] and "Slack @ExampleOperator" in out["error"]
     assert fake.stored["S1"]["kind"] == "waiting"  # still shown waiting
 
 
@@ -1023,7 +1023,7 @@ def test_response_moves_to_verification_and_stays_visible(plugin, fake):
     out = call(plugin, {"kind": "wait", "on": [{**PERSON, "state": "verifying", "evidence": "her reply in the thread"}]})
     assert out["ok"]
     item = fake.stored["S1"]["on"][0]
-    assert item["state"] == "verifying" and item["label"].startswith("Verifying Slack @Eve")
+    assert item["state"] == "verifying" and item["label"].startswith("Verifying Slack @ExampleOperator")
     # verification is not completion
     assert not call(plugin, {"kind": "done", "summary": "ok"})["ok"]
 
