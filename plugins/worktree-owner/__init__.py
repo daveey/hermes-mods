@@ -551,6 +551,7 @@ def _complex_reason(path: str) -> str | None:
     return None
 
 
+SOURCE_CUSTODY_PROTOCOL = 1  # active host GC requires this native-removal capability
 CUSTODY_TIMEOUT_S = 180.0
 # The CLI selects the board from HERMES_KANBAN_DB; a worker's own pins must not redirect or refuse that read.
 _BOARD_PINS = ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK")
