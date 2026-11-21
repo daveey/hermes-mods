@@ -99,6 +99,33 @@ def test_reported_running_needs_a_fresh_read_and_a_remote_row():
     assert 'status unknown' in model.reduce_panel(bundle(local), now=NOW)['sections']['waiting'][0]['detail']
 
 
+@pytest.mark.parametrize('synced_at, allowed', [(None, False), (NOW + 5000, False), (NOW + 1, False),
+                                               (NOW - 300, True), (NOW - 301, False), (NOW, True),
+                                               ('bad', False), (str(NOW), False), (True, False),
+                                               (float('nan'), False), (float('inf'), False)])
+def test_reported_running_requires_numeric_bounded_sync(synced_at, allowed):
+    row = remote_running()
+    if synced_at is None:
+        row.pop('synced_at')
+    else:
+        row['synced_at'] = synced_at
+    m = model.reduce_panel(bundle(row), now=NOW, projector=lambda r, **kw: {'state': 'unknown', 'unknown_reason': 'no_run_identity'})
+    assert bool(m['sections']['running']) is allowed
+    if not allowed:
+        assert 'status unknown' in m['sections']['waiting'][0]['detail']
+
+
+@pytest.mark.parametrize('observed_at, state, reason', [(NOW - 181, 'running', 'source expired'),
+                                                      (NOW, 'completed', 'unsupported state')])
+def test_reported_running_never_masks_real_expired_or_nonrunning_observation(observed_at, state, reason):
+    pytest.importorskip('hermes_cli.execution_observations')
+    row = remote_running()
+    row['execution_observations'] = [v1(row, observed_at, state=state)]
+    m = model.reduce_panel(bundle(row), now=NOW)
+    assert not m['sections']['running']
+    assert f'status unknown ({reason})' in m['sections']['waiting'][0]['detail']
+
+
 def test_parked_remote_rows_show_their_true_state_without_a_provenance_tail():
     pytest.importorskip('hermes_cli.execution_observations')
     for status, shown in (('scheduled', 'scheduled · its owner has not published what wakes it'), ('triage', 'in triage · waiting to be specified and promoted'),
@@ -218,6 +245,23 @@ def test_answered_ask_attaches_to_its_card_and_keeps_it_out_of_needs_you():
     # the card runs again: the status line follows it
     m = model.reduce_panel(bundle(task(), requests=[req]), now=now, projector=lambda r, *, now: {'state': 'running', 'sourced': True},)
     assert not [r for r in m['sections']['waiting'] if r['kind'] == 'decision']
+
+
+def live_ask_with_pending_decision():
+    ref = {'type': 'kanban', 'gatewayId': 'remote', 'profile': 'default', 'board': 'default', 'id': 't_abc123'}
+    old = answered(scope={'markdown': 'Older ask', 'sourceRefs': [ref]})
+    live = answered(requestId='req-live', resolution=None, title='A new decision', scope={'markdown': 'New ask', 'sourceRefs': [ref]})
+    hr = {'action': 'Pick', 'why_human': 'Tried: x. Only you can: y.', 'interaction': 'approval', 'evidence': 'e'}
+    return model.reduce_panel(bundle(task(status='blocked', human_request=hr, wait={'wait_state': 'human'}), requests=[old, live]), now=NOW)
+
+
+def test_live_ask_keeps_older_answered_decision_on_same_card():
+    m = live_ask_with_pending_decision()
+    [row] = m['sections']['needs_you']
+    assert row['request_id'] == 'req-live'
+    assert row['decision']['request_id'] == 'req-9'
+    assert row['decision']['text']
+    assert not m['sections']['waiting'], 'do not duplicate the owner card'
 
 
 def test_long_undelivered_decision_says_so():

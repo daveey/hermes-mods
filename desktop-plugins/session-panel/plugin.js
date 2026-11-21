@@ -8,8 +8,18 @@ const VERSION = 'session-panel-v16-status-lines'
 const str = v => (typeof v === 'string' ? v : v == null ? '' : String(v))
 // Emoji-presentation glyphs the Desktop fonts draw as tofu (a Hermes-bug title carried "⛔"); the model strips them
 // too, this covers a cached older model.
-const EMOJI = /[\u{1F000}-\u{1FAFF}\u231a\u231b\u23e9-\u23f3\u23f8-\u23fa\u25fd\u25fe\u2614\u2615\u2648-\u2653\u267f\u2693\u26a1\u26aa\u26ab\u26bd\u26be\u26c4\u26c5\u26ce\u26d4\u26ea\u26f2\u26f3\u26f5\u26fa\u26fd\u2705\u270a\u270b\u2728\u274c\u274e\u2753-\u2755\u2757\u2795-\u2797\u27b0\u27bf\u2b1b\u2b1c\u2b50\u2b55\ufe0f\u200d\u20e3]/gu
-export const plain = v => str(v).replace(EMOJI, '').replace(/\s+/g, ' ').trim()
+const EMOJI_RANGES = [
+  [0x1F000, 0x1FAFF], [0x231A, 0x231B], [0x23E9, 0x23F3], [0x23F8, 0x23FA],
+  [0x25FD, 0x25FE], [0x2614, 0x2615], [0x2648, 0x2653], [0x267F, 0x267F],
+  [0x2693, 0x2693], [0x26A1, 0x26A1], [0x26AA, 0x26AB], [0x26BD, 0x26BE],
+  [0x26C4, 0x26C5], [0x26CE, 0x26CE], [0x26D4, 0x26D4], [0x26EA, 0x26EA],
+  [0x26F2, 0x26F3], [0x26F5, 0x26F5], [0x26FA, 0x26FA], [0x26FD, 0x26FD],
+  [0x2705, 0x2705], [0x270A, 0x270B], [0x2728, 0x2728], [0x274C, 0x274C],
+  [0x274E, 0x274E], [0x2753, 0x2755], [0x2757, 0x2757], [0x2795, 0x2797],
+  [0x27B0, 0x27B0], [0x27BF, 0x27BF], [0x2B1B, 0x2B1C], [0x2B50, 0x2B50],
+  [0x2B55, 0x2B55], [0xFE0F, 0xFE0F], [0x200D, 0x200D], [0x20E3, 0x20E3]
+]
+export const plain = v => Array.from(str(v)).filter(c => !EMOJI_RANGES.some(([lo, hi]) => lo <= c.codePointAt(0) && c.codePointAt(0) <= hi)).join('').replace(/\s+/g, ' ').trim()
 let osApi = null // ctx.os, set in register()
 const log = (...a) => console.info(`[${ID}]`, ...a)
 const clamp = n => ({ display: '-webkit-box', WebkitLineClamp: n, WebkitBoxOrient: 'vertical', overflow: 'hidden' })
@@ -294,6 +304,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
       ] }),
       jsx('strong', { 'data-ask-title': '', style: { fontWeight: 600, fontSize: 14, lineHeight: 1.35, overflowWrap: 'anywhere', marginTop: -4 }, children: plain(row.title) || row.id }),
       row.detail && jsx('div', { style: { ...modelSmall, ...muted }, children: row.detail }),
+      row.decision?.text && jsx('div', { 'data-decision-status': row.decision.request_id || '', role: 'status', style: { ...muted, overflowWrap: 'anywhere' }, children: row.decision.text }),
       row.situation && jsx('div', { 'data-ask-situation': '', title: row.situation, style: { ...modelSmall, fontSize: 12.5, ...clamp(3) }, children: row.situation }),
       decision && jsx('div', { 'data-ask-options': '', style: { display: 'grid', gap: 6 }, children: row.options.map(option => {
         const rec = !!option.recommended, on = enabled(option)

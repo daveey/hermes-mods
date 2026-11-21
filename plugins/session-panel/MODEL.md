@@ -154,7 +154,8 @@ Order matters, matching Desktop `classify`:
 - Worker clocks may lead the read clock by up to `SKEW_S` (120 s): `now` is lifted to the newest observation
   before core's projector runs; a larger lead stays core's `clock_inconsistent`.
 - A remote row whose replica placeholder has no run id (`missing_qualified_identity`; core reports
-  `invalid_requested_identity`) is a producer gap, not an unknown state: a fresh (`<=60 s` read, `<=300 s` sync)
+  `invalid_requested_identity`) is a producer gap, not an unknown state: a fresh (`0–60 s` read,
+  numeric `synced_at` with `0 <= now - synced_at <= 300 s`; no future skew allowance)
   running row is shown In progress with `evidence_state: "reported"` and a Details line saying so; parked
   states show their board state. No `· board status` tail on any row.
 - Waiting text is one short phrase (`waiting on CI · PR #3881 · 2m`, `waiting on hub deploy · 15m`); URLs go to an
