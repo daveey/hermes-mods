@@ -18,3 +18,12 @@ import tempfile
 # The feed saves its snapshot under HERMES_HOME, also from an atexit hook after every test has finished: the whole
 # test process points it at a throwaway directory, never the real Hermes home.
 os.environ['HERMES_HOME'] = tempfile.mkdtemp(prefix='session-panel-test-home-')
+
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _own_hermes_home(tmp_path, monkeypatch):
+    """Each test its own HERMES_HOME (snapshots never leak from one test into the next)."""
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path / 'hermes-home'))

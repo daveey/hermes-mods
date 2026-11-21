@@ -2343,10 +2343,18 @@ async function feedCatchUpNow(target, { nowMs = Date.now(), reset = false, full 
   }
   if (!r || r.profile_unsupported || typeof r.epoch !== 'string') return unsupported(r?.profile_unsupported ? `profile ${r.profile}` : 'no epoch')
   const cur = feeds.get(key)
-  // A push for a later revision landed while this request was out: keep it, drop this older answer's bundles.
   if (cur && !cur.unsupported && cur.epoch === r.epoch && cur.feed === r.feed && Number(r.rev) < cur.rev) {
-    cur.sessions = [...new Set([...(cur.sessions || []), ...target.sessions])]
-    return true
+    // A push for a later revision landed while this request was out: keep it, drop this older answer's bundles.
+    if (feedIsLive(cur, nowMs)) {
+      cur.sessions = [...new Set([...(cur.sessions || []), ...target.sessions])]
+      return true
+    }
+    // No pushes reach us and the gateway is behind what we hold: it carried the feed on from an older snapshot (a
+    // restart). Waiting for it to pass our revision could take hours: start over with it instead.
+    if (!reset) {
+      feedLog(`${target.connectionId}/${profile} behind rev=${r.rev} < ${cur.rev}: reset`)
+      return feedCatchUpNow(target, { nowMs, reset: true })
+    }
   }
   const next = { connectionId: target.connectionId, profile, feedProfile: str(r.profile) || profile, feed: r.feed, epoch: r.epoch, rev: Number(r.rev) || 0,
     sessions: [...target.sessions], liveAt: cur?.feed === r.feed && cur?.epoch === r.epoch ? cur.liveAt : 0, at: Date.now() }

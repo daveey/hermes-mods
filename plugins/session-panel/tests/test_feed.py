@@ -668,7 +668,8 @@ def test_revisions_after_a_restore_stay_above_what_the_old_process_pushes_during
     new.tick()  # recomputes every restored chat: S1 differs from what was saved
     assert pushed and all(p['rev'] > client_rev for p in pushed)
     out = new.changes(['S1', 'S2'], since=client_rev, epoch=first['epoch'])
-    assert out['reset'] is False and set(out['bundles']) == {'S1'}, 'the client catches up, never resets'
+    assert out['reset'] is False, 'the client catches up, never resets'
+    assert set(out['bundles']) == {'S1', 'S2'}, 'every restored chat is re-issued, changed or not'
 
 
 def test_restore_drops_expired_interest_and_refuses_another_shape():
@@ -706,3 +707,34 @@ def test_a_quiet_restored_chat_is_recomputed_on_the_first_pass():
     pushed.clear()
     new._publish({}, heartbeat=True)
     assert pushed and pushed[-1]['fresh'] == ['S3']
+
+
+
+def test_a_restored_chat_the_client_holds_newer_is_reissued_even_when_unchanged():
+    # The old process saved S1 at h1, then pushed S1=h2 (the client holds it), then S1 went back to h1. The new
+    # process recomputes h1 = what it restored: without a new revision the client would keep h2 while vouched.
+    old, r, pushed, t = make()
+    first = old.changes(['S1'])
+    snap = _roundtrip(old.snapshot())
+    r.cards['t_ccccccc3'] = detail('t_ccccccc3', 'done', session='S9')
+    r.events, r.stamp = [('t_ccccccc3', 'S9')], 2
+    t['now'] += 1
+    old.tick()
+    client_rev = old.rev
+    r.cards['t_ccccccc3'] = detail('t_ccccccc3', 'running', session='S9')  # back to what was saved
+    new = feedmod.Feed(r, emit=pushed.append, clock=lambda: t['now']).restore(snap)
+    pushed.clear()
+    new.tick()
+    sent = [p for p in pushed if p.get('bundles')]
+    assert sent and 'S1' in sent[-1]['bundles'] and sent[-1]['rev'] > client_rev
+    out = new.changes(['S1'], since=client_rev, epoch=first['epoch'])
+    assert set(out['bundles']) == {'S1'} and out['bundles']['S1']['cards']['t_ccccccc3']['detail']['task']['status'] == 'running'
+
+
+def test_restore_keeps_only_bundles_of_chats_still_watched():
+    old, r, pushed, t = make()
+    old.changes(['S1', 'S2'])
+    snap = _roundtrip(old.snapshot())
+    snap['interest']['S2'] = t['now'] - 1  # nobody re-registered it
+    new = feedmod.Feed(r, emit=pushed.append, clock=lambda: t['now']).restore(snap)
+    assert set(new.bundles) == {'S1'} and 'S2' not in new._retry and 'S2' not in new._carried

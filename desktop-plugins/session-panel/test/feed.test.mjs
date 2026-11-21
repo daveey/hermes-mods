@@ -244,3 +244,31 @@ test('a restarted backend that restored its feed is followed by catch-up, never 
   push({ prev: 4, rev: 5, bundles: { S1: bundle() }, fresh: ['S1'] })  // the old process, still finishing
   assert.equal(ingested.length, before + 1, "the old process's later pushes are older: ignored")
 })
+
+test('a gateway behind what we hold while no pushes reach us (restored from an older snapshot) is reset to', async () => {
+  window.__answer = () => answer({ rev: 3 })
+  await m.feedCatchUp(target())
+  push({ prev: 3, rev: 9, bundles: { S1: bundle() }, fresh: ['S1'] })  // a gap: catch up
+  window.__answer = () => answer({ rev: 9, reset: false })
+  await settle(); await settle()
+  // Live: an older answer than a push that landed meanwhile is dropped (unchanged behaviour).
+  calls.length = 0
+  window.__answer = () => answer({ rev: 5, reset: false })
+  await m.feedCatchUp(target())
+  assert.equal(calls.length, 1, 'live: kept what the pushes gave')
+  // Pushes stopped (the backend restarted from an older snapshot) and it answers below our revision: start over.
+  const realNow = Date.now
+  try {
+    const later = realNow() + m.FEED_STALE_MS + 1
+    Date.now = () => later
+    calls.length = 0
+    window.__answer = req => req.body.epoch === null ? answer({ rev: 5, reset: true, bundles: { S1: bundle() } }) : answer({ rev: 5, reset: false })
+    assert.equal(await m.feedCatchUp(target(), { nowMs: later }), true)
+    assert.equal(calls.length, 2, 'asked again, from scratch')
+    assert.equal(calls.at(-1).body.epoch, null)
+    window.__answer = () => answer({ rev: 6, reset: false })
+    const before = ingested.length
+    push({ prev: 5, rev: 6, bundles: { S1: bundle() }, fresh: ['S1'] })
+    assert.equal(ingested.length, before + 1, 'its next push applies: the chain continues from its revision')
+  } finally { Date.now = realNow }
+})

@@ -126,6 +126,7 @@ class Feed:
         self._flights: dict[str, _Flight] = {}
         self._retry: set[str] = set()  # a tick joined reads that may predate its change cursor
         self._carried: set[str] = set()  # bundles resumed from a stopped feed: never vouched for until restored
+        self._reissue: set[str] = set()  # restored from another process: their recompute takes a new revision
         self._successor: Optional['Feed'] = None  # the feed that resumed this one (requests still here move on)
 
     def resume(self, prev: 'Feed') -> 'Feed':
@@ -191,6 +192,7 @@ class Feed:
         self.failures.pop(s, None)
         self._retry.discard(s)
         self._carried.discard(s)
+        self._reissue.discard(s)
 
     # ── computing ───────────────────────────────────────────────────────────
     def compute(self, session: str, *, seq: Optional[int] = None) -> dict:
@@ -295,14 +297,23 @@ class Feed:
                         flight.ready.set()
 
     # ── across processes ────────────────────────────────────────────────────
-    def snapshot(self) -> dict:
+    def snapshot(self, timeout: Optional[float] = None) -> Optional[dict]:
         """What a later process of this gateway needs to carry this feed on (Feed.restore): the revision space, the
-        held bundles and the interest. Taken under the publish lock, so it is one consistent revision."""
-        with self.compute_lock, self.lock:
-            return {'version': SNAPSHOT_VERSION, 'epoch': self.epoch, 'rev': self.rev, 'saved_at': self.clock(),
-                    'bundles': {s: {'rev': b['rev'], 'hash': b['hash'], 'bundle': b['bundle']}
-                                for s, b in self.bundles.items()},
-                    'interest': dict(self.interest)}
+        held bundles and the interest. Taken under the publish lock, so it is one consistent revision. With a
+        `timeout`, None when the lock was not free in time (an exit must not hang on a stuck push)."""
+        if not self.compute_lock.acquire(timeout=-1 if timeout is None else timeout):
+            return None
+        try:
+            with self.lock:
+                return self._snapshot_locked()
+        finally:
+            self.compute_lock.release()
+
+    def _snapshot_locked(self) -> dict:
+        return {'version': SNAPSHOT_VERSION, 'epoch': self.epoch, 'rev': self.rev, 'saved_at': self.clock(),
+                'bundles': {s: {'rev': b['rev'], 'hash': b['hash'], 'bundle': b['bundle']}
+                            for s, b in self.bundles.items()},
+                'interest': dict(self.interest)}
 
     def restore(self, snap: dict) -> 'Feed':
         """Carry on a feed a previous process of this gateway saved, so clients keep their revision chain across a
@@ -316,14 +327,16 @@ class Feed:
         if snap.get('version') != SNAPSHOT_VERSION or not isinstance(snap.get('epoch'), str):
             raise ValueError('not a session-panel feed snapshot of this version')
         now = self.clock()
+        interest = {str(s): float(until) for s, until in (snap.get('interest') or {}).items() if float(until) > now}
         bundles = {}
         for s, held in (snap.get('bundles') or {}).items():
+            if str(s) not in interest:
+                continue  # nobody watches it any more: a later registration computes it fresh
             bundle = held['bundle']
             rows = list(bundle['tasks']) + list(bundle['done'])
             bundles[str(s)] = {'rev': int(held['rev']), 'hash': str(held['hash']), 'bundle': bundle,
                                'refs': set(bundle['cards']) | {str(t.get('id')) for t in rows if t.get('id')},
                                'lineage': set(bundle['lineage']), 'source_stale': False}
-        interest = {str(s): float(until) for s, until in (snap.get('interest') or {}).items() if float(until) > now}
         with self.compute_lock, self.lock:
             self.epoch = snap['epoch']
             self.rev = int(snap['rev']) + RESTORE_REV_GAP
@@ -331,6 +344,7 @@ class Feed:
             self.interest = interest
             self._retry = set(bundles)
             self._carried = set(bundles)
+            self._reissue = set(bundles)
             top = max((int(b['bundle'].get('computed_seq') or 0) for b in bundles.values()), default=0)
             self._seq = itertools.count(top + 1)
         return self
@@ -348,8 +362,13 @@ class Feed:
         source_stale = any(t.get('stale') or t.get('partial_source_unknown') or t.get('_execution_error') for t in rows)
         if source_stale:
             self._retry.add(session)
-        self._carried.discard(session)  # recomputed: its bundle is this feed's own now
-        if prev and prev['hash'] == h:
+        # Recomputed: its bundle is this feed's own now. One restored from another process takes a new revision even
+        # when unchanged: a client may hold a newer copy the old process pushed after it saved (a restart's
+        # overlap), which a catch-up would otherwise never replace while this feed vouched for it.
+        reissue = session in self._reissue
+        self._carried.discard(session)
+        self._reissue.discard(session)
+        if prev and prev['hash'] == h and not reissue:
             prev.update(bundle=bundle, refs=refs, lineage=set(bundle['lineage']), source_stale=source_stale)
             return False
         self.rev += 1

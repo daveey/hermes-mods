@@ -11,6 +11,7 @@ its own reads for that profile.
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -18,10 +19,9 @@ import copy
 from contextlib import contextmanager
 import importlib.util
 import json
-import contextlib
-import re
 import logging
 import os
+import re
 import socket
 import sqlite3
 import sys
@@ -593,12 +593,24 @@ def _request_profile() -> str:
         return 'default'
 
 
+_GLOBAL_FLAGS_WITH_VALUE = {'-p', '--profile'}  # hermes flags before the subcommand that take the next argument
+
+
 def _feed_role(argv: Optional[list[str]] = None) -> str:
     """Which backend of this host this process is, stable across its restarts: the hermes subcommand (`serve`,
     `dashboard`, ...) and, for a Desktop's ssh-launched backend, that Desktop's slot (the directory of its session
     token file; the token itself changes per launch). Two Desktops on one hub are two roles."""
     args = list(sys.argv[1:] if argv is None else argv)
-    sub = next((a for a in args if a and not a.startswith('-')), 'proc')
+    sub, i = 'proc', 0
+    while i < len(args):
+        a = args[i]
+        if a in _GLOBAL_FLAGS_WITH_VALUE:
+            i += 2
+            continue
+        if a and not a.startswith('-'):
+            sub = a
+            break
+        i += 1
     slot = ''
     for i, a in enumerate(args):
         if a == '--ssh-session-token-file' and i + 1 < len(args):
@@ -612,8 +624,19 @@ FEED_ROLE = _feed_role()
 # Stable across restarts (not the pid): clients match pushes by it, so a restarted backend's pushes count at once.
 FEED_ID = f'{socket.gethostname()}:{FEED_ROLE}'
 LAUNCH_PROFILE = _launch_profile()
-SNAPSHOT_EVERY_S = 5.0        # a changed feed is saved at most this often (and on stop / exit)
+SNAPSHOT_EVERY_S = 30.0        # a changed feed is saved at most this often (and on stop / exit)
 RESTORE_MAX_AGE_S = 15 * 60.0  # an older snapshot starts a new revision space instead
+SNAPSHOT_PRUNE_S = 7 * 86400.0  # snapshots of backends not seen for this long are deleted
+WARN_EVERY_S = 600.0            # a repeated snapshot warning is logged at most this often
+_CLAIMS = _LOADER.__dict__.setdefault('snapshot_claims', {})  # snapshot path -> this process's claim generation
+_WARNED = _LOADER.__dict__.setdefault('snapshot_warned', {})  # warning key -> when last logged
+
+
+def _warn(key: str, msg: str, *args, exc_info: bool = False) -> None:
+    now = time.monotonic()
+    if now - _WARNED.get(key, -WARN_EVERY_S) >= WARN_EVERY_S:
+        _WARNED[key] = now
+        log.warning(msg, *args, exc_info=exc_info)
 
 
 def _snapshot_path() -> Path:
@@ -623,47 +646,95 @@ def _snapshot_path() -> Path:
     except ImportError:  # no core on the path (plugin-only test runs)
         home = Path(os.environ.get('HERMES_HOME') or Path.home() / '.hermes')
     safe = re.sub(r'[^A-Za-z0-9_.-]', '_', f'{FEED_ROLE}-{LAUNCH_PROFILE}')
-    return Path(get_hermes_home()) / 'session-panel' / f'feed-{safe}.json'
+    return home / 'session-panel' / f'feed-{safe}.json'
 
 
-# When this process started (kept across plugin reloads): a snapshot names the process that wrote it, and an older
-# process (one a restart is replacing, still running for a while) never overwrites a newer one's.
-PROCESS_STARTED = _LOADER.__dict__.setdefault('process_started', time.time())
+@contextmanager
+def _locked(path: Path, timeout: float = 5.0):
+    """An exclusive lock on `path`'s sibling .lock file, across processes (no-op where fcntl is missing)."""
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path.with_name(path.name + '.lock'), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f'{path} is locked by another process')
+                time.sleep(0.02)
+        yield
+    finally:
+        os.close(fd)  # closing releases the flock
 
 
 def _read_header(path: Path) -> Optional[dict]:
-    """A snapshot file is two lines: a small JSON header (who wrote it, which revision) and the JSON snapshot."""
+    """A snapshot file is two lines: a small JSON header (who wrote it, its claim generation, which revision) and
+    the JSON snapshot."""
     try:
         with path.open('r', encoding='utf-8') as fh:
             head = json.loads(fh.readline())
         return head if isinstance(head, dict) else None
-    except FileNotFoundError:
-        return None
     except Exception:
         return None
 
 
-def save_snapshot(f, path: Optional[Path] = None) -> bool:
-    """Write `f`'s snapshot atomically (temp file + replace). False when a newer process owns the file, or (logged)
-    when it could not be written."""
+def _prune(directory: Path, keep: Path) -> None:
+    now = time.time()
+    for p in directory.glob('feed-*.json'):
+        with contextlib.suppress(OSError):
+            if p != keep and now - p.stat().st_mtime > SNAPSHOT_PRUNE_S:
+                p.unlink()
+                with contextlib.suppress(OSError):
+                    p.with_name(p.name + '.lock').unlink()
+    for p in directory.glob('.feed-*.tmp'):
+        with contextlib.suppress(OSError):
+            if now - p.stat().st_mtime > 86400:
+                p.unlink()
+
+
+def save_snapshot(f, path: Optional[Path] = None, *, claim: bool = False, timeout: Optional[float] = None) -> bool:
+    """Write `f`'s snapshot atomically (temp file, owner-only, then replace), under a cross-process lock.
+    Ownership is a claim generation in the file, never a clock: a process claims the file when its feed starts
+    (`claim`: the generation goes up by one) and from then on saves only while the file still carries its claim.
+    So the process a restart replaces, still running for a while, never overwrites its successor's snapshot.
+    False when the file has a newer claim, the feed was busy past `timeout`, or the write failed (logged)."""
     tmp = None
     try:
         path = path or _snapshot_path()
-        held = _read_header(path)
-        if held and float(held.get('owner_started') or 0) > PROCESS_STARTED:
-            return False  # a newer process of this backend carries the feed on now
-        snap = json_safe(f.snapshot())
-        head = {'version': snap['version'], 'feed': FEED_ID, 'profile': LAUNCH_PROFILE, 'epoch': snap['epoch'],
-                'rev': snap['rev'], 'saved_at': snap['saved_at'], 'owner_started': PROCESS_STARTED,
-                'owner_pid': os.getpid()}
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f'.{path.name}.{os.getpid()}.{threading.get_ident()}.tmp')
-        tmp.write_text(json.dumps(head, separators=(',', ':')) + '\n' + json.dumps(snap, separators=(',', ':')),
-                       encoding='utf-8')
-        os.replace(tmp, path)
+        snap = f.snapshot(timeout=timeout)
+        if snap is None:
+            return False
+        snap = json_safe(snap)
+        with _locked(path):
+            held = _read_header(path) or {}
+            held_gen = int(held.get('gen') or 0)
+            mine = _CLAIMS.get(str(path))
+            if claim or mine is None:
+                mine = _CLAIMS[str(path)] = held_gen + 1
+            elif held_gen != mine:
+                _warn(f'claimed:{path}', 'session-panel feed: snapshot not saved; a newer process (claim %s, pid %s) '
+                      'carries this feed on', held_gen, held.get('owner_pid'))
+                return False
+            head = {'version': snap['version'], 'feed': FEED_ID, 'profile': LAUNCH_PROFILE, 'epoch': snap['epoch'],
+                    'rev': snap['rev'], 'saved_at': snap['saved_at'], 'gen': mine, 'owner_pid': os.getpid()}
+            tmp = path.with_name(f'.{path.name}.{os.getpid()}.{threading.get_ident()}.tmp')
+            fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)  # chat and card content: owner only
+            with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+                fh.write(json.dumps(head, separators=(',', ':')) + '\n' + json.dumps(snap, separators=(',', ':')))
+            os.replace(tmp, path)
+            tmp = None
+        if claim:
+            _prune(path.parent, path)
         return True
     except Exception:
-        log.warning('session-panel feed: snapshot not saved', exc_info=True)
+        _warn(f'save:{path}', 'session-panel feed: snapshot not saved', exc_info=True)
         if tmp is not None:
             with contextlib.suppress(OSError):
                 tmp.unlink()
@@ -671,8 +742,8 @@ def save_snapshot(f, path: Optional[Path] = None) -> bool:
 
 
 def load_snapshot(path: Optional[Path] = None, *, now: Optional[float] = None) -> Optional[dict]:
-    """This backend's last snapshot when it can be carried on: same feed id and profile, at most RESTORE_MAX_AGE_S
-    old. None otherwise (missing, stale, unreadable, another backend's)."""
+    """This backend's last snapshot when it can be carried on: same feed id, profile and epoch in header and body,
+    at most RESTORE_MAX_AGE_S old. None otherwise (missing, stale, unreadable, another backend's)."""
     try:
         path = path or _snapshot_path()
         head_line, _, body = path.read_text(encoding='utf-8').partition('\n')
@@ -680,7 +751,7 @@ def load_snapshot(path: Optional[Path] = None, *, now: Optional[float] = None) -
     except FileNotFoundError:
         return None
     except Exception:
-        log.warning('session-panel feed: snapshot unreadable; starting a new revision space', exc_info=True)
+        _warn('load', 'session-panel feed: snapshot unreadable; starting a new revision space', exc_info=True)
         return None
     now = time.time() if now is None else now
     if not (isinstance(head, dict) and isinstance(snap, dict)) or head.get('feed') != FEED_ID \
@@ -692,7 +763,6 @@ def load_snapshot(path: Optional[Path] = None, *, now: Optional[float] = None) -
     except (TypeError, ValueError):
         return None
     return snap
-
 
 def feed():
     """The process's one feed, started on first use (its thread ticks every TICK_S until stopped)."""
@@ -720,7 +790,7 @@ def feed():
                             log.warning('session-panel feed: snapshot not restored; starting a new revision space',
                                         exc_info=True)
                             new = core.Feed(CoreReaders(), emit=_emit)
-                    save_snapshot(new)  # claim it now: the process this one replaces no longer overwrites it
+                    save_snapshot(new, claim=True)  # claim it now: the process this one replaces no longer saves
                     _save_at_exit()
                 core.PROCESS_FEED = new
                 threading.Thread(target=_run, args=(core.PROCESS_FEED,), name='session-panel-feed', daemon=True).start()
@@ -747,7 +817,8 @@ def _run(f) -> None:
                 f.tick()
             except Exception:
                 log.warning('session-panel feed tick failed', exc_info=True)
-            state = (f.rev, frozenset(f.interest))
+            with f.lock:
+                state = (f.rev, frozenset(f.interest))
             if state != saved and time.monotonic() - saved_at >= SNAPSHOT_EVERY_S:
                 saved_at = time.monotonic()
                 if save_snapshot(f):
@@ -766,12 +837,13 @@ def _save_at_exit() -> None:
         return
     _LOADER.atexit_registered = True
     import atexit
+    atexit.register(_save_running)
 
-    def save():
-        f = getattr(sys.modules.get(_FEED_KEY), 'PROCESS_FEED', None)
-        if f is not None and not f.stopped.is_set():
-            save_snapshot(f)
-    atexit.register(save)
+
+def _save_running() -> bool:
+    """The exit hook: save the running feed's last state (never hanging the exit on a stuck push)."""
+    f = getattr(sys.modules.get(_FEED_KEY), 'PROCESS_FEED', None)
+    return f is not None and not f.stopped.is_set() and save_snapshot(f, timeout=5.0)
 
 
 class ChangesBody(BaseModel):
