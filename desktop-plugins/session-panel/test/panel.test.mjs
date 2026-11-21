@@ -804,7 +804,8 @@ test('panel: a chain through this chat\'s running card ends there; its card open
   const tree = el().querySelector('[data-running-list] [data-wait-group="t_aaaaaaaa"]')
   assert.equal(tree.querySelector('[data-running-title]').textContent, 'Parent build')
   const chain = tree.querySelector('[data-wait-kids] [data-wait-chain="kb:t_kid"]')
-  assert.equal(chain.querySelector('[data-wait-parent]').textContent, 'Waiting on Parent build')
+  assert.equal(chain.querySelector('[data-wait-parent]').textContent, 'scheduled')
+  assert.doesNotMatch(chain.querySelector('[data-wait-reason]').textContent, /Waiting on Parent build/)
   // The running card opens from its own row; its dependent's long form opens the waiting card itself.
   await React.act(async () => { tree.querySelector('[data-running-row] button').click() })
   await React.act(async () => { tree.querySelector('[data-running-row] [data-open-card]').click() })
@@ -961,6 +962,57 @@ test('panel (whole): shared remote intermediate is drawn once beneath a running 
   assert.match(el().querySelector(`[data-wait-chain="kb:${F}"] [data-chain-same]`).textContent, /same prerequisite.*Dependent one/)
 })
 
+test('extra parent suppression requires qualified identity and the actual read board', () => {
+  const chip = { connectionId: 'C1', profile: 'default', board: 'requested' }
+  const info = { board: 'default', parents: ['t_parent', 't_extra', 't_extra'] }
+  const key = m.chainKey({ ...chip, board: 'default' }, 't_parent')
+  assert.deepEqual(m.extraChainParents(chip, info, key), ['t_extra'])
+  assert.deepEqual(m.extraChainParents(chip, info, m.chainKey(chip, 't_parent')), ['t_parent', 't_extra'])
+  assert.deepEqual(m.extraChainParents({ ...chip, connectionId: 'C2' }, info, key), ['t_parent', 't_extra'])
+  assert.deepEqual(m.extraChainParents({ ...chip, profile: 'other' }, info, key), ['t_parent', 't_extra'])
+  assert.deepEqual(m.extraChainParents({}, info, undefined), ['t_parent', 't_extra'])
+  assert.deepEqual(m.extraChainParents(chip, { parents: null }, key), [])
+})
+
+test('WaitChain does not read a stale chip for extra parents', async () => {
+  window.localStorage.clear()
+  m.resetReadsForTests()
+  let reads = 0
+  window.hermesDesktop = { api: async () => { reads++; return null } }
+  const chip = { kind: 'kanban', id: 't_stale', connectionId: 'C1', profile: 'default', board: 'default', state: 'scheduled', stale: true }
+  await show(J.jsx(m.WaitChain, { i: { key: 'stale', kind: 'kanban', label: 'Stale card', chip } }))
+  await flush()
+  assert.equal(reads, 0)
+  assert.equal(el().querySelector('[data-wait-extra-parents]'), null)
+})
+
+test('panel: nested dependency hides redundant ancestor text but preserves additional parents', async () => {
+  window.localStorage.clear()
+  bridges({ chips: [card(D, 'running', { label: 'Visible build', activityAt: Date.now() / 1000 - 30 }), wchip(E, 'Dependent', D)] })
+  m.resetReadsForTests()
+  window.hermesDesktop = { api: async a => a.path.includes(`/tasks/${E}`)
+    ? { task: { id: E, title: 'Dependent', status: 'todo' }, events: [], links: { parents: [D, F] }, link_tasks: [{ id: D, status: 'running' }, { id: F, status: 'done' }] }
+    : { tasks: [], includes: ['done'] } }
+  await show(React.createElement(m.Panel, { key: 'nested-extra-parent' }))
+  await settle()
+  const reason = el().querySelector(`[data-wait-chain="kb:${E}"] [data-wait-reason]`)
+  assert.doesNotMatch(reason.textContent, /Waiting on Visible build/)
+  assert.match(reason.textContent, /scheduled/)
+  const extra = reason.querySelector('[data-wait-extra-parents]')
+  assert.ok(!!extra, 'additional parents remain visible, even when not the followed chain')
+  assert.match(extra.textContent, new RegExp(F))
+  assert.doesNotMatch(extra.textContent, /waiting|open/i, 'parent membership alone does not prove unfinished work')
+  assert.equal(extra.textContent.includes(D), false, 'visible followed parent is not repeated')
+  // Without a visible ancestor the flat row keeps its normal reason and the extra edge.
+  const chip = { ...wchip(E, 'Dependent', D), connectionId: 'C1', profile: 'default', board: 'default' }
+  const i = { key: `kb:${E}`, kind: 'kanban', label: 'Dependent', chip }
+  const running = { key: `kb:${D}`, kind: 'kanban', label: 'Visible build', chip: { ...chip, id: D, state: 'running' } }
+  await show(J.jsx(m.WaitChain, { i, known: new Set(), local: m.chainLocal([i], [running]) }))
+  assert.equal(el().querySelector('[data-wait-parent]'), null)
+  assert.match(el().querySelector('[data-wait-reason]').textContent, /waiting on running work/)
+  assert.match(el().querySelector('[data-wait-extra-parents]').textContent, new RegExp(F))
+})
+
 test('panel (whole): identical running prerequisite ids on different routes remain separate trees', async () => {
   window.localStorage.clear()
   bridges({ chips: [wchip(E, 'Wait local', D), { ...wchip(F, 'Wait other', D), connectionId: 'C2', profile: 'other', board: 'other' }] })
@@ -994,7 +1046,7 @@ test('panel (whole): two dependents + a multilevel waiter nest under the running
   const top = [...tree.querySelector(':scope > [data-wait-kids]').children].map(x => x.getAttribute('data-wait-chain'))
   assert.deepEqual(top, [`kb:${E}`, `kb:${F}`])
   const e = tree.querySelector(`[data-wait-chain="kb:${E}"]`)
-  assert.equal(e.querySelector('[data-wait-parent]').textContent, 'Waiting on Stage2 (d)')
+  assert.equal(e.querySelector('[data-wait-parent]').textContent, 'scheduled')
   assert.equal(e.querySelector('[data-line-pip]').getAttribute('data-line-pip'), 'waiting', 'waiters stay yellow, not running')
   assert.ok(e.querySelector(`:scope > [data-wait-kids] [data-wait-chain="kb:${G}"]`), 'Closeout nests under Stage2 (e)')
   for (const id of [E, F, G]) assert.equal(drawn(id), 1, id)
@@ -1017,7 +1069,7 @@ test('panel (whole): a single waiting dependent uses the same hierarchy (no two-
   assert.equal(tree.getAttribute('data-wait-group'), D)
   const kid = tree.querySelector(':scope > [data-wait-kids] > [data-wait-chain]')
   assert.equal(kid.getAttribute('data-wait-chain'), `kb:${E}`)
-  assert.equal(kid.querySelector('[data-wait-parent]').textContent, 'Waiting on Stage2 (d)')
+  assert.equal(kid.querySelector('[data-wait-parent]').textContent, 'scheduled')
   assert.equal(root.querySelector('[data-section="waiting"]'), null)
   assert.match(root.querySelector('[data-status-summary]').textContent, /1 running.*1 waiting/)
 })

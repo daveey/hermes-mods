@@ -1761,12 +1761,23 @@ const leafBox = k => (LEAF[k]?.dashed ? { width: 9, height: 9, borderRadius: 2, 
 const summaryText = ch => `${ch.leaf.kind === 'unknown' ? shortLeaf(ch.leaf.text) : `waiting on ${ch.leaf.kind === 'you' ? 'you' : ch.leaf.kind === 'hold' ? 'a spend decision' : ch.leaf.kind === 'slot' ? 'a worker slot' : ch.leaf.kind === 'lane' ? 'admission to a lane' : ch.leaf.kind === 'running' ? 'running work' : ch.leaf.kind === 'done' ? 'a finished card' : shortLeaf(ch.leaf.text)}`} · ${hops(ch)} ${hops(ch) === 1 ? 'hop' : 'hops'}`
 const shortLeaf = t => { const x = str(t).replace(/^CI: /, 'CI ').split(/[:(·]/)[0].trim(); return x.length > 28 ? `${x.slice(0, 27).trimEnd()}…` : x || 'something external' }
 
-/** One waiting card of this chat and its chain: the root line (box · title, its disclosure · root cause and hops ·
- *  age), then each card it passes through on a tree guide (box by state · title, opens it · its chat · state), ending
- *  on the tinted leaf. `sameAs` = an earlier root this chain runs into: its chain is not repeated. */
+/** Parent membership is not evidence that a parent is still open. Retain extra edges
+ * without assigning them a status, and only omit the qualified edge already drawn. */
+export function extraChainParents(chip, info, followedKey) {
+  if (!Array.isArray(info?.parents)) return []
+  const route = { ...chip, board: info.board || chip?.board }
+  return [...new Set(info.parents.filter(Boolean))].filter(id => {
+    const key = chainKey(route, id)
+    return !key || key !== followedKey
+  })
+}
+/** One waiting card and its chain. A visible parent replaces the redundant wait label
+ * with own status; `sameAs` cuts a chain already drawn without hiding extra edges. */
 export function WaitChain({ i, now = Date.now(), known, local = new Map(), sameAs = new Map(), k = 'waiting', parent = null, kids = null }) {
   const [open, setOpen] = useState(false)
   const ch = chainFor(i, now, { local })
+  const ownRead = i.kind === 'kanban' && i.chip?.id && !i.chip.stale ? cardInfo(i.chip, i.chip.id, now) : null
+  const extraParents = extraChainParents(i.chip, ownRead?.info, ch.nodes[0]?.key)
   const st = typeof window !== 'undefined' ? window.__sessionTasks : null
   const age = rowWait(i, now, needsPark(i) ? parkFor(i.chip, now) : null).age
   const L = LEAF[ch.leaf.kind] || LEAF.unknown
@@ -1821,8 +1832,9 @@ export function WaitChain({ i, now = Date.now(), known, local = new Map(), sameA
       ] }),
       jsxs('span', { 'data-wait-reason': '', 'data-root-cause': ch.leaf.kind, title: `${L.label}: ${ch.leaf.text}`, style: { ...muted, color: parent ? 'var(--muted-foreground)' : L.color, display: 'flex', minWidth: 0, gap: 0, whiteSpace: 'nowrap' }, children: [
         parent
-          ? jsx('span', { 'data-wait-parent': parent.id, style: { ...CELL }, children: `Waiting on ${parent.title}${ch.stale ? ' · not re-read' : ''}` })
+          ? jsx('span', { 'data-wait-parent': parent.id, style: { ...CELL }, children: `${str(i.chip?.state).replace(/_/g, ' ') || 'status unknown'}${ch.stale ? ' · not re-read' : ''}` })
           : jsx('span', { style: { ...CELL }, children: `${summaryText(ch).replace(/ · \d+ hops?$/, '')}${ch.stale ? ' · not re-read' : ''}` }),
+        extraParents.length > 0 && jsx('span', { 'data-wait-extra-parents': extraParents.length, title: extraParents.join(', '), style: CELL, children: ` · other parents: ${extraParents.join(', ')}${ownRead?.state !== 'ok' || ownRead?.info?.stale ? ' · not re-read' : ''}` }),
         !parent && jsx('span', { 'data-hops': '', style: { flex: 'none' }, children: ` · ${hops(ch)} ${hops(ch) === 1 ? 'hop' : 'hops'}` })
       ] }),
       jsx('span', { 'data-wait-age': '', style: { ...muted, textAlign: 'right', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }, children: age })
