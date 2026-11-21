@@ -45,6 +45,54 @@ longer is an error, never a partial read) and returns only each user row plus th
 it, slimmed (`authorityRows`, `slimAuthorityRow`). A Desktop that predates the action answers `unknown action`,
 which the coach treats as no approval. Tests: `tests/authority-read.test.mjs`.
 
+## Courier wake-up: outbox push (no tight polling)
+
+The Desktop courier used to drain every connected gateway every 3 s (`GET /outbox`) plus a 5 s home beat, from a
+worker, hidden window or not: about 70 requests/min with three connections. Now the gateway pushes and the courier
+drains on the push.
+
+Contract:
+
+- **Event** `plugin.session-mentions.outbox`, payload `{feed, seq}`, or `{feed, seq, heartbeat: true}`. It is
+  a notice only and never carries requests: the courier still claims them with `GET /outbox`, so the claim rule,
+  routing and home-courier gate are unchanged. `feed` is `<host>:<12 hex of the outbox root path>`. It names the
+  gateway's outbox, not a process, so every serve process of a gateway and its turn-isolation child share it.
+  `seq` increases per emitting process.
+- **Emitters.** Every outbox write by this plugin (`cross_session`/`cross_task` in `_relay`, and `POST /enqueue`)
+  calls `relay_files.notify_outbox` after the atomic write. That call never raises: in a process with no Desktop
+  client (`hermes gateway run`, cron, a worker) or with no core it does nothing. A watcher thread in the process
+  that serves the Desktop, started by its first `/ping` or `/outbox`, stats the outbox directory every 1 s. It
+  pushes when the directory changed and holds a request, which covers writers that never emit themselves
+  (user-terminal, coach, out-of-process turns). It also sends a heartbeat every 20 s.
+- **Feed to connection.** `/outbox` and `/ping` replies carry `feed`, and the Desktop maps each feed to the
+  connections that answered with it.
+- **Push-live connection.** A connection is push-live when a push or heartbeat from its feed arrived within 60 s.
+  A push makes the courier drain that connection immediately, with at most one drain in flight per connection:
+  pushes that arrive during a drain fold into one more drain after it. The courier also runs a safety drain every
+  60 s, and between drains it sends `/ping?courier=…` (the drain's parameters) every 8 s. That ping refreshes
+  `couriers/<device>.json` and claims nothing. The 20 s courier liveness window is unchanged (session-mentions,
+  user-terminal, coach), so a closed Desktop still looks gone within 20 s. A failed push-driven drain is retried
+  after the 5 s error backoff, not at the next safety drain.
+- **Other connections.** These are backends without the push, or connections whose pushes don't reach this window,
+  for example because the window has no open socket to that gateway. They keep the 3 s drain. An event that never
+  arrives is covered by that drain or by the 60 s safety drain, so the pickup timeouts (15 s / 30 s) stay valid.
+- **Home beat.** `POST /result {id: home-courier}` to this Mac's own gateway now goes every 8 s with a 5 s timeout,
+  instead of every 5 s. The server's home window is 20 s (`HOME_FRESH_SECONDS`), and 8 s keeps one failed beat
+  plus its retry inside it.
+- The tick itself stays on a dedicated worker (3 s) so a hidden, throttled window keeps its ping, home beat and
+  fallback cadence. Pushes are socket events, not timers, so a hidden window gets them too.
+
+Rate with three connections, all push-live: about 3 safety drains, 22.5 pings and 7.5 home beats a minute, plus one
+drain per real request. That is about 33 a minute, down from about 72. Connections without pushes cost what they did
+before.
+
+Tests: `tests/test_outbox_push.py` covers the enqueue and tool writes emitting, an emit failure or missing core not
+breaking the write, the watcher pushing for an out-of-process write and heartbeating, and `/ping` refreshing
+liveness without claiming. `tests/outbox-push.test.mjs` covers a push draining the right connection, burst
+coalescing, the safety drain, ping and fallback cadences, retry of a failed push drain, and the `register()`
+subscription. `tests/courier-liveness.test.mjs` pins both cadences inside the 20 s windows. Delivery of the event
+through a running Desktop's socket is untested here.
+
 ## `@` typeahead (Desktop half)
 
 `desktop-plugins/session-mentions/plugin.js` offers sessions and kanban tasks from every connected gateway in

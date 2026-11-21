@@ -33,13 +33,29 @@ const PLUGIN_ID = 'session-mentions'
 const STALE_MS = 60_000
 const MAX_MATCHES = 8
 const MAX_RECENT = 15
+// The courier's tick (on a worker, see register). What it sends per connection depends on whether that gateway's
+// outbox pushes (`plugin.session-mentions.outbox`) reach this window:
+//  - push-live (a push or 20 s heartbeat from its feed within PUSH_STALE_MS): drain on each push, at once, plus a
+//    safety drain every SAFETY_POLL_MS; between drains a /ping?courier=… every COURIER_PING_MS keeps this courier's
+//    couriers/<device>.json fresh (the gateway calls a courier gone after 20 s, see courier-liveness.test.mjs);
+//  - otherwise (a backend without the push, or pushes that do not reach this window: its socket is not open): drain
+//    every COURIER_INTERVAL_MS, as before. A push that never arrives is covered by that drain or the safety drain.
 const COURIER_INTERVAL_MS = 3_000
+export const SAFETY_POLL_MS = 60_000
+export const PUSH_STALE_MS = 60_000 // three missed 20 s heartbeats
+export const COURIER_PING_MS = 8_000
+const PING_TIMEOUT_MS = 5_000
+export const OUTBOX_EVENT = 'plugin.session-mentions.outbox'
 const UNSUPPORTED_BACKOFF_MS = 5 * 60_000
 // A failed drain retries soon: the gateway calls this Mac's courier gone after 20 s without a drain
 // (user-terminal COURIER_FRESH_S), so a backoff at or above that turns ONE timed-out GET (a loaded
 // Mac) into "no Hermes Desktop connected" for the remote agent. Pinned by courier-liveness.test.mjs.
 const ERROR_BACKOFF_MS = 5_000
-const HOME_BEAT_MS = 5_000 // server treats the home courier as gone after 20s of silence
+// Liveness beat: the gateway treats its home courier as gone after 20 s of silence (relay_files.HOME_FRESH_SECONDS).
+// About half that, so one failed beat (HOME_BEAT_TIMEOUT_MS) retried on the next tick still lands inside the window:
+// 8 + 3 (tick) + 5 (timeout) + 3 (tick) = 19 s. One POST to this Mac's own gateway only.
+export const HOME_BEAT_MS = 8_000
+const HOME_BEAT_TIMEOUT_MS = 5_000
 const HOME_COURIER_ID = 'home-courier'
 const FORWARD_PICKUP_MS = 20_000
 const FORWARD_POLL_MS = 1_500
@@ -1252,6 +1268,12 @@ const courierState = new Map() // connectionId -> {until}
 // Per connection, not one flag for the whole tick: a stalled backend (this Mac's own gateway under
 // load, 10 s timeouts) must not hold back the drain of every other gateway, whose liveness window is 20 s.
 const courierInflight = new Set()
+const drainAgain = new Set() // connectionId: a push arrived while its drain was in flight; run once more after it
+const pingInflight = new Set()
+const feedConns = new Map() // gateway outbox feed id -> Set of connectionIds (learned from /outbox and /ping replies)
+const pushAt = new Map() // connectionId -> when its last push or heartbeat arrived
+const lastDrainAt = new Map() // connectionId -> last successful drain
+const lastPingAt = new Map() // connectionId -> last successful drain or courier ping (both refresh liveness)
 export const RESULT_RETRY_MS = [1_000, 3_000, 5_000, null]
 
 export async function performRequest(req, origin, conns) {
@@ -1551,6 +1573,15 @@ const stampNote = () =>
  *  gateway name it can reach, so the gateway hands it only requests it can serve, and which
  *  plugin.js this Desktop runs (see the stamp above). */
 export function outboxPath(conn, conns) {
+  return `/outbox${courierQuery(conn, conns)}`
+}
+
+/** The courier's liveness ping: the same parameters as a drain, but the gateway only refreshes the record. */
+export function pingPath(conn, conns) {
+  return `/ping${courierQuery(conn, conns)}`
+}
+
+function courierQuery(conn, conns) {
   const q = []
   if (isHome(conn)) q.push('home=1')
   const me = conns.find(isHome)
@@ -1560,7 +1591,7 @@ export function outboxPath(conn, conns) {
       q.push(`plugin=${enc(pluginStamp.loaded)}`, `plugin_disk=${enc(pluginStamp.disk)}`, `plugin_at=${Math.round(pluginStamp.loadedAt / 1000)}`)
     }
   }
-  return `/outbox${q.length ? `?${q.join('&')}` : ''}`
+  return q.length ? `?${q.join('&')}` : ''
 }
 
 /** This Desktop's own machine. Its backend owns the chats open in this Desktop's windows. */
@@ -1576,53 +1607,118 @@ export async function courierTick() {
       // a non-owning serve process) leave its outbox to us. Plain /result, so it also works on a
       // backend that predates the home-courier gate.
       lastHomeBeat = Date.now()
-      void relay(home.id, '/result', { method: 'POST', body: { id: HOME_COURIER_ID, result: { at: Date.now() / 1000 } }, timeoutMs: 10_000 }).catch(() => {
+      void relay(home.id, '/result', { method: 'POST', body: { id: HOME_COURIER_ID, result: { at: Date.now() / 1000 } }, timeoutMs: HOME_BEAT_TIMEOUT_MS }).catch(() => {
         lastHomeBeat = 0
       })
     }
+    const now = Date.now()
     await Promise.all(
-      conns.map(async conn => {
-        const st = courierState.get(conn.id)
-        if (st && Date.now() < st.until) return
-        if (courierInflight.has(conn.id)) return
-        courierInflight.add(conn.id)
-        let res
-        try {
-          res = await relay(conn.id, outboxPath(conn, conns), { timeoutMs: 10_000 })
-        } catch (error) {
-          const msg = String(error?.message || error)
-          courierState.set(conn.id, { until: Date.now() + (/404|not found/i.test(msg) ? UNSUPPORTED_BACKOFF_MS : ERROR_BACKOFF_MS) })
-          return
-        } finally {
-          courierInflight.delete(conn.id)
-        }
-        courierState.delete(conn.id)
-        for (const req of Array.isArray(res?.requests) ? res.requests : []) {
-          // Don't block the drain on a long send-and-wait.
-          void (async () => {
-            let result
-            try {
-              result = await performRequest(req, conn.id, conns)
-            } catch (error) {
-              result = { ok: false, error: String(error?.message || error) }
-            }
-            // Keyed by request id, so a repeat is harmless; one dropped POST strands the remote agent
-            // until its wait runs out ("claimed the request but sent no answer in time").
-            for (const delay of RESULT_RETRY_MS) {
-              try {
-                await api(conn.id, `/api/plugins/${PLUGIN_ID}/result`, { method: 'POST', body: { id: req.id, result } })
-                break
-              } catch {
-                if (delay == null) break
-                await sleep(delay)
-              }
-            }
-          })()
-        }
+      conns.map(conn => {
+        const backoff = (courierState.get(conn.id)?.until || 0) > now
+        if (!pushLive(conn.id, now)) return backoff ? null : drainConnection(conn, conns)
+        if (now - (lastDrainAt.get(conn.id) || 0) >= SAFETY_POLL_MS) return backoff ? null : drainConnection(conn, conns)
+        if (now - (lastPingAt.get(conn.id) || 0) >= COURIER_PING_MS) return pingConnection(conn, conns)
+        return null
       })
     )
   }
 }
+
+/** True while `connectionId`'s gateway outbox pushes (or their heartbeats) reach this window. */
+export function pushLive(connectionId, now = Date.now()) {
+  const at = pushAt.get(connectionId)
+  return at != null && now - at <= PUSH_STALE_MS
+}
+
+function learnFeed(feed, connectionId) {
+  if (typeof feed !== 'string' || !feed) return
+  for (const [f, ids] of feedConns) if (f !== feed) ids.delete(connectionId) // one feed per connection
+  if (!feedConns.has(feed)) feedConns.set(feed, new Set())
+  feedConns.get(feed).add(connectionId)
+}
+
+/** `plugin.session-mentions.outbox` {feed, seq[, heartbeat]}: mark the connections behind `feed` push-live and, for
+ *  a push, drain them now. A feed this window has not learned yet (no drain answered) is ignored: its fallback
+ *  drain is due within COURIER_INTERVAL_MS anyway. */
+export async function onOutboxEvent(ev) {
+  const p = ev?.payload
+  const ids = typeof p?.feed === 'string' ? feedConns.get(p.feed) : null
+  if (!ids?.size) return
+  const now = Date.now()
+  for (const id of ids) pushAt.set(id, now)
+  if (p.heartbeat) return
+  const conns = await connections()
+  await Promise.all(conns.filter(c => ids.has(c.id)).map(c => drainConnection(c, conns, { push: true })))
+}
+
+/** Claim and perform this connection's requests. One drain in flight per connection: a call while one runs
+ *  (a burst of pushes) is folded into ONE more drain after it, which sees everything that arrived meanwhile. */
+export async function drainConnection(conn, conns, { push = false } = {}) {
+  if (courierInflight.has(conn.id)) {
+    if (push) drainAgain.add(conn.id) // a timer tick just skips: the drain in flight is its drain
+    return
+  }
+  courierInflight.add(conn.id)
+  let res
+  try {
+    res = await relay(conn.id, outboxPath(conn, conns), { timeoutMs: 10_000 })
+  } catch (error) {
+    const msg = String(error?.message || error)
+    courierState.set(conn.id, { until: Date.now() + (/404|not found/i.test(msg) ? UNSUPPORTED_BACKOFF_MS : ERROR_BACKOFF_MS) })
+    // A push-live connection whose drain failed is due again after the backoff, not at the next safety poll:
+    // the push that asked for it will not repeat. That retry also covers any push that came in meanwhile.
+    lastDrainAt.delete(conn.id)
+    drainAgain.delete(conn.id)
+    return
+  } finally {
+    courierInflight.delete(conn.id)
+  }
+  courierState.delete(conn.id)
+  lastDrainAt.set(conn.id, Date.now())
+  lastPingAt.set(conn.id, Date.now())
+  learnFeed(res?.feed, conn.id)
+  for (const req of Array.isArray(res?.requests) ? res.requests : []) {
+    // Don't block the drain on a long send-and-wait.
+    void (async () => {
+      let result
+      try {
+        result = await performRequest(req, conn.id, conns)
+      } catch (error) {
+        result = { ok: false, error: String(error?.message || error) }
+      }
+      // Keyed by request id, so a repeat is harmless; one dropped POST strands the remote agent
+      // until its wait runs out ("claimed the request but sent no answer in time").
+      for (const delay of RESULT_RETRY_MS) {
+        try {
+          await api(conn.id, `/api/plugins/${PLUGIN_ID}/result`, { method: 'POST', body: { id: req.id, result } })
+          break
+        } catch {
+          if (delay == null) break
+          await sleep(delay)
+        }
+      }
+    })()
+  }
+  if (drainAgain.delete(conn.id)) await drainConnection(conn, conns, { push: true })
+}
+
+/** Liveness between drains on a push-live connection: refresh couriers/<device>.json, claim nothing. A failure is
+ *  retried on the next tick (COURIER_PING_MS + tick + timeout x2 stays under the gateway's 20 s window). */
+async function pingConnection(conn, conns) {
+  if (pingInflight.has(conn.id)) return
+  pingInflight.add(conn.id)
+  try {
+    const res = await relay(conn.id, pingPath(conn, conns), { timeoutMs: PING_TIMEOUT_MS })
+    lastPingAt.set(conn.id, Date.now())
+    learnFeed(res?.feed, conn.id)
+  } catch {
+    // next tick tries again
+  } finally {
+    pingInflight.delete(conn.id)
+  }
+}
+
+export const courierStateForTests = () => ({ feedConns, pushAt, lastDrainAt, lastPingAt })
 
 // ── plugin ───────────────────────────────────────────────────────────────────
 
@@ -1649,6 +1745,11 @@ export default {
     rowCache.clear()
     taskCache.clear()
     courierState.clear()
+    drainAgain.clear()
+    feedConns.clear()
+    pushAt.clear()
+    lastDrainAt.clear()
+    lastPingAt.clear()
     lastHomeBeat = 0
     connCache = { at: 0, rows: [] }
     deviceCache = { at: 0, info: null }
@@ -1699,10 +1800,13 @@ export default {
     }
     const subscribe = typeof ctx.onEvent === 'function' ? ctx.onEvent : host.onEvent
     const off = subscribe('sessions.changed', onChanged)
+    // Outbox pushes: drain the gateway that has work at once (an event, not a timer, so a hidden window gets it too).
+    const offOutbox = subscribe(OUTBOX_EVENT, ev => void onOutboxEvent(ev).catch(() => {}))
 
     ctx.onDispose?.(() => {
       if (debounce) clearTimeout(debounce)
       if (typeof off === 'function') off()
+      if (typeof offOutbox === 'function') offOutbox()
       if (typeof ctx.setInterval !== 'function') timers.forEach(t => clearInterval(t))
     })
 

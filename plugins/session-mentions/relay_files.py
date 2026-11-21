@@ -39,10 +39,10 @@ from typing import Any
 
 STALE_SECONDS = 3600
 HOME_COURIER_ID = "home-courier"
-HOME_FRESH_SECONDS = 20.0  # the home Desktop beats every ~5s (from a worker, so hidden windows keep it)
+HOME_FRESH_SECONDS = 20.0  # the home Desktop beats every ~10s (from a worker, so hidden windows keep it)
 ACTIONS = ("list", "read", "send")
 LOCAL_ALIASES = ("this-device", "local")
-COURIER_FRESH_SECONDS = 20.0  # couriers drain every ~3s
+COURIER_FRESH_SECONDS = 20.0  # couriers drain (or, when pushes reach them, ping) well inside this
 
 # Idle-drain caches (per process; a hot reload of this file starts them empty). Every courier drains
 # every ~3s, so on an idle gateway the drain must not re-list empty dirs, re-read courier records or
@@ -312,6 +312,45 @@ def claim_pending(base: Path | None = None, home: bool = True, courier: Any = ""
         out.append(req)
     sweep(base)
     return out
+
+
+# ── outbox push (plugin.session-mentions.outbox) ─────────────────────────────
+# The Desktop courier used to find new requests only by draining every gateway every 3 s. Now a write to the
+# outbox also pushes a small notice on the gateway's event stream, and a Desktop that receives this gateway's
+# pushes drains it at once (plus a 60 s safety poll). The notice never carries the requests: the Desktop still
+# claims them with GET /outbox, so the claim rule and the ownership checks are unchanged. ``feed`` names the
+# gateway's outbox, not the process (the turn-isolation child and every serve process of one gateway share it), so
+# the Desktop can map it to its connections from the ``feed`` that /ping and /outbox return.
+OUTBOX_EVENT = "outbox"  # wire name: plugin.session-mentions.outbox
+_SEQ_LOCK = threading.Lock()
+_SEQ = [0]
+
+
+def feed_id(base: Path | None = None) -> str:
+    """``<host>:<12 hex of the outbox root path>``: one id per gateway outbox, the same in every process."""
+    import hashlib
+    import socket
+    path = str((base or root()).resolve())
+    return f"{socket.gethostname()}:{hashlib.sha1(path.encode()).hexdigest()[:12]}"
+
+
+def notify_outbox(base: Path | None = None, heartbeat: bool = False) -> bool:
+    """Push ``plugin.session-mentions.outbox`` {feed, seq[, heartbeat]} to this process's Desktop clients.
+
+    Never raises: a process with no Desktop client (``hermes gateway run``, cron, a worker) or no core at all
+    is a no-op, and the request still waits in the outbox for the next drain. True when the broadcast call ran."""
+    try:
+        with _SEQ_LOCK:
+            _SEQ[0] += 1
+            seq = _SEQ[0]
+        payload = {"feed": feed_id(base), "seq": seq}
+        if heartbeat:
+            payload["heartbeat"] = True
+        from hermes_cli.plugin_events import broadcast_plugin_event  # type: ignore
+        broadcast_plugin_event("session-mentions", OUTBOX_EVENT, payload)
+        return True
+    except Exception:
+        return False
 
 
 def write_result(req_id: Any, result: dict, base: Path | None = None) -> bool:
@@ -606,6 +645,7 @@ def enqueue(req: Any, base: Path | None = None) -> bool:
     except (TypeError, ValueError):
         ttl = 600.0
     atomic_write(base / "outbox" / f"{rid}.json", {**req, "id": rid, "created_at": time.time(), "ttl": ttl})
+    notify_outbox(base)
     return True
 
 

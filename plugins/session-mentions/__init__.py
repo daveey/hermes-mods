@@ -32,7 +32,7 @@ else:  # pytest imports this hyphen-named plugin dir without a parent package
     rh = _load_sibling("relay_human")
 
 TOOLSET = "session_mentions"
-PICKUP_TIMEOUT = 30.0  # Desktop drains every ~3s; no claim by then = Desktop not running
+PICKUP_TIMEOUT = 30.0  # Desktop drains on the outbox push, else every ~3s; no claim by then = Desktop not running
 MAX_REPLY_WAIT = 600
 
 SCHEMA = {
@@ -446,6 +446,8 @@ def _relay(action: str, args: dict, session_id: str | None, wait: int, *, timeou
         "ttl": 600,
     }
     rf.atomic_write(base / "outbox" / f"{rid}.json", req)
+    if hasattr(rf, "notify_outbox"):
+        rf.notify_outbox(base)  # wake the Desktop courier now (no-op outside `hermes serve`)
 
     outbox = base / "outbox" / f"{rid}.json"
     result_path = base / "results" / f"{rid}.json"

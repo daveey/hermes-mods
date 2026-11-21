@@ -9,6 +9,7 @@
 // POST back to the gateway is retried.
 import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
+import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 const pluginUrl = process.env.SM_PLUGIN_JS ? new URL(`file://${process.env.SM_PLUGIN_JS}`) : new URL('../../../desktop-plugins/session-mentions/plugin.js', import.meta.url)
 const source = await fs.readFile(pluginUrl, 'utf8')
@@ -29,13 +30,54 @@ const sender = { session_id: '20261030_201549_7bdc2d', title: 't', profile: 'def
 const num = (src, re) => Number(src.match(re)[1].replace(/_/g, ''))
 const tick = () => new Promise(r => setTimeout(r, 5))
 
-test('drain backoff + interval + request timeout stay inside the gateway courier liveness window', () => {
+test('fallback (no pushes): drain backoff + interval + request timeout stay inside the gateway courier liveness window', () => {
   const freshMs = num(utSource, /^COURIER_FRESH_S = ([\d.]+)/m) * 1000
   const backoff = num(source, /const ERROR_BACKOFF_MS = ([\d_]+)/)
   const interval = num(source, /const COURIER_INTERVAL_MS = ([\d_]+)/)
   const drainTimeout = num(source, /outboxPath\(conn, conns\), \{ timeoutMs: ([\d_]+)/)
   // Worst case between two successful drains: one GET times out, back off, wait for the next tick.
   assert.ok(drainTimeout + backoff + interval < freshMs, `${drainTimeout}+${backoff}+${interval} must be < ${freshMs}`)
+})
+
+test('push-live: the courier ping (and the home beat) keep the 20 s liveness windows without drains', () => {
+  // Same 20 s in every reader: session-mentions, user-terminal and coach (unchanged by the push).
+  const rfSource = readFileSync(new URL('../relay_files.py', import.meta.url), 'utf8')
+  const freshMs = num(utSource, /^COURIER_FRESH_S = ([\d.]+)/m) * 1000
+  assert.equal(num(rfSource, /^COURIER_FRESH_SECONDS = ([\d.]+)/m) * 1000, freshMs)
+  const homeFreshMs = num(rfSource, /^HOME_FRESH_SECONDS = ([\d.]+)/m) * 1000
+  const tickMs = num(source, /const COURIER_INTERVAL_MS = ([\d_]+)/)
+  const ping = num(source, /export const COURIER_PING_MS = ([\d_]+)/)
+  const pingTimeout = num(source, /const PING_TIMEOUT_MS = ([\d_]+)/)
+  // Worst case between two refreshes: the ping is due up to one tick late, times out, and the next tick retries it.
+  assert.ok(ping + tickMs + pingTimeout + tickMs < freshMs, `${ping}+${tickMs}+${pingTimeout}+${tickMs} must be < ${freshMs}`)
+  const beat = num(source, /export const HOME_BEAT_MS = ([\d_]+)/)
+  const beatTimeout = num(source, /const HOME_BEAT_TIMEOUT_MS = ([\d_]+)/)
+  assert.ok(beat + tickMs + beatTimeout + tickMs < homeFreshMs, `${beat}+${tickMs}+${beatTimeout}+${tickMs} must be < ${homeFreshMs}`)
+  assert.match(source, /relay\(conn\.id, pingPath\(conn, conns\), \{ timeoutMs: PING_TIMEOUT_MS \}\)/)
+})
+
+test('push-live: a failed ping is retried on the next tick', async () => {
+  const realNow = Date.now
+  let now = realNow()
+  Date.now = () => now
+  try {
+    let pings = 0
+    const m = await load({ state, connections: async () => conns }, async req => {
+      if (req.path.includes('/session-mentions/ping?') && req.connectionId === 'hub' && ++pings === 1) throw Error('timeout')
+      if (req.path.includes('/outbox')) return { requests: [], feed: `feed-${req.connectionId}` }
+      return { ok: true, feed: `feed-${req.connectionId}`, device: req.connectionId === 'local' ? 'macbook' : 'hub' }
+    })
+    await m.courierTick()
+    await m.onOutboxEvent({ payload: { feed: 'feed-hub', seq: 1, heartbeat: true } })
+    now += m.COURIER_PING_MS
+    await m.courierTick()
+    assert.equal(pings, 1)
+    now += 3_000
+    await m.courierTick()
+    assert.equal(pings, 2)
+  } finally {
+    Date.now = realNow
+  }
 })
 
 test('a failed hub drain is retried before the hub calls this Mac gone', async () => {
