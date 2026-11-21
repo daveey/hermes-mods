@@ -27,6 +27,10 @@ hermes kanban lanes unclassified --json  # open cards nothing placed in a lane
 hermes kanban lanes explain <card>       # one card: its lane, where that came from, why it waits
 ```
 
+A lane over its target: sum `task_runs` hours by `tasks.tenant` over 48 h, group that lane's cards by `created_by`
+and title topic, and `explain` a few. Source `unclassified` means no match rule caught it and it fell to the default
+lane (typically chat-filed cards); fix classification, not shares, and `reclassify` returning no changes confirms it.
+
 A lane under its target with `ready: 0` is short of cards, not slots. Say that; changing shares will not help it.
 
 For lane-accounting repairs, distinguish scopes: `show` uses the fleet replica when available, while `unclassified` and `reclassify` read the current owning board. Audit the fleet's open `other` rows, then run supported dry-run/apply on each owning board; never write the fleet replica. Read back each changed card's actual tenant after synchronization: an empty repeat dry-run or a `lane_assigned` event alone does not establish that the tenant persisted. Preserve containment and custody if a protected row reverts. The run-hour report joins runs to each card's current tenant; open-card repair intentionally leaves terminal historical cards unchanged, so quantify their residual run-hours rather than promising an immediate historical drain.
