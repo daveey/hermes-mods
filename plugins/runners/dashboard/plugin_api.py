@@ -695,7 +695,10 @@ FLEET_PUSH_MAX_BYTES = 256 * 1024
 _VOLATILE = frozenset(('generated_at', 'events_since'))
 # Also left out of the *change* digest (they move every ~30 s as machines report): last_seen, load and CI
 # observation times. They still reach clients: a fleet whose full digest moved is sent in place of the heartbeat
-# (at most every FLEET_HEARTBEAT_S), so load bars stay under a minute old without a push every check.
+# (at most every FLEET_HEARTBEAT_S), so load bars are at most ~60-80 s old (heartbeat + one check) without a push
+# every check. NOTE: ``_without`` drops these keys at ANY depth, by name: a future field that carries real state
+# under one of these names would reach clients only with that once-a-minute refresh (up to ~75 s late), not at once.
+# Name real state differently, or narrow this to paths.
 _REPORTED = frozenset(('last_seen', 'load', 'observed_at'))
 _push_log = logging.getLogger('hermes.plugins.runners')
 
@@ -713,6 +716,7 @@ def _json_safe(v):
 
 
 def _without(v, keys):
+    """``v`` without any dict key in ``keys``, at every depth (matched by name only, see _REPORTED)."""
     if isinstance(v, dict):
         return {k: _without(x, keys) for k, x in v.items() if k not in keys}
     if isinstance(v, list):

@@ -118,3 +118,17 @@ def test_lifespan_shutdown_stops_the_fleet_pusher(module):
         p = module.fleet_pusher()
         assert not p.stopped.is_set()
     assert p.stopped.is_set() and 'p' not in module._fleet_pusher
+
+
+@pytest.mark.parametrize('change', ['state', 'reason', 'slots'])
+def test_a_machine_state_reason_or_slots_change_pushes_at_once(module, change):
+    t0 = 1_800_000_000
+    base, moved = realistic(t0), realistic(t0 + 15)
+    row = moved['gateways']['machines'][0]
+    row[change] = {'state': 'draining', 'reason': 'held for maintenance', 'slots': 6}[change]
+    p, sent, clock = make(module, [base, moved])
+    p.note()
+    p.step()
+    clock[0] += 15  # well inside FLEET_HEARTBEAT_S: only a real change goes out now
+    pushed = p.step()
+    assert pushed is not None and pushed['fleet']['gateways']['machines'][0][change] == row[change]

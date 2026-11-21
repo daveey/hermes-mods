@@ -11,7 +11,8 @@ The dashboard mounts `plugin_api.py` at `/api/plugins/runners`:
   read `/v1/fleet` in the last 5 min, the serving process (where core's gateway transport is loaded) checks its
   own profile's fleet every 15 s and pushes it when it changed, ignoring build times (`generated_at`,
   `events_since`) and machine report times (`last_seen`, `load`, `observed_at`); every 60 s it sends the fleet again
-  if only those report fields moved, else a heartbeat naming the fleet's `hash`. JSON-safe, and over 256 KB only
+  if only those report fields moved (so load bars are 60–80 s old at most), else a heartbeat naming the fleet's
+  `hash`. Those names are dropped at any depth: real state must not use them. JSON-safe, and over 256 KB only
   `changed: true` (clients read it). The push thread starts on the first read, exits when interest lapses, and is
   stopped by the router's lifespan (reload, shutdown). Tests: `tests/test_fleet_push.py`, `tests/test_api.py`
   `test_fleet_route_carries_feed_and_the_push_hash`.
