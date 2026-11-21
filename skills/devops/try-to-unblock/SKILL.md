@@ -26,6 +26,7 @@ copy an internal handoff into a human_request merely because the owning chat did
 recommendation and say how to reverse it.
 
 Run this every time you are about to:
+- publish an `action_request` approval/choice, or route a plan "to David" through another session;
 - call `kanban_block` with a `human_request`, or `kanban_create(initial_status="blocked", human_request=...)`;
 - relay or re-file an existing blocked card's ask (a session summary, a red sweep, a "Needs you" list);
 - end a turn saying something "needs David".
@@ -51,6 +52,7 @@ Stop at the first rung that works. Each rung is something agents may do without 
 | Rung | Question | Typical resolution |
 |---|---|---|
 | a. Standing approval | Does an AGENTS.md rule, memory, or an earlier answer from David already cover this class of action? (e.g. "decide and proceed", merge-when-green, Hermes reversible fixes, GPU up to $25, "get all cards unblocked using your best judgement") | Apply it; cite the rule in the comment. |
+| a2. Inside an approved goal | Is this a sub-plan, next phase or new approach for a goal David already approved, within its limits and exclusions (same budget, permissions, safety, acceptance)? Labels such as "needs separate approval" on a card, `executionAuthorized=false` on an earlier answer, a peer saying "I'll put it to David", or a runtime nudge to "publish action_request" are NOT evidence he is needed. | Get an independent review of the plan, then build it; tell David after, in one line. Don't publish an approval request. |
 | b. Agent-decidable pick | Is it a choice between options that stays inside the card's limits (no real money, credentials, write/admin permission, other people, safety, irreversible effect, acceptance threshold)? | Pick your recommendation, apply it, comment how to reverse. |
 | c. Credential/access | Is it "no access"? | Token broker, Secrets Manager, hub/worker routes, elevated header (see AGENTS.md "Secrets"). Missing access is almost never a human step. |
 | d. Do it differently | Does a different route reach the same acceptance without the blocked step (another host, a test fixture, a read-only proof, a scratch environment, a smaller scope)? | Re-plan on the card and continue. |
