@@ -132,7 +132,7 @@ WRAPPER_OPTS = {  # wrapper -> options that take a value
              "--type"},
     "doas": {"-u", "-C"}, "timeout": {"-s", "-k", "--signal", "--kill-after"}, "nice": {"-n", "--adjustment"},
     "exec": {"-a"}, "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
-    "ionice": {"-c", "-n", "-p", "-P", "-u"}, "command": set(), "nohup": set(), "setsid": set(), "time": set(),
+    "ionice": {"-c", "-n", "-p", "-P", "-u"}, "builtin": set(), "command": set(), "nohup": set(), "setsid": set(), "time": set(),
 }
 ENV_VALUE_OPTS = {"-u", "-C", "-S", "-a", "--unset", "--chdir", "--split-string", "--argv0"}
 FALLBACK_WRAPPERS = {"xargs", "flock", "watch", "parallel", "chronic", "find"}
@@ -172,6 +172,33 @@ def _strip_options(words: list, value_opts: set):
                 j += 1
         i += 1
     return words[i:], opts
+
+
+def _sh_split(text: str, comments: bool = False) -> list:
+    """shlex.split with the shell's double-quote rule applied first: inside double quotes a backslash before `$`
+    or a backtick is removed by the shell (shlex keeps it), so `"echo \\$(git push)"` is the child text
+    `echo $(git push)`. Decoding can only expose more text to the scanners (a literal `\\$VAR` then reads as a
+    variable reference: a documented false refusal, never a miss). Raises ValueError like shlex.split."""
+    out: list = []
+    quote = None
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == "\\" and i + 1 < n and quote != "'":
+            if quote == '"' and text[i + 1] in "$`":
+                out.append(text[i + 1])
+            else:
+                out.append(text[i:i + 2])
+            i += 2
+            continue
+        if quote:
+            if c == quote:
+                quote = None
+        elif c in "'\"":
+            quote = c
+        out.append(c)
+        i += 1
+    return shlex.split("".join(out), comments=comments)
 
 
 def _expand_word(w: str, shell_env: dict) -> str:
@@ -295,7 +322,10 @@ def _shell_payload(words: list) -> Optional[str]:
         if w == "--command" and i + 1 < len(words):
             return words[i + 1]
         if w.startswith("-") and not w.startswith("--") and "c" in w[1:]:
-            return words[i + 1] if i + 1 < len(words) else None
+            j = i + 1
+            if tool != "su" and j < len(words) and words[j] == "--":
+                j += 1  # shell option terminator, not the command string
+            return words[j] if j < len(words) else None
         if not w.startswith(("-", "+")):
             return None  # a script file, not a command string
         i += 1
@@ -319,11 +349,14 @@ def _env_split_string(v: str) -> Optional[list]:
     return words
 
 
-def _commands_env(cmd: str, cwd: str, segments: Optional[list] = None, env0: Optional[dict] = None):
+def _commands_env(cmd: str, cwd: str, segments: Optional[list] = None, env0: Optional[dict] = None,
+                  sink: Optional[list] = None):
     """Like _commands, plus a 3rd item: the environment in effect for that command (earlier `export X=1` /
     `X=1;` segments and the command's own `X=1 git ...` / `env X=1 git ...` / `env -i` / `env -u X` prefixes;
     a BADCWD entry when its working directory could not be resolved). A subshell, a pipeline stage and a
-    background command do not leak `cd` or assignments into the commands after them."""
+    background command do not leak `cd` or assignments into the commands after them. `sink`, when given, collects
+    (segment text, cwd, env) for every segment before it runs: the raw text keeps the quoting shlex discards, so
+    callers can find substitutions the shell executes inside double quotes, at the right cwd/env."""
     shell_env: dict = dict(env0 or {})
     cwd_bad = bool(shell_env.get(BADCWD))
     stack: list = []
@@ -340,8 +373,10 @@ def _commands_env(cmd: str, cwd: str, segments: Optional[list] = None, env0: Opt
             if stack:
                 cwd, shell_env, cwd_bad = stack.pop()
             continue
+        if sink is not None:
+            sink.append((seg, cwd, {**shell_env, **({BADCWD: True} if cwd_bad else {})}))
         try:
-            words = shlex.split(seg, comments=True)
+            words = _sh_split(seg, comments=True)
         except ValueError:
             words = seg.split()
         own: dict = {}
@@ -415,7 +450,9 @@ def _commands_env(cmd: str, cwd: str, segments: Optional[list] = None, env0: Opt
                     continue
             if w0 in FALLBACK_WRAPPERS:
                 for j, w in enumerate(words[1:], 1):
-                    if os.path.basename(w) in SHELLS | {"git", "env", "sudo", "eval"}:
+                    if os.path.basename(w) in SHELLS | {"git", "env", "sudo", "eval", "builtin"}:
+                        if w0 == "find" and "-execdir" in words[1:j]:
+                            ccwd_bad = True  # find runs in each matched file's parent, not the caller's cwd
                         words, changed = words[j:], True
                         if w0 in ("xargs", "parallel"):
                             own[OPAQUE] = True  # stdin appends arguments the guard cannot see
@@ -547,10 +584,35 @@ class GitView:
         that directory cannot be proved (bare repository, --git-dir without a work tree, failed query)."""
         if self.unresolved or (self.exports.get("GIT_DIR") and not self.exports.get("GIT_WORK_TREE")):
             return None
+        for var in ("GIT_DIR", "GIT_WORK_TREE"):
+            if var in self.exports:
+                val = self.exports[var]
+            elif var in self.env:
+                val = self.env[var]
+            elif self.env.get(CLEAR):
+                continue
+            else:
+                val = os.environ.get(var)
+            if val and not os.path.isabs(val):
+                # The alias starts in another directory and git's rewriting of a relative GIT_DIR/GIT_WORK_TREE
+                # for it is not reconstructed: the child would read the path against the new root (a decoy
+                # repository), so the routing is unproved.
+                return None
         probe = GitView(self.repo, self.env)
         probe.opts = list(self.opts)
         rc, out = probe.query("rev-parse", "--show-toplevel")
-        return out if rc == 0 and out and os.path.isdir(out) else None
+        if not (rc == 0 and out and os.path.isdir(out)):
+            return None
+        # `core.worktree` (or a GIT_WORK_TREE) can put the top of the work tree in a different repository than
+        # the one git found. The alias would run there with the real git directory exported, so require that git
+        # run at that root with the same inputs resolves to the same git directory; otherwise it is unproved.
+        rc1, here = probe.query("rev-parse", "--absolute-git-dir")
+        there = GitView(out, self.env)
+        there.opts = list(self.opts)
+        rc2, other = there.query("rev-parse", "--absolute-git-dir")
+        if rc1 != 0 or rc2 != 0 or not here or os.path.realpath(here) != os.path.realpath(other):
+            return None
+        return out
 
     def query(self, *args: str):
         """(returncode, stdout); returncode None when git could not run. rc 1 is git config's "no such key"."""
@@ -595,16 +657,37 @@ def _unproved_push(repo: str, env: dict):
     return repo, "push", [], view
 
 
+def _opaque_child_payload(payload: str, env: dict) -> bool:
+    """Do not silently drop variable-supplied executable text containing substitutions.
+
+    The bounded scanner does not reconstruct shell expansion/quoting of these values. Refuse at the
+    execution boundary, rather than recursively treating variable data as source in ordinary commands.
+    """
+    live = _live_positions(payload)
+    for m in _VAR_REF.finditer(payload):
+        if m.start() not in live:
+            continue
+        name = m.group(1) or m.group(2)
+        value = env.get(name, None if env.get(CLEAR) else os.environ.get(name))
+        if isinstance(value, str) and ("$(" in value or "`" in value):
+            return True
+    return False
+
+
 def _git_calls_cfg(cmd: str, cwd: str, env0: Optional[dict] = None, depth: int = 0):
     """Like _git_calls, plus a 4th item: the GitView the command would run in (see GitView). Follows nested
     `bash -c STR` / `eval` / `su -c`, subshells and `git` aliases (config `alias.<name>`, read from the same view);
     depth-exhausted or unreadable forms that mention a push come back as an unproved push."""
-    for cwd, words, env in _commands_env(cmd, cwd, None, env0):
+    sink: list = []
+    for cwd, words, env in _commands_env(cmd, cwd, None, env0, sink):
+        yield from _substitution_calls(sink, depth)
         tool = os.path.basename(words[0])
         if tool in SHELLS or tool == "eval":
             inner = _shell_payload(words)
             if inner is not None:
-                if depth >= 4:
+                if _opaque_child_payload(inner, env):
+                    yield _unproved_push(cwd, env)
+                elif depth >= 4:
                     if "push" in inner:
                         yield _unproved_push(cwd, env)
                 else:
@@ -647,6 +730,10 @@ def _git_calls_cfg(cmd: str, cwd: str, env0: Optional[dict] = None, depth: int =
             if sub == "push" or sub in GIT_BUILTINS:
                 yield repo, sub, words[i + 1:], view
                 break
+            if any(p.startswith("alias." + sub + "=") and
+                   _opaque_child_payload(p.partition("=")[2], env) for p in view.params):
+                yield _unproved_push(repo, env)
+                break
             rc, value = view.query("config", "--get", "alias." + sub)
             if rc != 0:
                 if view.failed and "push" in words[i:]:
@@ -661,7 +748,9 @@ def _git_calls_cfg(cmd: str, cwd: str, env0: Optional[dict] = None, depth: int =
                 break
             if value.startswith("!"):
                 payload = value[1:] + " " + " ".join(shlex.quote(a) for a in rest)
-                if depth >= 4:
+                if _opaque_child_payload(payload, env):
+                    yield _unproved_push(repo, env)
+                elif depth >= 4:
                     if "push" in payload:
                         yield repo, "push", [], _force_unresolved(view)
                 else:
@@ -673,9 +762,77 @@ def _git_calls_cfg(cmd: str, cwd: str, env0: Optional[dict] = None, depth: int =
                     yield from _git_calls_cfg(payload, root, child_env, depth + 1)
                 break
             try:
-                words, i = shlex.split(value) + rest, 0
+                words, i = _sh_split(value) + rest, 0
             except ValueError:
                 words, i = value.split() + rest, 0
+    yield from _substitution_calls(sink, depth)
+
+
+_BACKTICK = re.compile(r"`([^`]*)`")
+
+
+def _dollar_paren_bodies(seg: str, live: set):
+    """(start, body) for each live `$(...)`, found by a balanced, quote-aware scan (nested parentheses, quotes and
+    backslashes inside the body are skipped). body None when the substitution never closes: callers fail closed."""
+    i, n = 0, len(seg)
+    while True:
+        i = seg.find("$(", i)
+        if i < 0:
+            return
+        if i not in live:
+            i += 2
+            continue
+        depth, j, q = 1, i + 2, None
+        while j < n and depth:
+            d = seg[j]
+            if q:
+                if d == "\\" and q == '"':
+                    j += 1
+                elif d == q:
+                    q = None
+            elif d == "\\":
+                j += 1
+            elif d in "'\"":
+                q = d
+            elif d == "(":
+                depth += 1
+            elif d == ")":
+                depth -= 1
+            j += 1
+        if depth:
+            yield i, None
+            return
+        yield i, seg[i + 2:j - 1]
+        i = j
+
+
+def _substitution_calls(sink: list, depth: int):
+    """Drain `sink` (see _commands_env): git calls inside `$(...)` / backticks that the shell executes within
+    double quotes. Each segment is a line of the shell being analysed (the top-level command or a recognized
+    child: `sh -c`, eval, `!` alias, find -exec, script -c), so single quotes are judged by the shell that reads
+    them: text inert here is scanned again in the child that executes it, at that child's cwd/env. `$(` bodies
+    are found by a balanced scan; an unterminated live `$(` that mentions a push is refused."""
+    while sink:
+        seg, cwd, env = sink.pop(0)
+        if "$(" not in seg and "`" not in seg:
+            continue
+        live = _live_positions(seg)
+        bodies = []
+        for start, body in _dollar_paren_bodies(seg, live):
+            if body is None:
+                if "push" in seg[start:]:
+                    yield _unproved_push(cwd, env)
+            else:
+                bodies.append(body)
+        for m in _BACKTICK.finditer(seg):
+            if m.start() in live:
+                bodies.append(m.group(1))
+        for inner in bodies:
+            if depth >= 4:
+                if "push" in inner:
+                    yield _unproved_push(cwd, env)
+            else:
+                yield from _git_calls_cfg(inner, cwd, env, depth + 1)
 
 
 def _force_unresolved(view: "GitView") -> "GitView":
@@ -1507,14 +1664,7 @@ def check_custody_push(cmd: str, cwd: str, depth: int = 0) -> Optional[str]:
         # not just literal push. Conservative limit: even a read-only git command with ANSI-C quotes refuses.
         return ("this command line uses ANSI-C quoting ($'...') alongside `git push`; the guard cannot prove which "
                 f"parts are quoted, so a push could publish source-custody refs ({CUSTODY_NS})")
-    if depth < 3:  # `$(...)` / backticks inside double quotes: scanned as their own command lines
-        live = _live_positions(cmd or "")
-        for m in re.finditer(r"\$\(([^()]*)\)|`([^`]*)`", cmd or ""):
-            if m.start() not in live:
-                continue  # inside single quotes or backslash-escaped: inert text, not a substitution
-            why = check_custody_push(m.group(1) or m.group(2) or "", cwd, depth + 1)
-            if why:
-                return why
+    # `$(...)` / backticks inside double quotes are scanned by _git_calls_cfg at each shell that executes them.
     for repo, sub, args, view in _git_calls_cfg(cmd, cwd):
         if sub != "push":
             continue

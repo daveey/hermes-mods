@@ -143,7 +143,16 @@ branch name containing those characters. Use literal operands instead. `env -S` 
 backslashes, expansion/comment syntax and leading options (including nested `-S`) refuse, even for non-push
 payloads. ANSI-C quoting alongside Git or push text also refuses conservatively, including read-only Git commands.
 Ordinary single-quoted substitution text in echo/printf/commit messages is inert; shell payloads passed through
-`find -exec` or `script -c` are scanned as executing. These are conservative text checks, not a shell interpreter.
+`find -exec` or `script -c` are scanned as executing. Quoting is judged per shell: text single-quoted for the outer
+shell is scanned again in the child that runs it (`sh -c`, `eval`, `!` alias, `find -exec sh -c`, `script -c`), so
+`sh -c 'echo "$(git push mir)"'` refuses, at that child's cwd and environment, while `echo '$(git push mir)'` stays
+inert. Variable-provided executable payloads containing `$()` or backticks fail closed at recognized child-shell
+and alias boundaries when expansion cannot be reconstructed; merely storing or printing that data stays inert.
+Shell `-c --` and `builtin eval` are recognized. For recognized Git paths beneath `find -execdir`, the child cwd
+is unproved, so remote-dependent pushes fail closed (explicit URL plus literal branch refspec remains allowed).
+A relative `--git-dir`/`--work-tree` or `GIT_DIR`/`GIT_WORK_TREE` cannot be re-read from a shell alias's new
+working directory (a decoy repository there would look empty), so broad pushes through such an alias refuse; absolute
+paths and explicit-URL branch pushes still pass. These are conservative text checks, not a shell interpreter.
 
 This is a second fence: core's publisher validates actual argv. Arbitrary generated programs, script files,
 heredocs, remote SSH code and unsupported shell constructs remain outside the hook's guarantee. Tests in

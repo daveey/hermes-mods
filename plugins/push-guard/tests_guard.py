@@ -878,3 +878,236 @@ def test_inert_quoted_command_substitution_is_not_executed_or_refused(held_mirro
 def test_live_command_substitution_is_still_refused(held_mirror, cmd):
     repo, mir = held_mirror
     assert _term(cmd, repo), cmd
+
+
+@pytest.mark.parametrize("child", ['git push mir', "sh -c 'echo \"$(git push mir)\"'"])
+def test_find_execdir_cannot_prove_invocation_cwd(held_mirror, tmp_path, child):
+    repo, mir = held_mirror
+    clean = tmp_path / 'clean-execdir'
+    clean.mkdir()
+    git('init', '-q', cwd=clean)
+    git('remote', 'add', 'mir', str(mir), cwd=clean)
+    git('config', 'remote.mir.mirror', 'true', cwd=clean)
+    assert _term(f"find {repo}/f -maxdepth 0 -execdir {child} \\;", clean)
+    assert not _term(f"find {repo}/f -maxdepth 0 -execdir git push {mir} HEAD:refs/heads/feature \\;", clean)
+    assert not _term(f"find {repo}/f -maxdepth 0 -execdir echo harmless \\;", clean)
+    assert not _leaked(mir)
+
+
+@pytest.mark.parametrize("payload", ['git push mir', 'echo "$(git push mir)"'])
+def test_builtin_eval_executes_payload(held_mirror, payload):
+    repo, mir = held_mirror
+    assert _term(f"builtin eval '{payload}'", repo)
+    assert not _term("builtin eval 'git push origin feat'", repo)
+    assert not _term("builtin echo '$(git push mir)'", repo)
+    assert not _leaked(mir)
+
+
+@pytest.mark.parametrize("shell", ["sh", "bash"])
+@pytest.mark.parametrize("payload", ['git push mir', 'echo "$(git push mir)"'])
+def test_shell_c_option_terminator_is_not_the_payload(held_mirror, shell, payload):
+    repo, mir = held_mirror
+    assert _term(f"{shell} -c -- '{payload}'", repo)
+    assert not _term(f"{shell} -c -- 'git push origin feat'", repo)
+    assert not _term(f"{shell} -c -- 'echo harmless'", repo)
+    assert not _leaked(mir)
+
+
+@pytest.mark.parametrize("child", [
+    'sh -c "$C"', 'bash -c "$C"', 'eval "$C"',
+    'script -qc "$C" /dev/null', 'sh -c "echo $C"',
+    'git -c alias.p="!$C" p',
+])
+@pytest.mark.parametrize("payload", ['echo "$(git push mir)"', 'echo "`git push mir`"'])
+def test_variable_child_substitution_fails_closed(held_mirror, child, payload):
+    repo, mir = held_mirror
+    assert _term(f"C='{payload}'; {child}", repo)
+    assert _term(f"C='!{payload}'; git -c alias.p=\"$C\" p", repo)
+    # Storing/printing the same text is inert, not another execution boundary.
+    assert not _term(f"C='{payload}'; printf '%s' \"$C\"", repo)
+    assert not _leaked(mir)
+
+
+# --- custody: review round 3 (child-shell substitutions, relative GIT_DIR/GIT_WORK_TREE across alias cwd) ---------
+
+@pytest.mark.parametrize("cmd", [
+    "sh -c 'echo \"$(git push mir)\"'",
+    "bash -c 'echo \"`git push mir`\"'",
+    "git -c alias.p='!echo \"$(git push mir)\"' p",
+    "eval 'echo \"$(git push mir)\"'",
+    "find . -maxdepth 0 -exec sh -c 'echo \"$(git push mir)\"' \\;",
+    "script -qc 'echo \"$(git push mir)\"' /dev/null",
+    "sh -c 'sh -c \"echo \\\"$(git push mir)\\\"\"'",
+    "sh -c 'cd . && echo \"$(git push --mirror mir)\"'",
+])
+def test_substitution_executed_by_a_recognized_child_shell_is_scanned(held_mirror, cmd):
+    repo, mir = held_mirror
+    assert _term(cmd, repo), cmd
+    assert not _leaked(mir)
+
+
+def test_child_shell_substitution_uses_the_childs_cwd_and_env(held_mirror, tmp_path):
+    repo, mir = held_mirror
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    git("init", "-q", cwd=clean)
+    git("remote", "add", "mir", str(mir), cwd=clean)
+    git("config", "remote.mir.mirror", "true", cwd=clean)
+    # `cd` inside the child shell moves the substitution into the repo that holds custody refs
+    assert _term(f"sh -c 'cd {repo} && echo \"$(git push mir)\"'", clean)
+    assert _term(f"cd {repo} && sh -c 'echo \"$(git push mir)\"'", clean)
+    assert _term(f"env -C {repo} sh -c 'echo \"$(git push mir)\"'", clean)
+    # a clean repo provably holds no custody refs, so the same shape there is allowed
+    assert not _term("sh -c 'echo \"$(git push mir)\"'", clean)
+    assert not _leaked(mir)
+
+
+def test_inert_and_legitimate_child_shell_substitutions_are_allowed(held_mirror):
+    repo, mir = held_mirror
+    git("config", "alias.q", "!echo '$(git push mir)'", cwd=repo)
+    git("config", "alias.r", "!echo \"$(git push origin feat)\"", cwd=repo)
+    for cmd in ("sh -c 'echo \"$(git push origin feat)\"'",
+                "sh -c \"echo '$(git push mir)'\"",  # outer double quotes execute it in the OUTER shell: see below
+                "git r",  # configured alias: legitimate explicit branch push inside a substitution
+                "git -c alias.p='!echo \"$(git status)\"' p",
+                "git q", "eval 'echo \"$(git status)\"'",
+                "find . -maxdepth 0 -exec sh -c 'echo \"$(git push origin feat)\"' \\;",
+                "script -qc 'echo \"$(git push origin feat)\"' /dev/null",
+                "echo 'sh -c \"$(git push mir)\"'"):
+        if cmd == "sh -c \"echo '$(git push mir)'\"":
+            assert _term(cmd, repo), cmd  # the outer double quotes make that substitution live
+            continue
+        assert not _term(cmd, repo), cmd
+    assert not _leaked(mir)
+
+
+def _relative_view(tmp_path):
+    """A held repo `held` (custody refs, mirror remote) with a decoy repository `held/held`: relative GIT_DIR /
+    GIT_WORK_TREE read from the alias's own cwd (`held`) would pick the decoy, which has no custody refs."""
+    held = tmp_path / "base" / "held"
+    held.mkdir(parents=True)
+    git("init", "-q", "-b", "main", cwd=held)
+    (held / "f").write_text("x")
+    git("add", "f", cwd=held)
+    git("commit", "-qm", "b", cwd=held)
+    mir = tmp_path / "rel-mirror.git"
+    mir.mkdir()
+    git("init", "-q", "--bare", cwd=mir)
+    git("remote", "add", "mir", str(mir), cwd=held)
+    git("config", "remote.mir.mirror", "true", cwd=held)
+    hold_custody_ref(held)
+    decoy = held / "held"
+    decoy.mkdir()
+    git("init", "-q", "-b", "main", cwd=decoy)
+    git("remote", "add", "mir", str(mir), cwd=decoy)
+    git("config", "remote.mir.mirror", "true", cwd=decoy)
+    git("config", "alias.p", "!git push mir", cwd=held)
+    git("config", "alias.p", "!git push mir", cwd=decoy)
+    git("config", "alias.q", f"!git push {mir} feat", cwd=held)  # explicit URL + refspec: independent of mirror config
+    git("config", "alias.q", f"!git push {mir} feat", cwd=decoy)
+    return held.parent, held, mir
+
+
+@pytest.mark.parametrize("form", [
+    "git --git-dir=held/.git --work-tree=held p",
+    "git --git-dir held/.git --work-tree held p",
+    "GIT_DIR=held/.git GIT_WORK_TREE=held git p",
+    "env GIT_DIR=held/.git GIT_WORK_TREE=held git p",
+    "export GIT_DIR=held/.git GIT_WORK_TREE=held; git p",
+    "git --git-dir=held/.git --work-tree=. p",
+])
+def test_relative_git_dir_and_work_tree_are_not_reread_against_the_alias_cwd(tmp_path, form):
+    base, held, mir = _relative_view(tmp_path)
+    assert _term(form, base), form
+    assert not _leaked(mir)
+
+
+def test_relative_routing_controls_stay_allowed(tmp_path):
+    base, held, mir = _relative_view(tmp_path)
+    # explicit branch-push alias with the same relative routing, and an absolute routing of the blocked alias
+    assert not _term("git --git-dir=held/.git --work-tree=held q", base)
+    assert not _term("GIT_DIR=held/.git GIT_WORK_TREE=held git q", base)
+    assert _term(f"git --git-dir={held}/.git --work-tree={held} p", base)
+    assert not _term(f"git --git-dir={held}/.git --work-tree={held} q", base)
+    assert not _leaked(mir)
+
+
+# --- custody: review round 4 siblings (escaped substitutions, core.worktree alias routing, nested parentheses) ------
+
+@pytest.mark.parametrize("cmd", [
+    'sh -c "echo \\"\\$(git push --mirror mir)\\""',
+    'sh -c "echo \\$(git push --mirror mir)"',
+    'sh -c "echo \\`git push --mirror mir\\`"',
+    'eval "echo \\"\\$(git push --mirror mir)\\""',
+    'script -qc "echo \\"\\$(git push --mirror mir)\\"" /dev/null',
+    'find . -maxdepth 0 -exec sh -c "echo \\"\\$(git push --mirror mir)\\"" \\;',
+    'git -c alias.p="!echo \\"\\$(git push --mirror mir)\\"" p',
+    "bash -c \"bash -c 'echo \\$(git push --mirror mir)'\"",
+])
+def test_backslash_escaped_substitution_in_a_double_quoted_child_payload_is_scanned(held_mirror, cmd):
+    repo, mir = held_mirror
+    assert _term(cmd, repo), cmd
+    assert not _leaked(mir)
+
+
+def test_escaped_substitution_controls_stay_allowed(held_mirror):
+    repo, mir = held_mirror
+    for cmd in ('echo "\\$(git push --mirror mir)"',                   # top level: literal text
+                "sh -c 'echo \"\\$(git push --mirror mir)\"'",         # single-quoted outer: child sees a literal \$
+                'sh -c "echo \\"\\$(git status)\\""',                   # decoded substitution, not a push
+                'sh -c "echo \\"\\$(git push origin feat)\\""',         # explicit branch push stays allowed
+                'echo "\\`git push --mirror mir\\`"'):
+        assert not _term(cmd, repo), cmd
+    assert not _leaked(mir)
+
+
+def _worktree_decoy(tmp_path, held_mirror):
+    repo, mir = held_mirror
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    git("init", "-q", "-b", "main", cwd=decoy)
+    git("remote", "add", "mir", str(mir), cwd=decoy)
+    git("config", "remote.mir.mirror", "true", cwd=decoy)
+    git("config", "core.worktree", str(decoy), cwd=repo)
+    return repo, mir
+
+
+@pytest.mark.parametrize("cmd", [
+    "git -c alias.p='!git push --mirror mir' p",
+    "git -c alias.p='!git push mir' p",
+])
+def test_core_worktree_decoy_does_not_pick_the_alias_repository(held_mirror, tmp_path, cmd):
+    repo, mir = _worktree_decoy(tmp_path, held_mirror)
+    assert _term(cmd, repo), cmd
+    assert not _leaked(mir)
+
+
+def test_core_worktree_decoy_controls_stay_allowed(held_mirror, tmp_path):
+    repo, mir = _worktree_decoy(tmp_path, held_mirror)
+    # Alias cwd is unproved: a bare remote's mirror config cannot be assumed safe.
+    assert _term("git -c alias.p='!git push origin HEAD:refs/heads/feature' p", repo)
+    assert not _term(f"git -c alias.p='!git push {mir} HEAD:refs/heads/feature' p", repo)
+    assert not _term("git -c alias.p='!git status' p", repo)
+
+
+@pytest.mark.parametrize("cmd", [
+    'echo "$( (git push --mirror mir) )"',
+    'echo "$( (git push mir) )"',
+    'echo "$( ( (git push --mirror mir) ) )"',
+    'echo "$(echo \')\'; git push --mirror mir)"',
+    "sh -c 'echo \"$( (git push --mirror mir) )\"'",
+    'echo "$(git push --mirror mir"',   # unterminated live substitution mentioning a push
+])
+def test_parentheses_inside_substitutions_do_not_hide_a_push(held_mirror, cmd):
+    repo, mir = held_mirror
+    assert _term(cmd, repo), cmd
+
+
+def test_parenthesised_substitution_controls_stay_allowed(held_mirror):
+    repo, mir = held_mirror
+    for cmd in ("echo '$( (git push --mirror mir) )'",
+                'echo "$( (git status) )"',
+                'echo "$( (git push origin feat) )"',
+                'echo "$(echo \')\')"'):
+        assert not _term(cmd, repo), cmd
+    assert not _leaked(mir)
