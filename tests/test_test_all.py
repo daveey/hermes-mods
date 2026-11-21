@@ -2,6 +2,7 @@
 import json
 import os
 import runpy
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -70,6 +71,67 @@ class TestAll(unittest.TestCase):
         self.assertEqual(r.returncode, 2, r.stderr)
         self.assertIn("Python >= 3.11", r.stderr)
         self.assertNotIn("Traceback", r.stderr)
+
+    def test_the_uv_a_run_found_is_on_path_for_its_suites(self):
+        # [2026-11-21] each suite runs with an isolated HOME; over ssh PATH lacks ~/.local/bin; the nested test-all
+        # of the push-gate tests found no uv and the whole tests suite failed in the hub gate.
+        ns = runpy.run_path(str(RUNNER), run_name="test_all_uv_path")
+        bindir = self.root / "home" / ".local" / "bin"
+        bindir.mkdir(parents=True)
+        fake = bindir / "uv"
+        fake.write_text("#!/bin/sh\n")
+        fake.chmod(0o755)
+        with patch.dict(os.environ, {"PATH": "/nonexistent"}):
+            with patch("pathlib.Path.home", return_value=self.root / "home"):
+                uv = ns["find_uv"]()
+            self.assertEqual(uv, str(fake))
+            ns["put_uv_on_path"](uv)
+            self.assertEqual(shutil.which("uv"), str(fake), "a suite with another HOME finds it on PATH")
+            before = os.environ["PATH"]
+            ns["put_uv_on_path"](uv)
+            self.assertEqual(os.environ["PATH"], before, "not added twice")
+        # main() exports it: a suite run with PATH lacking uv finds the one main found.
+        import contextlib
+        import io
+        runner = runpy.run_path(str(RUNNER))
+        probe = f"import shutil, sys; sys.exit(0 if shutil.which('uv') == {str(fake)!r} else 1); print('1 passed')"
+        suites = [dict(name="probe", cmd=[sys.executable, "-c", probe + "\nprint('1 passed')"])]
+        with patch.dict(os.environ, {"PATH": f"{Path(sys.executable).parent}{os.pathsep}/nonexistent"}), \
+                patch("pathlib.Path.home", return_value=self.root / "home"), \
+                patch.dict(runner["main"].__globals__, {
+                    "discover": lambda *args, **kwargs: suites,
+                    "select_python": lambda core: (sys.executable, False),
+                    "ensure_test_site": lambda *args: self.root,
+                }), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(runner["main"](["--root", str(self.root)]), 0, out.getvalue())
+
+    def test_a_non_blocking_stdout_pipe_does_not_crash_a_long_report(self):
+        # [2026-11-21] over ssh the gate's stdout pipe was O_NONBLOCK; the skip summary hit BlockingIOError after
+        # every suite passed and the push was refused.
+        import fcntl
+        import threading
+        import time
+        for i in range(1200):
+            d = self.root / "plugins" / f"p{i:04d}-{'x' * 70}"
+            d.mkdir(parents=True)
+            (d / "test_ok.py").write_text("def test_ok():\n    pass\n")
+        rfd, wfd = os.pipe()
+        fcntl.fcntl(wfd, fcntl.F_SETFL, fcntl.fcntl(wfd, fcntl.F_GETFL) | os.O_NONBLOCK)
+        env = {k: v for k, v in os.environ.items() if k != "HERMES_CORE_CHECKOUT"}
+        env["HERMES_MODS_PYTHON"] = sys.executable
+        p = subprocess.Popen([sys.executable, str(RUNNER), "--root", str(self.root), "--hermes-core", "/nonexistent",
+                              "--list"], stdout=wfd, stderr=subprocess.PIPE, env=env)
+        os.close(wfd)
+        time.sleep(1.0)  # a slow reader: the >64 KiB listing fills the pipe before anyone drains it
+        chunks = []
+        drain = threading.Thread(target=lambda: chunks.extend(iter(lambda: os.read(rfd, 65536), b"")))
+        drain.start()
+        _, err = p.communicate(timeout=120)
+        drain.join(30)
+        os.close(rfd)
+        self.assertEqual(p.returncode, 0, err.decode())
+        self.assertNotIn(b"BlockingIOError", err)
+        self.assertEqual(b"".join(chunks).count(b"plugins/p"), 1200)
 
     def test_empty_core_venv_falls_through_to_production(self):
         core = self.root / 'core'
