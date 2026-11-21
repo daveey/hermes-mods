@@ -721,3 +721,160 @@ def test_configured_non_push_alias_without_push_literal_is_allowed(repo):
     git("config", "alias.s", "status", cwd=repo)
     assert block("terminal", {"command": "git s", "workdir": str(repo)}) is None
     assert block("execute_code", {"code": "subprocess.run(['git', 's'])", "workdir": str(repo)}) is None
+
+
+# --- custody: review round (inherited config, alias cwd, variable operands, env -S, quoted substitution) ------------
+
+def _term(cmd, workdir):
+    got = block("terminal", {"command": cmd, "workdir": str(workdir)})
+    return bool(got and got["action"] == "block" and NS in got["message"])
+
+
+@pytest.mark.parametrize("cmd", [
+    """GIT_CONFIG_PARAMETERS="'remote.origin.mirror=true'" git -c alias.p="!git push origin" p""",
+    """GIT_CONFIG_PARAMETERS="'remote.origin.mirror=true'" git -c alias.p="!git push origin" -c user.name=x p""",
+    """export GIT_CONFIG_PARAMETERS="'remote.origin.mirror=true'"; git -c alias.p="!git push origin" p""",
+])
+def test_inherited_git_config_parameters_survive_a_shell_alias(repo, cmd):
+    hold_custody_ref(repo)
+    assert _term(cmd, repo)
+    # control: the same alias without the inherited mirror config is a plain push of the current branch
+    assert not _term("""git -c alias.p="!git push origin" p""", repo)
+    assert not _term("""GIT_CONFIG_PARAMETERS="'user.name=x'" git -c alias.p="!git push origin" p""", repo)
+
+
+def test_alias_cwd_is_the_worktree_root_not_the_invocation_subdir(tmp_path):
+    held = tmp_path / "held"
+    held.mkdir()
+    git("init", "-q", "-b", "main", cwd=held)
+    (held / "f").write_text("x")
+    git("add", ".", cwd=held)
+    git("commit", "-qm", "b", cwd=held)
+    bare = tmp_path / "held-remote.git"
+    bare.mkdir()
+    git("init", "-q", "--bare", cwd=bare)
+    git("remote", "add", "origin", str(bare), cwd=held)
+    hold_custody_ref(held)
+    outer = tmp_path / "outer"
+    (outer / "sub").mkdir(parents=True)
+    git("init", "-q", "-b", "main", cwd=outer)
+    decoy = outer / "held"  # what `../held` means from outer/sub: a repo with no refs at all
+    decoy.mkdir()
+    git("init", "-q", cwd=decoy)
+    git("remote", "add", "origin", str(bare), cwd=decoy)
+    git("config", "alias.p", "!git -C ../held push --mirror origin", cwd=outer)
+    assert _term("git p", outer / "sub")  # alias runs in outer/, so ../held is the sibling holding refs
+    assert _term("git p", outer)
+    # control: an explicit branch push through the same alias shape is allowed
+    git("config", "alias.q", "!git -C ../held push origin main", cwd=outer)
+    assert not _term("git q", outer / "sub")
+    assert not _leaked(bare)
+
+
+def test_alias_whose_worktree_root_cannot_be_found_fails_closed(tmp_path):
+    bare = tmp_path / "b.git"
+    bare.mkdir()
+    git("init", "-q", "--bare", cwd=bare)
+    git("config", "alias.p", "!git push --mirror origin", cwd=bare)
+    assert _term("git --git-dir=%s p" % bare, tmp_path)
+
+
+@pytest.mark.parametrize("cmd", [
+    "R=mir; git push \"$R\"", "R=mir; git push ${R}", "R=mir; git push --mirror \"$R\"",
+    "S=refs/hermes-source-custody/store/unit/pin; git push origin \"$S\"",
+    "S=refs/hermes-source-custody/store/unit/pin; git push origin HEAD:$S",
+    "export S=refs/hermes-source-custody/x; git push origin $S",
+    "git push origin \"$UNSET_SPEC_XYZ\"", "git push \"$UNSET_REMOTE_XYZ\"",
+    "S=x git push origin \"$(echo refs/hermes-source-custody/x)\"",
+    "R=; git push origin $R", "export R=; git push origin $R",
+    "S='origin refs/hermes-source-custody/store/unit/pin'; git push $S",
+    "R='--mirror mir'; git push $R", "R='main refs/hermes-source-custody/store/unit/pin'; git push origin $R",
+    "USER=--mirror; A=\"$USER\"; git push $A mir", "unset HOME; git push origin $HOME",
+    "git push `echo mir`", "git push --mirror $(echo mir)",
+    "B=feat; git push origin \"$B\"", "R=origin B=feat; git push $R $B", "B=feat; git push origin HEAD:$B",
+])
+def test_push_operands_with_expansion_fail_closed_before_expansion(held_mirror, cmd):
+    repo, mir = held_mirror
+    assert _term(cmd, repo), cmd
+    assert not _leaked(mir)
+
+
+def test_push_operands_without_expansion_are_allowed(held_mirror):
+    repo, mir = held_mirror
+    for cmd in ("git push origin feat", "git push origin HEAD:feat", "B=feat; git push origin feat"):
+        assert not _term(cmd, repo), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "env -S 'git\\_push\\_mir'", "env -S 'git\\_push\\_--mirror\\_@M'", "env -S 'git push\\_mir'",
+    "env -S'git\\_push\\_mir'", "env --split-string='git\\_push\\_mir'", "env -i -S 'git\\_push\\_mir'",
+    "env -S 'git\\_push mir'", "env -S 'git push \\qmir'", "env -S 'git\\_push\\_\\x'",
+    "env -S \"git push 'x\\_y'\"",  # single-quoted \_ is literal to GNU env: any backslash is refused
+    "env -S '-i git push mir'", "env -S '-u FOO git push mir'", "env -S '-- git push mir'",
+    "env -S \"-S'git push mir'\"", "env -S ' -i git push mir'", "env -S '--ignore-environment git push mir'",
+    "env -S 'git push " + chr(36) + "X'", "env -S 'git push mir # c'",
+])
+def test_env_split_string_backslash_expansion_or_leading_option_is_refused(held_mirror, cmd):
+    repo, mir = held_mirror
+    assert _term(cmd.replace("@M", str(mir)), repo), cmd
+    assert not _leaked(mir)
+
+
+def test_env_split_string_safe_forms_are_not_over_blocked(held_mirror):
+    repo, mir = held_mirror
+    for cmd in ("env -S 'git push origin feat'", "env -S 'git status'", "env -S 'echo hi'",
+                "env -i -S 'git status'", "env -u FOO -S 'git status'"):
+        assert not _term(cmd, repo), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo $'a\\'b' $(git push mir) c\\'", "echo $'a\\'b' `git push mir` c\\'",
+    "echo $'x'; git push mir", "git push mir $'x'", "echo $'$(git push mir)'",
+])
+def test_ansi_c_quoting_with_push_refuses_conservatively(held_mirror, cmd):
+    repo, mir = held_mirror
+    git("config", "alias.p", "push mir", cwd=repo)
+    assert _term("echo $'a\\'b' $(git p) c\\'", repo)
+    assert _term(cmd, repo), cmd
+    assert not _leaked(mir)
+
+
+@pytest.mark.parametrize("cmd", [
+    "find . -maxdepth 0 -exec sh -c 'echo $(git push mir)' \\;",
+    "find . -maxdepth 0 -exec sh -c 'echo `git push mir`' \\;",
+    "find . -maxdepth 0 -execdir bash -c 'git push mir' +",
+    "script -qc 'echo $(git push mir)' /dev/null", "script -qc 'git push mir' /dev/null",
+    "script -c 'git push --mirror mir' /dev/null", "script --command 'git push mir' /dev/null",
+    "script -q -c 'git push mir' /dev/null",
+])
+def test_find_exec_and_script_payloads_are_scanned_as_executing(held_mirror, cmd):
+    repo, mir = held_mirror
+    assert _term(cmd, repo), cmd
+    assert not _leaked(mir)
+
+
+def test_inert_single_quoted_text_around_find_and_script_is_allowed(held_mirror):
+    repo, mir = held_mirror
+    for cmd in ("find . -maxdepth 0 -exec echo '$(git push mir)' \\;", "echo '$(git push mir)'",
+                "printf '%s' '`git push mir`'", "git commit -q --allow-empty -m 'doc: $(git push mir)'",
+                "script -qc 'echo hi' /dev/null"):
+        assert not _term(cmd, repo), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo '`git push mir`'", "echo '$(git push --mirror mir)'", "echo 'a `git push mir` b'",
+    "printf '%s' '`git push mir`'",
+    "echo \\`git push mir\\`",
+])
+def test_inert_quoted_command_substitution_is_not_executed_or_refused(held_mirror, cmd):
+    repo, mir = held_mirror
+    assert not _term(cmd, repo), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo `git push mir`", "echo \"`git push mir`\"", "echo \"$(git push mir)\"", "echo $(git push mir)",
+    "echo '`ok`' `git push mir`", "echo '$(ok)' \"$(git push mir)\"",
+])
+def test_live_command_substitution_is_still_refused(held_mirror, cmd):
+    repo, mir = held_mirror
+    assert _term(cmd, repo), cmd

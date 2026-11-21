@@ -134,6 +134,18 @@ configured guard, and `PUSH_GUARD=off` does not skip it:
   `remote.<name>.mirror`, and a `*` refspec on the command line or in `remote.<name>.push`, unless the glob is
   confined to `refs/heads/` or `refs/tags/`.
 
-Named branches, `--all` and `--tags` are unaffected. This is a second fence: core's own publisher refuses the same
-argv. Limits: like the rest of the guard it reads the command text, so a push assembled at run time or a refspec in
-`branch.<name>.pushRemote`/`push.default` it does not model is not seen.
+Literal named branches, `--all` and `--tags` remain allowed when their effective Git view proves they cannot carry
+custody refs. Queries preserve Git routing and configuration; shell aliases inherit configuration and start at
+the worktree root. An unproved view refuses rather than treating failed reads as absent refs.
+
+Bounded shell handling deliberately refuses push operands containing `$` or backticks, even a quoted literal
+branch name containing those characters. Use literal operands instead. `env -S` accepts only plain quoted words:
+backslashes, expansion/comment syntax and leading options (including nested `-S`) refuse, even for non-push
+payloads. ANSI-C quoting alongside Git or push text also refuses conservatively, including read-only Git commands.
+Ordinary single-quoted substitution text in echo/printf/commit messages is inert; shell payloads passed through
+`find -exec` or `script -c` are scanned as executing. These are conservative text checks, not a shell interpreter.
+
+This is a second fence: core's publisher validates actual argv. Arbitrary generated programs, script files,
+heredocs, remote SSH code and unsupported shell constructs remain outside the hook's guarantee. Tests in
+`tests_guard.py` exercise the actual terminal pre-tool entrypoint, inherited config, alias cwd, opaque operands,
+GNU env splitting refusals, executable substitutions and inert-data/literal-branch controls.

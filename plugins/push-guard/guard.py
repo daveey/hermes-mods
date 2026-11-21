@@ -135,7 +135,7 @@ WRAPPER_OPTS = {  # wrapper -> options that take a value
     "ionice": {"-c", "-n", "-p", "-P", "-u"}, "command": set(), "nohup": set(), "setsid": set(), "time": set(),
 }
 ENV_VALUE_OPTS = {"-u", "-C", "-S", "-a", "--unset", "--chdir", "--split-string", "--argv0"}
-FALLBACK_WRAPPERS = {"xargs", "flock", "watch", "parallel", "chronic"}
+FALLBACK_WRAPPERS = {"xargs", "flock", "watch", "parallel", "chronic", "find"}
 
 
 def _strip_options(words: list, value_opts: set):
@@ -302,6 +302,23 @@ def _shell_payload(words: list) -> Optional[str]:
     return None
 
 
+def _env_split_string(v: str) -> Optional[list]:
+    """Bounded reading of an `env -S STRING` payload. GNU env re-parses the string with its own rules (backslash
+    escapes, `\\_`, `\\c`, `${VAR}`, `#` comments, a leading option such as `-i`/`-u`/`--` or a nested `-S`),
+    which differ from shlex; this deliberately does not reimplement them. Only a plain payload is accepted:
+    quotes and whitespace, no backslash, `$`, backtick or `#`, and no leading `-`. None for anything else:
+    callers must refuse it, never treat it as a command that is not git."""
+    if re.search(r"[\\$`#]", v) or v.lstrip().startswith("-"):
+        return None
+    try:
+        words = shlex.split(v)
+    except ValueError:
+        return None
+    if words and words[0].startswith("-"):
+        return None
+    return words
+
+
 def _commands_env(cmd: str, cwd: str, segments: Optional[list] = None, env0: Optional[dict] = None):
     """Like _commands, plus a 3rd item: the environment in effect for that command (earlier `export X=1` /
     `X=1;` segments and the command's own `X=1 git ...` / `env X=1 git ...` / `env -i` / `env -u X` prefixes;
@@ -362,10 +379,11 @@ def _commands_env(cmd: str, cwd: str, segments: Optional[list] = None, env0: Opt
                     elif o in ("-S", "--split-string") and v is not None:
                         if re.search(r"[$`]", v):
                             ccwd_bad = True  # env expands ${VAR} inside -S itself: the command is unproved
-                        try:
-                            pre = shlex.split(v)
-                        except ValueError:
-                            pre = v.split()
+                        split = _env_split_string(v)
+                        if split is None:  # a form GNU env reads differently from shlex: refuse, never drop it
+                            own[OPAQUE] = True
+                            split = ["git", "push"]
+                        pre = split
                 words, changed = pre + rest, True
                 continue
             if w0 in WRAPPER_OPTS:
@@ -382,6 +400,19 @@ def _commands_env(cmd: str, cwd: str, segments: Optional[list] = None, env0: Opt
                     rest = rest[1:]
                 words, changed = rest, True
                 continue
+            if w0 == "script":  # util-linux `script -c COMMAND FILE`: COMMAND runs under the user's shell
+                payload = None
+                for j, w in enumerate(words[1:], 1):
+                    if w.startswith("--command="):
+                        payload = w.partition("=")[2]
+                    elif w == "--command" or (w.startswith("-") and not w.startswith("--") and "c" in w[1:]):
+                        payload = words[j + 1] if j + 1 < len(words) else None
+                    else:
+                        continue
+                    break
+                if payload is not None:
+                    words, changed = ["sh", "-c", payload], True
+                    continue
             if w0 in FALLBACK_WRAPPERS:
                 for j, w in enumerate(words[1:], 1):
                     if os.path.basename(w) in SHELLS | {"git", "env", "sudo", "eval"}:
@@ -499,8 +530,27 @@ class GitView:
             # reconstructed -c-only environment below proves that child's config or custody absence.
             env[OPAQUE] = True
         if self.params:
-            env["GIT_CONFIG_PARAMETERS"] = " ".join("'" + p + "'" for p in self.params)
+            # git appends its own -c entries to what it inherited: keep the inherited ones (assigned on the
+            # command line or already in the process environment) in front, never replace them.
+            if "GIT_CONFIG_PARAMETERS" in self.env:
+                inherited = self.env["GIT_CONFIG_PARAMETERS"] or ""
+            elif self.env.get(CLEAR):
+                inherited = ""
+            else:
+                inherited = os.environ.get("GIT_CONFIG_PARAMETERS", "")
+            quoted = " ".join("'" + p.replace("'", "'\\''") + "'" for p in self.params)
+            env["GIT_CONFIG_PARAMETERS"] = (inherited + " " + quoted).strip()
         return env
+
+    def alias_root(self) -> Optional[str]:
+        """Where git runs a `!shell` alias: the top of the work tree, not the invocation subdirectory. None when
+        that directory cannot be proved (bare repository, --git-dir without a work tree, failed query)."""
+        if self.unresolved or (self.exports.get("GIT_DIR") and not self.exports.get("GIT_WORK_TREE")):
+            return None
+        probe = GitView(self.repo, self.env)
+        probe.opts = list(self.opts)
+        rc, out = probe.query("rev-parse", "--show-toplevel")
+        return out if rc == 0 and out and os.path.isdir(out) else None
 
     def query(self, *args: str):
         """(returncode, stdout); returncode None when git could not run. rc 1 is git config's "no such key"."""
@@ -615,7 +665,12 @@ def _git_calls_cfg(cmd: str, cwd: str, env0: Optional[dict] = None, depth: int =
                     if "push" in payload:
                         yield repo, "push", [], _force_unresolved(view)
                 else:
-                    yield from _git_calls_cfg(payload, repo, view.exported_env(), depth + 1)
+                    root = view.alias_root()
+                    child_env = view.exported_env()
+                    if root is None:
+                        child_env[BADCWD] = True  # the alias's working directory is unproved: fail closed
+                        root = repo
+                    yield from _git_calls_cfg(payload, root, child_env, depth + 1)
                 break
             try:
                 words, i = shlex.split(value) + rest, 0
@@ -1411,6 +1466,33 @@ def _abbrev(a: str, *fulls: str) -> bool:
     return a.startswith("--") and len(name) > 2 and any(f.startswith(name) for f in fulls)
 
 
+def _live_positions(cmd: str) -> set:
+    """Indexes of the characters of `cmd` the shell reads as syntax: outside single quotes and not backslash-escaped
+    (a backtick or `$(` there is a real command substitution; elsewhere it is inert text)."""
+    live: set = set()
+    quote = None
+    i, n = 0, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+        elif c == "\\":
+            i += 2
+            continue
+        elif quote == '"':
+            if c == '"':
+                quote = None
+            else:
+                live.add(i)
+        elif c in "'\"":
+            quote = c
+        else:
+            live.add(i)
+        i += 1
+    return live
+
+
 def check_custody_push(cmd: str, cwd: str, depth: int = 0) -> Optional[str]:
     """Refuse a `git push` that would publish core's source-custody refs. Those refs pin unpushed, possibly
     private work that was preserved locally; they are never meant to reach a remote.
@@ -1420,8 +1502,16 @@ def check_custody_push(cmd: str, cwd: str, depth: int = 0) -> Optional[str]:
     mirror, and a `*` refspec on the command line or in the remote's push config. Applies to every remote, with
     or without a configured guard, and PUSH_GUARD=off does not skip it. This is a second fence: core's own
     publisher refuses the same argv."""
+    if "$'" in (cmd or "") and ("push" in cmd or "git" in cmd):
+        # ANSI-C quoting changes where quotes close; shlex cannot prove this command. Include git aliases,
+        # not just literal push. Conservative limit: even a read-only git command with ANSI-C quotes refuses.
+        return ("this command line uses ANSI-C quoting ($'...') alongside `git push`; the guard cannot prove which "
+                f"parts are quoted, so a push could publish source-custody refs ({CUSTODY_NS})")
     if depth < 3:  # `$(...)` / backticks inside double quotes: scanned as their own command lines
+        live = _live_positions(cmd or "")
         for m in re.finditer(r"\$\(([^()]*)\)|`([^`]*)`", cmd or ""):
+            if m.start() not in live:
+                continue  # inside single quotes or backslash-escaped: inert text, not a substitution
             why = check_custody_push(m.group(1) or m.group(2) or "", cwd, depth + 1)
             if why:
                 return why
@@ -1432,6 +1522,13 @@ def check_custody_push(cmd: str, cwd: str, depth: int = 0) -> Optional[str]:
         def cfg(*a: str) -> Optional[str]:  # real git config view: -c/--config-env/--git-dir/GIT_* included
             return view.run("config", *a)
 
+        # Operands are words of this command line, read before the shell expands them. One holding `$` or a
+        # backtick (variable, substitution, empty/unset/word-split expansion) could become any remote, option or
+        # refspec, so it proves nothing: refuse. Not expanded here: that loses empty, unquoted-splitting and
+        # unset-variable semantics. (A literal `$` in a single-quoted branch name is refused too: bounded limit.)
+        if any(re.search(r"[$`]", a) for a in args):
+            return (f"this `git push` has an operand the guard cannot expand (shell variable or command "
+                    f"substitution); it might name the source-custody namespace {CUSTODY_NS} or a mirror remote")
         pos, mirror, repo_opt, i, ddash = [], False, None, 0, False
         while i < len(args):
             a = args[i]
