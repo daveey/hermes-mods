@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Fail-closed main publication gate, sharing CI's suite selector.
 
-The entire gate is bounded to 240 seconds, below hermes-sync's 300-second push
-budget. A timeout refuses publication; it never turns incomplete tests green.
+Suite execution is bounded to 240 seconds. Slot queue time is excluded; an
+outer publisher timeout may refuse a queued push, but never skips its suites.
+A timeout refuses publication; it never turns incomplete tests green.
 HERMES_MODS_SKIP_PUSH_SUITES=<reason> is the sole emergency escape and is logged.
 """
+import fcntl
 import hashlib
 import json
 import os
@@ -20,6 +22,43 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 BUDGET = 240
+SLOT_FDS = ()
+
+
+def suite_slot():
+    """One cache namespace across worktrees/profiles, with kernel-owned lifetime.
+
+    Children retain the lock if this supervisor is SIGKILLed: a live orphaned
+    suite still consumes capacity until it exits. Never unlink a lock file.
+    """
+    count = os.environ.get('HERMES_MODS_SUITE_SLOTS', '1')
+    if not count.isdigit() or int(count) < 1:
+        raise ValueError('HERMES_MODS_SUITE_SLOTS must be a positive integer')
+    cache = Path(os.environ.get('XDG_CACHE_HOME') or Path.home() / '.cache')
+    directory = cache / 'hermes-mods-push' / 'slots'
+    directory.mkdir(parents=True, exist_ok=True)
+    announced = False
+    while True:
+        holders = []
+        for index in range(int(count)):
+            slot = (directory / f'{index}.lock').open('a+')
+            try:
+                fcntl.flock(slot, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                slot.seek(0)
+                holders.append(slot.read().strip() or 'unknown (acquiring)')
+                slot.close()
+                continue
+            slot.seek(0)
+            slot.truncate()
+            slot.write(f'{os.getpid()}/{Path.cwd()}')
+            slot.flush()
+            return slot
+        if not announced:
+            print('pre-push-suites: waiting for suite slot held by ' + ', '.join(holders),
+                  file=sys.stderr, flush=True)
+            announced = True
+        time.sleep(.2)
 
 
 def provision(snapshot, deadline):
@@ -55,7 +94,7 @@ def run(cmd, deadline, **kwargs):
     if remaining <= 0:
         raise TimeoutError('gate budget exhausted')
     # Kill descendants too: pytest/uv may spawn further processes.
-    with subprocess.Popen(cmd, start_new_session=True, **kwargs) as child:
+    with subprocess.Popen(cmd, start_new_session=True, pass_fds=SLOT_FDS, **kwargs) as child:
         try:
             out, _ = child.communicate(timeout=remaining)
         except BaseException:
@@ -130,7 +169,21 @@ def main():
     # Suites see that this is the publish gate: its host is whatever machine pushes, under whatever load, so a
     # check that needs quiet deployment hardware (plugins/runners/INVENTORY-BUDGET.md) skips itself here.
     os.environ['HERMES_MODS_PUSH_GATE'] = '1'
+    slot = None
+    global SLOT_FDS
     try:
+        if not preparing and all(has_receipt(receipt_for(base, head)) for base, head in updates):
+            for base, head in updates:
+                print(f'pre-push-suites: verified local receipt {base}..{head}', file=sys.stderr)
+            return 0
+        slot = suite_slot()
+        SLOT_FDS = (slot.fileno(),)
+        # Queue time is not test time: never skip or exhaust the suite budget
+        # merely because another publisher owns the host slot.
+        deadline = time.monotonic() + budget
+        current_nice = os.getpriority(os.PRIO_PROCESS, 0)
+        if current_nice < 10:
+            os.nice(10 - current_nice)
         for base, head in updates:
             receipt = receipt_for(base, head)
             if not preparing and has_receipt(receipt):
@@ -171,6 +224,9 @@ def main():
         print(f'pre-push-suites: REFUSED: {exc}', file=sys.stderr)
         return 1
     finally:
+        SLOT_FDS = ()
+        if slot is not None:
+            slot.close()
         print(f'pre-push-suites: wall={time.monotonic() - started:.2f}s budget={budget}s',
               file=sys.stderr)
     return 0
