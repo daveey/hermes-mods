@@ -530,6 +530,7 @@ class GitView:
     def __init__(self, repo: str, env: Optional[dict] = None):
         self.repo, self.env, self.opts, self.unresolved, self.repointed = repo, dict(env or {}), [], False, False
         self.failed, self.params, self.exports = False, [], {}
+        self.tainted = False  # an earlier config write in this command may have changed what queries return
         for k, v in self.env.items():
             if k.startswith("\0"):
                 continue
@@ -674,13 +675,62 @@ def _opaque_child_payload(payload: str, env: dict) -> bool:
     return False
 
 
-def _git_calls_cfg(cmd: str, cwd: str, env0: Optional[dict] = None, depth: int = 0):
+_CFG_READ_FLAGS = {"--get", "--get-all", "--get-regexp", "--get-urlmatch", "-l", "--list", "--get-color",
+                   "--get-colorbool", "-h", "--help"}
+_CFG_WRITE_FLAGS = {"--add", "--replace-all", "--unset", "--unset-all", "--rename-section", "--remove-section",
+                    "-e", "--edit"}
+_CFG_NEUTRAL_FLAGS = {"--local", "--global", "--system", "--worktree", "--null", "-z", "--bool", "--int",
+                      "--bool-or-int", "--path", "--expiry-date", "--includes", "--no-includes", "--fixed-value",
+                      "--url", "--literally"}
+_CFG_VALUE_OPTS = {"-f", "--file", "--blob", "--default", "--type", "-t", "--comment"}
+
+
+def _mutates_config(sub: str, args: list) -> bool:
+    """Might this literal git call change configuration a later git in the same command would read? Errs towards
+    True: anything not provably a read counts (unexpanded words included); `git remote` is config by another name.
+    Scope, --file/--global/--system and include paths all count: the decision is not keyed on the key name."""
+    if sub == "remote":
+        pos = [a for a in args if not a.startswith("-")]
+        return (bool(pos) and pos[0] not in ("show", "get-url")) or any(re.search(r"[$`]", a) for a in args)
+    if sub != "config":
+        return False
+    # Read flags prove a read only BEFORE the first operand (`git config K V --get` still writes K), and an
+    # unrecognized dash word is an operand (`git config alias.z '-c ... push'`), not a flag.
+    known = _CFG_READ_FLAGS | _CFG_WRITE_FLAGS | _CFG_VALUE_OPTS | _CFG_NEUTRAL_FLAGS
+    pos, read_first, i = [], False, 0
+    while i < len(args):
+        a = args[i]
+        w = a.partition("=")[0] if a.startswith("--") else a
+        if w in _CFG_WRITE_FLAGS or w.startswith("--unset"):
+            return True
+        if a.startswith("-") and not pos and (w not in known or re.search(r"[$`]", a)):
+            return True  # unknown/negated options can cancel a preceding read action
+        if w in known and not pos:
+            if w in _CFG_READ_FLAGS and not pos:
+                read_first = True
+            i += 2 if (w in _CFG_VALUE_OPTS and "=" not in a and i + 1 < len(args)) else 1
+            continue
+        pos.append(a)
+        i += 1
+    if pos and pos[0] in ("set", "unset", "edit", "rename-section", "remove-section"):
+        return True
+    if pos and pos[0] in ("get", "list"):
+        return False
+    if read_first:
+        return False
+    return len(pos) >= 2
+
+
+def _git_calls_cfg(cmd: str, cwd: str, env0: Optional[dict] = None, depth: int = 0,
+                   state: Optional[dict] = None):
     """Like _git_calls, plus a 4th item: the GitView the command would run in (see GitView). Follows nested
     `bash -c STR` / `eval` / `su -c`, subshells and `git` aliases (config `alias.<name>`, read from the same view);
     depth-exhausted or unreadable forms that mention a push come back as an unproved push."""
+    if state is None:
+        state = {"mutated": False}  # shared by every recursive child of one tool command
     sink: list = []
     for cwd, words, env in _commands_env(cmd, cwd, None, env0, sink):
-        yield from _substitution_calls(sink, depth)
+        yield from _substitution_calls(sink, depth, state)
         tool = os.path.basename(words[0])
         if tool in SHELLS or tool == "eval":
             inner = _shell_payload(words)
@@ -691,7 +741,7 @@ def _git_calls_cfg(cmd: str, cwd: str, env0: Optional[dict] = None, depth: int =
                     if "push" in inner:
                         yield _unproved_push(cwd, env)
                 else:
-                    yield from _git_calls_cfg(inner, cwd, env, depth + 1)
+                    yield from _git_calls_cfg(inner, cwd, env, depth + 1, state)
             continue
         if tool != "git":
             if env.get(OPAQUE) and "push" in words:
@@ -728,7 +778,17 @@ def _git_calls_cfg(cmd: str, cwd: str, env0: Optional[dict] = None, depth: int =
                 break
             sub = words[i]
             if sub == "push" or sub in GIT_BUILTINS:
+                if state["mutated"]:
+                    view.tainted = True
+                if _mutates_config(sub, words[i + 1:]):
+                    state["mutated"] = True
                 yield repo, sub, words[i + 1:], view
+                break
+            if state["mutated"]:
+                # An earlier recognized config write may have defined this alias/external command, or changed
+                # what it does: the lookup below would read the pre-write file. Do not follow it.
+                view.tainted = True
+                yield repo, "push", [], _force_unresolved(view)
                 break
             if any(p.startswith("alias." + sub + "=") and
                    _opaque_child_payload(p.partition("=")[2], env) for p in view.params):
@@ -759,13 +819,13 @@ def _git_calls_cfg(cmd: str, cwd: str, env0: Optional[dict] = None, depth: int =
                     if root is None:
                         child_env[BADCWD] = True  # the alias's working directory is unproved: fail closed
                         root = repo
-                    yield from _git_calls_cfg(payload, root, child_env, depth + 1)
+                    yield from _git_calls_cfg(payload, root, child_env, depth + 1, state)
                 break
             try:
                 words, i = _sh_split(value) + rest, 0
             except ValueError:
                 words, i = value.split() + rest, 0
-    yield from _substitution_calls(sink, depth)
+    yield from _substitution_calls(sink, depth, state)
 
 
 _BACKTICK = re.compile(r"`([^`]*)`")
@@ -806,7 +866,7 @@ def _dollar_paren_bodies(seg: str, live: set):
         i = j
 
 
-def _substitution_calls(sink: list, depth: int):
+def _substitution_calls(sink: list, depth: int, state: Optional[dict] = None):
     """Drain `sink` (see _commands_env): git calls inside `$(...)` / backticks that the shell executes within
     double quotes. Each segment is a line of the shell being analysed (the top-level command or a recognized
     child: `sh -c`, eval, `!` alias, find -exec, script -c), so single quotes are judged by the shell that reads
@@ -832,7 +892,7 @@ def _substitution_calls(sink: list, depth: int):
                 if "push" in inner:
                     yield _unproved_push(cwd, env)
             else:
-                yield from _git_calls_cfg(inner, cwd, env, depth + 1)
+                yield from _git_calls_cfg(inner, cwd, env, depth + 1, state)
 
 
 def _force_unresolved(view: "GitView") -> "GitView":
@@ -1709,7 +1769,13 @@ def check_custody_push(cmd: str, cwd: str, depth: int = 0) -> Optional[str]:
             if any(_custody_side(side) for side in s.split(":", 1) if side):
                 return f"`git push ... {s[:80]}` names the source-custody namespace {CUSTODY_NS}"
         held = None
-        if not view.unresolved:
+        if view.tainted and not specs:
+            # A recognized config write earlier in this command (not executed here) may have added a mirror, push
+            # refspec, route or include: queries show the pre-write config. Explicit refspecs replace configured
+            # ones and are judged above/below; a bare push is unproved.
+            return (f"this `git push` follows a git config change in the same command; the guard cannot see the "
+                    f"resulting configuration, so it might publish source-custody refs ({CUSTODY_NS})")
+        if not view.unresolved and not view.tainted:
             rc, held = view.query("for-each-ref", "--count=1", "--format=%(refname)", CUSTODY_NS)
             if rc != 0:
                 held = None

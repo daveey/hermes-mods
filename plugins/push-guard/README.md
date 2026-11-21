@@ -154,6 +154,16 @@ A relative `--git-dir`/`--work-tree` or `GIT_DIR`/`GIT_WORK_TREE` cannot be re-r
 working directory (a decoy repository there would look empty), so broad pushes through such an alias refuse; absolute
 paths and explicit-URL branch pushes still pass. These are conservative text checks, not a shell interpreter.
 
+Same-command configuration changes: queries read the config as it is *before* the command runs and the hook never
+executes a write. After a recognized literal `git config` write (anything not provably a read, whatever key, scope,
+`--file`, `--global` or include path; also `git remote` add/set/remove forms), a later push in the same command,
+including inside `sh -c`, `$(...)`, `!` aliases and their children, is treated as unproved: a push with no explicit
+refspecs is refused, absent-custody-ref shortcuts are skipped, and any alias/external `git <name>` is refused rather
+than resolved from stale config. Explicit refspecs replace configured ones and are still judged on their text.
+Config-only commands, read-only `git config` (`--get`, `--list`, ...), writes after the push, and commands that never
+reach a push stay allowed. Writers other than recognized `git config`/`git remote` (editors, `sed -i`, scripts) are
+outside this guarantee. Tests: `tests_config_mutation.py`, `tests_config_mutation_more.py`.
+
 This is a second fence: core's publisher validates actual argv. Arbitrary generated programs, script files,
 heredocs, remote SSH code and unsupported shell constructs remain outside the hook's guarantee. Tests in
 `tests_guard.py` exercise the actual terminal pre-tool entrypoint, inherited config, alias cwd, opaque operands,
