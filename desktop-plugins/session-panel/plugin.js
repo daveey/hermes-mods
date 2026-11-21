@@ -1974,14 +1974,26 @@ export function pollWhileVisible(refresh, intervalMs = PERSON_WAITS_POLL_MS, doc
 
 /** Read-only view of one card-cache record for other plugins (blocked-panel, via window.__sessionPanel): never
  *  starts a read. `detail` is the card's kanban detail when the gateway feed pushed it (slim: no comments), else
- *  null; `fresh` = answered, not stale, within CARD_FRESH_MS (a feed-vouched chat's records are re-stamped). */
+ *  null; `at` = when it was read or last confirmed by a push; `fresh` = answered, not stale, within CARD_FRESH_MS;
+ *  `trusted` = it came in a trusted bundle of a chat the live feed currently vouches for (feedScopes + feedVouches),
+ *  so pushes keep it current. An untrusted (catch-up only) bundle's record is never `trusted`. */
 export function cachedCard(chip, id, nowMs = Date.now()) {
   loadReads()
   const route = refRoute(chip, () => null)
   if (!route.connectionId || !id) return null
-  const hit = cards.get(titleKey(route, str(id)))
+  const k = titleKey(route, str(id))
+  const hit = cards.get(k)
   if (!hit) return null
-  return { info: hit.info || null, detail: hit.detail || null, board: str(hit.info?.board) || null, at: hit.at,
+  let trusted = false
+  if (hit.detail && !hit.pending && !hit.stale) {
+    for (const [scope, keys] of feedScopes) {
+      if (!keys.has(k)) continue
+      let parsed = null
+      try { parsed = JSON.parse(scope) } catch {}
+      if (Array.isArray(parsed) && feedVouches({ connectionId: parsed[0], profile: parsed[1], session: parsed[2] }, nowMs)) { trusted = true; break }
+    }
+  }
+  return { info: hit.info || null, detail: hit.detail || null, board: str(hit.info?.board) || null, at: hit.at, trusted,
     stale: !!hit.stale, pending: !!hit.pending, fresh: !hit.pending && !hit.stale && !!hit.info && nowMs - hit.at < CARD_FRESH_MS }
 }
 

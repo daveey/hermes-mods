@@ -81,3 +81,17 @@ test('fallback Unblock and Archive remain answer rows', async () => {
  await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call: async () => ({}) }))
  assert.deepEqual([...el().querySelectorAll('[data-option-label]')].map(n => n.textContent), ['Unblock','Archive','Skip','Other (type your answer)'])
 })
+
+test('a recorded decision makes blocked-panel read the cards itself (forced), not from a pre-change copy', async () => {
+ const r = request(), forced = []
+ window.__blockedPanel = { refresh: force => { forced.push(force) } }
+ try {
+  const call = async () => ({ request: r, operation: { operationId: 'op-force', dispatchState: 'pending' } })
+  await show(React.createElement(m.DecisionRow, { key: `${r.requestId}-force`, request: r, route, call }))
+  assert.deepEqual(forced, [], 'nothing before the action')
+  await click('card-1')
+  await React.act(async () => { await flush(); await flush() })
+  assert.deepEqual(forced, [true])
+  assert.equal(m.refreshBlockedAfterAction(null), false, 'no blocked-panel: nothing to do')
+ } finally { delete window.__blockedPanel }
+})

@@ -18,14 +18,14 @@ const row = (id, status = 'blocked') => ({ id, title: `Card ${id}`, status, boar
 const slim = (id, extra = {}) => ({ task: { id, title: `Card ${id}`, status: 'blocked', assignee: 'ops-agent', board: 'default', block_kind: 'needs_input', human_request: ask, body: 'card body', ...extra }, events: [], links: { parents: [], children: [] }, link_tasks: [], slim: true })
 const settle = async () => { for (let i = 0; i < 5; i++) await new Promise(r => setTimeout(r, 0)) }
 
-function wire({ lineage, rows, card, vouched = true, detailAt = Date.now() }) {
+function wire({ lineage, rows, card, vouched = true, trusted = true, detailAt = Date.now(), rowsAt = Date.now(), rowsFeed = false }) {
   const calls = [], spCalls = []
   globalThis.document = { hidden: false, addEventListener() {}, removeEventListener() {} }
   globalThis.window = {
     localStorage: { getItem: () => null },
-    __sessionTasks: { lineageIds: async (stored, conn, profile) => (calls.push({ shared: 'lineage', stored, conn, profile }), lineage), kanbanRows: (route, ids) => (calls.push({ shared: 'rows', route, ids: [...ids] }), rows ? { rows: rows.map(r => ({ ...r })), at: Date.now() } : null) },
+    __sessionTasks: { lineageIds: async (stored, conn, profile) => (calls.push({ shared: 'lineage', stored, conn, profile }), lineage), kanbanRows: (route, ids) => (calls.push({ shared: 'rows', route, ids: [...ids] }), rows ? { rows: rows.map(r => ({ ...r })), at: rowsAt, feed: rowsFeed } : null) },
     __sessionPanel: {
-      cachedCard: (chip, id) => (spCalls.push({ chip, id }), card?.(id) ? { detail: card(id), board: 'default', at: detailAt, stale: false, pending: false } : null),
+      cachedCard: (chip, id) => (spCalls.push({ chip, id }), card?.(id) ? { detail: card(id), board: 'default', at: detailAt, trusted, stale: false, pending: false } : null),
       feedVouches: route => (spCalls.push({ vouch: route }), vouched)
     },
     hermesDesktop: { api: async req => {
@@ -60,7 +60,6 @@ test('current shared data: lineage, owner list and blocked-card details are take
   assert.deepEqual(calls.find(c => c.shared === 'rows').ids.sort(), ['s-current', 's-parent'])
   // Details come from session-panel's cache, read through the owner route, vouched by the feed.
   assert.deepEqual(spCalls.find(c => c.id === 't_ask1').chip, { connectionId: 'local', profile: 'default', board: 'default' })
-  assert.deepEqual(spCalls.find(c => c.vouch).vouch, { connectionId: 'local', profile: 'default', session: 's-current' })
   // The only card read is the one the rewrite needs (a pushed detail has no comments), made once per ask.
   const cardReads = reads('/api/plugins/kanban/tasks/')
   assert.equal(cardReads.length, 1)
@@ -98,7 +97,7 @@ test('missing or not-current shared data: blocked-panel reads lineage, list and 
   globalThis.__bp.stored = 's-stale'
   const incomplete = new Set(['s-stale']); incomplete.incomplete = 'GET /api/sessions failed'
   globalThis.__bp.liveRows = [row('t_ask3')]
-  const { calls, reads } = wire({ lineage: incomplete, rows: null, card: id => slim(id), vouched: false, detailAt: Date.now() - 120_000 })
+  const { calls, reads } = wire({ lineage: incomplete, rows: null, card: id => slim(id), detailAt: Date.now() - 120_000 })
   try {
     await m.refresh()
     await settle()
@@ -139,19 +138,59 @@ test('a forced refresh reads list and details itself even when shared data is cu
   } finally { delete globalThis.__bp.liveRows }
 })
 
-test('sharedDetail: board, id, staleness, pending and the TTL are all checked', () => {
+test('sharedDetail: only a trusted record within the TTL; board, id, staleness and pending checked; its own time kept', () => {
   const t = { id: 't_x', board: 'default', connectionId: 'local', readProfile: 'default' }
   const now = Date.now()
-  const sp = (rec, vouched = false) => ({ cachedCard: () => rec, feedVouches: () => vouched })
-  const rec = extra => ({ detail: slim('t_x'), board: 'default', at: now, stale: false, pending: false, ...extra })
-  assert.ok(m.sharedDetail(t, 's', now, sp(rec())))
+  const sp = rec => ({ cachedCard: () => rec })
+  const rec = extra => ({ detail: slim('t_x'), board: 'default', at: now - 5_000, trusted: true, stale: false, pending: false, ...extra })
+  assert.deepEqual(m.sharedDetail(t, 's', now, sp(rec())), { detail: slim('t_x'), at: now - 5_000 }, 'the record keeps its own time')
+  assert.equal(m.sharedDetail(t, 's', now, sp(rec({ trusted: false }))), null, 'an untrusted / unvouched record')
+  assert.equal(m.sharedDetail(t, 's', now, sp(rec({ trusted: undefined }))), null, 'an older session-panel without the flag')
   assert.equal(m.sharedDetail({ ...t, readProfile: undefined }, 's', now, sp(rec())), null, 'a row not read through the owner route')
   assert.equal(m.sharedDetail(t, 's', now, sp(rec({ board: 'ops' }))), null, 'another board under the same id')
   assert.equal(m.sharedDetail(t, 's', now, sp(rec({ detail: slim('t_y') }))), null, 'another card')
   assert.equal(m.sharedDetail(t, 's', now, sp(rec({ stale: true }))), null)
   assert.equal(m.sharedDetail(t, 's', now, sp(rec({ pending: true }))), null)
-  assert.equal(m.sharedDetail(t, 's', now, sp(rec({ at: now - 61_000 }))), null, 'older than the detail TTL')
-  assert.ok(m.sharedDetail(t, 's', now, sp(rec({ at: now - 61_000 }), true)), 'unless the feed vouches for the chat')
+  assert.equal(m.sharedDetail(t, 's', now, sp(rec({ at: now - 61_000 }))), null, 'older than the detail TTL, trusted or not')
+  assert.equal(m.sharedDetail(t, 's', now, sp(rec({ at: now + 5_000 }))), null, 'a time in the future')
   assert.equal(m.sharedDetail(t, 's', now, sp(rec({ detail: null }))), null, 'a read-only summary (no detail)')
   assert.equal(m.sharedDetail(t, 's', now, null), null, 'session-panel not loaded')
+})
+
+test('sharedOwnerRows checks the age it is given: 15 s for a read, 60 s for a feed push', () => {
+  const now = Date.now(), route = { connectionId: 'local', profile: 'default' }
+  const st = (at, feed) => ({ kanbanRows: () => ({ rows: [row('t_r')], at, feed }) })
+  assert.equal(m.sharedOwnerRows('s', ['s'], route, now, st(now - 10_000, false)).length, 1)
+  assert.equal(m.sharedOwnerRows('s', ['s'], route, now, st(now - 16_000, false)), null, 'an old read')
+  assert.equal(m.sharedOwnerRows('s', ['s'], route, now, st(now - 50_000, true)).length, 1, 'a recent push')
+  assert.equal(m.sharedOwnerRows('s', ['s'], route, now, st(now - 61_000, true)), null, 'pushes stopped')
+  assert.equal(m.sharedOwnerRows('s', ['s'], route, now, st(undefined, false)), null, 'no time: not current')
+  assert.equal(m.sharedOwnerRows('s', ['s'], route, now, st(now + 1_000, false)), null, 'a time in the future')
+})
+
+test('an untrusted detail or an old list is not taken: read here', async () => {
+  globalThis.__bp.stored = 's-untrusted'
+  globalThis.__bp.liveRows = [row('t_ask6')]
+  const { reads } = wire({ lineage: new Set(['s-untrusted']), rows: [row('t_ask6')], rowsAt: Date.now() - 20_000, card: id => slim(id), trusted: false })
+  try {
+    await m.refresh()
+    assert.equal(reads('/api/session-kanban-tasks').length, 1, 'list older than 15 s: read')
+    assert.ok(reads('/api/plugins/kanban/tasks/').some(c => /t_ask6/.test(c.path)), 'untrusted detail: read')
+  } finally { delete globalThis.__bp.liveRows }
+})
+
+test('unblocking a card forces a read of everything (never a neighbour copy taken before the change)', async () => {
+  globalThis.__bp.stored = 's-act'
+  const rows = [row('t_ask7')]
+  globalThis.__bp.liveRows = rows
+  const { calls, reads } = wire({ lineage: new Set(['s-act']), rows, card: id => slim(id) })
+  try {
+    await m.refresh()
+    assert.equal(reads('/api/session-kanban-tasks').length, 0, 'before: shared')
+    calls.length = 0
+    await m.unblockCard({ id: 't_ask7', board: 'default', connectionId: 'local' }, '', async () => ({ ok: true }))
+    await settle()
+    assert.equal(reads('/api/session-kanban-tasks').length, 1, 'after the action: read here')
+    assert.ok(!calls.some(c => c.shared === 'rows'))
+  } finally { delete globalThis.__bp.liveRows }
 })

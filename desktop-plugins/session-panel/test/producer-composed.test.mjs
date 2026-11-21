@@ -275,12 +275,10 @@ test('producer: blocked-panel takes the owner list and lineage from the real ses
   try {
     await React.act(async () => { await blocked.refresh(true); await flush() })
     const own = window.__blockedPanel.snapshot.items.map(i => [i.connectionId, i.profile, i.board, i.id, i.text])
-    // Earlier tests read this chat (S1) against other answers: let session-tasks' list read come due, so the rows it
-    // offers are this world's (as they would be: a real board does not change answers between reads).
+    // Earlier tests read this chat (S1) against other answers: session-tasks reads this world's list now (as its
+    // next poll would; a real board does not change answers between reads).
     tasksPlugin.resetRowsForTests()
-    const realNow = Date.now
-    Date.now = () => realNow() + 11_000
-    try { await React.act(async () => { await window.__sessionTasks.refresh(); await flush() }) } finally { Date.now = realNow }
+    await tasksPlugin.loadKanban(new Set(['S1']), { connectionId: 'C1', profile: 'default' })
     calls.length = 0
     await React.act(async () => { await blocked.refresh(); await flush() })
     const lists = calls.filter(c => c.path.startsWith('/api/session-kanban-tasks'))

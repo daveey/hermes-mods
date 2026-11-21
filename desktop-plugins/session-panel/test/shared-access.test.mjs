@@ -17,6 +17,7 @@ function memoryStorage() {
 }
 globalThis.window = { localStorage: memoryStorage() }
 const m = await import('../plugin.js')
+const blocked = await import('../../blocked-panel/plugin.js')
 
 function fakeDoc(hidden = false) {
   const handlers = new Set()
@@ -98,4 +99,41 @@ test('window.__sessionPanel exposes the read-only doors', () => {
     for (const k of ['cachedCard', 'feedVouches', 'feedIsLive']) assert.equal(typeof window.__sessionPanel[k], 'function', k)
     assert.equal(window.__sessionPanel.feedVouches({ connectionId: 'C1', profile: 'default', session: 'S1' }), false, 'no push seen')
   } finally { dispose() }
+})
+
+const settle = () => new Promise(r => setTimeout(r, 0))
+const feedAnswer = extra => ({ feed: 'hub:1', profile: 'default', epoch: 'E1', rev: 3, bundles: {}, ...extra })
+const askBundle = () => ({ session: 'S1', lineage: ['S1'], tasks: [], cards: { t_aaaaaa1: slim('t_aaaaaa1', 'blocked') } })
+const row = { id: 't_aaaaaa1', board: 'default', connectionId: 'C1', readProfile: 'default' }
+const sp = () => ({ cachedCard: m.cachedCard, feedVouches: m.feedVouches })
+
+test('an untrusted (catch-up only) bundle detail never reaches blocked-panel; a trusted, vouched one does', async () => {
+  const calls = []
+  window.hermesDesktop = { api: async req => { calls.push(req); return window.__answer(req) } }
+  // Catch-up answer before any push: an ordinary cached copy.
+  window.__answer = () => feedAnswer({ bundles: { S1: askBundle() } })
+  await m.feedCatchUp({ connectionId: 'C1', profile: 'default', sessions: ['S1'] })
+  const untrusted = m.cachedCard({ connectionId: 'C1', profile: 'default' }, 't_aaaaaa1')
+  assert.ok(untrusted.detail, 'the detail is cached')
+  assert.equal(untrusted.trusted, false)
+  assert.equal(blocked.sharedDetail(row, 'S1', Date.now(), sp()), null, 'blocked-panel does not take it')
+  // Pushes start: the full catch-up is trusted and the chat vouched.
+  window.__answer = () => feedAnswer({ bundles: { S1: askBundle() } })
+  m.onFeedEvent({ type: m.FEED_EVENT, payload: { feed: 'hub:1', profile: 'default', epoch: 'E1', prev: 3, rev: 3, heartbeat: true, fresh: ['S1'] } })
+  await settle(); await settle()
+  const trusted = m.cachedCard({ connectionId: 'C1', profile: 'default' }, 't_aaaaaa1')
+  assert.equal(trusted.trusted, true)
+  const taken = blocked.sharedDetail(row, 'S1', Date.now(), sp())
+  assert.equal(taken.detail.task.id, 't_aaaaaa1')
+  assert.equal(taken.at, trusted.at, 'its own confirmation time')
+  // The gateway stops vouching for the chat (a heartbeat without it): no longer trusted.
+  m.onFeedEvent({ type: m.FEED_EVENT, payload: { feed: 'hub:1', profile: 'default', epoch: 'E1', prev: 3, rev: 3, heartbeat: true, fresh: [] } })
+  assert.equal(m.cachedCard({ connectionId: 'C1', profile: 'default' }, 't_aaaaaa1').trusted, false)
+  assert.equal(blocked.sharedDetail(row, 'S1', Date.now(), sp()), null)
+  // A later untrusted bundle for the chat withdraws the trusted scope.
+  m.onFeedEvent({ type: m.FEED_EVENT, payload: { feed: 'hub:1', profile: 'default', epoch: 'E1', prev: 3, rev: 3, heartbeat: true, fresh: ['S1'] } })
+  assert.equal(m.cachedCard({ connectionId: 'C1', profile: 'default' }, 't_aaaaaa1').trusted, true)
+  m.ingestBundle('C1', 'default', askBundle(), { trusted: false })
+  assert.equal(m.cachedCard({ connectionId: 'C1', profile: 'default' }, 't_aaaaaa1').trusted, false)
+  assert.ok(!calls.some(c => String(c.path).startsWith('/api/plugins/kanban/tasks/')), 'no card read by either')
 })

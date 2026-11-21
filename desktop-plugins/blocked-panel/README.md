@@ -46,17 +46,24 @@ them while it is current and reads only what is missing:
 - **Lineage**: session-tasks' `lineageIds` (its cache, kept across launches and filled by the gateway feed). An
   incomplete ancestry, or no session-tasks, walks it here as before.
 - **The owner gateway's card list**: session-tasks' `kanbanRows` (the raw `/api/session-kanban-tasks` rows of its own
-  read of the same route and lineage, within 15 s, or of a feed-kept chat). They get the same owner-route
-  qualification as a read here (`withOwnerRoute`). Other registered gateways and hub `session-links` are still read
-  here: session-tasks does not hold them.
+  read of the same route and lineage, or of a feed-kept chat). Its `at` is checked here too: a read at most 15 s old,
+  a feed push at most 60 s old. The rows get the same owner-route qualification as a read here (`withOwnerRoute`).
+  Other registered gateways and hub `session-links` are still read here: session-tasks does not hold them.
 - **A blocked card's detail**: session-panel's card cache (`window.__sessionPanel.cachedCard`, which never starts a
-  read) when the gateway feed pushed the card's detail, for the same connection, profile, board and id, not stale or
-  pending, and either the feed vouches for the chat (`feedVouches`) or it was confirmed within the 60 s detail TTL.
-  A pushed detail has no comments, so the step rewrite reads the card once (as before) for its comments.
-- A forced `refresh(true)` reads everything itself.
+  read), only for a record that came in a trusted bundle of a chat the live feed vouches for (`trusted`), for the
+  same connection, profile, board and id, not stale or pending, and confirmed within the 60 s detail TTL (its `at`).
+  It is kept with that `at`, so it ages from its confirmation. A catch-up-only (untrusted) or unvouched record is
+  never taken. A pushed detail has no comments, so the step rewrite reads the card once (as before).
+- A forced `refresh(true)` reads everything itself. A refresh asked for while one runs waits and then runs once
+  (forced if any caller asked), so a forced read is never swallowed by a poll in flight. Actions force one:
+  `unblockCard`, and user-steps after a recorded decision, a withdrawal or a list answer
+  (`refreshBlockedAfterAction`).
 
 Tests: `test/shared-caches.test.mjs` (current data: no lineage, list or detail reads, steady state; identical
-snapshot to a live read; stale/missing data read here; no neighbours; forced refresh; the detail checks) and
+snapshot to a live read; stale/missing/untrusted data read here; list age checks; no neighbours; forced refresh;
+unblocking forces a read; the detail checks), `../session-panel/test/shared-access.test.mjs` (an untrusted bundle's
+detail never reaches blocked-panel, a trusted vouched one does), `../user-steps/test/kanban-question.test.mjs`
+(a recorded decision forces blocked-panel's refresh) and
 `../session-panel/test/producer-composed.test.mjs` (real session-tasks feeding blocked-panel: the owner list is not
 read again, the other gateway still is, identical qualified items).
 

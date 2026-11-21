@@ -42,6 +42,10 @@ const ID = 'blocked-panel'
 const POLL_MS = 10_000
 const DETAIL_TTL_MS = 60_000
 const LINEAGE_TTL_MS = 5 * 60_000
+// How old a neighbour's answer may be and still stand in for a read here: session-tasks' own read (it re-reads every
+// 10 s) or a feed push (heartbeats every 20 s; three missed = stale, as session-panel judges it).
+export const SHARED_ROWS_MAX_AGE_MS = 15_000
+export const SHARED_FEED_MAX_AGE_MS = 60_000
 const PARKED_KEY = 'hermes.desktop.blockedSessionIds'
 const COLLAPSED_LINES = 4
 
@@ -508,7 +512,10 @@ export async function unblockCard(item, note = '', call = api) {
       body: { body, author: 'user' }
     })
   }
-  return call(taskPath(item.id, item.board), { ...route, method: 'PATCH', body: { status: 'ready' } })
+  const result = await call(taskPath(item.id, item.board), { ...route, method: 'PATCH', body: { status: 'ready' } })
+  // The card changed: read it ourselves now, never from a neighbour's copy taken before the change.
+  void refresh(true)
+  return result
 }
 
 /** Open the card's drawer: core hook → task-mentions popup → Kanban page. */
@@ -579,7 +586,6 @@ let snapshot = { stored: null, items: [], issues: [], parked: false }
 const subs = new Set()
 const details = new Map() // detailKey → { at, data }
 let timer = null
-let running = false
 let rerun = false
 const rewrites = new Map() // rewriteKey → { status: 'pending'|'done'|'failed', steps, at }
 let backend = { ok: null, at: 0 } // blocked-panel agent plugin present?
@@ -644,17 +650,17 @@ async function requestRewrites(items, detailMap) {
 
 const emit = () => subs.forEach(fn => fn(snapshot))
 
-/** session-panel's cached kanban detail for an owner-route row (the gateway feed pushes it), when current: the
- *  chat is feed-vouched or the record was confirmed within DETAIL_TTL_MS. Never starts a read. */
+/** session-panel's cached kanban detail for an owner-route row, `{ detail, at }`, only when the gateway feed pushed it
+ *  in a trusted bundle of a chat the live feed vouches for (`trusted`) and it was confirmed within DETAIL_TTL_MS (`at`).
+ *  An untrusted (catch-up only) or aged record is never taken. Never starts a read. */
 export function sharedDetail(t, stored, nowMs = Date.now(), sp = typeof window !== 'undefined' ? window.__sessionPanel : null) {
   if (!t?.readProfile || !t.connectionId || typeof sp?.cachedCard !== 'function') return null
   let rec = null
   try { rec = sp.cachedCard({ connectionId: t.connectionId, profile: t.readProfile, board: str(t.board) || 'default' }, str(t.id), nowMs) } catch { return null }
   const task = rec?.detail?.task
-  if (!task || rec.stale || rec.pending || str(task.id) !== str(t.id) || (str(rec.board) || 'default') !== (str(t.board) || 'default')) return null
-  let vouched = false
-  try { vouched = !!stored && typeof sp.feedVouches === 'function' && sp.feedVouches({ connectionId: t.connectionId, profile: t.readProfile, session: stored }, nowMs) } catch {}
-  return vouched || nowMs - Number(rec.at) < DETAIL_TTL_MS ? rec.detail : null
+  if (!task || rec.trusted !== true || rec.stale || rec.pending || str(task.id) !== str(t.id) || (str(rec.board) || 'default') !== (str(t.board) || 'default')) return null
+  const at = Number(rec.at)
+  return Number.isFinite(at) && nowMs - at >= 0 && nowMs - at < DETAIL_TTL_MS ? { detail: rec.detail, at } : null
 }
 
 async function loadDetails(tasks, { stored = null, shared = true } = {}) {
@@ -666,8 +672,9 @@ async function loadDetails(tasks, { stored = null, shared = true } = {}) {
         const k = detailKey(t)
         const pushed = shared ? sharedDetail(t, stored, now) : null
         if (pushed) {
-          if (pushed.task?.status) t.status = pushed.task.status
-          details.set(k, { at: now, data: pushed })
+          if (pushed.detail.task?.status) t.status = pushed.detail.task.status
+          // Kept with the record's own time: it ages from when it was confirmed, not from when we took it.
+          details.set(k, { at: pushed.at, data: pushed.detail })
           return
         }
         const hit = details.get(k)
@@ -688,25 +695,46 @@ async function loadDetails(tasks, { stored = null, shared = true } = {}) {
   )
 }
 
-/** session-tasks' current `/api/session-kanban-tasks` rows for the focused chat's owner read, or null. */
-function sharedOwnerRows(stored, ids, route = ownerRoute()) {
-  const st = typeof window !== 'undefined' ? window.__sessionTasks : null
+/** session-tasks' current `/api/session-kanban-tasks` rows for the focused chat's owner read, or null. Its `at` is
+ *  checked here too: its own read within SHARED_ROWS_MAX_AGE_MS, a feed push within SHARED_FEED_MAX_AGE_MS. */
+export function sharedOwnerRows(stored, ids, route = ownerRoute(), nowMs = Date.now(), st = typeof window !== 'undefined' ? window.__sessionTasks : null) {
   if (!route?.connectionId || typeof st?.kanbanRows !== 'function') return null
   try {
-    const r = st.kanbanRows({ connectionId: route.connectionId, profile: route.profile || 'default', session: stored }, ids)
-    return Array.isArray(r?.rows) ? r.rows : null
+    const r = st.kanbanRows({ connectionId: route.connectionId, profile: route.profile || 'default', session: stored }, ids, nowMs)
+    const age = nowMs - Number(r?.at)
+    const max = r?.feed ? SHARED_FEED_MAX_AGE_MS : SHARED_ROWS_MAX_AGE_MS
+    return Array.isArray(r?.rows) && age >= 0 && age <= max ? r.rows : null
   } catch {
     return null
   }
 }
 
-export async function refresh(force = false) {
+// A refresh asked for while one runs waits for it and then runs once (forced if any caller asked for force), so a
+// forced read after an action is never swallowed by a poll already in flight. Callers awaiting it get that run.
+let running = null
+let queued = null // { force, promise }
+export function refresh(force = false) {
   if (running) {
-    rerun = true
-    return
+    if (queued) queued.force = queued.force || force
+    else {
+      const q = { force }
+      q.promise = running.catch(() => {}).then(() => { if (queued === q) queued = null; return refresh(q.force) })
+      queued = q
+    }
+    return queued.promise
   }
-  if (typeof document !== 'undefined' && document.hidden && !force) return
-  running = true
+  if (typeof document !== 'undefined' && document.hidden && !force) return Promise.resolve()
+  running = refreshNow(force).finally(() => {
+    running = null
+    if (rerun && !queued) {
+      rerun = false
+      void refresh()
+    }
+  })
+  return running
+}
+
+async function refreshNow(force) {
   try {
     const stored = host.state.focusedStoredSessionId.get()
     const connection = activeConnection()
@@ -738,12 +766,6 @@ export async function refresh(force = false) {
     void requestRewrites(items, flat)
   } catch (e) {
     log('refresh failed', e)
-  } finally {
-    running = false
-    if (rerun) {
-      rerun = false
-      void refresh()
-    }
   }
 }
 

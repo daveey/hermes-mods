@@ -116,7 +116,8 @@ it stops, and showing the window again reads once at once. Test: `test/shared-ac
 ## Read-only doors for other plugins
 
 `window.__sessionPanel` also carries `cachedCard(chip, id)` (one card-cache record, including the pushed kanban
-`detail` when the gateway feed sent one; it never starts a read), `feedVouches(route)` and `feedIsLive(route)`.
+`detail` when the gateway feed sent one, its `at`, and `trusted`: it came in a trusted bundle of a chat the live feed
+vouches for now; it never starts a read), `feedVouches(route)` and `feedIsLive(route)`.
 blocked-panel uses them to take a blocked card's detail without reading it again. Test: `test/shared-access.test.mjs`.
 
 ## Pushed from the gateway

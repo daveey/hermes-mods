@@ -266,6 +266,12 @@ export function dismissIssues(list) {
 function blockedPanel() {
   return typeof window !== 'undefined' ? window.__blockedPanel : null
 }
+/** A decision, withdrawal or list answer can change a Kanban card (its ask delivered, the card unblocked): have
+ *  blocked-panel read the cards itself now (forced: never from a neighbour's copy taken before the change). */
+export function refreshBlockedAfterAction(bp = blockedPanel()) {
+  try { if (typeof bp?.refresh === 'function') { void bp.refresh(true); return true } } catch {}
+  return false
+}
 const matchingBlocked = (s, route) => s?.stored === route.session && (!s.connectionId || s.connectionId === route.connectionId) && (!s.profile || s.profile === route.profile)
 
 function attachKanban() {
@@ -1082,6 +1088,7 @@ export function DecisionRow({ request, route, call = api, unavailable = false, p
         update({ request: recorded }); saveReadback(route, recorded)
       }
       apply(await readOperation(operationId(result.operation))) // POST success alone is never confirmation
+      refreshBlockedAfterAction()
       if (live.current && currentRoute(route)) setEditing(null)
     } catch (e) {
       if (!currentRoute(route)) return
@@ -1129,6 +1136,7 @@ export function DecisionRow({ request, route, call = api, unavailable = false, p
       const done = result?.request
       if (validRequest(done) && done.state === 'withdrawn' && requestKey(done) === requestKey(r) && done.owner.storedSessionId === route.session) saveReadback(route, done)
       await refreshRequests(call)
+      refreshBlockedAfterAction()
     } catch (e) {
       if (!currentRoute(route)) return
       if (errorStatus(e) === 409) {
@@ -1363,6 +1371,7 @@ export function DecisionList({ attrs, deps }) {
       const result = await call(`${BASE}/lists/${encodeURIComponent(sourceId)}/answers`, { ...route, method: 'POST', body: { session: route.session, snapshotDigest: list.digest, n, idempotencyKey: keys.current.get(kk) } })
       if (!currentRoute(route)) return
       setState(st => ({ ...st, sent: { n, delivery: str(result?.operation?.dispatchState) || 'recorded' }, busy: false }))
+      refreshBlockedAfterAction()
     } catch (e) {
       if (currentRoute(route)) setState(st => ({ ...st, busy: false, error: `Outcome unknown: ${e.message}. The answer may or may not have been recorded. Retry (the same request key is reused, so it cannot be applied twice) or check the decision queue.` }))
     } finally { busy.current = false }

@@ -25,8 +25,9 @@
  *
  * Hidden when nothing is running. Ticks every 5 s while the window is visible: kanban cards are read every 10 s,
  * machines every 30 s; `process.list` + `subagent.list` are read when the focused runtime's gateway events say they
- * changed (`subagent.start` / `.complete`, a `terminal` / `process` tool call finishing, a `status.update` of kind
- * `process`), on a new runtime or chat, after a failed read, and otherwise every 30 s (RPC_FALLBACK_MS).
+ * changed (`subagent.start` / `.complete`, a `terminal` / `process_manage` tool call finishing, a `status.update` of
+ * kind `process`, the turn's `message.complete`), when the socket reconnects (`gateway.ready`, the gateway state, a
+ * moved work-source epoch), on a new runtime or chat, after a failed read, and otherwise every 15 s (RPC_FALLBACK_MS).
  * blocked-panel takes this plugin's lineage and raw kanban rows (`kanbanRows`) instead of reading them again.
  * Known-owner kanban chips open the qualified Kanban drawer (never ambient
  * task mentions); unresolved owners are non-clickable. A machine chip opens the
@@ -920,14 +921,18 @@ function rememberRows(route, ids, rows) {
   rowsCache.set(k, { rows, at: Date.now() })
   while (rowsCache.size > ROWS_MAX) rowsCache.delete(rowsCache.keys().next().value)
 }
-/** `{ rows, at }` (copies) for the chat `{ connectionId, profile, session }` and its lineage `ids` when this plugin
- *  holds a current answer: read within ROWS_FRESH_MS, or the chat is feed-kept (pushes keep it current). Else null. */
+/** `{ rows, at, feed }` (copies) for the chat `{ connectionId, profile, session }` and its lineage `ids` when this
+ *  plugin holds a current answer: read within ROWS_FRESH_MS (`at` = the read, `feed` false), or the chat is feed-kept
+ *  (`at` = the last push that re-stamped it, `feed` true, current within FEED_STALE_MS). Else null. */
 export function kanbanRows({ connectionId, profile = 'default', session } = {}, ids, nowMs = Date.now()) {
   if (!connectionId || !ids) return null
   const hit = rowsCache.get(rowsKey({ connectionId, profile }, ids))
   if (!hit) return null
-  const current = nowMs - hit.at <= ROWS_FRESH_MS || (!!session && feedFresh(JSON.stringify([connectionId, profile || 'default', session]), null, nowMs))
-  return current ? { rows: hit.rows.map(r => ({ ...r })), at: hit.at } : null
+  const copy = () => hit.rows.map(r => ({ ...r }))
+  if (nowMs - hit.at <= ROWS_FRESH_MS) return { rows: copy(), at: hit.at, feed: false }
+  const scope = session ? JSON.stringify([connectionId, profile || 'default', session]) : null
+  if (scope && feedFresh(scope, null, nowMs)) return { rows: copy(), at: cachedChips(scope).feedAt, feed: true }
+  return null
 }
 export const resetRowsForTests = () => rowsCache.clear()
 
@@ -1138,6 +1143,8 @@ export async function refresh() {
     // must not throw them away; only process/sub-agent chips belong to one runtime session.
     const capturedFocus = focusGeneration
     const capturedRuntime = runtimeGeneration
+    // Keyed by chat and runtime: core records each source read per stored chat, so a switch reads (and reports) anew.
+    const rpcKey = JSON.stringify([scope, runtime])
     const stillFocused = () => {
       observeFocusAuthority()
       return focusGeneration === capturedFocus && focusScope().scope === scope
@@ -1146,7 +1153,11 @@ export async function refresh() {
     const begin = source => {
       if (!stored || !route.connectionId) return
       const read = { connectionId: route.connectionId, profile: route.profile, storedSessionId: stored, source }
-      tokens.set(source, host.sessions?.beginWorkSourceRead?.(read) || read)
+      const token = host.sessions?.beginWorkSourceRead?.(read) || read
+      tokens.set(source, token)
+      // Core re-epochs a chat's sources together (socket state, rebinding). An epoch the last process/sub-agent read
+      // was not reported under means that read no longer counts: re-read them now (this round, or right after it).
+      noteEpoch(rpcKey, source, token.authorityEpoch)
     }
     // Publish actual source failures to core's completion veto, qualified to this owner/chat.
     // Older renderers lack the optional API; never fabricate task/outcome state as a fallback.
@@ -1194,11 +1205,9 @@ export async function refresh() {
     // Process / sub-agent rows are read when the runtime's gateway says they changed (onRuntimeEvent), on a new
     // runtime, after a failed read, and every RPC_FALLBACK_MS; between reads the last answer for this runtime stands.
     // Only a read that runs is begun and reported to core's work-source veto.
-    // Keyed by chat and runtime: core records each source read per stored chat, so a switch reads (and reports) anew.
-    const rpcKey = JSON.stringify([scope, runtime])
     if (runtime && rpcLast.key === rpcKey) { procs = rpcLast.procs; subagents = rpcLast.subagents }
     const rpcDue = !!runtime && (rpcDirty || rpcLast.key !== rpcKey || Date.now() - rpcLast.at >= RPC_FALLBACK_MS)
-    if (rpcDue) { rpcDirty = false; begin('process'); begin('subagent') }
+    if (rpcDue) { rpcDirty = false; rpcStarted = rpcKey; begin('process'); begin('subagent') } else rpcStarted = null
     const rpc = rpcDue
       ? Promise.all([
           safe(() => host.request('process.list', { session_id: runtime }), null),
@@ -1308,24 +1317,64 @@ export async function refresh() {
 
 // ── process / sub-agent rows follow the runtime's own events ──────────────
 // The gateway already emits these for the focused runtime session: a sub-agent starting or finishing
-// (`subagent.start` / `.complete`, tui_gateway/contracts/events.py), a `terminal` or `process` tool call finishing
-// (a background process started, was killed or waited on) and a process notice (`status.update` kind `process`:
-// a background process finished or matched a watch). Core has no dedicated process start/exit event; these cover
-// what the agent does with processes. Each schedules one coalesced re-read of `process.list` + `subagent.list`;
-// RPC_FALLBACK_MS keeps a slow safety-net poll for anything the events miss (an exit with no notice).
-export const RPC_FALLBACK_MS = 30_000
+// (`subagent.start` / `.complete`, tui_gateway/contracts/events.py), a `terminal` or `process_manage` tool call
+// finishing (a background process started, was killed or waited on), a process notice (`status.update` kind
+// `process`: a background process finished or matched a watch) and the turn ending (`message.complete`: with tool
+// progress off no tool.complete arrives). Core has no dedicated process start/exit event. Each schedules one
+// coalesced re-read of `process.list` + `subagent.list`; RPC_FALLBACK_MS keeps a safety-net poll for anything the
+// events miss (an exit with no notice, a runtime-only re-epoch).
+export const RPC_FALLBACK_MS = 15_000
 export const RPC_EVENT_DEBOUNCE_MS = 250
-export const RPC_EVENTS = ['subagent.start', 'subagent.complete', 'tool.complete', 'status.update']
-const PROCESS_TOOLS = new Set(['terminal', 'process'])
+// `message.complete`: the turn ended (with tool progress off no tool.complete arrives); `gateway.ready`: a socket
+// (re)connected, so core re-epoched the chat's work sources and the last read no longer counts.
+export const RPC_EVENTS = ['subagent.start', 'subagent.complete', 'tool.complete', 'status.update', 'message.complete', 'gateway.ready']
+// Core's tool names: `terminal` (starts background processes) and `process_manage` (list/poll/wait/kill/write).
+export const PROCESS_TOOLS = new Set(['terminal', 'process_manage'])
 let rpcLast = { key: null, procs: null, subagents: null, at: 0 }
 let rpcDirty = false
+let rpcStarted = null // the chat+runtime key whose process/sub-agent read this round started, else null
 let rpcEventTimer = null
-export const resetRpcForTests = () => { rpcLast = { key: null, procs: null, subagents: null, at: 0 }; rpcDirty = false; clearTimeout(rpcEventTimer); rpcEventTimer = null }
+let rpcEpochs = new Map() // chat+runtime key -> { source: last authority epoch seen }
+export const resetRpcForTests = () => { rpcLast = { key: null, procs: null, subagents: null, at: 0 }; rpcDirty = false; rpcStarted = null; rpcEpochs = new Map(); clearTimeout(rpcEventTimer); rpcEventTimer = null }
+
+/** A begun read's authority epoch. The lineage/tasks (durable) epoch moves whenever core re-epochs the chat (socket
+ *  state, rebinding; the runtime epoch moves with it), so a change seen there means the last process/sub-agent read
+ *  can no longer clear the chat's veto: mark them due and run the next round at once. A runtime-only re-epoch (a
+ *  tile mounting) is not visible to plugins; the RPC_FALLBACK_MS poll covers it. */
+function noteEpoch(key, source, epoch) {
+  if (!Number.isSafeInteger(epoch)) return
+  const seen = rpcEpochs.get(key) || {}
+  const before = seen[source]
+  seen[source] = epoch
+  rpcEpochs.delete(key); rpcEpochs.set(key, seen)
+  while (rpcEpochs.size > 50) rpcEpochs.delete(rpcEpochs.keys().next().value)
+  if (source === 'process' || source === 'subagent' || before === undefined || before === epoch) return
+  // This round's process/sub-agent read was begun under the new epoch already: it counts.
+  if (rpcLast.key !== key || rpcStarted === key) return
+  rpcDirty = true
+  scheduleRpcRefresh(0)
+}
+
+function scheduleRpcRefresh(delay = RPC_EVENT_DEBOUNCE_MS) {
+  if (rpcEventTimer) return
+  rpcEventTimer = setTimeout(() => { rpcEventTimer = null; void refresh() }, delay)
+  rpcEventTimer?.unref?.()
+}
+
+/** The gateway socket's state changed (reconnect, drop): the chat's work-source epoch moved with it. */
+export function onGatewayState() {
+  rpcDirty = true
+  scheduleRpcRefresh()
+}
 
 /** True when `ev` says the focused runtime's processes or sub-agents may have changed. */
-export function runtimeWorkChanged(ev, runtime) {
-  if (!ev || !runtime || ev.session_id !== runtime) return false
+export function runtimeWorkChanged(ev, runtime, connectionId = null) {
+  if (!ev || !runtime) return false
+  // A (re)connected socket: the focused chat's gateway, or any when the event names none.
+  if (ev.type === 'gateway.ready') return !ev.connectionId || !connectionId || ev.connectionId === connectionId
+  if (ev.session_id !== runtime) return false
   const p = ev.payload || {}
+  if (ev.type === 'message.complete') return true
   if (ev.type === 'subagent.start' || ev.type === 'subagent.complete') return true
   if (ev.type === 'tool.complete') return PROCESS_TOOLS.has(str(p.name))
   if (ev.type === 'status.update') return p.kind === 'process'
@@ -1334,14 +1383,11 @@ export function runtimeWorkChanged(ev, runtime) {
 
 /** Gateway event tap: mark the rows due and refresh once the burst settles. Exported for tests. */
 export function onRuntimeEvent(ev) {
-  let runtime = null
-  try { runtime = host.state.focusedSessionId.get() } catch { return false }
-  if (!runtimeWorkChanged(ev, runtime)) return false
+  let runtime = null, connectionId = null
+  try { runtime = host.state.focusedSessionId.get(); connectionId = focusedRoute().connectionId } catch { return false }
+  if (!runtimeWorkChanged(ev, runtime, connectionId)) return false
   rpcDirty = true
-  if (!rpcEventTimer) {
-    rpcEventTimer = setTimeout(() => { rpcEventTimer = null; void refresh() }, RPC_EVENT_DEBOUNCE_MS)
-    rpcEventTimer?.unref?.()
-  }
+  scheduleRpcRefresh()
   return true
 }
 
@@ -1607,6 +1653,11 @@ export default {
     // Process / sub-agent rows re-read on the focused runtime's own events (RPC_EVENTS), not every tick.
     const listen = typeof ctx.onEvent === 'function' ? ctx.onEvent : host?.onEvent
     const offEvents = typeof listen === 'function' ? RPC_EVENTS.map(type => listen(type, onRuntimeEvent)) : []
+    // The gateway socket's state (reconnects): core re-epochs the chat's sources, so the rows are read again.
+    let lastGateway
+    try { lastGateway = host.state.gateway?.get?.() } catch {}
+    const onGateway = v => { const now = typeof v === 'string' ? v : host.state.gateway?.get?.(); if (now !== lastGateway) { lastGateway = now; onGatewayState() } }
+    offEvents.push(host.state.gateway?.listen?.(onGateway) || host.state.gateway?.subscribe?.(onGateway))
     window.__sessionTasks = { version: 'wait-visible-v1', get snapshot() { return snapshot }, refresh, subscribe, openTaskChip, lineageIds, focusedRoute, warm, cachedSnapshot, ingestFeed, touchFeed, feedFresh, kanbanRows, activityLabel, connectionForHubGateway }
     return () => {
       for (const stop of stops) stop?.()
