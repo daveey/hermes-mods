@@ -120,7 +120,7 @@ test('readable waits: how long it has waited, how long is left, how late, and a 
 
 test('card references read "Title" (t_x): this chat\'s cards, else a read on the owner (or chat) route, board then default', async () => {
   const chip = { kind: 'kanban', id: 't_child', connectionId: 'C9', profile: 'default', board: 'ops' }
-  m.noteTitles([{ kind: 'kanban', id: 't_aaaaaaaa', label: 'Sibling card', connectionId: 'C9', profile: 'default', board: 'default' }])
+  m.noteTitles([{ kind: 'kanban', id: 't_aaaaaaaa', label: 'Sibling card', connectionId: 'C9', profile: 'default', board: 'ops' }])
   assert.equal(m.waitLabel('waiting on card t_aaaaaaaa for 1m', chip), 'waiting on card "Sibling card" (t_aaaaaaaa) for 1m')
   const reads = []
   const read = (r, id) => { reads.push([r.connectionId, r.profile, r.board, id]); return Promise.resolve(id === 't_bbbbbbbb' ? { title: 'Fetched title', board: 'default' } : { title: '' }) }
