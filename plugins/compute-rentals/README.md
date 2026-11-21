@@ -4,7 +4,11 @@ A read-only inventory of the GPU and compute you're renting, across clouds, in o
 It also keeps a local registry that records which Hermes session started which box, so idle boxes
 can be traced back to a session. It never creates, stops or changes anything in a cloud.
 
-Desktop half: [desktop-plugins/compute-rentals](../../desktop-plugins/compute-rentals/).
+Desktop half: [desktop-plugins/compute-rentals](../../desktop-plugins/compute-rentals/). The panel reads
+`/inventory` every 30 s and shares its last answer read-only as `window.__computeRentals.inventory`
+(`{ connectionId, profile, at, data }`); session-tasks' machine chips use it while it is under 30 s old for the same
+connection and profile instead of reading the same route themselves (tests: `tests/plugin.test.mjs`, "the last
+inventory answer is shared"; `desktop-plugins/session-tasks/test/shared-sources.test.mjs`).
 
 ## Providers
 

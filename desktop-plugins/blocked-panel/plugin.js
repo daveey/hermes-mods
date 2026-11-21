@@ -22,6 +22,11 @@
  * Data: `/api/session-kanban-tasks?ids=<lineage>` (every board) + per blocked card
  * `/api/plugins/kanban/tasks/<id>?board=<slug>` (events → reason/kind/human_request). Polls every
  * 10 s while visible; card details are cached 60 s or until the blocked set changes.
+ * Shared first: the lineage comes from session-tasks (`lineageIds`), the owner gateway's list from session-tasks'
+ * current answer (`kanbanRows`: its own read within 15 s, or a feed-kept chat) and a blocked card's detail from
+ * session-panel's card cache when the gateway feed pushed it and it is current (`cachedCard` + `feedVouches`).
+ * Each is read here only when that data is missing or not current, and always on a forced refresh. Other
+ * registered gateways and hub session-links are still read here (session-tasks does not hold them).
  * Only the FOCUSED session is known to a composer plugin, so every tile's composer
  * renders the focused chat's panel only when that tile is the focused one.
  *
@@ -444,7 +449,7 @@ export function withOwnerRoute(t, route, connectionId) {
 /** Live lists on every registered gateway, plus hub session links for cross-host
  * subscriptions and offline owners. Replica rows discover cards; only the owner
  * detail response makes them actionable. Never guess a connection from a name. */
-export async function sessionTasks(ids, call = api, registry = () => host.connections?.(), resolve = name => sdk.connectionForHubGateway?.(name), route = ownerRoute()) {
+export async function sessionTasks(ids, call = api, registry = () => host.connections?.(), resolve = name => sdk.connectionForHubGateway?.(name), route = ownerRoute(), ownerRows = null) {
   const active = activeConnection() || 'local'
   let connections = []
   try { connections = await registry() || [] } catch { /* active still works */ }
@@ -457,6 +462,11 @@ export async function sessionTasks(ids, call = api, registry = () => host.connec
       await sdk.learnHubGatewayName?.(connectionId)
       // The owner's own gateway is read through the owner profile, so its rows' identity is that route's.
       const owned = route?.connectionId === connectionId && str(route.profile)
+      // session-tasks' current answer for the same owner read (same route, same lineage): no request of our own.
+      if (owned && Array.isArray(ownerRows)) {
+        answered = true
+        return ownerRows.map(t => withOwnerRoute(t, route, connectionId))
+      }
       const r = await call(`/api/session-kanban-tasks?ids=${query}`, owned ? { connectionId, profile: route.profile } : { connectionId })
       if (!Array.isArray(r?.tasks)) return []
       answered = true
@@ -517,9 +527,24 @@ export function openCard(item, win = typeof window !== 'undefined' ? window : {}
 
 const lineageCache = new Map()
 
+/** session-tasks' lineage for the chat (its cache, kept across launches and filled by the gateway feed; it reads only
+ *  when nobody has), or null when it is not loaded or its ancestry is incomplete (then we walk it ourselves). */
+async function sharedLineage(storedId, route) {
+  const st = typeof window !== 'undefined' ? window.__sessionTasks : null
+  if (!route?.connectionId || typeof st?.lineageIds !== 'function') return null
+  try {
+    const ids = await st.lineageIds(storedId, route.connectionId, route.profile || 'default')
+    return ids && !ids.incomplete && typeof ids[Symbol.iterator] === 'function' ? new Set([...ids].map(String)) : null
+  } catch {
+    return null
+  }
+}
+
 async function lineageIds(storedId) {
   const owner = host.state.focusedSessionOwner?.get?.()
   if (host.state.focusedSessionOwner && !owner) return new Set([storedId])
+  const shared = await sharedLineage(storedId, ownerRoute())
+  if (shared) return shared
   const conn = owner?.connectionId || activeConnection() || ''
   const profile = owner?.profile || ''
   const key = `${conn}\u0000${profile}\u0000${storedId}`
@@ -590,7 +615,9 @@ async function requestRewrites(items, detailMap) {
   emit()
   for (const it of todo) {
     const k = rewriteKey(it)
-    const d = detailMap.get(detailKey(it))
+    let d = detailMap.get(detailKey(it))
+    // A pushed (slim) detail has no comments: read the card once, as before, so the rewrite sees the same context.
+    if (d?.slim) d = await api(taskPath(it.id, it.board), { connectionId: it.connectionId, ...(it.profile ? { profile: it.profile } : {}), timeoutMs: 8_000 }).catch(() => d)
     const comments = (Array.isArray(d?.comments) ? d.comments : []).slice(-3).map(c => str(c?.body)).filter(Boolean)
     api('/api/plugins/blocked-panel/steps', {
       connectionId: it.connectionId,
@@ -617,13 +644,32 @@ async function requestRewrites(items, detailMap) {
 
 const emit = () => subs.forEach(fn => fn(snapshot))
 
-async function loadDetails(tasks) {
+/** session-panel's cached kanban detail for an owner-route row (the gateway feed pushes it), when current: the
+ *  chat is feed-vouched or the record was confirmed within DETAIL_TTL_MS. Never starts a read. */
+export function sharedDetail(t, stored, nowMs = Date.now(), sp = typeof window !== 'undefined' ? window.__sessionPanel : null) {
+  if (!t?.readProfile || !t.connectionId || typeof sp?.cachedCard !== 'function') return null
+  let rec = null
+  try { rec = sp.cachedCard({ connectionId: t.connectionId, profile: t.readProfile, board: str(t.board) || 'default' }, str(t.id), nowMs) } catch { return null }
+  const task = rec?.detail?.task
+  if (!task || rec.stale || rec.pending || str(task.id) !== str(t.id) || (str(rec.board) || 'default') !== (str(t.board) || 'default')) return null
+  let vouched = false
+  try { vouched = !!stored && typeof sp.feedVouches === 'function' && sp.feedVouches({ connectionId: t.connectionId, profile: t.readProfile, session: stored }, nowMs) } catch {}
+  return vouched || nowMs - Number(rec.at) < DETAIL_TTL_MS ? rec.detail : null
+}
+
+async function loadDetails(tasks, { stored = null, shared = true } = {}) {
   const now = Date.now()
   await Promise.all(
     tasks
       .filter(t => ['blocked', 'triage'].includes(str(t.status)))
       .map(async t => {
         const k = detailKey(t)
+        const pushed = shared ? sharedDetail(t, stored, now) : null
+        if (pushed) {
+          if (pushed.task?.status) t.status = pushed.task.status
+          details.set(k, { at: now, data: pushed })
+          return
+        }
         const hit = details.get(k)
         if (hit && now - hit.at < DETAIL_TTL_MS) {
           if (hit.data?.task?.status) t.status = hit.data.task.status
@@ -640,6 +686,18 @@ async function loadDetails(tasks) {
         }
       })
   )
+}
+
+/** session-tasks' current `/api/session-kanban-tasks` rows for the focused chat's owner read, or null. */
+function sharedOwnerRows(stored, ids, route = ownerRoute()) {
+  const st = typeof window !== 'undefined' ? window.__sessionTasks : null
+  if (!route?.connectionId || typeof st?.kanbanRows !== 'function') return null
+  try {
+    const r = st.kanbanRows({ connectionId: route.connectionId, profile: route.profile || 'default', session: stored }, ids)
+    return Array.isArray(r?.rows) ? r.rows : null
+  } catch {
+    return null
+  }
 }
 
 export async function refresh(force = false) {
@@ -659,8 +717,10 @@ export async function refresh(force = false) {
     }
     if (force) details.clear()
     const ids = await lineageIds(stored)
-    const tasks = await sessionTasks(ids)
-    if (tasks) await loadDetails(tasks)
+    // A forced refresh (after an action) reads everything itself; otherwise the owner's list and pushed card details
+    // come from session-tasks / session-panel while they are current.
+    const tasks = await sessionTasks(ids, undefined, undefined, undefined, undefined, force ? null : sharedOwnerRows(stored, ids))
+    if (tasks) await loadDetails(tasks, { stored, shared: !force })
     if (host.state.focusedStoredSessionId.get() !== stored || activeConnection() !== connection || (host.state.focusedSessionOwner?.get?.()?.profile || host.state.profile?.get?.() || 'default') !== profile) { rerun = true; return }
     const flat = new Map([...details].map(([k, v]) => [k, v.data]))
     const same = snapshot.stored === stored && snapshot.connectionId === connection && snapshot.profile === profile

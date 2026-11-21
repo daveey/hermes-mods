@@ -1027,3 +1027,33 @@ test('Mine shows machines linked to any session, hiding unowned account machines
     await ui.close()
   }
 })
+
+test('the last inventory answer is shared on window.__computeRentals for session-tasks (connection, profile, time)', async () => {
+  const disposers = []
+  const registrations = []
+  const ctx = {
+    register: (item) => registrations.push(item),
+    onDispose: (fn) => disposers.push(fn),
+    rest: async () => fixture(),
+  }
+  plugin.default.register(ctx)
+  assert.equal(window.__computeRentals.version, 1)
+  const before = Date.now()
+  const ui = await mount(registrations[0].render())
+  try {
+    await ui.flush()
+    const shared = window.__computeRentals.inventory
+    assert.equal(shared.connectionId, 'local')
+    assert.equal(shared.profile, 'default')
+    assert.ok(shared.at >= before && shared.at <= Date.now())
+    assert.deepEqual(shared.data.machines.map((m) => m.key), fixture().machines.map((m) => m.key))
+    assert.equal(plugin.sharedInventory(), shared)
+    // A malformed answer is never shared.
+    assert.equal(plugin.rememberInventory({ connection: 'local', ambientProfile: 'default' }, { error: 'x' }), false)
+    assert.equal(window.__computeRentals.inventory, shared)
+  } finally {
+    await ui.close()
+    for (const fn of disposers) fn()
+  }
+  assert.equal(window.__computeRentals, undefined, 'unload removes the shared door')
+})

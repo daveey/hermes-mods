@@ -108,6 +108,17 @@ The **In progress** heading shows only when another section shares the body; alo
 
 Tests: `test/instant-switch.test.mjs` (persisted reads, stale and chat-title re-read across a relaunch, bounded waits, warm targets, chain pre-read, trace line), `test/evidence.test.mjs` (cached running and parked cards across the pending read, honour bounds, live chips never judged in the past, first frame; needs `HERMES_CORE_SOURCE`), `../session-tasks/test/instant.test.mjs` (per-card tags, untagging on answer and failure, machines-only refresh). Untested: the kanban endpoint's own 2-5 s latency on the hub is unchanged; only what the panel shows while it runs.
 
+## Person waits pause while hidden
+
+The `session-outcome/person-waits` read runs every 8 s only while the window is visible (`pollWhileVisible`); hidden,
+it stops, and showing the window again reads once at once. Test: `test/shared-access.test.mjs`.
+
+## Read-only doors for other plugins
+
+`window.__sessionPanel` also carries `cachedCard(chip, id)` (one card-cache record, including the pushed kanban
+`detail` when the gateway feed sent one; it never starts a read), `feedVouches(route)` and `feedIsLive(route)`.
+blocked-panel uses them to take a blocked card's detail without reading it again. Test: `test/shared-access.test.mjs`.
+
 ## Pushed from the gateway
 
 [daveey 2026-11-20] "precompute the status panel data on the hub ... kept in sync without polling." When a chat's gateway runs this plugin's backend half (`plugins/session-panel`, its README has the contract), the panel's data for every watched chat (the focused chat plus `warmTargets()`, grouped by connection) is computed there and pushed as `plugin.session-panel.changed`:

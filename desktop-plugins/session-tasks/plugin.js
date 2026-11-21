@@ -14,14 +14,20 @@
  *          owner gateway + sync age; absent plugin or hub down → none)
  *   ▣ box  rented machines linked to this session (or an ancestor in its lineage)
  *          by the compute-rentals plugin's local registry
- *          (`/api/plugins/compute-rentals/inventory`, polled every 30 s; absent → no chips)
+ *          (`/api/plugins/compute-rentals/inventory`, polled every 30 s; absent → no chips; while the
+ *          compute-rentals panel's own answer for the same connection/profile is under 30 s old,
+ *          `window.__computeRentals.inventory`, that answer is used instead of a second read)
  *
  * Parked kanban cards say what they wait on and since when ("waiting on card t_x on hub since 20:43"), from the
  * backend's per-card `wait` (core kanban_wait_info: the park's producer or its wake check). A wait that only an
  * agent can end and that has lasted over 2 h is amber "stalled"; other parked waits are grey "waiting"; a human
  * ask stays red. [daveey]
  *
- * Hidden when nothing is running. Polls every 5 s while the window is visible.
+ * Hidden when nothing is running. Ticks every 5 s while the window is visible: kanban cards are read every 10 s,
+ * machines every 30 s; `process.list` + `subagent.list` are read when the focused runtime's gateway events say they
+ * changed (`subagent.start` / `.complete`, a `terminal` / `process` tool call finishing, a `status.update` of kind
+ * `process`), on a new runtime or chat, after a failed read, and otherwise every 30 s (RPC_FALLBACK_MS).
+ * blocked-panel takes this plugin's lineage and raw kanban rows (`kanbanRows`) instead of reading them again.
  * Known-owner kanban chips open the qualified Kanban drawer (never ambient
  * task mentions); unresolved owners are non-clickable. A machine chip opens the
  * Compute Rentals status-bar popover. Hover any chip for the full title.
@@ -867,6 +873,8 @@ export function ingestFeed({ connectionId, profile = 'default', session, lineage
     const ids = new Set(lineage.map(String))
     lineageCache.set(scope, { at: Date.now(), ids })
     saveLineage(scope, ids)
+    // Only a trusted bundle is current; an untrusted one may be older than this plugin's last read.
+    if (trusted) rememberRows(route, ids, tasks)
   }
   if (snapshot.scope === scope && trusted) {
     // The focused chat: its kanban answer just arrived. Live process / sub-agent rows stay as they are.
@@ -898,6 +906,31 @@ const emit = () => subs.forEach(fn => fn(snapshot))
 let hubLinkCache = { session: null, chips: [] }
 const taskReadCache = new Map()
 
+// The raw `/api/session-kanban-tasks` rows of the last authoritative answer per (owner route, lineage), from this
+// plugin's own read or a trusted feed bundle. blocked-panel reads the same list for the same chat every 10 s; it
+// takes these rows instead while they are current (kanbanRows) and reads for itself otherwise. Memory only.
+export const ROWS_FRESH_MS = 15_000 // one KANBAN_POLL_MS plus slack: a visible strip re-reads every 10 s
+const ROWS_MAX = 100
+const rowsCache = new Map()
+const rowsKey = (route, ids) => JSON.stringify([route?.connectionId || '', route?.profile || 'default', [...(ids || [])].map(String).sort()])
+function rememberRows(route, ids, rows) {
+  if (!route?.connectionId || !Array.isArray(rows)) return
+  const k = rowsKey(route, ids)
+  rowsCache.delete(k)
+  rowsCache.set(k, { rows, at: Date.now() })
+  while (rowsCache.size > ROWS_MAX) rowsCache.delete(rowsCache.keys().next().value)
+}
+/** `{ rows, at }` (copies) for the chat `{ connectionId, profile, session }` and its lineage `ids` when this plugin
+ *  holds a current answer: read within ROWS_FRESH_MS, or the chat is feed-kept (pushes keep it current). Else null. */
+export function kanbanRows({ connectionId, profile = 'default', session } = {}, ids, nowMs = Date.now()) {
+  if (!connectionId || !ids) return null
+  const hit = rowsCache.get(rowsKey({ connectionId, profile }, ids))
+  if (!hit) return null
+  const current = nowMs - hit.at <= ROWS_FRESH_MS || (!!session && feedFresh(JSON.stringify([connectionId, profile || 'default', session]), null, nowMs))
+  return current ? { rows: hit.rows.map(r => ({ ...r })), at: hit.at } : null
+}
+export const resetRowsForTests = () => rowsCache.clear()
+
 export async function loadKanban(ids, route = focusedRoute()) {
   route = { ...route }
   const cacheScope = JSON.stringify([route.connectionId || '', route.profile, [...ids].sort()])
@@ -908,6 +941,7 @@ export async function loadKanban(ids, route = focusedRoute()) {
   )
   let live = null
   if (list && Array.isArray(list.tasks)) {
+    rememberRows(route, ids, list.tasks)
     live = sessionTaskChips(list.tasks, route)
     taskReadCache.set(cacheScope, live)
     // Authoritative projections include remote obligations and releases.
@@ -971,10 +1005,22 @@ function focusedProfile() {
   }
 }
 
+/** compute-rentals' last inventory answer (window.__computeRentals.inventory) when it was read on `connectionId` /
+ *  `profile` (the ambient route this plugin reads it through) within `maxAgeMs`; else null. The route's `machines`
+ *  and `gateway_id` do not depend on its session query, so one answer serves both plugins. */
+export function sharedInventory(connectionId, profile, nowMs = Date.now(), maxAgeMs = MACHINE_POLL_MS) {
+  const s = typeof window !== 'undefined' ? window.__computeRentals?.inventory : null
+  if (!s || !connectionId || s.connectionId !== connectionId || (s.profile || 'default') !== (profile || 'default')) return null
+  const age = nowMs - Number(s.at)
+  return age >= 0 && age < maxAgeMs && Array.isArray(s.data?.machines) ? s.data : null
+}
+
 async function loadMachines(ids) {
   const profile = focusedProfile()
   if (!profile) return []
-  const inv = await safe(() => api('/api/plugins/compute-rentals/inventory?session_id=&profile=&gateway_id='), null)
+  const ambient = (() => { try { return host.state.profile?.get?.() || 'default' } catch { return 'default' } })()
+  const inv = sharedInventory(activeConnection(), ambient) ||
+    await safe(() => api('/api/plugins/compute-rentals/inventory?session_id=&profile=&gateway_id='), null)
   if (!inv || !Array.isArray(inv.machines)) return null
   return machineChips(inv.machines, { gatewayId: str(inv.gateway_id), profile, ids })
 }
@@ -1145,8 +1191,15 @@ export async function refresh() {
       }
       emit()
     }
-    if (runtime) { begin('process'); begin('subagent') }
-    const rpc = runtime
+    // Process / sub-agent rows are read when the runtime's gateway says they changed (onRuntimeEvent), on a new
+    // runtime, after a failed read, and every RPC_FALLBACK_MS; between reads the last answer for this runtime stands.
+    // Only a read that runs is begun and reported to core's work-source veto.
+    // Keyed by chat and runtime: core records each source read per stored chat, so a switch reads (and reports) anew.
+    const rpcKey = JSON.stringify([scope, runtime])
+    if (runtime && rpcLast.key === rpcKey) { procs = rpcLast.procs; subagents = rpcLast.subagents }
+    const rpcDue = !!runtime && (rpcDirty || rpcLast.key !== rpcKey || Date.now() - rpcLast.at >= RPC_FALLBACK_MS)
+    if (rpcDue) { rpcDirty = false; begin('process'); begin('subagent') }
+    const rpc = rpcDue
       ? Promise.all([
           safe(() => host.request('process.list', { session_id: runtime }), null),
           safe(() => host.request('subagent.list', { session_id: runtime }), null)
@@ -1154,6 +1207,10 @@ export async function refresh() {
           // A malformed/failed answer is unknown, never an authoritative empty list.
           procs = Array.isArray(p?.processes) ? p : null
           subagents = Array.isArray(sa?.subagents) ? sa : null
+          // Kept only when it could be reported for this chat and runtime (focus, owner and runtime unchanged since it
+          // was sent); a failed source, or an answer dropped as stale, is read again on the next tick (at 0).
+          const current = stillFocused() && runtimeGeneration === capturedRuntime && host.state.focusedSessionId.get() === runtime
+          rpcLast = { key: rpcKey, procs, subagents, at: current && procs && subagents ? Date.now() : 0 }
           report('process', procs !== null)
           report('subagent', subagents !== null)
           publish()
@@ -1247,6 +1304,45 @@ export async function refresh() {
       }
     }
   }
+}
+
+// ── process / sub-agent rows follow the runtime's own events ──────────────
+// The gateway already emits these for the focused runtime session: a sub-agent starting or finishing
+// (`subagent.start` / `.complete`, tui_gateway/contracts/events.py), a `terminal` or `process` tool call finishing
+// (a background process started, was killed or waited on) and a process notice (`status.update` kind `process`:
+// a background process finished or matched a watch). Core has no dedicated process start/exit event; these cover
+// what the agent does with processes. Each schedules one coalesced re-read of `process.list` + `subagent.list`;
+// RPC_FALLBACK_MS keeps a slow safety-net poll for anything the events miss (an exit with no notice).
+export const RPC_FALLBACK_MS = 30_000
+export const RPC_EVENT_DEBOUNCE_MS = 250
+export const RPC_EVENTS = ['subagent.start', 'subagent.complete', 'tool.complete', 'status.update']
+const PROCESS_TOOLS = new Set(['terminal', 'process'])
+let rpcLast = { key: null, procs: null, subagents: null, at: 0 }
+let rpcDirty = false
+let rpcEventTimer = null
+export const resetRpcForTests = () => { rpcLast = { key: null, procs: null, subagents: null, at: 0 }; rpcDirty = false; clearTimeout(rpcEventTimer); rpcEventTimer = null }
+
+/** True when `ev` says the focused runtime's processes or sub-agents may have changed. */
+export function runtimeWorkChanged(ev, runtime) {
+  if (!ev || !runtime || ev.session_id !== runtime) return false
+  const p = ev.payload || {}
+  if (ev.type === 'subagent.start' || ev.type === 'subagent.complete') return true
+  if (ev.type === 'tool.complete') return PROCESS_TOOLS.has(str(p.name))
+  if (ev.type === 'status.update') return p.kind === 'process'
+  return false
+}
+
+/** Gateway event tap: mark the rows due and refresh once the burst settles. Exported for tests. */
+export function onRuntimeEvent(ev) {
+  let runtime = null
+  try { runtime = host.state.focusedSessionId.get() } catch { return false }
+  if (!runtimeWorkChanged(ev, runtime)) return false
+  rpcDirty = true
+  if (!rpcEventTimer) {
+    rpcEventTimer = setTimeout(() => { rpcEventTimer = null; void refresh() }, RPC_EVENT_DEBOUNCE_MS)
+    rpcEventTimer?.unref?.()
+  }
+  return true
 }
 
 function subscribe(fn) {
@@ -1508,9 +1604,15 @@ export default {
     })
     const onVis = () => document.hidden || void refresh()
     document.addEventListener('visibilitychange', onVis)
-    window.__sessionTasks = { version: 'wait-visible-v1', get snapshot() { return snapshot }, refresh, subscribe, openTaskChip, lineageIds, focusedRoute, warm, cachedSnapshot, ingestFeed, touchFeed, feedFresh, activityLabel, connectionForHubGateway }
+    // Process / sub-agent rows re-read on the focused runtime's own events (RPC_EVENTS), not every tick.
+    const listen = typeof ctx.onEvent === 'function' ? ctx.onEvent : host?.onEvent
+    const offEvents = typeof listen === 'function' ? RPC_EVENTS.map(type => listen(type, onRuntimeEvent)) : []
+    window.__sessionTasks = { version: 'wait-visible-v1', get snapshot() { return snapshot }, refresh, subscribe, openTaskChip, lineageIds, focusedRoute, warm, cachedSnapshot, ingestFeed, touchFeed, feedFresh, kanbanRows, activityLabel, connectionForHubGateway }
     return () => {
       for (const stop of stops) stop?.()
+      for (const off of offEvents) if (typeof off === 'function') off()
+      clearTimeout(rpcEventTimer)
+      rpcEventTimer = null
       document.removeEventListener('visibilitychange', onVis)
       document.getElementById(`${ID}-style`)?.remove()
       delete window.__sessionTasks

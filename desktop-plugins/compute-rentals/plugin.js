@@ -170,10 +170,12 @@ function Inventory({ ctx, identity }) {
       if (!identityCurrent(identity)) throw Error('Focus changed; discard the old inventory request.')
       const refresh = forceRefresh.current
       forceRefresh.current = false
-      return ctx.rest(
+      const data = await ctx.rest(
         `/inventory?${new URLSearchParams({ session_id: identity.session_id, profile: identity.profile, gateway_id: '', refresh: String(refresh) })}`,
         { method: 'GET' },
       )
+      rememberInventory(identity, data)
+      return data
     },
     enabled: available,
     refetchInterval: 30_000,
@@ -517,6 +519,18 @@ function Inventory({ ctx, identity }) {
     ),
   )
 }
+
+// The last inventory answer, shared with session-tasks (its machine chips read the same route on the same ambient
+// connection every 30 s). `machines` and `gateway_id` do not depend on the session/profile query, so one answer
+// serves both: session-tasks uses it while it is younger than its own poll interval, else reads for itself.
+// Read-only: window.__computeRentals.inventory = { connectionId, profile, at, data } | null.
+let lastInventory = null
+export function rememberInventory(identity, data, at = Date.now()) {
+  if (!identity?.connection || !data || !Array.isArray(data.machines)) return false
+  lastInventory = { connectionId: identity.connection, profile: identity.ambientProfile || 'default', at, data }
+  return true
+}
+export const sharedInventory = () => lastInventory
 
 function identityCurrent(identity) {
   const owner = host.state.focusedSessionOwner.get()
@@ -1186,6 +1200,13 @@ export default {
       data: { after: 'gateway-health' },
       render: () => h(ComputeRentals, { ctx }),
     })
+    if (typeof window !== 'undefined') {
+      const shared = { version: 1, get inventory() { return lastInventory } }
+      window.__computeRentals = shared
+      ctx.onDispose?.(() => {
+        if (window.__computeRentals === shared) delete window.__computeRentals
+      })
+    }
   },
 }
 

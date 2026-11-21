@@ -1960,6 +1960,31 @@ function Fold({ label, items, k }) {
   ] })
 }
 
+/** Run `refresh` now and every `intervalMs` while `doc` is visible; a hidden window does not read, and becoming
+ *  visible again refreshes once at once. Returns the stop function. (The person-waits poll.) */
+export const PERSON_WAITS_POLL_MS = 8_000
+export function pollWhileVisible(refresh, intervalMs = PERSON_WAITS_POLL_MS, doc = typeof document !== 'undefined' ? document : null) {
+  const visible = () => !doc?.hidden
+  const tick = () => { if (visible()) void refresh() }
+  tick()
+  const timer = setInterval(tick, intervalMs)
+  doc?.addEventListener?.('visibilitychange', tick)
+  return () => { clearInterval(timer); doc?.removeEventListener?.('visibilitychange', tick) }
+}
+
+/** Read-only view of one card-cache record for other plugins (blocked-panel, via window.__sessionPanel): never
+ *  starts a read. `detail` is the card's kanban detail when the gateway feed pushed it (slim: no comments), else
+ *  null; `fresh` = answered, not stale, within CARD_FRESH_MS (a feed-vouched chat's records are re-stamped). */
+export function cachedCard(chip, id, nowMs = Date.now()) {
+  loadReads()
+  const route = refRoute(chip, () => null)
+  if (!route.connectionId || !id) return null
+  const hit = cards.get(titleKey(route, str(id)))
+  if (!hit) return null
+  return { info: hit.info || null, detail: hit.detail || null, board: str(hit.info?.board) || null, at: hit.at,
+    stale: !!hit.stale, pending: !!hit.pending, fresh: !hit.pending && !hit.stale && !!hit.info && nowMs - hit.at < CARD_FRESH_MS }
+}
+
 // ── session-panel feed client (the gateway pushes; nothing polls) ──────────
 // [daveey 2026-11-20] "precompute the status panel data on the hub, and then simply render it on the desktop ...
 // use a websocket or some form of event streaming so that the desktop is always kept in sync without polling".
@@ -2271,9 +2296,8 @@ export function Panel() {
       } catch { /* Keep last known dependencies on a read failure; never imply closure. */ }
       finally { pending = false }
     }
-    void refresh()
-    const timer = setInterval(refresh, 8000)
-    return () => { cancelled = true; clearInterval(timer) }
+    const stop = pollWhileVisible(refresh)
+    return () => { cancelled = true; stop() }
   }, [scope])
   useEffect(() => {
     const st = window.__sessionTasks
@@ -2457,7 +2481,7 @@ export default {
   id: ID,
   name: 'Session Panel',
   register(ctx) {
-    if (typeof window !== 'undefined') window.__sessionPanel = { active: true, version: VERSION, refreshDone, warmRecent }
+    if (typeof window !== 'undefined') window.__sessionPanel = { active: true, version: VERSION, refreshDone, warmRecent, cachedCard, feedVouches, feedIsLive }
     ctx.register({ id: 'panel', area: COMPOSER_AREAS.top, order: -30, render: () => jsx(Panel, {}) })
     // First pass shortly after launch (covers the first switch after a relaunch), then every WARM_TICK_MS.
     const idle = fn => (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function' ? window.requestIdleCallback(fn, { timeout: 5_000 }) : fn())

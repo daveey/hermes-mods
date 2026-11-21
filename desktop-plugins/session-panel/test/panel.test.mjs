@@ -43,8 +43,12 @@ test('person dependency is linked and visible even without card work or with pan
     paths.push(args)
     return args.path.includes('/person-waits?') ? { records: [record] } : { includes: ['done'], tasks: [] }
   } }
-  await show(J.jsx(m.Panel, {}))
-  await React.act(async () => { await flush() })
+  // A visible window (jsdom without pretendToBeVisual reports document.hidden; the poll pauses while hidden).
+  Object.defineProperty(document, 'hidden', { value: false, configurable: true })
+  try {
+    await show(J.jsx(m.Panel, {}))
+    await React.act(async () => { await flush() })
+  } finally { delete document.hidden }
   const link = el().querySelector('[data-person-wait] a')
   assert.ok(link, 'actual person link must render')
   assert.equal(link.href, record.thread)

@@ -269,3 +269,24 @@ test('producer: a real hub-sync session_links row reaches classify with its last
 })
 
 test('done', () => { root.unmount() })
+
+test('producer: blocked-panel takes the owner list and lineage from the real session-tasks read, same items as its own read', async () => {
+  const { calls, dispose } = wire({ C1: [coreRow({ wait: human }), coreRow({ board: 'ops', key: `ops/${ID}` })], C2: [coreRow()] })
+  try {
+    await React.act(async () => { await blocked.refresh(true); await flush() })
+    const own = window.__blockedPanel.snapshot.items.map(i => [i.connectionId, i.profile, i.board, i.id, i.text])
+    // Earlier tests read this chat (S1) against other answers: let session-tasks' list read come due, so the rows it
+    // offers are this world's (as they would be: a real board does not change answers between reads).
+    tasksPlugin.resetRowsForTests()
+    const realNow = Date.now
+    Date.now = () => realNow() + 11_000
+    try { await React.act(async () => { await window.__sessionTasks.refresh(); await flush() }) } finally { Date.now = realNow }
+    calls.length = 0
+    await React.act(async () => { await blocked.refresh(); await flush() })
+    const lists = calls.filter(c => c.path.startsWith('/api/session-kanban-tasks'))
+    assert.deepEqual(lists.map(c => c.connectionId), ['C2'], 'the owner list (C1) came from session-tasks; the other gateway is still read here')
+    assert.equal(calls.filter(c => c.path.startsWith('/api/sessions/')).length, 0, 'lineage from session-tasks')
+    const shared = window.__blockedPanel.snapshot.items.map(i => [i.connectionId, i.profile, i.board, i.id, i.text])
+    assert.deepEqual(shared.sort(), own.sort(), 'identical qualified items')
+  } finally { dispose() }
+})
