@@ -20,28 +20,22 @@ const root = createRoot(document.getElementById('root'))
 const el = () => document.getElementById('root')
 const flush = () => new Promise(r => setTimeout(r, 0))
 const show = async node => React.act(async () => { root.render(node); await flush() })
-const click = async id => React.act(async () => { const b = el().querySelector(`[data-clarify-row="${id}"]`); assert.ok(b, id); b.click(); await flush() })
+const click = async label => React.act(async () => { const b = [...el().querySelectorAll('button')].find(x => x.textContent === label); assert.ok(b, label); b.click(); await flush() })
 const owner = { gatewayId: 'G1', profile: 'default', storedSessionId: 'S1' }
 const route = { connectionId: 'C1', profile: 'default', session: 'S1' }
 let serial = 0
 const request = extra => ({ schemaVersion: 2, owner, requestId: `00000000-0000-4000-8000-${String(++serial).padStart(12, '0')}`, revision: 1, kind: 'choice', title: 'Raw card title t_example', scope: { complete: true, markdown: 'Unblock = continue; archive = abandon. No commands run from this panel.', sourceRefs: [] }, limits: [], exclusions: [], outcomes: { answer: 'Record answer' }, choices: ['Red','Green','Blue'].map((label, i) => ({ id: `card-${i}`, label, effect: 'answer' })), aliases: [], state: 'open', presentation: { kind: 'kanban-question', question: 'Which color should we use?', details: 'Original context and evidence. Unblock = continue; archive = abandon.', recommendedChoiceId: 'card-1', other: true }, ...extra })
 after(async () => { await React.act(async () => root.unmount()); dom.window.close() })
 
-// Compare the visible compact face, not hidden Details textContent.
-test('card question has lettered ordered rows, hidden details and unchanged choice payload', async () => {
+
+// The session panel renders every card ask (question, options, Other, Skip). This plugin only keeps the decision POST.
+test('card-question asks draw no card UI here; the choice posts the unchanged payload', async () => {
  const r = request(), calls = []
  const call = async (path, opts = {}) => { calls.push([path, opts]); return { request: r, operation: { operationId: 'op-fixed', dispatchState: 'pending' } } }
- await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call, position: 2, total: 3 }))
- assert.equal(el().querySelector('[data-action-card-title]')?.textContent, r.title, 'card context stays next to the question')
- assert.equal(el().querySelector('details').open, false)
- const visible = el().cloneNode(true); visible.querySelectorAll('details').forEach(n => n.remove())
- assert.doesNotMatch(visible.textContent, /Unblock =|archive =|No commands run from this panel/)
- assert.match(visible.textContent, /2\/3 — Which color should we use\?/)
- assert.match(visible.textContent, /Pick one/)
- assert.deepEqual([...el().querySelectorAll('[data-choice-letter]')].map(n => n.textContent), ['A','B','C','D','E'])
- assert.deepEqual([...el().querySelectorAll('[data-option-label]')].map(n => n.textContent), ['Green','Red','Blue','Skip','Other (type your answer)'])
- assert.deepEqual([...el().querySelectorAll('[data-recommended-row] [data-option-label]')].map(n => n.textContent), ['Green'])
- await click('card-1')
+ await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call }))
+ for (const sel of ['[data-clarify-question]', '[data-clarify-row]', '[data-choice-letter]', '[data-ask-situation]', '[data-ask-only-you]', '[data-recommended-row]'])
+  assert.equal(el().querySelector(sel), null, sel)
+ await click('Green')
  const post = calls.find(([,o]) => o.method === 'POST')
  assert.equal(post[0], `/api/plugins/user-steps/requests/${r.requestId}/decisions`)
  const { idempotencyKey, ...payload } = post[1].body
@@ -49,38 +43,21 @@ test('card question has lettered ordered rows, hidden details and unchanged choi
  assert.deepEqual(payload, { session: 'S1', expectedRevision: 1, choiceId: 'card-1', revisionText: 'Green' })
 })
 
-test('Other sends typed text using existing decision payload', async () => {
- const r = request(), calls = []
- const call = async (path, opts = {}) => { calls.push([path,opts]); return { request: r, operation: { operationId: 'op-other', dispatchState: 'pending' } } }
- await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call }))
- await click('answer-text')
- const input = el().querySelector('textarea'); assert.equal(document.activeElement, input)
- await React.act(async () => { Object.getOwnPropertyDescriptor(dom.window.HTMLTextAreaElement.prototype,'value').set.call(input,'Use purple'); input.dispatchEvent(new dom.window.Event('input',{bubbles:true})); await flush() })
- await React.act(async () => { [...el().querySelectorAll('button')].find(b => b.textContent === 'Send answer').click(); await flush() })
- const post = calls.find(([,o]) => o.method === 'POST')
- assert.equal(post[1].body.choiceId, 'answer-text'); assert.equal(post[1].body.revisionText, 'Use purple')
-})
-
-test('Skip hides only this request locally and updates queue count without a write', async () => {
+test('dismissRequest still hides one request locally and updates the queue count without a write', async () => {
  await show(null)
  const r = request(), second = request(), calls = []
  window.hermesDesktop = { api: async args => { calls.push(args); return { requests: [r, second] } } }
- await show(React.createElement(m.ActionQueue, { embedded: true }))
  await React.act(async () => { await m.refreshRequests(); await flush() })
  assert.equal(m.openAskCount(), 2)
- assert.match(el().textContent, /1\/2/); assert.match(el().textContent, /2\/2/)
- await click('skip')
+ m.dismissRequest(r)
  assert.equal(m.openAskCount(), 1)
- assert.equal(el().querySelectorAll('[data-action-request]').length, 1)
  assert.ok(m.isRequestDismissed(r)); assert.ok(!m.isRequestDismissed(second))
  assert.ok(calls.every(c => !c.method || c.method === 'GET'))
- await show(null); delete window.hermesDesktop
+ delete window.hermesDesktop
 })
 
-test('fallback Unblock and Archive remain answer rows', async () => {
- const r = request({ choices: [{ id: 'card-0', label: 'Unblock', effect: 'answer' }, { id: 'card-1', label: 'Archive', effect: 'answer' }], presentation: { kind: 'kanban-question', question: 'Ready to continue?', details: 'Evidence', recommendedChoiceId: null, other: true } })
- await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call: async () => ({}) }))
- assert.deepEqual([...el().querySelectorAll('[data-option-label]')].map(n => n.textContent), ['Unblock','Archive','Skip','Other (type your answer)'])
+test('card brief / letter helpers are gone (the hub PanelModel owns display text)', () => {
+ for (const name of ['card' + 'Brief', 'panel' + 'Letters', 'option' + 'Name']) assert.equal(m[name], undefined, name)
 })
 
 test('a recorded decision makes blocked-panel read the cards itself (forced), not from a pre-change copy', async () => {
@@ -90,7 +67,7 @@ test('a recorded decision makes blocked-panel read the cards itself (forced), no
   const call = async () => ({ request: r, operation: { operationId: 'op-force', dispatchState: 'pending' } })
   await show(React.createElement(m.DecisionRow, { key: `${r.requestId}-force`, request: r, route, call }))
   assert.deepEqual(forced, [], 'nothing before the action')
-  await click('card-1')
+  await click('Green')
   await React.act(async () => { await flush(); await flush() })
   assert.deepEqual(forced, [true])
   assert.equal(m.refreshBlockedAfterAction(null), false, 'no blocked-panel: nothing to do')
@@ -106,7 +83,7 @@ test('a recorded decision forces blocked-panel\'s refresh even when the delivery
    throw new Error('operation read timed out')
   }
   await show(React.createElement(m.DecisionRow, { key: `${r.requestId}-throw`, request: r, route, call }))
-  await click('card-1')
+  await click('Green')
   await React.act(async () => { await flush(); await flush() })
   assert.deepEqual(forced, [true], 'forced once, after the POST, despite the failed read')
  } finally { delete window.__blockedPanel }
@@ -118,34 +95,8 @@ test('a decision whose POST fails does not force a refresh (nothing changed)', a
  try {
   const call = async () => { throw new Error('offline') }
   await show(React.createElement(m.DecisionRow, { key: `${r.requestId}-fail`, request: r, route, call }))
-  await click('card-1')
+  await click('Green')
   await React.act(async () => { await flush(); await flush() })
   assert.deepEqual(forced, [])
  } finally { delete window.__blockedPanel }
-})
-
-// The generate-unblock-card brief (Situation / lettered Options / Recommend / Only you can) renders as tiles, and a
-// choice labelled "C: …" keeps its own letter instead of being re-lettered A by display order.
-test('card brief renders own letters, option details, the recommendation reason and the only-you line', async () => {
- const details = [
-  "Pick how to get the Slack test unblocked. Unblock = C; archive = shelve both.",
-  "Tried: 5 build windows. Only you can: approve that budget and permission scope, or drop this proof requirement.",
-  "Situation: The safety proof stalled after ~13 runs; a review says finishing needs 18-30 more runs plus a throwaway VM.\nOptions:\nA) Fund the full proof: ~$35-60 in runs plus a VM under $25.\nC) Test Slack on live version: park the proof, run the end-to-end test now; ~$5; reversible.\nRecommend: C - a cheap real test tells us if the fix is needed.",
-  "**Estimate:** very low confidence"].join('\n\n')
- const r = request({ choices: [{ id: 'card-0', label: 'C: test Slack on the live version (recommended)', effect: 'answer' }, { id: 'card-1', label: 'A: fund the full proof (~$60 + VM)', effect: 'answer' }],
-  presentation: { kind: 'kanban-question', question: 'Pick how to get the Slack test unblocked.', details, recommendedChoiceId: 'card-0', other: true } })
- await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call: async () => ({ request: r }) }))
- assert.deepEqual([...el().querySelectorAll('[data-choice-letter]')].map(n => n.textContent), ['C','A','D','E'])
- assert.deepEqual([...el().querySelectorAll('[data-option-label]')].map(n => n.textContent), ['Test Slack on the live version','Fund the full proof (~$60 + VM)','Skip','Other (type your answer)'])
- assert.deepEqual([...el().querySelectorAll('[data-option-detail]')].map(n => n.textContent), ['Park the proof, run the end-to-end test now; ~$5; reversible.','~$35-60 in runs plus a VM under $25.'])
- assert.equal(el().querySelector('[data-recommended-row] [data-option-reason]')?.textContent, 'Why: a cheap real test tells us if the fix is needed.')
- assert.match(el().querySelector('[data-ask-situation]')?.textContent || '', /^The safety proof stalled/)
- assert.equal(el().querySelector('[data-ask-only-you]')?.textContent, 'Only you can: approve that budget and permission scope, or drop this proof requirement.')
-})
-
-test('panelLetters keeps own letters only when every choice has a distinct one', () => {
- assert.deepEqual(m.panelLetters(['C: x', 'A: y'], 2), ['C','A','D','E'])
- assert.deepEqual(m.panelLetters(['C: x', 'plain'], 1), ['A','B','C'])
- assert.deepEqual(m.panelLetters(['A: x', 'A) y'], 1), ['A','B','C'])
- assert.deepEqual(m.panelLetters(['Red','Green'], 2), ['A','B','C','D'])
 })

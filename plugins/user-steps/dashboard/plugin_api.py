@@ -138,6 +138,29 @@ def _with_terminal_history(tasks, history, ids):
     return out
 
 
+def panel_requests(home: Path, session: str, lineage) -> list:
+    """Reconcile the canonical producer before the feed renders; no legacy GET needed.
+
+    The feed's context must be the owning profile. Never turn a supplied filesystem
+    path or source reference into write authority for a different profile.
+    """
+    core = _load('core')
+    if core.home().resolve() != Path(home).resolve():
+        raise core.ActionError('Panel profile does not match current profile', 409)
+    if not core._row(core._state_db(), session):
+        raise core.ActionError('Unknown stored session on this profile', 404)
+    st = core.ActionStore()
+    producer = _load('kanban_mirror').Mirror(core, st)
+    requests = []
+    for sid in dict.fromkeys([*lineage, session]):
+        if not core._row(core._state_db(), sid):
+            continue
+        own = core.server_owner(sid)
+        producer.reconcile(own)
+        requests.extend(producer.present(r) for r in st.views(own, include_withdrawn=True))
+    return requests
+
+
 def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = None,
                   cards=None, *, action_store=None, owner_resolver=None, receiver=None, kanban_boards=None,
                   session_tasks=None, kanban_mirror=None):

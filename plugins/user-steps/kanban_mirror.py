@@ -34,7 +34,7 @@ MISMATCH = "Request no longer matches its frozen server binding"
 # resolver is injected (no key covers it), and at least every FULL_EVERY_S. That ceiling is the P1 fallback: a
 # change the key does not see (a compression parent ended after its child was created) is picked up that late.
 FULL_EVERY_S = 60.0
-_EVENT_KINDS = ("created", "blocked", "unblocked", "archived", "completed")
+_EVENT_KINDS = ("created", "blocked", "block_loop_detected", "unblocked", "archived", "completed")
 _MEMO: dict = {}  # owner key -> (inputs key, monotonic time of the full pass that produced it)
 _MEMO_LOCK = threading.Lock()
 _MEMO_MAX = 256
@@ -306,7 +306,7 @@ class Mirror:
         if row is None:
             return None
         row = dict(row)
-        if row.get("status") != "blocked" or str(
+        if row.get("status") not in ("blocked", "triage") or str(
             row.get("idempotency_key") or ""
         ).startswith("user-steps:decision-card:"):
             return None
@@ -343,7 +343,7 @@ class Mirror:
         # A new identical block after an unblock is a NEW question, not an old answer replay.
         generation = c.execute(
             "SELECT MAX(id) FROM task_events WHERE task_id=? AND kind IN "
-            "('created','blocked','unblocked','archived','completed')",
+            "('created','blocked','block_loop_detected','unblocked','archived','completed')",
             (task,),
         ).fetchone()[0]
         snap = dict(
@@ -690,7 +690,7 @@ class Mirror:
         latest = ("(SELECT MAX(e.id) FROM task_events e WHERE e.task_id=t.id AND e.kind IN "
                   f"({','.join('?' * len(_EVENT_KINDS))}))")
         rows = [tuple(r) for r in c.execute(
-            f"SELECT {cols}, {latest} FROM tasks t WHERE t.status='blocked' AND t.human_request IS NOT NULL "
+            f"SELECT {cols}, {latest} FROM tasks t WHERE t.status IN ('blocked','triage') AND t.human_request IS NOT NULL "
             f"UNION SELECT {cols}, {latest} FROM tasks t WHERE t.id IN (SELECT value FROM json_each(?)) ORDER BY 1",
             (*_EVENT_KINDS, *_EVENT_KINDS, json.dumps(ids)))]
         try:
@@ -722,7 +722,7 @@ class Mirror:
             try:
                 with _kept(path) as c:
                     rows = c.execute(
-                        "SELECT id FROM tasks WHERE status='blocked' AND human_request IS NOT NULL"
+                        "SELECT id FROM tasks WHERE status IN ('blocked','triage') AND human_request IS NOT NULL"
                     ).fetchall()
                     snapshots = [self._snapshot(c, r[0], owner) for r in rows]
             except (sqlite3.Error, OSError):

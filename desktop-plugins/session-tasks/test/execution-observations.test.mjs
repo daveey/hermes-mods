@@ -1,4 +1,4 @@
-// Shared golden parity for BOTH public consumers (session-tasks and session-panel) of the SDK's execution projector.
+// Shared golden parity for session-tasks' use of the SDK's execution projector (the hub PanelModel owns the panel's display).
 // Expected verdicts come only from the frozen core fixture (HERMES_CORE_SOURCE, else the hash-pinned public copy);
 // the projector is the core's own module. See execution-support.mjs. Projector-backed tests skip without a core.
 import { test } from 'node:test'
@@ -18,8 +18,7 @@ globalThis.__obsSdk = projector || undefined
 globalThis.__obsReact = React
 register('data:text/javascript,' + encodeURIComponent(`export async function resolve(s,c,n){const map={'react':'const R=globalThis.__obsReact;export const useState=R.useState,useEffect=R.useEffect,useRef=R.useRef','react/jsx-runtime':'export const jsx=()=>null,jsxs=()=>null','@hermes/plugin-sdk':${JSON.stringify(sdkStubSource())}};return map[s]?{url:'data:text/javascript,'+encodeURIComponent(map[s]),shortCircuit:true}:n(s,c)}`))
 const tasks = await import('../plugin.js')
-const panel = await import('../../session-panel/plugin.js')
-const consumers = { 'session-tasks': tasks, 'session-panel': panel }
+const consumers = { 'session-tasks': tasks }
 const { fixture, fromCore, sha256: fixtureSha } = loadFixture()
 const skip = projector ? false : 'no core checkout: set HERMES_CORE_SOURCE to run projector-backed parity'
 const cls = t => t.source_class ?? 'sidebar'
@@ -84,15 +83,6 @@ for (const [name, m] of Object.entries(consumers)) {
     }
   })
 }
-
-test('both consumers produce identical views for every fixture record', { skip }, () => {
-  for (const t of fixture.cases) {
-    const a = tasks.projectView(caseInput(fixture, t), t.now ?? 1001, cls(t), undefined, t.expected_identity)
-    const b = panel.projectView(caseInput(fixture, t), t.now ?? 1001, cls(t), undefined, t.expected_identity)
-    assert.deepEqual(a, b, t.id)
-    assert.equal(tasks.observationLine(a, t.now ?? 1001), panel.observationLine(b, t.now ?? 1001), t.id)
-  }
-})
 
 // ── chip level: what each consumer shows for the card a producer sent ──────────────────────────────────────
 const chipFor = (records, extra = {}) => ({ id: 'task-a', board: 'tasks', profile: 'work', gateway: 'edge', kind: 'kanban', observations: records, ...extra })

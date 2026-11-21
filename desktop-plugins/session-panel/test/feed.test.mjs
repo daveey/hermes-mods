@@ -1,274 +1,156 @@
-// node --test: the session-panel feed client. Pushed bundles fill every cache the panel renders from; trust comes from
-// pushes only (a catch-up answer alone never makes data current); chain steps are worked out at render; the revision
-// chain is followed (gaps and new epochs catch up, stale answers are dropped); a gateway without the backend half or
-// serving another profile keeps today's reads. [daveey 2026-11-20] "precompute the status panel data on the hub ...
-// kept in sync without polling".
+// Transport tests: cache hub models without interpreting raw task/card fields.
 import { test, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { register } from 'node:module'
-
 register('data:text/javascript,' + encodeURIComponent(`
 export async function resolve(spec, ctx, next) {
-  if (spec === '@hermes/plugin-sdk') return { url: 'data:text/javascript,export const COMPOSER_AREAS={top:"composer.top"};const a=v=>({get:()=>v});export const host={state:{focusedStoredSessionId:a("S1"),focusedSessionOwner:a({connectionId:"C1",profile:"default"}),connectionId:a("C1"),profile:a("default")}};export const Codicon=()=>null;export const DisclosureCaret=()=>null;export const useValue=()=>null', shortCircuit: true }
-  if (spec === 'react' || spec === 'react/jsx-runtime') return { url: 'data:text/javascript,export const useEffect=()=>{};export const useRef=v=>({current:v});export const useState=v=>[v,()=>{}];export const jsx=()=>null;export const jsxs=()=>null', shortCircuit: true }
-  return next(spec, ctx)
+ if (spec === '@hermes/plugin-sdk') return { url: 'data:text/javascript,export const COMPOSER_AREAS={top:"composer.top"};const a=v=>({get:()=>v});export const host={state:{focusedStoredSessionId:a("S1"),focusedSessionOwner:a({connectionId:"C1",profile:"default"}),connectionId:a("C1"),profile:a("default")}};export const useValue=()=>null', shortCircuit: true }
+ if (spec === 'react' || spec === 'react/jsx-runtime') return { url: 'data:text/javascript,export const useEffect=()=>{};export const useState=v=>[v,()=>{}];export const jsx=()=>null;export const jsxs=()=>null', shortCircuit: true }
+ return next(spec, ctx)
+}
+export async function load(u,c,n) {
+ if(u.endsWith('/plugin.js')) { const fs=await import('node:fs/promises');return {format:'module',source:await fs.readFile(new URL(u),'utf8'),shortCircuit:true} }
+ return n(u,c)
 }`))
-
-function memoryStorage() {
-  const data = new Map()
-  return { getItem: k => (data.has(k) ? data.get(k) : null), setItem: (k, v) => data.set(k, String(v)), removeItem: k => data.delete(k), clear: () => data.clear(), data }
+const memoryStorage = () => {
+ const data = new Map()
+ return { getItem: k => data.get(k) || null, setItem: (k,v) => data.set(k,String(v)) }
 }
 globalThis.window = { localStorage: memoryStorage() }
 const m = await import('../plugin.js')
-
-const slim = (id, status, extra = {}) => ({ detail: { task: { id, title: `Title ${id}`, status, session_id: 'S1', ...extra.task }, events: extra.events || [], links: { parents: extra.parents || [], children: [] }, link_tasks: extra.linkTasks || [], slim: true }, board: 'default' })
-const bundle = (session = 'S1') => ({
-  session, lineage: [session, 'S0'],
-  tasks: [{ id: 't_aaaaaa1', status: 'blocked', board: 'default', session_id: session }],
-  done: [{ id: 't_dddddd4', status: 'done', title: 'Shipped', activity_at: 10 }],
-  cards: { t_aaaaaa1: slim('t_aaaaaa1', 'blocked', { task: { block_kind: 'dependency' }, parents: ['t_bbbbbb2'], linkTasks: [{ id: 't_bbbbbb2', status: 'running' }] }), t_bbbbbb2: slim('t_bbbbbb2', 'running') }
-})
-const settle = () => new Promise(r => setTimeout(r, 0))
-const never = () => new Promise(() => {})
-const chip = { kind: 'kanban', id: 't_aaaaaa1', connectionId: 'C1', profile: 'default', board: 'default' }
+const route = (session = 'S1', connectionId = 'C1', profile = 'default') => ({ connectionId, profile, session })
+const model = revision => ({ version: 1, revision, header: { state: 'hub says waiting' }, sections: {} })
+const bundle = (session = 'S1', revision = 'r1') => ({ session, model: model(revision), tasks: [{ status: 'running' }], cards: { arbitrary: { human_request: 'ignored' } } })
 const target = (sessions = ['S1']) => ({ connectionId: 'C1', profile: 'default', sessions })
-const answer = (extra = {}) => ({ feed: 'hub:1', profile: 'default', epoch: 'E1', rev: 3, reset: true, bundles: {}, ...extra })
-const push = extra => m.onFeedEvent({ type: m.FEED_EVENT, payload: { feed: 'hub:1', profile: 'default', epoch: 'E1', bundles: {}, ...extra } })
-
-let ingested, touched, calls
+const answer = (extra = {}) => ({ feed: 'hub:1', profile: 'default', epoch: 'E1', rev: 3, bundles: {}, ...extra })
+const push = extra => m.onFeedEvent({ payload: { feed: 'hub:1', profile: 'default', epoch: 'E1', bundles: {}, ...extra } })
+const settle = () => new Promise(r => setTimeout(r, 0))
+let calls, reply
 beforeEach(() => {
-  window.localStorage = memoryStorage()
-  m.resetReadsForTests(); m.resetFeedForTests(); m.resetDoneCacheForTests()
-  ingested = []; touched = []; calls = []
-  window.__sessionTasks = { ingestFeed: x => ingested.push(x), touchFeed: (...a) => touched.push(a) }
-  window.hermesDesktop = { api: async req => { calls.push(req); if (window.__answer) return window.__answer(req); throw new Error('no answer') } }
-  window.__answer = null
+ m.resetFeedForTests(); window.localStorage = memoryStorage(); calls = []; reply = () => answer()
+ window.hermesDesktop = { api: async req => { calls.push(req); return reply(req) } }
+ window.__sessionTasks = { ingestFeed: payload => { window.lastChipBundle = payload } }
+ window.lastChipBundle = null
 })
-
-test('a catch-up answer alone is never trusted: it prepaints, and the panel still reads for itself', async () => {
-  window.__answer = () => answer({ bundles: { S1: bundle() } })
-  assert.equal(await m.feedCatchUp(target()), true)
-  assert.equal(m.feedIsLive({ connectionId: 'C1', profile: 'default' }), false, 'no push seen yet')
-  assert.equal(ingested[0].trusted, false)
-  assert.equal(m.cachedDone(JSON.stringify(['C1', 'default', 'S1'])).length, 1, 'Done prepaints')
-  let reads = 0
-  m.cardInfo(chip, 't_aaaaaa1', Date.now() + 2 * 60_000, () => { reads++; return never() })
-  assert.equal(reads, 1, 'untrusted: it ages and is re-read like any read')
+test('catch-up caches only the supplied model, with no claim of live transport', async () => {
+ reply = () => answer({ bundles: { S1: bundle() } })
+ assert.equal(await m.feedCatchUp(target()), true)
+ assert.deepEqual(m.cachedModel(route()), model('r1'))
+ assert.equal(m.feedIsLive(route()), false)
+ assert.equal(calls.length, 1)
+ assert.deepEqual(window.lastChipBundle.model, m.cachedModel(route()))
+ assert.equal(window.lastChipBundle.connectionId, 'C1')
+ assert.equal(window.lastChipBundle.session, 'S1')
 })
-
-test('the first push makes the feed live and fetches everything again, trusted; heartbeats keep it current', async () => {
-  window.__answer = () => answer({ rev: 3 })
-  await m.feedCatchUp(target())
-  window.__answer = () => answer({ rev: 3, reset: false, bundles: { S1: bundle() } })
-  push({ heartbeat: true, prev: 3, rev: 3, fresh: ['S1'] })
-  await settle(); await settle()
-  assert.equal(m.feedIsLive({ connectionId: 'C1', profile: 'default' }), true)
-  assert.equal(calls.at(-1).body.since, 0, 'a full catch-up (since 0, same epoch)')
-  assert.equal(ingested.at(-1).trusted, true)
-  // Ten minutes on, with heartbeats all along: the trusted entries were re-stamped, nothing is read.
-  const t0 = Date.now()
-  const realNow = Date.now
-  try {
-    for (let i = 1; i <= 30; i++) { Date.now = () => t0 + i * 20_000; push({ heartbeat: true, prev: 3, rev: 3, fresh: ['S1'] }) }
-    let reads = 0
-    const now = t0 + 30 * 20_000
-    const r = m.cardInfo(chip, 't_aaaaaa1', now, () => { reads++; return never() })
-    assert.equal(r.state, 'ok')
-    assert.equal(m.parkFor({ ...chip, state: 'scheduled' }, now, () => { reads++; return never() }).state, 'ok')
-    assert.equal(reads, 0, 'current while heartbeats arrive')
-    assert.ok(touched.length >= 30 && touched.at(-1)[2].includes('S1'), 'session-tasks re-stamped too')
-    // Heartbeats stop: after the freshness window the entries are read again.
-    const later = now + m.FEED_STALE_MS + 1
-    Date.now = () => later
-    assert.equal(m.feedIsLive({ connectionId: 'C1', profile: 'default' }), false)
-    m.cardInfo(chip, 't_aaaaaa1', later, () => { reads++; return never() })
-    assert.equal(reads, 1)
-  } finally { Date.now = realNow }
+test('cache is qualified by connection, profile and stored session', () => {
+ for (const r of [route(), route('S2'), route('S1', 'C2'), route('S1', 'C1', 'work')]) {
+  m.ingestBundle(r.connectionId, r.profile, bundle(r.session, JSON.stringify(r)))
+ }
+ assert.equal(m.cachedModel(route('missing')), null)
+ for (const r of [route(), route('S2'), route('S1', 'C2'), route('S1', 'C1', 'work')]) assert.equal(m.cachedModel(r).revision, JSON.stringify(r))
 })
-
-test('chain steps from a pushed card are worked out when read: a wait keeps counting', async () => {
-  const wakeAt = Math.floor(Date.now() / 1000) + 600
-  const b = bundle()
-  b.cards.t_aaaaaa1 = slim('t_aaaaaa1', 'scheduled', { events: [{ id: 1, kind: 'scheduled', created_at: wakeAt - 3600, payload: { wake_at: wakeAt } }] })
-  m.ingestBundle('C1', 'default', b)
-  const sub = now => m.cardInfo(chip, 't_aaaaaa1', now, never).info.hop.leaf.sub
-  const soon = sub(Date.now()), late = sub(Date.now() + 20 * 60_000)
-  assert.notEqual(soon, late, 'the same pushed record reads differently later (not frozen at ingest)')
-  assert.match(late, /overdue/)
+test('missing/unsupported models invalidate their own scope without raw fallback', () => {
+ m.ingestBundle('C1', 'default', bundle()); m.ingestBundle('C1', 'default', bundle('S2'))
+ for (const raw of [{ session: 'S1', tasks: [{ status: 'running' }] }, { session: 'S1', model: { version: 2 } }]) {
+  m.ingestBundle('C1', 'default', raw)
+  assert.equal(m.cachedModel(route()), null)
+  assert.ok(m.cachedModel(route('S2')))
+ }
+ assert.equal(m.ingestBundle('', 'default', bundle()), false)
 })
-
-test('a gateway without the backend half (404) or serving another profile is left to its own reads', async () => {
-  window.__answer = () => { throw new Error('404: {"detail":"Not Found"}') }
-  assert.equal(await m.feedCatchUp({ connectionId: 'C2', profile: 'default', sessions: ['S9'] }), false)
-  assert.equal(await m.feedCatchUp({ connectionId: 'C2', profile: 'default', sessions: ['S9'] }), false)
-  assert.equal(calls.length, 1, 'not asked again until the retry window passes')
-  window.__answer = () => ({ feed: 'hub:1', profile: 'work', profile_unsupported: true })
-  assert.equal(await m.feedCatchUp({ connectionId: 'C3', profile: 'work', sessions: ['S9'] }), false)
-  assert.equal(await m.feedCatchUp({ connectionId: 'C3', profile: 'work', sessions: ['S9'] }), false)
-  assert.equal(calls.length, 2)
-  window.__answer = () => { throw new Error('timeout') }
-  assert.equal(await m.feedCatchUp({ connectionId: 'C4', profile: 'default', sessions: ['S9'] }), false)
-  assert.equal(await m.feedCatchUp({ connectionId: 'C4', profile: 'default', sessions: ['S9'] }), false)
-  assert.equal(calls.length, 4, 'a transient failure is retried')
+test('model cache is bounded to 100 scopes', () => {
+ for (let i = 0; i < 101; i++) m.ingestBundle('C1', 'default', bundle(`S${i}`))
+ assert.equal(m.cachedModel(route('S0')), null)
+ assert.ok(m.cachedModel(route('S1'))); assert.ok(m.cachedModel(route('S100')))
 })
-
-test('pushes continuing the chain apply; a duplicate is ignored; a gap, an oversized batch or a new epoch catches up', async () => {
-  window.__answer = () => answer({ rev: 3 })
-  await m.feedCatchUp(target())
-  calls.length = 0
-  push({ prev: 3, rev: 4, bundles: { S1: bundle() }, fresh: ['S1'] })
-  assert.equal(ingested.length, 1, 'applied in order')
-  assert.equal(ingested[0].trusted, true)
-  await settle()
-  calls.length = 0
-  push({ prev: 3, rev: 4, bundles: { S1: bundle() }, fresh: ['S1'] })
-  assert.equal(ingested.length, 1 + 0, 'already have it')
-  window.__answer = () => answer({ rev: 7, reset: false })
-  push({ prev: 6, rev: 7, bundles: { S1: bundle() } })
-  await settle()
-  assert.equal(calls.at(-1).body.since, 4, 'a gap: catch up from the last revision applied')
-  window.__answer = () => answer({ rev: 8, reset: false })
-  push({ prev: 7, rev: 8, sessions: ['S1'] })
-  await settle()
-  assert.equal(calls.at(-1).body.since, 7, 'sent by name only: fetched')
-  window.__answer = () => answer({ epoch: 'E2', rev: 1 })
-  push({ epoch: 'E2', prev: 0, rev: 1 })
-  await settle()
-  assert.equal(calls.at(-1).body.epoch, null, 'a restarted gateway: full reset')
-  const before = ingested.length
-  m.onFeedEvent({ type: m.FEED_EVENT, payload: { feed: 'other:9', profile: 'default', epoch: 'X', prev: 0, rev: 1, bundles: { S1: bundle() } } })
-  m.onFeedEvent({ type: m.FEED_EVENT, payload: { feed: 'hub:1', profile: 'work', epoch: 'E2', prev: 1, rev: 2, bundles: { S1: bundle() } } })
-  assert.equal(ingested.length, before, 'another feed or another profile is ignored')
+test('first heartbeat makes feed live and requests a full catch-up; models never tick locally', async () => {
+ reply = () => answer({ bundles: { S1: bundle() } }); await m.feedCatchUp(target())
+ const before = m.cachedModel(route())
+ push({ heartbeat: true, rev: 3, fresh: ['S1'] }); await settle(); await settle()
+ assert.equal(m.feedIsLive(route()), true)
+ assert.equal(calls.at(-1).body.since, 0)
+ assert.deepEqual(m.cachedModel(route()), before)
+ assert.equal(m.feedIsLive(route(), Date.now() + m.FEED_STALE_MS + 1), false)
 })
-
-test('a catch-up answer older than a push that landed meanwhile is dropped', async () => {
-  window.__answer = () => answer({ rev: 3 })
-  await m.feedCatchUp(target())
-  let release
-  window.__answer = () => new Promise(r => { release = () => r(answer({ rev: 3, reset: false, bundles: { S1: { ...bundle(), tasks: [] } } })) })
-  const slow = m.feedCatchUp(target(['S1', 'S2']))
-  await settle()
-  push({ prev: 3, rev: 4, bundles: { S1: bundle() }, fresh: ['S1'] })
-  const n = ingested.length
-  release()
-  assert.equal(await slow, true)
-  assert.equal(ingested.length, n, 'the older answer did not overwrite the newer push')
+test('404/unsupported profile backs off; transient failures are retried', async () => {
+ reply = () => { throw Error('404: Not Found') }
+ assert.equal(await m.feedCatchUp(target()), false); assert.equal(await m.feedCatchUp(target()), false)
+ assert.equal(calls.length, 1)
+ m.resetFeedForTests(); reply = () => ({ profile_unsupported: true })
+ assert.equal(await m.feedCatchUp(target()), false); assert.equal(await m.feedCatchUp(target()), false)
+ assert.equal(calls.length, 2)
+ m.resetFeedForTests(); reply = () => { throw Error('timeout') }
+ assert.equal(await m.feedCatchUp(target()), false); assert.equal(await m.feedCatchUp(target()), false)
+ assert.equal(calls.length, 4)
 })
-
-test('one catch-up in flight per connection', async () => {
-  let release
-  window.__answer = () => new Promise(r => { release = () => r(answer()) })
-  const a = m.feedCatchUp(target())
-  await settle()
-  const b = m.feedCatchUp(target())
-  await settle()
-  assert.equal(calls.length, 1, 'the second waits for the first')
-  release()
-  await a
-  await settle()
-  release()
-  await b
-  assert.equal(calls.length, 2)
+test('ordered pushes apply; duplicates and other gateway/profile pushes are ignored', async () => {
+ await m.feedCatchUp(target())
+ push({ prev: 3, rev: 4, fresh: ['S1'], bundles: { S1: bundle('S1', 'r4') } }); await settle()
+ assert.equal(m.cachedModel(route()).revision, 'r4')
+ push({ prev: 3, rev: 4, bundles: { S1: bundle('S1', 'duplicate') } })
+ push({ feed: 'other:1', prev: 4, rev: 5, bundles: { S1: bundle('S1', 'wrong') } })
+ push({ profile: 'work', prev: 4, rev: 5, bundles: { S1: bundle('S1', 'wrong') } })
+ assert.equal(m.cachedModel(route()).revision, 'r4')
 })
-
-test('feedTargets groups the focused chat and warm targets by connection', () => {
-  const rows = [{ id: 'S7', connection_id: 'C2', profile: 'work', last_active: 5 }, { id: 'S8', connection_id: 'C1', last_active: 4 }]
-  const t = m.feedTargets(rows)
-  const c1 = t.find(x => x.connectionId === 'C1'), c2 = t.find(x => x.connectionId === 'C2')
-  assert.equal(c1.sessions[0], 'S1', 'the focused chat first')
-  assert.ok(c1.sessions.includes('S8'))
-  assert.deepEqual(c2, { connectionId: 'C2', profile: 'work', sessions: ['S7'] })
+test('gaps, name-only batches and new epochs catch up', async () => {
+ await m.feedCatchUp(target())
+ reply = () => answer({ rev: 7 }); push({ prev: 6, rev: 7 }); await settle()
+ assert.equal(calls.at(-1).body.since, 3)
+ reply = () => answer({ rev: 8 }); push({ prev: 7, rev: 8, sessions: ['S1'] }); await settle()
+ assert.equal(calls.at(-1).body.since, 7)
+ reply = () => answer({ epoch: 'E2', rev: 1 }); push({ epoch: 'E2', rev: 1 }); await settle()
+ assert.equal(calls.at(-1).body.epoch, null)
 })
-
-
-test('a push re-stamps only the chats it vouches for; the gateway\'s own profile name is what pushes carry', async () => {
-  window.__answer = () => answer({ rev: 3, profile: 'custom' }) // the hub calls its launch profile 'custom'
-  await m.feedCatchUp(target(['S1', 'S2']))
-  window.__answer = () => answer({ rev: 3, profile: 'custom', reset: false, bundles: { S1: bundle('S1'), S2: bundle('S2') } })
-  m.onFeedEvent({ type: m.FEED_EVENT, payload: { feed: 'hub:1', profile: 'custom', epoch: 'E1', prev: 3, rev: 3, heartbeat: true, bundles: {}, fresh: ['S1', 'S2'] } })
-  await settle(); await settle()
-  assert.equal(m.feedIsLive({ connectionId: 'C1', profile: 'default' }), true, 'matched on the hub\'s name for its profile')
-  touched.length = 0
-  m.onFeedEvent({ type: m.FEED_EVENT, payload: { feed: 'hub:1', profile: 'custom', epoch: 'E1', prev: 3, rev: 3, heartbeat: true, bundles: {}, fresh: ['S1'] } })
-  assert.deepEqual(touched.at(-1)[2], ['S1'], 'S2 (dropped or failing on the gateway) is left to age')
+test('a catch-up older than a meanwhile push cannot overwrite the model', async () => {
+ await m.feedCatchUp(target())
+ let release
+ reply = () => new Promise(r => { release = () => r(answer({ bundles: { S1: bundle('S1', 'old') } })) })
+ const slow = m.feedCatchUp(target(['S1', 'S2'])); await settle()
+ push({ prev: 3, rev: 4, fresh: ['S1'], bundles: { S1: bundle('S1', 'new') } })
+ release(); await slow
+ assert.equal(m.cachedModel(route()).revision, 'new')
+ await settle(); release(); await settle()
 })
-
-test('catch-ups for one connection never overlap, and those waiting merge into one', async () => {
-  let inFlight = 0, most = 0
-  const releases = []
-  window.__answer = () => { inFlight++; most = Math.max(most, inFlight); return new Promise(r => releases.push(() => { inFlight--; r(answer()) })) }
-  const first = m.feedCatchUp(target(['S1']))
-  await settle()
-  const all = [first, m.feedCatchUp(target(['S2'])), m.feedCatchUp(target(['S3']), { full: true })]
-  for (let i = 0; i < 3; i++) { await settle(); await settle(); releases.shift()?.() }
-  await Promise.all(all)
-  assert.equal(calls.length, 2, 'the two waiting calls merged')
-  assert.deepEqual(calls[1].body.sessions, ['S2', 'S3'])
-  assert.equal(most, 1)
+test('pending catch-ups merge sessions/flags and never overlap', async () => {
+ let inFlight = 0, most = 0
+ const releases = []
+ reply = () => { inFlight++; most = Math.max(most, inFlight); return new Promise(r => releases.push(() => { inFlight--; r(answer()) })) }
+ const first = m.feedCatchUp(target(['S1'])); await settle()
+ const all = [first, m.feedCatchUp(target(['S2'])), m.feedCatchUp(target(['S3']), { full: true })]
+ for (let i = 0; i < 3; i++) { await settle(); releases.shift()?.() }
+ await Promise.all(all)
+ assert.equal(calls.length, 2); assert.equal(most, 1)
+ assert.deepEqual(calls[1].body.sessions, ['S2', 'S3']); assert.equal(calls[1].body.since, 0)
 })
-
-test('a catch-up bundle is trusted only for chats the last push vouched for; warm skips only those', async () => {
-  window.__answer = () => answer({ rev: 3 })
-  await m.feedCatchUp(target(['S1', 'S2']))
-  window.__answer = () => answer({ rev: 3, reset: false, bundles: { S1: bundle('S1'), S2: bundle('S2') } })
-  push({ heartbeat: true, prev: 3, rev: 3, fresh: ['S1'] })
-  await settle(); await settle()
-  const byS = Object.fromEntries(ingested.slice(-2).map(x => [x.session, x.trusted]))
-  assert.deepEqual(byS, { S1: true, S2: false }, 'S2 is failing on the gateway: a cached copy here')
-  assert.equal(m.feedVouches({ connectionId: 'C1', profile: 'default', session: 'S1' }), true)
-  assert.equal(m.feedVouches({ connectionId: 'C1', profile: 'default', session: 'S2' }), false)
+test('feed targets group focused, recent and sidebar scopes by connection/profile', () => {
+ m.noteRecent(route('S9', 'C2', 'work'))
+ const t = m.feedTargets([{ id: 'S7', connection_id: 'C2', profile: 'work', last_active: 5 }, { id: 'S8', connection_id: 'C1', last_active: 4 }, { id: 'hidden', connection_id: 'C1', archived: true }])
+ assert.deepEqual(t.find(x => x.connectionId === 'C1').sessions, ['S1', 'S8'])
+ assert.deepEqual(t.find(x => x.connectionId === 'C2'), { connectionId: 'C2', profile: 'work', sessions: ['S9', 'S7'] })
 })
-
-// [daveey 2026-11-21] "we restart the hub for updates, figure out how to preserve the feed": a restarted backend
-// keeps its feed id and epoch and jumps its revisions past the old process's; the client catches up and stays live.
-test('a restarted backend that restored its feed is followed by catch-up, never a reset, and stays trusted', async () => {
-  window.__answer = () => answer({ rev: 3 })
-  await m.feedCatchUp(target())
-  push({ prev: 3, rev: 4, bundles: { S1: bundle() }, fresh: ['S1'] })
-  await settle()
-  assert.equal(m.feedIsLive({ connectionId: 'C1', profile: 'default' }), true)
-  calls.length = 0
-  const logged = []
-  window.hermesDesktop.logLine = line => logged.push(line)
-  const restored = 4 + 1_000_000
-  window.__answer = () => answer({ rev: restored + 1, reset: false, bundles: { S1: bundle() } })
-  push({ prev: restored, rev: restored + 1, bundles: { S1: bundle() }, fresh: ['S1'] })  // the new process's first push
-  await settle(); await settle()
-  assert.equal(calls.at(-1).body.epoch, 'E1', 'same epoch: a catch-up, not a reset')
-  assert.equal(calls.at(-1).body.since, 4, 'from the last revision applied')
-  assert.equal(m.feedIsLive({ connectionId: 'C1', profile: 'default' }), true, 'trust kept across the restart')
-  assert.equal(logged.filter(l => /registered/.test(l)).length, 0, 'no re-registration')
-  const before = ingested.length
-  push({ prev: restored + 1, rev: restored + 2, bundles: { S1: bundle() }, fresh: ['S1'] })
-  assert.equal(ingested.length, before + 1, 'later pushes of the new process apply in order')
-  push({ prev: 4, rev: 5, bundles: { S1: bundle() }, fresh: ['S1'] })  // the old process, still finishing
-  assert.equal(ingested.length, before + 1, "the old process's later pushes are older: ignored")
+test('heartbeat freshness is exact-session qualified and matches gateway profile aliases', async () => {
+ reply = () => answer({ profile: 'custom' }); await m.feedCatchUp(target(['S1', 'S2']))
+ push({ profile: 'custom', heartbeat: true, rev: 3, fresh: ['S1'] }); await settle(); await settle()
+ assert.equal(m.feedVouches(route()), true); assert.equal(m.feedVouches(route('S2')), false)
 })
-
-test('a gateway behind what we hold while no pushes reach us (restored from an older snapshot) is reset to', async () => {
-  window.__answer = () => answer({ rev: 3 })
-  await m.feedCatchUp(target())
-  push({ prev: 3, rev: 9, bundles: { S1: bundle() }, fresh: ['S1'] })  // a gap: catch up
-  window.__answer = () => answer({ rev: 9, reset: false })
-  await settle(); await settle()
-  // Live: an older answer than a push that landed meanwhile is dropped (unchanged behaviour).
-  calls.length = 0
-  window.__answer = () => answer({ rev: 5, reset: false })
-  await m.feedCatchUp(target())
-  assert.equal(calls.length, 1, 'live: kept what the pushes gave')
-  // Pushes stopped (the backend restarted from an older snapshot) and it answers below our revision: start over.
-  const realNow = Date.now
-  try {
-    const later = realNow() + m.FEED_STALE_MS + 1
-    Date.now = () => later
-    calls.length = 0
-    window.__answer = req => req.body.epoch === null ? answer({ rev: 5, reset: true, bundles: { S1: bundle() } }) : answer({ rev: 5, reset: false })
-    assert.equal(await m.feedCatchUp(target(), { nowMs: later }), true)
-    assert.equal(calls.length, 2, 'asked again, from scratch')
-    assert.equal(calls.at(-1).body.epoch, null)
-    window.__answer = () => answer({ rev: 6, reset: false })
-    const before = ingested.length
-    push({ prev: 5, rev: 6, bundles: { S1: bundle() }, fresh: ['S1'] })
-    assert.equal(ingested.length, before + 1, 'its next push applies: the chain continues from its revision')
-  } finally { Date.now = realNow }
+test('restored backend revision jumps catch up without resetting its epoch', async () => {
+ await m.feedCatchUp(target())
+ push({ prev: 3, rev: 4, fresh: ['S1'], bundles: { S1: bundle() } }); await settle()
+ const restored = 1000004
+ reply = () => answer({ rev: restored + 1, bundles: { S1: bundle('S1', 'restored') } })
+ push({ prev: restored, rev: restored + 1, fresh: ['S1'] }); await settle(); await settle()
+ assert.equal(calls.at(-1).body.epoch, 'E1'); assert.equal(calls.at(-1).body.since, 4)
+ assert.equal(m.cachedModel(route()).revision, 'restored')
+ push({ prev: 4, rev: 5, bundles: { S1: bundle('S1', 'retired-process') } })
+ assert.equal(m.cachedModel(route()).revision, 'restored')
+})
+test('older snapshot is ignored while live, reset to after transport expires', async () => {
+ reply = () => answer({ rev: 9 }); await m.feedCatchUp(target())
+ push({ heartbeat: true, rev: 9, fresh: ['S1'] }); await settle(); await settle()
+ reply = () => answer({ rev: 5, bundles: { S1: bundle('S1', 'older') } })
+ await m.feedCatchUp(target()); assert.equal(m.cachedModel(route()), null)
+ const later = Date.now() + m.FEED_STALE_MS + 1
+ await m.feedCatchUp(target(), { nowMs: later })
+ assert.equal(calls.at(-1).body.epoch, null)
+ assert.equal(m.cachedModel(route()).revision, 'older')
 })

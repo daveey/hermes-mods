@@ -33,6 +33,27 @@ class Reader:
             c.close()
 
 
+def test_feed_reconciles_before_opening_request_reader(tmp_path, monkeypatch):
+    events = []
+    class FeedReader(Reader):
+        def reconcile_user_steps(self, session, lineage):
+            events.append(('reconcile', session, tuple(lineage)))
+            return [{'requestId': 'canonical-new', 'state': 'open'}]
+
+        def conn(self, path):
+            if path.name == 'actions.sqlite3':
+                events.append(('read',))
+            return super().conn(path)
+
+    reader = FeedReader(tmp_path)
+    try:
+        result = inputs.read(reader, 'chat', ['parent', 'chat'])
+        assert result['requests'] == [{'requestId': 'canonical-new', 'state': 'open'}]
+        assert events[0] == ('reconcile', 'chat', ('parent', 'chat'))
+    finally:
+        reader.close()
+
+
 def test_reads_current_lifecycle_without_writes_and_reuses_runtime_producers(tmp_path, monkeypatch):
     h = tmp_path
     with sqlite3.connect(h / 'state.db') as c:

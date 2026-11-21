@@ -346,72 +346,28 @@ export function humanRequestOf(raw) {
   if (!r || typeof r !== 'object' || Array.isArray(r)) return null
   const s = k => (typeof r[k] === 'string' ? r[k].trim() : '')
   const out = { action: s('action'), why: s('why_human'), interaction: s('interaction') }
-  const brief = briefOf(s('scope'))
-  if (brief) out.brief = brief
   return out.action ? out : null
 }
 
-// The decision brief generate-unblock-card writes into human_request.scope. Same parse as ask-gate's
-// unblock_card_quality.py (sections/options/_at_boundary), which enforces it: change both together. A label is a
-// markdown heading (colon optional) or the word + colon at a line start (after a bullet) or after a sentence end;
-// the first occurrence of each counts; a part runs to the next label or a physical-ask contract line.
-const BRIEF_NAMES = '(situation|options?|recommend(?:ation|ed)?)'
-const BRIEF_HEADING = new RegExp(`^[ \\t]*#{1,6}[ \\t]*(?:\\*\\*|__)?${BRIEF_NAMES}(?:\\*\\*|__)?[ \\t]*:?(?:\\*\\*|__)?[ \\t]*$`, 'gim')
-const BRIEF_WORD = new RegExp(`(?<![\\w])(?:\\*\\*|__)?${BRIEF_NAMES}(?:\\*\\*|__)?[ \\t]*:(?:\\*\\*|__)?`, 'gi')
-const BRIEF_CONTRACT = /^[ \t]*(?:DEVICE|HUMAN_STEP|OBSERVATION|EVIDENCE)[ \t]*:/gm
-const BRIEF_OPTION = /(?<!\S)(?:[-*][ \t]+)?(?:\*\*)?(?:[Oo]ption[ \t]+)?\(?(?:[A-F](?:\)|\.(?=\s)|:|[ \t]+[-—–](?=\s))|[1-9](?:\)|\.(?=\s)))(?:\*\*)?/g
-const BRIEF_MIN = 20
-const flatText = t => t.replace(/\*\*|__/g, '').replace(/\s+/g, ' ').trim()
-const cleanText = t => String(t || '').replace(/\r\n?/g, '\n')
-const skipBack = (t, i) => { while (i >= 0 && (t[i] === ' ' || t[i] === '\t')) i--; return i }
-/** pos starts a line (after spaces; with bullets also after a bullet/quote marker). */
-const lineStart = (t, pos, bullets = false) => {
-  let i = skipBack(t, pos - 1)
-  if (bullets && i >= 0 && '-*>'.includes(t[i])) i = skipBack(t, i - 1)
-  return i < 0 || t[i] === '\n'
-}
-/** pos starts a line (after spaces, a bullet/quote) or follows a sentence end (. ! ? ;) and spaces. */
-function atBoundary(t, pos) {
-  const i = skipBack(t, pos - 1)
-  if (i < 0 || t[i] === '\n') return true
-  if ('-*>'.includes(t[i])) { const j = skipBack(t, i - 1); if (j < 0 || t[j] === '\n') return true }
-  return '.!?;'.includes(t[i]) && i < pos - 1
-}
-const briefName = n => { n = n.toLowerCase(); return n.startsWith('situation') ? 'situation' : n.startsWith('option') ? 'options' : 'recommend' }
-/** Option items of an Options part: each marker to the next; text before the first is dropped. With two or more
- *  line-start markers only those count; a single-line part splits at line starts and sentence ends. */
-export function briefOptions(text) {
-  text = cleanText(text)
-  const cands = [...text.matchAll(BRIEF_OPTION)].map(m => m.index)
-  let line = cands.filter(s => lineStart(text, s))
-  const lettered = line.filter(s => /^[-*\s]*(?:\*\*)?(?:[Oo]ption\s+)?\(?[A-F]/.test(text.slice(s)))
-  if (lettered.length >= 2) line = lettered // numbered sub-steps under lettered options stay inside their option
-  const starts = line.length >= 2 ? line : cands.filter(s => atBoundary(text, s))
-  return starts.map((s, i) => flatText(text.slice(s, starts[i + 1] ?? text.length)).replace(/^[-*]\s*/, '')).filter(Boolean)
-}
-/** {situation, options[], recommend} from a scope with a Situation part (>= 20 chars), else null. Exported for tests. */
-export function briefOf(scope) {
-  if (typeof scope !== 'string' || !scope.trim()) return null
-  scope = cleanText(scope)
-  const marks = [...scope.matchAll(BRIEF_HEADING)].map(m => ({ start: m.index, end: m.index + m[0].length, name: briefName(m[1]) }))
-  const taken = marks.map(m => [m.start, m.end])
-  let words = [...scope.matchAll(BRIEF_WORD)].filter(m => atBoundary(scope, m.index) && !taken.some(([s, e]) => s <= m.index && m.index < e))
-  // A sentence-end label is prose when the same label also starts a line (a "Recommended:" inside an option's text,
-  // with a real "Recommend:" line below); single-line and mixed layouts keep their sentence-end labels.
-  const atLine = new Set([...marks.map(m => m.name), ...words.filter(m => lineStart(scope, m.index, true)).map(m => briefName(m[1]))])
-  words = words.filter(m => lineStart(scope, m.index, true) || !atLine.has(briefName(m[1])))
-  for (const m of words) marks.push({ start: m.index, end: m.index + m[0].length, name: briefName(m[1]) })
-  marks.sort((x, y) => x.start - y.start)
-  const stops = [...marks.map(m => m.start), ...[...scope.matchAll(BRIEF_CONTRACT)].map(m => m.index)].sort((x, y) => x - y)
-  const parts = {}
-  for (const m of marks) {
-    if (m.name in parts) continue
-    const next = stops.find(s => s >= m.end) ?? scope.length
-    parts[m.name] = scope.slice(m.end, next).replace(/[\s>*-]+$/, '').trim() // the next label's bullet/quote marker
+// Display text for a card comes from the hub's PanelModel v1 row (title/detail); nothing here parses a card's scope.
+const MODEL_SECTION_KEYS = ['needs_you', 'stuck', 'running', 'waiting', 'ready', 'done']
+/** The PanelModel row that shows this card chip: same card id, and the same gateway/profile/board where both sides say. */
+export function modelRowFor(model, chip) {
+  if (!model || model.version !== 1 || !model.sections || chip?.kind !== 'kanban') return null
+  const same = (a, b) => !a || !b || str(a) === str(b)
+  for (const name of MODEL_SECTION_KEYS) {
+    const row = (Array.isArray(model.sections[name]) ? model.sections[name] : []).find(r => r && r.kind !== 'question' && str(r.id) === chip.id && same(r.gateway, chip.gateway) && same(r.profile, chip.profile) && same(r.board, chip.board))
+    if (row) return row
   }
-  const situation = flatText(parts.situation || '')
-  if (situation.length < BRIEF_MIN) return null
-  return { situation, options: briefOptions(parts.options || ''), recommend: flatText(parts.recommend || '') }
+  return null
+}
+/** Chips with `display` ({title, detail}) copied verbatim from the PanelModel row that shows them; others unchanged. */
+export function withModelDisplay(chips, model) {
+  if (!model) return chips
+  return chips.map(c => {
+    const row = modelRowFor(model, c)
+    return row ? { ...c, display: { title: str(row.title), detail: str(row.detail) } } : c
+  })
 }
 
 const epochSec = v => { const n = Number(v); return Number.isFinite(n) && n > 0 ? (n > 1e11 ? n / 1000 : n) : 0 }
@@ -863,12 +819,12 @@ export function touchFeed(connectionId, profile = 'default', sessions = [], at =
   return n
 }
 /** Take one pushed bundle (`tasks` = /api/session-kanban-tasks rows, `lineage` = the chat and its ancestors). */
-export function ingestFeed({ connectionId, profile = 'default', session, lineage, tasks, trusted = true } = {}) {
+export function ingestFeed({ connectionId, profile = 'default', session, lineage, tasks, model = null, trusted = true } = {}) {
   if (!connectionId || !session || !Array.isArray(tasks)) return false
   profile = profile || 'default'
   const route = { connectionId, profile }
   const scope = JSON.stringify([connectionId, profile, session])
-  const chips = sessionTaskChips(tasks, route)
+  const chips = withModelDisplay(sessionTaskChips(tasks, route), model)
   rememberChips(scope, chips, undefined, { feed: !!trusted })
   if (Array.isArray(lineage) && lineage.length) {
     const ids = new Set(lineage.map(String))
@@ -1467,7 +1423,7 @@ export function Chip({ chip: rawChip, now }) {
       onHub(chip) && jsx('span', { 'data-on-hub': '', style: { color, fontSize: 10, fontWeight: 600, flex: 'none' }, children: '[H]' }),
       jsx('i', { 'aria-hidden': true, className: `codicon ${KIND_GLYPH[chip.kind]}`, style: { fontSize: 12, flex: 'none', opacity: 0.8 } }),
       chip.kind === 'kanban' && jsx('span', { style: { opacity: 0.7, fontFamily: 'var(--font-mono, ui-monospace, monospace)', fontSize: 10.5 }, children: chip.id }),
-      jsx('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', fontSize: 11 }, children: truncate(chip.label) }),
+      jsx('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', fontSize: 11 }, children: truncate(chip.display?.title || chip.label) }),
       chip.extra && jsx('span', { style: { opacity: 0.7, fontSize: 10.5, fontVariantNumeric: 'tabular-nums' }, children: chip.extra }),
       chip.state !== 'running' && jsx('span', { style: { color, fontSize: 10.5 }, children: chip.look === 'stalled' ? 'stalled' : chip.state }),
       age && jsx('span', { style: { opacity: 0.6, fontSize: 10.5, fontVariantNumeric: 'tabular-nums' }, children: age })

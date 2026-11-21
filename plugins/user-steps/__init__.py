@@ -304,21 +304,24 @@ def _panel_rows(request: dict) -> list[str]:
     return rows
 
 
-# A choice label's own option letter ("C: …", "(C) …", "Option C - …"); same rule as OWN_LETTER in plugin.js.
-_OWN_LETTER = re.compile(r"^\s*(?:option\s+)?\(?([A-Za-z])(?:\)|:|\.(?=\s)|\s+[-\u2013\u2014](?=\s))\s*", re.I)
+def _panel_brief():
+    """Use the same pure badge grammar as the session-panel producer."""
+    import importlib.util as ilu
+    import sys as _s
+    path = Path(__file__).resolve().parents[1] / 'session-panel' / 'brief.py'
+    key = '_user_steps_session_panel_brief_' + str(path)
+    mod = _s.modules.get(key)
+    if mod is None:
+        spec = ilu.spec_from_file_location(key, path)
+        assert spec is not None and spec.loader is not None
+        mod = ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod = _s.modules.setdefault(key, mod)
+    return mod
 
 
 def _panel_letters(rows: list[str], extra: int) -> list[str]:
-    """The badge letter of each _panel_rows row, mirroring plugin.js panelLetters.
-
-    Choices whose labels all carry distinct own letters keep them (the card's brief calls them that), and the last
-    `extra` rows (Skip, Other) take the letters after the highest; otherwise rows are lettered A, B, C... in order."""
-    choices = rows[:len(rows) - extra]
-    own = [(m.group(1).upper() if (m := _OWN_LETTER.match(label)) else "") for label in choices]
-    top = max((ord(c) for c in own if c), default=0)
-    if not own or not all(own) or len(set(own)) != len(own) or top + extra > 90:
-        return [chr(65 + i) for i in range(len(rows))]
-    return own + [chr(top + 1 + i) for i in range(extra)]
+    return _panel_brief().panel_letters(rows, extra)
 
 
 def _panel_letter_hint(message: str, requests: list) -> str:

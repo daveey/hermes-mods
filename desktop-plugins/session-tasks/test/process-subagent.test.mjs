@@ -17,14 +17,8 @@ globalThis.__obsHost = { state: { focusedSessionId: atom('runtime'), focusedStor
 globalThis.__obsSdk = await loadProjector()
 globalThis.__sourceReact = React; globalThis.__sourceJsx = J
 register('data:text/javascript,' + encodeURIComponent(`export async function resolve(s,c,n){const map={'react':'const R=globalThis.__sourceReact;export const useState=R.useState,useEffect=R.useEffect,useRef=R.useRef','react/jsx-runtime':'const J=globalThis.__sourceJsx;export const jsx=J.jsx,jsxs=J.jsxs','@hermes/plugin-sdk':${JSON.stringify(sdkStubSource())}};return map[s]?{url:'data:text/javascript,'+encodeURIComponent(map[s]),shortCircuit:true}:n(s,c)}`))
-const tasks = await import('../plugin.js'), panel = await import('../../session-panel/plugin.js')
+const tasks = await import('../plugin.js')
 const skip = !globalThis.__obsSdk && 'set HERMES_CORE_SOURCE for real SDK/source tests'
-const render = (chips, now) => {
-  const old = Date.now
-  Date.now = () => now * 1000
-  window.__sessionTasks = { snapshot: { runtime: 'runtime', stored: 'owner', chips } }
-  try { return renderToStaticMarkup(React.createElement(panel.Panel)) } finally { Date.now = old }
-}
 const sourceRecords = () => JSON.parse(execFileSync(process.env.PYTHON || 'python3', ['-c', `
 import json
 from hermes_cli.turn_process_execution_observations import process, registry_subagent
@@ -45,48 +39,24 @@ test('real process/subagent adapter records survive RPC chips, both consumers an
   assert.strictEqual(subs[0].observations[0], s)
   // The registry id is never the canonical identity: without the child session id the record cannot be adopted.
   const legacy = tasks.subagentChips([{ subagent_id: 'child-a', started_at: 900, status: 'running', goal: 'old core', execution_observations: [s] }])
-  for (const m of [tasks, panel]) assert.equal(m.chipObservation(legacy[0], 1001).state, 'unknown')
+  for (const m of [tasks]) assert.equal(m.chipObservation(legacy[0], 1001).state, 'unknown')
   const chips = [...procs, ...subs]
-  for (const m of [tasks, panel]) for (const chip of chips) {
+  for (const m of [tasks]) for (const chip of chips) {
     assert.equal(m.chipObservation(chip, 1001).state, 'running')
     assert.equal(m.chipObservation(chip, 1180).state, 'unknown')
     assert.equal(m.chipObservation(chip, 1001).progress, null)
   }
-  const html = render(chips, 1001)
-  // Running rows are one line each; the evidence line (with its source) is in the row's click-open details.
-  assert.equal(html.match(/data-running-row=/g)?.length, 2)
-  assert.match(panel.chipEvidenceLine(procs[0], 1001), /process\.registry/)
-  const expired = render(chips, 1180)
-  assert.doesNotMatch(expired, /In progress ·|data-running-row=/)
-  assert.match(expired, /2 evidence unknown/)
-  assert.match(panel.chipEvidenceLine(procs[0], 1180), /source expired/)
+  assert.match(tasks.chipEvidenceLine(procs[0], 1001), /process\.registry/)
+  assert.match(tasks.chipEvidenceLine(procs[0], 1180), /source expired/)
   const strip = renderToStaticMarkup(React.createElement(tasks.Chip, { chip: procs[0], now: 1180000 }))
   assert.match(strip, /unknown/)
   assert.doesNotMatch(strip, /session-tasks-pulse/)
 })
 
-test('initial mixed-version and partial source stay visible beside running; no tools-as-progress/stuck inference', { skip }, () => {
-  const [p] = sourceRecords()
-  const good = tasks.processChips([{ session_id: 'proc-a', status: 'running', execution_observations: [p] }])
-  const old = tasks.subagentChips([{ subagent_id: 'legacy-child', status: 'running', goal: 'legacy', tool_count: 100 }])
-  const chips = [...good, ...old]
-  const sorted = panel.classify(chips, { nowMs: 1001000, silence: new Map([[old[0].key, 999999999]]) })
-  assert.equal(sorted.active.length, 1)
-  assert.equal(sorted.waiting.length, 1)
-  assert.equal(sorted.stuck.length, 0)
-  assert.equal(panel.annotateEvidence(sorted, 1001000), 1)
-  const html = render(chips, 1001)
-  assert.match(html, /In progress · 1/)
-  // Waiting rows are folded to counts by default; the unknown row's evidence still names why.
-  assert.match(sorted.waiting[0].evidenceText, /producer sent no observations/)
-  assert.match(html, /1 evidence unknown/)
-  assert.doesNotMatch(html, /Nudge agent/)
-})
-
 test('source identity fences same work id on other owner/kind/generation; ambiguous executions never choose a winner', { skip }, () => {
   const [p, s] = sourceRecords()
   const chip = tasks.processChips([{ session_id: 'proc-a', status: 'running', execution_observations: [p] }])[0]
-  for (const m of [tasks, panel]) {
+  for (const m of [tasks]) {
     for (const patch of [{ gateway: 'other' }, { profile: 'other' }, { generation: 'pid=99:start=99' }]) {
       const foreign = { ...p, identity: { ...p.identity, ...patch } }
       if (!patch.generation) assert.equal(m.chipObservation({ ...chip, gateway: 'edge', profile: 'work', observations: [foreign] }, 1001).state, 'unknown')
@@ -94,25 +64,6 @@ test('source identity fences same work id on other owner/kind/generation; ambigu
     }
     assert.equal(m.chipObservation({ ...chip, observations: [s] }, 1001).state, 'unknown')
     assert.equal(m.selectView([p, { ...p, identity: { ...p.identity, generation: 'old' }, observed_at: 1001 }], p.identity, 1002).state, 'running')
-  }
-})
-
-test('shared golden records traverse actual task chips, panel classification and evidence annotation', { skip }, () => {
-  const { fixture } = loadFixture()
-  for (const t of fixture.cases) {
-    if (t.expected_identity || (t.source_class && t.source_class !== 'sidebar')) continue
-    const record = caseInput(fixture, t), id = record?.identity
-    if (id?.kind !== 'card' || !id.work_id) continue
-    const chips = tasks.sessionTaskChips([{ id: id.work_id, status: 'running', board: id.board, profile: id.profile, gateway: id.gateway, execution_observations: [record] }])
-    const now = t.now ?? 1001
-    // Real render clocks are milliseconds converted to finite epoch seconds. Invalid API-clock cases
-    // are covered by the direct SDK parity suite, not coerced into a different input here.
-    if (typeof now !== 'number' || !Number.isFinite(now)) continue
-    const sorted = panel.classify(chips, { nowMs: now * 1000, evidence: c => panel.chipObservation(c, now) })
-    panel.annotateEvidence(sorted, now * 1000)
-    const rows = [...sorted.active, ...sorted.stuck, ...sorted.waiting, ...sorted.queued, ...sorted.unasked]
-    assert.equal(rows.length, 1, t.id)
-    if ('state' in t.expected) assert.equal(rows[0].evidenceState, t.expected.state, t.id)
   }
 })
 
