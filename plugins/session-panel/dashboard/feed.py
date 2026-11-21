@@ -25,6 +25,8 @@ and each batch's `prev` is the revision right before it. Pure: every read goes t
 from __future__ import annotations
 
 import hashlib
+from contextlib import nullcontext
+from dataclasses import dataclass, field
 import itertools
 import json
 import logging
@@ -41,7 +43,6 @@ INTEREST_TTL_S = 15 * 60.0   # a chat nobody re-registers stops being computed
 MAX_WATCHED = 200            # interest cap across all clients
 CHAIN_DEPTH = 6              # hops per chain (session-panel walks at most six cards)
 CHAIN_CARDS = 80             # cards per bundle
-CATCHUP_WAIT_S = 8.0         # a catch-up waits at most this long for chats another thread is computing (< 15 s client timeout)
 TERMINAL = {'done', 'archived', 'cancelled'}
 CARD_ID = re.compile(r'\bt_[0-9a-f]{6,}\b')
 PROCESS_FEED = None          # the one feed of this process (plugin_api.feed())
@@ -73,6 +74,13 @@ def chain_refs(row: Optional[dict], detail: Optional[dict]) -> list[str]:
     return list(dict.fromkeys(out))
 
 
+@dataclass
+class _Flight:
+    owner: int
+    ready: threading.Event = field(default_factory=threading.Event)
+    bundle: Optional[dict] = None
+
+
 class Feed:
     """One feed per gateway process (one profile: the process's own)."""
 
@@ -99,7 +107,8 @@ class Feed:
         self._stamps: Any = None
         self._cursor: Any = None
         self._last_full = 0.0
-        self._inflight: dict[str, threading.Event] = {}  # session -> set once its running compute is stored
+        self._flights: dict[str, _Flight] = {}
+        self._retry: set[str] = set()  # a tick joined reads that may predate its change cursor
 
     # ── interest ────────────────────────────────────────────────────────────
     def watch(self, sessions: Iterable[str]) -> list[str]:
@@ -123,10 +132,11 @@ class Feed:
         self.interest.pop(s, None)
         self.bundles.pop(s, None)
         self.failures.pop(s, None)
+        self._retry.discard(s)
 
     # ── computing ───────────────────────────────────────────────────────────
-    def compute(self, session: str) -> dict:
-        seq = next(self._seq)  # taken before any read: a slower compute that started earlier loses to this one
+    def compute(self, session: str, *, seq: Optional[int] = None) -> dict:
+        seq = next(self._seq) if seq is None else seq  # assigned before the pass's first shared read
         r = self.readers
         lineage = list(r.lineage(session)) or [session]
         tasks = list(r.linked(lineage))
@@ -152,47 +162,74 @@ class Feed:
         return {'session': session, 'lineage': lineage, 'tasks': tasks, 'done': done, 'cards': cards,
                 'computed_at': self.clock(), 'computed_seq': seq}
 
-    def _compute_all(self, sessions: Iterable[str]) -> dict[str, dict]:
-        """Compute outside any lock. A chat that fails keeps its last bundle; its failure is counted and logged."""
-        out = {}
-        for s in sessions:
-            # A long pass must not starve clients of heartbeats (their trust lapses after three missed ones).
+    def _wait_flight(self, flight: _Flight) -> Optional[dict]:
+        # No interest/publication lock while waiting, including heartbeat emits.
+        if flight.owner == threading.get_ident() and not flight.ready.is_set():
+            raise RuntimeError('reentrant session-panel compute')
+        while not flight.ready.wait(min(self.heartbeat_s, 1.0)):
             self._publish({}, heartbeat=True)
-            try:
-                out[s] = self.compute(s)
-                with self.lock:
-                    self.failures.pop(s, None)
-            except Exception as e:
-                with self.lock:
-                    f = self.failures.setdefault(s, {'count': 0})
-                    f.update(count=f['count'] + 1, error=f'{type(e).__name__}: {e}'[:300], at=self.clock())
-                    first = f['count'] == 1
-                (log.warning if first else log.debug)('session-panel feed: %s failed', s, exc_info=True)
-        return out
+        return flight.bundle
 
-    def _compute_publish(self, sessions: Iterable[str], *, always: bool = False
-                         ) -> tuple[dict[str, dict], list[threading.Event]]:
-        """Single-flight compute + store + push: `(pushed, waits)`, where `waits` are the events of the chats another
-        thread was already computing (skipped here; that thread stores and pushes them, then sets the event).
-        `always` (the tick) computes every chat anyway: a change can land after a running catch-up read its data,
-        and only the newer compute wins (`computed_seq`). Catch-ups may still wait on the tick's compute.
+    def _compute_all(self, sessions: Iterable[str], *, refresh: bool = False) -> dict[str, dict]:
+        """One owner per session, shared by requests and ticks; disjoint owners never wait on each other.
 
-        Without this every catch-up that found a chat missing recomputed it in parallel; under load each took
-        longer than the Desktop's 15 s timeout, whose retries added still more computes until no request reached
-        the backend in time and the panel showed no cards (hub serve, 2026-11-21). [daveey]"""
-        wanted = list(dict.fromkeys(sessions))
+        Reserve each session immediately before its reads, never queued behind unrelated sessions.
+        Join after owned work so overlapping passes cannot form a cycle. Results stay joinable until publication.
+        """
+        owned, joined, out = {}, {}, {}
+        ident = threading.get_ident()
+        finished = False
+        sessions = list(dict.fromkeys(sessions))
         with self.lock:
-            waits = [] if always else [self._inflight[s] for s in wanted if s in self._inflight]
-            owned = [s for s in wanted if s not in self._inflight]
-            for s in owned:
-                self._inflight[s] = threading.Event()
-        todo = wanted if always else owned
+            if any(s in self._flights and self._flights[s].owner == ident
+                   and not self._flights[s].ready.is_set() for s in sessions):
+                raise RuntimeError('reentrant session-panel compute')
+            seq = next(self._seq)
+            read_at = self.clock()
+        batch = getattr(self.readers, 'batch', None)
         try:
-            return (self._publish(self._compute_all(todo)) if todo else {}), waits
+            with batch(sessions) if sessions and callable(batch) else nullcontext():
+                for s in sessions:
+                    with self.lock:
+                        flight = self._flights.get(s)
+                        if flight is not None:
+                            joined[s] = flight
+                            if refresh:
+                                self._retry.add(s)
+                            continue
+                        self._retry.discard(s)
+                        owned[s] = self._flights[s] = flight = _Flight(ident)
+                    self._publish({}, heartbeat=True)
+                    try:
+                        flight.bundle = out[s] = self.compute(s, seq=seq)
+                        flight.bundle['computed_at'] = read_at  # trust ages from the snapshot, never its completion
+                        with self.lock:
+                            self.failures.pop(s, None)
+                    except Exception as e:
+                        with self.lock:
+                            f = self.failures.setdefault(s, {'count': 0})
+                            f.update(count=f['count'] + 1, error=f'{type(e).__name__}: {e}'[:300], at=self.clock())
+                            first = f['count'] == 1
+                        (log.warning if first else log.debug)('session-panel feed: %s failed', s, exc_info=True)
+                    finally:
+                        with self.lock:
+                            if flight.bundle is None and self._flights.get(s) is flight:
+                                self._flights.pop(s)
+                            flight.ready.set()
+            for s, flight in joined.items():
+                bundle = self._wait_flight(flight)
+                if bundle is not None:
+                    out[s] = bundle
+            finished = True
+            return out
         finally:
-            with self.lock:  # after the store: a woken waiter finds the bundle (or, on failure, recomputes later)
-                for s in owned:
-                    self._inflight.pop(s).set()
+            # Includes BaseException and a reader scope that fails at entry/exit: never strand waiters.
+            with self.lock:
+                for s, flight in owned.items():
+                    if not finished or not flight.ready.is_set() or s not in out:
+                        if self._flights.get(s) is flight:
+                            self._flights.pop(s)
+                        flight.ready.set()
 
     def _store(self, session: str, bundle: dict) -> bool:
         """Keep `bundle`; True when it differs from what clients last got (it took a new revision)."""
@@ -214,13 +251,19 @@ class Feed:
         with self.compute_lock:
             prev = self.rev
             with self.lock:
+                for s, b in computed.items():
+                    flight = self._flights.get(s)
+                    if flight is not None and flight.bundle is b:
+                        self._flights.pop(s)
                 changed = {s: b for s, b in computed.items() if s in self.interest and self._store(s, b)}
             now = self.clock()
             if changed or (heartbeat and now - self.last_emit >= self.heartbeat_s):
                 with self.lock:
                     # The chats this push vouches for: held, watched, and last computed without a failure. Clients
                     # re-stamp only these (a dropped or failing chat is never confirmed by a heartbeat).
-                    fresh = sorted(s for s in self.interest if s in self.bundles and s not in self.failures)
+                    fresh = sorted(s for s in self.interest if s in self.bundles and s not in self.failures
+                                   and s not in self._retry
+                                   and now - self.bundles[s]['bundle']['computed_at'] <= self.full_every_s)
                 try:
                     self.emit({'epoch': self.epoch, 'prev': prev, 'rev': self.rev, 'bundles': changed, 'fresh': fresh,
                                **({} if changed else {'heartbeat': True})})
@@ -239,7 +282,9 @@ class Feed:
             return 0
         stamps = self.readers.stamps()
         full = now - self._last_full >= self.full_every_s
-        if stamps == self._stamps and not full:
+        with self.lock:
+            retry = self._retry.intersection(watched)
+        if stamps == self._stamps and not full and not retry:
             self._publish({}, heartbeat=True)
             return 0
         changed_cards, self._cursor = self.readers.changed_cards(self._cursor)
@@ -265,13 +310,12 @@ class Feed:
                     b = self.bundles.get(s)
                     if b and (b['refs'] & set(changed_cards) or b['lineage'] & touched):
                         dirty.add(s)
+        dirty.update(retry)
         started = time.monotonic()
-        pushed, _ = self._compute_publish(sorted(dirty), always=True) if dirty else ({}, [])
+        computed = self._compute_all(sorted(dirty), refresh=True) if dirty else {}
         if dirty:
             self.last_tick_s = time.monotonic() - started
-        if not pushed:
-            self._publish({}, heartbeat=True)
-        return len(pushed)
+        return len(self._publish(computed, heartbeat=True))
 
     # ── catch-up ────────────────────────────────────────────────────────────
     def changes(self, sessions: Iterable[str], *, since: int = 0, epoch: Optional[str] = None) -> dict:
@@ -284,16 +328,11 @@ class Feed:
             missing = [s for s in wanted if s not in self.bundles]
         if missing:
             try:
-                _, waits = self._compute_publish(missing)
+                self._publish(self._compute_all(missing))
             finally:
                 release = getattr(self.readers, 'release', None)
                 if callable(release):
                     release()  # request threads keep no connections between catch-ups
-            # Another thread's compute of a chat we also miss: wait for it, bounded below the Desktop's request
-            # timeout. Whatever is still computing is left out; its push reaches this client anyway.
-            deadline = time.monotonic() + CATCHUP_WAIT_S
-            for ev in waits:
-                ev.wait(max(0.0, deadline - time.monotonic()))
         with self.compute_lock, self.lock:
             out = {s: self.bundles[s]['bundle'] for s in wanted
                    if s in self.bundles and (reset or self.bundles[s]['rev'] > since)}

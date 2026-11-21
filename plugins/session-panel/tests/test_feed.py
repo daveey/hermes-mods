@@ -382,7 +382,9 @@ def test_a_slower_older_compute_never_replaces_a_newer_bundle():
     th.start()
     entered.wait(5)
     t['now'] += feedmod.FULL_EVERY_S + 1
-    f.tick()                     # computes later, publishes 'blocked'
+    # Direct producers still obey the publication fence; tick/changes now deliberately coalesce.
+    newer = f.compute('S1')
+    f._publish({'S1': newer})      # computes later, publishes 'blocked'
     gate.set()
     th.join()
     assert f.bundles['S1']['bundle']['tasks'][0]['status'] == 'blocked', 'the newer compute wins'

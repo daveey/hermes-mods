@@ -12,6 +12,8 @@ its own reads for that profile.
 from __future__ import annotations
 
 import dataclasses
+import copy
+from contextlib import contextmanager
 import importlib.util
 import json
 import logging
@@ -162,6 +164,12 @@ class CoreReaders:
         return changed, cursor
 
     def lineage(self, session: str) -> list[str]:
+        scope = getattr(self._local, 'batch', None)
+        if scope is not None and session in scope['lineages']:
+            result = scope['lineages'][session]
+            if isinstance(result, Exception):
+                raise result
+            return list(result)
         c = self.conn(self.state_db())
         out, cur = [], session
         while c is not None and cur and cur not in out and len(out) < 50:
@@ -173,28 +181,176 @@ class CoreReaders:
             cur = row['parent_session_id'] if row else None
         return out or [session]
 
+    @contextmanager
+    def batch(self, sessions):
+        """Thread/pass-local hydration only. Nothing survives this context or crosses profiles/requests.
+
+        Local membership is still core's creator/subscriber selector; remote inventory is cached BEFORE
+        core's lineage-key dedup, so a card linked to two chats remains in both. Errors are not memoized.
+        """
+        previous = getattr(self._local, 'batch', None)
+        if previous is not None:
+            yield
+            return
+        scope = {'lineages': {}, 'local': {}, 'remote': {}, 'cards': {}}
+        self._local.batch = scope
+        try:
+            for s in sessions:
+                try:
+                    scope['lineages'][s] = self.lineage(s)
+                except Exception as e:
+                    scope['lineages'][s] = e
+            scope['ids'] = list(dict.fromkeys(i for v in scope['lineages'].values()
+                                              if isinstance(v, list) for i in v[:50]))
+            yield
+        finally:
+            self._local.batch = previous
+
+    def _batch_scope(self):
+        scope = getattr(self._local, 'batch', None)
+        if scope is not None:
+            # A pass is one bounded snapshot, not a global cache. Content writes are seen by the next tick;
+            # unrelated state.db traffic must not discard shared board work. Replacements invalidate at once.
+            stamp = []
+            for path in self.files():
+                try:
+                    st = os.stat(path)
+                    stamp.append((str(path), st.st_dev, st.st_ino))
+                except FileNotFoundError:
+                    stamp.append((str(path), None))
+            if scope.get('stamp') != stamp:
+                for name in ('local', 'remote', 'cards'):
+                    scope[name].clear()
+                scope.pop('history', None)
+                scope.pop('local_failed', None)
+                scope['stamp'] = stamp
+        return scope
+
+    def _session_tasks(self, ids, statuses):
+        from hermes_cli import kanban_session_activity as ksa
+        scope = self._batch_scope()
+        if (scope is None or len(scope['lineages']) < 2 or len(scope['ids']) > 400
+                or not set(ids) <= set(scope['ids'])):
+            return ksa.session_tasks(ids, statuses, stale_ok=True)
+        from hermes_cli.kanban_session_outcome_tasks import select_listed_local_tasks
+        from hermes_cli.kanban_session_activity_release import PENDING_RELEASE_STATUSES
+        from hermes_cli.kanban_session_activity_card_details import annotate_remote_upstream
+        from hermes_cli.kanban_execution_observations import add_cards
+        out = []
+        if scope.get('local_failed'):
+            return ksa.session_tasks(ids, statuses, stale_ok=True)
+        try:
+            for path in ksa._board_db_paths():
+                key = (str(path), statuses)
+                if key not in scope['local']:
+                    # One attempt, no changing union key in core's bounded last-good lineage memo.
+                    rows = ksa._read_session_tasks(path, scope['ids'], statuses)
+                    if any(row.get('_execution_error') for row in rows):
+                        raise RuntimeError('session-panel union execution evidence unavailable')
+                    scope['local'][key] = {r['id']: r for r in rows}
+                rows = scope['local'][key]
+                c = self.conn(path)
+                if c is None:
+                    raise RuntimeError('session-panel membership board unavailable')
+                members = select_listed_local_tasks(c, ids, statuses)
+                # A writer may have changed membership after the union read; never omit a new card.
+                if not members.keys() <= rows.keys():
+                    return ksa.session_tasks(ids, statuses, stale_ok=True)
+                board = ksa._board_slug(path)
+                selected = []
+                for tid, member in members.items():
+                    row = copy.deepcopy(rows[tid])
+                    row.update(via=member['via'])
+                    selected.append(row)
+                # Refresh exactly the memo core would have stored for this lineage, before evidence projection.
+                projected = ksa._busy.session_tasks(path, ids, statuses, lambda *_: selected)
+                for row in projected:
+                    row.setdefault('key', f"{board}/{row['id']}")
+                    out.append(row)
+            wanted, seen, remote = set(ids), set(), []
+            # Same projection as append_remote_listed_cards, applied before key dedup for EACH lineage.
+            for card in self._remote_inventory(scope, ids, statuses):
+                if (card['session'] in wanted or card.get('origin_session') in wanted) and (
+                        card.get('status') in statuses or (card.get('status') in PENDING_RELEASE_STATUSES
+                                                          and card.get('unfinished'))) and card['key'] not in seen:
+                    seen.add(card['key'])
+                    wait = ksa._remote_wait(card)
+                    row = {**copy.deepcopy(card), 'session_id': card['session']}
+                    if wait is not None:
+                        row['wait'] = wait
+                    remote.append(row)
+            annotate_remote_upstream(remote)
+            return add_cards(out + remote)
+        except Exception:
+            # Preserve stable per-lineage busy memos and per-session failure isolation on batch read failure.
+            scope['local_failed'] = True
+            log.debug('session-panel shared read unavailable; retrying lineage', exc_info=True)
+            return ksa.session_tasks(ids, statuses, stale_ok=True)
+
+    def _remote_inventory(self, scope, ids, statuses):
+        """Share replica hydration, not ids-dependent origin-obligation dedup or failure decisions."""
+        from hermes_cli import kanban_session_activity as ksa, kanban_db_sync as sync
+        from hermes_cli import kanban_chat_links as links
+        from hermes_cli.kanban_origin_obligations import preserve_origin_obligations
+        from hermes_cli.profiles import get_active_profile_name
+        if sync.sync_config().get('links_reader') != 'replica':
+            if statuses not in scope['remote']:
+                scope['remote'][statuses] = ksa._remote_cards(scope['ids'], statuses, True)
+            return scope['remote'][statuses]
+        if statuses not in scope['remote']:
+            # A ledger error must retain core's per-lineage empty/partial failure policy, not a union success.
+            try:
+                gateway = self.ksc.load_identity().gateway
+                origin = ksa._remote_links(stale_ok=True)
+            except Exception:
+                return ksa._remote_cards(ids, statuses, True)
+            selected = links.replica_cards(scope['ids'], gateway, statuses, stale_ok=True, origin_cards=origin)
+            scope['remote'][statuses] = (selected, origin, gateway, get_active_profile_name())
+        selected, origin, gateway, profile = scope['remote'][statuses]
+        selected = [c for c in selected if c['session'] in ids]
+        return preserve_origin_obligations(selected, origin, gateway=gateway, profile=profile,
+                                           ids=ids, statuses=statuses)
+
     def linked(self, ids):
         from hermes_cli import kanban_session_activity as ksa
-        return _calm(ksa.session_tasks(list(ids)[:50], stale_ok=True))
+        return _calm(self._session_tasks(list(ids)[:50], tuple(ksa.LISTED_STATUSES)))
 
     def done(self, ids):
         from hermes_cli import kanban_session_activity as ksa
         ids = list(ids)[:50]
-        tasks = _calm(ksa.session_tasks(ids, tuple(ksa.LISTED_STATUSES) + ('done', 'archived'), stale_ok=True))
+        tasks = _calm(self._session_tasks(ids, tuple(ksa.LISTED_STATUSES) + ('done', 'archived')))
         reader = getattr(ksa, 'remote_links_and_origin_rows', None)
         if reader is None:
             return tasks
         try:
-            try:
-                _, history = reader(stale_ok=True)
-            except TypeError:
-                _, history = reader()
+            scope = getattr(self._local, 'batch', None)
+            if scope is not None and 'history' in scope:
+                history = scope['history']
+            else:
+                try:
+                    _, history = reader(stale_ok=True)
+                except TypeError:
+                    _, history = reader()
+                if scope is not None:
+                    scope['history'] = history
         except Exception:
             log.debug('session-panel feed: origin history unavailable', exc_info=True)
             return tasks
         return _load_feed().with_terminal_history(tasks, history, ids)
 
     def card(self, card_id: str, board: str):
+        scope = self._batch_scope()
+        if scope is None:
+            return self._card(card_id, board)
+        key = (card_id, board)
+        if key not in scope['cards']:
+            value = self._card(card_id, board)
+            if value is None:
+                return None  # unavailable/missing is not a pass-wide negative cache
+            scope['cards'][key] = value
+        return copy.deepcopy(scope['cards'][key])
+
+    def _card(self, card_id: str, board: str):
         """A slim `/api/plugins/kanban/tasks/<id>` answer: `{detail, board}`, or None when no board has it."""
         paths = dict(self.boards())
         for slug in dict.fromkeys([board or 'default', 'default']):
@@ -347,13 +503,16 @@ def stop() -> None:
 
 
 def _run(f) -> None:
-    while not f.stopped.is_set():
-        started = time.monotonic()
-        try:
-            f.tick()
-        except Exception:
-            log.warning('session-panel feed tick failed', exc_info=True)
-        f.stopped.wait(max(0.2, TICK_S - (time.monotonic() - started)))
+    try:
+        while not f.stopped.is_set():
+            started = time.monotonic()
+            try:
+                f.tick()
+            except Exception:
+                log.warning('session-panel feed tick failed', exc_info=True)
+            f.stopped.wait(max(0.2, TICK_S - (time.monotonic() - started)))
+    finally:
+        f.readers.release()  # retained connections belong to this thread, including plugin unload
 
 
 class ChangesBody(BaseModel):
