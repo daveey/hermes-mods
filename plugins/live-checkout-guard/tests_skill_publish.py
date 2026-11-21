@@ -5,7 +5,9 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -22,6 +24,33 @@ DESKTOP_SERVE_PATH = os.pathsep.join([
 # GitHub Actions sets CI=true. There a missing tool is a provisioning bug, not a host quirk: a skip would
 # report green while the real pre-commit tests never ran (as with PR #61/#62), so fail instead.
 UNDER_CI = os.environ.get('CI', '').lower() == 'true'
+
+# The worktree part of core's `hermes kanban source-custody remove` contract, for these fixtures only: the owner
+# id must match the created marker in the tree's own gitdir (exit 1 otherwise), removal is never forced, and a
+# tree whose HEAD is on no remote ref or that Git will not remove is kept (exit 3).
+CUSTODY_LAUNCHER = '''#!/usr/bin/env python3
+import json, os, subprocess, sys
+args = sys.argv[1:]
+if args[:5] != ['kanban', 'source-custody', 'remove', '--kind', 'worktree'] or args[5] != '--path' \\
+        or args[7] != '--expected-owner' or len(args) != 9:
+    sys.exit(2)
+path, owner = args[6], args[8]
+def git(*a):
+    return subprocess.run(['git', '-C', path, *a], capture_output=True, text=True)
+gitdir = git('rev-parse', '--absolute-git-dir').stdout.strip()
+try:
+    rec = json.load(open(os.path.join(gitdir, 'hermes-owner.json')))
+except (OSError, ValueError):
+    print('source-custody: owner marker unreadable', file=sys.stderr); sys.exit(1)
+if owner != 'created:%s/%s' % (rec.get('tool'), rec.get('creation_id')) or rec.get('path') != os.path.realpath(path):
+    print('source-custody: owner marker is a different owner', file=sys.stderr); sys.exit(1)
+if not git('branch', '-r', '--contains', 'HEAD').stdout.strip():
+    print('source-custody: custody refused: unpublished commit', file=sys.stderr); sys.exit(3)
+common = git('rev-parse', '--path-format=absolute', '--git-common-dir').stdout.strip()
+done = subprocess.run(['git', '-C', os.path.dirname(common), 'worktree', 'remove', path], capture_output=True, text=True)
+if done.returncode:
+    print('source-custody: git refused to remove the worktree (dirty, locked or changed)', file=sys.stderr); sys.exit(3)
+'''
 
 
 def skip_or_fail_in_ci(test, reason, fix):
@@ -171,6 +200,24 @@ class ToolPathTests(unittest.TestCase):
 
 class PublicationTests(unittest.TestCase):
     def setUp(self):
+        self._setup_fixture()
+
+    def assert_kept_worktree(self, reason):
+        """A failed publication's worktree holds unpublished work: core refuses, the tree stays, and the keep is
+        written beside it and in the retry log."""
+        self.assertEqual(len(self.reaped), 1)
+        worktree, owner_id, kept = self.reaped[0]
+        self.assertRegex(owner_id, r'^created:skill-publish/[0-9a-f]{32}$')
+        self.assertIn(reason, kept)
+        self.assertTrue(Path(worktree).is_dir())
+        note = (Path(worktree).parent / 'worktree-kept.txt').read_text()
+        self.assertIn(worktree, note)
+        self.assertIn(owner_id, note)
+        self.assertIn(reason, note)
+        log = (Path(os.environ['HERMES_HOME']) / 'logs/skill-publish-retry.log').read_text()
+        self.assertIn('kept publication worktree ' + worktree, log)
+
+    def _setup_fixture(self):
         if not shutil.which('gitleaks'):
             skip_or_fail_in_ci(self, 'real pre-commit tests require gitleaks',
                                'put gitleaks v8.28.0 on PATH (plugin-suites.yml "Suite provisions")')
@@ -212,6 +259,19 @@ fi
                                           'LIVE_CHECKOUT_ROOT': str(self.root)})
         self.env.start()
         self.addCleanup(self.env.stop)
+        # Core's `source-custody remove` is not in this repo: a launcher with its worktree contract stands in at
+        # this fixture home's install path (so the detached retry worker finds it too). In-process publications
+        # reap inline so a test can read the result.
+        self.cli = self.base / 'hermes-home/hermes-agent/.hermes/bin/hermes'
+        self.cli.parent.mkdir(parents=True)
+        self.cli.write_text(CUSTODY_LAUNCHER)
+        self.cli.chmod(0o755)
+        self.reaped = []
+        def reap_now(worktree, owner_id):
+            self.reaped.append((str(worktree), owner_id, publisher.reap(worktree, owner_id)))
+        seam = patch.object(publisher, 'spawn_reaper', side_effect=reap_now)
+        seam.start()
+        self.addCleanup(seam.stop)
         self.git(self.root, 'add', '.')
         self.git(self.root, '-c', 'core.hooksPath=.githooks', 'commit', '-qm', 'base')
         self.git(self.root, '-c', 'core.hooksPath=.githooks', 'push', '-q', 'origin', 'HEAD:main')
@@ -231,10 +291,15 @@ fi
                                  task_id='card-example', ci=kwargs.pop('ci', lambda *_: 'green'), **kwargs)
 
     def assert_no_worktrees(self):
+        # A publication made by the detached retry worker is reaped by its own detached child: allow it to land.
+        gone = lambda: self.git(self.root, 'worktree', 'list', '--porcelain').count('worktree ') == 1
+        deadline = time.monotonic() + 20
+        while not gone() and time.monotonic() < deadline:
+            time.sleep(0.1)
         self.assertEqual(self.git(self.root, 'worktree', 'list', '--porcelain').count('worktree '), 1)
         self.assertFalse(self.git(self.root, 'worktree', 'list').count('skill-publish-') > 0)
 
-    def test_total_deadline_stops_after_commit_and_still_cleans_worktree(self):
+    def test_total_deadline_stops_after_commit_and_keeps_the_unpublished_worktree(self):
         now = [100.0]
         original = publisher.bounded
         def advance_after_commit(command, **kwargs):
@@ -249,7 +314,7 @@ fi
         self.assertEqual(self.git(self.origin, 'rev-parse', 'main'), self.head)
         self.assertTrue(list((self.base / 'hermes-home/kanban/evidence/mods-reconcile').glob(
             'skill-publish-*/publish.patch')))
-        self.assert_no_worktrees()
+        self.assert_kept_worktree('custody refused: unpublished commit')
         # An expired context must not poison the next publication on this worker.
         self.assertEqual(self.publish()['status'], 'published')
 
@@ -348,7 +413,7 @@ fi
         self.assertEqual(self.git(self.origin, 'rev-parse', 'main'), self.head)
         self.assertEqual(len(list((self.base / 'hermes-home/kanban/evidence/mods-reconcile').glob(
             'skill-publish-*/publish.patch'))), 1)
-        self.assert_no_worktrees()
+        self.assert_kept_worktree('git refused to remove the worktree')
 
     def test_red_and_unknown_ci_one_skip_no_mutation(self):
         for state in ['red', 'unknown']:
@@ -365,7 +430,7 @@ fi
         self.assertEqual(self.target.read_text(), 'PRIVATE_FIXTURE_MARKER\n')
         self.assertEqual(self.git(self.origin, 'rev-parse', 'main'), self.head)
         self.assertEqual(len(list((self.base / 'hermes-home/kanban/evidence/mods-reconcile').glob('skill-publish-*/publish.patch'))), 1)
-        self.assert_no_worktrees()
+        self.assert_kept_worktree('git refused to remove the worktree')
 
     def test_real_push_race_fetch_rebase_retry(self):
         racer = self.base / 'racer'
@@ -406,7 +471,7 @@ fi
         self.assertEqual(self.target.read_text(), 'published\n')
         self.assertEqual(self.git(self.origin, 'show', 'main:' + self.path), 'base')
         self.assertEqual(len(list((self.base / 'hermes-home/kanban/evidence/mods-reconcile').glob('skill-publish-*/publish.patch'))), 1)
-        self.assert_no_worktrees()
+        self.assert_kept_worktree('custody refused: unpublished commit')
 
     def test_new_writer_during_ci_is_never_overwritten(self):
         def ci(*_):
@@ -657,7 +722,13 @@ printf '[{"headSha":"%s","status":"%s","conclusion":"%s","workflowName":"CI","cr
         self.assertFalse(record.exists())
         # Published, so reconcile retired the live dirt (the edit now arrives by fast-forward).
         self.assertEqual(self.git(self.root, 'status', '--porcelain'), '')
-        self.assert_no_worktrees()
+        # The deferred first pass left a commit that reached no remote: its worktree is kept. The publishing
+        # pass's worktree is removed.
+        self.assertEqual([kept is None for _, _, kept in self.reaped], [False, True])
+        self.assertIn('custody refused: unpublished commit', self.reaped[0][2])
+        self.assertEqual(self.git(self.root, 'worktree', 'list', '--porcelain').count('worktree '), 2)
+        self.assertTrue(Path(self.reaped[0][0]).is_dir())
+        self.assertFalse(Path(self.reaped[1][0]).exists())
 
     def test_pending_ci_state_is_distinct_from_unknown(self):
         def gh(rows, code=0):
@@ -802,6 +873,96 @@ printf '[{"headSha":"%s","status":"%s","conclusion":"%s","workflowName":"CI","cr
                        {'success': True, 'staged': True, 'pending_id': 'pending-example',
                         'path': str(self.target)}]:
             self.assertEqual(publisher.written_paths({'action': 'patch'}, result, self.root), [])
+
+
+class CreatedOwnerTests(unittest.TestCase):
+    """The owner marker written at `worktree add`, and the one removal route."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.base = Path(tmp.name).resolve()
+        self.root = self.base / 'repo'
+        run = lambda cwd, *a: subprocess.run(['git', '-C', str(cwd), *a], check=True, capture_output=True, text=True,
+                                             env=dict(os.environ, GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@example.com',
+                                                      GIT_COMMITTER_NAME='t', GIT_COMMITTER_EMAIL='t@example.com'))
+        self.git = run
+        run(self.base, 'init', '-q', '-b', 'main', str(self.root))
+        run(self.root, 'commit', '-q', '--allow-empty', '-m', 'base')
+        self.head = run(self.root, 'rev-parse', 'HEAD').stdout.strip()
+        self.tree = self.base / 'archive' / 'worktree'
+        self.tree.parent.mkdir()
+        run(self.root, 'worktree', 'add', '-q', '--detach', str(self.tree), self.head)
+        self.home = self.base / 'home'
+        env = patch.dict(os.environ, {'HERMES_HOME': str(self.home), 'HOME': str(self.base / 'nohome')})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def marker(self):
+        gitdir = self.git(self.tree, 'rev-parse', '--absolute-git-dir').stdout.strip()
+        return Path(gitdir) / 'hermes-owner.json'
+
+    def install_cli(self, body):
+        cli = self.home / 'hermes-agent/.hermes/bin/hermes'
+        cli.parent.mkdir(parents=True, exist_ok=True)
+        cli.write_text(body)
+        cli.chmod(0o755)
+        return cli
+
+    def test_marker_is_the_created_class_with_a_random_id_and_is_never_overwritten(self):
+        owner_id = publisher.mark_created(self.tree, self.head)
+        rec = json.loads(self.marker().read_text())
+        self.assertEqual(owner_id, 'created:skill-publish/' + rec['creation_id'])
+        self.assertRegex(rec['creation_id'], r'^[0-9a-f]{32}$')
+        self.assertEqual({k: rec[k] for k in ('tool', 'host', 'path', 'born_head')},
+                         {'tool': 'skill-publish', 'host': os.uname().nodename.split('.')[0],
+                          'path': os.path.realpath(self.tree), 'born_head': self.head})
+        self.assertTrue(rec['registered_at'])
+        # Core rejects a created marker that also carries task or session keys.
+        self.assertFalse({'task_id', 'run_id', 'board_db', 'agent', 'agent_session_id'} & set(rec))
+        self.assertEqual(self.marker().stat().st_mode & 0o777, 0o600)
+        before = self.marker().read_bytes()
+        self.assertIsNone(publisher.mark_created(self.tree, self.head))
+        self.assertEqual(self.marker().read_bytes(), before)
+        self.assertNotIn(rec['creation_id'], str(self.tree))  # the path confers nothing
+
+    def test_remove_uses_the_exact_cli_argv_and_exit_0_alone_means_removed(self):
+        record = self.base / 'argv'
+        self.install_cli('#!/bin/sh\nprintf "%%s\\n" "$@" > %s\npwd >> %s\nexit "${CLI_EXIT:-0}"\n' % (record, record))
+        self.assertIsNone(publisher.remove_created(self.tree, 'created:skill-publish/abc', time.monotonic))
+        self.assertEqual(record.read_text().splitlines(),
+                         ['kanban', 'source-custody', 'remove', '--kind', 'worktree', '--path', str(self.tree),
+                          '--expected-owner', 'created:skill-publish/abc', '/'])
+        for code in ('3', '1', '2'):
+            with patch.dict(os.environ, {'CLI_EXIT': code}):
+                kept = publisher.remove_created(self.tree, 'created:skill-publish/abc', time.monotonic)
+            self.assertIn('source-custody remove exit ' + code, kept)
+        self.assertTrue(self.tree.is_dir())
+
+    def test_no_cli_no_owner_or_a_hung_cli_keeps_the_worktree_and_never_runs_git(self):
+        with patch.object(publisher.subprocess, 'Popen') as popen:
+            with patch.dict(os.environ, {'PATH': str(self.base / 'empty')}), \
+                    patch.object(publisher, 'TOOL_DIRS', ()):
+                self.assertIn('no installed hermes CLI',
+                              publisher.remove_created(self.tree, 'created:skill-publish/abc', time.monotonic))
+            self.assertIn('no created owner marker', publisher.remove_created(self.tree, None, time.monotonic))
+            popen.assert_not_called()
+        self.install_cli('#!/bin/sh\nsleep 30\n')
+        with patch.object(publisher, 'REMOVE_BUDGET', 0.5):
+            self.assertIn('did not finish', publisher.remove_created(self.tree, 'created:skill-publish/abc',
+                                                                     time.monotonic))
+        self.assertTrue(self.tree.is_dir())
+
+    def test_reap_child_process_keeps_and_records_a_refused_worktree(self):
+        self.install_cli('#!/bin/sh\necho "source-custody: custody refused: busy" >&2\nexit 3\n')
+        done = subprocess.run([sys.executable, str(HERE / 'skill_publish.py'), '--reap', str(self.tree),
+                               'created:skill-publish/abc'], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0)
+        self.assertIn('kept publication worktree', done.stderr)
+        note = (self.tree.parent / 'worktree-kept.txt').read_text()
+        self.assertIn('custody refused: busy', note)
+        self.assertIn('custody refused: busy', (self.home / 'logs/skill-publish-retry.log').read_text())
+        self.assertTrue(self.tree.is_dir())
 
 
 if __name__ == '__main__':

@@ -155,7 +155,15 @@ as `skill-publish-*` with `manifest.json`,
 the helper invokes the existing `reconcile.py` with the exact archive and selected paths.
 It restores only unchanged archived leftovers to live HEAD bytes, leaving live HEAD and index
 untouched for a **later** clean `merge --ff-only origin/main`; the observer never deploys itself.
-Detached worktrees are removed on success or failure; archives remain for recovery. Errors
+The detached worktree gets an owner marker (`hermes-owner.json` in its own gitdir: `tool: skill-publish`, a random
+`creation_id`, host, path and `born_head`) right after `worktree add`; an existing marker is never overwritten. When
+the publication ends, a detached child asks core to remove it:
+`hermes kanban source-custody remove --kind worktree --path <worktree> --expected-owner created:skill-publish/<creation_id>`.
+Core proves the marker and never forces, so a published, clean worktree is removed and a worktree left with staged
+changes or a commit that reached no remote (hook refusal, lost push race, deadline, deferral after a race) is **kept**.
+So is every worktree when that CLI is missing, refuses or does not answer in 90 s. A keep is printed, written to
+`<archive>/worktree-kept.txt` and to `logs/skill-publish-retry.log`; nothing retries or deletes it, and there is no
+`git worktree remove` fallback. Archives remain for recovery either way. Errors
 leave source edits untouched or recoverable in that archive. No stash/reset/commit in live.
 A later filesystem failure can leave a partially reconciled multi-file selection; its original
 bytes are still archived; completed reconciliations append an audit record.

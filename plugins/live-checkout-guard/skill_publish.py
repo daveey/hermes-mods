@@ -245,6 +245,7 @@ def _publish(root, paths, *, session_id, task_id, ci, clock):
             time.sleep(0.05)
     archive = None
     worktree = None
+    owner_id = None
     try:
         head = run(root, 'rev-parse', 'HEAD').decode().strip()
         if run(root, 'diff', *DIFF_FLAGS, '--cached', '--name-only', '--', *paths):
@@ -302,6 +303,7 @@ def _publish(root, paths, *, session_id, task_id, ci, clock):
         index.unlink()
         worktree = archive / 'worktree'
         run(root, 'worktree', 'add', '--detach', str(worktree), base)
+        owner_id = mark_created(worktree, base)
         run(worktree, 'apply', '--3way', '--index', '-', data=patch)
         # No identity overrides, and no hook bypass even if the caller has opted out globally.
         if not (worktree / '.githooks/pre-commit').is_file():
@@ -371,10 +373,103 @@ def _publish(root, paths, *, session_id, task_id, ci, clock):
         try:
             if worktree is not None and worktree.exists():
                 # Only the disposable publication worktree; source edits and archive stay intact.
-                with operation_budget(CLEANUP_BUDGET, clock):
-                    run(root, 'worktree', 'remove', '--force', str(worktree))
+                try:
+                    spawn_reaper(worktree, owner_id)
+                except OSError as exc:
+                    keep_note(worktree, owner_id, 'could not start the reaper: %s' % exc)
         finally:
             os.close(fd)
+
+
+OWNER_MARKER = 'hermes-owner.json'
+REMOVE_BUDGET = 90.0
+
+
+def mark_created(worktree, born_head):
+    """Write this publication's owner marker in the new worktree's own gitdir and return its
+    `created:skill-publish/<creation_id>` id (None when a marker already exists: never overwritten).
+    The id is random; core proves ownership from these bytes, not from the path or directory name."""
+    gitdir = Path(run(worktree, 'rev-parse', '--absolute-git-dir').decode().strip())
+    creation_id = os.urandom(16).hex()
+    record = {'tool': 'skill-publish', 'creation_id': creation_id,
+              'host': os.uname().nodename.split('.')[0], 'path': os.path.realpath(worktree),
+              'born_head': born_head, 'registered_at': time.strftime('%Y-%m-%dT%H:%M:%S%z')}
+    try:
+        marker = os.open(gitdir / OWNER_MARKER, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+    except FileExistsError:
+        return None
+    with os.fdopen(marker, 'w') as handle:
+        handle.write(json.dumps(record, indent=1))
+    return 'created:skill-publish/' + creation_id
+
+
+def custody_cli():
+    """The installed core launcher (this home's, then the default home's), else `hermes` on PATH, else None."""
+    homes = [Path(os.environ.get('HERMES_HOME') or Path.home() / '.hermes'), Path.home() / '.hermes']
+    for home in homes:
+        launcher = home / 'hermes-agent/.hermes/bin/hermes'
+        if os.access(launcher, os.X_OK):
+            return str(launcher)
+    import shutil
+    return shutil.which('hermes', path=clean_env()['PATH'])
+
+
+def remove_created(worktree, owner_id, clock):
+    """Remove the disposable publication worktree through core's `hermes kanban source-custody remove`.
+    Returns None when removed, else why it is kept. Core never forces: a worktree left dirty or holding an
+    unpushed commit by a failed publication is kept, and so is every tree when the CLI is missing, times out
+    or refuses. There is no other removal."""
+    if not owner_id:
+        return 'no created owner marker of this publication'
+    cli = custody_cli()
+    if not cli:
+        return 'no installed hermes CLI for `kanban source-custody remove`'
+    try:
+        with operation_budget(REMOVE_BUDGET, clock):
+            done = bounded([cli, 'kanban', 'source-custody', 'remove', '--kind', 'worktree',
+                            '--path', os.path.realpath(worktree), '--expected-owner', owner_id],
+                           timeout=REMOVE_BUDGET, cwd='/')
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return 'source-custody remove did not finish: %s' % (exc or type(exc).__name__)
+    if done.returncode == 0:
+        return None
+    detail = (done.stderr or done.stdout).decode(errors='replace').strip().splitlines()
+    return 'source-custody remove exit %d: %s' % (done.returncode, detail[-1][:200] if detail else 'no detail')
+
+
+def keep_note(worktree, owner_id, reason):
+    """A kept worktree is said out loud and recorded beside it; nothing retries or deletes it."""
+    text = ('kept publication worktree %s (%s): %s. Inspect it, then remove it with '
+            '`git worktree remove`; the publication archive beside it is unaffected.'
+            % (worktree, owner_id or 'no owner id', reason))
+    print('skill-publish: ' + text, file=sys.stderr)
+    _retry_log(pending_dir(), text)
+    try:
+        (Path(worktree).parent / 'worktree-kept.txt').write_text(text + '\n')
+    except OSError:
+        pass
+
+
+def reap(worktree, owner_id, clock=None):
+    """Remove one finished publication worktree, or keep it and say why. Returns the keep reason."""
+    kept = remove_created(worktree, owner_id, clock or time.monotonic)
+    if kept:
+        keep_note(worktree, owner_id, kept)
+    return kept
+
+
+def spawn_reaper(worktree, owner_id):
+    """Reap in a detached child: the CLI takes seconds to start, and the observer hook's own deadline
+    must never kill it in the middle of a removal."""
+    logs = pending_dir().parent.parent / 'logs'
+    logs.mkdir(parents=True, exist_ok=True)
+    with open(logs / 'skill-publish-retry.log', 'a') as out:
+        process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--reap',
+                                    str(worktree), owner_id or ''], cwd='/', env=clean_env(),
+                                   stdin=subprocess.DEVNULL, stdout=out, stderr=out,
+                                   start_new_session=True, close_fds=True)
+    import threading
+    threading.Thread(target=process.wait, name='skill-publish-reaper', daemon=True).start()
 
 
 def written_paths(args, result, root):
@@ -609,9 +704,14 @@ def retry_pending(directory=None, *, interval=None, ci=None, clock=None, sleep=t
 def main(argv):
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--retry-pending', action='store_true', required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--retry-pending', action='store_true')
+    mode.add_argument('--reap', nargs=2, metavar=('WORKTREE', 'OWNER_ID'))
     parser.add_argument('--dir')
     args = parser.parse_args(argv)
+    if args.reap:
+        reap(Path(args.reap[0]), args.reap[1] or None)
+        return 0
     counts = retry_pending(args.dir)
     if not counts['busy']:
         _retry_log(Path(args.dir) if args.dir else pending_dir(), 'worker exit %s' % counts)
