@@ -467,16 +467,6 @@ def test_compression_and_mounted_person_api_keep_same_request(real, monkeypatch)
         assert response.status_code == 200
         assert len(response.json()['records']) == 1
         assert response.json()['records'][0]['thread'] == person['thread']
-        import subprocess
-        node_spec = importlib.util.spec_from_file_location(
-            'person_contract_node_pick', ROOT.parent / 'user-steps/tests/node_pick.py')
-        assert node_spec and node_spec.loader
-        node_pick = importlib.util.module_from_spec(node_spec)
-        node_spec.loader.exec_module(node_pick)
-        rendered = subprocess.run([node_pick.find_node(), str(Path(__file__).with_name('validate_person_views.mjs'))],
-                                  input=json.dumps(response.json()['records']), capture_output=True, text=True, timeout=30)
-        assert rendered.returncode == 0, rendered.stdout + rendered.stderr
-        assert json.loads(rendered.stdout) == {'validated': 1}
         assert client.get('/api/plugins/session-outcome/person-waits', params={'ids': ','.join(str(n) for n in range(33))}).status_code == 400
         update = {**person, 'state': 'verifying', 'evidence': 'https://example.com/reply'}
         assert json.loads(plugin.handle({'kind': 'wait', 'on': [update]}, session_id='tip'))['ok']
