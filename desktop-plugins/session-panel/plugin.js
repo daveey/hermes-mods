@@ -554,7 +554,7 @@ export function parkFor(chip, nowMs = Date.now(), read = readPark, fallback) {
   const route = refRoute(chip, fallback)
   if (!route.connectionId) return { state: 'failed', park: null }
   const k = titleKey(route, chip.id), hit = parks.get(k)
-  const age = hit ? nowMs - hit.at : Infinity
+  const age = hit ? (hit.feed && feedIsLive(route) ? 0 : nowMs - hit.at) : Infinity
   if (hit && (hit.pending ? age < PARK_PENDING_MS : age < (hit.failed ? PARK_RETRY_MS : PARK_FRESH_MS))) {
     return { state: hit.pending && !hit.park ? 'loading' : hit.failed && !hit.park ? 'failed' : hit.stale ? 'stale' : 'ok', park: hit.park || null }
   }
@@ -953,6 +953,11 @@ export const resetDoneCacheForTests = () => { doneCache = null; done = { scope: 
 
 export async function refreshDone() {
   const route = panelRoute(), scope = routeKey(route)
+  if (feedKept.has(scope) && feedIsLive(route) && cachedDone(scope)) {
+    done = { scope, rows: cachedDone(scope) }
+    doneSubs.forEach(fn => fn(done))
+    return
+  }
   const st = typeof window !== 'undefined' ? window.__sessionTasks : null
   const bridge = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
   if (!route.session || !route.connectionId || !bridge || typeof st?.lineageIds !== 'function') return
@@ -1068,6 +1073,7 @@ export async function warmRecent({ nowMs = Date.now(), force = false } = {}) {
     for (const route of warmTargets()) {
       const key = routeKey(route)
       if (key === focused || nowMs - (warmedAt.get(key) || 0) < WARM_EVERY_MS) continue
+      if (feedIsLive(route)) continue // the gateway's feed keeps this chat current: nothing to warm
       if (typeof document !== 'undefined' && document.hidden) break
       if (routeKey(panelRoute()) !== focused) break // the user switched: stop, the next pass starts over
       warmedAt.set(key, nowMs)
@@ -1473,7 +1479,7 @@ export function cardInfo(chip, id, nowMs = Date.now(), read = readCard, fallback
   loadReads()
   const route = refRoute(chip, fallback)
   if (!route.connectionId) return { state: 'failed', info: null }
-  const k = titleKey(route, id), hit = cards.get(k), age = hit ? nowMs - hit.at : Infinity
+  const k = titleKey(route, id), hit = cards.get(k), age = hit ? (hit.feed && feedIsLive(route) ? 0 : nowMs - hit.at) : Infinity
   if (hit && (hit.pending ? age < TITLE_PENDING_MS : age < (hit.info && !hit.stale ? CARD_FRESH_MS : CARD_RETRY_MS))) return { state: hit.info ? (hit.stale ? 'stale' : 'ok') : hit.pending ? 'loading' : 'failed', info: hit.info ? (hit.stale ? { ...hit.info, stale: true } : hit.info) : null }
   put(cards, k, { info: hit?.info || null, ...(hit?.stale ? { stale: true } : {}), at: nowMs, pending: true })
   const loud = !quietReads
@@ -1916,6 +1922,126 @@ function Fold({ label, items, k }) {
   ] })
 }
 
+// ── session-panel-feed client (the gateway pushes; nothing polls) ───────────
+// [daveey 2026-11-20] "precompute the status panel data on the hub, and then simply render it on the desktop ...
+// use a websocket or some form of event streaming so that the desktop is always kept in sync without polling".
+// Each gateway with the session-panel-feed plugin precomputes the chats this window watches (warmTargets + the
+// focused chat) and pushes every changed bundle as `plugin.session-panel-feed.changed` on the gateway event stream.
+// A bundle fills every cache the panel renders from (session-tasks' cards and ancestry, Done, the chain's card,
+// wake and title reads), so a switch to a watched chat paints its final panel with no request. `POST /changes`
+// registers the watched chats and catches up: on load, when the watched set grows, on a revision gap or an
+// oversized batch, and every FEED_CATCHUP_MS as a safety net. A gateway without the plugin keeps today's reads.
+const FEED_PATH = '/api/plugins/session-panel-feed/changes'
+export const FEED_EVENT = 'plugin.session-panel-feed.changed'
+export const FEED_CATCHUP_MS = 60_000
+const FEED_UNSUPPORTED_RETRY_MS = 10 * 60_000
+const feeds = new Map()      // JSON [connectionId, profile] -> { connectionId, profile, feed, epoch, rev, at, sessions, unsupported }
+const feedKept = new Set()   // routeKey scopes whose data came from a feed
+const connKey = (connectionId, profile) => JSON.stringify([connectionId || '', profile || 'default'])
+const tasksBridge = () => (typeof window !== 'undefined' ? window.__sessionTasks : null)
+/** True when `route`'s gateway feed answered or pushed recently (session-tasks owns the clock). */
+export function feedIsLive(route, nowMs = Date.now()) {
+  const st = tasksBridge()
+  return typeof st?.feedLive === 'function' && !!route?.connectionId && st.feedLive(route.connectionId, route.profile || 'default', nowMs)
+}
+export const resetFeedForTests = () => { feeds.clear(); feedKept.clear() }
+
+/** Fill every cache the panel renders from with one chat's bundle. Exported for tests. */
+export function ingestBundle(connectionId, profile, b, nowMs = Date.now()) {
+  if (!connectionId || !b?.session) return false
+  profile = profile || 'default'
+  const scope = routeKey({ connectionId, profile, session: b.session })
+  tasksBridge()?.ingestFeed?.({ connectionId, profile, session: b.session, lineage: b.lineage, tasks: Array.isArray(b.tasks) ? b.tasks : [] })
+  if (Array.isArray(b.done)) {
+    const rows = doneRows(b.done)
+    rememberDone(scope, rows)
+    if (routeKey(panelRoute()) === scope) { done = { scope, rows }; doneSubs.forEach(fn => fn(done)) }
+  }
+  for (const [id, rec] of Object.entries(b.cards || {})) {
+    if (!rec?.detail?.task) continue
+    const route = { connectionId, profile, board: str(rec.board) || 'default' }
+    const k = titleKey(route, id), r = { detail: rec.detail, board: route.board }
+    const info = cardSummary(id, r)
+    put(cards, k, { info, at: nowMs, feed: true })
+    put(parks, k, { park: parkFromDetail(rec.detail), failed: false, at: nowMs, feed: true })
+    if (info.title) put(titles, k, { title: info.title, board: info.board, state: info.status, at: nowMs })
+  }
+  feedKept.add(scope)
+  saveReadsSoon()
+  return true
+}
+
+/** The chats to watch, per gateway connection: the focused chat first, then warmTargets(). */
+export function feedTargets(rows) {
+  const out = new Map()
+  const focused = panelRoute()
+  for (const r of [focused, ...warmTargets(rows)]) {
+    if (!r?.connectionId || !r?.session) continue
+    const key = connKey(r.connectionId, r.profile)
+    if (!out.has(key)) out.set(key, { connectionId: r.connectionId, profile: r.profile || 'default', sessions: [] })
+    const t = out.get(key)
+    if (!t.sessions.includes(r.session)) t.sessions.push(r.session)
+  }
+  return [...out.values()]
+}
+
+/** Register `target.sessions` with its gateway's feed and apply what changed since our last revision. False when
+ *  the gateway has no feed (remembered for FEED_UNSUPPORTED_RETRY_MS) or the call failed. */
+export async function feedCatchUp(target, { nowMs = Date.now(), reset = false } = {}) {
+  const bridge = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
+  if (!bridge || !target?.connectionId || !target.sessions?.length) return false
+  const key = connKey(target.connectionId, target.profile)
+  const st = feeds.get(key)
+  if (st?.unsupported && nowMs - st.at < FEED_UNSUPPORTED_RETRY_MS) return false
+  let r
+  try {
+    r = await bridge({ path: FEED_PATH, method: 'POST', connectionId: target.connectionId, profile: target.profile || 'default', timeoutMs: 15_000,
+      body: { sessions: target.sessions.slice(0, 200), since: reset ? 0 : st?.rev || 0, epoch: reset ? null : st?.epoch || null } })
+  } catch (e) {
+    log('feed catch-up failed', target.connectionId, e?.message || e)
+    return false
+  }
+  if (!r || typeof r.epoch !== 'string') { feeds.set(key, { ...(st || {}), unsupported: true, at: nowMs }); return false }
+  feeds.set(key, { connectionId: target.connectionId, profile: target.profile || 'default', feed: r.feed, epoch: r.epoch,
+    rev: Number(r.rev) || 0, at: Date.now(), sessions: [...target.sessions] })
+  tasksBridge()?.markFeedLive?.(target.connectionId, target.profile || 'default')
+  for (const b of Object.values(r.bundles || {})) ingestBundle(target.connectionId, target.profile || 'default', b)
+  notifyTitles()
+  return true
+}
+
+/** One pushed batch: apply it when it continues our revision chain, else catch up. Exported for tests. */
+export function onFeedEvent(ev) {
+  const p = ev?.payload
+  if (!p || typeof p.feed !== 'string') return
+  const st = [...feeds.values()].find(f => f.feed === p.feed && !f.unsupported)
+  if (!st) return // a gateway this window did not register with: the next catch-up covers it
+  const target = { connectionId: st.connectionId, profile: st.profile, sessions: st.sessions }
+  if (p.epoch !== st.epoch) { void feedCatchUp(target, { reset: true }); return }
+  if (Number(p.rev) <= st.rev) return // already have it (a catch-up answered first)
+  if (Number(p.prev) !== st.rev || (Array.isArray(p.sessions) && p.sessions.length)) { void feedCatchUp(target); return }
+  st.rev = Number(p.rev)
+  st.at = Date.now()
+  tasksBridge()?.markFeedLive?.(st.connectionId, st.profile)
+  for (const b of Object.values(p.bundles || {})) ingestBundle(st.connectionId, st.profile, b)
+  notifyTitles()
+}
+
+/** Catch up every gateway once (the safety net, and on load). A chat newly focused is registered at once. */
+export async function feedPass({ nowMs = Date.now() } = {}) {
+  const done = []
+  for (const t of feedTargets()) if (await feedCatchUp(t, { nowMs })) done.push(t)
+  return done
+}
+/** Focus moved: register the chat with its gateway's feed now if that feed does not watch it yet. */
+export function feedFocus(route) {
+  if (!route?.connectionId || !route?.session) return
+  const st = feeds.get(connKey(route.connectionId, route.profile))
+  if (st?.unsupported || st?.sessions?.includes(route.session)) return
+  const t = feedTargets().find(x => x.connectionId === route.connectionId && (x.profile || 'default') === (route.profile || 'default'))
+  if (t) void feedCatchUp(t)
+}
+
 // ── switch timing ──────────────────────────────────────────────────────────
 // [daveey 2026-11-20] "session changes must be instant". One desktop.log line per switch, like core's open-timing:
 // every distinct thing the panel showed in the PANEL_TRACE_MS after focus reached a chat, with ms since then.
@@ -2024,6 +2150,7 @@ export function Panel() {
   // only open work is an ask used to wait for user-steps' 8 s poll before its panel appeared at all.
   useEffect(() => {
     noteRecent(route)
+    feedFocus(route)
     void refreshDone(); void window.__sessionTasks?.refresh?.()
     void window.__userSteps?.refresh?.(); void window.__userSteps?.refreshRequests?.()
   }, [scope])
@@ -2200,9 +2327,16 @@ export default {
     const tick = () => idle(() => void warmRecent())
     const first = setTimeout(() => idle(() => void warmRecent({ force: true })), 4_000)
     const warmTimer = setInterval(tick, WARM_TICK_MS)
+    const subscribe = typeof ctx.onEvent === 'function' ? ctx.onEvent : host?.onEvent
+    const offFeed = typeof subscribe === 'function' ? subscribe(FEED_EVENT, onFeedEvent) : null
+    const feedFirst = setTimeout(() => void feedPass(), 1_000)
+    const feedTimer = setInterval(() => { if (typeof document === 'undefined' || !document.hidden) void feedPass() }, FEED_CATCHUP_MS)
     return () => {
       clearTimeout(first)
       clearInterval(warmTimer)
+      clearTimeout(feedFirst)
+      clearInterval(feedTimer)
+      if (typeof offFeed === 'function') offFeed()
       if (typeof window !== 'undefined' && window.__sessionPanel?.version === VERSION) delete window.__sessionPanel
       if (doneTimer) clearInterval(doneTimer)
       doneTimer = null

@@ -458,3 +458,63 @@ test('a machines-only refresh does not make old kanban evidence look newly read'
     assert.equal(m.cachedChips(scopeOf('chat-m')).kanbanAt, 1_000_000)
   } finally { Date.now = realNow }
 })
+
+// [daveey 2026-11-20] session-panel-feed: the gateway pushes each watched chat's cards; session-tasks takes them as
+// that chat's current answer and, while the feed is live, does not read the kanban list on a switch.
+test('a pushed bundle becomes the chat\'s feed-kept copy and its ancestry', () => {
+  m.ingestFeed({ connectionId: 'conn', profile: 'default', session: 'chat-feed', lineage: ['chat-feed', 'chat-old'], tasks: [card('t_p1')] })
+  const c = m.cachedChips(scopeOf('chat-feed'))
+  assert.deepEqual(c.kanban.map(x => x.id), ['t_p1'])
+  assert.ok(c.feedAt > 0, 'marked as from the feed')
+  m.rememberChips(scopeOf('chat-feed'), undefined, [])
+  assert.ok(m.cachedChips(scopeOf('chat-feed')).feedAt, 'a machines-only refresh keeps it')
+  m.rememberChips(scopeOf('chat-feed'), [card('t_p1')], undefined)
+  assert.equal(m.cachedChips(scopeOf('chat-feed')).feedAt, undefined, 'a kanban read of our own replaces it')
+})
+
+test('a switch to a feed-kept chat paints it untagged and reads no kanban list while the feed is live', async () => {
+  m.ingestFeed({ connectionId: 'conn', profile: 'default', session: 'chat-live', lineage: ['chat-live'], tasks: [card('t_l1')] })
+  m.markFeedLive('conn', 'default')
+  assert.equal(m.feedFresh(scopeOf('chat-live'), { connectionId: 'conn', profile: 'default' }), true)
+  focus.stored = 'chat-live'
+  const paths = []
+  host.request = async () => ({ processes: [], subagents: [] })
+  globalThis.window = { hermesDesktop: { api: async ({ path }) => {
+    paths.push(path)
+    if (path.startsWith('/api/sessions/')) return { id: 'chat-live', parent_session_id: null }
+    if (path.startsWith('/api/session-kanban-tasks')) return { tasks: [card('t_l1')] }
+    return { machines: [] }
+  } } }
+  const dispose = m.default.register({ register() {} })
+  try {
+    await m.refresh()
+    const snap = window.__sessionTasks.snapshot
+    assert.deepEqual(snap.chips.filter(c => c.kind === 'kanban').map(c => c.id), ['t_l1'])
+    assert.equal(snap.cachedAt, undefined, 'current, not a cached copy: no "updating…"')
+    assert.ok(snap.chips.every(c => !('cachedAt' in c)))
+    assert.ok(!paths.some(p => p.startsWith('/api/session-kanban-tasks')), 'no kanban read: the feed keeps it')
+    // A push for the focused chat republishes at once.
+    m.ingestFeed({ connectionId: 'conn', profile: 'default', session: 'chat-live', lineage: ['chat-live'], tasks: [card('t_l1'), card('t_l2', 'review')] })
+    assert.deepEqual(window.__sessionTasks.snapshot.chips.filter(c => c.kind === 'kanban').map(c => c.id), ['t_l1', 't_l2'])
+    assert.equal(window.__sessionTasks.snapshot.fresh, true)
+  } finally { dispose(); delete globalThis.window; delete host.request }
+})
+
+test('when the feed is not live a feed-kept chat is read as before', async () => {
+  m.ingestFeed({ connectionId: 'conn', profile: 'default', session: 'chat-dead', lineage: ['chat-dead'], tasks: [card('t_d1')] })
+  m.markFeedLive('conn', 'default', Date.now() - m.FEED_STALE_MS - 1)
+  focus.stored = 'chat-dead'
+  const paths = []
+  host.request = async () => ({ processes: [], subagents: [] })
+  globalThis.window = { hermesDesktop: { api: async ({ path }) => {
+    paths.push(path)
+    if (path.startsWith('/api/sessions/')) return { id: 'chat-dead', parent_session_id: null }
+    if (path.startsWith('/api/session-kanban-tasks')) return { tasks: [card('t_d1')] }
+    return { machines: [] }
+  } } }
+  const dispose = m.default.register({ register() {} })
+  try {
+    await m.refresh()
+    assert.ok(paths.some(p => p.startsWith('/api/session-kanban-tasks')), 'stale feed: read it ourselves')
+  } finally { dispose(); delete globalThis.window; delete host.request }
+})

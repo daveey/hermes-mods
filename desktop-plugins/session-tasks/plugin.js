@@ -738,13 +738,16 @@ export function tagCached(chips, cachedAt, paintedAt = Date.now()) {
 const untagCached = chips => (chips || []).map(c => (c && 'cachedAt' in c ? (({ cachedAt, paintedAt, ...rest }) => rest)(c) : c))
 
 /** Remember a chat's chips; warning chips (kind kanban-status) are never cached. */
-export function rememberChips(scope, kanban, machines) {
+export function rememberChips(scope, kanban, machines, { feed = false } = {}) {
   loadCache()
   const keep = chips => (chips || []).filter(c => c && c.kind !== 'kanban-status')
   const prev = chipCache.get(scope)
   const at = Date.now()
   // kanbanAt = when the kanban list was read (a machines-only refresh must not make old card evidence look new).
-  chipCache.set(scope, { at, kanbanAt: kanban ? at : (prev?.kanbanAt ?? prev?.at ?? at), kanban: keep(kanban ?? prev?.kanban), machines: keep(machines ?? prev?.machines) })
+  // feedAt = the kanban list came from the gateway's session-panel feed (kept by a machines-only refresh).
+  const feedAt = kanban ? (feed ? at : undefined) : prev?.feedAt
+  chipCache.set(scope, { at, kanbanAt: kanban ? at : (prev?.kanbanAt ?? prev?.at ?? at), ...(feedAt ? { feedAt } : {}),
+    kanban: keep(kanban ?? prev?.kanban), machines: keep(machines ?? prev?.machines) })
   saveCacheSoon()
 }
 
@@ -826,6 +829,52 @@ let snapshot = { runtime: null, stored: null, chips: [] }
 const subs = new Set()
 let timer = null
 let lastKanbanAt = 0
+
+// ── session-panel-feed (the gateway pushes each watched chat's cards) ──────
+// [daveey 2026-11-20] "precompute the status panel data on the hub ... kept in sync without polling". session-panel
+// runs the feed client (catch-up + pushed events) and hands each chat's bundle here: its cards become this chat's
+// cached copy, marked as feed-kept (`feedAt`), and the focused chat is republished at once. While the feed is live for
+// a connection (an answer or push within FEED_STALE_MS), a feed-kept chat is current: a switch to it paints its
+// cards untagged (no "updating…") and its own kanban read runs only every FEED_KANBAN_POLL_MS as a safety net.
+export const FEED_STALE_MS = 150_000
+export const FEED_KANBAN_POLL_MS = 60_000
+const feedLiveAt = new Map() // JSON [connectionId, profile] -> ms
+export function markFeedLive(connectionId, profile = 'default', at = Date.now()) {
+  if (connectionId) feedLiveAt.set(JSON.stringify([connectionId, profile || 'default']), at)
+}
+export function feedLive(connectionId, profile = 'default', nowMs = Date.now()) {
+  const at = feedLiveAt.get(JSON.stringify([connectionId || '', profile || 'default']))
+  return !!at && nowMs - at <= FEED_STALE_MS
+}
+/** True when this chat's cached cards came from the feed and the feed is live for its connection. */
+export function feedFresh(scope, route, nowMs = Date.now()) {
+  return !!(cachedChips(scope)?.feedAt && feedLive(route?.connectionId, route?.profile, nowMs))
+}
+/** Take one pushed bundle (`tasks` = /api/session-kanban-tasks rows, `lineage` = the chat and its ancestors). */
+export function ingestFeed({ connectionId, profile = 'default', session, lineage, tasks } = {}) {
+  if (!connectionId || !session || !Array.isArray(tasks)) return false
+  profile = profile || 'default'
+  const route = { connectionId, profile }
+  const scope = JSON.stringify([connectionId, profile, session])
+  const chips = sessionTaskChips(tasks, route)
+  rememberChips(scope, chips, undefined, { feed: true })
+  if (Array.isArray(lineage) && lineage.length) {
+    const ids = new Set(lineage.map(String))
+    lineageCache.set(scope, { at: Date.now(), ids })
+    saveLineage(scope, ids)
+  }
+  if (snapshot.scope === scope) {
+    // The focused chat: its kanban answer just arrived. Live process / sub-agent rows stay as they are.
+    kanbanCachedAt = null
+    kanbanCache = chips
+    lastKanbanAt = Date.now()
+    const live = (snapshot.chips || []).filter(c => c.kind === 'bg' || c.kind === 'sub' || c.key === 'process-status' || c.key === 'subagent-status')
+    const { cachedAt, ...rest } = snapshot
+    snapshot = { ...rest, chips: [...kanbanCache, ...machineCache, ...live], fresh: true }
+    emit()
+  }
+  return true
+}
 // [daveey 2026-11-20] "session changes must be instant". While the kanban cards on screen are the switch's cached
 // copy (no read of this chat has landed yet), each of those cards carries `cachedAt` (when the copy was read) and
 // `paintedAt`, and snapshots carry `cachedAt` (the panel's "updating…" marker): the panel judges those cards' evidence
@@ -1006,7 +1055,8 @@ function paintCached() {
     machineCache = []
     return false
   }
-  kanbanCachedAt = cached.kanbanAt ?? cached.at ?? null
+  // A copy the gateway's feed keeps current is not a cached copy: shown as is, judged at now.
+  kanbanCachedAt = feedFresh(scope, route) ? null : cached.kanbanAt ?? cached.at ?? null
   kanbanCache = tagCached(cached.kanban, kanbanCachedAt)
   machineCache = cached.machines
   lastKanbanAt = 0
@@ -1104,7 +1154,10 @@ export async function refresh() {
           publish()
         })
       : Promise.resolve()
-    const kanbanDue = stored && (!sameSession || Date.now() - lastKanbanAt >= KANBAN_POLL_MS)
+    // A feed-kept chat is current: a switch reads its kanban list only as the FEED_KANBAN_POLL_MS safety net.
+    const viaFeed = !!stored && feedFresh(scope, route)
+    if (viaFeed && !lastKanbanAt) lastKanbanAt = Date.now()
+    const kanbanDue = stored && (viaFeed ? Date.now() - lastKanbanAt >= FEED_KANBAN_POLL_MS : (!sameSession || Date.now() - lastKanbanAt >= KANBAN_POLL_MS))
     const machinesDue = stored && (!sameSession || Date.now() - lastMachinesAt >= MACHINE_POLL_MS)
     if (kanbanDue || machinesDue) {
       begin('lineage')
@@ -1449,7 +1502,7 @@ export default {
     })
     const onVis = () => document.hidden || void refresh()
     document.addEventListener('visibilitychange', onVis)
-    window.__sessionTasks = { version: 'wait-visible-v1', get snapshot() { return snapshot }, refresh, subscribe, openTaskChip, lineageIds, focusedRoute, warm, cachedSnapshot, activityLabel, connectionForHubGateway }
+    window.__sessionTasks = { version: 'wait-visible-v1', get snapshot() { return snapshot }, refresh, subscribe, openTaskChip, lineageIds, focusedRoute, warm, cachedSnapshot, ingestFeed, markFeedLive, feedLive, feedFresh, activityLabel, connectionForHubGateway }
     return () => {
       for (const stop of stops) stop?.()
       document.removeEventListener('visibilitychange', onVis)
