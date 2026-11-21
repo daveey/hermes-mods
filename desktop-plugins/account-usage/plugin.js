@@ -155,6 +155,51 @@ export function describe(account, now = Date.now()) {
   return parts.join(' · ')
 }
 
+// Fable has its own allowance per Claude account, separate from the 5-hour and weekly bars: an account
+// can be ready for Opus with no Fable left. The pool records that as a per-model cooldown; the Fable
+// column shows it so "ready" is never read as "Fable ready".
+const FABLE_MODEL = /^claude-fable/i
+export function fableColumn(g) {
+  return !!g && g.slug === 'anthropic' && !g.statusOnly
+}
+
+function fableUntil(account, now) {
+  const live = (account.model_cooldowns || [])
+    .filter(m => m && FABLE_MODEL.test(String(m.model || '')) && Date.parse(m.until) > now)
+    .map(m => m.until)
+  return live.length ? live.reduce((a, b) => (Date.parse(a) >= Date.parse(b) ? a : b)) : null
+}
+
+// {tone, text}: 'ok' when this account can serve Fable now, its Fable reset when benched for Fable,
+// '—' when the account itself is out, disabled or unchecked (the row's own cue says why).
+export function fableCell(account, now = Date.now()) {
+  if (!account || account.disabled || account.state !== 'ready') return { tone: 'unknown', text: '—' }
+  const until = fableUntil(account, now)
+  return until ? { tone: 'limited', text: fmtReset(until, now) } : { tone: 'ready', text: 'ok' }
+}
+
+// Enabled accounts that can serve Fable now, of all enabled ones, and the earliest time one can again:
+// a Fable-benched account is back at its Fable reset; an account that is itself out is back at the
+// later of its own reset and its Fable reset.
+export function fableSummary(g, now = Date.now()) {
+  const enabled = (g.accounts || []).filter(a => !a.disabled)
+  const ready = enabled.filter(a => fableCell(a, now).text === 'ok').length
+  const later = (a, b) => (!a ? b : !b ? a : Date.parse(a) >= Date.parse(b) ? a : b)
+  const backs = enabled.filter(a => fableCell(a, now).text !== 'ok').map(a => {
+    const own = a.state === 'ready' ? null : a.limit_kind === 'cooldown' ? a.cooldown_until || a.resets_at : a.resets_at || a.cooldown_until
+    const back = later(own && Date.parse(own) > now ? own : null, fableUntil(a, now))
+    return back
+  }).filter(Boolean)
+  const nextBack = backs.length ? backs.reduce((a, b) => (Date.parse(a) <= Date.parse(b) ? a : b)) : null
+  return { ready, total: enabled.length, nextBack }
+}
+
+// The group header's Fable segment: "Fable 2/10", or "Fable 0/10 · back Sat 8 AM" when none can serve it.
+export function fableHeader(g, now = Date.now()) {
+  const f = fableSummary(g, now)
+  return `Fable ${f.ready}/${f.total}${!f.ready && f.nextBack ? ` · back ${fmtReset(f.nextBack, now)}` : ''}`
+}
+
 // Status-only providers (Grok, Gemini) say "rejected"/"blocked" ONLY for a real failed check (state limited).
 // An account with no fresh check yet (state unknown: cold start, or the 15-min snapshot went stale and the
 // background recheck hasn't landed) is "not checked yet", never "key rejected".
@@ -1188,6 +1233,9 @@ function Meter({ win }) {
 
 // minmax(0, …) lets long cause text wrap instead of widening the popover.
 const GRID = { display: 'grid', gridTemplateColumns: '10px minmax(0,1.3fr) minmax(0,1fr) minmax(0,1fr)', gap: 8, alignItems: 'center' }
+// Claude rows add a narrow Fable column (fableColumn).
+const GRID_FABLE = { ...GRID, gridTemplateColumns: '10px minmax(0,1.2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.55fr)' }
+const gridFor = g => (fableColumn(g) ? GRID_FABLE : GRID)
 const PANEL_STYLE = { width: 'min(460px, calc(100vw - 24px))', maxWidth: 'calc(100vw - 24px)', maxHeight: 'min(80vh, 680px)', overflowY: 'auto', overflowX: 'hidden' }
 
 function DisableLine({ g, a, disableStore, disableState }) {
@@ -1279,6 +1327,13 @@ export function ReconnectLine({ g, a, reconnectStore, reconnectState }) {
   return jsxs('div', { className: 'hermes-au-fix', children })
 }
 
+function FableCell({ a }) {
+  const c = fableCell(a)
+  return jsx('span', { 'data-fable': c.tone, title: c.tone === 'limited' ? `No Fable left on this account · back ${c.text}` : c.tone === 'ready' ? 'Fable available on this account' : 'Account not ready',
+    style: { fontSize: 10.5, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', color: c.tone === 'limited' ? COLORS.limited : c.tone === 'ready' ? COLORS.ready : undefined, opacity: c.tone === 'unknown' ? 0.5 : 1 },
+    children: c.text })
+}
+
 // Quota/cooldown reasons stay behind the chevron. A confirmed sign-in-needed warning is visible
 // even when the row is collapsed, and the reconnect action is shown with it.
 export function AccountRow({ g, a, open, onToggle, selectionStore, selectionState, reconnectStore, reconnectState, disableStore = null, disableState = {} }) {
@@ -1302,7 +1357,7 @@ export function AccountRow({ g, a, open, onToggle, selectionStore, selectionStat
         'aria-label': refused ? `${name}: ${refused}` : `Try ${name} next`, disabled: selectionState.busy || selectionState.loading || !!refused,
         'aria-disabled': refused ? 'true' : undefined, 'data-unavailable': refused ? 'true' : undefined,
         onClick: refused ? undefined : () => selectionStore.select(g.slug, a),
-        style: { ...GRID, opacity: a.disabled ? 0.45 : a.state === 'ready' || a.id === g.markId ? 1 : 0.6, ...(refused ? { cursor: 'not-allowed' } : {}) },
+        style: { ...gridFor(g), opacity: a.disabled ? 0.45 : a.state === 'ready' || a.id === g.markId ? 1 : 0.6, ...(refused ? { cursor: 'not-allowed' } : {}) },
         title: refused ? `${name} · ${why || a.state} · ${refused}` : `${name} · ${why || a.state} · Next request in the focused chat only`, children: [
         jsx(Dot, { t, mark: a.id === g.markId ? g.mark : null }),
         jsxs('span', { style: { display: 'flex', alignItems: 'center', minWidth: 0, fontSize: 11.5, fontWeight: a.id === g.markId ? 600 : undefined }, children: [
@@ -1314,7 +1369,8 @@ export function AccountRow({ g, a, open, onToggle, selectionStore, selectionStat
             ? jsx('span', { className: 'hermes-au-next', children: 'Next to try' }) : null] }),
         ...(g.statusOnly
           ? [jsx('span', { className: 'hermes-au-pill', style: { gridColumn: 'span 2', '--au-c': COLORS[t] }, children: statusLabel(g, a) })]
-          : [jsx(Meter, { win: pickWindow(a.windows, 'session') }), jsx(Meter, { win: pickWindow(a.windows, 'week') })])
+          : [jsx(Meter, { win: pickWindow(a.windows, 'session') }), jsx(Meter, { win: pickWindow(a.windows, 'week') })]),
+        ...(fableColumn(g) ? [jsx(FableCell, { a })] : [])
       ] }),
       details
         ? jsx('button', { type: 'button', className: 'hermes-au-more', 'aria-label': `Details for ${name}`, 'aria-expanded': shown,
@@ -1337,13 +1393,15 @@ function GroupPanel({ g, selectionStore, selectionState, reconnectStore, reconne
   const off = g.disabled || 0
   const unknown = g.total - g.ready - limited - cooling - off
   const parts = [`${g.ready} ready`, limited && `${limited} ${g.statusBad || 'out of quota'}`, cooling && `${cooling} cooling down`, off && `${off} disabled`, unknown && `${unknown} unknown`].filter(Boolean)
+  if (fableColumn(g) && g.accounts.length) parts.push(fableHeader(g))
   return jsxs('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 }, children: [
     jsxs('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }, children: [
       jsx('b', { style: { fontSize: 12 }, children: g.title }),
       jsx('span', { style: { fontSize: 10.5, opacity: 0.65 }, children: parts.join(' · ') })
     ] }),
     g.statusOnly ? null : jsxs('div', { className: 'hermes-au-line', style: { fontSize: 10, opacity: 0.5 }, children: [
-      jsxs('div', { style: { ...GRID, flex: 1, padding: '0 3px' }, children: [jsx('span', {}), jsx('span', { children: 'Account' }), jsx('span', { children: '5-hour' }), jsx('span', { children: 'Weekly' })] }),
+      jsxs('div', { style: { ...gridFor(g), flex: 1, padding: '0 3px' }, children: [jsx('span', {}), jsx('span', { children: 'Account' }), jsx('span', { children: '5-hour' }), jsx('span', { children: 'Weekly' }),
+        ...(fableColumn(g) ? [jsx('span', { children: 'Fable' })] : [])] }),
       jsx('span', { className: 'hermes-au-gap' })
     ] }),
     ...g.accounts.map(a => jsx(AccountRow, { key: a.id, g, a, open: open.has(a.id), onToggle: () => toggle(a.id), selectionStore, selectionState, reconnectStore, reconnectState, disableStore, disableState }))

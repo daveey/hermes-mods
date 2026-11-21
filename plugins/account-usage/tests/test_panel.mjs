@@ -696,3 +696,31 @@ test('the in-use mark follows the account id the backend names, never a shared l
  assert.equal(g({label:'Work',at}).mark,null)
  assert.equal(g({label:'Home',at}).markId,'fp:three')
 })
+test('Claude rows carry a Fable cell from the per-model Fable cooldown; other providers have none', async () => {
+ const {plugin}=await setup()
+ const now=Date.parse('2026-11-20T18:00:00-08:00'), later=new Date(now+3*86400_000).toISOString(), past=new Date(now-60_000).toISOString()
+ const g={slug:'anthropic',accounts:[
+  {id:'free',state:'ready',model_cooldowns:[{model:'claude-opus-5-5',until:later}]},
+  {id:'out',state:'ready',model_cooldowns:[{model:'claude-fable-5-2',until:later}]},
+  {id:'expired',state:'ready',model_cooldowns:[{model:'claude-fable-5-2',until:past}]},
+  {id:'spent',state:'limited',model_cooldowns:[]},
+  {id:'off',state:'ready',disabled:true,model_cooldowns:[]}]}
+ assert.equal(plugin.fableColumn(g),true)
+ assert.equal(plugin.fableColumn({slug:'openai-codex',accounts:[]}),false)
+ const cell=id=>plugin.fableCell(g.accounts.find(a=>a.id===id),now)
+ assert.deepEqual(cell('free'),{tone:'ready',text:'ok'})
+ assert.equal(cell('out').tone,'limited'); assert.equal(cell('out').text,plugin.fmtReset(later,now))
+ assert.deepEqual(cell('expired'),{tone:'ready',text:'ok'})
+ assert.deepEqual(cell('spent'),{tone:'unknown',text:'—'})
+ assert.deepEqual(cell('off'),{tone:'unknown',text:'—'})
+ assert.deepEqual(plugin.fableSummary(g,now),{ready:2,total:4,nextBack:later})
+ assert.equal(plugin.fableHeader(g,now),'Fable 2/4')
+ const soon=new Date(now+3600_000).toISOString(), week=new Date(now+5*86400_000).toISOString()
+ const none={slug:'anthropic',accounts:[
+  {id:'benched',state:'ready',model_cooldowns:[{model:'claude-fable-5-2',until:later}]},
+  {id:'spent',state:'limited',limit_kind:'quota',resets_at:soon,model_cooldowns:[{model:'claude-fable-5-2',until:week}]},
+  {id:'spent2',state:'limited',limit_kind:'quota',resets_at:soon,model_cooldowns:[]}]}
+ // spent2 is back for everything in an hour; spent needs its later Fable reset; benched its Fable reset.
+ assert.equal(plugin.fableSummary(none,now).nextBack,soon)
+ assert.equal(plugin.fableHeader(none,now),`Fable 0/3 · back ${plugin.fmtReset(soon,now)}`)
+})

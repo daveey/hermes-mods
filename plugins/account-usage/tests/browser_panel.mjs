@@ -67,7 +67,8 @@ try {
  assert.equal(await page.locator('.hermes-au-details[data-account="Cooling account"]').count(),0); evidence.push('Chevron expands and collapses cause text')
  const dots=await page.evaluate(()=>[...document.querySelectorAll('button[aria-label="Account usage"] .hermes-au-dot')].map(d=>getComputedStyle(d).backgroundColor))
  assert.deepEqual(dots.slice(0,4),['rgb(63, 185, 80)','rgb(63, 185, 80)','rgb(227, 179, 65)','rgb(248, 81, 73)'])
- await page.getByText('2 ready · 1 out of quota · 1 cooling down',{exact:true}).waitFor(); evidence.push('Cooldown amber / quota red with reasons and counts')
+ await page.getByText('2 ready · 1 out of quota · 1 cooling down · Fable 2/4',{exact:true}).waitFor(); evidence.push('Cooldown amber / quota red with reasons and counts')
+ assert.equal(await page.locator('[data-fable]').count(),4); evidence.push('Claude rows carry a Fable column')
  const putsBefore=(await page.evaluate(()=>window.fixture.calls)).filter(c=>c.method==='PUT').length
  await page.getByRole('button',{name:'Try Cooling account next',exact:true}).click()
  await page.getByRole('alert').filter({hasText:'Cooldowns are not reset'}).waitFor(); evidence.push('Cooling row -> readable refusal, no mutation')
