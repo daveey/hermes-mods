@@ -140,8 +140,10 @@ def test_a_changed_feed_py_is_loaded_anew_and_the_running_feed_handed_over_at_on
         assert isinstance(f, new_mod.Feed) and not f.stopped.is_set()
         assert f.epoch == first['epoch'] and f.rev == running.rev
         assert api.feed() is f
-        out = f.changes(['S1'], since=first['rev'], epoch=first['epoch'])
-        assert out['reset'] is False and out['bundles'] == {}
+        held = running.rev  # what a client of the old code holds
+        out = f.changes(['S1'], since=held, epoch=first['epoch'])
+        assert out['reset'] is False, 'no reset across the handover'
+        assert all(f.bundles[s]['rev'] > held for s in out['bundles']), 'only what changed since (its thread may tick)'
     finally:
         _restore(api, old_mod)
 
