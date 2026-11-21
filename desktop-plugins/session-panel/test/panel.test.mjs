@@ -1223,6 +1223,43 @@ test('recommendParts / whyParts edge cases', () => {
   assert.deepEqual(m.whyParts('Only you can approve the spend.'), { line: 'Only you can: approve the spend.', tried: '' })
 })
 
+test('idle dependent chat exposes an upstream permission action on a non-first branch and removes it on resolution', async () => {
+  window.localStorage.clear(); m.resetReadsForTests()
+  const draftCount = drafts.length
+  host.state.focusedStoredSessionId.value = 'inherited-chat'
+  const c = card('t_root', 'todo', { waitingOn: 'parent cards', blockedUpstream: { id: 't_middle', status: 'todo' } })
+  window.__userSteps = { openAskCount: () => 0, openAskKeys: () => [] }
+  window.__sessionTasks = { snapshot: { stored: 'inherited-chat', chips: [c] }, lineageIds: async s => new Set([s]) }
+  const request = { action: 'On your test Mac, allow Screen Recording. Unblock = verify grants; archive = stop.', why_human: 'Only its owner can grant access', interaction: 'physical', scope: 'DEVICE: test Mac', evidence: 'Permission denied' }
+  const detail = (id, status, parents = [], extra = {}) => ({ task: { id, title: id, status, ...extra }, links: { parents }, link_tasks: [], events: [] })
+  const ds = { t_root: detail('t_root', 'todo', ['t_running', 't_middle']), t_running: detail('t_running', 'running'), t_middle: detail('t_middle', 'todo', ['t_ask']), t_ask: detail('t_ask', 'blocked', [], { block_kind: 'needs_input', human_request: request }) }
+  window.hermesDesktop = { api: async a => {
+    const id = /\/tasks\/([^?]+)/.exec(a.path)?.[1]
+    return id ? ds[id] : { includes: ['done'], tasks: [], records: [] }
+  } }
+  for (let n = 0; n < 5; n++) { await show(J.jsx(m.Panel, {})); await React.act(async () => { await flush() }) }
+  assert.ok(el().querySelector('[data-upstream-action]'), 'upstream action must be visible in an idle chat')
+  assert.equal(el().querySelector('[data-upstream-action]').textContent, request.action)
+  assert.match(el().textContent, /t_root → t_middle → t_ask/)
+  assert.match(el().querySelector('[data-section="needs-you"]').textContent, /Needs you · 1/)
+  assert.equal(drafts.length, draftCount, 'read-only upstream display drafts nothing')
+  const opened = []
+  window.__sessionTasks.openTaskChip = c => opened.push(c)
+  await show(J.jsx(m.Panel, {}))
+  await React.act(async () => el().querySelector('[data-open-upstream-card]').click())
+  assert.deepEqual([opened[0].id, opened[0].state, opened[0].connectionId, opened[0].profile, opened[0].board], ['t_ask', 'blocked', 'C1', 'default', 'default'])
+  window.__userSteps.presentationForSource = source => ({ representedInQueue: source.id === 't_ask' })
+  await show(J.jsx(m.Panel, {}))
+  assert.ok(el().querySelector('[data-upstream-action]') === null, 'canonical queue already represents this exact ask')
+  delete window.__userSteps.presentationForSource
+  ds.t_ask.task.status = 'done'
+  m.resetReadsForTests()
+  for (let n = 0; n < 5; n++) { await show(J.jsx(m.Panel, {})); await React.act(async () => { await flush() }) }
+  assert.ok(el().querySelector('[data-upstream-action]') === null, 'resolved upstream ask disappears')
+  assert.ok(el().querySelector('[data-section="needs-you"]') === null, 'no human ask means no needs-you heading')
+  host.state.focusedStoredSessionId.value = 'S1'
+})
+
 test('situation More re-measures on resize (ResizeObserver)', async () => {
   window.localStorage.clear()
   const observers = []

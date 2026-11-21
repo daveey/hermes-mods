@@ -14,6 +14,14 @@ A canonical decision can be dismissed, withdrawn, or resolved while its owner ca
 
 The bridge additions `presentationForSource(source)` and `hasQueuePresentation()` are optional for compatibility with older user-steps installations. They are scoped to the focused connection/profile/session; matching uses existing exact-source provenance rules.
 
+## Inherited human requests
+
+A session may be red because one of its waiting cards depends on a valid human ask owned elsewhere. The panel now searches **all** open parent branches, not only the first displayed chain. Fresh validated blocked ancestors appear under **Needs you · upstream dependency**, with the original action and scope (including the device named by its owner), the dependency path and qualified read source. **Open original card** opens that ancestor, not the dependent card. There are no answer, skip, permission-grant or draft controls on inherited rows.
+
+The existing inherited-human stripe semantics are unchanged. Resolving the original ask removes its inherited row on the next current read; nonhuman waits never create one. A request already represented in the canonical queue or a directly listed card is not duplicated. Restored/pending/stale reads, legacy summaries missing graph fields, and truncated graph walks remain explicitly incomplete, never evidence of no ask. Walks are bounded to six parent hops and 80 reads per render and share the normal card cache/feed.
+
+`test/inherited-asks.test.mjs` covers sibling branches, validation, resolution, terminal ancestors, route separation, cycle/depth/read bounds and persisted-read freshness. The idle-chat regression in `test/panel.test.mjs` exercises the real Panel and API-read cache, renders the action/path, opens the qualified original card, deduplicates the canonical queue, and removes human attention after resolution. The same test on the prior plugin fails because no upstream action is visible. Native production proof is separate from these fixtures.
+
 ## Finished history
 
 Open cards remain visible by default. Done and archived cards share a collapsed **N finished** button; expanding it mounts their rows. Expansion is held only in renderer state, keyed by connection/profile/chat, and resets on remount. A finished-only chat retains the disclosure. Existing Done badges still count only done cards; needs-you and live agent projections are unchanged.
