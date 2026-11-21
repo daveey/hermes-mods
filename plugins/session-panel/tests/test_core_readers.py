@@ -113,21 +113,29 @@ def test_each_thread_reads_on_its_own_connection_and_a_replaced_file_is_reopened
     r = readers_for(api, path, monkeypatch)
     main = r.conn(path)
     other = []
-    th = threading.Thread(target=lambda: other.append(r.conn(path)))
+
+    def in_thread():
+        other.append(r.conn(path))
+        r.release()  # a request thread closes its own when done
+    th = threading.Thread(target=in_thread)
     th.start(); th.join()
     assert other[0] is not main
     assert r.card(a, 'default') is not None
-    # Replace the board file with another one (another inode): the reader follows it.
+    # Replace the board file with another one (another inode), the way a swap is done: every connection to the old
+    # file closed (its -wal / -shm gone with the last close), then the new file moved in. The reader follows it.
     from hermes_cli.kanban_db_connect import connect
     fresh = tmp_path / 'fresh.db'
     c2 = connect(fresh)
     b = kanban_db.create_task(c2, title='B', initial_status='running', session_id='S2')
     c2.close(); conn.close()
-    for suffix in ('', '-wal', '-shm'):
-        try:
-            os.replace(f'{fresh}{suffix}', f'{path}{suffix}')
-        except FileNotFoundError:
-            pass
+    assert r.conn(path) is main, 'still holding the old file'
+    for suffix in ('-wal', '-shm'):
+        for f in (f'{path}{suffix}', f'{fresh}{suffix}'):
+            try:
+                os.remove(f)
+            except FileNotFoundError:
+                pass
+    os.replace(fresh, path)
     assert r.card(b, 'default') is not None, 'reads the new file'
     assert r.card(a, 'default') is None
 
