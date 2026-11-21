@@ -105,5 +105,8 @@ For a private historical golden, retain raw input, observation time, source revi
 - A push heartbeat proves transport freshness, not executor liveness. Do not reinterpret the cached model.
 - An ask for an unfocused chat can exist in the backend without being painted; inspect both independently.
 - MODEL.md contains phase-era notes; source and deployed bindings settle current answer-path behavior.
+- Test recorded-decision dedup through both ask-row and line-row renderers: a live ask can share its card with an older answered-undelivered request. `showsDecision` must imply a drawn status line, and failed/unknown delivery must retain queue Check status/Retry even when it returns true. Exercise actual StepBox and mounted Panel actions, not only renderModel with a test-owned callback.
+- Require a numeric, bounded replica sync timestamp before using a reported-running fallback; missing/future/non-finite values fail closed. Preserve real expired/non-running observation tests and kill the mutation that drops the producer-gap restriction.
+- Use integer codepoint ranges for title emoji sanitization, not closed glyph regex lists: repo-wide runtime-notice guards intentionally reject private glyph classes. Keep Python and Desktop ranges in step and compare the replacement against the prior sanitizer over Unicode before claiming unchanged behavior.
 - Passing jsdom proves structure, not native pixels; screenshots prove pixels, not that a click was recorded.
 - Report checks executed now, prior evidence reviewed, and production conditions still unobserved separately. Done means published skills, passing relevant gates, and the requested native captures attached—not a plan for obtaining them.
