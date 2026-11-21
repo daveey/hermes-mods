@@ -265,19 +265,21 @@ test('a hub-sync replica blocked ask keeps its own section', { skip }, async () 
 // chat's fresh read lands, that copy is judged as of when it was read (`cachedAt`), so a running card does not flash
 // to "status unknown" for the 2-5 s read. The header says "updating…". The fresh read (no cachedAt) judges at now.
 test('a switch keeps a cached running card running until the fresh read lands', { skip }, async () => {
-  const chips = [card('task-a', 'running', { observations: [record('task-a')] })]
+  const fresh = [card('task-a', 'running', { observations: [record('task-a')] })]
+  const tag = { cachedAt: (BASE_AT + 100) * 1000, paintedAt: (BASE_AT + 595) * 1000 }
+  const chips = fresh.map(c => ({ ...c, ...tag }))
   const subs = new Set()
   bridges({ chips })
-  window.__sessionTasks.snapshot = { runtime: 'R1', stored: 'S1', chips, cachedAt: (BASE_AT + 100) * 1000 }
+  window.__sessionTasks.snapshot = { runtime: 'R1', stored: 'S1', chips, cachedAt: tag.cachedAt }
   window.__sessionTasks.subscribe = fn => (subs.add(fn), () => subs.delete(fn))
-  at(600) // the cached copy is ten minutes old: judged at now, its evidence has long expired
+  at(600) // the cached copy is eight minutes old: judged at now, its evidence has long expired
   await show(React.createElement(m.Panel, { key: 'cached-switch' }))
   assert.equal(el().querySelectorAll('[data-running-row]').length, 1, 'still running while the refresh is pending')
   assert.doesNotMatch(el().querySelector('[data-status-summary]').textContent, /evidence unknown/)
   assert.match(el().querySelector('[data-panel-updating]').textContent, /updating/)
   assert.match(el().querySelector('[data-panel-updating]').title, /Last-known cards from 8 min ago/)
   // The fresh read answers with the same (expired) evidence: now it is judged at now, and the marker goes.
-  await React.act(async () => { subs.forEach(fn => fn({ runtime: 'R1', stored: 'S1', chips, fresh: true })); await flush() })
+  await React.act(async () => { subs.forEach(fn => fn({ runtime: 'R1', stored: 'S1', chips: fresh, fresh: true })); await flush() })
   assert.equal(el().querySelectorAll('[data-running-row]').length, 0)
   assert.equal(el().querySelector('[data-panel-updating]'), null)
   assert.match(el().querySelector('[data-status-summary]').textContent, /1 evidence unknown/)
@@ -286,7 +288,7 @@ test('a switch keeps a cached running card running until the fresh read lands', 
 test('a cached parked card keeps its board status until the fresh read lands', { skip }, async () => {
   at(10)
   const raw = record('t_x', { set: { 'identity.gateway': 'hub', 'identity.profile': 'default', 'identity.board': 'default', state: 'waiting', source: 'kanban.card', observed_at: null, valid_until: null, source_revision: null, evidence_refs: [] }, delete: ['identity.run_id'] })
-  const chips = tasks.sessionTaskChips([{ id: 't_x', title: 'Wait for release', status: 'scheduled', board: 'default', execution_observations: [raw] }], { connectionId: 'C1', profile: 'default' })
+  const chips = tasks.tagCached(tasks.sessionTaskChips([{ id: 't_x', title: 'Wait for release', status: 'scheduled', board: 'default', execution_observations: [raw] }], { connectionId: 'C1', profile: 'default' }), (BASE_AT + 10) * 1000, (BASE_AT + 495) * 1000)
   bridges({ chips })
   window.__sessionTasks.snapshot = { runtime: 'R1', stored: 'S1', chips, cachedAt: (BASE_AT + 10) * 1000 }
   at(500)
@@ -301,9 +303,21 @@ test('the first frame after a switch paints session-tasks\' cache for the new ch
   bridges({ chips: [] })
   window.__sessionTasks.snapshot = { runtime: 'R0', stored: 'S_previous', chips: [] } // session-tasks has not repainted yet
   const asked = []
-  window.__sessionTasks.cachedSnapshot = (scope, stored) => (asked.push([scope, stored]), { stored, scope, chips, cachedAt: (BASE_AT + 100) * 1000 })
+  window.__sessionTasks.cachedSnapshot = (scope, stored) => (asked.push([scope, stored]), { stored, scope, chips: tasks.tagCached(chips, (BASE_AT + 100) * 1000, (BASE_AT + 119) * 1000), cachedAt: (BASE_AT + 100) * 1000 })
   at(120)
   await show(React.createElement(m.Panel, { key: 'first-frame' }))
   assert.deepEqual(asked[0], [JSON.stringify(['C1', 'default', 'S1']), 'S1'], 'asked for the focused chat, by session-tasks\' scope')
   assert.equal(el().querySelectorAll('[data-running-row]').length, 1)
+})
+
+test('the cached copy is honoured only briefly after the paint, and only when recent', { skip }, async () => {
+  const c = card('task-a', 'running', { observations: [record('task-a')] })
+  const now = (BASE_AT + 600) * 1000
+  const tagged = (cachedSec, paintedSec) => ({ ...c, cachedAt: (BASE_AT + cachedSec) * 1000, paintedAt: (BASE_AT + paintedSec) * 1000 })
+  assert.equal(m.chipAsOf(tagged(100, 590), now), (BASE_AT + 100) * 1000, 'painted 10 s ago, read 8 min ago: judged as of the read')
+  assert.equal(m.chipAsOf(tagged(100, 600 - 31), now), now, 'a read pending past CACHED_HONOUR_MS: judged at now (unknown)')
+  assert.equal(m.chipAsOf({ ...tagged(600 - 31 * 60, 595) }, now), now, 'a copy older than CACHED_MAX_AGE_MS is never honoured')
+  assert.equal(m.chipAsOf({ ...tagged(100, 590), stale: true }, now), now, 'a stale (failed-read) copy is never honoured')
+  assert.equal(m.chipAsOf({ ...tagged(100, 590), kind: 'bg' }, now), now, 'process / sub-agent chips are always live')
+  assert.equal(m.chipAsOf(c, now), now, 'an untagged (fresh) card is judged at now')
 })

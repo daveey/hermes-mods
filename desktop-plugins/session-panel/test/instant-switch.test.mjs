@@ -94,3 +94,52 @@ test('panelSignature and tracePanel log one line per switch with each distinct s
   assert.deepEqual(JSON.parse(lines[0].replace('[panel-timing] ', '')), { session: 'S_a', connection: 'C1', steps: [[0, 'one'], [40, 'two']] })
   m.resetTraceForTests()
 })
+
+// [daveey 2026-11-20] "pre-compute the status panels ... so most switches are instant": the background warm also
+// covers the most recently active sidebar chats and pre-reads every waiting card's dependency chain.
+test('warmTargets: recently focused chats first, then the most recently active sidebar chats, deduped and capped', () => {
+  window.localStorage = memoryStorage()
+  m.noteRecent({ connectionId: 'C1', profile: 'default', session: 'S_recent' })
+  const rows = [
+    { id: 'S_old', connection_id: 'C1', profile: '', last_active: 10 },
+    { id: 'S_new', connection_id: 'C2', profile: 'work', last_active: 99 },
+    { id: 'S_recent', connection_id: 'C1', profile: 'default', last_active: 50 }, // already listed as recent
+    { id: 'S_arch', connection_id: 'C1', last_active: 100, archived: true },
+    { id: 'S_noconn', last_active: 100 }
+  ]
+  assert.deepEqual(m.warmTargets(rows).map(r => `${r.connectionId}/${r.profile}/${r.session}`), ['C1/default/S_recent', 'C2/work/S_new', 'C1/default/S_old'])
+  const many = Array.from({ length: 40 }, (_, i) => ({ id: `S${i}`, connection_id: 'C1', last_active: i }))
+  const out = m.warmTargets(many)
+  assert.equal(out.length, 1 + m.WARM_SIDEBAR, 'sidebar contributes at most WARM_SIDEBAR')
+  assert.ok(out.length <= m.WARM_MAX)
+  assert.equal(out[1].session, 'S39', 'most recently active first')
+})
+
+test('warmChains walks every waiting card\'s chain to its leaf, so a switch shows no "reading…"', async () => {
+  const route = { connectionId: 'C1', profile: 'default', session: 'S_w' }
+  const waiting = { key: 'kb:t_aaaaaa1', kind: 'kanban', id: 't_aaaaaa1', state: 'blocked', label: 'Waiting card', waitingOn: 'card t_bbbbbb2 (blocked)', connectionId: 'C1', profile: 'default', board: 'default' }
+  const reads = []
+  const details = {
+    t_aaaaaa1: { task: { id: 't_aaaaaa1', title: 'Waiting card', status: 'blocked' }, events: [] },
+    t_bbbbbb2: { task: { id: 't_bbbbbb2', title: 'Middle', status: 'todo', parents: ['t_ccccccc3'] }, parents: [{ id: 't_ccccccc3', status: 'running' }], events: [] },
+    t_ccccccc3: { task: { id: 't_ccccccc3', title: 'Leaf', status: 'running' }, events: [] }
+  }
+  window.hermesDesktop = { api: async ({ path }) => { const id = /tasks\/([^?]+)/.exec(path)?.[1]; reads.push(id); return details[id] || {} } }
+  try {
+    const local = m.chainLocal([{ key: waiting.key, kind: 'kanban', label: waiting.label, chip: waiting }], [])
+    const item = { key: waiting.key, kind: 'kanban', label: waiting.label, id: waiting.id, chip: waiting }
+    assert.equal(m.chainFor(item, Date.now(), { local, fallback: () => route }).loading, true, 'cold: the chain would read "reading…"')
+    m.resetReadsForTests()
+    const walked = await m.warmChains(route, { snapshot: { stored: 'S_w', chips: [waiting] } })
+    assert.equal(walked, 1)
+    const ch = m.chainFor(item, Date.now(), { local, fallback: () => route })
+    assert.ok(!ch.loading, 'warm: the whole chain is known')
+    assert.ok(reads.includes('t_bbbbbb2'), 'the named card was read')
+  } finally { delete window.hermesDesktop }
+})
+
+test('warmChains does nothing for a chat with no cached cards or no waiting card', async () => {
+  const route = { connectionId: 'C1', profile: 'default', session: 'S_none' }
+  assert.equal(await m.warmChains(route, { snapshot: null }), 0)
+  assert.equal(await m.warmChains(route, { snapshot: { chips: [{ key: 'm', kind: 'machine', label: 'box' }] } }), 0)
+})

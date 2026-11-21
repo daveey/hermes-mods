@@ -718,10 +718,19 @@ export function cachedChips(scope) {
 
 /** The snapshot a switch to `scope` paints before any read: its last-known cards, `cachedAt` = when they were
  *  read (ms). The panel reads this on its first render after a switch, so that frame is never empty. */
-export function cachedSnapshot(scope, stored) {
+export function cachedSnapshot(scope, stored, nowMs = Date.now()) {
   const c = cachedChips(scope)
-  return c ? { stored, scope, chips: [...c.kanban, ...c.machines], cachedAt: c.kanbanAt ?? c.at } : null
+  if (!c) return null
+  const cachedAt = c.kanbanAt ?? c.at
+  return { stored, scope, chips: [...tagCached(c.kanban, cachedAt, nowMs), ...c.machines], cachedAt }
 }
+
+/** Mark kanban cards as a cached copy read at `cachedAt`, painted at `paintedAt` (the panel judges their evidence as
+ *  of `cachedAt` for a bounded time after the paint). Only kanban cards: process/sub-agent chips are always live. */
+export function tagCached(chips, cachedAt, paintedAt = Date.now()) {
+  return cachedAt ? (chips || []).map(c => (c?.kind === 'kanban' ? { ...c, cachedAt, paintedAt } : c)) : chips || []
+}
+const untagCached = chips => (chips || []).map(c => (c && 'cachedAt' in c ? (({ cachedAt, paintedAt, ...rest }) => rest)(c) : c))
 
 /** Remember a chat's chips; warning chips (kind kanban-status) are never cached. */
 export function rememberChips(scope, kanban, machines) {
@@ -813,9 +822,10 @@ const subs = new Set()
 let timer = null
 let lastKanbanAt = 0
 // [daveey 2026-11-20] "session changes must be instant". While the kanban cards on screen are the switch's cached
-// copy (no read of this chat has landed yet), snapshots carry `cachedAt` = when that copy was read: the panel judges
-// its evidence as of then instead of flashing every running card to "evidence unknown" for the 2-5 s read. Cleared
-// when the read answers, or fails (a failed read then shows unknown, as before).
+// copy (no read of this chat has landed yet), each of those cards carries `cachedAt` (when the copy was read) and
+// `paintedAt`, and snapshots carry `cachedAt` (the panel's "updating…" marker): the panel judges those cards' evidence
+// as of then, for a bounded time, instead of flashing every running card to "evidence unknown" for the 2-5 s read.
+// Cleared (tags removed) when the read answers or fails: a failed read then shows unknown, as before.
 let kanbanCachedAt = null
 let kanbanCache = []
 let lastMachinesAt = 0
@@ -981,6 +991,7 @@ function paintCached() {
   const runtime = host.state.focusedSessionId.get()
   const stored = host.state.focusedStoredSessionId.get()
   const { route, scope } = focusScope()
+  if (!stored || !route.connectionId) kanbanCachedAt = null
   if (!stored || !route.connectionId || scope === snapshot.scope) return false
   const cached = cachedChips(scope)
   if (!cached) {
@@ -990,9 +1001,9 @@ function paintCached() {
     machineCache = []
     return false
   }
-  kanbanCache = cached.kanban
-  machineCache = cached.machines
   kanbanCachedAt = cached.kanbanAt ?? cached.at ?? null
+  kanbanCache = tagCached(cached.kanban, kanbanCachedAt)
+  machineCache = cached.machines
   lastKanbanAt = 0
   lastMachinesAt = 0
   snapshot = { runtime, stored, scope, chips: [...kanbanCache, ...machineCache], ...(kanbanCachedAt ? { cachedAt: kanbanCachedAt } : {}) }
@@ -1110,14 +1121,14 @@ export async function refresh() {
         report('lineage', false)
         await rpc
         if (!stillFocused()) return
-        kanbanCachedAt = null
+        if (kanbanCachedAt) { kanbanCachedAt = null; kanbanCache = untagCached(kanbanCache) }
         // Never turn a partial ancestry read into an authoritative empty answer.
         // Keep only this owner's previous chips and retry ancestry next poll.
         lastKanbanAt = 0
         lastMachinesAt = 0
         snapshot = {
           runtime, stored, scope,
-          chips: [...staleChips(snapshot.scope === scope ? snapshot.chips : []).filter(c => c.key !== `lineage-status:${scope}`), {
+          chips: [...staleChips(untagCached(snapshot.scope === scope ? snapshot.chips : [])).filter(c => c.key !== `lineage-status:${scope}`), {
             key: `lineage-status:${scope}`, kind: 'kanban-status', state: 'unknown', stale: true,
             label: 'Session lineage unavailable', title: 'Could not read full session ancestry; work may still be unfinished.'
           }]
@@ -1130,8 +1141,9 @@ export async function refresh() {
         ? ((lastKanbanAt = Date.now()), loadKanban(ids, route)).then(kChips => {
             if (!stillFocused()) return
             report('tasks', Array.isArray(kChips) && !kChips.some(c => c.kind === 'kanban-status' && c.state === 'unknown'))
-            // The read answered (or failed): the cards are no longer the switch's cached copy.
-            kanbanCachedAt = null
+            // The read answered (or failed): the cards are no longer the switch's cached copy (a failed read keeps
+            // them, untagged: judged at now, unknown, as before).
+            if (kanbanCachedAt) { kanbanCachedAt = null; kanbanCache = untagCached(kanbanCache) }
             // null = fetch failed: keep this chat's last good list (cached or live), never the previous chat's.
             if (kChips) {
               kanbanCache = kChips

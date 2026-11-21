@@ -418,10 +418,15 @@ test('a switch carries cachedAt (the kanban read time) until the fresh kanban re
     for (let i = 0; i < 20 && !window.__sessionTasks.snapshot.fresh; i++) await new Promise(r => setTimeout(r, 5))
     assert.equal(window.__sessionTasks.snapshot.fresh, true, 'process/sub-agent answers published')
     assert.equal(window.__sessionTasks.snapshot.cachedAt, readAt, 'kanban cards are still the cached copy')
+    const tagged = window.__sessionTasks.snapshot.chips.find(c => c.id === 't_c')
+    assert.equal(tagged.cachedAt, readAt, 'each cached kanban card carries its read time')
+    assert.ok(tagged.paintedAt >= readAt)
+    assert.ok(window.__sessionTasks.snapshot.chips.filter(c => c.kind !== 'kanban').every(c => !('cachedAt' in c)), 'live chips are never tagged')
     assert.deepEqual(window.__sessionTasks.cachedSnapshot(scopeOf('chat-at'), 'chat-at').chips.map(c => c.id), ['t_c'])
     kanban.resolve({ tasks: [card('t_c')] })
     await round
     assert.equal(window.__sessionTasks.snapshot.cachedAt, undefined, 'the fresh read is judged at now')
+    assert.ok(window.__sessionTasks.snapshot.chips.every(c => !('cachedAt' in c)), 'fresh cards are untagged')
   } finally { dispose(); delete globalThis.window; delete host.request }
 })
 
@@ -438,6 +443,8 @@ test('a failed kanban read drops cachedAt (the cached cards are then judged at n
   try {
     await m.refresh()
     assert.equal(window.__sessionTasks.snapshot.cachedAt, undefined)
+    const kept = window.__sessionTasks.snapshot.chips.filter(c => c.kind === 'kanban')
+    assert.ok(kept.every(c => !('cachedAt' in c)), 'the kept cached cards are untagged: judged at now')
   } finally { dispose(); delete globalThis.window; delete host.request }
 })
 
