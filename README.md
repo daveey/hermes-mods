@@ -166,7 +166,9 @@ See [AGENTS.md](AGENTS.md). Every commit is scanned for secrets (`.githooks/pre-
 gitleaks in CI). The hook refuses to commit when gitleaks or the private denylist is missing;
 `./install.sh --tools` installs gitleaks (brew on macOS, the pinned release into `~/.local/bin` on Linux).
 Tests: `scripts/test-all` runs every suite (`tests/`, each `plugins/<name>/`, `tools/*`) in its own process and
-prints one line per suite, then the tail of every failing one; it exits 0 only if all pass. A bare `pytest -q` at
+prints one line per suite, then the tail of every failing one; it exits 0 only if all pass. Core `.venv`
+selection requires a cached, five-second `import ruamel.yaml` probe; an empty/incomplete venv falls through
+to the production runtime instead of silently supplying no core dependencies. A bare `pytest -q` at
 the repo root does not work: plugins reuse test-module names, some need a core checkout, and a test importing core's
 `hermes_bootstrap` can re-exec the interpreter and exit 1 with no output (the runner sets
 `HERMES_DISABLE_LAZY_INSTALLS=1` and reports such a death as `SILENT-EXIT`). Options: `-k NAME` (substring, repeatable),
