@@ -1581,7 +1581,7 @@ test('situation More re-measures on resize (ResizeObserver)', async () => {
 
 // [daveey 2026-11-21] "the panels keep flipping between correct and incorrect": a failed session-cards read (a busy
 // owner) replaced the Done list with unknown until the next read answered.
-test('panel: a failed or unmarked session-cards read keeps the last-known Done count', async () => {
+test('panel: a failed session-cards read keeps the last-known Done count', async () => {
   window.localStorage.clear()
   m.resetDoneCacheForTests()
   const s = Date.now() / 1000
@@ -1593,15 +1593,35 @@ test('panel: a failed or unmarked session-cards read keeps the last-known Done c
   window.hermesDesktop = { api: async () => { throw new Error('500 database is locked: cached reader is borrowed') } }
   await React.act(async () => { await m.refreshDone(); await flush() })
   assert.deepEqual(summary(), ['1 running', '1 done'], 'a failed read keeps what was known')
-  window.hermesDesktop = { api: async () => ({ tasks: [] }) } // no includes: says nothing about finished cards
-  await React.act(async () => { await m.refreshDone(); await flush() })
-  assert.deepEqual(summary(), ['1 running', '1 done'], 'an unmarked answer keeps what was known')
-  // Switching away and back after a relaunch: memory gone, the failed read still paints the stored list.
+  // After a relaunch (memory gone), a failed read still paints the stored list.
   await show(null)
   m.resetDoneCacheForTests()
-  window.localStorage.setItem('hermes.sessionPanel.done.v1', JSON.stringify({ [JSON.stringify(['C1', 'default', 'S1'])]: [{ key: 't_d1', label: 'Shipped A' }] }))
-  window.hermesDesktop = { api: async () => { throw new Error('timeout') } }
   await show(React.createElement(m.Panel, { key: 'keep-done-2' }))
   await React.act(async () => { await m.refreshDone(); await flush() })
   assert.deepEqual(summary(), ['1 running', '1 done'])
+  // An answer from an owner that cannot list finished cards is not a failure: Done is unknown, never a stale list.
+  window.hermesDesktop = { api: async () => ({ tasks: [] }) }
+  await React.act(async () => { await m.refreshDone(); await flush() })
+  assert.deepEqual(summary(), ['1 running'])
+})
+
+test('panel: a Done read that fails after focus moved leaves the new chat alone', async () => {
+  window.localStorage.clear()
+  m.resetDoneCacheForTests()
+  const s = Date.now() / 1000
+  bridges({ chips: [card('t_run', 'running', { activityAt: s - 30 })], cards: [{ id: 't_d1', status: 'done', title: 'Shipped A', activity_at: s - 60 }] })
+  await show(React.createElement(m.Panel, { key: 'moved' }))
+  await React.act(async () => { await m.refreshDone(); await flush() }) // S1: 1 done, remembered
+  let fail
+  window.hermesDesktop = { api: () => new Promise((_, rej) => { fail = rej }) }
+  let pending
+  await React.act(async () => { pending = m.refreshDone(); await flush() }) // a read for S1 hangs
+  host.state.focusedStoredSessionId.value = 'S2' // focus moves to a chat with no Done known
+  window.__sessionTasks.snapshot.stored = 'S2'
+  await React.act(async () => { fail(new Error('timeout')); await pending; await flush() })
+  assert.equal(m.cachedDone(JSON.stringify(['C1', 'default', 'S2'])), null)
+  await show(React.createElement(m.Panel, { key: 'moved-2' }))
+  assert.deepEqual(el().querySelector('[data-status-summary]').textContent.split(' · '), ['1 running'], 'S1\'s Done is not painted on S2')
+  host.state.focusedStoredSessionId.value = 'S1'
+  window.__sessionTasks.snapshot.stored = 'S1'
 })

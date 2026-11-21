@@ -55,6 +55,9 @@ class Readers:
         self.reads.append(cid)
         return self.cards.get(cid)
 
+    def release(self):
+        pass
+
 
 def make(clock=None):
     r = Readers()
@@ -477,28 +480,63 @@ def test_a_long_recompute_pass_keeps_heartbeating():
     assert sum(1 for p in pushed if p.get('heartbeat')) >= 1, 'heartbeats went out during the pass'
 
 
+
 def test_a_plugin_reload_resumes_the_feed_so_clients_see_no_reset():
     # [daveey 2026-11-21] panels flipped while the hub reloaded plugins for each new session and the feed restarted
     # with a new epoch and no bundles.
     old, r, pushed, t = make()
     first = old.changes(['S1', 'S2'])
+    for _ in range(3):  # later passes: carried sequence numbers run well past 1
+        t['now'] += 61
+        old.tick()
+    top = max(b['bundle']['computed_seq'] for b in old.bundles.values())
+    assert top > 2
     old.stopped.set()  # plugin unload
     new = feedmod.Feed(r, emit=pushed.append, clock=lambda: t['now']).resume(old)
     assert new.epoch == old.epoch and new.rev == old.rev
-    again = new.changes(['S1', 'S2'], since=first['rev'], epoch=first['epoch'])
+    again = new.changes(['S1', 'S2'], since=old.rev, epoch=first['epoch'])
     assert again['reset'] is False and again['bundles'] == {}, 'the client keeps its revision chain'
-    # Carried bundles are not vouched for until recomputed; the next tick recomputes them.
+    # A heartbeat is due while the carried bundles are still young: none is vouched for before a recompute.
     pushed.clear()
-    t['now'] += 100  # a heartbeat is due
+    t['now'] += 21
     new._publish({}, heartbeat=True)
     assert pushed and pushed[-1]['fresh'] == [], 'nothing carried is vouched for before a recompute'
-    pushed.clear()
+    # The recompute's sequence numbers continue past every carried one, so its bundles are stored and pushed.
     r.cards['t_ccccccc3'] = detail('t_ccccccc3', 'done', session='S9')
+    pushed.clear()
     new.tick()
-    assert pushed and pushed[-1]['epoch'] == first['epoch'] and pushed[-1]['prev'] == first['rev']
+    assert all(b['bundle']['computed_seq'] > top for b in new.bundles.values())
+    assert pushed and pushed[-1]['epoch'] == first['epoch'] and pushed[-1]['prev'] == old.rev
     assert set(pushed[-1]['bundles']) == {'S1'} and pushed[-1]['fresh'] == ['S1', 'S2']
     # The stopped feed emits nothing more and takes no revision.
     rev = new.rev
     pushed.clear()
     old._publish({'S1': old.compute('S1')}, heartbeat=True)
     assert pushed == [] and new.rev == rev
+
+
+def test_a_carried_chat_is_not_vouched_for_by_a_heartbeat_in_the_middle_of_its_recompute():
+    old, r, pushed, t = make()
+    old.changes(['S1', 'S2'])
+    old.stopped.set()
+    new = feedmod.Feed(r, emit=pushed.append, clock=lambda: t['now']).resume(old)
+    t['now'] += 21  # every reservation's heartbeat is due
+    pushed.clear()
+    # S2 is reserved (its retry mark cleared) and computed; S1's reservation heartbeats before the pass publishes.
+    out = new._compute_all(['S2', 'S1'])
+    beats = [p for p in pushed if p.get('heartbeat')]
+    assert beats and all(p['fresh'] == [] for p in beats), beats
+    new._publish(out)  # the same content as carried: no new revision, but the carried mark is cleared
+    t['now'] += 21
+    new._publish({}, heartbeat=True)
+    assert pushed[-1]['heartbeat'] and pushed[-1]['fresh'] == ['S1', 'S2']
+
+
+def test_a_catch_up_that_reached_the_stopped_feed_lands_in_its_successor():
+    old, r, pushed, t = make()
+    first = old.changes(['S1'])
+    old.stopped.set()
+    new = feedmod.Feed(r, emit=pushed.append, clock=lambda: t['now']).resume(old)
+    out = old.changes(['S1', 'S2'], since=first['rev'], epoch=first['epoch'])  # a request that held the old feed
+    assert 'S2' in new.interest and 'S2' in new.bundles and 'S2' not in old.interest
+    assert out['epoch'] == new.epoch and set(out['bundles']) == {'S2'}

@@ -47,6 +47,7 @@ TERMINAL = {'done', 'archived', 'cancelled'}
 CARD_ID = re.compile(r'\bt_[0-9a-f]{6,}\b')
 PROCESS_FEED = None          # the one feed of this process (plugin_api.feed())
 PROCESS_LOCK = threading.Lock()
+RESTART = None               # plugin_api.feed: a plugin reload restarts (resumes) the feed at once
 log = logging.getLogger('session-panel')
 
 
@@ -109,6 +110,8 @@ class Feed:
         self._last_full = 0.0
         self._flights: dict[str, _Flight] = {}
         self._retry: set[str] = set()  # a tick joined reads that may predate its change cursor
+        self._carried: set[str] = set()  # bundles resumed from a stopped feed: never vouched for until restored
+        self._successor: Optional['Feed'] = None  # the feed that resumed this one (requests still here move on)
 
     def resume(self, prev: 'Feed') -> 'Feed':
         """Carry a stopped feed of this process into this one, so clients see no reset.
@@ -120,14 +123,24 @@ class Feed:
         with prev.compute_lock, prev.lock:
             prev.stopped.set()
             self.epoch, self.rev, self.last_emit = prev.epoch, prev.rev, prev.last_emit
-            self.bundles = dict(prev.bundles)
+            self.last_tick_s = prev.last_tick_s
+            self.bundles = {s: dict(b) for s, b in prev.bundles.items()}
             self.interest = dict(prev.interest)
-            self.failures = dict(prev.failures)
-            self._retry = set(prev._retry) | set(prev.bundles)
+            self.failures = {s: dict(f) for s, f in prev.failures.items()}
+            self._retry = set(prev._retry) | set(prev.bundles)  # recompute every carried chat on the next pass
+            self._carried = set(prev.bundles)  # ...and vouch for none of them until its new bundle is stored
             # A carried bundle never outranks a newer computation: sequence numbers continue past every held one.
             top = max((int(b['bundle'].get('computed_seq') or 0) for b in prev.bundles.values()), default=0)
             self._seq = itertools.count(top + 1)
+            prev._successor = self
         return self
+
+    def _current(self) -> 'Feed':
+        """The feed that now owns this one's revision space (itself unless a reload resumed it elsewhere)."""
+        f = self
+        while f._successor is not None:
+            f = f._successor
+        return f
 
     # ── interest ────────────────────────────────────────────────────────────
     def watch(self, sessions: Iterable[str]) -> list[str]:
@@ -263,6 +276,7 @@ class Feed:
         source_stale = any(t.get('stale') or t.get('partial_source_unknown') or t.get('_execution_error') for t in rows)
         if source_stale:
             self._retry.add(session)
+        self._carried.discard(session)  # recomputed: its bundle is this feed's own now
         if prev and prev['hash'] == h:
             prev.update(bundle=bundle, refs=refs, lineage=set(bundle['lineage']), source_stale=source_stale)
             return False
@@ -289,7 +303,8 @@ class Feed:
                     # The chats this push vouches for: held, watched, and last computed without a failure. Clients
                     # re-stamp only these (a dropped or failing chat is never confirmed by a heartbeat).
                     fresh = sorted(s for s in self.interest if s in self.bundles and s not in self.failures
-                                   and s not in self._retry and not self.bundles[s].get('source_stale')
+                                   and s not in self._retry and s not in self._carried
+                                   and not self.bundles[s].get('source_stale')
                                    and now - self.bundles[s]['bundle']['computed_at'] <= (
                                        self.full_every_s if self.bundles[s]['bundle'].get('tasks')
                                        else QUIET_FULL_EVERY_S))
@@ -350,7 +365,10 @@ class Feed:
     def changes(self, sessions: Iterable[str], *, since: int = 0, epoch: Optional[str] = None) -> dict:
         """Watch `sessions` and return every bundle of theirs newer than `since` (all of them when `epoch` is not
         this process's: the client's revisions mean nothing here). Missing bundles are computed now (and pushed, so
-        every other client's revision chain stays unbroken)."""
+        every other client's revision chain stays unbroken). A request that reached a feed a reload has since resumed
+        is answered by its successor (its watch and computed bundles must land in the live feed)."""
+        if self._successor is not None:
+            return self._current().changes(sessions, since=since, epoch=epoch)
         wanted = self.watch(sessions)
         reset = epoch != self.epoch
         with self.lock:
@@ -362,6 +380,8 @@ class Feed:
                 release = getattr(self.readers, 'release', None)
                 if callable(release):
                     release()  # request threads keep no connections between catch-ups
+        if self._successor is not None:  # resumed while this request computed: what it watched lives there
+            return self._current().changes(sessions, since=since, epoch=epoch)
         with self.compute_lock, self.lock:
             out = {s: self.bundles[s]['bundle'] for s in wanted
                    if s in self.bundles and (reset or self.bundles[s]['rev'] > since)}

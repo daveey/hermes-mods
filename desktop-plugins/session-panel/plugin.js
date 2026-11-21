@@ -965,13 +965,14 @@ export async function refreshDone() {
     if (ids?.incomplete) return
     const r = await bridge({ path: `/api/plugins/user-steps/session-cards?ids=${encodeURIComponent([...ids].join(','))}`, connectionId: route.connectionId, profile: route.profile, timeoutMs: 15_000 })
     if (routeKey(panelRoute()) !== scope) return
-    // Only an answer that says it lists finished cards counts; anything else keeps the last-known list (unknown when
-    // there is none). [daveey 2026-11-21] "panels keep flipping between correct and incorrect": a busy owner failed
-    // this read and the Done count vanished until the next read answered.
-    const rows = Array.isArray(r?.tasks) && Array.isArray(r.includes) && r.includes.includes('done') ? doneRows(r.tasks) : null
-    done = { scope, rows: rows || cachedDone(scope) }
-    if (rows) rememberDone(scope, rows)
+    // Only an answer that says it lists finished cards counts; any other answer (an owner that cannot list them)
+    // leaves done unknown.
+    done = { scope, rows: Array.isArray(r?.tasks) && Array.isArray(r.includes) && r.includes.includes('done') ? doneRows(r.tasks) : null }
+    if (done.rows) rememberDone(scope, done.rows)
   } catch (e) {
+    // A failed read keeps the last-known list (unknown when there is none). [daveey 2026-11-21] "panels keep
+    // flipping between correct and incorrect": a busy owner failed this read and the Done count vanished until
+    // the next read answered.
     log('session-cards read failed', e?.message || e)
     if (routeKey(panelRoute()) !== scope) return
     done = { scope, rows: (done.scope === scope && done.rows) || cachedDone(scope) }

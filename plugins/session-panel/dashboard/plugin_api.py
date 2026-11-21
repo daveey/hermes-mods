@@ -490,11 +490,19 @@ def feed():
     core = _load_feed()
     with core.PROCESS_LOCK:
         if core.PROCESS_FEED is None or core.PROCESS_FEED.stopped.is_set():
-            prev, core.PROCESS_FEED = core.PROCESS_FEED, core.Feed(CoreReaders(), emit=_emit)
+            prev, new = core.PROCESS_FEED, core.Feed(CoreReaders(), emit=_emit)
             if prev is not None:  # a plugin reload stopped it: carry its revisions on, so clients see no reset
-                core.PROCESS_FEED.resume(prev)
+                try:
+                    new.resume(prev)
+                except Exception:  # never leave the process without a running feed: start clean (clients reset)
+                    log.warning('session-panel feed: resume failed; starting a new revision space', exc_info=True)
+                    new = core.Feed(CoreReaders(), emit=_emit)
+            core.PROCESS_FEED = new
             threading.Thread(target=_run, args=(core.PROCESS_FEED,), name='session-panel-feed', daemon=True).start()
         return core.PROCESS_FEED
+
+
+_load_feed().RESTART = feed  # plugin register() after a reload resumes the feed now, not at the next request
 
 
 def stop() -> None:
@@ -531,7 +539,7 @@ async def changes(body: ChangesBody):
     profile = _request_profile()
     if profile != LAUNCH_PROFILE:
         return {'feed': FEED_ID, 'profile': profile, 'profile_unsupported': True}
-    f = feed()
+    f = await run_in_threadpool(feed)  # a resume waits for the stopped feed's in-flight push: never on the loop
     out = await run_in_threadpool(f.changes, body.sessions, since=body.since, epoch=body.epoch)
     return json_safe({'feed': FEED_ID, 'profile': LAUNCH_PROFILE, **out})
 

@@ -51,3 +51,45 @@ def test_a_request_for_another_profile_is_refused_not_served_from_the_wrong_stat
     r = TestClient(app).post('/api/plugins/session-panel/changes', json={'sessions': ['S1']}).json()
     assert r == {'feed': api.FEED_ID, 'profile': 'work', 'profile_unsupported': True}
     assert api._load_feed().PROCESS_FEED is None, 'no feed started for it'
+
+
+def test_a_plugin_reload_resumes_the_process_feed_on_register_and_on_the_next_request(monkeypatch):
+    # [daveey 2026-11-21] a reload (unload -> register) must not start a new revision space.
+    import threading
+    api = load('_spf_reload_api', HERE.parents[1] / 'dashboard' / 'plugin_api.py')
+    fakes = load('_spf_reload_fakes', HERE.parent / 'test_feed.py')
+    plugin = load('_spf_reload_plugin', HERE.parents[1] / '__init__.py')
+    core = api._load_feed()
+    monkeypatch.setattr(api, 'CoreReaders', fakes.Readers)
+    monkeypatch.setattr(api, '_emit', lambda payload: None)
+    core.PROCESS_FEED = None
+    try:
+        app = FastAPI()
+        app.include_router(api.router, prefix='/api/plugins/session-panel')
+        c = TestClient(app)
+        first = c.post('/api/plugins/session-panel/changes', json={'sessions': ['S1', 'S2']}).json()
+        # Unload: the feed stops. The next request resumes it (same epoch, no reset).
+        plugin.stop()
+        again = c.post('/api/plugins/session-panel/changes',
+                       json={'sessions': ['S1', 'S2'], 'since': first['rev'], 'epoch': first['epoch']}).json()
+        assert again['epoch'] == first['epoch'] and again['reset'] is False and again['bundles'] == {}
+        assert core.PROCESS_FEED.stopped.is_set() is False
+        # Unload then register again: register resumes it at once, before any request.
+        resumed = core.PROCESS_FEED
+        plugin.stop()
+        started = threading.Event()
+        real = core.RESTART
+        monkeypatch.setattr(core, 'RESTART', lambda: (real(), started.set()))
+        plugin.register(type('Ctx', (), {'on_unload': lambda self, cb: None})())
+        assert started.wait(5)
+        assert core.PROCESS_FEED is not resumed and not core.PROCESS_FEED.stopped.is_set()
+        assert core.PROCESS_FEED.epoch == first['epoch']
+        # A resume that fails still leaves a running feed (a new revision space).
+        plugin.stop()
+        monkeypatch.setattr(core.Feed, 'resume', lambda self, prev: (_ for _ in ()).throw(RuntimeError('boom')))
+        f = api.feed()
+        assert not f.stopped.is_set() and f.epoch != first['epoch']
+    finally:
+        if core.PROCESS_FEED is not None:
+            core.PROCESS_FEED.stopped.set()
+        core.PROCESS_FEED = None
