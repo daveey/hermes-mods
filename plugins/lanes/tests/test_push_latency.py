@@ -157,7 +157,8 @@ def test_incremental_equals_full_on_a_real_board_backup(tmp_path, monkeypatch):
     kbc = pytest.importorskip('hermes_cli.kanban_db_connect')
     from hermes_cli import kanban_lanes_cli as cli
     copy = tmp_path / 'board.db'
-    source = sqlite3.connect(f"file:{os.environ['LANES_BOARD_BACKUP']}?mode=ro", uri=True)
+    source = sqlite3.connect(os.environ['LANES_BOARD_BACKUP'])
+    source.execute('PRAGMA query_only=ON')
     target = sqlite3.connect(copy)
     source.backup(target)
     source.close(), target.close()
@@ -181,3 +182,60 @@ def test_incremental_equals_full_on_a_real_board_backup(tmp_path, monkeypatch):
         assert json.dumps(incremental, sort_keys=True) == json.dumps(full, sort_keys=True), step
     assert row is not None
     print('memo hits/misses', memo.hits, memo.misses)
+
+
+def test_shared_memo_does_not_share_mutable_events_or_derived_values(board):
+    from hermes_cli.kanban_lanes_flow_evidence import Evidence
+    api, connect, _calls = board
+    memo = api._card_memo()
+    with connect() as conn:
+        first = memo.bind(Evidence(conn))
+        first.events('t_pr')[0]['payload']['metadata']['pr'] = 'mutated'
+        first.derived('t_pr', 'nested', lambda events: {'items': [1]})['items'].append(2)
+    with connect() as conn:
+        second = memo.bind(Evidence(conn))
+        assert second.events('t_pr')[0]['payload']['metadata']['pr'] == fixtures.URL
+        assert second.derived('t_pr', 'nested', lambda events: {'items': [1]}) == {'items': [1]}
+    assert memo.hits > 0
+
+
+def test_shared_memo_detects_same_id_event_replacement(board):
+    from hermes_cli.kanban_lanes_flow_evidence import Evidence
+    api, connect, _calls = board
+    memo = api._card_memo()
+    with connect() as conn:
+        old = memo.bind(Evidence(conn)).events('t_pr')[0]
+    with connect() as conn:
+        conn.execute('DELETE FROM task_events WHERE id=?', (old['id'],))
+        conn.execute('INSERT INTO task_events(id,task_id,kind,created_at,payload) VALUES(?,?,?,?,?)',
+                     (old['id'], 't_pr', 'scheduled', int(time.time()), '{"nested": ["new"]}'))
+        conn.commit()
+    with connect() as conn:
+        assert memo.bind(Evidence(conn)).events('t_pr') == Evidence(conn).events('t_pr')
+
+
+def test_shared_memo_validates_the_open_connection_not_its_replaced_path(board, tmp_path):
+    from hermes_cli.kanban_lanes_flow_evidence import Evidence
+    import sqlite3
+    api, _connect, _calls = board
+    memo = api._card_memo()
+    path = tmp_path / 'source.db'
+    fresh_path = tmp_path / 'replacement.db'
+    # DELETE journal avoids mixing the replaced file with the predecessor's WAL.
+    with contextlib.closing(sqlite3.connect(path)) as old_conn:
+        old_conn.row_factory = sqlite3.Row
+        old_conn.execute('CREATE TABLE task_events(id INTEGER, task_id TEXT, kind TEXT, payload TEXT)')
+        old_conn.execute("INSERT INTO task_events VALUES(1,'t_pr','created','{}')")
+        old_conn.commit()
+        with contextlib.closing(sqlite3.connect(fresh_path)) as replacement:
+            old_conn.backup(replacement)
+            replacement.execute("UPDATE task_events SET payload='{\"new\": true}'")
+            replacement.commit()
+        # Retained connection populates after replacement: a path stat would lie.
+        os.replace(fresh_path, path)
+        old_events = memo.bind(Evidence(old_conn, rows=[])).events('t_pr')
+        with contextlib.closing(sqlite3.connect(path)) as new_conn:
+            new_conn.row_factory = sqlite3.Row
+            fresh = Evidence(new_conn, rows=[]).events('t_pr')
+            assert fresh != old_events
+            assert memo.bind(Evidence(new_conn, rows=[])).events('t_pr') == fresh
