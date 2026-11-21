@@ -263,6 +263,12 @@ ask only once its prerequisite is verifiably in place. If an early one is alread
 - ask-gate's injected "already answered or dismissed" list prints each recorded answer after `->`. If that answer
   is a runtime notice (it opens with `[`, `<` or a symbol + `[`), the user never answered: treat the ask as still
   open, never act on it as decided, and fix the gate's notice check (`hermes-mods-repo-plugin-design`).
+- A decide tile that drops off the open-asks list was answered, not lost: look for its receipt in the injected
+  "Canonical user decisions" block before re-posting. Never call `session_outcome(kind=decide)` again for a question
+  still open: every call mints a new request, so the user sees duplicates you then have to withdraw.
+- A decision receipt for an answer you already acted on (recorded it in a commit or card before the receipt came):
+  verify the effect is live (remote head, comment id), then go acknowledged → reserved → applied with that existing
+  evidence. Do not redo the effect to "apply" it.
 - Passing the user's answer on to a card that asked them: post it with `kanban_comment(relays_user_message=true)`
   (another gateway: `cross_task action=comment relays_user_message=true`), once per answer, from the chat the user
   answered in. Only that mark tells the card's no-progress budget a person answered; a plain comment or a bare
