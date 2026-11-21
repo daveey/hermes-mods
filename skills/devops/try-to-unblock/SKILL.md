@@ -48,6 +48,15 @@ Read the card's newest comments and runs, the linked PR/CI, and the actual state
 alive? file present? token valid? PR merged?). Many asks are already answered, already done, or about a process
 that no longer exists. If the premise is gone, the block is gone: comment what you read and unblock.
 
+A macOS permission ask (Screen Recording, Accessibility, "grant it at the Mac") is a premise to read, not to relay.
+Read the Mac's existing grants over `tailnet_exec` first:
+`sqlite3 '/Library/Application Support/com.apple.TCC/TCC.db' "select service,client,auth_value from access where service in ('kTCCServiceScreenCapture','kTCCServiceAccessibility')"`.
+An `auth_value` of 2 means allowed. The user-level TCC.db is unreadable over ssh, so use the system one.
+A worker that only probed `screencapture` over ssh has not checked these grants. Often some client already holds the
+permission, sshd for input or an installed app for capture. In that case, re-plan the card onto that client, with no
+new grant.
+Never forward the ask to David before this read.
+
 ## 3. Walk the self-unblock ladder
 
 Stop at the first rung that works. Each rung is something agents may do without asking.
