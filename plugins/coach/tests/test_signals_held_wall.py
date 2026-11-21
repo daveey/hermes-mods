@@ -159,13 +159,16 @@ def test_non_error_row_with_short_wall_text_is_not_withdrawn(kind):
 
 
 def test_threshold_matches_core_reroute_policy():
-    """Drift guard: the hold window must be core's WALL_REROUTE_MIN_SECONDS (a longer core window would make
-    designed holds file again; a shorter one would hide far walls that failed to reroute)."""
+    """Drift guard against core's reroute floor. Core (9810dd16e2) dropped WALL_REROUTE_MIN_SECONDS: a non-explicit
+    pin now reroutes at any wall length, so only explicit/card pins and sessionless builds still hold a short wall.
+    HELD_WALL_S stays as the window for those remaining designed holds (logs can't tell them apart). If core
+    reintroduces a floor, it must equal HELD_WALL_S."""
     import os
     try:  # scripts/test-all puts core on PYTHONPATH (HERMES_CORE_CHECKOUT); the public CI has no core
-        from agent.model_routing_walls import WALL_REROUTE_MIN_SECONDS
+        import agent.model_routing_walls as walls
     except ImportError:
         if os.environ.get("HERMES_CORE_CHECKOUT"):
             raise
         pytest.skip("needs Hermes core (HERMES_CORE_CHECKOUT unset)")
-    assert WALL_REROUTE_MIN_SECONDS == sg.HELD_WALL_S
+    floor = getattr(walls, "WALL_REROUTE_MIN_SECONDS", None)
+    assert floor is None or floor == sg.HELD_WALL_S

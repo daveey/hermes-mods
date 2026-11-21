@@ -491,7 +491,9 @@ def _cron_held_failures(recs: List[dict]) -> set:
 # real defects of the same frames as "came back" (selfheal agent-13b91b3e1b: walls 2.9-4.3 h out on 11-14). Only the
 # exact class with a parseable reset strictly after the record and inside the window is a hold: a far wall (a pin
 # that should have rerouted) and a refusal at/after its own reset (a stale wall) stay defects.
-# tests/test_signals_held_wall.py asserts HELD_WALL_S equals core's constant when core is on the path.
+# Core 9810dd16e2 removed that floor (non-explicit pins reroute at any length); the window now covers the holds that
+# remain (explicit/card pins, sessionless builds). tests/test_signals_held_wall.py asserts HELD_WALL_S equals core's
+# constant if core reintroduces it.
 HELD_WALL_S = 6 * 3600
 HELD_WALL_EXC = "SubscriptionQuotaUnavailable"
 HELD_WALL_RESET_RE = re.compile(r"; resets at (\d+(?:\.\d+)?)\s*$")
