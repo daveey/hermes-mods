@@ -359,11 +359,11 @@ def test_person_wait_survives_real_core_store_and_blocks_done(real, tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
         db.create_session(sid, source="desktop")
-        db.append_message(sid, role="user", content="Stage it once Eve confirms.")
+        db.append_message(sid, role="user", content="Stage it once the example operator confirms.")
     finally:
         db.close()
     out = _json.loads(plugin.handle({"kind": "wait", "on": [{
-        "kind": "person", "contact": "Slack @Eve", "channel": "slack", "thread": "https://example.com/C0EXAMPLE/1.1",
+        "kind": "person", "contact": "Slack @ExampleOperator", "channel": "slack", "thread": "https://example.com/C0EXAMPLE/1.1",
         "request_id": "key-request", "response": "confirm the key", "next_step": "run staging checks"}]}, session_id=sid))
     assert out["ok"] and out["declared"], out
     stored = so.get_outcome(sid)
@@ -382,7 +382,7 @@ def test_durable_person_lifecycle_through_refresh_and_new_messages(real, tmp_pat
     monkeypatch.setattr(so, '_live_turn', lambda *a: False)
     monkeypatch.setattr(plugin, '_open_linked_cards', lambda *a: [])
     plugin._llm = lambda *a: 'YES'
-    person = {'kind': 'person', 'contact': 'Slack @Eve', 'channel': 'slack',
+    person = {'kind': 'person', 'contact': 'Slack @ExampleOperator', 'channel': 'slack',
               'thread': 'https://example.com/thread/123', 'request_id': 'request-123',
               'response': 'rotate the example key', 'next_step': 'verify example staging'}
     def invoke(args):
@@ -443,7 +443,7 @@ def test_compression_and_mounted_person_api_keep_same_request(real, monkeypatch)
     from hermes_state import SessionDB
     so, plugin = real
     monkeypatch.setattr(plugin, '_open_linked_cards', lambda *a: [])
-    person = {'kind': 'person', 'contact': 'Slack @Eve', 'channel': 'slack',
+    person = {'kind': 'person', 'contact': 'Slack @ExampleOperator', 'channel': 'slack',
               'thread': 'https://example.com/thread/123', 'request_id': 'request-123',
               'response': 'deploy example', 'next_step': 'verify example'}
     assert json.loads(plugin.handle({'kind': 'wait', 'on': [person]}, session_id='chat'))['ok']
@@ -455,14 +455,15 @@ def test_compression_and_mounted_person_api_keep_same_request(real, monkeypatch)
         db.append_message('tip', role='assistant', content=SUMMARY)
     assert plugin.person_provider('tip')['waiting_on'][0]['id'] == wid
     assert not json.loads(plugin.handle({'kind': 'done', 'summary': SUMMARY}, session_id='tip'))['ok']
-    spec = importlib.util.spec_from_file_location('person_api_test', ROOT / 'dashboard/plugin_api.py')
-    assert spec and spec.loader
-    api = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(api)
+    from hermes_cli import web_server_dashboard as dashboard
     app = FastAPI()
-    app.include_router(api.create_router(), prefix='/api/plugins/session-outcome')
+    # Exercise core's real plugin import/router contract, not a hand-mounted factory.
+    assert dashboard._mount_one_plugin_api(app, {
+        'name': 'session-outcome', 'source': 'user',
+        '_dir': str(ROOT / 'dashboard'), '_api_file': 'plugin_api.py',
+    }, {'session-outcome'}, set())
     with TestClient(app) as client:
-        response = client.get('/api/plugins/session-outcome/person-waits', params={'ids': 'chat,tip'})
+        response = client.get('/api/plugins/session-outcome/person-waits', params={'ids': 'chat,tip', 'profile': 'current'})
         assert response.status_code == 200
         assert len(response.json()['records']) == 1
         assert response.json()['records'][0]['thread'] == person['thread']

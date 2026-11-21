@@ -36,7 +36,7 @@ test('person dependency is linked and visible even without card work or with pan
   window.localStorage.setItem('hermes.sessionPanel.collapsed.v1', '[]')
   window.__userSteps = { openAskCount: () => 0 }
   window.__sessionTasks = { snapshot: { stored: 'person-chat', chips: [] }, lineageIds: async s => new Set([s]) }
-  const record = { id: 'person:example', session: 'person-chat', state: 'waiting', contact: 'Slack @Eve',
+  const record = { id: 'person:example', session: 'person-chat', state: 'waiting', contact: 'Slack @ExampleOperator',
     thread: 'https://example.com/thread/123', response: 'deploy example', next_step: 'verify example staging' }
   const paths = []
   window.hermesDesktop = { api: async args => {
@@ -48,8 +48,8 @@ test('person dependency is linked and visible even without card work or with pan
   const link = el().querySelector('[data-person-wait] a')
   assert.ok(link, 'actual person link must render')
   assert.equal(link.href, record.thread)
-  assert.equal(link.textContent, 'Slack @Eve')
-  assert.match(el().textContent, /Waiting on Slack @Eve/)
+  assert.equal(link.textContent, 'Slack @ExampleOperator')
+  assert.match(el().textContent, /Waiting on Slack @ExampleOperator/)
   assert.match(el().textContent, /verify example staging/)
   assert.ok(paths.some(p => p.path.includes('/api/plugins/session-outcome/person-waits?') && p.connectionId === 'C1' && p.profile === 'default'))
   host.state.focusedStoredSessionId.value = 'other-chat'
@@ -61,10 +61,10 @@ test('person dependency is linked and visible even without card work or with pan
 })
 
 test('person reply renders verification rather than completion and unsafe links are inert', async () => {
-  const record = { id: 'person:example', state: 'verifying', contact: 'Slack @Eve',
+  const record = { id: 'person:example', state: 'verifying', contact: 'Slack @ExampleOperator',
     thread: 'https://example.com/reply', response: 'deploy example', next_step: 'verify staging' }
   await show(J.jsx(m.PersonWaitRows, { records: [record] }))
-  assert.match(el().textContent, /Verifying reply from Slack @Eve/)
+  assert.match(el().textContent, /Verifying reply from Slack @ExampleOperator/)
   assert.equal(el().querySelector('a').href, record.thread)
   await show(J.jsx(m.PersonWaitRows, { records: [{ ...record, thread: 'javascript:alert(1)' }] }))
   assert.ok(el().querySelector('a') === null)
