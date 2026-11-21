@@ -104,6 +104,14 @@ say what's running, never what needs the user.
   still alive`. That's a prompt stranded in an old Desktop `serve` that outlived the update. Re-send the user's
   exact text with `cross_session.send` (it runs, unlike the stranded copy), then check for other chats stranded
   by the same hold. A later replacement of that `serve` replays the marker too, so check for double delivery.
+- "I made a chat about X and can't find it": search user-role `messages` (not titles) in every gateway's
+  `state.db`: hub `~/.hermes/state.db` plus `profiles/*/state.db`, then MacBook and mini via `tailnet_exec`
+  (`mbp`, `mini`), last 2–4 days, archived/hidden included. Drop rows starting with `✔ ⏸ ⏳ ❓ [ #` (notices,
+  compaction replays, card prompts) and dedupe on the first 60 chars, or Kanban traffic floods the output
+  past 50k chars; then regex the topic words (and synonyms: "top bar" → strip/lane/pill/header). Also list
+  desktop sessions with no user message (a send that never landed). A user's chat can also be an older chat where
+  they asked a follow-up, so report near-matches by title. No match on any gateway = the prompt never left the app:
+  say so plainly, point at the closest existing chat, and offer the work with a stated default.
 - When a chain waits on a PR whose exact head is green and `CLEAN`, with no changes requested, but its owner card
   is queued, merge it yourself (`gh pr merge --rebase --match-head-commit <head>` via token-broker). Then
   `kanban_comment` each owner card that the merge step is done, so it resumes from the next step.
