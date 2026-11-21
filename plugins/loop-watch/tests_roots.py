@@ -68,9 +68,39 @@ def _probe_dir(home):
 
 def _request(d):
     time.sleep(0.01)
-    req = d / 'request'
-    req.write_bytes(r.COMMAND)
-    req.chmod(0o600)
+    # Publish only complete, private bytes: the probe can unlink request as soon
+    # as it appears, so chmod after publication races with its consumer.
+    fresh = d / 'request.new'
+    fresh.write_bytes(r.COMMAND)
+    fresh.chmod(0o600)
+    os.replace(fresh, d / 'request')
+
+
+def test_request_publication_survives_immediate_consumption(tmp_path, monkeypatch):
+    """The probe may unlink a published request before the writer runs again."""
+    write_bytes, replace = Path.write_bytes, os.replace
+    consumed = []
+
+    def consume(path):
+        path = Path(path)
+        if path.name == 'request':
+            consumed.append((path.read_bytes(), path.stat().st_mode & 0o777))
+            path.unlink()
+
+    def write_and_consume(path, data):
+        result = write_bytes(path, data)
+        consume(path)
+        return result
+
+    def replace_and_consume(src, dst):
+        replace(src, dst)
+        consume(dst)
+
+    monkeypatch.setattr(Path, 'write_bytes', write_and_consume)
+    monkeypatch.setattr(os, 'replace', replace_and_consume)
+    _request(tmp_path)
+    assert consumed == [(r.COMMAND, 0o600)]
+    assert list(tmp_path.iterdir()) == []
 
 
 # --- the scan -------------------------------------------------------------------------------------------
