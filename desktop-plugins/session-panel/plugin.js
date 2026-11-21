@@ -2222,6 +2222,12 @@ export function ingestBundle(connectionId, profile, b, { nowMs = Date.now(), tru
   if (!connectionId || !b?.session) return false
   profile = profile || 'default'
   const scope = routeKey({ connectionId, profile, session: b.session })
+  if (b.model?.version === 1) {
+    modelCache.delete(scope)
+    modelCache.set(scope, b.model)
+    if (modelCache.size > 100) modelCache.delete(modelCache.keys().next().value)
+    modelChanged()
+  }
   tasksBridge()?.ingestFeed?.({ connectionId, profile, session: b.session, lineage: b.lineage, tasks: Array.isArray(b.tasks) ? b.tasks : [], trusted })
   if (Array.isArray(b.done)) {
     const rows = doneRows(b.done)
@@ -2337,10 +2343,18 @@ async function feedCatchUpNow(target, { nowMs = Date.now(), reset = false, full 
   }
   if (!r || r.profile_unsupported || typeof r.epoch !== 'string') return unsupported(r?.profile_unsupported ? `profile ${r.profile}` : 'no epoch')
   const cur = feeds.get(key)
-  // A push for a later revision landed while this request was out: keep it, drop this older answer's bundles.
   if (cur && !cur.unsupported && cur.epoch === r.epoch && cur.feed === r.feed && Number(r.rev) < cur.rev) {
-    cur.sessions = [...new Set([...(cur.sessions || []), ...target.sessions])]
-    return true
+    // A push for a later revision landed while this request was out: keep it, drop this older answer's bundles.
+    if (feedIsLive(cur, nowMs)) {
+      cur.sessions = [...new Set([...(cur.sessions || []), ...target.sessions])]
+      return true
+    }
+    // No pushes reach us and the gateway is behind what we hold: it carried the feed on from an older snapshot (a
+    // restart). Waiting for it to pass our revision could take hours: start over with it instead.
+    if (!reset) {
+      feedLog(`${target.connectionId}/${profile} behind rev=${r.rev} < ${cur.rev}: reset`)
+      return feedCatchUpNow(target, { nowMs, reset: true })
+    }
   }
   const next = { connectionId: target.connectionId, profile, feedProfile: str(r.profile) || profile, feed: r.feed, epoch: r.epoch, rev: Number(r.rev) || 0,
     sessions: [...target.sessions], liveAt: cur?.feed === r.feed && cur?.epoch === r.epoch ? cur.liveAt : 0, at: Date.now() }
@@ -2452,7 +2466,7 @@ export function PersonWaitRows({ records }) {
   }) })
 }
 
-export function Panel() {
+function LegacyPanel() {
   const [personState, setPeople] = useState({ scope: null, records: [] })
   const [tasks, setTasks] = useState(() => (typeof window !== 'undefined' ? window.__sessionTasks?.snapshot : null) || null)
   const [doneState, setDone] = useState(done)
@@ -2704,16 +2718,201 @@ export function Panel() {
   ] })
 }
 
+// ── Hub PanelModel v1: presentation only; legacy parsing stays behind the off switch until P3. ──
+export const HUB_MODEL_SETTING = 'sessionPanel.hubModel'
+const modelCache = new Map() // exact connection/profile/stored-session scope
+const modelSubs = new Set()
+const modelChanged = () => modelSubs.forEach(fn => fn())
+export const cachedModel = route => modelCache.get(routeKey(route)) || null
+export const hubModelEnabled = () => {
+  try { return window.localStorage.getItem(HUB_MODEL_SETTING) === 'true' } catch { return false }
+}
+export function setHubModelEnabled(value) {
+  window.localStorage.setItem(HUB_MODEL_SETTING, value === true ? 'true' : 'false')
+  modelChanged()
+}
+function HubModelSettings() {
+  const [enabled, setEnabled] = useState(hubModelEnabled)
+  return jsxs('label', { style: { display: 'flex', gap: 8, padding: 16 }, children: [
+    jsx('input', { type: 'checkbox', checked: enabled, onChange: e => { setHubModelEnabled(e.target.checked); setEnabled(e.target.checked) } }),
+    'Use hub-computed status panel (sessionPanel.hubModel; experimental, default off)'
+  ] })
+}
+const MODEL_SECTIONS = [
+  ['needs_you', 'Needs you'], ['stuck', 'Stuck'], ['running', 'In progress'],
+  ['waiting', 'Waiting'], ['ready', 'Ready'], ['done', 'Done']
+]
+const modelSmall = { fontSize: 12, lineHeight: 1.5, overflowWrap: 'anywhere' }
+
+/** Pure model -> React tree. No parsing, classification, I/O, clock or ambient state. */
+export function renderModel(model, { onChoose, onAction, decisionStatus = () => null, onCheck } = {}) {
+  if (model?.version !== 1 || !model.header || !model.sections) return null
+  const details = row => row.details?.length > 0 && jsxs('details', { 'data-ask-details': '', style: modelSmall, children: [
+    jsx('summary', { children: 'Details' }),
+    ...row.details.map((text, i) => jsx('div', { style: { whiteSpace: 'pre-wrap', marginTop: 4 }, children: text }, i))
+  ] })
+  return jsxs('section', { 'data-session-panel': '', 'data-hub-model': model.revision, 'aria-label': 'Session status',
+    style: { minWidth: 0, width: '100%', color: 'var(--foreground)', maxHeight: '55vh', overflowY: 'auto', padding: '6px 12px', boxSizing: 'border-box' }, children: [
+    jsxs('header', { style: { ...modelSmall, display: 'flex', gap: 8, flexWrap: 'wrap' }, children: [
+      jsx('strong', { children: 'This session' }),
+      jsx('span', { 'data-session-status': '', children: model.header.state }),
+      ...model.header.pips.map((pip, i) => jsx('span', { 'data-model-pip': pip.section, children: `${pip.count} ${pip.label}` }, i)),
+      // Counts are the hub's values, not row lengths, even if a test deliberately makes them disagree.
+      ...MODEL_SECTIONS.map(([section]) => jsx('span', { 'data-model-count': section, hidden: true, children: model.header.counts[section] }, section))
+    ] }),
+    ...MODEL_SECTIONS.map(([section, label]) => model.sections[section].length > 0 && jsxs('div', { 'data-model-section': section, children: [
+      jsx('h3', { 'data-section': section.replaceAll('_', '-'), style: { fontSize: 12, margin: '10px 0 6px', color: 'var(--muted-foreground)' }, children: `${label} · ${model.header.counts[section]}` }),
+      ...model.sections[section].map(row => {
+        const status = decisionStatus(row)
+        return jsxs('article', { 'data-panel-row': row.key, ...(section === 'needs_you' ? { 'data-ask-row': row.source } : {}),
+          style: { border: '1px solid var(--border)', borderRadius: 8, padding: '8px 10px', marginBottom: 6, minWidth: 0, display: 'grid', gap: 6 }, children: [
+          jsx('strong', { 'data-ask-title': '', style: { fontSize: 13, overflowWrap: 'anywhere' }, children: row.title }),
+          row.detail && jsx('div', { style: modelSmall, children: row.detail }),
+          section === 'needs_you' && jsxs('div', { style: { display: 'grid', gap: 6 }, children: [
+            row.situation && jsx('div', { 'data-ask-situation': '', title: row.situation, style: { ...modelSmall, ...clamp(3) }, children: row.situation }),
+            ...row.options.map(option => jsxs('button', { type: 'button', 'data-choice-letter': option.letter,
+              ...(option.recommended ? { 'data-recommended-row': '' } : {}), disabled: !onChoose || !!status?.locked,
+              'aria-label': `Choose option ${option.letter}: ${option.name}`,
+              onClick: () => onChoose?.(row, option),
+              style: { textAlign: 'left', font: 'inherit', color: 'inherit', border: '1px solid var(--border)', borderRadius: 6, padding: '8px 10px', background: option.recommended ? 'color-mix(in srgb, var(--foreground) 6%, transparent)' : 'transparent', display: 'grid', gridTemplateColumns: '22px minmax(0,1fr)', gap: 8, cursor: 'pointer' }, children: [
+              jsx('span', { 'data-option-badge': '', style: { fontWeight: 700 }, children: option.letter }),
+              jsxs('span', { style: { minWidth: 0 }, children: [
+                jsx('strong', { 'data-option-label': '', children: option.name }),
+                option.recommended && jsx('span', { style: { ...pill('var(--foreground)'), marginLeft: 8 }, children: 'Recommended' }),
+                jsx('span', { 'data-option-detail': '', title: option.detail, style: { display: 'block', ...modelSmall, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', color: 'var(--muted-foreground)' }, children: option.detail }),
+                option.recommended && option.reason && jsx('span', { 'data-option-reason': '', style: { display: 'block', ...modelSmall }, children: `Why: ${option.reason}` })
+              ] })
+            ] }, option.letter)),
+            row.only_you && jsx('div', { 'data-ask-only-you': '', style: modelSmall, children: row.only_you }),
+            row.source === 'card' && !row.request_id && jsx('small', { children: 'Choosing drafts your answer; send it in the chat to decide.' }),
+            status?.text && jsx('div', { role: 'status', style: modelSmall, children: status.text }),
+            status?.locked && onCheck && jsx('button', { type: 'button', onClick: () => onCheck(row), children: 'Check status' })
+          ] }),
+          details(row),
+          ...row.actions.filter(action => action.kind === 'open_card').map((action, i) => jsx('button', { type: 'button', style: askLinkBtn, disabled: !onAction, onClick: () => onAction?.(row, action), children: action.label }, i))
+        ] }, row.key)
+      })
+    ] }, section))
+  ] })
+}
+
+const MODEL_INTENT_PREFIX = 'hermes.sessionPanel.decision.v1:'
+const modelDecisions = new Map()
+const modelDecisionKey = row => JSON.stringify([row.actions.find(a => a.kind === 'decide')?.owner, row.request_id, row.request_revision])
+export function modelDecisionStatus(row) {
+  const key = modelDecisionKey(row)
+  if (modelDecisions.has(key)) return modelDecisions.get(key)
+  try { if (window.localStorage.getItem(MODEL_INTENT_PREFIX + key)) return { locked: true, text: 'Decision outcome unknown — check status before choosing again.' } } catch {}
+  return null
+}
+const sameModelOwner = (a, b) => !!a && !!b && a.gatewayId === b.gatewayId && a.profile === b.profile && a.storedSessionId === b.storedSessionId
+/** Resolve on click only. Never use an ambient gateway for an unverified foreign request. */
+async function modelRequestRoute(action, sourceRoute, call) {
+  const candidates = [sourceRoute.connectionId]
+  try { for (const c of await host.connections?.() || []) if (!candidates.includes(c.id)) candidates.push(c.id) } catch {}
+  for (const connectionId of candidates.filter(Boolean)) {
+    const route = { connectionId, profile: action.owner.profile, session: action.owner.storedSessionId }
+    try {
+      const data = await call(`/api/plugins/user-steps/requests/${encodeURIComponent(action.request_id)}?session=${encodeURIComponent(route.session)}`, route)
+      if (data?.request?.requestId === action.request_id && sameModelOwner(data.request.owner, action.owner)) return { route, request: data.request }
+    } catch {}
+  }
+  throw Error('The exact decision owner is unavailable. No decision was posted.')
+}
+const modelApi = (path, opts) => window.hermesDesktop.api({ path, timeoutMs: 10_000, ...opts })
+export async function chooseModelOption(row, option, sourceRoute, { call = modelApi } = {}) {
+  if (row.source === 'card' && !row.request_id) {
+    if (routeKey(panelRoute()) !== routeKey(sourceRoute)) return
+    await host.composer?.setDraft?.(sourceRoute.session, chooseText(row, option))
+    host.composer?.focus?.(sourceRoute.session)
+    return
+  }
+  const action = row.actions.find(a => a.kind === 'decide')
+  if (!action?.owner || action.request_id !== row.request_id || action.revision !== row.request_revision || !option.choice_id) throw Error('No canonical decision binding')
+  const key = modelDecisionKey(row)
+  if (modelDecisionStatus(row)?.locked) return
+  modelDecisions.set(key, { locked: true, text: 'Checking decision owner…' }); modelChanged()
+  try {
+    const { route, request } = await modelRequestRoute(action, sourceRoute, call)
+    const choice = request.choices?.find(c => c.id === option.choice_id)
+    if (request.revision !== action.revision || request.state !== 'open' || request.resolution || !choice) throw Error('Request changed. Refresh the panel before choosing.')
+    if (['approve', 'answer'].includes(choice.effect) && (!request.scope?.complete || !request.scope.markdown?.trim())) throw Error('The complete scope is not available. No decision posted.')
+    if (['revise'].includes(choice.effect) || choice.id === 'answer-text') throw Error('This choice needs text. Answer from the existing decision queue.')
+    const decision = { session: route.session, expectedRevision: action.revision, choiceId: option.choice_id,
+      ...(choice.effect === 'answer' ? { revisionText: choice.label } : {}), idempotencyKey: globalThis.crypto.randomUUID() }
+    // Retain BEFORE POST. A timeout or reload must not permit a second choice or new key.
+    window.localStorage.setItem(MODEL_INTENT_PREFIX + key, JSON.stringify({ route, owner: action.owner, requestId: action.request_id, decision }))
+    modelDecisions.set(key, { locked: true, text: 'Submitting decision…' }); modelChanged()
+    await call(`/api/plugins/user-steps/requests/${encodeURIComponent(action.request_id)}/decisions`, { ...route, method: 'POST', body: decision })
+    await checkModelDecision(row, { call })
+  } catch (e) {
+    const retained = window.localStorage.getItem(MODEL_INTENT_PREFIX + key)
+    modelDecisions.set(key, { locked: !!retained, text: retained ? `Outcome unknown: ${e.message}. Check status; do not choose again.` : e.message })
+    modelChanged()
+  }
+}
+export async function checkModelDecision(row, { call = modelApi } = {}) {
+  const key = modelDecisionKey(row)
+  const intent = JSON.parse(window.localStorage.getItem(MODEL_INTENT_PREFIX + key) || 'null')
+  if (!intent) return
+  try {
+    const { route, request } = await modelRequestRoute({ request_id: intent.requestId, owner: intent.owner }, intent.route, call)
+    const query = `?session=${encodeURIComponent(route.session)}`
+    const found = await call(`/api/plugins/user-steps/operations${query}&idempotencyKey=${encodeURIComponent(intent.decision.idempotencyKey)}`, route)
+    const id = found?.operation?.operationId || found?.operation?.id
+    if (!id) throw Error('No operation receipt found yet')
+    const data = await call(`/api/plugins/user-steps/operations/${encodeURIComponent(id)}${query}`, route)
+    const op = data?.operation, r = data?.request
+    if (!op || (op.operationId || op.id) !== id || !sameModelOwner(r?.owner, intent.owner) || r.requestId !== intent.requestId || r.revision < intent.decision.expectedRevision ||
+      (op.requestId && op.requestId !== intent.requestId) || (op.owner && !sameModelOwner(op.owner, intent.owner))) throw Error('Invalid decision receipt')
+    const state = op.dispatchState || op.state
+    const confirmed = state === 'delivered' && r.resolution?.operationId === id
+    modelDecisions.set(key, { locked: true, text: confirmed ? 'Decision delivered.' : `Decision recorded; delivery ${state || 'unconfirmed'}. Check status.` })
+    // Keep intent even after confirmation: an old cached model must never offer the choice again.
+    void request
+  } catch (e) { modelDecisions.set(key, { locked: true, text: `Outcome unknown: ${e.message}. Check status.` }) }
+  modelChanged()
+}
+function HubModelPanel() {
+  const [, tick] = useState(0)
+  useValue(host.state.focusedStoredSessionId)
+  useValue(host.state.focusedSessionOwner || host.state.connectionId)
+  useValue(host.state.connectionId)
+  useValue(host.state.profile || host.state.connectionId)
+  const route = panelRoute(), scope = routeKey(route)
+  useEffect(() => { const fn = () => tick(v => v + 1); modelSubs.add(fn); return () => modelSubs.delete(fn) }, [])
+  useEffect(() => { noteRecent(route); feedFocus(route) }, [scope])
+  const model = cachedModel(route)
+  if (!route.session) return null
+  if (!model) return jsx('div', { 'data-hub-model-pending': '', children: 'Hub status model not available yet.' })
+  return renderModel(model, {
+    onChoose: (row, option) => void chooseModelOption(row, option, route),
+    decisionStatus: modelDecisionStatus, onCheck: row => void checkModelDecision(row),
+    onAction: (row, action) => {
+      const t = action.target
+      const connectionId = t.gateway ? tasksBridge()?.connectionForHubGateway?.(t.gateway) : route.connectionId
+      if (!connectionId) { host.notify?.({ kind: 'error', message: 'Card owner connection unavailable.' }); return }
+      void tasksBridge()?.openTaskChip?.({ id: t.id, kind: 'kanban', gatewayId: t.gateway, profile: t.profile, board: t.board, connectionId })
+    }
+  })
+}
+export function Panel() {
+  const [, tick] = useState(0)
+  useEffect(() => { const fn = () => tick(v => v + 1); modelSubs.add(fn); return () => modelSubs.delete(fn) }, [])
+  return hubModelEnabled() ? jsx(HubModelPanel, {}) : jsx(LegacyPanel, {})
+}
+
 export default {
   id: ID,
   name: 'Session Panel',
   register(ctx) {
-    if (typeof window !== 'undefined') window.__sessionPanel = { active: true, version: VERSION, refreshDone, warmRecent, cachedCard, feedVouches, feedIsLive }
+    ctx.registerSettingsPage?.({ id: 'panel', title: 'Session Panel', icon: 'pulse', render: () => jsx(HubModelSettings, {}) })
+    if (typeof window !== 'undefined') window.__sessionPanel = { active: true, version: VERSION, refreshDone, warmRecent, cachedCard, feedVouches, feedIsLive, cachedModel }
     ctx.register({ id: 'panel', area: COMPOSER_AREAS.top, order: -30, render: () => jsx(Panel, {}) })
     // First pass shortly after launch (covers the first switch after a relaunch), then every WARM_TICK_MS.
     const idle = fn => (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function' ? window.requestIdleCallback(fn, { timeout: 5_000 }) : fn())
-    const tick = () => idle(() => void warmRecent())
-    const first = setTimeout(() => idle(() => void warmRecent({ force: true })), 4_000)
+    const tick = () => { if (!hubModelEnabled()) idle(() => void warmRecent()) }
+    const first = setTimeout(() => { if (!hubModelEnabled()) idle(() => void warmRecent({ force: true })) }, 4_000)
     const warmTimer = setInterval(tick, WARM_TICK_MS)
     const subscribe = typeof ctx.onEvent === 'function' ? ctx.onEvent : host?.onEvent
     const offFeed = typeof subscribe === 'function' ? subscribe(FEED_EVENT, onFeedEvent) : null

@@ -2,6 +2,35 @@
 
 The panel displays the current chat's tasks and decisions using the owner-qualified session-tasks and user-steps projections.
 
+## Hub model renderer (P2, opt-in)
+
+Settings → Plugins → Session Panel exposes **Use hub-computed status panel**.
+The Desktop-local boolean `sessionPanel.hubModel` defaults to **off**; switching it
+off immediately restores the legacy panel below. No shared-config or default flip
+is part of P2.
+
+When enabled, `renderModel(model)` paints the pushed PanelModel v1 header and six
+sections without classifying cards, parsing briefs, or reading extra data. Existing
+feed registration/reconnect remains; models cache by connection/profile/stored chat
+(up to 100) and paint synchronously on a switch. The legacy panel component and
+its warming reads are not mounted/run in model mode. Missing models show an explicit
+unavailable message, never an unrelated chat's snapshot.
+
+Question choices use the existing user-steps decisions POST with `choice_id`, the
+exact owner/session/revision and a persisted idempotency key. The owner is verified
+on click before posting; delivery is read back separately. An unknown POST outcome
+locks all options and offers **Check status**, retaining the key across reloads.
+Card asks with no canonical request only draft composer text (nothing is sent);
+P3 removes that transitional branch after widening the mirror. Open card uses the
+existing qualified owner connection mapping. Details are plain text, not executable
+HTML or commands.
+
+`test/hub-model.test.mjs` calls the real Python reducer for public structural
+fixtures. Set `HERMES_PANEL_GOLDENS=/private/path/private-golden-cases.json` to render
+all seven preserved P1 real-data goldens too; never commit those private dumps.
+Schema: [`../../plugins/session-panel/MODEL.md`](../../plugins/session-panel/MODEL.md).
+Native MacBook activation/screenshots and the default flip remain P3/P4 work.
+
 ## Blocked cards and retired decisions
 
 A canonical decision can be dismissed, withdrawn, or resolved while its owner card still reports `blocked`. Deduplicating the decision must not make that card undiscoverable.
@@ -140,7 +169,7 @@ blocked-panel uses them to take a blocked card's detail without reading it again
 
 [daveey 2026-11-20] "precompute the status panel data on the hub ... kept in sync without polling." When a chat's gateway runs this plugin's backend half (`plugins/session-panel`, its README has the contract), the panel's data for every watched chat (the focused chat plus `warmTargets()`, grouped by connection) is computed there and pushed as `plugin.session-panel.changed`:
 
-- **Registration and catch-up.** `feedCatchUp` POSTs the watched chats to `/api/plugins/session-panel/changes` with the last revision it applied: 1 s after load, when focus reaches a chat that gateway does not watch yet (`feedFocus`), on a revision gap, a new epoch (gateway process restarted: full reset; a plugin reload inside the same process resumes the feed's epoch, revisions, bundles and interest at once (on register, else on the next request), vouches for a carried chat again only after recomputing it, and hands a request still on the stopped feed to the resumed one), a batch sent by name only, and every 60 s (`FEED_CATCHUP_MS`). Catch-ups for one connection run one after another; an answer older than a push that landed meanwhile is dropped. A 404 (no backend half; the bridge rejects with `404: …`) or `profile_unsupported` leaves that connection to today's reads and is asked again after 10 min.
+- **Registration and catch-up.** `feedCatchUp` POSTs the watched chats to `/api/plugins/session-panel/changes` with the last revision it applied: 1 s after load, when focus reaches a chat that gateway does not watch yet (`feedFocus`), on a revision gap, a new epoch (gateway process restarted: full reset; a restart of the backend for an update restores the feed from its snapshot (`$HERMES_HOME/session-panel/feed-<role>-<profile>.json`, owner-only, saved at most every 30 s and on stop/exit; restored when at most 15 min old; a process claims the file when its feed starts and the one it replaces then saves no more): the feed id is `<host>:<role>` (the hermes subcommand and, for a Desktop's ssh backend, its slot), not the pid, the epoch is kept and revisions jump 1,000,000 past the snapshot's so they stay above anything the old process still pushes, so clients catch up instead of resetting; restored chats are re-issued (a new revision even when unchanged) and vouched for only after the new process recomputes them; a client that gets no pushes and finds the gateway behind its revision starts over with it; a plugin reload inside the same process resumes the feed's epoch, revisions, bundles and interest at once (on register, else on the next request), vouches for a carried chat again only after recomputing it, and hands a request still on the stopped feed to the resumed one), a batch sent by name only, and every 60 s (`FEED_CATCHUP_MS`). Catch-ups for one connection run one after another; an answer older than a push that landed meanwhile is dropped. A 404 (no backend half; the bridge rejects with `404: …`) or `profile_unsupported` leaves that connection to today's reads and is asked again after 10 min.
 - **Trust comes from pushes only.** A connection is live while pushes or the 20 s heartbeats reach this window (`feedIsLive`, 60 s window: three missed heartbeats). A catch-up answer while the connection is not live is an ordinary cached copy: it prepaints, and the panel still reads for itself. The first push or heartbeat that makes it live triggers one full catch-up, trusted. Every push names the chats it vouches for (`fresh`: held, watched and last computed without a failure on the gateway) and re-stamps only those chats' cards, wakes, Done and session-tasks copy (`confirmFeed`, `touchFeed`), so they stay current with no reads; a chat the gateway dropped or keeps failing on is left to age. When pushes stop (another backend took the sockets, no socket, a stuck feed) the stamps stop and after 60 s everything ages and is read as before. A window shown again re-registers its chats at once (the gateway drops chats nobody re-registers for 15 min).
 - **Pushes.** `onFeedEvent` matches the feed id and the gateway's own name for its profile (from the catch-up answer), applies a batch only when its `prev` is the revision we have, ignores one we already have, and catches up on a gap.
 - **One bundle fills every cache** (`ingestBundle`): session-tasks' per-chat cards and ancestry (`ingestFeed`, republished at once for the focused chat), Done rows, and each chain card's card read, wake and title. A pushed card keeps its record, and its next hop is worked out when read (`cardInfo`), so waits, "10m left" and "overdue" keep counting between pushes.

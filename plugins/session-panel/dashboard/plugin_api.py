@@ -11,6 +11,7 @@ its own reads for that profile.
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -20,6 +21,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import socket
 import sqlite3
 import sys
@@ -398,6 +400,29 @@ class CoreReaders:
         return preserve_origin_obligations(selected, origin, gateway=gateway, profile=profile,
                                            ids=ids, statuses=statuses)
 
+    def panel_stamp(self, session):
+        """Cheap per-session outcome/request invalidation; no board hydration."""
+        c = self.conn(self.state_db())
+        try:
+            row = c.execute('SELECT outcome_json FROM sessions WHERE id=?', (session,)).fetchone() if c else None
+            outcome = row['outcome_json'] if row else None
+        except sqlite3.Error:
+            outcome = None
+        c = self.conn(self.state_db().parent / 'user-steps' / 'actions.sqlite3')
+        try:
+            requests = tuple(tuple(r) for r in c.execute('SELECT id,revision,state,resolution FROM requests WHERE session=? ORDER BY id', (session,))) if c else ()
+        except sqlite3.Error:
+            requests = None
+        return (outcome, requests)
+
+    def panel_inputs(self, session, lineage):
+        path = Path(__file__).resolve().parents[1] / 'inputs.py'
+        spec = importlib.util.spec_from_file_location('_session_panel_inputs', path)
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.read(self, session, lineage)
+
     def linked(self, ids):
         from hermes_cli import kanban_session_activity as ksa
         return _calm(self._session_tasks(list(ids)[:50], tuple(ksa.LISTED_STATUSES)))
@@ -568,9 +593,187 @@ def _request_profile() -> str:
         return 'default'
 
 
-FEED_ID = f'{socket.gethostname()}:{os.getpid()}'
-LAUNCH_PROFILE = _launch_profile()
+_GLOBAL_FLAGS_WITH_VALUE = {'-p', '--profile'}  # hermes flags before the subcommand that take the next argument
 
+
+def _feed_role(argv: Optional[list[str]] = None) -> str:
+    """Which backend of this host this process is, stable across its restarts: the hermes subcommand (`serve`,
+    `dashboard`, ...) and, for a Desktop's ssh-launched backend, that Desktop's slot (the directory of its session
+    token file; the token itself changes per launch). Two Desktops on one hub are two roles."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    sub, i = 'proc', 0
+    while i < len(args):
+        a = args[i]
+        if a in _GLOBAL_FLAGS_WITH_VALUE:
+            i += 2
+            continue
+        if a and not a.startswith('-'):
+            sub = a
+            break
+        i += 1
+    slot = ''
+    for i, a in enumerate(args):
+        if a == '--ssh-session-token-file' and i + 1 < len(args):
+            slot = Path(args[i + 1]).parent.name
+        elif a.startswith('--ssh-session-token-file='):
+            slot = Path(a.split('=', 1)[1]).parent.name
+    return re.sub(r'[^A-Za-z0-9_.-]', '_', f'{sub}-{slot}' if slot else sub)[:80]
+
+
+FEED_ROLE = _feed_role()
+# Stable across restarts (not the pid): clients match pushes by it, so a restarted backend's pushes count at once.
+FEED_ID = f'{socket.gethostname()}:{FEED_ROLE}'
+LAUNCH_PROFILE = _launch_profile()
+SNAPSHOT_EVERY_S = 30.0        # a changed feed is saved at most this often (and on stop / exit)
+RESTORE_MAX_AGE_S = 15 * 60.0  # an older snapshot starts a new revision space instead
+SNAPSHOT_PRUNE_S = 7 * 86400.0  # snapshots of backends not seen for this long are deleted
+WARN_EVERY_S = 600.0            # a repeated snapshot warning is logged at most this often
+EXIT_SAVE_TIMEOUT_S = 5.0       # the exit save waits at most this long for a push in flight
+_CLAIMS = _LOADER.__dict__.setdefault('snapshot_claims', {})  # snapshot path -> this process's claim generation
+_WARNED = _LOADER.__dict__.setdefault('snapshot_warned', {})  # warning key -> when last logged
+
+
+def _warn(key: str, msg: str, *args, exc_info: bool = False) -> None:
+    now = time.monotonic()
+    if now - _WARNED.get(key, -WARN_EVERY_S) >= WARN_EVERY_S:
+        _WARNED[key] = now
+        log.warning(msg, *args, exc_info=exc_info)
+
+
+def _snapshot_path() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+        home = Path(get_hermes_home())
+    except ImportError:  # no core on the path (plugin-only test runs)
+        home = Path(os.environ.get('HERMES_HOME') or Path.home() / '.hermes')
+    safe = re.sub(r'[^A-Za-z0-9_.-]', '_', f'{FEED_ROLE}-{LAUNCH_PROFILE}')
+    return home / 'session-panel' / f'feed-{safe}.json'
+
+
+@contextmanager
+def _locked(path: Path, timeout: float = 5.0):
+    """An exclusive lock on `path`'s sibling .lock file, across processes (no-op where fcntl is missing)."""
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path.with_name(path.name + '.lock'), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f'{path} is locked by another process')
+                time.sleep(0.02)
+        yield
+    finally:
+        os.close(fd)  # closing releases the flock
+
+
+def _read_header(path: Path) -> Optional[dict]:
+    """A snapshot file is two lines: a small JSON header (who wrote it, its claim generation, which revision) and
+    the JSON snapshot."""
+    try:
+        with path.open('r', encoding='utf-8') as fh:
+            head = json.loads(fh.readline())
+        return head if isinstance(head, dict) else None
+    except Exception:
+        return None
+
+
+def _prune(directory: Path, keep: Path) -> None:
+    now = time.time()
+    for p in directory.glob('feed-*.json'):
+        with contextlib.suppress(OSError):
+            if p != keep and now - p.stat().st_mtime > SNAPSHOT_PRUNE_S:
+                p.unlink()  # its .lock stays: a process still saving to it keeps its mutual exclusion
+    for p in directory.glob('.feed-*.tmp'):
+        with contextlib.suppress(OSError):
+            if now - p.stat().st_mtime > 86400:
+                p.unlink()
+
+
+def save_snapshot(f, path: Optional[Path] = None, *, claim: bool = False, timeout: Optional[float] = None) -> bool:
+    """Write `f`'s snapshot atomically (temp file, owner-only, then replace), under a cross-process lock.
+    Ownership is a claim generation in the file, never a clock: a process claims the file when its feed starts
+    (`claim`: the generation goes up by one) and from then on saves only while the file still carries its claim.
+    So the process a restart replaces, still running for a while, never overwrites its successor's snapshot.
+    False when the file has a newer claim, the feed was busy past `timeout`, or the write failed (logged)."""
+    tmp = None
+    try:
+        path = path or _snapshot_path()
+        snap = f.snapshot(timeout=timeout)
+        if snap is None:
+            return False
+        snap = json_safe(snap)
+        with _locked(path):
+            held = _read_header(path) or {}
+            # The generation also lives in the .lock file (never pruned): a deleted snapshot does not reset it, so
+            # an older process cannot re-take the file from a newer one after it vanished.
+            gen_file = path.with_name(path.name + '.lock')
+            try:
+                lock_gen = int(gen_file.read_text(encoding='utf-8').strip() or 0)
+            except (OSError, ValueError):
+                lock_gen = 0
+            held_gen = max(int(held.get('gen') or 0), lock_gen)
+            mine = _CLAIMS.get(str(path))
+            if claim or mine is None:
+                mine = held_gen + 1  # recorded once it is on disk
+            elif held_gen > mine:  # generations only go up, under this lock: a newer process claimed the file
+                _warn(f'claimed:{path}', 'session-panel feed: snapshot not saved; a newer process (claim %s, pid %s) '
+                      'carries this feed on', held_gen, held.get('owner_pid'))
+                return False
+            head = {'version': snap['version'], 'feed': FEED_ID, 'profile': LAUNCH_PROFILE, 'epoch': snap['epoch'],
+                    'rev': snap['rev'], 'saved_at': snap['saved_at'], 'gen': mine, 'owner_pid': os.getpid()}
+            tmp = path.with_name(f'.{path.name}.{os.getpid()}.{threading.get_ident()}.tmp')
+            fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)  # chat and card content: owner only
+            with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+                fh.write(json.dumps(head, separators=(',', ':')) + '\n' + json.dumps(snap, separators=(',', ':')))
+            os.replace(tmp, path)
+            tmp = None
+            if mine > lock_gen:
+                with contextlib.suppress(OSError):
+                    gen_file.write_text(str(mine), encoding='utf-8')
+            # A claim counts once written. A file that vanished (or never got our claim) is simply written again.
+            _CLAIMS[str(path)] = max(mine, _CLAIMS.get(str(path), 0))
+        if claim:
+            _prune(path.parent, path)
+        return True
+    except Exception:
+        _warn(f'save:{path}', 'session-panel feed: snapshot not saved', exc_info=True)
+        if tmp is not None:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+        return False
+
+
+def load_snapshot(path: Optional[Path] = None, *, now: Optional[float] = None) -> Optional[dict]:
+    """This backend's last snapshot when it can be carried on: same feed id, profile and epoch in header and body,
+    at most RESTORE_MAX_AGE_S old. None otherwise (missing, stale, unreadable, another backend's)."""
+    try:
+        path = path or _snapshot_path()
+        head_line, _, body = path.read_text(encoding='utf-8').partition('\n')
+        head, snap = json.loads(head_line), json.loads(body)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        _warn('load', 'session-panel feed: snapshot unreadable; starting a new revision space', exc_info=True)
+        return None
+    now = time.time() if now is None else now
+    if not (isinstance(head, dict) and isinstance(snap, dict)) or head.get('feed') != FEED_ID \
+            or head.get('profile') != LAUNCH_PROFILE or head.get('epoch') != snap.get('epoch'):
+        return None
+    try:
+        if now - float(head.get('saved_at')) > RESTORE_MAX_AGE_S:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return snap
 
 def feed():
     """The process's one feed, started on first use (its thread ticks every TICK_S until stopped)."""
@@ -587,6 +790,19 @@ def feed():
                     except Exception:  # never leave the process without a running feed: start clean (clients reset)
                         log.warning('session-panel feed: resume failed; starting a new revision space', exc_info=True)
                         new = core.Feed(CoreReaders(), emit=_emit)
+                else:  # this process's first feed: carry on the one its previous process saved
+                    snap = load_snapshot()
+                    if snap is not None:
+                        try:
+                            new.restore(snap)
+                            log.info('session-panel feed: restored epoch %s at rev %s (%d bundles)',
+                                     new.epoch, new.rev, len(new.bundles))
+                        except Exception:
+                            log.warning('session-panel feed: snapshot not restored; starting a new revision space',
+                                        exc_info=True)
+                            new = core.Feed(CoreReaders(), emit=_emit)
+                    save_snapshot(new, claim=True)  # claim it now: the process this one replaces no longer saves
+                    _save_at_exit()
                 core.PROCESS_FEED = new
                 threading.Thread(target=_run, args=(core.PROCESS_FEED,), name='session-panel-feed', daemon=True).start()
             return core.PROCESS_FEED
@@ -603,6 +819,8 @@ def stop() -> None:
 
 
 def _run(f) -> None:
+    saved = (None, None)  # (rev, watched chats) last written
+    saved_at = 0.0
     try:
         while not f.stopped.is_set():
             started = time.monotonic()
@@ -610,9 +828,34 @@ def _run(f) -> None:
                 f.tick()
             except Exception:
                 log.warning('session-panel feed tick failed', exc_info=True)
+            with f.lock:
+                state = (f.rev, frozenset(f.interest))
+            if state != saved and time.monotonic() - saved_at >= SNAPSHOT_EVERY_S:
+                saved_at = time.monotonic()
+                if save_snapshot(f):
+                    saved = state
             f.stopped.wait(max(0.2, TICK_S - (time.monotonic() - started)))
     finally:
+        # A plugin reload's successor owns the revision space now (and saves it); a plain stop saves the last state.
+        if getattr(f, '_successor', None) is None:
+            save_snapshot(f)
         f.readers.release()  # retained connections belong to this thread, including plugin unload
+
+
+def _save_at_exit() -> None:
+    """Once per process: at interpreter exit (a restart for an update) save the running feed's last state."""
+    if _LOADER.__dict__.setdefault('atexit_registered', False):
+        return
+    _LOADER.atexit_registered = True
+    import atexit
+    atexit.register(_save_running)
+    _LOADER.atexit_hook = _save_running  # what was registered (tests check it)
+
+
+def _save_running() -> bool:
+    """The exit hook: save the running feed's last state (never hanging the exit on a stuck push)."""
+    f = getattr(sys.modules.get(_FEED_KEY), 'PROCESS_FEED', None)
+    return f is not None and not f.stopped.is_set() and save_snapshot(f, timeout=EXIT_SAVE_TIMEOUT_S)
 
 
 class ChangesBody(BaseModel):

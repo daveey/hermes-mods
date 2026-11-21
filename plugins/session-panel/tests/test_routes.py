@@ -140,8 +140,10 @@ def test_a_changed_feed_py_is_loaded_anew_and_the_running_feed_handed_over_at_on
         assert isinstance(f, new_mod.Feed) and not f.stopped.is_set()
         assert f.epoch == first['epoch'] and f.rev == running.rev
         assert api.feed() is f
-        out = f.changes(['S1'], since=first['rev'], epoch=first['epoch'])
-        assert out['reset'] is False and out['bundles'] == {}
+        held = running.rev  # what a client of the old code holds
+        out = f.changes(['S1'], since=held, epoch=first['epoch'])
+        assert out['reset'] is False, 'no reset across the handover'
+        assert all(f.bundles[s]['rev'] > held for s in out['bundles']), 'only what changed since (its thread may tick)'
     finally:
         _restore(api, old_mod)
 
@@ -191,7 +193,11 @@ def test_a_reload_from_real_older_feed_code_hands_over_with_the_same_epoch(monke
             time.sleep(0.01)
         f = new_mod.PROCESS_FEED  # resumed without any request
         assert isinstance(f, new_mod.Feed) and not f.stopped.is_set()
-        assert f.epoch == first['epoch'] and f.rev == running.rev
+        # The revision space survives. Recomputing the old raw-only bundle now
+        # adds model, so the resumed feed may already have published a new rev.
+        assert f.epoch == first['epoch'] and f.rev >= running.rev
+        if f.rev > running.rev:
+            assert f.bundles['S1']['bundle']['model']['version'] == 1
         sent.clear()
         rev = running.rev
         older.Feed._publish(running, {'S1': running.compute('S1')})  # the old class's own publish, still in flight
@@ -200,3 +206,199 @@ def test_a_reload_from_real_older_feed_code_hands_over_with_the_same_epoch(monke
         assert out['epoch'] == f.epoch and 'S2' in f.interest and 'S2' in out['bundles']
     finally:
         _restore(api, current)
+
+
+def test_feed_role_is_stable_across_launches_and_tells_backends_apart():
+    api = load('_spf_role_api', HERE.parents[1] / 'dashboard' / 'plugin_api.py')
+    tok = '/home/u/.hermes/desktop-ssh/5caca281/b6911608.token'
+    assert api._feed_role(['serve', '--isolated', '--port', '9148', '--ssh-session-token-file', tok]) == 'serve-5caca281'
+    assert api._feed_role(['serve', '--port', '9149', f'--ssh-session-token-file={tok.replace("b69", "c00")}']) == \
+        'serve-5caca281', 'the port and the per-launch token change; the Desktop slot does not'
+    assert api._feed_role(['--profile', 'coder', 'serve', '--ssh-session-token-file', tok]) == 'serve-5caca281'
+    assert api._feed_role(['-p', 'coder', 'dashboard']) == 'dashboard', 'a profile value is not the subcommand'
+    assert api._feed_role(['--profile', 'coder', 'serve', '--port', '9147']) == 'serve'
+    assert api._feed_role(['dashboard', '--port', '9147']) == 'dashboard'
+    assert api._feed_role([]) == 'proc'
+    assert api.FEED_ID.endswith(':' + api.FEED_ROLE) and str(__import__('os').getpid()) not in api.FEED_ID.split(':')
+
+
+def test_snapshot_save_and_load_round_trip_and_refusals(tmp_path, monkeypatch, caplog):
+    import json
+    import os
+    import stat
+    import time
+    api = load('_spf_snap_api', HERE.parents[1] / 'dashboard' / 'plugin_api.py')
+    fakes = load('_spf_snap_fakes', HERE.parent / 'test_feed.py')
+    core = api._load_feed()
+    f = core.Feed(fakes.Readers(), emit=lambda p: None)
+    first = f.changes(['S1'])
+    path = tmp_path / 'feed.json'
+    assert api.save_snapshot(f, path, claim=True)
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600, 'chat content: owner only'
+    snap = api.load_snapshot(path)
+    assert snap['epoch'] == first['epoch'] and snap['rev'] == f.rev and set(snap['bundles']) == {'S1'}
+    head = json.loads(path.read_text().split('\n', 1)[0])
+    mine = head['gen']
+    assert head['feed'] == api.FEED_ID and mine == api._CLAIMS[str(path)]
+    assert api.load_snapshot(path, now=time.time() + api.RESTORE_MAX_AGE_S + 1) is None, 'stale'
+    for key, value in (('feed', 'otherhost:serve'), ('profile', 'other'), ('epoch', 'other')):
+        bad = dict(head, **{key: value})
+        (tmp_path / 'bad.json').write_text(json.dumps(bad) + '\n' + path.read_text().split('\n', 1)[1])
+        assert api.load_snapshot(tmp_path / 'bad.json') is None, key
+    # A newer process claimed the file (its generation is higher): this one never overwrites it, and says so once.
+    body = path.read_text().split('\n', 1)[1]
+    path.write_text(json.dumps(dict(head, gen=mine + 1, owner_pid=1)) + '\n' + body)
+    f.changes(['S2'])
+    caplog.clear()
+    assert api.save_snapshot(f, path) is False and api.save_snapshot(f, path) is False
+    assert set(api.load_snapshot(path)['bundles']) == {'S1'}, 'file unchanged'
+    assert caplog.text.count('a newer process') == 1, 'refusal logged, not repeated'
+    # Claiming again (as a new process would) takes it over with the next generation.
+    assert api.save_snapshot(f, path, claim=True)
+    assert json.loads(path.read_text().split('\n', 1)[0])['gen'] == mine + 2
+    path.write_text('{not json')
+    assert api.load_snapshot(path) is None and 'snapshot unreadable' in caplog.text
+    assert api.load_snapshot(tmp_path / 'missing.json') is None
+    assert not [p for p in tmp_path.iterdir() if p.name.endswith('.tmp')], 'no temp files left behind'
+
+
+def test_snapshot_path_without_core_uses_hermes_home(monkeypatch, tmp_path):
+    import builtins
+    api = load('_spf_nocore_api', HERE.parents[1] / 'dashboard' / 'plugin_api.py')
+    real_import = builtins.__import__
+
+    def no_core(name, *a, **k):
+        if name == 'hermes_constants':
+            raise ImportError(name)
+        return real_import(name, *a, **k)
+    monkeypatch.setattr(builtins, '__import__', no_core)
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    assert api._snapshot_path().parent == tmp_path / 'session-panel'
+
+
+def test_a_snapshot_busy_past_its_timeout_is_skipped_not_waited_for(tmp_path):
+    api = load('_spf_busy_api', HERE.parents[1] / 'dashboard' / 'plugin_api.py')
+    fakes = load('_spf_busy_fakes', HERE.parent / 'test_feed.py')
+    f = api._load_feed().Feed(fakes.Readers(), emit=lambda p: None)
+    with f.compute_lock:  # a push stuck in emit
+        assert api.save_snapshot(f, tmp_path / 'feed.json', timeout=0.05) is False
+    assert not (tmp_path / 'feed.json').exists()
+
+
+def test_old_snapshots_of_other_backends_are_pruned_on_claim(tmp_path):
+    import os
+    import time
+    api = load('_spf_prune_api', HERE.parents[1] / 'dashboard' / 'plugin_api.py')
+    fakes = load('_spf_prune_fakes', HERE.parent / 'test_feed.py')
+    f = api._load_feed().Feed(fakes.Readers(), emit=lambda p: None)
+    old, recent = tmp_path / 'feed-gone-default.json', tmp_path / 'feed-other-default.json'
+    for p in (old, recent):
+        p.write_text('x')
+    week = time.time() - api.SNAPSHOT_PRUNE_S - 60
+    os.utime(old, (week, week))
+    assert api.save_snapshot(f, tmp_path / 'feed-mine-default.json', claim=True)
+    assert not old.exists() and recent.exists()
+
+
+def test_a_new_process_restores_the_saved_feed_claims_it_and_saves_on_stop_and_exit(monkeypatch):
+    import json
+    import time
+    api, original = _hot(monkeypatch, 'restore')
+    monkeypatch.setattr(api, 'SNAPSHOT_EVERY_S', 10_000.0)  # no periodic save: only the paths under test write
+    try:
+        f1 = api.feed()
+        first = f1.changes(['S1', 'S2'])
+        assert api.save_snapshot(f1)
+        old_claim = api._CLAIMS[str(api._snapshot_path())]
+        # A new process: nothing running in it yet (the old one is gone or still finishing).
+        monkeypatch.setattr(f1, '_successor', object())  # keep the stopping thread from saving over the test
+        f1.stopped.set()
+        time.sleep(1.5)  # its thread finishes the tick it may be in
+        saved_rev = json.loads(api._snapshot_path().read_text().split('\n', 1)[0])['rev']
+        original.PROCESS_FEED = None
+        api._CLAIMS.clear()
+        f2 = api.feed()
+        assert f2 is not f1 and f2.epoch == first['epoch']
+        assert f2.rev >= saved_rev + api._load_feed().RESTORE_REV_GAP
+        head = json.loads(api._snapshot_path().read_text().split('\n', 1)[0])
+        assert head['rev'] == f2.rev and head['gen'] == old_claim + 1, 'the new process claimed the snapshot at once'
+        # The old process (its claim superseded) can no longer save.
+        mine = api._CLAIMS[str(api._snapshot_path())]
+        api._CLAIMS[str(api._snapshot_path())] = old_claim
+        assert api.save_snapshot(f1) is False
+        api._CLAIMS[str(api._snapshot_path())] = mine
+        # The exit hook saves the running feed.
+        f2.changes(['S3'])
+        assert api._save_running() and 'S3' in api.load_snapshot()['bundles']
+        # A plain stop saves the last state from the feed thread.
+        f2.changes(['S4'])
+        f2.stopped.set()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and 'S4' not in (api.load_snapshot() or {}).get('bundles', {}):
+            time.sleep(0.05)
+        assert 'S4' in api.load_snapshot()['bundles']
+    finally:
+        _restore(api, original)
+
+
+def test_a_claim_that_never_reached_disk_or_a_vanished_file_does_not_block_later_saves(tmp_path, monkeypatch):
+    import json
+    import os
+    api = load('_spf_claimfail_api', HERE.parents[1] / 'dashboard' / 'plugin_api.py')
+    fakes = load('_spf_claimfail_fakes', HERE.parent / 'test_feed.py')
+    f = api._load_feed().Feed(fakes.Readers(), emit=lambda p: None)
+    f.changes(['S1'])
+    path = tmp_path / 'feed.json'
+    real_replace = os.replace
+    monkeypatch.setattr(api.os, 'replace', lambda *a: (_ for _ in ()).throw(OSError('disk full')))
+    assert api.save_snapshot(f, path, claim=True) is False
+    assert str(path) not in api._CLAIMS, 'a claim counts only once written'
+    monkeypatch.setattr(api.os, 'replace', real_replace)
+    assert api.save_snapshot(f, path) is True
+    path.unlink()  # deleted by hand, or pruned
+    assert api.save_snapshot(f, path) is True, 'a vanished file is written again'
+    assert json.loads(path.read_text().split('\n', 1)[0])['gen'] == api._CLAIMS[str(path)]
+
+
+def test_the_exit_hook_is_registered_once_and_never_waits_past_its_timeout(monkeypatch):
+    import atexit
+    import time
+    api, original = _hot(monkeypatch, 'exit')
+    registered = []
+    monkeypatch.setattr(atexit, 'register', lambda fn: registered.append(fn))
+    monkeypatch.setitem(api._LOADER.__dict__, 'atexit_registered', False)
+    monkeypatch.setattr(api, 'EXIT_SAVE_TIMEOUT_S', 0.05)
+    try:
+        f = api.feed()
+        assert registered == [api._save_running], "the process's first feed registers the exit hook"
+        api._save_at_exit()
+        assert registered == [api._save_running], 'registered once'
+        import threading
+        with f.compute_lock:  # a push stuck in flight
+            result = []
+            t = threading.Thread(target=lambda: result.append(api._save_running()), daemon=True)
+            t.start()
+            t.join(2)
+            assert not t.is_alive() and result == [False], 'the exit is not held up'
+        assert api._save_running() is True
+    finally:
+        _restore(api, original)
+
+
+
+def test_an_older_process_cannot_retake_a_vanished_snapshot_from_a_newer_one(tmp_path):
+    api = load('_spf_vanish_api', HERE.parents[1] / 'dashboard' / 'plugin_api.py')
+    fakes = load('_spf_vanish_fakes', HERE.parent / 'test_feed.py')
+    f = api._load_feed().Feed(fakes.Readers(), emit=lambda p: None)
+    f.changes(['S1'])
+    path = tmp_path / 'feed.json'
+    assert api.save_snapshot(f, path, claim=True)
+    old_claim = api._CLAIMS[str(path)]
+    assert api.save_snapshot(f, path, claim=True)  # a newer process claims (same process stands in for it)
+    newer = api._CLAIMS[str(path)]
+    assert newer == old_claim + 1
+    path.unlink()  # the snapshot vanishes while both are alive
+    api._CLAIMS[str(path)] = old_claim  # the older process saves
+    assert api.save_snapshot(f, path) is False, 'the newer claim survives in the lock file'
+    api._CLAIMS[str(path)] = newer
+    assert api.save_snapshot(f, path) is True
