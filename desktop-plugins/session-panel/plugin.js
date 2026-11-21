@@ -73,6 +73,11 @@ export function splitObservations(raw) {
 }
 
 const span = s => (s < 60 ? `${Math.max(0, Math.floor(s))} s` : s < 3600 ? `${Math.floor(s / 60)} min` : s < 86_400 ? `${Math.floor(s / 3600)} h` : `${Math.floor(s / 86_400)} d`)
+/** " 2 h" when a ready card's ready-since (epoch s, or ms) is known and not in the future, else '': the wait-for-a-worker age. */
+export const readyWait = (since, nowSec) => {
+  const n = Number(since), t = n > 1e11 ? n / 1000 : n
+  return Number.isFinite(t) && t > 0 && nowSec >= t ? ` ${span(nowSec - t)}` : ''
+}
 const qual = o => [obsOwn(o, 'gateway'), obsOwn(o, 'profile')].filter(obsText).join('/')
 
 function identityText(identity) {
@@ -344,7 +349,7 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
       // A parked card has no run to observe: its fresh board lifecycle is the answer, so its unknown execution
       // evidence is not counted (`parked`). The row leads with what it waits on; the source comes last.
       const source = board.source === 'replica' ? 'reported board status' : 'board status'
-      if (c.state === 'ready') { out.ready.push({ ...item(c), parked: true, detail: `ready · waiting for a worker to claim it · ${source}` }); continue }
+      if (c.state === 'ready') { out.ready.push({ ...item(c), parked: true, detail: `ready · waiting${readyWait(c.readySince, now)} for a worker to claim it · ${source}` }); continue }
       if (c.state === 'todo' && !c.waitingOn && !c.upstream?.id) { out.queued.push({ ...item(c), parked: true, detail: `not started · ${source}` }); continue }
       // The upstream leaf follows a published wait only: without one, parkedWaitText already names the upstream.
       const text = parkedWaitText(c, on, nowMs)
@@ -1263,7 +1268,7 @@ export function nextHop(detail, nowMs = Date.now()) {
   }
   if (status === 'scheduled') return parkHop(detail, nowMs)
   if (status === 'todo') return openParent ? { ref: openParent } : { leaf: { kind: 'slot', text: 'not started: waiting to be promoted' } }
-  if (status === 'ready') return { leaf: { kind: 'slot', text: `waiting for a worker${cleanNote(detail?.queue_note || detail?.capacity_note) ? `: ${cleanNote(detail?.queue_note || detail?.capacity_note)}` : ''}` } }
+  if (status === 'ready') return { leaf: { kind: 'slot', text: `waiting${readyWait(t.ready_since, now)} for a worker${cleanNote(detail?.queue_note || detail?.capacity_note) ? `: ${cleanNote(detail?.queue_note || detail?.capacity_note)}` : ''}` } }
   if (status === 'triage') return openParent && str(t.block_kind) === 'dependency' ? { ref: openParent } : { leaf: { kind: 'slot', text: 'needs triage: nobody is working it' } }
   if (status === 'review') {
     const run = (detail?.runs || []).slice(-1)[0]
@@ -1380,7 +1385,7 @@ export function chainFor(i, nowMs = Date.now(), { info = cardInfo, fallback, loc
     const own = mine.get(id)
     if (own) {
       nodes.push({ id, title: own.label, status: str(own.chip?.state), session: '', owner: '', local: true })
-      hop = own.waiting ? firstHop(own.item, nowMs, { info, fallback }) : localHop(own.item)
+      hop = own.waiting ? firstHop(own.item, nowMs, { info, fallback }) : localHop(own.item, nowMs)
       continue
     }
     const r = info(i.chip, id, nowMs, undefined, fallback)
@@ -1401,11 +1406,11 @@ export function chainLocal(waiting, others = []) {
   return map
 }
 /** Where a chain ends on one of this chat's cards that is not waiting: by its own state. */
-function localHop(i) {
+function localHop(i, nowMs = Date.now()) {
   const st = str(i?.chip?.state), m = whereText(i?.chip)
   if (st === 'running') return { leaf: { kind: 'running', text: `running${m ? ` on ${m}` : ''}` } }
   if (st === 'review') return { leaf: { kind: 'running', text: 'in review' } }
-  if (st === 'ready') return { leaf: { kind: 'slot', text: 'waiting for a worker' } }
+  if (st === 'ready') return { leaf: { kind: 'slot', text: `waiting${readyWait(i?.chip?.readySince, nowMs / 1000)} for a worker` } }
   if (st === 'todo') return { leaf: { kind: 'slot', text: 'not started' } }
   if (!OPEN(st)) return { leaf: { kind: 'done', text: `${st} · the waiting card should resume` } }
   return { leaf: { kind: 'unknown', text: st || 'status unknown' } }
