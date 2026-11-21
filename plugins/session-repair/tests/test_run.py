@@ -225,7 +225,7 @@ def test_live_pins_the_repair_chat_once_it_exists(tmp_path):
 
 def test_parse_result_takes_the_last_block():
     text = result_block([{'fingerprint': 'a', 'outcome': 'deferred'}]) + result_block([{'fingerprint': 'a', 'outcome': 'fixed'}])
-    assert run.parse_result(text) == {'a': {'outcome': 'fixed', 'card': None, 'reason': ''}}
+    assert run.parse_result(text) == {'a': {'outcome': 'fixed', 'card': None, 'reason': '', 'commented_on': None}}
     assert run.parse_result('no block') is None and run.parse_result('```session-repair-result\nnot json\n```') is None
 
 
@@ -274,16 +274,6 @@ def test_a_deferral_with_a_reason_is_seen_for_24_hours(tmp_path):
     assert lines(tmp_path / 'session-repair' / 'ledger-live.jsonl')[0]['reason'] == 'no open area card; not blocking'
 
 
-def test_over_budget_comes_back_next_tick_without_an_attempt(tmp_path):
-    fp = finding(1, 'card')['fingerprint']
-    h = outcomes_hermes(lambda f: {'fingerprint': f, 'outcome': 'over_budget'})
-    run.tick(home=tmp_path, scanner=scanner([finding(1, 'card')]), runner=h, now=1000.0, run_mode='live')
-    att = json.loads((tmp_path / 'session-repair' / 'attempts-live.json').read_text())
-    assert fp not in att['fps']
-    run.tick(home=tmp_path, scanner=scanner([finding(1, 'card')]), runner=h, now=1900.0, run_mode='live')
-    assert len(h.chats()) == 2, 'handed over again on the very next tick'
-
-
 def test_unknown_outcomes_and_reasonless_deferrals_are_failed_attempts(tmp_path):
     fp1, fp2 = finding(1)['fingerprint'], finding(2)['fingerprint']
     h = outcomes_hermes(lambda f: {'fingerprint': f, 'outcome': 'done-ish'} if f == fp1
@@ -312,3 +302,30 @@ def test_an_open_fix_card_reaches_the_prompt_so_the_turn_comments(tmp_path):
     run.tick(home=tmp_path, scanner=scanner([f]), runner=FakeHermes(card_outcome='commented'), now=1000.0, run_mode='live')
     prompt = (tmp_path / 'session-repair' / 'last-prompt.md').read_text()
     assert '"open_fix_card": "t_open"' in prompt and 'never a second card' in prompt
+
+
+def test_over_budget_is_a_failed_attempt_unless_the_budget_was_used(tmp_path):
+    fps = [finding(i, 'card') for i in range(2)]
+    h = outcomes_hermes(lambda f: {'fingerprint': f, 'outcome': 'over_budget'})
+    run.tick(home=tmp_path, scanner=scanner(fps), runner=h, now=1000.0, run_mode='live')
+    att = json.loads((tmp_path / 'session-repair' / 'attempts-live.json').read_text())
+    assert set(att['fps']) == {f['fingerprint'] for f in fps}, 'no card created, so "over budget" is not true'
+
+
+def test_over_budget_is_accepted_when_the_turn_filed_its_whole_budget(tmp_path):
+    cards = [finding(i, 'card') for i in range(5)]
+    fix = finding(100)  # a safe fix that did not take; the 5-card budget is already spent on the card findings
+    h = outcomes_hermes(lambda f: {'fingerprint': f, 'outcome': 'over_budget'} if f == fix['fingerprint']
+                        else {'fingerprint': f, 'outcome': 'card', 'card': 't_new'})
+    run.tick(home=tmp_path, scanner=scanner(cards + [fix]), runner=h, now=1000.0, run_mode='live')
+    att = json.loads((tmp_path / 'session-repair' / 'attempts-live.json').read_text())
+    seen = json.loads((tmp_path / 'session-repair' / 'seen-live.json').read_text())
+    assert fix['fingerprint'] not in att['fps'] and fix['fingerprint'] not in seen, 'back next tick, no attempt'
+
+
+def test_only_created_cards_are_recorded_as_filed(tmp_path):
+    h = outcomes_hermes(lambda f: {'fingerprint': f, 'outcome': 'commented', 'card': 't_target',
+                                   'commented_on': 't_target'})
+    run.tick(home=tmp_path, scanner=scanner([finding(1)]), runner=h, now=1000.0, run_mode='live')
+    row = lines(tmp_path / 'session-repair' / 'ledger-live.jsonl')[0]
+    assert row['filed'] is None and row['commented_on'] == 't_target'

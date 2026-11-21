@@ -13,7 +13,8 @@ Modes (`SESSION_REPAIR` env, else `$HERMES_HOME/session-repair/config.json` `{"m
 
 Seen (24 h dedupe per fingerprint) only once handled: shadow marks what it logged; live marks what the turn's result
 block reports handled (`fixed`, `card`, `queued`, `commented`, `moved_on`, `false_positive`, or `deferred` with a
-reason). `over_budget` comes back next tick with no attempt counted; an unknown outcome, a `deferred` with no reason or
+reason). `over_budget` comes back next tick with no attempt counted, only when the turn reported as many cards as
+its budget; an unknown outcome, a `deferred` with no reason or
 a finding the block leaves out is a failed attempt (backoff, `gave_up` after 5). Caps: at most 5 fix cards per run and 20 per 24 h (cards
 the turn reports, including cards for safe fixes that did not take); safe fixes at most 20 per run. A failed turn
 (non-zero exit, no result block) backs off per fingerprint (15 min doubling, at most 6 h) and globally; after 5
@@ -270,7 +271,7 @@ def parse_result(text: str) -> Optional[dict[str, dict]]:
     for r in rows:
         if isinstance(r, dict) and isinstance(r.get('fingerprint'), str):
             out[r['fingerprint']] = {'outcome': str(r.get('outcome') or ''), 'card': r.get('card'),
-                                     'reason': str(r.get('reason') or '')}
+                                     'reason': str(r.get('reason') or ''), 'commented_on': r.get('commented_on')}
     return out
 
 
@@ -400,16 +401,22 @@ def tick(*, home: Optional[Path] = None, scanner: Optional[Callable[[], dict]] =
             return out
         pin_chat(sd, runner, home)
 
+        created = sum(1 for fp in fps if (results.get(fp) or {}).get('outcome') in CARD_OUTCOMES)
+
         def accepted(fp: str) -> Optional[str]:
             r = results.get(fp)
             if r is None or r['outcome'] not in OUTCOMES or (r['outcome'] == 'deferred' and not r['reason'].strip()):
                 return None  # left out, unknown, or a deferral with no reason: a failed attempt
+            if r['outcome'] == 'over_budget' and created < card_budget:
+                return None  # "over budget" while the budget was not used up: a failed attempt
             return r['outcome']
         handled = [fp for fp in fps if accepted(fp) in HANDLED]
         bad = [fp for fp in fps if accepted(fp) is None]
         by_fp = {f['fingerprint']: f for f in take}
-        _append(ledger, [_row(now, m, by_fp[fp], outcome=results[fp]['outcome'], filed=results[fp].get('card'),
-                              reason=results[fp]['reason'] or None) for fp in fps if fp in results])
+        _append(ledger, [_row(now, m, by_fp[fp], outcome=results[fp]['outcome'],
+                              filed=results[fp].get('card') if results[fp]['outcome'] in CARD_OUTCOMES else None,
+                              commented_on=results[fp].get('commented_on'), reason=results[fp]['reason'] or None)
+                         for fp in fps if fp in results])
         dedupe.mark(handled)
         attempts.succeeded(handled)
         if bad:  # the turn ran but did not account for these: retried after backoff, never silently dropped

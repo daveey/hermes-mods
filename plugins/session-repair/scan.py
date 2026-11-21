@@ -170,30 +170,32 @@ class Sources:
     def home(self) -> Path:
         return Path(Path(self.readers.state_db()).parent)
 
-    def tracked_requests(self) -> set[str]:
-        """Card and request ids the repair turns reported (`filed` in ledger-live.jsonl: a card id, or the request id
-        of a queued self-work acknowledgment)."""
-        out: set[str] = set()
+    def tracked(self) -> dict[str, set[str]]:
+        """{fingerprint: card or request ids} the repair turns CREATED (`filed` of ledger-live.jsonl rows whose outcome
+        is `card` or `queued`). A card they only commented on, fixed or judged is not theirs and stays judged."""
+        if getattr(self, '_tracked', None) is not None:
+            return self._tracked
+        out: dict[str, set[str]] = {}
         try:
             for line in (self.home() / 'session-repair' / 'ledger-live.jsonl').read_text().splitlines():
                 try:
-                    filed = json.loads(line).get('filed')
-                except (ValueError, AttributeError):
+                    row = json.loads(line)
+                except ValueError:
                     continue
-                if isinstance(filed, str) and filed:
-                    out.add(filed)
+                filed = row.get('filed') if isinstance(row, dict) else None
+                if row.get('outcome') in ('card', 'queued') and isinstance(filed, str) and filed:
+                    out.setdefault(str(row.get('fingerprint') or ''), set()).add(filed)
         except OSError:
             pass
+        self._tracked = out
         return out
 
-    def ours_ids(self) -> set[str]:
-        """Cards the repair session filed that do not carry its key: cards it reported, and cards the self-work
-        intake created for a request it reported or whose request carried a `session-repair:` key (the intake's
-        receipt names the task)."""
-        if self._ours is not None:
-            return self._ours
-        tracked = self.tracked_requests()
-        out = {t for t in tracked if t.startswith('t_')}
+    def tracked_requests(self) -> set[str]:
+        return set().union(set(), *self.tracked().values())
+
+    def _intake(self) -> list[tuple[str, str, str, Optional[str]]]:
+        """(board, request id, request idempotency key, created task id) of every self-work intake row."""
+        rows = []
         for slug, _p in self.boards():
             c = self.conn(slug)
             try:
@@ -201,19 +203,38 @@ class Sources:
                     continue
                 for rid, req, rec in c.execute('SELECT request_id, request_json, receipt_json FROM self_work_intake'):
                     key = str(((_json(req) or {}).get('args') or {}).get('idempotency_key') or '')
-                    if rid in tracked or key.startswith(REPAIR_KEY_PREFIX):
-                        task = (_json(rec) or {}).get('task_id')
-                        if task:
-                            out.add(str(task))
+                    task = (_json(rec) or {}).get('task_id')
+                    rows.append((slug, str(rid), key, str(task) if task else None))
             except Exception as e:  # noqa: BLE001
                 self.error(f'self_work_intake {slug}', e)
+        return rows
+
+    def ours_ids(self) -> set[str]:
+        """Cards the repair session created that do not carry its key: card ids its turns reported as `card`, and
+        cards the self-work intake created for a request they reported as `queued` or whose request carried a
+        `session-repair:` key (the intake's receipt names the task)."""
+        if self._ours is not None:
+            return self._ours
+        tracked = self.tracked_requests()
+        out = {t for t in tracked if t.startswith('t_')}
+        for _slug, rid, key, task in self._intake():
+            if task and (rid in tracked or key.startswith(REPAIR_KEY_PREFIX)):
+                out.add(task)
         self._ours = out
         return out
 
+    def _open(self, card: str) -> Optional[dict]:
+        for slug, _p in self.boards():
+            task, _c = self.task(slug, card)
+            if task is not None:
+                return {'id': card, 'board': slug, 'status': task.status} if task.status not in TERMINAL else None
+        return None
+
     def open_fix_card(self, fingerprint: str) -> Optional[dict]:
-        """The repair session's open fix card for this fingerprint on any board (its idempotency key starts with
-        `session-repair:<fingerprint>:`, any day bucket, status not done/archived/cancelled), else None. A plain prefix
-        compare, not LIKE: fingerprints hold `_`."""
+        """The repair session's open fix card for this fingerprint (status not done/archived/cancelled), else None:
+        a card whose idempotency key starts with `session-repair:<fingerprint>:` (any day bucket, any board; an
+        index-friendly range, not LIKE: fingerprints hold `_`), or a card the turns reported creating for this
+        fingerprint (directly, or through a queued self-work request the intake turned into a card)."""
         prefix = f'{REPAIR_KEY_PREFIX}{fingerprint}:'
         marks = ','.join('?' * len(TERMINAL))
         for slug, _p in self.boards():
@@ -221,18 +242,28 @@ class Sources:
             if c is None:
                 continue
             try:
-                r = c.execute(f'SELECT id, status FROM tasks WHERE substr(idempotency_key, 1, ?) = ? AND status NOT IN '
-                              f'({marks}) ORDER BY created_at DESC LIMIT 1', (len(prefix), prefix, *TERMINAL)).fetchone()
+                r = c.execute(f'SELECT id, status FROM tasks WHERE idempotency_key >= ? AND idempotency_key < ? AND '
+                              f'status NOT IN ({marks}) ORDER BY created_at DESC LIMIT 1',
+                              (prefix, prefix + chr(0x10FFFF), *TERMINAL)).fetchone()
             except Exception as e:  # noqa: BLE001
                 self.error(f'open_fix_card {slug}', e)
                 continue
             if r is not None:
                 return {'id': str(r[0]), 'board': slug, 'status': r[1]}
+        ids = self.tracked().get(fingerprint) or set()
+        if ids:
+            created = {task: rid for _s, rid, _k, task in self._intake() if task and rid in ids}
+            for card in sorted({i for i in ids if i.startswith('t_')} | set(created)):
+                hit = self._open(card)
+                if hit:
+                    return hit
         return None
 
     def closeout_waking(self, board: str, card: str, premise: Optional[str]) -> Optional[dict]:
-        """chat-closeout's owner wake already handled this (card, premise) in the last 24 h (`owner-wake.db` `fired`:
-        a claim in flight, a chat turn started or a supervisor route), else None. Read-only."""
+        """chat-closeout's owner wake already handled this (card, premise): `owner-wake.db` `fired` says a chat turn
+        `started` or a supervisor was `routed` in the last 24 h, or a claim with no result yet is younger than
+        chat-closeout's CLAIM_TTL_S (a wake in flight). Failed wakes (error, refused, busy) and abandoned claims do not
+        count. Read-only."""
         if not premise:
             return None
         path = os.environ.get('CHAT_CLOSEOUT_OWNER_WAKE_DB')
@@ -254,9 +285,14 @@ class Sources:
         except Exception as e:  # noqa: BLE001
             self.error('owner-wake.db', e)
             return None
-        if r is None or r[1] == 'too_old' or (_num(r[0]) or 0) < self.now - 86400:
+        if r is None:
             return None
-        return {'claimed_at': r[0], 'result': r[1], 'route': r[2]}
+        claimed = _num(r[0]) or 0
+        if r[1] in ('started', 'routed') and claimed >= self.now - 86400:
+            return {'claimed_at': r[0], 'result': r[1], 'route': r[2]}
+        if r[1] is None and claimed >= self.now - closeout_claim_ttl():
+            return {'claimed_at': r[0], 'result': None, 'route': r[2]}  # a wake in flight
+        return None  # too_old, error, refused, busy, or a claim its backend abandoned: nobody was woken
 
     def repair_chats(self) -> set[str]:
         """The Session repair chat(s): never scanned, never a notice target (`chat.json` from run.py, and any
@@ -443,6 +479,18 @@ def _finding(rule: str, card: Card, variant: str, summary: str, evidence: dict, 
                    evidence={**card.base(), **evidence}, fix=fix, variant=variant, area=area)
 
 
+def closeout_claim_ttl() -> float:
+    """chat-closeout's owner-wake CLAIM_TTL_S, read from its source (no import: its module has side effects on
+    load), else 600 s."""
+    import re
+    try:
+        text = (Path(__file__).resolve().parent.parent / 'chat-closeout' / 'owner_wake.py').read_text()
+        m = re.search(r'^CLAIM_TTL_S\s*=\s*([0-9.]+)', text, re.M)
+        return float(m.group(1)) if m else 600.0
+    except OSError:
+        return 600.0
+
+
 def _core_wait():
     """Core's wait vocabulary (kanban_wait_info): park events and agent-owned block kinds, never local copies."""
     from hermes_cli import kanban_wait_info as kwi
@@ -522,7 +570,12 @@ def rule_ready_worker_free(card: Card, src: Sources) -> Optional[Finding]:
                         {'kind': 'card', 'action': 'clear the leftover claim so the dispatcher can pick the card',
                          'commands': [kanban_cmd(card.board, 'show', card.id)],
                          'why': 'releasing a claim on a ready card is not one of the automatic fixes'}, 'hermes')
-    if place.get('skip'):
+    try:  # the queue view carries `skip` on the local lane only; ask core directly for the other lanes
+        skip = place.get('skip') or kds.latest(c, card.id)
+    except Exception as e:  # noqa: BLE001
+        src.error(f'dispatch skip {card.board}/{card.id}', e)
+        skip = None
+    if skip:
         return None  # the current ready episode has a recorded skip: the wait is explained, however old
     if place.get('pool_could_run'):
         if waited < READY_UNCLAIMED_S:

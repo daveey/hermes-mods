@@ -31,11 +31,13 @@ why}, area: hermes|card, fingerprint}`; fingerprint = `<id>:<board>/<card>` (`<i
 one). `area` says who a fix card is for: `hermes` (Hermes machinery misbehaved) or `card` (the card owner's work).
 
 Never judged: the Session repair chat (its `chat.json` id and any chat titled "Session repair"), cards the repair
-session filed (idempotency key `session-repair:...`, card ids its turns reported, and cards the self-work intake
-created for a request they reported or that carried a `session-repair:` key), worker-node copies (core
-`foreign_ids`). A `card` finding with an open fix card for its fingerprint (key prefix `session-repair:<fp>:`, any
-day, any board, not finished) carries `fix.open_fix_card`; the turn comments there. An agent-owned stall that
-chat-closeout's owner wake already handled for the same premise in the last 24 h (`owner-wake.db`) is skipped. Chats over
+session created (idempotency key `session-repair:...`, cards its turns reported as `card`, and cards the self-work
+intake created for a request they reported as `queued` or that carried a `session-repair:` key; a card only
+commented on or fixed stays judged), worker-node copies (core `foreign_ids`). A `card` finding with an open fix card
+for its fingerprint (key range `session-repair:<fp>:`, any day, any board, or a card its turns reported creating for
+it, not finished) carries `fix.open_fix_card`; the turn comments there. An agent-owned stall that chat-closeout's
+owner wake already handled for the same premise (`owner-wake.db`: `started`/`routed` in 24 h, or a live claim younger
+than its `CLAIM_TTL_S`) is skipped. Chats over
 `MAX_CHATS` (1000) are counted in `truncated_chats` and logged.
 
 Only this gateway's live board files are judged. A replica card (another gateway's) is skipped: its owner's scanner
@@ -60,8 +62,10 @@ so a core helper that tried to write raises instead (`tests/test_readonly.py`).
   and ends with a `session-repair-result` block giving each fingerprint's outcome. After the turn the chat is pinned
   and its id written to `chat.json`.
 - Seen only when handled: the result block's `fixed`, `card`, `queued`, `commented`, `moved_on`, `false_positive`,
-  or `deferred` with a `reason` (24 h). `over_budget` returns next tick with no attempt; an unknown outcome, a
-  reasonless `deferred` or a finding left out of the block is a failed attempt.
+  or `deferred` with a `reason` (24 h). `over_budget` returns next tick with no attempt, only when the turn created its
+  whole card budget; an unknown outcome, a reasonless `deferred`, an unearned `over_budget` or a finding left out of
+  the block is a failed attempt. The block's `card` is only a card the turn created (or a queued request id);
+  comments go in `commented_on`.
 - Caps: at most 5 fix cards per run (the prompt's budget includes cards for safe fixes that did not take) and 20 per
   24 h, counted from the cards the turn reports (`ledger-<mode>.jsonl`); safe fixes 20 per run.
 - Failures: a turn that exits non-zero or reports no result block counts one attempt for each finding it was given
@@ -107,7 +111,9 @@ hermes plugins enable session-repair                           # only for the /f
 exists (`--failure-deliver local` is refused: failures must show). For `bot-chat[:profile]` the plan first checks,
 with core's own helpers, that the profile has a canonical Bot Chat authority (`find_canonical_live_owner`) and
 warning notifications on (`warning_notifications_enabled`, as cron's failure delivery does); otherwise it prints
-`refuse:` and exits 2 without installing anything: pass another `--failure-deliver`. Run it again: it
+`refuse:` and exits 2 without installing anything (the other steps print as `would ...`): pass another
+`--failure-deliver`. An existing job whose `failure_deliver` differs is reconciled with `hermes cron edit <id>
+--failure-deliver <target>` after the same check. Run it again: it
 does nothing. To stop: `hermes cron pause <id>` or `--mode off`.
 
 ## Tests

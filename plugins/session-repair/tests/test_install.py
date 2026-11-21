@@ -16,7 +16,8 @@ def test_plan_apply_and_idempotence(tmp_path, monkeypatch, capsys):
     def fake_run(argv, **kw):
         calls.append(argv)
         (tmp_path / 'cron').mkdir(exist_ok=True)
-        (tmp_path / 'cron' / 'jobs.json').write_text(json.dumps({'jobs': [{'name': 'session-repair'}]}))
+        (tmp_path / 'cron' / 'jobs.json').write_text(json.dumps(
+            {'jobs': [{'id': 'j1', 'name': 'session-repair', 'failure_deliver': 'bot-chat'}]}))
         return subprocess.CompletedProcess(argv, 0, stdout='created', stderr='')
     monkeypatch.setattr(inst.subprocess, 'run', fake_run)
     monkeypatch.setattr(inst, 'failure_target_problem', lambda h, target: None)
@@ -92,3 +93,31 @@ def test_plan_refuses_a_bot_chat_that_cannot_show_failures(tmp_path, monkeypatch
     assert 'no canonical Bot Chat' in inst.failure_target_problem(tmp_path, 'bot-chat')
     state['owner'] = ValueError('profile authority is not ready')
     assert 'not ready' in inst.failure_target_problem(tmp_path, 'bot-chat')
+
+
+def test_rerun_reconciles_an_existing_jobs_failure_target(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    (tmp_path / 'cron').mkdir()
+    (tmp_path / 'cron' / 'jobs.json').write_text(json.dumps({'jobs': [{'id': 'j9', 'name': 'session-repair',
+                                                                       'failure_deliver': None}]}))
+    (tmp_path / 'plugins' / 'session-repair').mkdir(parents=True)
+    (tmp_path / 'plugins' / 'session-repair' / 'run.py').write_text('')
+    (tmp_path / 'scripts').mkdir()
+    (tmp_path / 'scripts' / 'session_repair_tick.py').write_text(inst.WRAPPER)
+    (tmp_path / 'session-repair').mkdir()
+    (tmp_path / 'session-repair' / 'config.json').write_text('{"mode": "shadow"}')
+    calls = []
+    monkeypatch.setattr(inst.subprocess, 'run', lambda argv, **kw: calls.append(argv) or
+                        subprocess.CompletedProcess(argv, 0, stdout='ok', stderr=''))
+    monkeypatch.setattr(inst, 'failure_target_problem', lambda h, target: None)
+    assert inst.main(['--apply']) == 0
+    assert calls == [inst.edit_argv('j9', 'bot-chat')] and calls[0][-4:] == ['edit', 'j9', '--failure-deliver', 'bot-chat']
+
+    monkeypatch.setattr(inst, 'failure_target_problem', lambda h, target: 'bot-chat: warnings suppressed')
+    calls.clear()
+    capsys.readouterr()
+    (tmp_path / 'session-repair' / 'config.json').unlink()
+    assert inst.main(['--apply']) == 2 and calls == []
+    out = capsys.readouterr().out
+    assert 'would config: shadow' in out and 'refuse: bot-chat: warnings suppressed' in out
+    assert not (tmp_path / 'session-repair' / 'config.json').exists(), 'refused: nothing written'

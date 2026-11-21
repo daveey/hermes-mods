@@ -13,13 +13,13 @@ it (outcome `moved_on`).
    probe park without running its probe first. Re-read after the fix: if it did not take, treat the finding as
    fix kind `card`.
 2. Fix cards (fix kind `card`, or a safe fix that did not take). At most {{CARD_BUDGET}} cards this run in total,
-   cards for failed safe fixes included; past that, outcome `over_budget` (it comes back next run; the scan already
+   cards for failed safe fixes included; past that (only once you have created that many), outcome `over_budget` (it comes back next run; the scan already
    held back {{DEFERRED}}). Before filing any card:
    - A finding with `fix.open_fix_card` already has an open fix card from an earlier run (any day): add ONE comment
-     there with the new evidence (outcome `commented`, `card` = that id), never a second card.
+     there with the new evidence (outcome `commented`, `commented_on` = that id), never a second card.
    - Look for other open work on the same thing (`kanban_list` on every board: the finding's `idempotency_key` prefix
      `session-repair:<fingerprint>:`, its card id, the pattern id, the subsystem). If a card is open, add ONE comment
-     with the new evidence instead (outcome `commented`), never a second card.
+     with the new evidence instead (outcome `commented`, `commented_on` = that id), never a second card.
    - Every card body names the open or recently decided work on that subsystem (all boards) and why none of it
      replaces this card, plus the finding's evidence, what you checked, and acceptance criteria: the pattern's
      detection no longer matches that card, plus the section's "Done when".
@@ -47,7 +47,7 @@ not shown again for 24 h; `over_budget` comes back next run; a finding you leave
 `deferred` with no reason counts as a failed attempt and is retried with backoff.
 
 ```{{RESULT_FENCE}}
-{"results": [{"fingerprint": "<fingerprint>", "outcome": "fixed|card|queued|commented|moved_on|false_positive|deferred|over_budget", "card": "<card id or request id, or null>", "reason": "<why, required for deferred>"}]}
+{"results": [{"fingerprint": "<fingerprint>", "outcome": "fixed|card|queued|commented|moved_on|false_positive|deferred|over_budget", "card": "<id of a card you CREATED (card) or the request id (queued), else null>", "commented_on": "<card you commented on, else null>", "reason": "<why, required for deferred>"}]}
 ```
 
 Findings (JSON):

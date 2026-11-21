@@ -447,3 +447,69 @@ def test_agent_owned_stall_chat_closeout_already_woke_is_skipped(env, monkeypatc
     c.execute("UPDATE fired SET result = 'started', claimed_at = ?", (env.now - 2 * 86400,))
     c.commit()
     assert one(env, 'BS-unexplained-wait', tid), 'a wake more than 24 h ago did not take: report it'
+
+
+def ledger(env, *rows):
+    (env.home / 'session-repair').mkdir(exist_ok=True)
+    (env.home / 'session-repair' / 'ledger-live.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
+
+
+def test_a_card_the_turn_only_commented_on_or_fixed_stays_judged(env):
+    tid = F.blocked_no_reason(env.conn, env.now)
+    fp = f'BS-unexplained-wait:default/{tid}'
+    ledger(env, {'fingerprint': fp, 'outcome': 'commented', 'filed': tid, 'commented_on': tid},
+           {'fingerprint': fp, 'outcome': 'fixed', 'filed': tid}, {'fingerprint': fp, 'outcome': 'moved_on', 'filed': tid})
+    assert one(env, 'BS-unexplained-wait', tid), 'only cards the turn created (card/queued) are excluded'
+
+
+def test_open_fix_card_found_through_the_ledger_and_the_intake(env):
+    tid = F.blocked_no_reason(env.conn, env.now)
+    fp = f'BS-unexplained-wait:default/{tid}'
+    direct = F.card(env.conn, 'Fix filed without the key', status='ready', session='R9')
+    ledger(env, {'fingerprint': fp, 'outcome': 'card', 'filed': direct})
+    assert one(env, 'BS-unexplained-wait', tid)['fix']['open_fix_card'] == direct
+    env.conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (direct,))
+    via_intake = F.card(env.conn, 'Fix the intake created', status='todo', session='R9')
+    env.conn.execute('CREATE TABLE IF NOT EXISTS self_work_intake (request_id TEXT PRIMARY KEY NOT NULL, '
+                     'request_json TEXT NOT NULL, receipt_json TEXT NOT NULL)')
+    env.conn.execute('INSERT INTO self_work_intake VALUES (?, ?, ?)', ('sw-r2', '{"args": {}}',
+                                                                      json.dumps({'task_id': via_intake})))
+    env.conn.commit()
+    ledger(env, {'fingerprint': fp, 'outcome': 'card', 'filed': direct}, {'fingerprint': fp, 'outcome': 'queued', 'filed': 'sw-r2'})
+    f = one(env, 'BS-unexplained-wait', tid)
+    assert f['fix']['open_fix_card'] == via_intake and env.findings(card=via_intake) == []
+
+
+def owner_wake(env, monkeypatch, card, premise, claimed_at, result):
+    import sqlite3
+    db = env.home / 'owner-wake.db'
+    c = sqlite3.connect(db)
+    c.execute('CREATE TABLE IF NOT EXISTS fired (card_key TEXT NOT NULL, premise TEXT NOT NULL, session_id TEXT NOT NULL,'
+              ' claimed_at REAL NOT NULL, result TEXT, route TEXT, supervisor_task TEXT, PRIMARY KEY (card_key, premise))')
+    c.execute('DELETE FROM fired')
+    c.execute('INSERT INTO fired VALUES (?, ?, ?, ?, ?, NULL, NULL)', (f'default/{card}', premise, F.CHAT, claimed_at, result))
+    c.commit()
+    monkeypatch.setenv('CHAT_CLOSEOUT_OWNER_WAKE_DB', str(db))
+
+
+def test_only_started_routed_or_live_claims_count_as_chat_closeout_handling(env, monkeypatch):
+    tid = F.blocked_agent_owned(env.conn, env.now)
+    premise = env.sources().bundle(F.CHAT)['tasks'][0]['wait']['premise']
+    assert env.scan_mod.closeout_claim_ttl() == 600.0, "read from chat-closeout's owner_wake.py"
+    for result, age, skipped in (('routed', 600, True), (None, 60, True), (None, 1200, False),
+                                 ('error', 60, False), ('refused', 60, False), ('busy', 60, False)):
+        owner_wake(env, monkeypatch, tid, premise, env.now - age, result)
+        hits = env.findings(rule='BS-unexplained-wait', card=tid)
+        assert (hits == []) == skipped, (result, age, hits)
+
+
+def test_machine_lane_skip_recorded_in_the_episode_explains_the_wait(env, monkeypatch):
+    from hermes_cli import kanban_worker_node as kwn
+    from hermes_cli import kanban_queue_position as kqp
+    now_ms = int(env.now * 1000)
+    monkeypatch.setattr(kwn, 'registry', lambda: {'me': 'hub', 'machines': {'w1': {
+        'state': 'active', 'hold': False, 'max_card_runs': 4, 'last_seen': now_ms,
+        'metrics': {'active_card_runs': 0, 'drain_active': 0}}}})
+    monkeypatch.setattr(kqp, 'read', lambda conn, task, board=None: {'lane': 'machine', 'machines': ['w1']})
+    tid = F.ready_with_old_skip(env.conn, env.now)  # the machine-lane place has no `skip`: core's latest() does
+    none(env, 'BS-ready-worker-free', tid)

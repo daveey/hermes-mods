@@ -44,10 +44,12 @@ Every finding carries `id`, `variant`, `card`, `board`, `chat`, `evidence`, `fix
 Fix kinds: `auto` = safe and reversible, the repair chat applies it; `card` = needs real work, file a fix card.
 `area`: `hermes` = Hermes machinery misbehaved (dispatcher, wakes, leases, notices); `card` = the card owner's own
 work. Never judged: the Session repair chat itself (its `chat.json` id and any chat with that title), cards the
-repair session filed (idempotency key `session-repair:...`, a card id the turns reported in `ledger-live.jsonl`, or
-the card the self-work intake created for a request they reported or that carried a `session-repair:` key), and
+repair session created (idempotency key `session-repair:...`, a card the turns reported as outcome `card` in
+`ledger-live.jsonl`, or the card the self-work intake created for a request they reported as `queued` or that carried
+a `session-repair:` key; a card they only commented on, fixed or judged stays judged), and
 worker-node copies (core `foreign_ids`: their home board owns them). A `card` finding whose fingerprint already has
-an open fix card (any board, key prefix `session-repair:<fingerprint>:`, any day, not done/archived/cancelled) carries
+an open fix card (not done/archived/cancelled, any board: idempotency key in the range `session-repair:<fingerprint>:`,
+any day, or a card the turns reported creating for that fingerprint, directly or through the intake) carries
 `fix.open_fix_card`: comment there, never file a second card.
 
 Rules for every fix:
@@ -72,7 +74,8 @@ Rules for every fix:
 - The cron hands at most 5 card findings per run (20 per 24 h, counting every card the turn reports) and 20 safe
   fixes per run; the turn's `session-repair-result` block decides what is marked seen: `fixed`, `card`, `queued`,
   `commented`, `moved_on`, `false_positive` and `deferred` with a `reason` are seen for 24 h; `over_budget` comes back
-  next run; an unknown outcome, a reasonless `deferred` or a finding left out is a failed attempt (backoff, given up
+  next run, but only when that turn created its whole card budget (else it is a failed attempt). The block's `card`
+  is only a card the turn created (or a queued request id); a comment goes in `commented_on`; an unknown outcome, a reasonless `deferred` or a finding left out is a failed attempt (backoff, given up
   after 5 with a `gave_up` ledger row).
 
 ## BS-ready-worker-free: ready, unclaimed, while a worker is free
@@ -89,7 +92,7 @@ finding. Otherwise, by core's queue view (`kanban_queue_position.read`):
 - `pool_could_run` names pool workers, ready > 10 min → `pool_could_run`;
 - `lane: local` and core's `kanban_dispatch_skip.unrecorded()` (ready >= 30 min, `running < limit`, no recorded
   skip) → `free_slot`;
-- `lane: machine`, ready > 10 min: a fitting machine that is active, unheld, not draining, seen within 5 min, with
+- `lane: machine`, ready > 10 min (the skip check reads core's `latest()` directly: the machine-lane queue view carries no `skip`): a fitting machine that is active, unheld, not draining, seen within 5 min, with
   `max_card_runs - active_card_runs` > the cards ranked ahead on its labels → `free_worker`. Free slots are
   allotted oldest waiter first, so 15 ready cards and 3 free slots flag 3 cards, not 15.
 
@@ -133,8 +136,9 @@ waiting card.
 - `blocked`, no `block_kind`, no reason, for >= 30 min → `no_reason`;
 - an agent-owned wait (the session-tasks row's `wait.agent_owned`, else a block kind in core
   `kanban_wait_info.AGENT_BLOCK_KINDS`) older than 2 h → `agent_owned_stalled`, unless chat-closeout's owner wake
-  already handled that card and wait premise in the last 24 h (its `owner-wake.db` `fired` row: claimed, started or
-  routed; `too_old` does not count): that chat was woken for exactly this.
+  already handled that card and wait premise (its `owner-wake.db` `fired` row: `started` or `routed` in the last
+  24 h, or a claim with no result younger than chat-closeout's `CLAIM_TTL_S`; `too_old`, `error`, `refused`, `busy`
+  and abandoned claims do not count): that chat was woken for exactly this.
 
 **Fix card** (area card): `invalid_human_request`: re-file the ask validly (action, why_human, interaction, scope,
 evidence) or clear the block if no person is needed (try-to-unblock). `no_reason`: ask the owning chat; unblock or

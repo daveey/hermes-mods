@@ -12,7 +12,8 @@ What it does:
 2. `$HERMES_HOME/session-repair/config.json` `{"mode": "shadow"}` unless it exists (or `--mode` is given).
 3. `hermes cron create "every 15m" --name session-repair --no-agent --script session_repair_tick.py --deliver local
    --failure-deliver bot-chat --catch-up off`, unless a job named `session-repair` exists (read from
-   `$HERMES_HOME/cron/jobs.json`). Successes stay local (silent); a failed tick (exit 1: the repair turn failed) is
+   `$HERMES_HOME/cron/jobs.json`). An existing job whose `failure_deliver` differs is reconciled with
+   `hermes cron edit <id> --failure-deliver <target>`, after the same target check. Successes stay local (silent); a failed tick (exit 1: the repair turn failed) is
    delivered to the profile's Bot Chat, a visible chat, instead of only `hermes cron list`.
 """
 from __future__ import annotations
@@ -45,14 +46,22 @@ def hermes() -> list[str]:
     return [found] if found else [sys.executable, '-m', 'hermes_cli.main']
 
 
-def job_exists(h: Path) -> bool:
+def find_job(h: Path) -> dict | None:
     try:
         data = json.loads((h / 'cron' / 'jobs.json').read_text())
     except (OSError, ValueError):
-        return False
+        return None
     jobs = data.get('jobs', data) if isinstance(data, dict) else data
     jobs = jobs.values() if isinstance(jobs, dict) else jobs
-    return any(isinstance(j, dict) and j.get('name') == JOB_NAME for j in jobs or [])
+    return next((j for j in jobs or [] if isinstance(j, dict) and j.get('name') == JOB_NAME), None)
+
+
+def job_exists(h: Path) -> bool:
+    return find_job(h) is not None
+
+
+def edit_argv(job_id: str, failure_deliver: str) -> list[str]:
+    return hermes() + ['cron', 'edit', job_id, '--failure-deliver', failure_deliver]
 
 
 def cron_argv(failure_deliver: str = FAILURE_DELIVER) -> list[str]:
@@ -111,12 +120,15 @@ def plan(h: Path, mode: str | None, failure_deliver: str = FAILURE_DELIVER) -> l
         steps.append(('config', mode or 'shadow'))
     if not (h / 'plugins' / 'session-repair' / 'run.py').exists():
         steps.append(('warn', f'{h}/plugins/session-repair is not linked yet: run hermes-sync first'))
-    if not job_exists(h):
+    job = find_job(h)
+    if job is None or job.get('failure_deliver') != failure_deliver:
         problem = failure_target_problem(h, failure_deliver)
         if problem:
             steps.append(('refuse', f'{problem}: pass --failure-deliver <a visible target> (telegram, slack:<chat>, ...)'))
-        else:
+        elif job is None:
             steps.append(('cron', ' '.join(cron_argv(failure_deliver))))
+        else:  # an existing job whose failures go elsewhere (or nowhere): bring it to the checked target
+            steps.append(('reconcile', ' '.join(edit_argv(str(job.get('id')), failure_deliver))))
     return steps
 
 
@@ -136,7 +148,7 @@ def main(argv=None) -> int:
         return 0
     refused = [what for kind, what in steps if kind == 'refuse']
     for kind, what in steps:
-        print(f'{"" if args.apply or kind == "refuse" else "would "}{kind}: {what}')
+        print(f'{"" if kind == "refuse" or (args.apply and not refused) else "would "}{kind}: {what}')
     if refused:
         return 2  # nothing applied: a failure target that cannot show failures is not installed
     for kind, what in steps:
@@ -151,8 +163,10 @@ def main(argv=None) -> int:
             cfg = h / 'session-repair' / 'config.json'
             cfg.parent.mkdir(parents=True, exist_ok=True)
             cfg.write_text(json.dumps({'mode': what}) + '\n')
-        elif kind == 'cron':
-            r = subprocess.run(cron_argv(args.failure_deliver), capture_output=True, text=True)
+        elif kind in ('cron', 'reconcile'):
+            argv = (cron_argv(args.failure_deliver) if kind == 'cron'
+                    else edit_argv(str(find_job(h).get('id')), args.failure_deliver))
+            r = subprocess.run(argv, capture_output=True, text=True)
             print(r.stdout.strip() or r.stderr.strip())
             if r.returncode != 0:
                 return r.returncode
