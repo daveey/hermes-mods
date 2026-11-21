@@ -24,7 +24,9 @@ class Env:
 
     def __init__(self, tmp_path, monkeypatch, *, max_in_progress=4):
         monkeypatch.setenv('HERMES_HOME', str(tmp_path))
-        (tmp_path / 'config.yaml').write_text(f'kanban:\n  max_in_progress: {max_in_progress}\n')
+        (tmp_path / 'config.yaml').write_text(
+            f'kanban:\n  max_in_progress: {max_in_progress}\n'
+            f'  sync:\n    key_file: {tmp_path / "missing-gateway.key"}\n')
         from hermes_cli.kanban_db_connect import connect
         self.home = tmp_path
         self.path = tmp_path / 'kanban.db'

@@ -72,3 +72,21 @@ def test_reads_current_lifecycle_without_writes_and_reuses_runtime_producers(tmp
         assert all(c.total_changes == 0 for c in r.connections)
     finally:
         r.close()
+
+
+def test_unenrolled_gateway_does_not_abort_local_inputs(tmp_path, monkeypatch):
+    class SyncUnavailable(RuntimeError):
+        pass
+
+    def missing_identity():
+        raise SyncUnavailable('kanban sync: no hub key')
+
+    reader = Reader(tmp_path)
+    reader.ksc = types.SimpleNamespace(load_identity=missing_identity)
+    try:
+        result = inputs.read(reader, 'chat', ['chat'])
+        assert result['gateway'] == ''
+        assert result['requests'] == []
+        assert result['rentals'] == []
+    finally:
+        reader.close()

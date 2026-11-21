@@ -40,7 +40,9 @@ def read(reader, session, lineage):
     out['profile'] = profile
     try:
         out['gateway'] = reader.ksc.load_identity().gateway
-    except (AttributeError, OSError, ValueError):
+    except (AttributeError, OSError, ValueError, RuntimeError):
+        # Core raises SyncUnavailable (RuntimeError) on standalone/unenrolled
+        # installs. Missing hub identity must not discard the local panel inputs.
         out['gateway'] = ''
     if store is not None:
         try:
