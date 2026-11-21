@@ -930,7 +930,7 @@ const optionStyle = c => ({ ...actionStyle, display: 'flex', flexDirection: 'col
 const recommendedPill = { padding: '1px 7px', borderRadius: 999, fontSize: 11, fontWeight: 600, color: 'var(--primary-foreground, #fff)', background: 'var(--primary, var(--accent))' }
 const needsText = c => c.effect === 'revise' || (c.effect === 'answer' && c.id === 'answer-text')
 // Missing plan/step = agent work. It never counts as something "for you".
-export const agentPending = r => !!r.resolution || !['choice','input'].includes(r.kind) && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open' || (r.kind === 'approval' && !(r.choices || []).some(c => c.effect === 'approve')))
+export const agentPending = r => !!r.resolution || !r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open' || (r.kind === 'approval' && !(r.choices || []).some(c => c.effect === 'approve'))
 const choiceLabel = (c, choices, kind) => kind !== 'approval' ? (c.authorizes === true ? `✓ ${c.label}` : c.label) : c.effect === 'approve' && choices.filter(x => x.effect === 'approve').length === 1 ? 'Approve' : c.effect === 'revise' && choices.filter(x => x.effect === 'revise').length === 1 ? 'Request changes' : c.label
 const WITHDRAW_REASON = 'Dismissed in Desktop as not needed'
 const WITHDRAW_TITLE = 'Remove this ask without deciding; nothing is sent to the agent'
@@ -1152,15 +1152,15 @@ export function DecisionRow({ request, route, call = api, unavailable = false, p
       if (live.current) setDismissal(outcome)
     }
   }
-  const presentation = cardPresentation(r)
+  const presentation = !r.resolution && agentPending(r) ? null : cardPresentation(r)
   const choices = Array.isArray(r.choices) ? r.choices : []
   const selected = choices.find(c => c.id === (r.resolution?.choiceId || state.operation?.decision?.choiceId || state.decision?.choiceId))
   // Pre-v2 migrations stored one placeholder choice; it is agent work, never a user-facing control.
   const legacyPlaceholder = c => c.id === 'request-context' && c.effect === 'revise' && c.label === 'Request complete action'
   const question = ['choice','input'].includes(r.kind)
-  const approvalPending = !question && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open' || (r.kind === 'approval' && !choices.some(c => c.effect === 'approve')))
-  // A plan-less ask shows no greyed-out Approve and no "request changes": the user can only ask for the plan or hide it.
-  const shown = choices.filter(c => !legacyPlaceholder(c) && (!approvalPending || !['revise','approve'].includes(c.effect)))
+  const approvalPending = agentPending(r)
+  // Repair belongs to the agent, never to a user-facing decision or request-for-plan action.
+  const shown = approvalPending ? [] : choices.filter(c => !legacyPlaceholder(c))
   const approvalReason = approvalPending ? (r.kind === 'approval'
     ? 'The agent asked you to approve this without a plan. Nothing can be approved until it posts one; no permission is granted.'
     : 'The agent asked you to do this without a complete step. Nothing is needed until it posts one; no permission is granted.')
@@ -1225,7 +1225,6 @@ export function DecisionRow({ request, route, call = api, unavailable = false, p
     !locked && !presentation && jsxs('div', { style: flowStyle, children: [
       ...ordered.filter(c => !optionButtons || !explained.includes(c)).map(c => jsx('button', { type: 'button', 'data-decision-effect': c.effect, 'data-primary': primary(c) ? '' : undefined, title: explainOf(c) || c.label, style: needsText(c) ? { ...actionStyle, fontSize: 12.5, borderColor: 'transparent', background: 'transparent', color: 'var(--muted-foreground)' } : primary(c) ? primaryStyle : choiceStyle(c.effect === 'approve' ? 'neutral' : c.effect), disabled: choiceDisabled(c), onClick: e => { if (needsText(c)) { trigger.current = e.currentTarget; setEditing(c) } else void send(c) }, children: c.recommended === true && !needsText(c) && !explained.includes(c) ? `${choiceLabel(c, choices, r.kind)} · Recommended` : choiceLabel(c, choices, r.kind) }, c.id)),
       ...(approvalPending ? [
-        jsx('button', { type: 'button', 'data-ask-plan': '', style: actionStyle, onClick: () => askAgentForPlan(r, route), children: r.kind === 'approval' ? 'Ask agent for the plan' : 'Ask agent for the full step' }, 'ask-plan'),
         // An owner without the withdraw route (older backend) can only hide it on this device.
         !canWithdraw && jsx('button', { type: 'button', 'data-dismiss-request': '', style: actionStyle, title: 'Hide this until the agent posts a new revision', onClick: () => dismissRequest(r), children: 'Dismiss' }, 'dismiss')
       ] : []),
@@ -1254,12 +1253,7 @@ export function dismissRequest(r) {
   canonical = { ...canonical }
   canonicalSubs.forEach(fn => fn(canonical))
 }
-function askAgentForPlan(r, route) {
-  const session = route?.session || focusedId()
-  const what = r.kind === 'approval' ? 'the full plan' : 'the complete step'
-  void host.composer?.setDraft?.(session, `Please post ${what} for "${r.title}" (what exactly you will do, and its limits) so I can decide.\n`)
-  host.composer?.focus?.(session)
-}
+
 function readMinimized() {
   try { const v = JSON.parse(window.localStorage.getItem(MINIMIZED_KEY) || '[]'); return Array.isArray(v) ? v.filter(k => typeof k === 'string') : [] } catch { return [] }
 }
