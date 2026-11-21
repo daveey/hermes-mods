@@ -65,6 +65,9 @@ def board(tmp_path, monkeypatch):
         return real_run(argv, *a, **k)
     monkeypatch.setattr(subprocess, 'run', run)
     api = load()
+    # This legacy fixture monkeypatches source selection and gh in-process.
+    # Dedicated worker parity has its own genuinely configured subprocess fixture.
+    api._projector_enabled = False
     yield api, connect, calls
     if api._observations.cache_info().currsize:
         api._observations().join(30)

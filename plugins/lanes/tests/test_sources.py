@@ -12,24 +12,34 @@ import test_pr_projection as fixtures
 board = fixtures.board
 
 
-def test_owner_status_push_does_not_wait_for_replica(board, tmp_path, monkeypatch):
+from test_projector import actual_board
+
+
+def test_owner_status_push_does_not_wait_for_replica(actual_board, tmp_path, monkeypatch):
     sources = pytest.importorskip('hermes_cli.kanban_lanes_sources')
-    from hermes_cli import kanban_db_sync as sync, kanban_db_connect as kbc, kanban_lanes_cli as cli
-    api, connect, _calls = board
-    fleet_path = tmp_path / 'fleet.db'
-    with contextlib.closing(kbc.connect(fleet_path)) as fleet:
-        sync.apply_sync_schema_steps(fleet)
-        fleet.execute("INSERT INTO tasks(id,title,status,created_at,tenant,sync_version) VALUES('t_pr','old','ready',100,'work',1)")
+    from hermes_cli import kanban_db_connect as kbc
+    api, config = actual_board
+    from pathlib import Path
+    fleet_path = Path(config['fleet'])
+    @contextlib.contextmanager
+    def connect():
+        with contextlib.closing(kbc.connect(Path(config['local']))) as conn:
+            yield conn
+    # Genuine configured primary mode: the production child cannot inherit a
+    # monkeypatched board_mode or replica selector from this test process.
     with connect() as conn:
-        sync.apply_sync_schema_steps(conn)
-        conn.execute("UPDATE tasks SET status='running',sync_version=1 WHERE id='t_pr'")
+        conn.execute("DELETE FROM tasks WHERE id='t_fixture'")
+        conn.execute("INSERT INTO tasks(id,title,status,created_at,tenant,sync_version) VALUES('t_pr','fixture','running',100,'work',1)")
         conn.execute("INSERT INTO tasks(id,title,status,created_at,tenant) VALUES('unrelated','fixture','archived',100,'work')")
         conn.execute('BEGIN')
         conn.executemany("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES('t_pr','heartbeat','{}',100)",
                          [()] * 40000)
+        conn.execute('DELETE FROM kanban_sync_outbox')  # historical events were already acknowledged
         conn.commit()
-    monkeypatch.setattr(sync, 'board_mode', lambda c: 'primary')
-    monkeypatch.setattr(cli, '_fleet', lambda *a, **kw: kbc.connect(fleet_path))
+    with contextlib.closing(kbc.connect(fleet_path)) as fleet:
+        fleet.execute("DELETE FROM tasks WHERE id='t_fixture'")
+        fleet.execute("INSERT INTO tasks(id,title,status,created_at,tenant,sync_version) VALUES('t_pr','fixture','ready',100,'work',1)")
+        fleet.commit()
     monkeypatch.setattr(api, '_ws_upgrade_authorized', lambda ws: True)
     # Deliberately equal revision with a lagging status: local owns equal rows.
     view = api.lane_view(6, '6h', True)

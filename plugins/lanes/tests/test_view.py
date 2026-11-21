@@ -9,6 +9,9 @@ def load():
     spec = importlib.util.spec_from_file_location('lanes_view_api', Path(__file__).parents[1] / 'dashboard/plugin_api.py')
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    # These unit harnesses inject projection/cursor functions in this process.
+    # Actual child execution is exercised separately in test_projector.py.
+    mod._projector_enabled = False
     return mod
 
 

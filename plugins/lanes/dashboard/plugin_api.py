@@ -237,27 +237,32 @@ def _lane_view(hours, window, expanded):
 def _current_view(mods, hours, window, expanded):
     """One source selection under short read snapshots, for strip AND panel."""
     from hermes_cli.kanban_lanes_sources import read_view
-    kbc, _, cli = mods
+    kbc = mods[0]
     try:
         with kbc.connect_closing() as conn, read_view(conn) as evidence:
-            snap = cli.snapshot(conn, hours=hours, evidence=evidence)
-            raw = None
-            if snap.get('configured'):  # collapsed too: the strip's all-lanes status counts need card reasons
-                try:
-                    flow_mods = flow_core()
-                    if flow_mods is None:
-                        raise RuntimeError('this Hermes core has no lanes flow support yet')
-                    flow_mod = flow_mods[1]
-                    contexts = _pr_contexts(evidence.conn, flow_mod, evidence=evidence)
-                    with _observer_init_lock:
-                        reader = _observations().reader(contexts)
-                    raw = flow_mod.snapshot(evidence.conn, window=window, reader=reader, evidence=evidence)
-                    raw['configured'] = bool(raw.get('lanes'))
-                except Exception as exc:
-                    raw = {'configured': False, 'reason': f'lanes flow is unavailable: {exc}'}
-            return _view_module().project(snap, raw, expanded)
+            return _project_evidence(mods, conn, evidence, hours, window, expanded)
     except Exception as exc:
         return _view_module().project({'configured': False, 'reason': f'lanes view is unavailable: {exc}'}, None, expanded)
+
+
+def _project_evidence(mods, conn, evidence, hours, window, expanded):
+    """Same hub-computed projection for owned in-process or borrowed RPC readers."""
+    snap = mods[2].snapshot(conn, hours=hours, evidence=evidence)
+    raw = None
+    if snap.get('configured'):
+        try:
+            flow_mods = flow_core()
+            if flow_mods is None:
+                raise RuntimeError('this Hermes core has no lanes flow support yet')
+            flow_mod = flow_mods[1]
+            contexts = _pr_contexts(evidence.conn, flow_mod, evidence=evidence)
+            with _observer_init_lock:
+                reader = _observations().reader(contexts)
+            raw = flow_mod.snapshot(evidence.conn, window=window, reader=reader, evidence=evidence)
+            raw['configured'] = bool(raw.get('lanes'))
+        except Exception as exc:
+            raw = {'configured': False, 'reason': f'lanes flow is unavailable: {exc}'}
+    return _view_module().project(snap, raw, expanded)
 
 
 def _need_core():
@@ -411,8 +416,6 @@ def change_cursor():
 @router.websocket('/v1/lanes/stream')
 async def stream_lanes(ws: WebSocket):
     global _active_streams
-    import hashlib
-    import json
     if not _ws_upgrade_authorized(ws):
         await ws.close(code=1008)
         return
@@ -425,76 +428,47 @@ async def stream_lanes(ws: WebSocket):
         return
     await ws.accept()
     debug = ws.query_params.get('debug', 'false').lower() == 'true'
-    last_hash = None
-    version = 0
-    last_project_end = 0.0
-    async def send_view(timing=None):
-        nonlocal last_hash, version, last_project_end
-        started = time.time()
-        view = await asyncio.to_thread(lane_view, *params)
-        finished = time.time()
-        last_project_end = time.monotonic()
-        echo = dict(zip(('hours', 'window', 'expanded'), params))
-        digest = hashlib.sha256(json.dumps({'view': view, 'params': echo}, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-        if digest != last_hash:
-            version += 1
-            frame = {'version': version, 'view': view, 'params': echo}
-            if debug:
-                # Wall-clock epoch seconds per stage, for this change only; never part of the view digest.
-                frame['timing'] = {**(timing or {}), 'project_start': started, 'project_end': finished, 'sent': time.time()}
-                frame['load'] = {'pid': os.getpid(), 'stream_viewers': _active_streams}
-            await ws.send_json(frame)
-            last_hash = digest
     _active_streams += 1
     try:
-        cursor = await asyncio.to_thread(change_cursor)
-        _refresh_cursor(cursor)
-        await send_view()
-        last_heartbeat = time.monotonic()
-        pending_timing = None
-        while True:
-            # wait_for cancels and joins receive on timeout. No detached poll/receive tasks.
-            # Poll through the short cooldown: retain the first detection, coalesce revisions,
-            # and project the latest cursor when eligible. Quiet changes have no debounce.
-            try:
-                message = await asyncio.wait_for(ws.receive(), WATCH_S)
-                if message['type'] == 'websocket.disconnect':
-                    return
-                if message.get('text'):
-                    try:
-                        update = json.loads(message['text'])
-                        new = (update.get('hours', params[0]), update.get('window', params[1]), update.get('expanded', params[2]))
-                        _validate_view(*new)
-                    except (ValueError, AttributeError, HTTPException):
-                        await ws.close(code=1008)
-                        return
-                    params = new
-                    await send_view()
-            except TimeoutError:
-                pass
-            polled = time.time()
-            current = await asyncio.to_thread(change_cursor)
-            if current != cursor:
-                if pending_timing is None:
-                    pending_timing = {'cursor_poll': polled, 'detected': time.time()}
-                if time.monotonic() - last_project_end >= MIN_PROJECT_GAP_S:
-                    cursor = current
-                    _refresh_cursor(cursor)
-                    await send_view({**pending_timing, 'released': time.time()})
-                    pending_timing = None
-            else:
-                pending_timing = None
-            if time.monotonic() - last_heartbeat >= HEARTBEAT_S:
-                await ws.send_json({'type': 'heartbeat', 'version': version})
-                last_heartbeat = time.monotonic()
+        # Keep the census live, rather than freezing it in the helper namespace.
+        class Context:
+            def __getattr__(self, name):
+                return globals()[name]
+        await _stream_engine.run(Context(), ws, params, debug)
     except WebSocketDisconnect:
         return
-    except (OSError, RuntimeError) as exc:
-        import logging
-        logging.getLogger(__name__).warning('Lanes stream closed: %s', exc)
+    except (OSError, RuntimeError, TimeoutError):
         try:
-            await ws.close(code=1011)
+            await ws.close(code=1013)
         except (RuntimeError, WebSocketDisconnect):
             pass
     finally:
         _active_streams -= 1
+
+
+# Capture once at router load, never recalculate expected hashes at child spawn.
+# Core and common projection stay loaded; lazily file-loaded helpers are fenced
+# against these same captured bytes before child or fallback work starts.
+import importlib.util as _import_util
+from pathlib import Path as _Path
+_spec = _import_util.spec_from_file_location('lanes_rpc_identity', _Path(__file__).with_name('projector_identity.py'))
+assert _spec is not None and _spec.loader is not None
+_identity = _import_util.module_from_spec(_spec)
+_spec.loader.exec_module(_identity)
+_loaded_identity = _identity.capture(_Path(__file__).parent)
+_rpc_client = _identity.load(_Path(__file__).with_name('projector_client.py'), 'lanes_rpc_client')
+_stream_engine = _identity.load(_Path(__file__).with_name('stream_engine.py'), 'lanes_stream_engine')
+_compat_fallback = _rpc_client.Fallback()
+_projector_instance = None
+_projector_init = threading.Lock()
+_projector_enabled = core() is not None
+
+
+def _projector():
+    global _projector_instance
+    with _projector_init:
+        if _projector_instance is None:
+            from types import SimpleNamespace
+            _projector_instance = _rpc_client.Supervisor(
+                SimpleNamespace(core=core, _lane_view=_lane_view, MIN_PROJECT_GAP_S=MIN_PROJECT_GAP_S), _loaded_identity)
+        return _projector_instance

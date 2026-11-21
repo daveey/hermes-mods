@@ -1,0 +1,406 @@
+"""Private-pipe projection RPC boundaries, real readers and process lifecycle."""
+import concurrent.futures
+import contextlib
+import importlib.util
+import json
+import os
+import sqlite3
+import time
+from pathlib import Path
+
+import pytest
+
+DASH = Path(__file__).parents[1] / 'dashboard'
+
+
+def module(name):
+    spec = importlib.util.spec_from_file_location('probe_' + name, DASH / (name + '.py'))
+    obj = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(obj)
+    return obj
+
+
+def test_cursor_500_urls_is_fixed_size_command():
+    rpc = module('projector_protocol')
+    cursor = [1, tuple('https://github.com/example/repo/pull/' + str(i) for i in range(500))]
+    cmd = rpc.project_command('session', 1, (6., '6h', True), 2, cursor, 'primary')
+    assert len(rpc.encode(cmd, rpc.COMMAND_CAP)) < 1024
+    assert 'pull/' not in json.dumps(cmd)
+    assert len(cmd['revision'][1]) == 64
+    assert cmd == json.loads(rpc.encode(cmd, rpc.COMMAND_CAP))
+
+
+def test_protocol_rejects_nonfinite_oversize_and_bad_params():
+    rpc = module('projector_protocol')
+    with pytest.raises(ValueError):
+        rpc.encode({'v': float('nan')}, rpc.COMMAND_CAP)
+    with pytest.raises(ValueError):
+        rpc.encode({'v': 'x' * rpc.COMMAND_CAP}, rpc.COMMAND_CAP)
+    for params in ([6, '6h', 1], [float('inf'), '6h', True], [2, '6h', True]):
+        with pytest.raises(ValueError):
+            rpc.project_command('s', 1, params, 0, [], 'off')
+
+
+def test_borrowed_reader_reopens_rebuilt_file_and_never_writes(tmp_path):
+    pytest.importorskip('hermes_cli.kanban_lockguard')
+    worker = module('projector')
+    path = tmp_path / 'source.db'
+    def seed(value):
+        with contextlib.closing(sqlite3.connect(path)) as db:
+            db.execute('CREATE TABLE value(v)')
+            db.execute('INSERT INTO value VALUES(?)', (value,))
+            db.commit()
+    seed(3)
+    with worker.readers(str(path), None, 'off') as (db, fleet):
+        assert fleet is None
+        assert db.execute('SELECT v FROM value').fetchone()[0] == 3
+        with pytest.raises(sqlite3.OperationalError):
+            db.execute('INSERT INTO value VALUES(4)')
+    path.unlink()
+    seed(5)
+    with worker.readers(str(path), None, 'off') as (db, _):
+        assert db.execute('SELECT v FROM value').fetchone()[0] == 5
+    with pytest.raises(Exception):
+        with worker.readers(str(path), str(tmp_path / 'missing.db'), 'off'):
+            pass
+
+
+def test_fallback_holds_single_slot_until_actual_completion():
+    import threading
+    client = module('projector_client')
+    slot = client.Fallback()
+    gate = threading.Event()
+    one = slot.submit(('key', 1), lambda: gate.wait(5))
+    assert slot.submit(('key', 1), lambda: None) is one
+    with pytest.raises(client.Unavailable):
+        slot.submit(('other', 1), lambda: None)
+    # A cancelled waiter cannot release capacity held by synchronous code.
+    assert not one.cancel()
+    with pytest.raises(client.Unavailable):
+        slot.submit(('other', 2), lambda: None)
+    gate.set()
+    assert one.result(2)
+    assert slot.submit(('next', 2), lambda: 'fresh').result(2) == 'fresh'
+
+
+@pytest.fixture
+def actual_board(tmp_path, monkeypatch):
+    pytest.importorskip('hermes_cli.kanban_lanes_sources')
+    from hermes_cli import kanban_db_connect as kbc, kanban_db_sync as sync
+    import hermes_constants
+    home = tmp_path / 'home'
+    home.mkdir()
+    for key in ('HERMES_HOME', 'HERMES_KANBAN_HOME'):
+        monkeypatch.setenv(key, str(home))
+    for key in ('HERMES_KANBAN_DB', 'HERMES_KANBAN_BOARD'):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(hermes_constants, 'get_default_hermes_root', lambda: home)
+    (home / 'config.yaml').write_text(json.dumps({'kanban': {
+        'sync': {'enabled': True},
+        'admission': {'lanes': {'work': {'share': 1}}, 'lane_default': 'work'}}}))
+    local, fleet = home / 'kanban.db', home / 'kanban' / 'sync-shadow' / 'default.db'
+    fleet.parent.mkdir(parents=True)
+    for path, status in ((local, 'running'), (fleet, 'ready')):
+        with contextlib.closing(kbc.connect(path)) as db:
+            db.execute("UPDATE kanban_sync_state SET mode='primary'")
+            db.execute("INSERT INTO tasks(id,title,status,created_at,tenant,sync_version) VALUES('t_fixture','fixture',?,100,'work',1)", (status,))
+            db.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES('t_fixture','created','{}',100)")
+            db.commit()
+    api = module('plugin_api')
+    config = {'local': str(local), 'fleet': str(fleet), 'mode': 'primary',
+              'home': str(home), 'identity': api._loaded_identity}
+    yield api, config
+    if api._projector_instance:
+        api._projector_instance.close()
+
+
+def start_process(api, config, clock=None, prefix='', directory=DASH):
+    import hermes_cli
+    from hermes_cli._launchers import runtime_command
+    root = Path(hermes_cli.__file__).resolve().parent.parent
+    code = (f'import time; time.time = lambda: {clock!r}; ' if clock else '')
+    code += prefix
+    code += f"runpy.run_path({str(directory / 'projector.py')!r}, run_name='__main__')"
+    command = runtime_command(root, code=code, home=config['home'])
+    return api._rpc_client.Process(config, command)
+
+
+def project(api, process, config, generation=1):
+    command = api._rpc_client.rpc.project_command(process.session, 0, (6., '6h', True), generation, [generation], config['mode'])
+    return process.request(command, 10)
+
+
+def test_managed_subprocess_primary_overlay_parity_and_source_rebuild(actual_board, monkeypatch):
+    from hermes_cli import kanban_lanes_sources as sources, kanban_db_connect as kbc
+    api, config = actual_board
+    fixed = 1800000000.
+    child = start_process(api, config, fixed)
+    try:
+        monkeypatch.setattr(time, 'time', lambda: fixed)
+        worker = module('projector')
+        for index, status in enumerate(('running', 'scheduled', 'archived', 'ready')):
+            with contextlib.closing(kbc.connect(Path(config['local']))) as db:
+                db.execute('UPDATE tasks SET status=?', (status,))
+                db.commit()
+            with worker.readers(config['local'], config['fleet'], 'primary') as (local, fleet):
+                expected = api._project_evidence(api.core(), local, sources.presentation(local, fleet), 6., '6h', True)
+                before = local.execute("SELECT sql FROM sqlite_master ORDER BY name").fetchall()
+            result = project(api, child, config, index)
+            assert result['projector_pid'] != os.getpid()
+            assert json.dumps(result['view'], sort_keys=True) == json.dumps(expected, sort_keys=True)
+            assert result['view']['totals']['open'] == (0 if status == 'archived' else 1)
+            assert result['view']['totals']['running'] == (1 if status == 'running' else 0)
+            with worker.readers(config['local'], config['fleet'], 'primary') as (local, _):
+                assert local.execute("SELECT sql FROM sqlite_master ORDER BY name").fetchall() == before
+        # Replace the fleet at the same pathname BETWEEN JOBS; no retained handle.
+        replacement = Path(config['fleet']).with_name('replacement.db')
+        with contextlib.closing(kbc.connect(replacement)) as db:
+            db.execute("INSERT INTO tasks(id,title,status,created_at,tenant,sync_version) VALUES('new','new','ready',100,'work',1)")
+            db.commit()
+            db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        replacement.replace(config['fleet'])
+        result = project(api, child, config, 10)
+        assert result['view']['totals']['open'] == 2
+        assert child.request({'op': 'observation_cursor'}, 1)
+    finally:
+        child.close()
+        assert child.proc.poll() is not None
+
+
+def test_child_mode_mismatch_and_identity_mismatch_fail_closed(actual_board):
+    api, config = actual_board
+    child = start_process(api, config)
+    try:
+        with pytest.raises(api._rpc_client.Unavailable):
+            project(api, child, config | {'mode': 'shadow'})
+    finally:
+        child.close()
+    bad = dict(config['identity'])
+    bad[str(DASH / 'view.py')] = '0' * 64
+    with pytest.raises(api._rpc_client.Unavailable):
+        start_process(api, config | {'identity': bad})
+
+
+def test_result_fences_session_revision_params_and_nonfinite():
+    rpc = module('projector_protocol')
+    cmd = rpc.project_command('s', 1, (6., '6h', True), 1, [], 'off')
+    reply = cmd | {'op': 'result', 'view': {'configured': False}, 'projector_pid': 2,
+                   'timing': {'project_start': 1., 'project_end': 2.}}
+    assert rpc.validate_result(reply, cmd) == reply
+    for delta in ({'session': 'old'}, {'revision': [0, '0' * 64]}, {'params': [24., '24h', True]},
+                  {'view': []}, {'projector_pid': None}, {'timing': {'project_start': 1., 'project_end': float('nan')}}):
+        with pytest.raises(ValueError):
+            rpc.validate_result(reply | delta, cmd)
+
+
+def test_real_stream_auth_shared_child_and_archive_push(actual_board, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from hermes_cli import kanban_db_connect as kbc
+    from starlette.websockets import WebSocketDisconnect
+    api, config = actual_board
+    app = FastAPI()
+    app.include_router(api.router)
+    monkeypatch.setattr(api, '_ws_upgrade_authorized', lambda ws: False)
+    with TestClient(app) as client:
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect('/v1/lanes/stream'):
+                pass
+        assert api._projector_instance is None
+        monkeypatch.setattr(api, '_ws_upgrade_authorized', lambda ws: True)
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect('/v1/lanes/stream?hours=2'):
+                pass
+        assert api._projector_instance is None
+        with client.websocket_connect('/v1/lanes/stream?expanded=true&debug=true') as one:
+            initial = one.receive_json()
+            assert initial['view']['totals']['running'] == 1
+            assert initial['projector']['mode'] == 'projector', initial
+            pid = initial['projector']['projector_pid']
+            with client.websocket_connect('/v1/lanes/stream?expanded=true&debug=true') as two:
+                assert two.receive_json()['projector']['projector_pid'] == pid
+                changed = time.monotonic()
+                with contextlib.closing(kbc.connect(Path(config['local']))) as db:
+                    db.execute("UPDATE tasks SET status='archived'")
+                    db.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES('t_fixture','archived','{}',100)")
+                    db.commit()
+                for socket in (one, two):
+                    frame = socket.receive_json()
+                    while frame.get('type') == 'heartbeat' or frame.get('view', {}).get('totals', {}).get('open') != 0:
+                        assert time.monotonic() - changed < 3
+                        frame = socket.receive_json()
+                    assert time.monotonic() - changed < 3
+                    assert frame['projector']['mode'] == 'projector'
+                    assert frame['projector']['projector_pid'] == pid
+    assert api._active_streams == 0
+
+
+def test_slow_compat_projection_does_not_block_heartbeat_or_disconnect(monkeypatch):
+    import asyncio
+    import threading
+    from test_view import load
+    api = load()
+    gate = threading.Event()
+    began = threading.Event()
+    monkeypatch.setattr(api, '_ws_upgrade_authorized', lambda ws: True)
+    monkeypatch.setattr(api, 'change_cursor', lambda: 0)
+    monkeypatch.setattr(api, 'WATCH_S', .01)
+    monkeypatch.setattr(api, 'HEARTBEAT_S', .03)
+    def hung(*args):
+        began.set()
+        gate.wait(5)
+        return {'configured': False}
+    monkeypatch.setattr(api, 'lane_view', hung)
+    class Socket:
+        query_params = {}
+        heartbeat = asyncio.Event()
+        async def accept(self):
+            pass
+        async def send_json(self, value):
+            if value.get('type') == 'heartbeat':
+                self.heartbeat.set()
+        async def receive(self):
+            await self.heartbeat.wait()
+            return {'type': 'websocket.disconnect'}
+    async def probe():
+        start = time.monotonic()
+        try:
+            await asyncio.wait_for(api.stream_lanes(Socket()), .5)
+            assert began.is_set()
+            assert time.monotonic() - start < .5
+            assert api._compat_fallback.active is not None
+        finally:
+            gate.set()
+    asyncio.run(probe())
+
+
+def test_child_control_and_eof_exit_while_projection_hangs(actual_board):
+    import threading
+    api, config = actual_board
+    child = start_process(api, config, prefix="from hermes_cli import kanban_lanes_cli as cli; import time; cli.snapshot = lambda *a, **k: time.sleep(20); ")
+    errors = []
+    def request():
+        try:
+            project(api, child, config)
+        except api._rpc_client.Unavailable:
+            errors.append('closed')
+    thread = threading.Thread(target=request)
+    thread.start()
+    try:
+        time.sleep(.1)
+        assert child.request({'op': 'observation_cursor'}, 1)
+        # Parent death closes stdin. Child must exit despite the hung worker.
+        child.proc.stdin.close()
+        child.proc.wait(2)
+        thread.join(2)
+        assert errors == ['closed']
+        assert not thread.is_alive()
+    finally:
+        child.close()
+
+
+def test_loaded_parent_rejects_changed_plugin_and_core_identity(actual_board, tmp_path):
+    import shutil
+    api, config = actual_board
+    directory = tmp_path / 'dashboard'
+    shutil.copytree(DASH, directory)
+    manifest = api._identity.capture(directory)
+    child = start_process(api, config | {'identity': manifest}, directory=directory)
+    try:
+        (directory / 'view.py').write_text((directory / 'view.py').read_text() + '\n# deployment moved\n')
+        with pytest.raises(api._rpc_client.Unavailable):
+            project(api, child, config)
+        assert not api._identity.matches(manifest)
+    finally:
+        child.close()
+    bad_core = dict(config['identity'])
+    key = next(p for p in bad_core if p.endswith('/kanban_lanes_cli.py'))
+    bad_core[key] = '0' * 64
+    with pytest.raises(api._rpc_client.Unavailable):
+        start_process(api, config | {'identity': bad_core})
+
+
+def test_supervisor_backoff_fallback_is_fresh_and_coalesces(monkeypatch):
+    from types import SimpleNamespace
+    client = module('projector_client')
+    state = {'value': 1}
+    api = SimpleNamespace(MIN_PROJECT_GAP_S=.01, _lane_view=lambda *a: {'configured': False, 'value': state['value']})
+    supervisor = client.Supervisor(api, {})
+    supervisor.retry_at = time.monotonic() + 30
+    config = {'local': 'fixture', 'fleet': None}
+    monkeypatch.setattr(supervisor, '_configuration', lambda: config)
+    try:
+        deadline = supervisor.retry_at
+        assert supervisor.submit((6., '6h', False), 1, [1]).result(2)['view']['value'] == 1
+        state['value'] = 2
+        fresh = supervisor.submit((6., '6h', False), 2, [2]).result(2)
+        assert fresh['view']['value'] == 2
+        assert fresh['mode'] == 'fallback' and fresh['projector_pid'] is None
+        assert fresh['revision'][0] == 2
+        assert supervisor.retry_at == deadline  # fallback does not extend backoff forever
+        with supervisor.cv:
+            one = supervisor.submit((6., '6h', False), 3, [3])
+            two = supervisor.submit((6., '6h', False), 4, [4])
+            assert one is two and not one.done()
+            assert len(supervisor.queue) == 1
+            assert next(iter(supervisor.queue.values()))[0][0] == 4
+        assert one.result(2)['revision'][0] == 4
+        for _ in range(128):
+            supervisor.acquire()
+        with pytest.raises(client.Unavailable):
+            supervisor.acquire()
+        for _ in range(128):
+            supervisor.release()
+    finally:
+        supervisor.close()
+
+
+def test_parent_cursor_keeps_planner_config_and_observation_triggers(actual_board):
+    api, config = actual_board
+    base = api.change_cursor()
+    home = Path(config['home'])
+    planner = home / 'kanban' / 'lanes-planner.json'
+    planner.write_text('{}')
+    planned = api.change_cursor()
+    assert planned != base
+    cfg = home / 'config.yaml'
+    cfg.write_text(cfg.read_text() + '\n# policy changed\n')
+    assert api.change_cursor() != planned
+    before = api.change_cursor()
+    store = api._observations()
+    store.reader({'https://github.com/example/repo/pull/1': ('new-evidence',)})
+    assert api.change_cursor() != before
+
+
+def test_child_observation_cursor_marks_parent_dirty_without_board_change(monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from test_view import load
+    api = load()
+    state = {'observation': 0}
+    class FakeSupervisor:
+        def acquire(self):
+            pass
+        def release(self):
+            pass
+        def cursor(self):
+            return state['observation']
+        def submit(self, params, generation, cursor):
+            result = concurrent.futures.Future()
+            now = time.time()
+            result.set_result({'view': {'configured': False, 'observation': state['observation']},
+                               'mode': 'projector', 'projector_pid': 123,
+                               'timing': {'project_start': now, 'project_end': now}})
+            return result
+    monkeypatch.setattr(api, '_projector_enabled', True)
+    monkeypatch.setattr(api, '_projector', FakeSupervisor)
+    monkeypatch.setattr(api, '_ws_upgrade_authorized', lambda ws: True)
+    monkeypatch.setattr(api, 'change_cursor', lambda: ['unchanged-board'])
+    monkeypatch.setattr(api, 'WATCH_S', .01)
+    monkeypatch.setattr(api, 'MIN_PROJECT_GAP_S', .01)
+    app = FastAPI()
+    app.include_router(api.router)
+    with TestClient(app) as client, client.websocket_connect('/v1/lanes/stream') as ws:
+        assert ws.receive_json()['view']['observation'] == 0
+        state['observation'] = 1
+        assert ws.receive_json()['view']['observation'] == 1
