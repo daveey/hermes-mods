@@ -86,14 +86,55 @@ event IDs. Run/cost/done/admission usage stays on the canonical fleet connection
 so copies cannot double-count it. Held-card provenance is local to its source;
 daily-cap usage remains canonical. Shadow/off modes keep the prior behavior.
 
-Concurrent viewers of the same parameters share a single in-flight projection
-and a bounded view cache keyed by invalidation generation/PR observation cursor.
-No per-card classifier evidence is retained. A changed cursor or successful write
-invalidates the next view; a projection already started is allowed to finish,
-not retried until the board is quiet. First-dirty debounce remains bounded under
-continuous unrelated churn. Tests exercise three real sockets with 40,000 history
-events and an intentionally unchanged stale replica, plus separate cache-race
-and write-invalidation controls. Real deployment latency still needs a live proof.
+GET viewers share the existing bounded view cache keyed by invalidation generation
+and parent PR-observation cursor. Streams share in-flight projection RPCs by parameters
+and requested revision, not retained views. No per-card classifier evidence is retained.
+A changed cursor or successful write invalidates the next view; work already started may
+finish with its original revision, while the first detected follow-up stays pending.
+Tests exercise three real sockets with 40,000 history events and an unchanged stale
+replica, plus separate cache-race and write-invalidation controls. Real deployment
+latency still needs a live proof.
+
+### Dedicated projection process
+
+After authorization and parameter validation, the first stream viewer starts one
+on-demand managed-runtime child using private stdin/stdout pipes. The parent still
+owns board/config/planner/PR change detection, leading-edge scheduling, the 1 s
+burst gap and socket versions/hashes. It polls the child's lightweight observation
+cursor too; the child has no source watcher or autonomous projection loop. GET
+continues its existing in-process path.
+
+Both paths call the same borrowed-evidence projection. Each child job freshly opens
+tracked `mode=ro` local/fleet handles, registers the existing sync mode without
+installing schema, checks it against the parent's mode, and rolls back/closes before
+publishing. This preserves primary-board local overlays, including archive before
+replica convergence, and reopens rebuilt source files between jobs. Evidence/history
+is request-local. SQL has a 250 ms busy timeout and 2 s progress budget.
+
+RPC commands carry a fixed-size cursor digest, never PR URL lists. JSON framing,
+size limits (16 KiB commands, 8 MiB replies), session/request/revision/parameter checks,
+and captured plugin/core code hashes fence malformed or mixed-deployment replies.
+Code identity movement fails unavailable until a matching natural backend rotation;
+it never blesses new disk hashes from a stale parent. One projection runs globally,
+with at most one pending revision per legal parameter key (32 keys) and 128 viewers.
+
+Startup/job failure bounds are 5/10 s, not latency promises. Child failure uses a fresh,
+uncached in-process fallback, one daemon slot held through actual completion with a
+3 s delivery deadline and no executor queue. Retry backoff is 1/2/4/8/16/30 s;
+backoff does not reuse stale successful frames. Socket receive/heartbeat tasks remain
+independent of compute; writes have a 3 s timeout and a latest-only pending frame.
+An idle child stops after 30 s without viewers; EOF exits even during hung work.
+No service/unit or forced restart is added.
+
+Debug frames add `projector: {mode, projector_pid, source_current}`. Mode is
+`projector` or `fallback` (PID null for fallback); `source_current=false` means a
+source change was detected during that revision's computation and a follow-up is
+pending. `timing.project_start/end` come from the actual compute process. Neither
+these diagnostics nor load/timing fields affect the view digest. The real subprocess
+fixtures test sync-primary overlay without mocking `board_mode`, byte-identical
+projection, source rebuild, identity/session fences, no-spawn auth, EOF during a
+hung projection, independent heartbeats and fresh bounded fallback. Private captured
+board backups are tested separately and never checked into this repository.
 
 PR network observation runs in one process-shared, bounded background worker,
 not the stream or GET request. A report consumes an immutable published reader.
