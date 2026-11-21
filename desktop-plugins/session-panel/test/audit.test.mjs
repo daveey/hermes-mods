@@ -86,4 +86,87 @@ test('defect 1: showsDecision tells the decision queue the panel already carries
   assert.equal(m.showsDecision('nope'), false)
 })
 
+test('showsDecision reads the actual cached model and isolates owner, profile, session and unknown requests', async () => {
+  await paint(null)
+  m.resetFeedForTests()
+  const saved = { ...current }
+  const decision = { request_id: 'req-cached', text: 'Decision recorded' }
+  m.ingestBundle('conn', 'default', { session: 'chat', model: model({ waiting: [row('answered', { decision })] }) })
+  try {
+    assert.ok(m.cachedModel(current), 'the fixture must populate the real model cache')
+    assert.equal(m.showsDecision(decision.request_id), true)
+    assert.equal(m.showsDecision('unknown-request'), false)
+    assert.equal(m.showsDecision(''), false)
+    for (const different of [{ connectionId: 'other-owner' }, { profile: 'other-profile' }, { session: 'other-chat' }]) {
+      current = { ...saved, ...different }
+      assert.equal(m.showsDecision(decision.request_id), false, JSON.stringify(different))
+    }
+  } finally { current = saved; m.resetFeedForTests() }
+})
+
+test('real Panel open_url dispatch uses registered OS handler, browser fallback and refuses non-http URLs', async () => {
+  await paint(null)
+  m.resetFeedForTests()
+  const osCalls = [], browserCalls = [], areas = []
+  let osResult = true
+  const oldOpen = window.open
+  window.open = (...args) => { browserCalls.push(args); return {} }
+  const dispose = m.default.register({ register: area => areas.push(area), os: { openExternal: async url => { osCalls.push(url); return osResult } } })
+  const action = { kind: 'open_url', label: 'Open CI', url: 'https://example.test/ci/run/1' }
+  const seed = async url => {
+    await React.act(async () => {
+      m.ingestBundle('conn', 'default', { session: 'chat', model: model({ waiting: [row('ci', { actions: [{ ...action, url }] })] }) })
+    })
+  }
+  const clickOpen = async () => React.act(async () => {
+    const button = document.querySelector('[data-open-url]')
+    assert.ok(button, 'mounted Panel must expose the actual Open action')
+    button.click()
+    await new Promise(resolve => setTimeout(resolve, 0))
+  })
+  try {
+    await seed(action.url)
+    await paint(areas.find(a => a.id === 'panel').render())
+    await clickOpen()
+    assert.deepEqual(osCalls, [action.url])
+    assert.deepEqual(browserCalls, [], 'successful OS handler must not also open a browser window')
+    osResult = false
+    await seed('http://example.test/ci/run/2')
+    await clickOpen()
+    assert.deepEqual(osCalls, [action.url, 'http://example.test/ci/run/2'])
+    assert.deepEqual(browserCalls, [['http://example.test/ci/run/2', '_blank', 'noopener']])
+    for (const url of ['javascript:alert(1)', 'file:///private/example.txt']) {
+      await seed(url)
+      assert.ok(document.querySelector('[data-open-url]') === null, 'non-http URL has no action')
+      assert.equal(await m.openUrl(url), false, 'URL opener itself must also refuse non-http input')
+    }
+    assert.equal(osCalls.length, 2)
+    assert.equal(browserCalls.length, 1)
+  } finally {
+    await paint(null)
+    dispose(); window.open = oldOpen; m.resetFeedForTests()
+  }
+})
+
+test('live ask renders its older recorded decision from the real reducer and cache', async () => {
+  const script = `import importlib.util, json
+from pathlib import Path
+p = Path('plugins/session-panel/model.py')
+s = importlib.util.spec_from_file_location('panel_fixture', p)
+f = importlib.util.module_from_spec(s); s.loader.exec_module(f)
+ref = {'type':'kanban','gatewayId':'remote','profile':'default','board':'default','id':'t_abc123'}
+old = {'requestId':'req-old','revision':1,'state':'open','title':'Older ask','owner':{'gatewayId':'remote','profile':'default','storedSessionId':'chat'},'scope':{'sourceRefs':[ref]},'choices':[{'id':'yes','label':'Done'}],'resolution':{'choiceId':'yes','operationId':'op-1','revision':1}}
+live = {**old, 'requestId':'req-live','resolution':None,'title':'New ask'}
+card = {'id':'t_abc123','gateway':'remote','profile':'default','board':'default','status':'blocked','human_request':{'action':'Pick','interaction':'approval'},'wait':{'wait_state':'human'}}
+print(json.dumps(f.reduce_panel({'tasks':[card],'requests':[old,live]}, now=1795281000)))`
+  const real = JSON.parse(execFileSync(process.env.PYTHON || 'python3', ['-c', script], { cwd: fileURLToPath(new URL('../../../', import.meta.url)), encoding: 'utf8' }))
+  assert.equal(real.sections.needs_you[0].request_id, 'req-live')
+  assert.equal(real.sections.needs_you[0].decision.request_id, 'req-old')
+  m.ingestBundle('conn', 'default', { session: 'chat', model: real })
+  await paint(React.createElement(m.Panel))
+  assert.equal(m.showsDecision('req-old'), true)
+  assert.equal(document.querySelector('[data-ask-row] [data-decision-status="req-old"]')?.textContent, real.sections.needs_you[0].decision.text)
+  await paint(null); m.resetFeedForTests()
+})
+
 test.after(async () => { await React.act(async () => root.unmount()); dom.window.close() })

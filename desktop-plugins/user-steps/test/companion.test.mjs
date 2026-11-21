@@ -124,6 +124,60 @@ test('audit: a recorded decision the panel carries has no queue block; the same 
  if (before) window.__sessionPanel = before; else panelOff()
 })
 
+for (const outcome of ['failed', 'unknown']) test(`companion: panel-carried ${outcome} delivery retains Check status and Retry`, async () => {
+ await show(null)
+ m.clearFeatureCache(); m.resetCanonicalCacheForTests()
+ const r = approval({ resolution: { operationId: `op-${outcome}`, choiceId: 'yes', revision: 1 } })
+ const before = window.__sessionPanel
+ const call = async path => {
+  if (path.includes('/operations/')) {
+   if (outcome === 'unknown') throw Error('Readback connection lost')
+   return { request: r, operation: { operationId: r.resolution.operationId, dispatchState: 'failed', error: 'Transport unavailable' } }
+  }
+  return { requests: [r], features: [] }
+ }
+ window.hermesDesktop = { api: ({ path }) => call(path) }
+ window.__sessionPanel = { active: true, showsDecision: id => id === r.requestId }
+ try {
+  await m.refreshRequests(call)
+  // The panel posts the decision; its durable readback has already established the recovery phase.
+  await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call, companion: true }))
+  assert.match(el().textContent, outcome === 'failed' ? /delivery unconfirmed/i : /outcome unknown/i)
+  await show(React.createElement(m.ActionQueue, { key: `recovery-${outcome}`, embedded: true, companion: true }))
+  assert.ok(el().querySelector('[data-action-request]'), `${outcome}: panel status must not hide recovery`)
+  assert.ok(btn('Check status') && btn('Retry'), `${outcome}: both recovery controls remain`)
+  assert.ok(!labels().some(l => /Request changes|Approve/.test(l)), 'recorded decisions stay locked')
+ } finally {
+  await show(null)
+  delete window.hermesDesktop
+  if (before) window.__sessionPanel = before; else panelOff()
+ }
+})
+
+test('transcript StepBox hides a recorded decision under the panel but keeps an open unanswered step', async () => {
+ await show(null)
+ m.resetCanonicalCacheForTests(); m.clearStepCache()
+ const r = approval({ resolution: { operationId: 'op-transcript', choiceId: 'yes', revision: 1 } })
+ const before = window.__sessionPanel
+ window.__sessionPanel = { active: true, showsDecision: () => true }
+ const step = { id: 'us_abcdef', status: 'open', text: 'Transcript decision text', requestId: r.requestId, requestOwner: owner }
+ const attrs = { id: step.id, s: 'S1', gatewayId: owner.gatewayId, profile: owner.profile, requestId: r.requestId }
+ try {
+  await m.refreshRequests(async () => ({ requests: [r] }))
+  await show(React.createElement(m.StepBox, { key: 'recorded', attrs, deps: { call: async () => ({ step }) } }))
+  assert.ok(el().querySelector('[data-user-step]') === null, 'recorded transcript does not duplicate the panel')
+  assert.equal(el().textContent, '')
+  await React.act(async () => { await m.refreshRequests(async () => ({ requests: [{ ...r, resolution: undefined }] })); await flush() })
+  await show(React.createElement(m.StepBox, { key: 'unanswered', attrs, deps: { call: async () => ({ step }) } }))
+  assert.ok(el().querySelector('[data-user-step]'), 'an unanswered step must remain visible')
+  assert.match(el().textContent, /Transcript decision text/)
+  assert.match(el().textContent, /Reference only/)
+ } finally {
+  await show(null)
+  if (before) window.__sessionPanel = before; else panelOff()
+ }
+})
+
 test('companion: a plan-less ask still offers Ask agent for the plan (composer draft) and draws no Approve', async () => {
  const r = approval({ title: 'No plan', scope: { complete: false, markdown: '', sourceRefs: [] } })
  drafts.length = 0
