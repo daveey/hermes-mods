@@ -415,6 +415,53 @@ def test_every_push_names_the_chats_it_vouches_for():
     assert 'S2' not in pushed[-1]['fresh'], 'nor a chat no longer watched'
 
 
+@pytest.mark.parametrize('section', ['tasks', 'done'])
+@pytest.mark.parametrize('flag', ['stale', 'partial_source_unknown', '_execution_error'])
+def test_source_stale_success_is_not_vouched_and_retries_without_stamp_changes(section, flag):
+    f, r, pushed, t = make()
+    f.changes(['S1'])
+    f.tick()
+    rows = r.links['S1'] if section == 'tasks' else r.finished['S1']
+    rows[0][flag] = True
+    r.stamp += 1
+    r.events = [('t_aaaaaa1', 'S1')]
+    t['now'] += 1
+    f.tick()
+    assert not f.failures, 'source-stale fallback succeeds without raising'
+    assert f.bundles['S1']['bundle'][section][0][flag] is True
+    assert 'S1' not in pushed[-1]['fresh']
+    t['now'] += feedmod.HEARTBEAT_S + 1
+    f._publish({}, heartbeat=True)
+    assert pushed[-1]['heartbeat'] and 'S1' not in pushed[-1]['fresh']
+    del rows[0][flag]
+    # No new cursor, stamp change, or full refresh: source degradation itself requires retry.
+    before = len(r.reads)
+    t['now'] += 1
+    f.tick()
+    assert len(r.reads) > before
+    assert flag not in f.bundles['S1']['bundle'][section][0]
+    assert 'S1' in pushed[-1]['fresh']
+    assert 'S1' not in f._retry
+
+
+def test_older_source_stale_publication_does_not_dirty_a_newer_fresh_bundle():
+    f, r, pushed, t = make()
+    f.watch(['S1'])
+    r.links['S1'][0]['stale'] = True
+    older = f.compute('S1')
+    del r.links['S1'][0]['stale']
+    newer = f.compute('S1')
+    # Fake reader rows alias; copy the old observation as an actual reader would.
+    older['tasks'] = [dict(row, stale=True) for row in older['tasks']]
+    f._publish({'S1': newer})
+    f._publish({'S1': older})
+    assert f.bundles['S1']['bundle'] is newer
+    assert 'S1' not in f._retry
+    t['now'] += feedmod.HEARTBEAT_S + 1
+    f._publish({}, heartbeat=True)
+    assert pushed[-1]['fresh'] == ['S1']
+
+
 def test_a_long_recompute_pass_keeps_heartbeating():
     f, r, pushed, t = make()
     f.changes(['S1', 'S2'])

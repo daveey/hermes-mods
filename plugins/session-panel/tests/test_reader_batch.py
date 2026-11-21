@@ -186,6 +186,53 @@ def test_shared_reads_keep_per_lineage_busy_memos_current(graph, monkeypatch):
             assert next(t for t in rows if t['id'] == local)['stale'] is True
 
 
+def test_busy_fallback_bundle_is_retried_and_only_vouched_after_recovery(graph, api, monkeypatch):
+    r, local, _, ksa = graph
+    # Independently healthy replica: an unstamped fixture replica is correctly source-stale too.
+    with contextlib.closing(sqlite3.connect(r.ksc.shadow_path('default'))) as replica:
+        columns = {row[1] for row in replica.execute('PRAGMA table_info(kanban_sync_state)')}
+        if 'pulled_at' not in columns:
+            replica.execute('ALTER TABLE kanban_sync_state ADD COLUMN pulled_at REAL')
+        replica.execute('INSERT OR REPLACE INTO kanban_sync_state '
+                        '(board_id, gateway_id, hlc_last, mode, pulled_at) VALUES (?, ?, ?, ?, ?)',
+                        ('default', 'remote-test', '0', 'replica', api.time.time()))
+        replica.execute('UPDATE kanban_sync_state SET pulled_at=?', (api.time.time(),))
+        replica.commit()
+    now = [1000.0]
+    pushed = []
+    f = api._load_feed().Feed(r, emit=pushed.append, clock=lambda: now[0])
+    f.changes(['S0', 'S1'])
+    f.tick()
+    original = ksa._read_session_tasks
+    def busy(*a, **k):
+        from hermes_cli.kanban_generation import BoardLifecycleBusy
+        raise BoardLifecycleBusy()
+    monkeypatch.setattr(ksa, '_read_session_tasks', busy)
+    # Force only this refresh. The recovery tick has unchanged stamps/cursor.
+    f._retry.update(['S0', 'S1'])
+    now[0] += 1
+    f.tick()
+    assert not f.failures
+    for sid in ('S0', 'S1'):
+        row = next(t for t in f.bundles[sid]['bundle']['tasks'] if t['id'] == local)
+        assert row['stale'] is True, 'real core busy memo, not a stubbed Feed bundle'
+        assert sid not in pushed[-1]['fresh']
+    now[0] += f.heartbeat_s + 1
+    f._publish({}, heartbeat=True)
+    assert pushed[-1]['heartbeat'] and pushed[-1]['fresh'] == []
+    monkeypatch.setattr(ksa, '_read_session_tasks', original)
+    now[0] += 1
+    f.tick()
+    flags = {sid: [{k: row[k] for k in ('id', 'stale', 'partial_source_unknown', '_execution_error') if k in row}
+                   for row in f.bundles[sid]['bundle']['tasks'] + f.bundles[sid]['bundle']['done']]
+             for sid in ('S0', 'S1')}
+    assert pushed[-1]['fresh'] == ['S0', 'S1'], flags
+    assert not f._retry
+    for sid in ('S0', 'S1'):
+        row = next(t for t in f.bundles[sid]['bundle']['tasks'] if t['id'] == local)
+        assert not row.get('stale')
+
+
 def test_origin_alias_obligation_survives_union_replica_selection(graph, monkeypatch):
     r, _, remote, ksa = graph
     # Only S1's replica link remains, but the ledger also names S0 as origin_session.

@@ -237,13 +237,19 @@ class Feed:
         prev = self.bundles.get(session)
         if prev and prev['bundle'].get('computed_seq', 0) > bundle.get('computed_seq', 0):
             return False  # computed before what we hold (a slow catch-up racing the tick): never goes back
-        refs = set(bundle['cards']) | {str(t.get('id')) for t in bundle['tasks'] + bundle['done'] if t.get('id')}
+        rows = bundle['tasks'] + bundle['done']
+        refs = set(bundle['cards']) | {str(t.get('id')) for t in rows if t.get('id')}
+        # Core's busy fallback succeeds with last-observed rows, not an exception. Keep them visible,
+        # but never vouch for that source as fresh; retry even when its file stamps/cursor stay unchanged.
+        source_stale = any(t.get('stale') or t.get('partial_source_unknown') or t.get('_execution_error') for t in rows)
+        if source_stale:
+            self._retry.add(session)
         if prev and prev['hash'] == h:
-            prev.update(bundle=bundle, refs=refs, lineage=set(bundle['lineage']))
+            prev.update(bundle=bundle, refs=refs, lineage=set(bundle['lineage']), source_stale=source_stale)
             return False
         self.rev += 1
         self.bundles[session] = {'rev': self.rev, 'hash': h, 'bundle': bundle, 'refs': refs,
-                                 'lineage': set(bundle['lineage'])}
+                                 'lineage': set(bundle['lineage']), 'source_stale': source_stale}
         return True
 
     def _publish(self, computed: dict[str, dict], *, heartbeat: bool = False) -> dict[str, dict]:
@@ -262,7 +268,7 @@ class Feed:
                     # The chats this push vouches for: held, watched, and last computed without a failure. Clients
                     # re-stamp only these (a dropped or failing chat is never confirmed by a heartbeat).
                     fresh = sorted(s for s in self.interest if s in self.bundles and s not in self.failures
-                                   and s not in self._retry
+                                   and s not in self._retry and not self.bundles[s].get('source_stale')
                                    and now - self.bundles[s]['bundle']['computed_at'] <= (
                                        self.full_every_s if self.bundles[s]['bundle'].get('tasks')
                                        else QUIET_FULL_EVERY_S))
