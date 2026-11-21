@@ -72,6 +72,7 @@ class TestAll(unittest.TestCase):
         self.assertIn("Python >= 3.11", r.stderr)
         self.assertNotIn("Traceback", r.stderr)
 
+    @unittest.skipUnless(os.name == "posix", "POSIX shell fake for uv")
     def test_the_uv_a_run_found_is_on_path_for_its_suites(self):
         # [2026-11-21] each suite runs with an isolated HOME; over ssh PATH lacks ~/.local/bin; the nested test-all
         # of the push-gate tests found no uv and the whole tests suite failed in the hub gate.
@@ -90,13 +91,16 @@ class TestAll(unittest.TestCase):
             before = os.environ["PATH"]
             ns["put_uv_on_path"](uv)
             self.assertEqual(os.environ["PATH"], before, "not added twice")
+        with patch.dict(os.environ, {"PATH": f"{bindir.parent}{os.pathsep}/nonexistent"}):
+            ns["put_uv_on_path"](str(fake))
+            self.assertTrue(os.environ["PATH"].startswith(f"{bindir.parent}{os.pathsep}"), "appended: shadows nothing")
         # main() exports it: a suite run with PATH lacking uv finds the one main found.
         import contextlib
         import io
         runner = runpy.run_path(str(RUNNER))
-        probe = f"import shutil, sys; sys.exit(0 if shutil.which('uv') == {str(fake)!r} else 1); print('1 passed')"
-        suites = [dict(name="probe", cmd=[sys.executable, "-c", probe + "\nprint('1 passed')"])]
-        with patch.dict(os.environ, {"PATH": f"{Path(sys.executable).parent}{os.pathsep}/nonexistent"}), \
+        probe = f"import shutil, sys\nif shutil.which('uv') != {str(fake)!r}: sys.exit(1)\nprint('1 passed')"
+        suites = [dict(name="probe", cmd=[sys.executable, "-c", probe])]
+        with patch.dict(os.environ, {"PATH": "/nonexistent"}), \
                 patch("pathlib.Path.home", return_value=self.root / "home"), \
                 patch.dict(runner["main"].__globals__, {
                     "discover": lambda *args, **kwargs: suites,
@@ -105,6 +109,7 @@ class TestAll(unittest.TestCase):
                 }), contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(runner["main"](["--root", str(self.root)]), 0, out.getvalue())
 
+    @unittest.skipUnless(os.name == "posix" and hasattr(os, "set_blocking"), "POSIX pipes")
     def test_a_non_blocking_stdout_pipe_does_not_crash_a_long_report(self):
         # [2026-11-21] over ssh the gate's stdout pipe was O_NONBLOCK; the skip summary hit BlockingIOError after
         # every suite passed and the push was refused.
