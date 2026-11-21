@@ -137,3 +137,30 @@ test('an untrusted (catch-up only) bundle detail never reaches blocked-panel; a 
   assert.equal(m.cachedCard({ connectionId: 'C1', profile: 'default' }, 't_aaaaaa1').trusted, false)
   assert.ok(!calls.some(c => String(c.path).startsWith('/api/plugins/kanban/tasks/')), 'no card read by either')
 })
+
+test('an untrusted bundle of another chat cannot replace a current trusted record; it clears trust otherwise', async () => {
+  window.hermesDesktop = { api: async req => window.__answer(req) }
+  window.__answer = () => feedAnswer({ bundles: { S1: askBundle() } })
+  await m.feedCatchUp({ connectionId: 'C1', profile: 'default', sessions: ['S1', 'S2'] })
+  m.onFeedEvent({ type: m.FEED_EVENT, payload: { feed: 'hub:1', profile: 'default', epoch: 'E1', prev: 3, rev: 3, heartbeat: true, fresh: ['S1'] } })
+  await settle(); await settle()
+  const before = m.cachedCard({ connectionId: 'C1', profile: 'default' }, 't_aaaaaa1')
+  assert.equal(before.trusted, true)
+  // Another chat's catch-up-only bundle carries an older copy of the same card.
+  const old = { session: 'S2', lineage: ['S2'], tasks: [], cards: { t_aaaaaa1: slim('t_aaaaaa1', 'running') } }
+  m.ingestBundle('C1', 'default', old, { trusted: false, nowMs: Date.now() + 1_000 })
+  const after = m.cachedCard({ connectionId: 'C1', profile: 'default' }, 't_aaaaaa1')
+  assert.equal(after.detail.task.status, 'blocked', 'the trusted content stands')
+  assert.equal(after.trusted, true)
+  assert.equal(after.at, before.at)
+  // Once the trusted record is no longer current, an untrusted copy replaces it and the record is untrusted, even
+  // though the key is still in S1's trusted scope.
+  m.ingestBundle('C1', 'default', old, { trusted: false, nowMs: before.at + 61_000 })
+  const replaced = m.cachedCard({ connectionId: 'C1', profile: 'default' }, 't_aaaaaa1', before.at + 61_000)
+  assert.equal(replaced.detail.task.status, 'running')
+  assert.equal(replaced.trusted, false, 'the record carries its own trust')
+  assert.equal(blocked.sharedDetail({ ...row }, 'S1', before.at + 61_000, sp()), null)
+  // A heartbeat vouching for S1 does not re-stamp the untrusted record.
+  m.onFeedEvent({ type: m.FEED_EVENT, payload: { feed: 'hub:1', profile: 'default', epoch: 'E1', prev: 3, rev: 3, heartbeat: true, fresh: ['S1'] } })
+  assert.equal(m.cachedCard({ connectionId: 'C1', profile: 'default' }, 't_aaaaaa1').at, before.at + 61_000)
+})

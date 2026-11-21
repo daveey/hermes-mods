@@ -1975,8 +1975,8 @@ export function pollWhileVisible(refresh, intervalMs = PERSON_WAITS_POLL_MS, doc
 /** Read-only view of one card-cache record for other plugins (blocked-panel, via window.__sessionPanel): never
  *  starts a read. `detail` is the card's kanban detail when the gateway feed pushed it (slim: no comments), else
  *  null; `at` = when it was read or last confirmed by a push; `fresh` = answered, not stale, within CARD_FRESH_MS;
- *  `trusted` = it came in a trusted bundle of a chat the live feed currently vouches for (feedScopes + feedVouches),
- *  so pushes keep it current. An untrusted (catch-up only) bundle's record is never `trusted`. */
+ *  `trusted` = the record itself was set by a trusted bundle (an untrusted ingest clears it) and a chat whose trusted
+ *  bundle carried it is vouched for by the live feed now (feedScopes + feedVouches), so pushes keep it current. */
 export function cachedCard(chip, id, nowMs = Date.now()) {
   loadReads()
   const route = refRoute(chip, () => null)
@@ -1985,7 +1985,8 @@ export function cachedCard(chip, id, nowMs = Date.now()) {
   const hit = cards.get(k)
   if (!hit) return null
   let trusted = false
-  if (hit.detail && !hit.pending && !hit.stale) {
+  // Both: the record itself came from a trusted bundle, and a chat holding it is vouched for by the live feed now.
+  if (hit.trusted === true && hit.detail && !hit.pending && !hit.stale) {
     for (const [scope, keys] of feedScopes) {
       if (!keys.has(k)) continue
       let parsed = null
@@ -2056,11 +2057,16 @@ export function ingestBundle(connectionId, profile, b, { nowMs = Date.now(), tru
     if (!rec?.detail?.task) continue
     const route = { connectionId, profile, board: str(rec.board) || 'default' }
     const k = titleKey(route, id), r = { detail: rec.detail, board: route.board }
+    keys.add(k)
+    // An untrusted copy (a catch-up answer, possibly from another chat's bundle) never replaces a trusted record that
+    // is still current: it may be older than what the pushes gave.
+    const held = cards.get(k)
+    if (!trusted && held?.trusted && held.detail && !held.pending && nowMs - held.at < CARD_FRESH_MS) continue
     const info = cardSummary(id, r)
-    put(cards, k, { info, detail: rec.detail, at: nowMs })
+    // The record carries its own trust: set by a trusted bundle, cleared by an untrusted one.
+    put(cards, k, { info, detail: rec.detail, at: nowMs, trusted: !!trusted })
     put(parks, k, { park: parkFromDetail(rec.detail), failed: false, at: nowMs })
     if (info.title) put(titles, k, { title: info.title, board: info.board, state: info.status, at: nowMs })
-    keys.add(k)
   }
   if (trusted) feedScopes.set(scope, keys)
   else feedScopes.delete(scope)
@@ -2080,7 +2086,7 @@ function confirmFeed(st, fresh, nowMs = Date.now()) {
     if (!keys) continue
     for (const k of keys) {
       const c = cards.get(k), p = parks.get(k)
-      if (c?.detail && !c.pending) c.at = nowMs
+      if (c?.detail && c.trusted && !c.pending) c.at = nowMs
       if (p && !p.pending && !p.failed) p.at = nowMs
     }
     if (doneFeedAt.has(scope)) doneFeedAt.set(scope, nowMs)

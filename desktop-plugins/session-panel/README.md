@@ -116,8 +116,10 @@ it stops, and showing the window again reads once at once. Test: `test/shared-ac
 ## Read-only doors for other plugins
 
 `window.__sessionPanel` also carries `cachedCard(chip, id)` (one card-cache record, including the pushed kanban
-`detail` when the gateway feed sent one, its `at`, and `trusted`: it came in a trusted bundle of a chat the live feed
-vouches for now; it never starts a read), `feedVouches(route)` and `feedIsLive(route)`.
+`detail` when the gateway feed sent one, its `at`, and `trusted`: the record itself was set by a trusted bundle (an
+untrusted ingest clears it) and a chat whose trusted bundle carried it is vouched for by the live feed now; it never
+starts a read), `feedVouches(route)` and `feedIsLive(route)`. An untrusted bundle (any chat's) never replaces a trusted
+record still within its 60 s freshness, and pushes re-stamp only trusted records.
 blocked-panel uses them to take a blocked card's detail without reading it again. Test: `test/shared-access.test.mjs`.
 
 ## Pushed from the gateway

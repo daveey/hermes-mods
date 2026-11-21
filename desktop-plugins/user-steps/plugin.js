@@ -1069,6 +1069,7 @@ export function DecisionRow({ request, route, call = api, unavailable = false, p
     if (!decision) return check()
     try { rememberIntent(key, decision) } catch { update({ error: 'Cannot retain a safe retry key. Check browser storage before submitting.' }); return }
     update({ phase: 'submitting', decision, error: '' }) // synchronous shared lock prevents a double click/two tiles
+    let posted = false
     try {
       if (retry) {
         const found = await findOperation(decision)
@@ -1076,6 +1077,7 @@ export function DecisionRow({ request, route, call = api, unavailable = false, p
         if (found?.operation && operationState(found.operation) !== 'failed') { apply(await readOperation(operationId(found.operation))); return }
       }
       const result = await call(`${BASE}/requests/${encodeURIComponent(r.requestId)}/decisions`, { ...route, method: 'POST', body: decision })
+      posted = true
       if (!currentRoute(route)) return
       if (!operationId(result?.operation)) throw Error('Missing operation receipt; outcome unknown')
       update({ operation: result.operation, phase: 'checking' })
@@ -1088,7 +1090,6 @@ export function DecisionRow({ request, route, call = api, unavailable = false, p
         update({ request: recorded }); saveReadback(route, recorded)
       }
       apply(await readOperation(operationId(result.operation))) // POST success alone is never confirmation
-      refreshBlockedAfterAction()
       if (live.current && currentRoute(route)) setEditing(null)
     } catch (e) {
       if (!currentRoute(route)) return
@@ -1109,6 +1110,9 @@ export function DecisionRow({ request, route, call = api, unavailable = false, p
         if (found?.operation) { apply(await readOperation(operationId(found.operation))); return }
       } catch { /* explicit unknown below */ }
       update({ phase: 'unknown', error: `Outcome unknown: ${e.message}. Check status or retry safely.` })
+    } finally {
+      // The decision was recorded (the POST answered), whatever the delivery read says: the card may have changed.
+      if (posted) refreshBlockedAfterAction()
     }
   }
   const failedId = state.phase === 'failed' ? operationId(state.operation) : null

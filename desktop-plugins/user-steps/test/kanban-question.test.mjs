@@ -95,3 +95,30 @@ test('a recorded decision makes blocked-panel read the cards itself (forced), no
   assert.equal(m.refreshBlockedAfterAction(null), false, 'no blocked-panel: nothing to do')
  } finally { delete window.__blockedPanel }
 })
+
+test('a recorded decision forces blocked-panel\'s refresh even when the delivery read fails', async () => {
+ const r = request(), forced = []
+ window.__blockedPanel = { refresh: force => { forced.push(force) } }
+ try {
+  const call = async (path, opts = {}) => {
+   if (opts.method === 'POST') return { request: r, operation: { operationId: 'op-throw', dispatchState: 'pending' } }
+   throw new Error('operation read timed out')
+  }
+  await show(React.createElement(m.DecisionRow, { key: `${r.requestId}-throw`, request: r, route, call }))
+  await click('card-1')
+  await React.act(async () => { await flush(); await flush() })
+  assert.deepEqual(forced, [true], 'forced once, after the POST, despite the failed read')
+ } finally { delete window.__blockedPanel }
+})
+
+test('a decision whose POST fails does not force a refresh (nothing changed)', async () => {
+ const r = request(), forced = []
+ window.__blockedPanel = { refresh: force => { forced.push(force) } }
+ try {
+  const call = async () => { throw new Error('offline') }
+  await show(React.createElement(m.DecisionRow, { key: `${r.requestId}-fail`, request: r, route, call }))
+  await click('card-1')
+  await React.act(async () => { await flush(); await flush() })
+  assert.deepEqual(forced, [])
+ } finally { delete window.__blockedPanel }
+})

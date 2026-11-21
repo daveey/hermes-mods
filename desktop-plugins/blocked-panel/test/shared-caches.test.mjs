@@ -194,3 +194,29 @@ test('unblocking a card forces a read of everything (never a neighbour copy take
     assert.ok(!calls.some(c => c.shared === 'rows'))
   } finally { delete globalThis.__bp.liveRows }
 })
+
+test('refresh(true) arriving while a poll runs is queued, then runs once, forced; callers get that run', async () => {
+  globalThis.__bp.stored = 's-queue'
+  const rows = [row('t_ask8')]
+  globalThis.__bp.liveRows = rows
+  const { calls, reads } = wire({ lineage: new Set(['s-queue']), rows, card: id => slim(id) })
+  let release
+  const gate = new Promise(r => { release = r })
+  const api = window.hermesDesktop.api
+  window.hermesDesktop.api = async req => { if (req.path.startsWith('/api/plugins/hub-sync/')) await gate; return api(req) }
+  try {
+    const poll = m.refresh() // a plain poll: shared data, stuck on the hub read
+    await settle()
+    const forcedA = m.refresh(true)
+    const forcedB = m.refresh() // a later plain request joins the queued forced run
+    assert.equal(forcedA, forcedB, 'one queued run')
+    assert.equal(reads('/api/session-kanban-tasks').length, 0, 'nothing forced yet: the poll is still running')
+    release()
+    await poll
+    await forcedA
+    assert.equal(reads('/api/session-kanban-tasks').length, 1, 'the queued run read the list itself (forced)')
+    assert.equal(calls.filter(c => c.shared === 'rows').length, 1, 'only the poll consulted shared rows')
+    await settle()
+    assert.equal(reads('/api/session-kanban-tasks').length, 1, 'and ran once')
+  } finally { delete globalThis.__bp.liveRows }
+})

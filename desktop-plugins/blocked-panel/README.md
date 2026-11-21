@@ -61,9 +61,10 @@ them while it is current and reads only what is missing:
 
 Tests: `test/shared-caches.test.mjs` (current data: no lineage, list or detail reads, steady state; identical
 snapshot to a live read; stale/missing/untrusted data read here; list age checks; no neighbours; forced refresh;
-unblocking forces a read; the detail checks), `../session-panel/test/shared-access.test.mjs` (an untrusted bundle's
+unblocking forces a read; a forced refresh during a running poll is queued and runs once, forced; the detail
+checks), `../session-panel/test/shared-access.test.mjs` (an untrusted bundle's
 detail never reaches blocked-panel, a trusted vouched one does), `../user-steps/test/kanban-question.test.mjs`
-(a recorded decision forces blocked-panel's refresh) and
+(a recorded decision forces blocked-panel's refresh, also when the delivery read fails; a failed POST does not) and
 `../session-panel/test/producer-composed.test.mjs` (real session-tasks feeding blocked-panel: the owner list is not
 read again, the other gateway still is, identical qualified items).
 
