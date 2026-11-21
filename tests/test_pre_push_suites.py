@@ -166,6 +166,34 @@ record('end')
             self.assertNotIn('waiting for suite slot', text)
         self.assertEqual([e[0] for e in self.records()], ['start', 'end'])
 
+    def test_interrupted_queued_prepare_invalidates_previous_receipt(self):
+        import fcntl
+        first, _ = self.start()
+        self.assertEqual(first.wait(15), 0)
+        receipts = list((self.repo / '.git/pre-push-suites').glob('*.json'))
+        self.assertEqual(len(receipts), 1)
+        slot = self.root / 'cache/hermes-mods-push/slots/0.lock'
+        with slot.open('a+') as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            queued, log = self.start()
+            deadline = time.monotonic() + 10
+            text = ''
+            while time.monotonic() < deadline:
+                log.seek(0)
+                text = log.read()
+                if 'waiting for suite slot held by' in text:
+                    break
+                time.sleep(.02)
+            queued.kill()
+            queued.wait(5)
+            self.assertIn('waiting for suite slot held by', text)
+            self.assertFalse(receipts[0].exists(), 'queued revalidation retained old success')
+        publication, log = self.start(prepare=False)
+        self.assertEqual(publication.wait(15), 0)
+        log.seek(0)
+        self.assertNotIn('verified local receipt', log.read())
+        self.assertEqual([e[0] for e in self.records()], ['start', 'end', 'start', 'end'])
+
     def test_killed_holder_releases_without_overlapping_live_suite(self):
         first, _ = self.start()
         self.await_start()
