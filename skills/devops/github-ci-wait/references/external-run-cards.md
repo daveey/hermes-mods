@@ -51,5 +51,24 @@ and do not hide it behind a filter pipeline. `wait_for_ci.py` itself does not pa
 retains its existing CLI exit contract; the wake-check wrapper owns translation and structured
 output.
 
+## Auditing which cards wait on CI
+
+There is no CLI filter for this; read the live board read-only via
+`~/.hermes/bin/hermes-core-python -m sqlite3 ~/.hermes/kanban.db` (default board; other boards are
+`~/.hermes/kanban/boards/<slug>/kanban.db`; `~/.hermes/kanban/default.db` is an empty stub).
+1. Take non-running cards only (`scheduled|blocked|todo|triage`). A `running` card with a live
+   `current_run_id` has a worker doing its own wait; leave it.
+2. The CURRENT wait is the `awaiting` in the newest `scheduled|blocked|continued|status` event.
+   Older events and `external_watch` rows keep stale CI refs after a card moved on to a
+   parent/clock/chat wait, so a "latest event mentioning awaiting" scan overcounts.
+3. Check each ref with `gh run view` / `gh pr view --json statusCheckRollup`, not the card text.
+4. A `triage` card whose awaiting is `ci` is usually a spend-budget hold that fired when CI
+   woke it (`spend_budget_held` event). If CI is green and the remaining steps are bounded
+   (review, ship, verify), re-scope in the reason and `hermes kanban promote <id> "<reason>"
+   --seen <newest comment id>`, then confirm a `claimed`/`spawned` event follows. If a supervisor's
+   newest comment deliberately RETAINS the hold, leave it.
+5. Red CI on a card that already parked for its creator's disposition: check whether the
+   creator answered (newer comment, card ready/running) before acting; the owner usually has it.
+
 On resume, reconcile the real exact-head checks and review/landing gates. The blue external
 state and its hover (service, status, last/next check, URL) are visibility, not acceptance.

@@ -154,7 +154,7 @@ If failed-only rerun is refused, read `references/refused-failed-only-rerun.md` 
 
 ## External-run cards
 
-Before parking CI/release work, read [external-run card contracts](references/external-run-cards.md) for native-versus-shell adapter selection, aggregate typed status, control tests and live probe readback.
+Before parking CI/release work, read [external-run card contracts](references/external-run-cards.md) for native-versus-shell adapter selection, aggregate typed status, control tests and live probe readback. Asked which cards wait on CI: same file, §Auditing which cards wait on CI.
 
 ## Done means
 - [ ] The sha was copied from `git`/`gh` output and passed positionally (not `--sha`; `--head-sha` only with `--run-id`), and `--once` ran with the same arguments before any "waiting on CI"?
