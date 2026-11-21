@@ -32,8 +32,17 @@ def test_stream_status_change_heartbeat_and_disconnect(monkeypatch):
                 frame = ws.receive_json()
             assert frame['view']['status'] == 'running'
             assert time.monotonic() - start < 3
+            # Leave a heartbeat queued before the parameter response. Clients
+            # must handle it even when the parameter projection is fast.
+            time.sleep(.2)
             ws.send_json({'hours': 24, 'window': '24h', 'expanded': True})
-            assert ws.receive_json()['view']['args'] == [24, '24h', True]
+            start = time.monotonic()
+            frame = ws.receive_json()
+            assert frame['type'] == 'heartbeat'
+            while frame.get('type') == 'heartbeat':
+                assert time.monotonic() - start < 3
+                frame = ws.receive_json()
+            assert frame['view']['args'] == [24, '24h', True]
         async def active():
             await asyncio.sleep(.05)
             return [t.get_name() for t in asyncio.all_tasks() if t.get_name().startswith('lanes-')]
