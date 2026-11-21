@@ -15,7 +15,9 @@ import tempfile
 PLUGIN = Path(__file__).resolve().parent
 INSTALLED = PLUGIN.parents[1] / 'hermes-agent'
 if not INSTALLED.is_dir():
-    INSTALLED = Path(os.environ.get('HERMES_AGENT_ROOT') or Path.home() / '.hermes' / 'hermes-agent')
+    # test-all names the core it selected in HERMES_CORE_CHECKOUT (a CI runner has no ~/.hermes/hermes-agent).
+    INSTALLED = Path(os.environ.get('HERMES_AGENT_ROOT') or os.environ.get('HERMES_CORE_CHECKOUT')
+                     or Path.home() / '.hermes' / 'hermes-agent')
 
 # Dependencies come from the installed PM runtime, but core imports must resolve
 # to the snapshot even if bootstrap imported installed core packages already.
