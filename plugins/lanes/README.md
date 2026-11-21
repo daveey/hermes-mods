@@ -35,10 +35,9 @@ The stream uses core's canonical WebSocket authorization (ticket/token/internal
 identity), failing closed with 1008. It watches the local and fleet-replica
 `task_events` cursor and policy/planner-note mtimes every 0.25 seconds. The first tick that
 sees a change projects it at once (no trailing debounce); changes that land during a
-projection coalesce into one immediate follow-up. Per-card decoded history is reused across
-projections while the card's own `(count, max id)` is unchanged, so a card create/status/archive
-rebuilds only that card; counts are still computed on the hub by core and equal a full
-recompute. Legacy read caches are invalidated once per revision, and a frame is sent only when
+projection coalesce into one immediate follow-up. Counts are computed on the hub by core,
+using request-local evidence shared by the strip and expanded flow; no cross-request card
+history memo is retained. Legacy read caches are invalidated once per revision, and a frame is sent only when
 the view/parameter hash differs. `&debug=true` adds a `timing` object to each pushed frame
 (wall-clock epoch seconds: `cursor_poll`, `detected`, `released`, `project_start`,
 `project_end`, `sent`); it is outside the view hash and absent otherwise. An unchanged board produces

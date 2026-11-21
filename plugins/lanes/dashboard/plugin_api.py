@@ -195,17 +195,6 @@ def _view_module():
     return module
 
 
-@lru_cache(maxsize=1)
-def _card_memo():
-    # Races on first use only build a spare memo; the lru_cache keeps one.
-    import importlib.util
-    from pathlib import Path
-    spec = importlib.util.spec_from_file_location('lanes_card_memo', Path(__file__).with_name('card_memo.py'))
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.CardMemo()
-
 
 def _shared_views():
     # lru_cache alone permits duplicate concurrent cold construction.
@@ -251,7 +240,7 @@ def _current_view(mods, hours, window, expanded):
     kbc, _, cli = mods
     try:
         with kbc.connect_closing() as conn, read_view(conn) as evidence:
-            _card_memo().bind(evidence)
+
             snap = cli.snapshot(conn, hours=hours, evidence=evidence)
             raw = None
             if expanded and snap.get('configured'):
