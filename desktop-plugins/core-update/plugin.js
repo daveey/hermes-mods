@@ -12,6 +12,8 @@
  * machine, and /restart quits it with osascript on the backend's host. Through the active gateway (often
  * hermes-hub) the chip showed that host's updater and its restart could not quit this Desktop.
  * Polled every 30 s only while the window is visible; read once when it is shown again.
+ * The polled /status read is `passive`: it never starts or installs a local backend that is not running
+ * (the chip just stays hidden); a click (show/hide, restart) may.
  */
 
 import { atom, host, STATUSBAR_AREAS, useValue } from '@hermes/plugin-sdk'
@@ -46,10 +48,11 @@ export function chipFor(status, restarting = false) {
   return null
 }
 
-/** REST options that pin a call to this machine's gateway: none when it is already the routed one. */
+/** REST options that pin a call to this machine's gateway: none only when it is the routed one by id (an
+ *  unknown active connection still names local explicitly). */
 export function localRoute(gateways, active) {
   const local = (Array.isArray(gateways) ? gateways : []).find(g => g && g.kind === LOCAL)?.id || LOCAL
-  return !active || active === local ? {} : { connectionId: local }
+  return active && active === local ? {} : { connectionId: local }
 }
 
 const route = () => {
@@ -66,7 +69,7 @@ export function createStore(ctx) {
   let inflight = null
   const refresh = () => {
     if (inflight) return inflight
-    inflight = Promise.resolve().then(() => ctx.rest('/status', route()))
+    inflight = Promise.resolve().then(() => ctx.rest('/status', { ...route(), passive: true }))
       .then(s => { $status.set(s && typeof s === 'object' ? s : null) })
       .catch(() => { $status.set(null) })
       .finally(() => { inflight = null })

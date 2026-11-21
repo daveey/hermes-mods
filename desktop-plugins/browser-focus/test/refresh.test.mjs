@@ -33,8 +33,10 @@ test('localRoute: nothing to add when the local gateway is routed, else pin its 
   assert.deepEqual(m.localRoute(gws, 'mbp'), {})
   assert.deepEqual(m.localRoute(gws, 'hub'), { connectionId: 'mbp' })
   assert.deepEqual(m.localRoute([{ id: 'hub', kind: 'remote' }], 'hub'), { connectionId: 'local' })
-  assert.deepEqual(m.localRoute(null, null), {})
   assert.deepEqual(m.localRoute([], 'local'), {})
+  // No known active id: still name the local connection, never fall back to whatever is routed.
+  assert.deepEqual(m.localRoute(gws, null), { connectionId: 'mbp' })
+  assert.deepEqual(m.localRoute(null, null), { connectionId: 'local' })
 })
 
 test('with hermes-hub active, /status and the action go to the local connection', async () => {
@@ -48,10 +50,12 @@ test('with hermes-hub active, /status and the action go to the local connection'
   await tick()
   assert.deepEqual(calls.slice(0, 2).map(c => [c.path, c.connectionId]), [['/status', 'local'], ['/show', 'local']])
   assert.ok(calls.every(c => c.connectionId === 'local'), 'every call, including the re-read after the action, is pinned')
+  assert.ok(calls.filter(c => c.path === '/status').every(c => c.passive === true), 'polled reads never cold-start a backend')
+  assert.equal(calls.find(c => c.path !== '/status').passive, undefined, 'the clicked action may start it')
   host.activeConnectionId = () => 'local'
   calls.length = 0
   await store.refresh()
-  assert.deepEqual(calls, [{ path: '/status' }])
+  assert.deepEqual(calls, [{ path: '/status', passive: true }])
 })
 
 test('register: 5000 ms poll skipped while hidden, one read when shown, listener disposed', async () => {

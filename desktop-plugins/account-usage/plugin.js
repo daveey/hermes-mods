@@ -22,7 +22,8 @@
  * this plugin, so every read here can cost provider traffic. Reads happen on load (+8 s, to pick up
  * that fetch), when the gateway pushes `plugin.account-usage.changed` (the plugin's post_api_request
  * hook: quota was just spent; at most one per provider per 60 s there, and at most one read per
- * EVENT_GAP_MS here), every 5 minutes as a safety net, and when the window is shown again (if a push
+ * EVENT_GAP_MS here; pushes from a connection other than the active one are ignored; a push or show read
+ * gets one follow-up read FOLLOWUP_MS later to show the fetch it started), every 5 minutes as a safety net, and when the window is shown again (if a push
  * came while hidden or the last read is older than EVENT_GAP_MS).
  * Nothing is read while the window is hidden. Was: model.options + /last + /disabled + /selection
  * every 30 s, hidden or not.
@@ -38,8 +39,10 @@ const ID = 'account-usage'
 // Safety net; pushes drive the live updates (was 30 s, which also drove a provider usage fetch every 2 min).
 const POLL_MS = 5 * 60_000
 export const CHANGED_EVENT = 'plugin.account-usage.changed'
-// A busy chat pushes once a minute per provider; several providers or gateways still mean one read per this gap.
+// A busy chat pushes once a minute per provider; several providers still mean one read per this gap.
 export const EVENT_GAP_MS = 30_000
+// The read after a push/show read that shows the provider fetch the first one started.
+export const FOLLOWUP_MS = 8_000
 const WARN_PCT = 80
 // A credential that served a call within this window is "in use" (pulses); older = "last used" (ring).
 const ACTIVE_MS = 10 * 60_000
@@ -1521,27 +1524,49 @@ function UsageBar({ store, selectionStore, reconnectStore, disableStore }) {
 const isHidden = () => typeof document !== 'undefined' && !!document.hidden
 
 /** Push-driven reads: `onChanged` reads at once, or once EVENT_GAP_MS after the last read; while hidden it
- *  only marks the state stale, and `onShow` reads then (or when the last read is older than EVENT_GAP_MS). `tick` is the safety poll (skipped while hidden).
- *  Exported for tests (`now`/`schedule` are seams). */
+ *  only marks the state stale, and `onShow` reads then (or when the last read is older than EVENT_GAP_MS).
+ *  A push or show read is followed by one more read FOLLOWUP_MS later: model.options only STARTS the provider
+ *  usage fetch, so the first read still shows the cached numbers (the load path does the same). `tick` is
+ *  the safety poll (skipped while hidden, no follow-up). Exported for tests (`now`/`schedule` are seams). */
 export function createRefresher(read, { now = () => Date.now(), schedule = (fn, ms) => setTimeout(fn, ms), cancel = t => clearTimeout(t) } = {}) {
-  let last = -Infinity, timer = null, stale = false
-  const run = () => { timer = null; stale = false; last = now(); return read() }
+  let last = -Infinity, timer = null, follow = null, stale = false
+  const run = followUp => {
+    timer = null
+    stale = false
+    last = now()
+    if (follow) { cancel(follow); follow = null }
+    if (followUp) follow = schedule(() => { follow = null; if (!isHidden()) read() }, FOLLOWUP_MS)
+    return read()
+  }
   const onChanged = () => {
     if (isHidden()) { stale = true; return }
     if (timer) return
     const wait = last + EVENT_GAP_MS - now()
-    if (wait <= 0) run()
-    else timer = schedule(run, wait)
+    if (wait <= 0) run(true)
+    else timer = schedule(() => run(true), wait)
   }
-  const tick = () => { if (!isHidden()) run() }
+  const tick = () => { if (!isHidden()) run(false) }
   // Shown again: read if something changed meanwhile or the last read is older than the gap (alt-tabbing is free).
   const onShow = () => {
     if (isHidden() || (!stale && now() - last < EVENT_GAP_MS)) return
     if (timer) { cancel(timer); timer = null }
-    run()
+    run(true)
   }
-  const dispose = () => { if (timer) cancel(timer); timer = null }
+  const dispose = () => {
+    if (timer) cancel(timer)
+    if (follow) cancel(follow)
+    timer = follow = null
+  }
   return { onChanged, tick, onShow, dispose, isStale: () => stale }
+}
+
+/** True when a push came over the active connection. Core tags an event with the registry connection whose
+ *  socket delivered it, and leaves the local/legacy primary untagged; `ctx.rest`/`host.request` read the
+ *  active one, so a push from another gateway (the hub's own chats) must not cost a read here. */
+export function eventForActive(ev, active, gateways) {
+  const localId = (Array.isArray(gateways) ? gateways : []).find(g => g && g.kind === 'local')?.id
+  const norm = id => (!id || id === 'local' || id === localId ? 'local' : id)
+  return norm(ev && ev.connectionId) === norm(active)
 }
 
 export default {
@@ -1572,7 +1597,8 @@ export default {
     ctx.onDispose(refresher.dispose)
     ctx.setInterval(refresher.tick, POLL_MS)
     const subscribe = typeof ctx.onEvent === 'function' ? ctx.onEvent : host?.onEvent
-    const offChanged = typeof subscribe === 'function' ? subscribe(CHANGED_EVENT, refresher.onChanged) : null
+    const onPush = ev => { if (eventForActive(ev, host.state.connectionId?.get?.(), host.state.gateways?.get?.())) refresher.onChanged() }
+    const offChanged = typeof subscribe === 'function' ? subscribe(CHANGED_EVENT, onPush) : null
     if (typeof offChanged === 'function') ctx.onDispose(offChanged)
     if (typeof document !== 'undefined' && document.addEventListener) {
       document.addEventListener('visibilitychange', refresher.onShow)

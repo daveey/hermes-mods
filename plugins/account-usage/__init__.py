@@ -108,6 +108,15 @@ def _wire_account_id(provider, entry):
 
 
 def _on_api(**kw):
+    provider = _record_api(kw)  # never raises
+    if provider:  # after the account_usage_last.json write, so the Desktop's /last read sees it
+        _push_changed(provider)
+    return None
+
+
+def _record_api(kw):
+    """Record the served credential; returns the provider whose usage moved (None: nothing to push here,
+    e.g. the request-local observer already wrote and pushed)."""
     try:
         request_id = kw.get('api_request_id')
         with _lock:
@@ -118,19 +127,19 @@ def _on_api(**kw):
             return None  # already observed the actual request-local credential
         pool = getattr(agent, "_credential_pool", None) if agent is not None else None
         if pool is None:
-            return None
+            # No pool (an API key / single credential): nothing to record, but its usage still moved.
+            return str(kw.get("provider") or getattr(agent, "provider", "") or "").lower() or None
         entry_id = getattr(agent, "_credential_pool_entry_id", None)
         entry = None
         if isinstance(entry_id, str) and entry_id:
             entry = next((e for e in pool.entries() if e.id == entry_id), None)
         if entry is None:
             entry = pool.current()
-        if entry is None:
-            return None
         provider = str(kw.get("provider") or getattr(agent, "provider", "") or "").lower()
         if not provider:
             return None
-        _push_changed(provider)
+        if entry is None:
+            return provider
         now = time.time()
         rec = {"entry_id": entry.id, "label": str(entry.label or ""), "at": now}
         account_id = _wire_account_id(provider, entry)
@@ -141,7 +150,7 @@ def _on_api(**kw):
             prev = _last.get((path, provider))
             if (prev and prev["entry_id"] == rec["entry_id"]
                     and prev.get("account_id") == rec.get("account_id") and now - prev["at"] < 20):
-                return None
+                return provider  # same account, written moments ago: usage still moved
             _last[(path, provider)] = rec
             try:
                 with open(path) as fh:
@@ -155,9 +164,9 @@ def _on_api(**kw):
             with open(tmp, "w") as fh:
                 json.dump(data, fh)
             os.replace(tmp, path)
+        return provider  # pushed after the write, so the Desktop's /last read sees it
     except Exception:
-        pass
-    return None
+        return None
 
 
 def _observe_selected(agent, snapshot):

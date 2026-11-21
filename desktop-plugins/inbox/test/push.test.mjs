@@ -121,3 +121,68 @@ test('register: subscribes to the push, polls every 5 min only while visible, re
     assert.equal(doc.listeners.size, 0)
   } finally { delete globalThis.document }
 })
+
+test('refreshGateway replaces only that connection: other connections and hub replica rows stay', async () => {
+  globalThis.document = fakeDocument()
+  try {
+    const { ctx, store, items } = setup()
+    ctx.hubGatewayName = id => ({ local: 'mbp', mini: 'mini' })[id] || ''
+    ctx.hubRest = async () => ({ gateway: 'mbp', items: [{ gateway: 'nous', session_id: 'h1', state: 'open', key: 'k', version: 1, synced_at: 1 }] })
+    await store.refresh()
+    const key = () => store.$items.get().map(i => `${i.gateway}:${i.session_id}`).sort()
+    assert.deepEqual(key(), ['hub:nous:h1', 'local:a', 'mini:b'])
+    items.local = [{ session_id: 'a2', updated_at: 5 }]
+    await store.refreshGateway('local')
+    assert.deepEqual(key(), ['hub:nous:h1', 'local:a2', 'mini:b'])
+    assert.ok(store.$items.get().find(i => i.session_id === 'h1').hub, 'the replica row keeps its hub marker')
+  } finally { delete globalThis.document }
+})
+
+test('alternating feeds route each push to its own connection, and a gateway restart (new feed) re-maps', async () => {
+  globalThis.document = fakeDocument()
+  try {
+    const { ctx, store, calls } = setup()
+    await store.refresh()
+    for (const [feed, want] of [['feed-mini', 'mini'], ['feed-local', 'local'], ['feed-mini', 'mini'], ['feed-local', 'local']]) {
+      calls.length = 0
+      store.onChanged({ payload: { feed, seq: 1 } })
+      await sleep(450)
+      assert.deepEqual(calls, [want])
+    }
+    // mini restarted: its next answer carries a new feed; the old one no longer maps to it.
+    const rest = ctx.rest
+    ctx.rest = async (path, opts = {}) => ({ ...(await rest(path, opts)), ...(opts.connectionId === 'mini' ? { feed: 'feed-mini-2' } : {}) })
+    await store.refreshGateway('mini')
+    calls.length = 0
+    store.onChanged({ payload: { feed: 'feed-mini-2', seq: 1 } })
+    await sleep(450)
+    assert.deepEqual(calls, ['mini'])
+    calls.length = 0
+    store.onChanged({ payload: { feed: 'feed-mini', seq: 9 } })
+    await sleep(450)
+    assert.deepEqual(calls.sort(), ['local', 'mini'], 'a stale feed is unknown: read everything')
+  } finally { delete globalThis.document }
+})
+
+test('a single-gateway answer older than a full pass never overwrites the newer rows', async () => {
+  globalThis.document = fakeDocument()
+  try {
+    const { ctx, store, items } = setup()
+    await store.refresh()
+    let release
+    const rest = ctx.rest
+    ctx.rest = async (path, opts = {}) => {
+      const snap = { ...(await rest(path, opts)) }
+      if (opts.connectionId === 'mini' && !release) await new Promise(r => { release = r }) // the single read stalls
+      return snap
+    }
+    items.mini = [{ session_id: 'old', updated_at: 1 }]
+    const single = store.refreshGateway('mini') // starts first, with the old rows
+    await sleep(5)
+    items.mini = [{ session_id: 'new', updated_at: 2 }]
+    await store.refresh() // starts later, lands first
+    release()
+    await single
+    assert.deepEqual(store.$items.get().filter(i => i.gateway === 'mini').map(i => i.session_id), ['new'])
+  } finally { delete globalThis.document }
+})

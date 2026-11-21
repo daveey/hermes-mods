@@ -34,7 +34,8 @@ API: `GET /api/plugins/core-update/status`, `POST /api/plugins/core-update/resta
 
 The Desktop chip always calls this machine's gateway (the `local` connection), even when another gateway (e.g.
 hermes-hub) is active: the update is for the Desktop on this machine and `/restart` quits it with osascript on the
-backend's host. It reads `/status` every 30 s only while the window is visible, and once when it is shown again.
+backend's host. It reads `/status` every 30 s only while the window is visible, and once when it is shown again. That read is
+`passive`, so it never starts or installs a local backend that is not running; the Restart click may.
 
 ## Tests
 

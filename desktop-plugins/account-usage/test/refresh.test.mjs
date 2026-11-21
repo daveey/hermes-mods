@@ -39,13 +39,20 @@ function clockedRefresher() {
     cancel: h => { t.timers = t.timers.filter(x => x !== h) }
   })
   const advance = ms => {
-    t.now += ms
-    for (const h of [...t.timers]) if (h.at <= t.now) { t.timers = t.timers.filter(x => x !== h); h.fn() }
+    const end = t.now + ms
+    for (;;) {
+      const due = t.timers.filter(h => h.at <= end).sort((a, b) => a.at - b.at)[0]
+      if (!due) break
+      t.timers = t.timers.filter(x => x !== due)
+      t.now = due.at
+      due.fn()
+    }
+    t.now = end
   }
   return { r, t, advance, reads: () => reads }
 }
 
-test('a push reads at once; a burst inside EVENT_GAP_MS is one more read at the end of the gap', () => {
+test('a push reads at once plus one follow-up FOLLOWUP_MS later; a burst inside EVENT_GAP_MS is one more read', () => {
   globalThis.document = fakeDocument()
   try {
     const { r, advance, reads } = clockedRefresher()
@@ -53,14 +60,34 @@ test('a push reads at once; a burst inside EVENT_GAP_MS is one more read at the 
     assert.equal(reads(), 1)
     r.onChanged(); r.onChanged(); r.onChanged()
     assert.equal(reads(), 1)
-    advance(m.EVENT_GAP_MS)
-    assert.equal(reads(), 2)
-    advance(m.EVENT_GAP_MS)
-    assert.equal(reads(), 2, 'nothing pending: no extra read')
+    advance(m.FOLLOWUP_MS)
+    assert.equal(reads(), 2, 'the follow-up shows the provider fetch the first read started')
+    advance(m.EVENT_GAP_MS - m.FOLLOWUP_MS)
+    assert.equal(reads(), 3, 'the burst: one read at the end of the gap')
+    advance(m.FOLLOWUP_MS)
+    assert.equal(reads(), 4, 'and its follow-up')
+    advance(10 * m.EVENT_GAP_MS)
+    assert.equal(reads(), 4, 'nothing pending: no extra read')
   } finally { delete globalThis.document }
 })
 
-test('hidden: pushes and the safety tick read nothing; shown reads once if a push came meanwhile', () => {
+test('the safety tick has no follow-up; a follow-up due while hidden is skipped', () => {
+  const doc = globalThis.document = fakeDocument()
+  try {
+    const { r, advance, reads } = clockedRefresher()
+    r.tick()
+    advance(m.FOLLOWUP_MS * 2)
+    assert.equal(reads(), 1)
+    advance(m.EVENT_GAP_MS)
+    r.onChanged()
+    assert.equal(reads(), 2)
+    doc.hidden = true
+    advance(m.FOLLOWUP_MS)
+    assert.equal(reads(), 2)
+  } finally { delete globalThis.document }
+})
+
+test('hidden: pushes and the safety tick read nothing; shown reads once (+ follow-up) if a push came meanwhile', () => {
   const doc = globalThis.document = fakeDocument()
   try {
     const { r, advance, reads } = clockedRefresher()
@@ -77,6 +104,8 @@ test('hidden: pushes and the safety tick read nothing; shown reads once if a pus
     assert.equal(reads(), 2)
     r.onShow()
     assert.equal(reads(), 2, 'alt-tab right after a read costs nothing')
+    advance(m.FOLLOWUP_MS)
+    assert.equal(reads(), 3)
   } finally { delete globalThis.document }
 })
 
@@ -92,6 +121,17 @@ test('shown with no push meanwhile reads only when the last read is older than E
     r.onShow()
     assert.equal(reads(), 2)
   } finally { delete globalThis.document }
+})
+
+test('eventForActive: untagged = local primary; a push from another connection is not for the active one', () => {
+  const gws = [{ id: 'mbp', kind: 'local' }, { id: 'hub', kind: 'remote' }]
+  assert.equal(m.eventForActive({}, null, gws), true)
+  assert.equal(m.eventForActive({}, 'mbp', gws), true)
+  assert.equal(m.eventForActive({ connectionId: 'mbp' }, null, gws), true)
+  assert.equal(m.eventForActive({ connectionId: 'hub' }, 'hub', gws), true)
+  assert.equal(m.eventForActive({ connectionId: 'hub' }, 'mbp', gws), false)
+  assert.equal(m.eventForActive({}, 'hub', gws), false)
+  assert.equal(m.eventForActive({ connectionId: 'local' }, undefined, undefined), true)
 })
 
 test('register: subscribes to the push, 5-minute safety poll, visibility listener, all disposed', async () => {
@@ -113,6 +153,11 @@ test('register: subscribes to the push, 5-minute safety poll, visibility listene
     assert.deepEqual(intervals.map(i => i.ms), [5 * 60_000])
     assert.deepEqual(subs.map(s => s.name), [m.CHANGED_EVENT])
     assert.equal(doc.listeners.size, 1)
+    host.state.connectionId = { get: () => 'local', subscribe: () => () => {} }
+    const before = rpc
+    subs[0].fn({ connectionId: 'hub', payload: { provider: 'anthropic' } })
+    await new Promise(r => setTimeout(r, 5))
+    assert.equal(rpc, before, 'a push from a non-active connection costs no read')
     const base = rpc
     doc.hidden = true
     intervals[0].fn()

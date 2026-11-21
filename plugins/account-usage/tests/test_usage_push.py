@@ -62,3 +62,41 @@ def test_post_api_request_hook_pushes():
             patch.object(plugin, '_wire_account_id', lambda p, e: None):
         plugin._on_api(session_id='s1', provider='anthropic')
     assert [d['provider'] for _, _, d in sent] == ['anthropic']
+
+
+def test_push_comes_after_the_last_used_write(tmp_path):
+    plugin = load_plugin()
+    seen = []
+    state = tmp_path / 'last.json'
+    entry = SimpleNamespace(id='e1', label='A')
+    pool = SimpleNamespace(entries=lambda: [entry], current=lambda: entry)
+    agent = SimpleNamespace(_credential_pool=pool, _credential_pool_entry_id='e1', provider='anthropic', session_id='s1')
+    with patch.object(plugin, '_find_agent', lambda sid: agent), patch.object(plugin, '_state_path', lambda: str(state)), \
+            patch.object(plugin, '_wire_account_id', lambda p, e: None), \
+            patch.object(plugin, '_push_changed', lambda p: seen.append((p, state.exists()))):
+        plugin._on_api(session_id='s1', provider='anthropic')
+    assert seen == [('anthropic', True)]
+
+
+def test_provider_without_a_pool_still_pushes():
+    plugin = load_plugin()
+    seen = []
+    agent = SimpleNamespace(_credential_pool=None, provider='openrouter', session_id='s1')
+    with patch.object(plugin, '_find_agent', lambda sid: agent), patch.object(plugin, '_push_changed', seen.append):
+        plugin._on_api(session_id='s1', provider='OpenRouter')
+    assert seen == ['openrouter']
+
+
+def test_request_local_observer_pushes_and_the_hook_does_not_push_twice(tmp_path):
+    plugin = load_plugin()
+    seen = []
+    entry = SimpleNamespace(id='e2', label='B')
+    pool = SimpleNamespace(entries=lambda: [entry], current=lambda: entry)
+    agent = SimpleNamespace(_credential_pool=pool, _account_usage_request_id='r1', provider='anthropic', session_id='s1')
+    snapshot = SimpleNamespace(entry_id='e2', account_id='acct', provider='anthropic')
+    with patch.object(plugin, '_state_path', lambda: str(tmp_path / 'last.json')), \
+            patch.object(plugin, '_push_changed', seen.append), patch.object(plugin, '_find_agent', lambda sid: agent):
+        plugin._observe_selected(agent, snapshot)
+        assert seen == ['anthropic'] and (tmp_path / 'last.json').exists()
+        plugin._on_api(session_id='s1', provider='anthropic', api_request_id='r1')
+    assert seen == ['anthropic']

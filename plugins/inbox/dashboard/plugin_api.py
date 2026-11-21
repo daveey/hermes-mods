@@ -1,7 +1,7 @@
 """/api/plugins/inbox — REST for the Desktop Inbox section (see ../store.py, ../card_types.py).
 
 GET  /ping                      {ok, api}   (api 3 = card types)
-GET  /items                     {items:[...], profile}  (root + every profile with an inbox; item.profile,
+GET  /items                     {items:[...], profile, feed}  (root + every profile with an inbox; item.profile,
                                  item.type/type_label/fields/field_specs/actions)
 POST /items                     {title, body, accept_prompt?, key?, poster?, cwd?, prompt_label?, type?, fields?}
                                  -> {session_id, updated}
@@ -15,10 +15,21 @@ GET  /outcome?key=K[&profile=p]  {found, state, outcome, value, fields, at, sess
 GET  /types[?profile=p]          {types:[...]}
 GET  /types/{name}[?profile=p]   the resolved type (with source) or 404
 PUT  /types/{name}[?profile=p]   {spec} or the spec itself -> define an ad-hoc local type
+
+Push: `plugin.inbox.changed` {feed, seq} on the gateway event stream whenever an inbox sidecar
+(`<home>/inbox/inbox.db`, plus every named profile's on the root dashboard) is written: a post, an
+update of a keyed card, an act/accept/archive/junk/settle, from ANY process (agent tool, CLI, cron,
+this API). A watcher thread compares the sidecar files' stat (db, -wal, -journal) every WATCH_TICK_S
+and pushes once two ticks agree (a half-done write is one push); a write through this API pushes at
+once. `feed` (hostname:pid) is also on every GET /items answer, so the Desktop re-reads only the
+connection that changed. The watcher starts on the first GET /items, i.e. only in the process that
+serves a Desktop, and keeps that request's profile context. A session archived or un-hidden through
+another door (core's sidebar) touches state.db only: the Desktop's 5-minute safety poll covers that.
 """
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import importlib.util
 import logging
 import os
@@ -121,7 +132,12 @@ def _emit(payload: Dict[str, Any]) -> None:
 
 class _Watch:
     """Push `plugin.inbox.changed` when the sidecar signature moves. `check()` is also called right after a
-    write through this API, so the Desktop does not wait for the next tick."""
+    write through this API, so the Desktop does not wait for the next tick.
+
+    The sidecar paths depend on the active profile (HERMES_HOME), a context variable of the request. `start()`
+    captures the first /items request's context and every check (the thread's ticks and later requests, whatever
+    profile they are scoped to) resolves the paths in a copy of it, so they always watch the same files: a tick
+    never sees "different files" as a change."""
 
     def __init__(self, paths=_sidecar_paths, emit=None):
         self._paths, self._emit = paths, emit
@@ -129,18 +145,32 @@ class _Watch:
         self.sig = None
         self.lock = threading.Lock()
         self.thread = None
+        self.ctx = None
+        self.settling = None  # a tick's new signature, pushed once the next tick sees it unchanged
         self.stop = threading.Event()
 
-    def check(self) -> bool:
+    def _resolve(self):
+        # A copy each time: one Context object cannot be entered by two threads at once.
+        return self.ctx.copy().run(self._paths) if self.ctx is not None else self._paths()
+
+    def check(self, settle: bool = False) -> bool:
+        """Push if the sidecars changed. ``settle`` (the thread's ticks): a write seen from outside may be half
+        done (one post commits the sidecar more than once), so push only once two ticks agree. A write through
+        this API has finished when it calls check(), so it pushes at once."""
         try:
-            sig = _signature(self._paths())
+            sig = _signature(self._resolve())
         except Exception:
             log.debug("inbox watch: signature failed", exc_info=True)
             return False
         with self.lock:
             if self.sig is None or sig == self.sig:
                 self.sig = sig  # the first read is the baseline: nothing changed yet
+                self.settling = None
                 return False
+            if settle and sig != self.settling:
+                self.settling = sig
+                return False
+            self.settling = None
             self.sig = sig
             self.seq += 1
             payload = {"feed": FEED_ID, "seq": self.seq}
@@ -151,25 +181,28 @@ class _Watch:
         return True
 
     def start(self) -> None:
+        """Start watching from the caller's context (call it from the request, or a to_thread of it)."""
         with self.lock:
             if self.thread is not None:
                 return
+            self.ctx = contextvars.copy_context()
             self.thread = threading.Thread(target=self._run, name="inbox-watch", daemon=True)
         self.check()  # baseline before the first tick
         self.thread.start()
 
     def _run(self) -> None:
         while not self.stop.wait(WATCH_TICK_S):
-            self.check()
+            self.check(settle=True)
 
 
 WATCH = _Watch()
 
 
-def _changed() -> None:
-    """After a write through this API: push now (the watcher would within WATCH_TICK_S)."""
+async def _changed() -> None:
+    """After a write through this API: push now (the watcher would within WATCH_TICK_S). Off the event loop:
+    the check stats files and may broadcast."""
     if WATCH.thread is not None:
-        WATCH.check()
+        await asyncio.to_thread(WATCH.check)
 
 
 async def _run(fn):
@@ -208,7 +241,7 @@ async def post(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
             key=payload.get("key"), poster=payload.get("poster"), cwd=payload.get("cwd"),
             prompt_label=payload.get("prompt_label"), type=payload.get("type"), fields=payload.get("fields"), ask=payload.get("ask")))
     finally:
-        _changed()
+        await _changed()
 
 
 @router.get("/items/{session_id}")
@@ -232,7 +265,7 @@ async def act(session_id: str, payload: Dict[str, Any] = Body(...), profile: Opt
     try:
         item = await _run(lambda: inbox.act(session_id, action, value))
     finally:
-        _changed()
+        await _changed()
     if not item:
         _not_open(inbox, session_id)
     return _public(item)
@@ -261,7 +294,7 @@ async def accept(session_id: str, profile: Optional[str] = None) -> Dict[str, An
     except _Conflict as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     finally:
-        _changed()
+        await _changed()
     if not item:
         _not_open(inbox, session_id)
     return _public(item)
@@ -275,7 +308,7 @@ class _Conflict(Exception):
 async def archive(session_id: str, profile: Optional[str] = None) -> Dict[str, Any]:
     inbox = _inbox(profile)
     ok = await asyncio.to_thread(lambda: inbox.archive(session_id))
-    _changed()
+    await _changed()
     if not ok:
         raise HTTPException(status_code=404, detail="not an inbox message")
     return {"ok": True}
@@ -286,7 +319,7 @@ async def junk(session_id: str, profile: Optional[str] = None) -> Dict[str, Any]
     """Owner marks a card as junk: archive, mute the poster family, file a five-whys Kanban card."""
     inbox = _inbox(profile)
     result = await asyncio.to_thread(lambda: inbox.junk(session_id))
-    _changed()
+    await _changed()
     if not result:
         raise HTTPException(status_code=404, detail="not an inbox message")
     return result

@@ -484,6 +484,10 @@ export function createStore(ctx) {
   const fetching = new Set()
   let inflight = null
   let again = false
+  // Read generations: every /items read (a full pass, or one gateway's) takes the next number when it starts, and
+  // a gateway's rows are only replaced by an answer from a read that started later than the one shown.
+  let readGen = 0
+  const shownGen = new Map() // connection id -> generation of the rows shown for it
   // feed (gateway process, from its /items answer) -> connection ids, to route a push to its connection.
   const feeds = new Map()
   const noteFeed = (gateway, feed) => {
@@ -532,6 +536,7 @@ export function createStore(ctx) {
       return inflight
     }
     const routed = routedGateway()
+    const pass = ++readGen
     inflight = Promise.all(
       gatewayIds().map(gateway =>
         ctx
@@ -544,6 +549,13 @@ export function createStore(ctx) {
       )
     )
       .then(async answers => {
+        // A single-gateway read that started after this pass and already landed is newer: keep its rows.
+        const cur = $items.get()
+        answers = answers.map(a => {
+          if ((shownGen.get(a.gateway) || 0) > pass) return { gateway: a.gateway, items: cur.filter(i => !i.hub && i.gateway === a.gateway) }
+          if (!a.failed) shownGen.set(a.gateway, pass)
+          return a
+        })
         const live = mergeItems(answers)
         const hub = await safeHub('/inbox')
         let extra = []
@@ -574,11 +586,15 @@ export function createStore(ctx) {
       return inflight
     }
     const routed = routedGateway()
+    const mine = ++readGen
     return Promise.resolve()
       .then(() => ctx.rest('/items', gateway === routed ? { timeoutMs: 8000 } : { connectionId: gateway, timeoutMs: 8000 }))
       .then(r => {
         if (!r || !Array.isArray(r.items)) return refresh()
         noteFeed(gateway, r.feed)
+        // A read (full pass or single) that started after this one already landed: this answer is older.
+        if ((shownGen.get(gateway) || 0) > mine) return
+        shownGen.set(gateway, mine)
         const name = hubName(gateway)
         const cur = $items.get()
         const others = cur.filter(i => !i.hub && i.gateway !== gateway)

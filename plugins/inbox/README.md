@@ -280,6 +280,8 @@ argparse/CLI implementation without loading unrelated plugins from a live profil
   unknown feed reads every gateway). A 5-minute safety poll (was 30 s) covers missed pushes, the hub replica and
   sessions archived through core's sidebar (state.db only, no sidecar write). Nothing is read while the window is
   hidden; showing it runs one full pass, which absorbs any pushes that arrived meanwhile.
+  Every read takes a generation number when it starts; a gateway's rows are replaced only by a read that started
+  later than the one shown, so a slow single-gateway answer never overwrites a newer full pass.
 - Opens rows on their own gateway (owner route).
 - Marks a message read through core's `PATCH /api/sessions/{id} {unread:false}` when its chat is focused.
 - Adds a composer bar when the focused chat is an open message: the card type's actions (primary first, Archive last), with an inline editor for `input` actions and a confirm prompt for `confirm` ones. `prompt` actions submit the returned prompt into the chat; `resolve` and `task` actions close the card and open the next message (`task` also toasts "Queued <id>"). Items from a gateway without card types (`api` < 3, no `actions`) keep **Do it** / **Archive**.
@@ -296,7 +298,9 @@ The gateway backend (`dashboard/plugin_api.py`) pushes `plugin.inbox.changed` {f
 an inbox sidecar is written: a post, an update of a keyed card, act / accept / archive / junk / settle, from any
 process (the `inbox_post` tool, `hermes inbox post`, cron, this API). A watcher thread compares the stat (mtime,
 size) of `inbox.db`, `-wal` and `-journal` every 2 s (`HERMES_INBOX_WATCH_TICK_S`), for this profile and, on the root
-dashboard, every named profile's sidecar. A write through the REST API pushes at once. Reads never write the sidecar,
+dashboard, every named profile's sidecar. A change seen by the watcher is pushed once two ticks agree, so a write that commits
+the sidecar more than once is one push. The watcher keeps the first `/items` request's profile context, so its ticks
+(and later requests scoped to another profile) always watch the same files. A write through the REST API pushes at once. Reads never write the sidecar,
 so a refresh never triggers another push. The watcher starts on the first `GET /items`, so only the process serving a
 Desktop runs it. Tests: `tests/test_push.py`, `desktop-plugins/inbox/test/push.test.mjs`.
 
