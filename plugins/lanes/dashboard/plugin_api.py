@@ -32,6 +32,7 @@ LIMIT_FIELDS = ("cards_per_day", "usd_per_day", "max_workers")
 _flow_cache: Dict[str, tuple] = {}
 _lock = threading.Lock()
 _observer_init_lock = threading.Lock()
+_view_init_lock = threading.Lock()
 _cache: Dict[float, tuple] = {}
 _generation = 0
 
@@ -190,8 +191,14 @@ def _view_module():
     return module
 
 
-@lru_cache(maxsize=1)
 def _shared_views():
+    # lru_cache alone permits duplicate concurrent cold construction.
+    with _view_init_lock:
+        return _make_shared_views()
+
+
+@lru_cache(maxsize=1)
+def _make_shared_views():
     import importlib.util
     from pathlib import Path
     spec = importlib.util.spec_from_file_location('lanes_shared_views', Path(__file__).with_name('shared_views.py'))
@@ -203,6 +210,11 @@ def _shared_views():
 
 def lane_view(hours: float = 6.0, window: str = "6h", expanded: bool = False):
     _validate_view(hours, window, expanded)
+    mods = core()
+    if mods is not None and 'evidence' not in inspect.signature(mods[2].snapshot).parameters:
+        # Legacy read/flow already own their expiry. An outer cache would
+        # resurrect a nearly expired inner snapshot for another full TTL.
+        return _lane_view(hours, window, expanded)
     with _lock:
         generation = _generation
     return _shared_views().get((hours, window, expanded), (generation, _observation_cursor()),
