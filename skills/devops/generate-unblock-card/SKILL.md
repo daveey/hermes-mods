@@ -66,12 +66,20 @@ when); `Options:` may be the single step plus "Archive = drop it".
 
 ## How the panel shows it
 
-The session panel renders the card as: a "Needs your decision" label and the title; the Situation (clamped to two
-lines, with More); one tile per option with its letter, **name** in bold and the rest of the line as a one-line
-detail; the recommended tile highlighted with your reason under it and a filled **Choose** button; then
-"Only you can: …". Everything else (what you tried, the Unblock/Archive mapping, the ask as filed, evidence) is
-folded under Details. So: the name after `A)` must stand alone as a button-sized label, the text after `:` is the
-consequence, and nothing important may live only in `action` for a decision card.
+Load [session-status-panel](../session-status-panel/SKILL.md) for the PanelModel contract, input-to-field map,
+fixture recipe and native verification. The backend's `plugins/session-panel/brief.py` is the single parser:
+ask-gate uses its raw `sections()` / `options()` grammar and the reducer uses `parse_brief()` for presentation;
+Desktop only draws the resulting model.
+
+The card shows its title and Situation, then lettered option tiles with names, consequence details and the
+recommended reason, followed by "Only you can: …". Tried, action mapping and evidence fold under Details.
+When `choices` exist, **their labels supply tile order and names**; write `C: Test live (recommended)` to
+match `C) Test live: ...` in scope. Own letters must be unique; missing/duplicate letters fall back to positional
+badges. Scope details join by letter, not index, so C/A order is valid. Keep the explicit `Recommend: C - reason`
+consistent with the single marked choice; it wins over the label marker. Put the reason in its first paragraph,
+not an appended evidence/footer. The name after `A)` supplies the tile name only when choices are absent.
+Keep decision-critical information in the brief, not only `action`. Exact line clamping and button styling are
+renderer details, not ask-authoring requirements; a matching tile does not prove a remote answer was recorded.
 
 ## 3. Read it back cold
 
