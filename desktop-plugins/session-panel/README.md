@@ -2,6 +2,35 @@
 
 The panel displays the current chat's tasks and decisions using the owner-qualified session-tasks and user-steps projections.
 
+## Hub model renderer (P2, opt-in)
+
+Settings → Plugins → Session Panel exposes **Use hub-computed status panel**.
+The Desktop-local boolean `sessionPanel.hubModel` defaults to **off**; switching it
+off immediately restores the legacy panel below. No shared-config or default flip
+is part of P2.
+
+When enabled, `renderModel(model)` paints the pushed PanelModel v1 header and six
+sections without classifying cards, parsing briefs, or reading extra data. Existing
+feed registration/reconnect remains; models cache by connection/profile/stored chat
+(up to 100) and paint synchronously on a switch. The legacy panel component and
+its warming reads are not mounted/run in model mode. Missing models show an explicit
+unavailable message, never an unrelated chat's snapshot.
+
+Question choices use the existing user-steps decisions POST with `choice_id`, the
+exact owner/session/revision and a persisted idempotency key. The owner is verified
+on click before posting; delivery is read back separately. An unknown POST outcome
+locks all options and offers **Check status**, retaining the key across reloads.
+Card asks with no canonical request only draft composer text (nothing is sent);
+P3 removes that transitional branch after widening the mirror. Open card uses the
+existing qualified owner connection mapping. Details are plain text, not executable
+HTML or commands.
+
+`test/hub-model.test.mjs` calls the real Python reducer for public structural
+fixtures. Set `HERMES_PANEL_GOLDENS=/private/path/private-golden-cases.json` to render
+all seven preserved P1 real-data goldens too; never commit those private dumps.
+Schema: [`../../plugins/session-panel/MODEL.md`](../../plugins/session-panel/MODEL.md).
+Native MacBook activation/screenshots and the default flip remain P3/P4 work.
+
 ## Blocked cards and retired decisions
 
 A canonical decision can be dismissed, withdrawn, or resolved while its owner card still reports `blocked`. Deduplicating the decision must not make that card undiscoverable.
